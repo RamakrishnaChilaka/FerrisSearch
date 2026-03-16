@@ -98,6 +98,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(handle_root))
         .route("/_cluster/health", get(cluster::get_health))
         .route("/_cluster/state", get(cluster::get_state))
+        .route("/_cluster/transfer_master", post(cluster::transfer_master))
         // _cat APIs
         .route("/_cat/nodes", get(cat::cat_nodes))
         .route("/_cat/shards", get(cat::cat_shards))

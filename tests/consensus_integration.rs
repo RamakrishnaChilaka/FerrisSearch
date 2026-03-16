@@ -374,3 +374,38 @@ async fn set_master_then_remove_master_node_clears_master() {
     let state = state_handle.read().unwrap();
     assert!(state.master_node.is_none(), "removing master node should clear master_node");
 }
+
+#[tokio::test]
+async fn transfer_leader_to_self_succeeds() {
+    // In a single-node cluster, transferring to self should succeed (no-op).
+    let (raft, _state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19314".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Get current vote from metrics
+    let vote = {
+        use openraft::type_config::async_runtime::WatchReceiver;
+        let m = raft.metrics();
+        m.borrow_watched().vote.clone()
+    };
+
+    let last_log_id = {
+        use openraft::type_config::async_runtime::WatchReceiver;
+        let m = raft.metrics();
+        m.borrow_watched().last_applied
+    };
+
+    let req = openraft::raft::TransferLeaderRequest::new(vote, 1u64, last_log_id);
+
+    // Should not return an error
+    raft.handle_transfer_leader(req)
+        .await
+        .expect("transfer_leader to self should succeed in single-node cluster");
+
+    // Node should still be leader
+    assert!(raft.is_leader(), "node should remain leader after self-transfer");
+}
