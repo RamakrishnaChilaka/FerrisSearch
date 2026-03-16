@@ -282,6 +282,50 @@ impl HotEngine {
                     Ok(Box::new(BooleanQuery::new(subqueries)))
                 }
             }
+            QueryClause::Range(fields) => {
+                use std::ops::Bound;
+                use tantivy::query::RangeQuery;
+
+                if let Some((field_name, condition)) = fields.iter().next() {
+                    let target_field = self.resolve_field(field_name);
+
+                    let to_term = |v: &serde_json::Value| -> Term {
+                        match v {
+                            serde_json::Value::String(s) => Term::from_field_text(target_field, s),
+                            serde_json::Value::Number(n) => {
+                                if let Some(i) = n.as_i64() {
+                                    Term::from_field_i64(target_field, i)
+                                } else if let Some(f) = n.as_f64() {
+                                    Term::from_field_f64(target_field, f)
+                                } else {
+                                    Term::from_field_text(target_field, &n.to_string())
+                                }
+                            }
+                            other => Term::from_field_text(target_field, &other.to_string()),
+                        }
+                    };
+
+                    let lower = if let Some(ref v) = condition.gt {
+                        Bound::Excluded(to_term(v))
+                    } else if let Some(ref v) = condition.gte {
+                        Bound::Included(to_term(v))
+                    } else {
+                        Bound::Unbounded
+                    };
+
+                    let upper = if let Some(ref v) = condition.lt {
+                        Bound::Excluded(to_term(v))
+                    } else if let Some(ref v) = condition.lte {
+                        Bound::Included(to_term(v))
+                    } else {
+                        Bound::Unbounded
+                    };
+
+                    Ok(Box::new(RangeQuery::new(lower, upper)))
+                } else {
+                    Ok(Box::new(AllQuery))
+                }
+            }
         }
     }
 }
@@ -959,6 +1003,114 @@ mod tests {
                 let mut m = HashMap::new();
                 m.insert("body".into(), json!("published"));
                 m
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["_id"], "d1");
+    }
+
+    // ── Range query tests ───────────────────────────────────────────────
+
+    #[test]
+    fn range_query_gte_lt_on_text() {
+        // Range on text field uses lexicographic ordering
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"name": "alice"})).unwrap();
+        engine.add_document("d2", json!({"name": "bob"})).unwrap();
+        engine.add_document("d3", json!({"name": "charlie"})).unwrap();
+        engine.add_document("d4", json!({"name": "dave"})).unwrap();
+        engine.refresh().unwrap();
+
+        // gte "b", lt "d" → should match "bob" and "charlie"
+        let mut fields = HashMap::new();
+        fields.insert("body".into(), crate::search::RangeCondition {
+            gte: Some(json!("b")),
+            lt: Some(json!("d")),
+            ..Default::default()
+        });
+        let req = SearchRequest {
+            query: QueryClause::Range(fields),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d2"), "bob should match");
+        assert!(ids.contains(&"d3"), "charlie should match");
+    }
+
+    #[test]
+    fn range_query_gt_lte_on_text() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"name": "alice"})).unwrap();
+        engine.add_document("d2", json!({"name": "bob"})).unwrap();
+        engine.add_document("d3", json!({"name": "charlie"})).unwrap();
+        engine.refresh().unwrap();
+
+        // gt "alice", lte "charlie" → bob and charlie
+        let mut fields = HashMap::new();
+        fields.insert("body".into(), crate::search::RangeCondition {
+            gt: Some(json!("alice")),
+            lte: Some(json!("charlie")),
+            ..Default::default()
+        });
+        let req = SearchRequest {
+            query: QueryClause::Range(fields),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d2"), "bob should match");
+        assert!(ids.contains(&"d3"), "charlie should match");
+        assert!(!ids.contains(&"d1"), "alice should be excluded (gt, not gte)");
+    }
+
+    #[test]
+    fn range_query_empty_fields_returns_all() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"x": "a"})).unwrap();
+        engine.add_document("d2", json!({"x": "b"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Range(HashMap::new()),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2, "empty Range should fall back to match all");
+    }
+
+    #[test]
+    fn range_inside_bool_filter_engine() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust alpha"})).unwrap();
+        engine.add_document("d2", json!({"title": "rust beta"})).unwrap();
+        engine.add_document("d3", json!({"title": "python gamma"})).unwrap();
+        engine.refresh().unwrap();
+
+        // must: match "rust", filter: range body >= "alpha" and < "beta"
+        // "alpha" matches d1, "beta" is excluded → only d1
+        let mut range_fields = HashMap::new();
+        range_fields.insert("body".into(), crate::search::RangeCondition {
+            gte: Some(json!("alpha")),
+            lt: Some(json!("beta")),
+            ..Default::default()
+        });
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("body".into(), json!("rust"));
+                    m
+                })],
+                filter: vec![QueryClause::Range(range_fields)],
+                ..Default::default()
             }),
             size: 10,
             from: 0,

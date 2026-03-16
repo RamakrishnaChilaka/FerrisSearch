@@ -18,7 +18,7 @@ fn default_size() -> usize {
     10
 }
 
-/// A query clause: term, match, match_all, or bool.
+/// A query clause: term, match, match_all, bool, or range.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryClause {
@@ -30,6 +30,21 @@ pub enum QueryClause {
     MatchAll(serde_json::Value),
     /// Boolean query: `{ "bool": { "must": [...], "should": [...], "must_not": [...], "filter": [...] } }`
     Bool(BoolQuery),
+    /// Range query: `{ "range": { "field": { "gte": 10, "lt": 100 } } }`
+    Range(HashMap<String, RangeCondition>),
+}
+
+/// Range condition with optional gt/gte/lt/lte bounds.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RangeCondition {
+    #[serde(default)]
+    pub gt: Option<serde_json::Value>,
+    #[serde(default)]
+    pub gte: Option<serde_json::Value>,
+    #[serde(default)]
+    pub lt: Option<serde_json::Value>,
+    #[serde(default)]
+    pub lte: Option<serde_json::Value>,
 }
 
 /// Boolean query with must/should/must_not/filter clauses.
@@ -251,6 +266,77 @@ mod tests {
                 assert_eq!(bq.must_not.len(), 1);
             }
             _ => panic!("expected Bool query after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn deserialize_range_query_gte_lt() {
+        let body = json!({
+            "query": { "range": { "age": { "gte": 18, "lt": 65 } } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Range(fields) => {
+                let cond = fields.get("age").unwrap();
+                assert_eq!(cond.gte, Some(json!(18)));
+                assert_eq!(cond.lt, Some(json!(65)));
+                assert!(cond.gt.is_none());
+                assert!(cond.lte.is_none());
+            }
+            _ => panic!("expected Range query"),
+        }
+    }
+
+    #[test]
+    fn deserialize_range_query_gt_lte() {
+        let body = json!({
+            "query": { "range": { "price": { "gt": 0, "lte": 100 } } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Range(fields) => {
+                let cond = fields.get("price").unwrap();
+                assert_eq!(cond.gt, Some(json!(0)));
+                assert_eq!(cond.lte, Some(json!(100)));
+            }
+            _ => panic!("expected Range query"),
+        }
+    }
+
+    #[test]
+    fn deserialize_range_query_string_bounds() {
+        let body = json!({
+            "query": { "range": { "name": { "gte": "a", "lt": "m" } } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Range(fields) => {
+                let cond = fields.get("name").unwrap();
+                assert_eq!(cond.gte, Some(json!("a")));
+                assert_eq!(cond.lt, Some(json!("m")));
+            }
+            _ => panic!("expected Range query"),
+        }
+    }
+
+    #[test]
+    fn range_inside_bool_filter() {
+        let body = json!({
+            "query": {
+                "bool": {
+                    "must": [{ "match": { "title": "rust" } }],
+                    "filter": [{ "range": { "year": { "gte": 2020, "lte": 2026 } } }]
+                }
+            }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Bool(bq) => {
+                assert_eq!(bq.must.len(), 1);
+                assert_eq!(bq.filter.len(), 1);
+                assert!(matches!(&bq.filter[0], QueryClause::Range(_)));
+            }
+            _ => panic!("expected Bool query"),
         }
     }
 }

@@ -158,6 +158,20 @@ curl -X POST 'http://localhost:9200/my-index/_search' \
   }'
 ```
 
+```bash
+# DSL: range query (inside bool filter)
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {
+      "bool": {
+        "must": [{"match": {"title": "rust"}}],
+        "filter": [{"range": {"year": {"gte": 2020, "lte": 2026}}}]
+      }
+    }
+  }'
+```
+
 ### Operations
 
 ```bash
@@ -203,8 +217,8 @@ Document writes use direct primary-to-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All 173 tests
-cargo test --lib                                # Unit tests (147)
+cargo test                                      # All 188 tests
+cargo test --lib                                # Unit tests (162)
 cargo test --test consensus_integration          # Raft consensus tests (15)
 cargo test --test replication_integration        # Replication tests (11)
 ```
@@ -237,7 +251,7 @@ config/            Default configuration
 - [x] Pagination support (`from` / `size` parameters)
 - [ ] Sort by field and `_score`
 - [x] Bool queries (`must`, `should`, `must_not`, `filter`)
-- [ ] Range queries (`gt`, `gte`, `lt`, `lte`)
+- [x] Range queries (`gt`, `gte`, `lt`, `lte`)
 - [ ] Wildcard and prefix queries
 - [x] Return `_score` in search results
 - [ ] Aggregations (terms, histogram, stats)
