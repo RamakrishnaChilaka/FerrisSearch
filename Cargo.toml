@@ -10,6 +10,7 @@ bincode-next = { version = "3.0.0-rc.5", features = ["serde"] }
 config = "0.15.21"
 futures = "0.3.32"
 murmur3 = "0.5"
+openraft = { version = "0.10.0-alpha.17", features = ["serde", "tokio-rt"] }
 prost = "0.13"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

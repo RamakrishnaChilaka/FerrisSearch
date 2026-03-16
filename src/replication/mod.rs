@@ -122,6 +122,7 @@ mod tests {
             transport_port: 19300,
             http_port: 19200,
             roles: vec![NodeRole::Data],
+            raft_node_id: 0,
         });
         cs.add_node(NodeInfo {
             id: "node-2".into(),
@@ -130,6 +131,7 @@ mod tests {
             transport_port: 19301,
             http_port: 19201,
             roles: vec![NodeRole::Data],
+            raft_node_id: 0,
         });
         cs
     }

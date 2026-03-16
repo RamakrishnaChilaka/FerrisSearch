@@ -36,6 +36,7 @@ message ClusterState {
 
 message JoinRequest {
     NodeInfo node_info = 1;
+    uint64 raft_node_id = 2;  // Joining node's unique Raft ID
 }
 
 message JoinResponse {
@@ -151,10 +152,24 @@ message ReplicateBulkResponse {
     string error = 2;
 }
 
+// ─── Raft Consensus ─────────────────────────────────────────────────────────
+
+// Generic Raft RPCs — payloads are JSON-encoded openraft messages.
+// This avoids duplicating openraft's complex type hierarchy in protobuf.
+
+message RaftRequest {
+    bytes data = 1;   // JSON-serialized openraft request
+}
+
+message RaftReply {
+    bytes data = 1;   // JSON-serialized openraft response
+    string error = 2; // non-empty on failure
+}
+
 // ─── Service Definition ─────────────────────────────────────────────────────
 
 service InternalTransport {
-    // Cluster coordination
+    // Cluster coordination (legacy — kept for backward compat during migration)
     rpc JoinCluster(JoinRequest) returns (JoinResponse);
     rpc PublishState(PublishStateRequest) returns (Empty);
     rpc Ping(PingRequest) returns (Empty);
@@ -172,4 +187,9 @@ service InternalTransport {
     // Primary-to-replica replication
     rpc ReplicateDoc(ReplicateDocRequest) returns (ReplicateDocResponse);
     rpc ReplicateBulk(ReplicateBulkRequest) returns (ReplicateBulkResponse);
+
+    // Raft consensus RPCs
+    rpc RaftVote(RaftRequest) returns (RaftReply);
+    rpc RaftAppendEntries(RaftRequest) returns (RaftReply);
+    rpc RaftSnapshot(RaftRequest) returns (RaftReply);
 }

@@ -73,13 +73,23 @@ pub async fn create_index(
         shard_routing: shard_assignment.clone(),
     };
 
-    // Register in cluster state (this node is master for now)
-    let mut new_state = cluster_state.clone();
-    new_state.add_index(metadata);
-    state.cluster_manager.update_state(new_state.clone());
-
-    // Broadcast updated state to all nodes so they learn about the new index
-    state.transport_client.publish_state(&new_state).await;
+    // Write through Raft if available (leader only), otherwise fallback
+    if let Some(ref raft) = state.raft {
+        if !raft.is_leader() {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "error": { "type": "master_not_discovered_exception", "reason": "This node is not the Raft leader. Send index creation requests to the master node." }
+            })));
+        }
+        let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
+        if let Err(e) = raft.client_write(cmd).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Raft write failed: {}", e) })));
+        }
+    } else {
+        let mut new_state = cluster_state.clone();
+        new_state.add_index(metadata);
+        state.cluster_manager.update_state(new_state.clone());
+        state.transport_client.publish_state(&new_state).await;
+    }
 
     // Open local shard engines for shards assigned to this node (primary or replica)
     for (shard_id, routing) in &shard_assignment {
@@ -138,10 +148,17 @@ pub async fn index_document(
             number_of_replicas: 0,
             shard_routing,
         };
-        let mut new_state = cluster_state.clone();
-        new_state.add_index(m.clone());
-        state.cluster_manager.update_state(new_state.clone());
-        state.transport_client.publish_state(&new_state).await;
+        if let Some(ref raft) = state.raft {
+            let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata: m.clone() };
+            if let Err(e) = raft.client_write(cmd).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Auto-create index via Raft failed: {}", e) })));
+            }
+        } else {
+            let mut new_state = cluster_state.clone();
+            new_state.add_index(m.clone());
+            state.cluster_manager.update_state(new_state.clone());
+            state.transport_client.publish_state(&new_state).await;
+        }
         let _ = state.shard_manager.open_shard(&index_name, 0);
         m
     };
@@ -271,10 +288,17 @@ pub async fn bulk_index(
             number_of_replicas: 0,
             shard_routing,
         };
-        let mut new_state = cluster_state.clone();
-        new_state.add_index(m.clone());
-        state.cluster_manager.update_state(new_state.clone());
-        state.transport_client.publish_state(&new_state).await;
+        if let Some(ref raft) = state.raft {
+            let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata: m.clone() };
+            if let Err(e) = raft.client_write(cmd).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Auto-create index via Raft failed: {}", e) })));
+            }
+        } else {
+            let mut new_state = cluster_state.clone();
+            new_state.add_index(m.clone());
+            state.cluster_manager.update_state(new_state.clone());
+            state.transport_client.publish_state(&new_state).await;
+        }
         let _ = state.shard_manager.open_shard(&index_name, 0);
         m
     };
@@ -498,14 +522,24 @@ pub async fn delete_index(
         })));
     }
 
-    // Remove from cluster state
-    let mut new_state = cluster_state.clone();
-    new_state.indices.remove(&index_name);
-    new_state.version += 1;
-    state.cluster_manager.update_state(new_state.clone());
-
-    // Broadcast updated state so all nodes learn the index is gone
-    state.transport_client.publish_state(&new_state).await;
+    // Remove from cluster state via Raft if available, otherwise fallback
+    if let Some(ref raft) = state.raft {
+        if !raft.is_leader() {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "error": { "type": "master_not_discovered_exception", "reason": "This node is not the Raft leader. Send index deletion requests to the master node." }
+            })));
+        }
+        let cmd = crate::consensus::types::ClusterCommand::DeleteIndex { index_name: index_name.clone() };
+        if let Err(e) = raft.client_write(cmd).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Raft write failed: {}", e) })));
+        }
+    } else {
+        let mut new_state = cluster_state.clone();
+        new_state.indices.remove(&index_name);
+        new_state.version += 1;
+        state.cluster_manager.update_state(new_state.clone());
+        state.transport_client.publish_state(&new_state).await;
+    }
 
     // Close local shard engines and delete data
     if let Err(e) = state.shard_manager.close_index_shards(&index_name) {

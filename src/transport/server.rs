@@ -1,6 +1,7 @@
 //! gRPC transport server — implements the InternalTransport service.
 
 use crate::cluster::manager::ClusterManager;
+use crate::consensus::types::RaftInstance;
 use crate::shard::ShardManager;
 use crate::transport::proto::internal_transport_server::{InternalTransport, InternalTransportServer};
 use crate::transport::proto::*;
@@ -14,6 +15,8 @@ pub struct TransportService {
     pub cluster_manager: Arc<ClusterManager>,
     pub shard_manager: Arc<ShardManager>,
     pub transport_client: crate::transport::TransportClient,
+    /// Optional Raft consensus instance. When present, Raft RPCs are forwarded here.
+    pub raft: Option<Arc<RaftInstance>>,
 }
 
 // ─── Conversion helpers: domain types ↔ proto types ─────────────────────────
@@ -46,6 +49,7 @@ fn proto_to_node_info(p: &NodeInfo) -> crate::cluster::state::NodeInfo {
             "client" => crate::cluster::state::NodeRole::Client,
             _ => crate::cluster::state::NodeRole::Data,
         }).collect(),
+        raft_node_id: 0,
     }
 }
 
@@ -101,8 +105,38 @@ impl InternalTransport for TransportService {
     async fn join_cluster(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
         let req = request.into_inner();
         let node_info = req.node_info.ok_or_else(|| Status::invalid_argument("missing node_info"))?;
-        let ni = proto_to_node_info(&node_info);
-        info!("gRPC: join request from node {}", ni.id);
+        let mut ni = proto_to_node_info(&node_info);
+        let joining_raft_id = req.raft_node_id;
+        info!("gRPC: join request from node {} (raft_id={})", ni.id, joining_raft_id);
+
+        // If Raft is active and we are the leader, register the node through Raft
+        if let Some(ref raft) = self.raft {
+            if raft.is_leader() && joining_raft_id > 0 {
+                ni.raft_node_id = joining_raft_id;
+
+                // 1. Register the node in cluster state via Raft
+                let cmd = crate::consensus::types::ClusterCommand::AddNode { node: ni.clone() };
+                raft.client_write(cmd).await
+                    .map_err(|e| Status::internal(format!("Raft AddNode failed: {}", e)))?;
+
+                // 2. Add as Raft learner (non-blocking — replication starts in background)
+                let addr = format!("{}:{}", ni.host, ni.transport_port);
+                raft.add_learner(joining_raft_id, openraft::BasicNode { addr }, false).await
+                    .map_err(|e| Status::internal(format!("Raft add_learner failed: {}", e)))?;
+
+                // 3. Promote to voter
+                let voters: std::collections::BTreeSet<u64> = raft.voter_ids().chain(std::iter::once(joining_raft_id)).collect();
+                raft.change_membership(voters, false).await
+                    .map_err(|e| Status::internal(format!("Raft change_membership failed: {}", e)))?;
+
+                let state = self.cluster_manager.get_state();
+                return Ok(Response::new(JoinResponse {
+                    state: Some(cluster_state_to_proto(&state)),
+                }));
+            }
+        }
+
+        // Fallback: legacy join (no Raft or not leader)
         self.cluster_manager.add_node(ni);
         let state = self.cluster_manager.get_state();
         Ok(Response::new(JoinResponse {
@@ -370,6 +404,59 @@ impl InternalTransport for TransportService {
             })),
         }
     }
+
+    // ─── Raft RPCs ────────────────────────────────────────────────────────────
+
+    async fn raft_vote(&self, request: Request<RaftRequest>) -> Result<Response<RaftReply>, Status> {
+        let raft = self.raft.as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        let rpc: openraft::raft::VoteRequest<crate::consensus::TypeConfig> =
+            serde_json::from_slice(&request.into_inner().data)
+                .map_err(|e| Status::invalid_argument(format!("bad vote request: {}", e)))?;
+        let resp = raft.vote(rpc).await
+            .map_err(|e| Status::internal(format!("raft vote error: {}", e)))?;
+        let data = serde_json::to_vec(&resp)
+            .map_err(|e| Status::internal(format!("serialise vote response: {}", e)))?;
+        Ok(Response::new(RaftReply { data, error: String::new() }))
+    }
+
+    async fn raft_append_entries(&self, request: Request<RaftRequest>) -> Result<Response<RaftReply>, Status> {
+        let raft = self.raft.as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        let rpc: openraft::raft::AppendEntriesRequest<crate::consensus::TypeConfig> =
+            serde_json::from_slice(&request.into_inner().data)
+                .map_err(|e| Status::invalid_argument(format!("bad append_entries request: {}", e)))?;
+        let resp = raft.append_entries(rpc).await
+            .map_err(|e| Status::internal(format!("raft append_entries error: {}", e)))?;
+        let data = serde_json::to_vec(&resp)
+            .map_err(|e| Status::internal(format!("serialise append_entries response: {}", e)))?;
+        Ok(Response::new(RaftReply { data, error: String::new() }))
+    }
+
+    async fn raft_snapshot(&self, request: Request<RaftRequest>) -> Result<Response<RaftReply>, Status> {
+        let raft = self.raft.as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        let payload: serde_json::Value = serde_json::from_slice(&request.into_inner().data)
+            .map_err(|e| Status::invalid_argument(format!("bad snapshot request: {}", e)))?;
+        let vote: crate::consensus::types::Vote = serde_json::from_value(
+            payload.get("vote").cloned().unwrap_or_default(),
+        ).map_err(|e| Status::invalid_argument(format!("bad vote in snapshot: {}", e)))?;
+        let meta: crate::consensus::types::SnapshotMeta = serde_json::from_value(
+            payload.get("meta").cloned().unwrap_or_default(),
+        ).map_err(|e| Status::invalid_argument(format!("bad meta in snapshot: {}", e)))?;
+        let data: Vec<u8> = serde_json::from_value(
+            payload.get("data").cloned().unwrap_or_default(),
+        ).map_err(|e| Status::invalid_argument(format!("bad data in snapshot: {}", e)))?;
+        let snapshot = crate::consensus::types::Snapshot {
+            meta,
+            snapshot: std::io::Cursor::new(data),
+        };
+        let resp = raft.install_full_snapshot(vote, snapshot).await
+            .map_err(|e| Status::internal(format!("raft snapshot error: {}", e)))?;
+        let data = serde_json::to_vec(&resp)
+            .map_err(|e| Status::internal(format!("serialise snapshot response: {}", e)))?;
+        Ok(Response::new(RaftReply { data, error: String::new() }))
+    }
 }
 
 impl TransportService {
@@ -392,6 +479,23 @@ pub fn create_transport_service(
         cluster_manager,
         shard_manager,
         transport_client,
+        raft: None,
+    };
+    InternalTransportServer::new(service)
+}
+
+/// Create the gRPC transport server with Raft consensus enabled.
+pub fn create_transport_service_with_raft(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    transport_client: crate::transport::TransportClient,
+    raft: Arc<RaftInstance>,
+) -> InternalTransportServer<TransportService> {
+    let service = TransportService {
+        cluster_manager,
+        shard_manager,
+        transport_client,
+        raft: Some(raft),
     };
     InternalTransportServer::new(service)
 }
@@ -417,6 +521,7 @@ mod tests {
             transport_port: 9300,
             http_port: 9200,
             roles: vec![NodeRole::Master, NodeRole::Data],
+            raft_node_id: 0,
         });
         cs.add_node(DomainNodeInfo {
             id: "node-2".into(),
@@ -425,6 +530,7 @@ mod tests {
             transport_port: 9300,
             http_port: 9200,
             roles: vec![NodeRole::Data],
+            raft_node_id: 0,
         });
 
         // Reset version (add_node bumps it)
@@ -549,6 +655,7 @@ mod tests {
             transport_port: 9300,
             http_port: 9200,
             roles: vec![NodeRole::Client],
+            raft_node_id: 0,
         });
 
         let proto = cluster_state_to_proto(&cs);

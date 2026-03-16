@@ -2,6 +2,7 @@ pub mod api;
 pub mod cluster;
 pub mod common;
 pub mod config;
+pub mod consensus;
 pub mod engine;
 pub mod indexing;
 pub mod node;

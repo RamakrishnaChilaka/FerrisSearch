@@ -7,6 +7,7 @@ pub mod index;
 pub mod search;
 
 use crate::cluster::ClusterManager;
+use crate::consensus::types::RaftInstance;
 use crate::shard::ShardManager;
 use crate::transport::TransportClient;
 use axum::{
@@ -42,6 +43,8 @@ pub struct AppState {
     pub transport_client: TransportClient,
     /// The local node ID — needed for routing decisions
     pub local_node_id: String,
+    /// Raft consensus instance (if enabled)
+    pub raft: Option<Arc<RaftInstance>>,
 }
 
 /// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.

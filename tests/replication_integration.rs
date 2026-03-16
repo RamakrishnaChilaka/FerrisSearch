@@ -78,6 +78,7 @@ fn setup_two_node_cluster_state(
         transport_port: 29999,
         http_port: 29998,
         roles: vec![NodeRole::Data],
+        raft_node_id: 0,
     });
     cs.add_node(DomainNodeInfo {
         id: "replica-node".into(),
@@ -86,6 +87,7 @@ fn setup_two_node_cluster_state(
         transport_port: replica_port,
         http_port: 0,
         roles: vec![NodeRole::Data],
+        raft_node_id: 0,
     });
 
     let mut shard_routing = HashMap::new();
@@ -392,6 +394,7 @@ async fn join_cluster_and_publish_state_via_grpc() {
                 http_port: 9201,
                 roles: vec!["data".into()],
             }),
+            raft_node_id: 0,
         }))
         .await
         .unwrap()

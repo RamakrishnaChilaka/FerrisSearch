@@ -1,0 +1,305 @@
+//! Integration tests for the Raft consensus module.
+//!
+//! These tests spin up real Raft instances (single-node) and exercise the full
+//! flow: bootstrap → leader election → client_write → state machine apply.
+
+use ropensearch::cluster::manager::ClusterManager;
+use ropensearch::cluster::state::{
+    IndexMetadata, NodeInfo, NodeRole, ShardRoutingEntry,
+};
+use ropensearch::consensus;
+use ropensearch::consensus::types::{ClusterCommand, ClusterResponse};
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn make_node(id: &str) -> NodeInfo {
+    NodeInfo {
+        id: id.into(),
+        name: id.into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9300,
+        http_port: 9200,
+        roles: vec![NodeRole::Master, NodeRole::Data],
+        raft_node_id: 0,
+    }
+}
+
+fn make_index(name: &str) -> IndexMetadata {
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(0, ShardRoutingEntry {
+        primary: "node-1".into(),
+        replicas: vec![],
+    });
+    IndexMetadata {
+        name: name.into(),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+    }
+}
+
+/// Wait for the single-node Raft to become leader (should be near-instant).
+async fn wait_for_leader(raft: &consensus::types::RaftInstance) {
+    for _ in 0..50 {
+        if raft.current_leader().await.is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("Raft node did not become leader within 5 seconds");
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn single_node_bootstrap_and_leader_election() {
+    let (raft, _state) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .expect("create_raft_instance should succeed");
+
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19300".into())
+        .await
+        .expect("bootstrap should succeed");
+
+    wait_for_leader(&raft).await;
+
+    let leader = raft.current_leader().await;
+    assert_eq!(leader, Some(1), "node 1 should be the leader");
+}
+
+#[tokio::test]
+async fn double_bootstrap_fails() {
+    let (raft, _state) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19301".into())
+        .await
+        .unwrap();
+
+    // Second bootstrap should fail (already initialized)
+    let result = consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19301".into()).await;
+    assert!(result.is_err(), "double bootstrap should fail");
+}
+
+#[tokio::test]
+async fn client_write_add_node() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19302".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let cmd = ClusterCommand::AddNode { node: make_node("data-node-1") };
+    let resp = raft.client_write(cmd).await.expect("client_write should succeed");
+
+    assert!(matches!(resp.data, ClusterResponse::Ok));
+    assert!(resp.log_id.index > 0, "applied log should have index > 0");
+
+    // Verify state machine was updated
+    let state = state_handle.read().unwrap();
+    assert!(state.nodes.contains_key("data-node-1"));
+}
+
+#[tokio::test]
+async fn client_write_remove_node() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19303".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Add then remove
+    raft.client_write(ClusterCommand::AddNode { node: make_node("ephemeral") })
+        .await
+        .unwrap();
+    {
+        let state = state_handle.read().unwrap();
+        assert!(state.nodes.contains_key("ephemeral"));
+    }
+
+    raft.client_write(ClusterCommand::RemoveNode { node_id: "ephemeral".into() })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert!(!state.nodes.contains_key("ephemeral"));
+}
+
+#[tokio::test]
+async fn client_write_create_and_delete_index() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19304".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Create index
+    let idx = make_index("products");
+    raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
+        .await
+        .unwrap();
+
+    {
+        let state = state_handle.read().unwrap();
+        assert!(state.indices.contains_key("products"));
+        assert_eq!(state.indices["products"].number_of_shards, 1);
+    }
+
+    // Delete index
+    raft.client_write(ClusterCommand::DeleteIndex { index_name: "products".into() })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert!(!state.indices.contains_key("products"));
+}
+
+#[tokio::test]
+async fn multiple_writes_are_ordered() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19305".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Write multiple nodes sequentially; log indices should be monotonically increasing
+    let mut last_index = 0;
+    for i in 0..5 {
+        let cmd = ClusterCommand::AddNode {
+            node: make_node(&format!("node-{}", i)),
+        };
+        let resp = raft.client_write(cmd).await.unwrap();
+        assert!(resp.log_id.index > last_index);
+        last_index = resp.log_id.index;
+    }
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(state.nodes.len(), 5);
+}
+
+#[tokio::test]
+async fn cluster_manager_reads_raft_state() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19306".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // ClusterManager wraps the same state_handle
+    let cm = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
+
+    // Write via Raft
+    raft.client_write(ClusterCommand::AddNode { node: make_node("raft-node") })
+        .await
+        .unwrap();
+
+    // Read via ClusterManager
+    let state = cm.get_state();
+    assert!(state.nodes.contains_key("raft-node"));
+    assert!(state.version > 0);
+}
+
+#[tokio::test]
+async fn state_version_increments_on_writes() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19307".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let v0 = state_handle.read().unwrap().version;
+
+    raft.client_write(ClusterCommand::AddNode { node: make_node("v1") })
+        .await
+        .unwrap();
+    let v1 = state_handle.read().unwrap().version;
+    assert!(v1 > v0, "version should increase after AddNode");
+
+    raft.client_write(ClusterCommand::CreateIndex { metadata: make_index("idx") })
+        .await
+        .unwrap();
+    let v2 = state_handle.read().unwrap().version;
+    assert!(v2 > v1, "version should increase after CreateIndex");
+
+    raft.client_write(ClusterCommand::DeleteIndex { index_name: "idx".into() })
+        .await
+        .unwrap();
+    let v3 = state_handle.read().unwrap().version;
+    assert!(v3 > v2, "version should increase after DeleteIndex");
+}
+
+#[tokio::test]
+async fn is_leader_after_bootstrap() {
+    let (raft, _state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19308".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    assert!(raft.is_leader(), "single-node cluster should report is_leader = true");
+}
+
+#[tokio::test]
+async fn create_multiple_indices() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19309".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    for i in 0..3 {
+        let idx = make_index(&format!("index-{}", i));
+        raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
+            .await
+            .unwrap();
+    }
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(state.indices.len(), 3);
+    assert!(state.indices.contains_key("index-0"));
+    assert!(state.indices.contains_key("index-1"));
+    assert!(state.indices.contains_key("index-2"));
+}
+
+#[tokio::test]
+async fn write_after_remove_node() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19310".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Add two nodes, remove one, add another
+    raft.client_write(ClusterCommand::AddNode { node: make_node("a") }).await.unwrap();
+    raft.client_write(ClusterCommand::AddNode { node: make_node("b") }).await.unwrap();
+    raft.client_write(ClusterCommand::RemoveNode { node_id: "a".into() }).await.unwrap();
+    raft.client_write(ClusterCommand::AddNode { node: make_node("c") }).await.unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert!(!state.nodes.contains_key("a"));
+    assert!(state.nodes.contains_key("b"));
+    assert!(state.nodes.contains_key("c"));
+    assert_eq!(state.nodes.len(), 2);
+}

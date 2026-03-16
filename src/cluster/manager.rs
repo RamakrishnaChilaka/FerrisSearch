@@ -13,6 +13,12 @@ impl ClusterManager {
         }
     }
 
+    /// Create a ClusterManager backed by an externally-owned state (e.g. shared
+    /// with the Raft state machine).
+    pub fn with_shared_state(state: Arc<RwLock<ClusterState>>) -> Self {
+        Self { state }
+    }
+
     /// Returns a cloned snapshot of the current state
     pub fn get_state(&self) -> ClusterState {
         self.state.read().unwrap_or_else(|e| e.into_inner()).clone()

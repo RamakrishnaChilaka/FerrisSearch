@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load()?;
 
     // Initialize and start the node
-    let node = Node::new(config)?;
+    let node = Node::new(config).await?;
     node.start().await?;
 
     Ok(())

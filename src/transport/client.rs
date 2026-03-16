@@ -36,11 +36,13 @@ impl TransportClient {
         Ok(InternalTransportClient::new(channel))
     }
 
-    /// Attempts to join the cluster by contacting the seed hosts
+    /// Attempts to join the cluster by contacting the seed hosts.
+    /// `raft_node_id` is sent to the leader so it can add this node to Raft membership.
     pub async fn join_cluster(
         &self,
         seed_hosts: &[String],
         local_node: &NodeInfo,
+        raft_node_id: u64,
     ) -> Option<ClusterState> {
         for host in seed_hosts {
             debug!("Attempting to join cluster via seed host: {}", host);
@@ -56,6 +58,7 @@ impl TransportClient {
                     let proto_node = node_info_to_proto(local_node);
                     let request = tonic::Request::new(JoinRequest {
                         node_info: Some(proto_node),
+                        raft_node_id,
                     });
                     match client.join_cluster(request).await {
                         Ok(response) => {

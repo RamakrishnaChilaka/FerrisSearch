@@ -23,6 +23,9 @@ pub struct NodeInfo {
     pub transport_port: u16,
     pub http_port: u16,
     pub roles: Vec<NodeRole>,
+    /// Unique Raft consensus node ID. 0 means not assigned.
+    #[serde(default)]
+    pub raft_node_id: u64,
 }
 
 /// Routing entry for a single shard: who is the primary, who are the replicas.
@@ -155,6 +158,7 @@ mod tests {
             transport_port: 9300,
             http_port: 9200,
             roles: vec![NodeRole::Master, NodeRole::Data],
+            raft_node_id: 0,
         }
     }
 
