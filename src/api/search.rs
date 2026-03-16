@@ -59,11 +59,11 @@ pub async fn search_documents(
 
     // Scatter to remote shards
     let mut remote_futures = Vec::new();
-    for (shard_id, node_id) in &metadata.shards {
+    for (shard_id, routing) in &metadata.shard_routing {
         if local_shard_ids.contains(shard_id) {
             continue;
         }
-        if let Some(node_info) = cluster_state.nodes.get(node_id) {
+        if let Some(node_info) = cluster_state.nodes.get(&routing.primary) {
             let client = state.transport_client.clone();
             let node_info = node_info.clone();
             let index = index_name.clone();

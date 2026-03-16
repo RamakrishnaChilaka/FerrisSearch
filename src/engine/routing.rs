@@ -19,7 +19,7 @@ pub fn route_document(document_id: &str, index_metadata: &IndexMetadata) -> Opti
     }
 
     let shard_id = calculate_shard(document_id, index_metadata.number_of_shards);
-    index_metadata.shards.get(&shard_id).cloned()
+    index_metadata.primary_node(shard_id).cloned()
 }
 
 #[cfg(test)]
@@ -69,13 +69,15 @@ mod tests {
 
     #[test]
     fn route_document_returns_correct_node() {
-        let mut shards = HashMap::new();
-        shards.insert(0, "node-A".into());
-        shards.insert(1, "node-B".into());
+        use crate::cluster::state::ShardRoutingEntry;
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(0, ShardRoutingEntry { primary: "node-A".into(), replicas: vec![] });
+        shard_routing.insert(1, ShardRoutingEntry { primary: "node-B".into(), replicas: vec![] });
         let meta = IndexMetadata {
             name: "test-index".into(),
             number_of_shards: 2,
-            shards,
+            number_of_replicas: 0,
+            shard_routing,
         };
 
         let routed = route_document("some-doc", &meta);
@@ -89,7 +91,8 @@ mod tests {
         let meta = IndexMetadata {
             name: "empty".into(),
             number_of_shards: 0,
-            shards: HashMap::new(),
+            number_of_replicas: 0,
+            shard_routing: HashMap::new(),
         };
         assert!(route_document("doc", &meta).is_none());
     }

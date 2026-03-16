@@ -80,6 +80,7 @@ impl Node {
         let transport_service = crate::transport::server::create_transport_service(
             self.cluster_manager.clone(),
             self.shard_manager.clone(),
+            self.transport_client.clone(),
         );
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));
         info!("gRPC Transport listening on {}", transport_addr);
@@ -144,10 +145,32 @@ impl Node {
 
                         if !dead_nodes.is_empty() {
                             let mut new_state = state.clone();
-                            for dead in dead_nodes {
+                            for dead in &dead_nodes {
                                 tracing::warn!("Node {} has died. Removing from ClusterState.", dead);
-                                new_state.remove_node(&dead);
+                                new_state.remove_node(dead);
                             }
+
+                            // Promote replicas for shards whose primary was on a dead node
+                            for index_meta in new_state.indices.values_mut() {
+                                for dead in &dead_nodes {
+                                    let orphaned = index_meta.remove_node(dead);
+                                    for shard_id in orphaned {
+                                        if index_meta.promote_replica(shard_id) {
+                                            let new_primary = &index_meta.shard_routing[&shard_id].primary;
+                                            tracing::warn!(
+                                                "Promoted replica to primary for {}/shard_{}: new primary = {}",
+                                                index_meta.name, shard_id, new_primary
+                                            );
+                                        } else {
+                                            tracing::error!(
+                                                "No replica available to promote for {}/shard_{} — shard is UNASSIGNED",
+                                                index_meta.name, shard_id
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
                             manager.update_state(new_state.clone());
                             // Broadcast the trimmed state
                             client.publish_state(&new_state).await;

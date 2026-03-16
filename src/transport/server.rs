@@ -13,6 +13,7 @@ use tracing::info;
 pub struct TransportService {
     pub cluster_manager: Arc<ClusterManager>,
     pub shard_manager: Arc<ShardManager>,
+    pub transport_client: crate::transport::TransportClient,
 }
 
 // ─── Conversion helpers: domain types ↔ proto types ─────────────────────────
@@ -57,9 +58,11 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
         indices: s.indices.values().map(|idx| IndexMetadata {
             name: idx.name.clone(),
             number_of_shards: idx.number_of_shards,
-            shards: idx.shards.iter().map(|(sid, nid)| ShardAssignment {
+            number_of_replicas: idx.number_of_replicas,
+            shards: idx.shard_routing.iter().map(|(sid, routing)| ShardAssignment {
                 shard_id: *sid,
-                node_id: nid.clone(),
+                node_id: routing.primary.clone(),
+                replica_node_ids: routing.replicas.clone(),
             }).collect(),
         }).collect(),
     }
@@ -74,14 +77,18 @@ pub fn proto_to_cluster_state(p: &ClusterState) -> crate::cluster::state::Cluste
         state.nodes.insert(ni.id.clone(), ni);
     }
     for idx in &p.indices {
-        let mut shards = std::collections::HashMap::new();
+        let mut shard_routing = std::collections::HashMap::new();
         for sa in &idx.shards {
-            shards.insert(sa.shard_id, sa.node_id.clone());
+            shard_routing.insert(sa.shard_id, crate::cluster::state::ShardRoutingEntry {
+                primary: sa.node_id.clone(),
+                replicas: sa.replica_node_ids.clone(),
+            });
         }
         state.indices.insert(idx.name.clone(), crate::cluster::state::IndexMetadata {
             name: idx.name.clone(),
             number_of_shards: idx.number_of_shards,
-            shards,
+            number_of_replicas: idx.number_of_replicas,
+            shard_routing,
         });
     }
     state
@@ -144,12 +151,21 @@ impl InternalTransport for TransportService {
         };
 
         info!("gRPC: index doc '{}' into {}/shard_{}", doc_id, req.index_name, req.shard_id);
-        match engine.add_document(&doc_id, payload) {
-            Ok(id) => Ok(Response::new(ShardDocResponse {
-                success: true,
-                doc_id: id,
-                error: String::new(),
-            })),
+        match engine.add_document(&doc_id, payload.clone()) {
+            Ok(id) => {
+                // Replicate to replica shards
+                let cs = self.cluster_manager.get_state();
+                if let Err(errors) = crate::replication::replicate_write(
+                    &self.transport_client, &cs, &req.index_name, req.shard_id, &id, &payload, "index",
+                ).await {
+                    tracing::warn!("Replication errors for {}/shard_{}: {:?}", req.index_name, req.shard_id, errors);
+                }
+                Ok(Response::new(ShardDocResponse {
+                    success: true,
+                    doc_id: id,
+                    error: String::new(),
+                }))
+            }
             Err(e) => Ok(Response::new(ShardDocResponse {
                 success: false,
                 doc_id: String::new(),
@@ -179,12 +195,21 @@ impl InternalTransport for TransportService {
             .collect::<Result<Vec<_>, Status>>()?;
 
         info!("gRPC: bulk {} docs into {}/shard_{}", docs.len(), req.index_name, req.shard_id);
-        match engine.bulk_add_documents(docs) {
-            Ok(ids) => Ok(Response::new(ShardBulkResponse {
-                success: true,
-                doc_ids: ids,
-                error: String::new(),
-            })),
+        match engine.bulk_add_documents(docs.clone()) {
+            Ok(ids) => {
+                // Replicate to replica shards
+                let cs = self.cluster_manager.get_state();
+                if let Err(errors) = crate::replication::replicate_bulk(
+                    &self.transport_client, &cs, &req.index_name, req.shard_id, &docs,
+                ).await {
+                    tracing::warn!("Bulk replication errors for {}/shard_{}: {:?}", req.index_name, req.shard_id, errors);
+                }
+                Ok(Response::new(ShardBulkResponse {
+                    success: true,
+                    doc_ids: ids,
+                    error: String::new(),
+                }))
+            }
             Err(e) => Ok(Response::new(ShardBulkResponse {
                 success: false,
                 doc_ids: vec![],
@@ -198,11 +223,21 @@ impl InternalTransport for TransportService {
         let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
         info!("gRPC: delete doc '{}' from {}/shard_{}", req.doc_id, req.index_name, req.shard_id);
         match engine.delete_document(&req.doc_id) {
-            Ok(deleted) => Ok(Response::new(ShardDeleteResponse {
-                success: true,
-                deleted,
-                error: String::new(),
-            })),
+            Ok(deleted) => {
+                // Replicate delete to replica shards
+                let cs = self.cluster_manager.get_state();
+                if let Err(errors) = crate::replication::replicate_write(
+                    &self.transport_client, &cs, &req.index_name, req.shard_id,
+                    &req.doc_id, &serde_json::json!({}), "delete",
+                ).await {
+                    tracing::warn!("Delete replication errors for {}/shard_{}: {:?}", req.index_name, req.shard_id, errors);
+                }
+                Ok(Response::new(ShardDeleteResponse {
+                    success: true,
+                    deleted,
+                    error: String::new(),
+                }))
+            }
             Err(e) => Ok(Response::new(ShardDeleteResponse {
                 success: false,
                 deleted: 0,
@@ -282,6 +317,59 @@ impl InternalTransport for TransportService {
             })),
         }
     }
+
+    async fn replicate_doc(&self, request: Request<ReplicateDocRequest>) -> Result<Response<ReplicateDocResponse>, Status> {
+        let req = request.into_inner();
+        let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
+
+        info!("gRPC: replicate {} doc '{}' to {}/shard_{}", req.op, req.doc_id, req.index_name, req.shard_id);
+
+        let result = match req.op.as_str() {
+            "index" => {
+                let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
+                    .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
+                engine.add_document(&req.doc_id, payload).map(|_| ())
+            }
+            "delete" => engine.delete_document(&req.doc_id).map(|_| ()),
+            other => Err(anyhow::anyhow!("Unknown replication op: {}", other)),
+        };
+
+        match result {
+            Ok(()) => Ok(Response::new(ReplicateDocResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(ReplicateDocResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn replicate_bulk(&self, request: Request<ReplicateBulkRequest>) -> Result<Response<ReplicateBulkResponse>, Status> {
+        let req = request.into_inner();
+        let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
+
+        info!("gRPC: replicate bulk {} ops to {}/shard_{}", req.ops.len(), req.index_name, req.shard_id);
+
+        let mut docs = Vec::with_capacity(req.ops.len());
+        for op in &req.ops {
+            let payload: serde_json::Value = serde_json::from_slice(&op.payload_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid JSON in bulk replicate: {}", e)))?;
+            docs.push((op.doc_id.clone(), payload));
+        }
+
+        match engine.bulk_add_documents(docs) {
+            Ok(_) => Ok(Response::new(ReplicateBulkResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(ReplicateBulkResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
 }
 
 impl TransportService {
@@ -298,10 +386,175 @@ impl TransportService {
 pub fn create_transport_service(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
+    transport_client: crate::transport::TransportClient,
 ) -> InternalTransportServer<TransportService> {
     let service = TransportService {
         cluster_manager,
         shard_manager,
+        transport_client,
     };
     InternalTransportServer::new(service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::state::{
+        ClusterState as DomainClusterState, IndexMetadata as DomainIndexMetadata,
+        NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
+    };
+    use std::collections::HashMap;
+
+    fn make_full_cluster_state() -> DomainClusterState {
+        let mut cs = DomainClusterState::new("roundtrip-cluster".into());
+        cs.version = 42;
+        cs.master_node = Some("node-1".into());
+
+        cs.add_node(DomainNodeInfo {
+            id: "node-1".into(),
+            name: "primary-node".into(),
+            host: "10.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Master, NodeRole::Data],
+        });
+        cs.add_node(DomainNodeInfo {
+            id: "node-2".into(),
+            name: "replica-node".into(),
+            host: "10.0.0.2".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+        });
+
+        // Reset version (add_node bumps it)
+        cs.version = 42;
+
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(0, ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec!["node-2".into()],
+        });
+        shard_routing.insert(1, ShardRoutingEntry {
+            primary: "node-2".into(),
+            replicas: vec!["node-1".into()],
+        });
+
+        cs.add_index(DomainIndexMetadata {
+            name: "products".into(),
+            number_of_shards: 2,
+            number_of_replicas: 1,
+            shard_routing,
+        });
+        cs.version = 42; // reset again after add_index
+
+        cs
+    }
+
+    #[test]
+    fn cluster_state_roundtrip_preserves_metadata() {
+        let original = make_full_cluster_state();
+        let proto = cluster_state_to_proto(&original);
+        let restored = proto_to_cluster_state(&proto);
+
+        assert_eq!(restored.cluster_name, "roundtrip-cluster");
+        assert_eq!(restored.version, 42);
+        assert_eq!(restored.master_node, Some("node-1".into()));
+        assert_eq!(restored.nodes.len(), 2);
+        assert_eq!(restored.indices.len(), 1);
+    }
+
+    #[test]
+    fn roundtrip_preserves_node_info() {
+        let original = make_full_cluster_state();
+        let proto = cluster_state_to_proto(&original);
+        let restored = proto_to_cluster_state(&proto);
+
+        let n1 = restored.nodes.get("node-1").unwrap();
+        assert_eq!(n1.name, "primary-node");
+        assert_eq!(n1.host, "10.0.0.1");
+        assert_eq!(n1.transport_port, 9300);
+        assert_eq!(n1.http_port, 9200);
+        assert!(n1.roles.contains(&NodeRole::Master));
+        assert!(n1.roles.contains(&NodeRole::Data));
+
+        let n2 = restored.nodes.get("node-2").unwrap();
+        assert_eq!(n2.name, "replica-node");
+        assert_eq!(n2.roles, vec![NodeRole::Data]);
+    }
+
+    #[test]
+    fn roundtrip_preserves_shard_routing() {
+        let original = make_full_cluster_state();
+        let proto = cluster_state_to_proto(&original);
+        let restored = proto_to_cluster_state(&proto);
+
+        let idx = restored.indices.get("products").unwrap();
+        assert_eq!(idx.number_of_shards, 2);
+        assert_eq!(idx.number_of_replicas, 1);
+        assert_eq!(idx.shard_routing.len(), 2);
+
+        let shard0 = idx.shard_routing.get(&0).unwrap();
+        assert_eq!(shard0.primary, "node-1");
+        assert_eq!(shard0.replicas, vec!["node-2".to_string()]);
+
+        let shard1 = idx.shard_routing.get(&1).unwrap();
+        assert_eq!(shard1.primary, "node-2");
+        assert_eq!(shard1.replicas, vec!["node-1".to_string()]);
+    }
+
+    #[test]
+    fn roundtrip_empty_cluster_state() {
+        let original = DomainClusterState::new("empty".into());
+        let proto = cluster_state_to_proto(&original);
+        let restored = proto_to_cluster_state(&proto);
+
+        assert_eq!(restored.cluster_name, "empty");
+        assert_eq!(restored.version, 0);
+        assert!(restored.master_node.is_none());
+        assert!(restored.nodes.is_empty());
+        assert!(restored.indices.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_index_with_no_replicas() {
+        let mut cs = DomainClusterState::new("test".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(0, ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+        });
+        cs.add_index(DomainIndexMetadata {
+            name: "logs".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+        });
+
+        let proto = cluster_state_to_proto(&cs);
+        let restored = proto_to_cluster_state(&proto);
+
+        let idx = restored.indices.get("logs").unwrap();
+        assert_eq!(idx.number_of_replicas, 0);
+        assert!(idx.shard_routing[&0].replicas.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_client_role() {
+        let mut cs = DomainClusterState::new("test".into());
+        cs.add_node(DomainNodeInfo {
+            id: "coord".into(),
+            name: "coordinator".into(),
+            host: "10.0.0.3".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Client],
+        });
+
+        let proto = cluster_state_to_proto(&cs);
+        let restored = proto_to_cluster_state(&proto);
+
+        let node = restored.nodes.get("coord").unwrap();
+        assert_eq!(node.roles, vec![NodeRole::Client]);
+    }
 }

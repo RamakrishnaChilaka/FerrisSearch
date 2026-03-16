@@ -32,9 +32,14 @@ fn compute_health_status(cs: &ClusterState) -> &'static str {
 
     let mut all_assigned = true;
     for index_meta in cs.indices.values() {
-        for (_shard_id, assigned_node) in &index_meta.shards {
-            if !data_node_ids.contains(assigned_node) {
+        for routing in index_meta.shard_routing.values() {
+            if !data_node_ids.contains(&routing.primary) {
                 all_assigned = false;
+            }
+            for replica in &routing.replicas {
+                if !data_node_ids.contains(replica) {
+                    all_assigned = false;
+                }
             }
         }
     }

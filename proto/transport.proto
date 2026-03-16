@@ -15,13 +15,15 @@ message NodeInfo {
 
 message ShardAssignment {
     uint32 shard_id = 1;
-    string node_id = 2;
+    string node_id = 2;          // primary node
+    repeated string replica_node_ids = 3; // replica nodes
 }
 
 message IndexMetadata {
     string name = 1;
     uint32 number_of_shards = 2;
     repeated ShardAssignment shards = 3;
+    uint32 number_of_replicas = 4;
 }
 
 message ClusterState {
@@ -123,6 +125,32 @@ message ShardSearchResponse {
     string error = 3;
 }
 
+// ─── Replication ──────────────────────────────────────────────────────────────
+
+message ReplicateDocRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    string doc_id = 3;
+    bytes payload_json = 4;   // document body as JSON bytes
+    string op = 5;            // "index" or "delete"
+}
+
+message ReplicateDocResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ReplicateBulkRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    repeated ReplicateDocRequest ops = 3;
+}
+
+message ReplicateBulkResponse {
+    bool success = 1;
+    string error = 2;
+}
+
 // ─── Service Definition ─────────────────────────────────────────────────────
 
 service InternalTransport {
@@ -140,4 +168,8 @@ service InternalTransport {
     // Shard-level search
     rpc SearchShard(ShardSearchRequest) returns (ShardSearchResponse);
     rpc SearchShardDsl(ShardSearchDslRequest) returns (ShardSearchResponse);
+
+    // Primary-to-replica replication
+    rpc ReplicateDoc(ReplicateDocRequest) returns (ReplicateDocResponse);
+    rpc ReplicateBulk(ReplicateBulkRequest) returns (ReplicateBulkResponse);
 }
