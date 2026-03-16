@@ -25,7 +25,7 @@ use std::sync::Mutex;
 const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
 
 /// A single WAL entry, representing one indexing operation.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct TranslogEntry {
     /// Monotonically increasing sequence number for ordering
     pub seq_no: u64,
@@ -33,6 +33,34 @@ pub struct TranslogEntry {
     pub op: String,
     /// The full document payload
     pub payload: serde_json::Value,
+}
+
+/// Wire format for binary serialization.
+/// `serde_json::Value` uses `deserialize_any()` which bincode doesn't support,
+/// so we serialize the JSON payload to a string first.
+#[derive(Serialize, Deserialize)]
+struct WireEntry {
+    seq_no: u64,
+    op: String,
+    payload_json: String,
+}
+
+impl WireEntry {
+    fn from_translog(entry: &TranslogEntry) -> Result<Self> {
+        Ok(Self {
+            seq_no: entry.seq_no,
+            op: entry.op.clone(),
+            payload_json: serde_json::to_string(&entry.payload)?,
+        })
+    }
+
+    fn into_translog(self) -> Result<TranslogEntry> {
+        Ok(TranslogEntry {
+            seq_no: self.seq_no,
+            op: self.op,
+            payload: serde_json::from_str(&self.payload_json)?,
+        })
+    }
 }
 
 /// Trait abstracting a Write-Ahead Log backend.
@@ -54,7 +82,8 @@ pub trait WriteAheadLog: Send + Sync {
 
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
 fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
-    let encoded = bincode_next::serde::encode_to_vec(entry, BINCODE_CONFIG)?;
+    let wire = WireEntry::from_translog(entry)?;
+    let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
     let len = encoded.len() as u32;
     let mut frame = Vec::with_capacity(4 + encoded.len());
     frame.extend_from_slice(&len.to_le_bytes());
@@ -83,9 +112,9 @@ fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
             }
             Err(e) => return Err(e.into()),
         }
-        let (entry, _): (TranslogEntry, _) =
+        let (wire, _): (WireEntry, _) =
             bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
-        entries.push(entry);
+        entries.push(wire.into_translog()?);
     }
     Ok(entries)
 }

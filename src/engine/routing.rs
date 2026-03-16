@@ -21,3 +21,76 @@ pub fn route_document(document_id: &str, index_metadata: &IndexMetadata) -> Opti
     let shard_id = calculate_shard(document_id, index_metadata.number_of_shards);
     index_metadata.shards.get(&shard_id).cloned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── calculate_shard ─────────────────────────────────────────────────
+
+    #[test]
+    fn shard_is_within_range() {
+        for num_shards in [1, 2, 3, 5, 10, 100] {
+            for i in 0..200 {
+                let doc_id = format!("doc-{}", i);
+                let shard = calculate_shard(&doc_id, num_shards);
+                assert!(shard < num_shards, "shard {} out of range for {} shards", shard, num_shards);
+            }
+        }
+    }
+
+    #[test]
+    fn same_id_always_routes_to_same_shard() {
+        let s1 = calculate_shard("my-document", 5);
+        let s2 = calculate_shard("my-document", 5);
+        assert_eq!(s1, s2, "deterministic routing");
+    }
+
+    #[test]
+    fn different_ids_distribute_across_shards() {
+        let num_shards = 5;
+        let mut seen = std::collections::HashSet::new();
+        // With enough docs we should hit more than 1 shard
+        for i in 0..100 {
+            seen.insert(calculate_shard(&format!("doc-{}", i), num_shards));
+        }
+        assert!(seen.len() > 1, "documents should spread across shards");
+    }
+
+    #[test]
+    fn single_shard_always_returns_zero() {
+        for i in 0..50 {
+            assert_eq!(calculate_shard(&format!("id-{}", i), 1), 0);
+        }
+    }
+
+    // ── route_document ──────────────────────────────────────────────────
+
+    #[test]
+    fn route_document_returns_correct_node() {
+        let mut shards = HashMap::new();
+        shards.insert(0, "node-A".into());
+        shards.insert(1, "node-B".into());
+        let meta = IndexMetadata {
+            name: "test-index".into(),
+            number_of_shards: 2,
+            shards,
+        };
+
+        let routed = route_document("some-doc", &meta);
+        assert!(routed.is_some());
+        let node = routed.unwrap();
+        assert!(node == "node-A" || node == "node-B");
+    }
+
+    #[test]
+    fn route_document_zero_shards_returns_none() {
+        let meta = IndexMetadata {
+            name: "empty".into(),
+            number_of_shards: 0,
+            shards: HashMap::new(),
+        };
+        assert!(route_document("doc", &meta).is_none());
+    }
+}

@@ -116,3 +116,105 @@ impl ShardManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn create_shard_manager() -> (tempfile::TempDir, ShardManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = ShardManager::new(dir.path(), Duration::from_secs(60));
+        (dir, mgr)
+    }
+
+    // ── ShardKey ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn shard_key_data_dir() {
+        let key = ShardKey::new("my-index", 2);
+        assert_eq!(key.data_dir(), "my-index/shard_2");
+    }
+
+    #[test]
+    fn shard_key_equality() {
+        let a = ShardKey::new("idx", 0);
+        let b = ShardKey::new("idx", 0);
+        let c = ShardKey::new("idx", 1);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // ── open / get (need tokio runtime for refresh loop) ────────────────
+
+    #[tokio::test]
+    async fn open_shard_creates_engine() {
+        let (_dir, mgr) = create_shard_manager();
+        let engine = mgr.open_shard("test-index", 0).unwrap();
+        engine.add_document("d1", json!({"hello": "world"})).unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 1);
+    }
+
+    #[test]
+    fn get_shard_returns_none_for_unopened() {
+        let (_dir, mgr) = create_shard_manager();
+        assert!(mgr.get_shard("no-index", 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn get_shard_returns_opened_engine() {
+        let (_dir, mgr) = create_shard_manager();
+        mgr.open_shard("idx", 0).unwrap();
+        assert!(mgr.get_shard("idx", 0).is_some());
+    }
+
+    #[tokio::test]
+    async fn open_shard_is_idempotent() {
+        let (_dir, mgr) = create_shard_manager();
+        let e1 = mgr.open_shard("idx", 0).unwrap();
+        let e2 = mgr.open_shard("idx", 0).unwrap();
+        // Both should point to the same engine (Arc)
+        assert!(std::sync::Arc::ptr_eq(&e1, &e2));
+    }
+
+    // ── get_index_shards / all_shards ───────────────────────────────────
+
+    #[tokio::test]
+    async fn get_index_shards_returns_correct_set() {
+        let (_dir, mgr) = create_shard_manager();
+        mgr.open_shard("idx-a", 0).unwrap();
+        mgr.open_shard("idx-a", 1).unwrap();
+        mgr.open_shard("idx-b", 0).unwrap();
+
+        let shards_a = mgr.get_index_shards("idx-a");
+        assert_eq!(shards_a.len(), 2);
+
+        let shards_b = mgr.get_index_shards("idx-b");
+        assert_eq!(shards_b.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_shards_returns_everything() {
+        let (_dir, mgr) = create_shard_manager();
+        mgr.open_shard("idx-a", 0).unwrap();
+        mgr.open_shard("idx-b", 0).unwrap();
+        assert_eq!(mgr.all_shards().len(), 2);
+    }
+
+    // ── close_index_shards ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn close_index_shards_removes_and_cleans_up() {
+        let (_dir, mgr) = create_shard_manager();
+        mgr.open_shard("to-delete", 0).unwrap();
+        mgr.open_shard("to-delete", 1).unwrap();
+        mgr.open_shard("keep", 0).unwrap();
+
+        mgr.close_index_shards("to-delete").unwrap();
+
+        assert!(mgr.get_shard("to-delete", 0).is_none());
+        assert!(mgr.get_shard("to-delete", 1).is_none());
+        assert!(mgr.get_shard("keep", 0).is_some());
+    }
+}

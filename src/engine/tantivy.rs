@@ -375,3 +375,212 @@ impl super::SearchEngine for HotEngine {
         self.reader.searcher().num_docs()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::{QueryClause, SearchRequest};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    /// Helper: create a HotEngine backed by a temp directory.
+    fn create_engine() -> (tempfile::TempDir, HotEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        (dir, engine)
+    }
+
+    // ── basic CRUD ──────────────────────────────────────────────────────
+
+    #[test]
+    fn add_and_get_document() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("doc1", json!({"title": "hello world"})).unwrap();
+        engine.refresh().unwrap();
+
+        let doc = engine.get_document("doc1").unwrap();
+        assert!(doc.is_some());
+        assert_eq!(doc.unwrap()["title"], "hello world");
+    }
+
+    #[test]
+    fn get_nonexistent_document_returns_none() {
+        let (_dir, engine) = create_engine();
+        let doc = engine.get_document("no-such-doc").unwrap();
+        assert!(doc.is_none());
+    }
+
+    #[test]
+    fn add_document_upsert_semantics() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("doc1", json!({"version": 1})).unwrap();
+        engine.refresh().unwrap();
+
+        // Overwrite with new payload
+        engine.add_document("doc1", json!({"version": 2})).unwrap();
+        engine.refresh().unwrap();
+
+        let doc = engine.get_document("doc1").unwrap().unwrap();
+        assert_eq!(doc["version"], 2);
+        // Should still be 1 doc, not 2
+        assert_eq!(engine.doc_count(), 1);
+    }
+
+    #[test]
+    fn delete_document() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("doc1", json!({"title": "delete me"})).unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 1);
+
+        engine.delete_document("doc1").unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 0);
+        assert!(engine.get_document("doc1").unwrap().is_none());
+    }
+
+    // ── bulk operations ─────────────────────────────────────────────────
+
+    #[test]
+    fn bulk_add_documents() {
+        let (_dir, engine) = create_engine();
+        let docs: Vec<(String, serde_json::Value)> = (0..10)
+            .map(|i| (format!("doc-{}", i), json!({"num": i})))
+            .collect();
+        let ids = engine.bulk_add_documents(docs).unwrap();
+        engine.refresh().unwrap();
+
+        assert_eq!(ids.len(), 10);
+        assert_eq!(engine.doc_count(), 10);
+
+        let doc = engine.get_document("doc-5").unwrap().unwrap();
+        assert_eq!(doc["num"], 5);
+    }
+
+    // ── search ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn simple_query_string_search() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust programming language"})).unwrap();
+        engine.add_document("d2", json!({"title": "python programming language"})).unwrap();
+        engine.add_document("d3", json!({"title": "cooking recipes"})).unwrap();
+        engine.refresh().unwrap();
+
+        let results = engine.search("rust").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn search_match_all() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("a", json!({"x": 1})).unwrap();
+        engine.add_document("b", json!({"x": 2})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_match_query() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "database internals"})).unwrap();
+        engine.add_document("d2", json!({"title": "web development"})).unwrap();
+        engine.refresh().unwrap();
+
+        let mut fields = HashMap::new();
+        fields.insert("body".to_string(), json!("database"));
+        let req = SearchRequest {
+            query: QueryClause::Match(fields),
+            size: 10,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["_id"], "d1");
+    }
+
+    // ── refresh / flush ─────────────────────────────────────────────────
+
+    #[test]
+    fn documents_not_visible_before_refresh() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "invisible"})).unwrap();
+        // doc_count uses the reader which hasn't been reloaded yet
+        assert_eq!(engine.doc_count(), 0);
+
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 1);
+    }
+
+    #[test]
+    fn flush_truncates_translog() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        engine.flush().unwrap();
+
+        // After flush the translog should be empty
+        let tl = engine.translog.lock().unwrap();
+        let entries = tl.read_all().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    // ── translog replay / crash recovery ────────────────────────────────
+
+    #[test]
+    fn translog_replay_recovers_documents_after_crash() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Simulate: write docs but never flush (simulating crash before commit)
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            engine.add_document("crash-doc", json!({"recovered": true})).unwrap();
+            // intentionally do NOT flush — translog has the entry, Tantivy segments may not
+        }
+
+        // Reopen — replay should recover the document
+        let engine2 = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        // After replay, the engine commits and reloads
+        let doc = engine2.get_document("crash-doc").unwrap();
+        assert!(doc.is_some(), "document should be recovered from translog replay");
+        assert_eq!(doc.unwrap()["recovered"], true);
+    }
+
+    #[test]
+    fn flush_then_reopen_has_empty_translog() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            engine.add_document("safe", json!({"flushed": true})).unwrap();
+            engine.flush().unwrap();
+        }
+        // Reopen
+        let engine2 = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let tl = engine2.translog.lock().unwrap();
+        let entries = tl.read_all().unwrap();
+        assert!(entries.is_empty(), "translog should be empty after flush + reopen");
+    }
+
+    // ── doc_count ───────────────────────────────────────────────────────
+
+    #[test]
+    fn doc_count_reflects_operations() {
+        let (_dir, engine) = create_engine();
+        assert_eq!(engine.doc_count(), 0);
+
+        engine.add_document("a", json!({"x": 1})).unwrap();
+        engine.add_document("b", json!({"x": 2})).unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 2);
+
+        engine.delete_document("a").unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 1);
+    }
+}

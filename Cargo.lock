@@ -1473,6 +1473,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tantivy",
+ "tempfile",
  "thiserror",
  "tokio",
  "tonic",
