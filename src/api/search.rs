@@ -33,13 +33,13 @@ pub async fn search_documents(
     Query(params): Query<SearchParams>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(&index_name) {
         Some(m) => m.clone(),
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": { "type": "index_not_found_exception", "index": index_name } }))),
+        None => return crate::api::error_response(StatusCode::NOT_FOUND, "index_not_found_exception", format!("no such index [{}]", index_name)),
     };
 
     let mut all_hits = Vec::new();

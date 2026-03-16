@@ -17,7 +17,7 @@ pub async fn create_index(
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": { "type": "invalid_index_name_exception", "reason": msg } })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let settings: Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
@@ -33,9 +33,7 @@ pub async fn create_index(
     let cluster_state = state.cluster_manager.get_state();
 
     if cluster_state.indices.contains_key(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": { "type": "resource_already_exists_exception", "index": index_name }
-        })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "resource_already_exists_exception", format!("index [{}] already exists", index_name));
     }
 
     // Build shard assignment: distribute shards round-robin across Data nodes
@@ -45,7 +43,7 @@ pub async fn create_index(
         .collect();
 
     if data_nodes.is_empty() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "No data nodes available to assign shards" })));
+        return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "no_data_nodes_exception", "No data nodes available to assign shards");
     }
 
     let mut shard_assignment: HashMap<u32, crate::cluster::state::ShardRoutingEntry> = HashMap::new();
@@ -76,13 +74,11 @@ pub async fn create_index(
     // Write through Raft if available (leader only), otherwise fallback
     if let Some(ref raft) = state.raft {
         if !raft.is_leader() {
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-                "error": { "type": "master_not_discovered_exception", "reason": "This node is not the Raft leader. Send index creation requests to the master node." }
-            })));
+            return crate::api::error_response(StatusCode::SERVICE_UNAVAILABLE, "master_not_discovered_exception", "This node is not the Raft leader. Send index creation requests to the master node.");
         }
         let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
         if let Err(e) = raft.client_write(cmd).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Raft write failed: {}", e) })));
+            return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "raft_write_exception", format!("Raft write failed: {}", e));
         }
     } else {
         let mut new_state = cluster_state.clone();
@@ -116,7 +112,7 @@ pub async fn index_document(
     Json(mut payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": { "type": "invalid_index_name_exception", "reason": msg } })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     // Extract or generate _id, then strip it from the document body
@@ -151,7 +147,7 @@ pub async fn index_document(
         if let Some(ref raft) = state.raft {
             let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata: m.clone() };
             if let Err(e) = raft.client_write(cmd).await {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Auto-create index via Raft failed: {}", e) })));
+                return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "raft_write_exception", format!("Auto-create index via Raft failed: {}", e));
             }
         } else {
             let mut new_state = cluster_state.clone();
@@ -167,18 +163,18 @@ pub async fn index_document(
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Shard has no assigned node" }))),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "shard_not_available_exception", "Shard has no assigned node"),
     };
 
     // Forward to the node owning the shard (may be ourselves)
     let target_node = match cluster_state.nodes.get(&target_node_id) {
         Some(n) => n.clone(),
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Target node not in cluster state" }))),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "node_not_found_exception", "Target node not in cluster state"),
     };
 
     match state.transport_client.forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &payload).await {
         Ok(res) => (StatusCode::CREATED, Json(res)),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Forward failed: {}", e) }))),
+        Err(e) => crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "forward_exception", format!("Forward failed: {}", e)),
     }
 }
 
@@ -188,7 +184,7 @@ pub async fn refresh_index(
     Path(index_name): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let shards = state.shard_manager.get_index_shards(&index_name);
@@ -213,7 +209,7 @@ pub async fn flush_index(
     Path(index_name): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let shards = state.shard_manager.get_index_shards(&index_name);
@@ -239,12 +235,12 @@ pub async fn bulk_index(
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let text = match std::str::from_utf8(&body) {
         Ok(t) => t,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid UTF-8 body" }))),
+        Err(_) => return crate::api::error_response(StatusCode::BAD_REQUEST, "parse_exception", "Invalid UTF-8 body"),
     };
 
     // Parse NDJSON: alternating action/doc lines
@@ -291,7 +287,7 @@ pub async fn bulk_index(
         if let Some(ref raft) = state.raft {
             let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata: m.clone() };
             if let Err(e) = raft.client_write(cmd).await {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Auto-create index via Raft failed: {}", e) })));
+                return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "raft_write_exception", format!("Auto-create index via Raft failed: {}", e));
             }
         } else {
             let mut new_state = cluster_state.clone();
@@ -345,18 +341,18 @@ pub async fn search_documents_dsl(
     Json(req): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let search_req: crate::search::SearchRequest = match serde_json::from_value(req) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": format!("Invalid query DSL: {}", e) }))),
+        Err(e) => return crate::api::error_response(StatusCode::BAD_REQUEST, "parsing_exception", format!("Invalid query DSL: {}", e)),
     };
 
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(&index_name) {
         Some(m) => m.clone(),
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": { "type": "index_not_found_exception", "index": index_name } }))),
+        None => return crate::api::error_response(StatusCode::NOT_FOUND, "index_not_found_exception", format!("no such index [{}]", index_name)),
     };
 
     let mut all_hits = Vec::new();
@@ -452,24 +448,24 @@ pub async fn get_document(
     Path((index_name, doc_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(&index_name) {
         Some(m) => m.clone(),
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": { "type": "index_not_found_exception", "index": index_name } }))),
+        None => return crate::api::error_response(StatusCode::NOT_FOUND, "index_not_found_exception", format!("no such index [{}]", index_name)),
     };
 
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Shard has no assigned node" }))),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "shard_not_available_exception", "Shard has no assigned node"),
     };
 
     let target_node = match cluster_state.nodes.get(&target_node_id) {
         Some(n) => n.clone(),
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Target node not in cluster state" }))),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "node_not_found_exception", "Target node not in cluster state"),
     };
 
     match state.transport_client.forward_get_to_shard(&target_node, &index_name, shard_id, &doc_id).await {
@@ -479,7 +475,7 @@ pub async fn get_document(
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "_index": index_name, "_id": doc_id, "found": false
         }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("{}", e) }))),
+        Err(e) => crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "search_exception", format!("{}", e)),
     }
 }
 
@@ -489,29 +485,29 @@ pub async fn delete_document(
     Path((index_name, doc_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(&index_name) {
         Some(m) => m.clone(),
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": { "type": "index_not_found_exception", "index": index_name } }))),
+        None => return crate::api::error_response(StatusCode::NOT_FOUND, "index_not_found_exception", format!("no such index [{}]", index_name)),
     };
 
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Shard has no assigned node" }))),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "shard_not_available_exception", "Shard has no assigned node"),
     };
 
     let target_node = match cluster_state.nodes.get(&target_node_id) {
         Some(n) => n.clone(),
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Target node not in cluster state" }))),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "node_not_found_exception", "Target node not in cluster state"),
     };
 
     match state.transport_client.forward_delete_to_shard(&target_node, &index_name, shard_id, &doc_id).await {
         Ok(res) => (StatusCode::OK, Json(res)),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("{}", e) }))),
+        Err(e) => crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "search_exception", format!("{}", e)),
     }
 }
 
@@ -521,27 +517,23 @@ pub async fn delete_index(
     Path(index_name): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })));
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
     }
 
     let cluster_state = state.cluster_manager.get_state();
 
     if !cluster_state.indices.contains_key(&index_name) {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": { "type": "index_not_found_exception", "index": index_name }
-        })));
+        return crate::api::error_response(StatusCode::NOT_FOUND, "index_not_found_exception", format!("no such index [{}]", index_name));
     }
 
     // Remove from cluster state via Raft if available, otherwise fallback
     if let Some(ref raft) = state.raft {
         if !raft.is_leader() {
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-                "error": { "type": "master_not_discovered_exception", "reason": "This node is not the Raft leader. Send index deletion requests to the master node." }
-            })));
+            return crate::api::error_response(StatusCode::SERVICE_UNAVAILABLE, "master_not_discovered_exception", "This node is not the Raft leader. Send index deletion requests to the master node.");
         }
         let cmd = crate::consensus::types::ClusterCommand::DeleteIndex { index_name: index_name.clone() };
         if let Err(e) = raft.client_write(cmd).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Raft write failed: {}", e) })));
+            return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "raft_write_exception", format!("Raft write failed: {}", e));
         }
     } else {
         let mut new_state = cluster_state.clone();

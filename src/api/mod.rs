@@ -47,6 +47,18 @@ pub struct AppState {
     pub raft: Option<Arc<RaftInstance>>,
 }
 
+/// Build a consistent OpenSearch-compatible error response.
+pub fn error_response(
+    status: StatusCode,
+    error_type: &str,
+    reason: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({
+        "error": { "type": error_type, "reason": reason.to_string() },
+        "status": status.as_u16()
+    })))
+}
+
 /// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.
 async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
     let wants_pretty = req.uri().query().map_or(false, |q| {

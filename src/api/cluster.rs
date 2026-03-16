@@ -87,30 +87,38 @@ pub async fn transfer_master(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let raft = match state.raft {
         Some(ref r) => r,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "Raft consensus is not enabled on this node"
-        }))),
+        None => return crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft_not_enabled_exception",
+            "Raft consensus is not enabled on this node",
+        ),
     };
 
     if !raft.is_leader() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": { "type": "master_not_discovered_exception", "reason": "This node is not the current master. Send transfer requests to the master node." }
-        })));
+        return crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "master_not_discovered_exception",
+            "This node is not the current master. Send transfer requests to the master node.",
+        );
     }
 
     // Look up the target node's raft_node_id
     let cs = state.cluster_manager.get_state();
     let target_info = match cs.nodes.get(&req.node_id) {
         Some(n) => n.clone(),
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": format!("Node '{}' not found in cluster state", req.node_id)
-        }))),
+        None => return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "node_not_found_exception",
+            format!("Node '{}' not found in cluster state", req.node_id),
+        ),
     };
 
     if target_info.raft_node_id == 0 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Node '{}' has no Raft ID assigned", req.node_id)
-        })));
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!("Node '{}' has no Raft ID assigned", req.node_id),
+        );
     }
 
     // Get current vote from metrics
@@ -131,9 +139,11 @@ pub async fn transfer_master(
     );
 
     if let Err(e) = raft.handle_transfer_leader(transfer_req).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("Transfer leader failed: {}", e)
-        })));
+        return crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "raft_transfer_exception",
+            format!("Transfer leader failed: {}", e),
+        );
     }
 
     (StatusCode::OK, Json(serde_json::json!({

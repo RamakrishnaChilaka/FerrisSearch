@@ -38,6 +38,13 @@ ROpenSearch is a lightweight, Rust-native search engine with OpenSearch-compatib
 cargo run
 ```
 
+### Docker
+
+```bash
+docker build -t ropensearch .
+docker run -p 9200:9200 -p 9300:9300 ropensearch
+```
+
 ```bash
 curl http://localhost:9200/
 ```
