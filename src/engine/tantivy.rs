@@ -221,6 +221,69 @@ impl HotEngine {
         }
         Ok(results)
     }
+
+    /// Recursively convert a QueryClause into a Tantivy Query.
+    fn build_query(&self, clause: &crate::search::QueryClause) -> Result<Box<dyn tantivy::query::Query>> {
+        use crate::search::QueryClause;
+        use tantivy::query::{AllQuery, BooleanQuery, Occur, TermQuery};
+        use tantivy::schema::IndexRecordOption;
+        use tantivy::Term;
+
+        match clause {
+            QueryClause::MatchAll(_) => Ok(Box::new(AllQuery)),
+            QueryClause::Match(fields) => {
+                if let Some((field_name, value)) = fields.iter().next() {
+                    let query_str = match value {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let target_field = self.resolve_field(field_name);
+                    let query_parser = QueryParser::for_index(&self.index, vec![target_field]);
+                    let query = query_parser.parse_query(&query_str)?;
+                    Ok(query)
+                } else {
+                    Ok(Box::new(AllQuery))
+                }
+            }
+            QueryClause::Term(fields) => {
+                if let Some((field_name, value)) = fields.iter().next() {
+                    let term_str = match value {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let target_field = self.resolve_field(field_name);
+                    let term = Term::from_field_text(target_field, &term_str);
+                    Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
+                } else {
+                    Ok(Box::new(AllQuery))
+                }
+            }
+            QueryClause::Bool(bq) => {
+                let mut subqueries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+
+                for clause in &bq.must {
+                    subqueries.push((Occur::Must, self.build_query(clause)?));
+                }
+                for clause in &bq.should {
+                    subqueries.push((Occur::Should, self.build_query(clause)?));
+                }
+                for clause in &bq.must_not {
+                    subqueries.push((Occur::MustNot, self.build_query(clause)?));
+                }
+                // filter = must without scoring (Tantivy doesn't distinguish, so treat as Must)
+                for clause in &bq.filter {
+                    subqueries.push((Occur::Must, self.build_query(clause)?));
+                }
+
+                if subqueries.is_empty() {
+                    // Empty bool matches all
+                    Ok(Box::new(AllQuery))
+                } else {
+                    Ok(Box::new(BooleanQuery::new(subqueries)))
+                }
+            }
+        }
+    }
 }
 
 impl super::SearchEngine for HotEngine {
@@ -332,47 +395,10 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn search_query(&self, req: &crate::search::SearchRequest) -> Result<Vec<serde_json::Value>> {
-        use crate::search::QueryClause;
-        use tantivy::query::{AllQuery, TermQuery};
-        use tantivy::schema::IndexRecordOption;
-        use tantivy::Term;
-
         let limit = std::cmp::max(req.from + req.size, 100);
         let searcher = self.reader.searcher();
-
-        match &req.query {
-            QueryClause::MatchAll(_) => {
-                self.execute_search(searcher, &AllQuery, limit)
-            }
-            QueryClause::Match(fields) => {
-                if let Some((field_name, value)) = fields.iter().next() {
-                    let query_str = match value {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    let target_field = self.resolve_field(field_name);
-                    let query_parser = QueryParser::for_index(&self.index, vec![target_field]);
-                    let query = query_parser.parse_query(&query_str)?;
-                    self.execute_search(searcher, &*query, limit)
-                } else {
-                    Ok(vec![])
-                }
-            }
-            QueryClause::Term(fields) => {
-                if let Some((field_name, value)) = fields.iter().next() {
-                    let term_str = match value {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    let target_field = self.resolve_field(field_name);
-                    let term = Term::from_field_text(target_field, &term_str);
-                    let query = TermQuery::new(term, IndexRecordOption::Basic);
-                    self.execute_search(searcher, &query, limit)
-                } else {
-                    Ok(vec![])
-                }
-            }
-        }
+        let query = self.build_query(&req.query)?;
+        self.execute_search(searcher, &*query, limit)
     }
 
     fn doc_count(&self) -> u64 {
@@ -675,5 +701,270 @@ mod tests {
         let paginated: Vec<_> = all_hits.into_iter().skip(req.from).take(req.size).collect();
         assert_eq!(total, 15, "total should reflect all matching docs");
         assert_eq!(paginated.len(), 5, "paginated should have size hits");
+    }
+
+    // ── Bool query tests ────────────────────────────────────────────────
+
+    #[test]
+    fn bool_must_filters_documents() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
+        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
+        engine.add_document("d3", json!({"title": "rust web server"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("body".into(), json!("rust"));
+                    m
+                })],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2, "must:rust should match d1 and d3");
+    }
+
+    #[test]
+    fn bool_must_not_excludes_documents() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
+        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
+        engine.add_document("d3", json!({"title": "rust web server"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::MatchAll(json!({}))],
+                must_not: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("body".into(), json!("python"));
+                    m
+                })],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2, "must_not:python should exclude d2");
+    }
+
+    #[test]
+    fn bool_should_with_no_must_matches_any() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust search"})).unwrap();
+        engine.add_document("d2", json!({"title": "python search"})).unwrap();
+        engine.add_document("d3", json!({"title": "java build"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                should: vec![
+                    QueryClause::Match({
+                        let mut m = HashMap::new();
+                        m.insert("body".into(), json!("rust"));
+                        m
+                    }),
+                    QueryClause::Match({
+                        let mut m = HashMap::new();
+                        m.insert("body".into(), json!("python"));
+                        m
+                    }),
+                ],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2, "should match d1 (rust) and d2 (python), not d3");
+    }
+
+    #[test]
+    fn bool_filter_acts_like_must() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
+        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                filter: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("body".into(), json!("rust"));
+                    m
+                })],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1, "filter:rust should match only d1");
+    }
+
+    #[test]
+    fn bool_empty_matches_all() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "one"})).unwrap();
+        engine.add_document("d2", json!({"title": "two"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery::default()),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2, "empty bool should match all docs");
+    }
+
+    #[test]
+    fn bool_combined_must_and_must_not() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
+        engine.add_document("d2", json!({"title": "rust web server"})).unwrap();
+        engine.add_document("d3", json!({"title": "python search tool"})).unwrap();
+        engine.refresh().unwrap();
+
+        // must: rust, must_not: web → should only match d1
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("body".into(), json!("rust"));
+                    m
+                })],
+                must_not: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("body".into(), json!("web"));
+                    m
+                })],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1, "must:rust + must_not:web should only match d1");
+        assert_eq!(results[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn bool_nested_bool_inside_must() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
+        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
+        engine.add_document("d3", json!({"title": "rust web server"})).unwrap();
+        engine.add_document("d4", json!({"title": "java build tool"})).unwrap();
+        engine.refresh().unwrap();
+
+        // Nested: must[ bool{ should[rust, python] } ], must_not[web]
+        // Should match: d1 (rust, no web) — d2 (python, has web→excluded), d3 (rust, has web→excluded)
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::Bool(crate::search::BoolQuery {
+                    should: vec![
+                        QueryClause::Match({ let mut m = HashMap::new(); m.insert("body".into(), json!("rust")); m }),
+                        QueryClause::Match({ let mut m = HashMap::new(); m.insert("body".into(), json!("python")); m }),
+                    ],
+                    ..Default::default()
+                })],
+                must_not: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("body".into(), json!("web"));
+                    m
+                })],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1, "nested bool + must_not should match only d1");
+        assert_eq!(results[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn build_query_match_empty_fields_returns_all() {
+        // Match with empty HashMap should return AllQuery (match all)
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "hello"})).unwrap();
+        engine.add_document("d2", json!({"title": "world"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Match(HashMap::new()),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2, "empty Match should fall back to match all");
+    }
+
+    #[test]
+    fn build_query_term_empty_fields_returns_all() {
+        // Term with empty HashMap should return AllQuery (match all)
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "hello"})).unwrap();
+        engine.add_document("d2", json!({"title": "world"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Term(HashMap::new()),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2, "empty Term should fall back to match all");
+    }
+
+    #[test]
+    fn build_query_match_with_numeric_value() {
+        // Match with a non-string value should stringify it
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "document 42"})).unwrap();
+        engine.add_document("d2", json!({"title": "other text"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Match({
+                let mut m = HashMap::new();
+                m.insert("body".into(), json!(42));
+                m
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1, "match with numeric value should find doc with '42'");
+        assert_eq!(results[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn build_query_term_via_search_query() {
+        // Verify term query works through search_query (build_query path)
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"status": "published"})).unwrap();
+        engine.add_document("d2", json!({"status": "draft"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Term({
+                let mut m = HashMap::new();
+                m.insert("body".into(), json!("published"));
+                m
+            }),
+            size: 10,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["_id"], "d1");
     }
 }

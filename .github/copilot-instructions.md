@@ -62,3 +62,15 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 ## Config
 - `config/ropensearch.yml` for defaults
 - `ROPENSEARCH_*` env vars override (e.g., ROPENSEARCH_RAFT_NODE_ID, ROPENSEARCH_NODE_NAME)
+
+## Development Workflow
+When implementing any feature or fix:
+1. **Read first** — understand existing code before changing it
+2. **Implement** — make the code changes
+3. **Unit tests** — cover every code path/branch (empty inputs, edge cases, error paths)
+4. **Integration tests** — if the feature involves Raft, gRPC, or multi-component interaction
+5. **Live test** — spin up a node, exercise the feature via curl, verify output
+6. **Fix bugs found in live test** — add a test for each bug discovered
+7. **Coverage audit** — check every branch in new code has a test; add missing ones
+8. **Update README** — examples, roadmap checkmarks, test counts
+9. **Update copilot-instructions.md** — if architecture or conventions changed

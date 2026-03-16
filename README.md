@@ -121,13 +121,41 @@ curl -X POST 'http://localhost:9200/my-index/_bulk' \
 # Match all
 curl 'http://localhost:9200/my-index/_search'
 
-# Query string
-curl 'http://localhost:9200/my-index/_search?q=rust'
+# Query string with pagination
+curl 'http://localhost:9200/my-index/_search?q=rust&from=0&size=10'
 
-# DSL query
+# DSL: match query
 curl -X POST 'http://localhost:9200/my-index/_search' \
   -H 'Content-Type: application/json' \
-  -d '{"query": {"match_all": {}}}'
+  -d '{"query": {"match": {"title": "search engine"}}}'
+
+# DSL: bool query (must + must_not)
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {
+      "bool": {
+        "must": [{"match": {"title": "rust"}}],
+        "must_not": [{"match": {"title": "web"}}]
+      }
+    }
+  }'
+
+# DSL: bool query (should = OR)
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {
+      "bool": {
+        "should": [
+          {"match": {"title": "rust"}},
+          {"match": {"title": "python"}}
+        ]
+      }
+    },
+    "from": 0,
+    "size": 5
+  }'
 ```
 
 ### Operations
@@ -175,8 +203,8 @@ Document writes use direct primary-to-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All 164 tests
-cargo test --lib                                # Unit tests (138)
+cargo test                                      # All 173 tests
+cargo test --lib                                # Unit tests (147)
 cargo test --test consensus_integration          # Raft consensus tests (15)
 cargo test --test replication_integration        # Replication tests (11)
 ```
@@ -208,7 +236,7 @@ config/            Default configuration
 ### Search & Query
 - [x] Pagination support (`from` / `size` parameters)
 - [ ] Sort by field and `_score`
-- [ ] Bool queries (`must`, `should`, `must_not`, `filter`)
+- [x] Bool queries (`must`, `should`, `must_not`, `filter`)
 - [ ] Range queries (`gt`, `gte`, `lt`, `lte`)
 - [ ] Wildcard and prefix queries
 - [x] Return `_score` in search results
