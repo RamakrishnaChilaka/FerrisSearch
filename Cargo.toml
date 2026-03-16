@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 axum = "0.8.8"
+bincode-next = { version = "3.0.0-rc.5", features = ["serde"] }
 config = "0.15.21"
 futures = "0.3.32"
 murmur3 = "0.5"
@@ -23,3 +24,6 @@ uuid = { version = "1.22.0", features = ["v4", "serde"] }
 
 [build-dependencies]
 tonic-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

@@ -4,13 +4,25 @@
 //! Every index operation is appended here BEFORE being written to the engine buffer.
 //! On crash + restart, uncommitted entries are replayed into the engine.
 //! After a successful flush (engine commit), the WAL is truncated.
+//!
+//! ## Binary format
+//!
+//! Each entry is stored as a length-prefixed bincode frame:
+//!
+//! ```text
+//! [u32 LE: payload_len] [payload_len bytes: bincode-encoded TranslogEntry]
+//! ```
+//!
+//! This is more compact than JSONL and faster to parse/replay.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
+
+const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
 
 /// A single WAL entry, representing one indexing operation.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -24,7 +36,7 @@ pub struct TranslogEntry {
 }
 
 /// Trait abstracting a Write-Ahead Log backend.
-/// The current default is `HotTranslog` (JSONL file, fsync-per-write).
+/// The current default is `HotTranslog` (binary file, fsync-per-write).
 /// Future implementations could use memory-only WAL, remote WAL, etc.
 pub trait WriteAheadLog: Send + Sync {
     /// Append a single operation and fsync for durability.
@@ -40,10 +52,48 @@ pub trait WriteAheadLog: Send + Sync {
     fn truncate(&self) -> Result<()>;
 }
 
-/// Hot translog — JSONL-backed, fsync-on-every-write WAL for maximum durability.
+/// Encode a `TranslogEntry` into a length-prefixed binary frame.
+fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
+    let encoded = bincode_next::serde::encode_to_vec(entry, BINCODE_CONFIG)?;
+    let len = encoded.len() as u32;
+    let mut frame = Vec::with_capacity(4 + encoded.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&encoded);
+    Ok(frame)
+}
+
+/// Read all length-prefixed entries from a reader, stopping at EOF or a partial frame.
+fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
+    let mut entries = Vec::new();
+    let mut len_buf = [0u8; 4];
+    loop {
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload_buf = vec![0u8; payload_len];
+        match reader.read_exact(&mut payload_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Partial entry at end of file — truncated write, skip it
+                tracing::warn!("Translog has partial entry at end, ignoring {} bytes", payload_len);
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let (entry, _): (TranslogEntry, _) =
+            bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Hot translog — binary length-prefixed, fsync-on-every-write WAL for maximum durability.
 ///
-/// Stored as newline-delimited JSON (JSONL) at `<data_dir>/translog.jsonl`.
-/// Each line is a serialized `TranslogEntry`. The file is fsynced on every write
+/// Stored at `<data_dir>/translog.bin`. Each entry is a bincode-encoded frame
+/// preceded by a 4-byte little-endian length. The file is fsynced on every write
 /// (request-level durability) to guarantee no ops are lost on crash.
 pub struct HotTranslog {
     file: Mutex<File>,
@@ -53,16 +103,20 @@ pub struct HotTranslog {
 impl HotTranslog {
     /// Open or create the translog at the given directory.
     pub fn open<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
-        let path = data_dir.as_ref().join("translog.jsonl");
+        let path = data_dir.as_ref().join("translog.bin");
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
             .read(true)
+            .write(true)
             .open(&path)?;
 
         // Figure out the highest sequence number already on disk
         let existing = Self::read_entries_from_path(&path)?;
         let next_seq = existing.last().map(|e| e.seq_no + 1).unwrap_or(0);
+
+        // Seek to end for subsequent appends
+        let mut f = file;
+        f.seek(SeekFrom::End(0))?;
 
         tracing::info!(
             "Translog opened at {:?} ({} pending entries, next seq_no: {})",
@@ -72,7 +126,7 @@ impl HotTranslog {
         );
 
         Ok(Self {
-            file: Mutex::new(file),
+            file: Mutex::new(f),
             seq_no: Mutex::new(next_seq),
         })
     }
@@ -80,18 +134,8 @@ impl HotTranslog {
     /// Helper to read entries directly from a path (used during open to check existing state)
     fn read_entries_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<TranslogEntry>> {
         let file = OpenOptions::new().read(true).open(&path)?;
-        let reader = BufReader::new(file);
-        let mut entries = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<TranslogEntry>(&line) {
-                entries.push(entry);
-            }
-        }
-        Ok(entries)
+        let mut reader = BufReader::new(file);
+        decode_entries(&mut reader)
     }
 }
 
@@ -105,11 +149,10 @@ impl WriteAheadLog for HotTranslog {
         };
         *seq += 1;
 
-        let mut line = serde_json::to_string(&entry)?;
-        line.push('\n');
+        let frame = encode_entry(&entry)?;
 
         let mut file = self.file.lock().unwrap();
-        file.write_all(line.as_bytes())?;
+        file.write_all(&frame)?;
         file.sync_data()?;
 
         Ok(entry)
@@ -118,7 +161,7 @@ impl WriteAheadLog for HotTranslog {
     fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
         let mut seq = self.seq_no.lock().unwrap();
         let mut entries = Vec::with_capacity(ops.len());
-        let mut buf = String::new();
+        let mut buf = Vec::new();
 
         for (op, payload) in ops {
             let entry = TranslogEntry {
@@ -127,13 +170,12 @@ impl WriteAheadLog for HotTranslog {
                 payload: payload.clone(),
             };
             *seq += 1;
-            buf.push_str(&serde_json::to_string(&entry)?);
-            buf.push('\n');
+            buf.extend_from_slice(&encode_entry(&entry)?);
             entries.push(entry);
         }
 
         let mut file = self.file.lock().unwrap();
-        file.write_all(buf.as_bytes())?;
+        file.write_all(&buf)?;
         file.sync_data()?;
 
         Ok(entries)
@@ -142,18 +184,8 @@ impl WriteAheadLog for HotTranslog {
     fn read_all(&self) -> Result<Vec<TranslogEntry>> {
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(0))?;
-        let reader = BufReader::new(&*file);
-        let mut entries = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<TranslogEntry>(&line) {
-                entries.push(entry);
-            }
-        }
-        Ok(entries)
+        let mut reader = BufReader::new(&*file);
+        decode_entries(&mut reader)
     }
 
     fn truncate(&self) -> Result<()> {
@@ -166,5 +198,180 @@ impl WriteAheadLog for HotTranslog {
         *seq = 0;
         tracing::info!("Translog truncated after flush.");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Helper: create a translog in a fresh temp directory.
+    fn open_translog() -> (tempfile::TempDir, HotTranslog) {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open(dir.path()).unwrap();
+        (dir, tl)
+    }
+
+    // ── append / read_all ───────────────────────────────────────────────
+
+    #[test]
+    fn append_single_entry_and_read_back() {
+        let (_dir, tl) = open_translog();
+        let entry = tl.append("index", json!({"title": "hello"})).unwrap();
+        assert_eq!(entry.seq_no, 0);
+        assert_eq!(entry.op, "index");
+
+        let entries = tl.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].payload["title"], "hello");
+    }
+
+    #[test]
+    fn append_multiple_entries_increments_seq_no() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+        let e3 = tl.append("delete", json!({"_doc_id": "x"})).unwrap();
+        assert_eq!(e3.seq_no, 2);
+
+        let entries = tl.read_all().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].op, "delete");
+    }
+
+    // ── append_bulk ─────────────────────────────────────────────────────
+
+    #[test]
+    fn append_bulk_writes_atomically() {
+        let (_dir, tl) = open_translog();
+        let ops: Vec<(&str, serde_json::Value)> = (0..5)
+            .map(|i| ("index", json!({"doc": i})))
+            .collect();
+        let entries = tl.append_bulk(&ops).unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[4].seq_no, 4);
+
+        let all = tl.read_all().unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn bulk_then_single_seq_no_continues() {
+        let (_dir, tl) = open_translog();
+        tl.append_bulk(&[("index", json!({"a": 1})), ("index", json!({"b": 2}))]).unwrap();
+        let e = tl.append("index", json!({"c": 3})).unwrap();
+        assert_eq!(e.seq_no, 2);
+    }
+
+    // ── truncate ────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_clears_all_entries() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"x": 1})).unwrap();
+        tl.append("index", json!({"y": 2})).unwrap();
+
+        tl.truncate().unwrap();
+
+        let entries = tl.read_all().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn truncate_resets_seq_no() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.truncate().unwrap();
+
+        let e = tl.append("index", json!({"b": 2})).unwrap();
+        assert_eq!(e.seq_no, 0, "seq_no should restart from 0 after truncate");
+    }
+
+    // ── persistence across reopen ───────────────────────────────────────
+
+    #[test]
+    fn entries_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let tl = HotTranslog::open(dir.path()).unwrap();
+            tl.append("index", json!({"persisted": true})).unwrap();
+            tl.append("delete", json!({"_doc_id": "abc"})).unwrap();
+        }
+        // Reopen from the same directory
+        let tl2 = HotTranslog::open(dir.path()).unwrap();
+        let entries = tl2.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].payload["persisted"], true);
+    }
+
+    #[test]
+    fn seq_no_resumes_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let tl = HotTranslog::open(dir.path()).unwrap();
+            tl.append("index", json!({"a": 1})).unwrap();
+            tl.append("index", json!({"b": 2})).unwrap();
+        }
+        let tl2 = HotTranslog::open(dir.path()).unwrap();
+        let e = tl2.append("index", json!({"c": 3})).unwrap();
+        assert_eq!(e.seq_no, 2, "seq_no should continue from where previous instance left off");
+    }
+
+    // ── binary format correctness ───────────────────────────────────────
+
+    #[test]
+    fn binary_encode_decode_roundtrip() {
+        let entry = TranslogEntry {
+            seq_no: 42,
+            op: "index".into(),
+            payload: json!({"field": "value", "num": 123}),
+        };
+        let frame = encode_entry(&entry).unwrap();
+        // First 4 bytes are the length prefix
+        let payload_len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
+        assert_eq!(frame.len(), 4 + payload_len);
+
+        let mut reader = std::io::Cursor::new(&frame);
+        let decoded = decode_entries(&mut reader).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].seq_no, 42);
+        assert_eq!(decoded[0].op, "index");
+        assert_eq!(decoded[0].payload["field"], "value");
+    }
+
+    #[test]
+    fn partial_frame_at_eof_is_skipped() {
+        let entry = TranslogEntry {
+            seq_no: 0,
+            op: "index".into(),
+            payload: json!({"ok": true}),
+        };
+        let mut frame = encode_entry(&entry).unwrap();
+        // Append a partial frame: valid length header but truncated body
+        frame.extend_from_slice(&100u32.to_le_bytes());
+        frame.extend_from_slice(&[0u8; 10]); // only 10 of 100 bytes
+
+        let mut reader = std::io::Cursor::new(&frame);
+        let decoded = decode_entries(&mut reader).unwrap();
+        assert_eq!(decoded.len(), 1, "should recover the first valid entry and skip the partial");
+    }
+
+    // ── edge cases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_translog_read_all_returns_empty() {
+        let (_dir, tl) = open_translog();
+        let entries = tl.read_all().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn large_payload_roundtrips() {
+        let (_dir, tl) = open_translog();
+        let big = "x".repeat(100_000);
+        tl.append("index", json!({"data": big})).unwrap();
+        let entries = tl.read_all().unwrap();
+        assert_eq!(entries[0].payload["data"].as_str().unwrap().len(), 100_000);
     }
 }

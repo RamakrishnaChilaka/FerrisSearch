@@ -120,6 +120,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bincode-next"
+version = "3.0.0-rc.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96a286793661cca5bdb534f7ebb929cfe2ca3f27ff8ae06985f13d776c6489d9"
+dependencies = [
+ "bincode_derive-next",
+ "pastey",
+ "rapidhash",
+ "serde",
+ "unty-next",
+]
+
+[[package]]
+name = "bincode_derive-next"
+version = "3.0.0-rc.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1ae645ae11c49d76bf87cf7f4867d4362ee5cc54b8698e17d7752589322d5a"
+dependencies = [
+ "virtue-next",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1100,6 +1122,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pastey"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
+
+[[package]]
 name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,6 +1378,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rapidhash"
+version = "4.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e48930979c155e2f33aa36ab3119b5ee81332beb6482199a8ecd6029b80b59"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "rayon"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1427,6 +1464,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bincode-next",
  "config",
  "futures",
  "murmur3",
@@ -2205,6 +2243,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
+name = "unty-next"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fa66022bbd1ab992fad72bdedcfd07a0023b6f5ecc83d50121e39e3a3caed41"
+
+[[package]]
 name = "utf8-ranges"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2233,6 +2277,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue-next"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d5208a9710a6ca1c2da0d64289a5dcca13deb05afdedf651f4e11bcd9fc53eb"
 
 [[package]]
 name = "want"
