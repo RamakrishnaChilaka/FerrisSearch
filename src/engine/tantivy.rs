@@ -1,38 +1,67 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, STORED, TEXT};
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
+use tantivy::schema::{Field, Schema, Value, STRING, STORED, TEXT};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
-use crate::wal::Translog;
+use super::SearchEngine;
+use crate::wal::{HotTranslog, WriteAheadLog};
 
-pub struct TantivyEngine {
+/// Dynamic field registry — maps user-facing field names to Tantivy Field handles.
+/// New fields are added on first encounter (dynamic mapping, like OpenSearch).
+struct FieldRegistry {
+    /// _id: unique document identifier (indexed, not tokenized)
+    id_field: Field,
+    /// _source: stores the raw JSON document (STORED only, not indexed)
+    source_field: Field,
+    /// Named text fields created dynamically from document keys
+    fields: HashMap<String, Field>,
+}
+
+/// Hot engine — Tantivy-backed search engine where all data lives in
+/// memory-mapped segments for maximum query performance.
+pub struct HotEngine {
     index: Index,
     reader: IndexReader,
     writer: Arc<RwLock<IndexWriter>>,
-    schema: Schema,
-    body_field: Field,
+    field_registry: RwLock<FieldRegistry>,
     /// The per-index refresh interval (e.g. 5s default, matches OpenSearch's index.refresh_interval)
     pub refresh_interval: Duration,
     /// Write-ahead log for crash durability
-    translog: Arc<Mutex<Translog>>,
+    translog: Arc<Mutex<dyn WriteAheadLog>>,
 }
 
-impl TantivyEngine {
+impl HotEngine {
     pub fn new<P: AsRef<Path>>(data_dir: P, refresh_interval: Duration) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         let index_path = data_dir.join("index");
         std::fs::create_dir_all(&index_path)?;
 
         let mut schema_builder = Schema::builder();
+        // _id stores the document identifier (indexed for exact lookup/delete, not tokenized)
+        let id_field = schema_builder.add_text_field("_id", STRING | STORED);
+        // _source stores the original JSON verbatim (STORED only — not searchable)
+        let source_field = schema_builder.add_text_field("_source", STORED);
+        // Pre-create a catch-all "body" field for backward compat with simple query strings
         let body_field = schema_builder.add_text_field("body", TEXT | STORED);
         let schema = schema_builder.build();
 
         let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
         let index = Index::open_or_create(mmap_dir, schema.clone())?;
+
+        // Rebuild field registry from persisted schema (handles restart)
+        let mut fields = HashMap::new();
+        fields.insert("body".to_string(), body_field);
+        for (field, entry) in schema.fields() {
+            let name = entry.name().to_string();
+            if name != "_source" && name != "_id" {
+                fields.insert(name, field);
+            }
+        }
 
         let writer = index.writer(50_000_000)?; // 50MB heap
         let reader = index
@@ -41,14 +70,19 @@ impl TantivyEngine {
             .try_into()?;
 
         // Open or create the translog in the data directory (not index_path)
-        let translog = Translog::open(data_dir)?;
+        let translog = HotTranslog::open(data_dir)?;
+
+        let field_registry = FieldRegistry {
+            id_field,
+            source_field,
+            fields,
+        };
 
         let engine = Self {
             index,
             reader,
             writer: Arc::new(RwLock::new(writer)),
-            schema,
-            body_field,
+            field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
         };
@@ -57,6 +91,53 @@ impl TantivyEngine {
         engine.replay_translog()?;
 
         Ok(engine)
+    }
+
+    /// Get (or lazily register) a field by name.
+    /// With Tantivy, once an index is created, the schema is fixed — so we look up
+    /// pre-existing fields. If a field doesn't exist, we fall back to the "body" field.
+    fn resolve_field(&self, field_name: &str) -> Field {
+        let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = registry.fields.get(field_name) {
+            return *f;
+        }
+        // Fall back to "body" for unknown fields
+        *registry.fields.get("body").expect("body field must exist")
+    }
+
+    /// Build a Tantivy document from a JSON object.
+    /// Stores _id, _source(raw JSON), and indexes text into the "body" catch-all.
+    fn build_tantivy_doc(&self, doc_id: &str, payload: &serde_json::Value) -> TantivyDocument {
+        let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
+        let mut doc = TantivyDocument::new();
+
+        // Store the document ID
+        doc.add_text(registry.id_field, doc_id);
+
+        // Store the raw JSON in _source
+        doc.add_text(registry.source_field, payload.to_string());
+
+        // Index each top-level string/number field into the "body" catch-all
+        let body_field = *registry.fields.get("body").expect("body field must exist");
+        if let Some(obj) = payload.as_object() {
+            let mut body_parts = Vec::new();
+            for (_key, value) in obj {
+                match value {
+                    serde_json::Value::String(s) => body_parts.push(s.clone()),
+                    serde_json::Value::Number(n) => body_parts.push(n.to_string()),
+                    serde_json::Value::Bool(b) => body_parts.push(b.to_string()),
+                    _ => {}
+                }
+            }
+            if !body_parts.is_empty() {
+                doc.add_text(body_field, body_parts.join(" "));
+            }
+        } else {
+            // Not an object — store the whole thing as body
+            doc.add_text(body_field, payload.to_string());
+        }
+
+        doc
     }
 
     /// Replays all pending translog entries into the Tantivy buffer.
@@ -76,10 +157,14 @@ impl TantivyEngine {
             entries.len()
         );
 
-        let mut writer = self.writer.write().unwrap();
+        let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         for entry in &entries {
-            let json_str = entry.payload.to_string();
-            let doc = doc!(self.body_field => json_str);
+            let doc_id = entry.payload.get("_doc_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let source = entry.payload.get("_source")
+                .unwrap_or(&entry.payload);
+            let doc = self.build_tantivy_doc(doc_id, source);
             writer.add_document(doc)?;
         }
         writer.commit()?;
@@ -104,32 +189,66 @@ impl TantivyEngine {
         });
     }
 
-    /// Index a document.
-    /// Writes to the translog FIRST for durability, then adds to the Tantivy buffer.
-    pub fn add_document(&self, payload: serde_json::Value) -> Result<String> {
+    /// Shared search execution helper — returns _id + _source from each hit
+    fn execute_search(&self, searcher: tantivy::Searcher, query: &dyn tantivy::query::Query) -> Result<Vec<serde_json::Value>> {
+        let top_docs = searcher.search(query, &TopDocs::with_limit(10))?;
+        let registry = self.field_registry.read()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut results = Vec::new();
+        for (_score, doc_address) in top_docs {
+            let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
+            // Get _id
+            let doc_id = retrieved_doc.get_all(registry.id_field)
+                .next()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Get _source
+            for value in retrieved_doc.get_all(registry.source_field) {
+                if let Some(text) = value.as_str() {
+                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text) {
+                        results.push(serde_json::json!({
+                            "_id": doc_id,
+                            "_source": json_val
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+}
+
+impl super::SearchEngine for HotEngine {
+    fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String> {
         // 1. Write to translog — durable before anything else
         {
             let tl = self.translog.lock().unwrap();
-            tl.append("index", payload.clone())?;
+            let wal_entry = serde_json::json!({
+                "_doc_id": doc_id,
+                "_source": payload
+            });
+            tl.append("index", wal_entry)?;
         }
 
-        // 2. Write to Tantivy in-memory buffer
-        let writer = self.writer.write().unwrap();
-        let doc_id = uuid::Uuid::new_v4().to_string();
-        let json_str = payload.to_string();
-        let doc = doc!(self.body_field => json_str);
+        // 2. Delete any existing doc with same _id (upsert semantics)
+        let id_field = self.field_registry.read().unwrap_or_else(|e| e.into_inner()).id_field;
+        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+        writer.delete_term(Term::from_field_text(id_field, doc_id));
+
+        // 3. Write to Tantivy in-memory buffer
+        let doc = self.build_tantivy_doc(doc_id, &payload);
         writer.add_document(doc)?;
 
-        Ok(doc_id)
+        Ok(doc_id.to_string())
     }
 
-    /// Bulk-index documents in a single lock acquisition and single translog fsync.
-    /// Returns the list of generated document IDs (one per document).
-    pub fn bulk_add_documents(&self, payloads: Vec<serde_json::Value>) -> Result<Vec<String>> {
+    fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
         // 1. Write all ops to translog with a single fsync
-        let ops: Vec<(&str, serde_json::Value)> = payloads
+        let ops: Vec<(&str, serde_json::Value)> = docs
             .iter()
-            .map(|p| ("index", p.clone()))
+            .map(|(id, p)| ("index", serde_json::json!({ "_doc_id": id, "_source": p })))
             .collect();
         {
             let tl = self.translog.lock().unwrap();
@@ -137,31 +256,63 @@ impl TantivyEngine {
         }
 
         // 2. Write all docs to Tantivy in-memory buffer under one lock
-        let writer = self.writer.write().unwrap();
-        let mut doc_ids = Vec::with_capacity(payloads.len());
-        for payload in &payloads {
-            let doc_id = uuid::Uuid::new_v4().to_string();
-            let json_str = payload.to_string();
-            let doc = doc!(self.body_field => json_str);
+        let id_field = self.field_registry.read().unwrap_or_else(|e| e.into_inner()).id_field;
+        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+        let mut doc_ids = Vec::with_capacity(docs.len());
+        for (doc_id, payload) in &docs {
+            writer.delete_term(Term::from_field_text(id_field, doc_id));
+            let doc = self.build_tantivy_doc(doc_id, payload);
             writer.add_document(doc)?;
-            doc_ids.push(doc_id);
+            doc_ids.push(doc_id.clone());
         }
 
         Ok(doc_ids)
     }
 
-    /// Refresh: commit the in-memory buffer and reload the reader so new docs become searchable.
-    pub fn refresh(&self) -> Result<()> {
-        let mut writer = self.writer.write().unwrap();
+    fn delete_document(&self, doc_id: &str) -> Result<u64> {
+        // 1. Write to translog
+        {
+            let tl = self.translog.lock().unwrap();
+            tl.append("delete", serde_json::json!({ "_doc_id": doc_id }))?;
+        }
+
+        // 2. Delete from Tantivy
+        let id_field = self.field_registry.read().unwrap_or_else(|e| e.into_inner()).id_field;
+        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+        let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
+        // delete_term returns an OpStamp, not a count — we report 1 optimistically
+        let _ = opstamp;
+        Ok(1)
+    }
+
+    fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
+        let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
+        let searcher = self.reader.searcher();
+        let term = Term::from_field_text(registry.id_field, doc_id);
+        let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1))?;
+        if let Some((_score, doc_address)) = top_docs.first() {
+            let retrieved_doc = searcher.doc::<TantivyDocument>(*doc_address)?;
+            for value in retrieved_doc.get_all(registry.source_field) {
+                if let Some(text) = value.as_str() {
+                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text) {
+                        return Ok(Some(json_val));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn refresh(&self) -> Result<()> {
+        let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         writer.commit()?;
         self.reader.reload()?;
         Ok(())
     }
 
-    /// Flush: commit the in-memory buffer to disk, then truncate the translog.
-    /// After this call, all data is safe in Tantivy segments — the translog is no longer needed.
-    pub fn flush(&self) -> Result<()> {
-        let mut writer = self.writer.write().unwrap();
+    fn flush(&self) -> Result<()> {
+        let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         writer.commit()?;
         drop(writer); // release lock before translog truncate
         let tl = self.translog.lock().unwrap();
@@ -169,16 +320,15 @@ impl TantivyEngine {
         Ok(())
     }
 
-    /// Search using a simple query string (e.g. from `?q=` param)
-    pub fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>> {
+    fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>> {
+        let body_field = self.resolve_field("body");
         let searcher = self.reader.searcher();
-        let query_parser = QueryParser::for_index(&self.index, vec![self.body_field]);
+        let query_parser = QueryParser::for_index(&self.index, vec![body_field]);
         let query = query_parser.parse_query(query_str)?;
         self.execute_search(searcher, &*query)
     }
 
-    /// Search using the OpenSearch Query DSL body
-    pub fn search_query(&self, req: &crate::search::SearchRequest) -> Result<Vec<serde_json::Value>> {
+    fn search_query(&self, req: &crate::search::SearchRequest) -> Result<Vec<serde_json::Value>> {
         use crate::search::QueryClause;
         use tantivy::query::{AllQuery, TermQuery};
         use tantivy::schema::IndexRecordOption;
@@ -191,13 +341,13 @@ impl TantivyEngine {
                 self.execute_search(searcher, &AllQuery)
             }
             QueryClause::Match(fields) => {
-                // Pull first field/value pair and do a full-text query
-                if let Some((_, value)) = fields.iter().next() {
+                if let Some((field_name, value)) = fields.iter().next() {
                     let query_str = match value {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    let query_parser = QueryParser::for_index(&self.index, vec![self.body_field]);
+                    let target_field = self.resolve_field(field_name);
+                    let query_parser = QueryParser::for_index(&self.index, vec![target_field]);
                     let query = query_parser.parse_query(&query_str)?;
                     self.execute_search(searcher, &*query)
                 } else {
@@ -205,13 +355,13 @@ impl TantivyEngine {
                 }
             }
             QueryClause::Term(fields) => {
-                // Exact term match on the body field
-                if let Some((_, value)) = fields.iter().next() {
+                if let Some((field_name, value)) = fields.iter().next() {
                     let term_str = match value {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    let term = Term::from_field_text(self.body_field, &term_str);
+                    let target_field = self.resolve_field(field_name);
+                    let term = Term::from_field_text(target_field, &term_str);
                     let query = TermQuery::new(term, IndexRecordOption::Basic);
                     self.execute_search(searcher, &query)
                 } else {
@@ -221,21 +371,7 @@ impl TantivyEngine {
         }
     }
 
-    /// Shared search execution helper
-    fn execute_search(&self, searcher: tantivy::Searcher, query: &dyn tantivy::query::Query) -> Result<Vec<serde_json::Value>> {
-        let top_docs = searcher.search(query, &TopDocs::with_limit(10))?;
-
-        let mut results = Vec::new();
-        for (_score, doc_address) in top_docs {
-            let retrieved_doc = searcher.doc::<tantivy::TantivyDocument>(doc_address)?;
-            for value in retrieved_doc.get_all(self.body_field) {
-                if let Some(text) = value.as_str() {
-                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text) {
-                        results.push(json_val);
-                    }
-                }
-            }
-        }
-        Ok(results)
+    fn doc_count(&self) -> u64 {
+        self.reader.searcher().num_docs()
     }
 }

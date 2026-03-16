@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Top-level search request body.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub query: QueryClause,
     #[serde(default = "default_size")]
@@ -17,7 +17,7 @@ fn default_size() -> usize {
 }
 
 /// A query clause: term, match, or match_all.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryClause {
     /// Exact term match: `{ "term": { "field": "value" } }`

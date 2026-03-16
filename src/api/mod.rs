@@ -1,14 +1,20 @@
 //! HTTP REST API Layer.
 //! Long-term goal: Implement OpenSearch-compatible REST APIs for searching, indexing, and cluster management.
 
+pub mod cat;
 pub mod cluster;
 pub mod index;
 pub mod search;
 
 use crate::cluster::ClusterManager;
 use crate::shard::ShardManager;
+use crate::transport::TransportClient;
 use axum::{
-    routing::{get, post, put},
+    body::Body,
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::Serialize;
@@ -33,8 +39,55 @@ async fn handle_root() -> Json<NodeInfoResponse> {
 pub struct AppState {
     pub cluster_manager: Arc<ClusterManager>,
     pub shard_manager: Arc<ShardManager>,
+    pub transport_client: TransportClient,
     /// The local node ID — needed for routing decisions
     pub local_node_id: String,
+}
+
+/// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.
+async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
+    let wants_pretty = req.uri().query().map_or(false, |q| {
+        q.split('&').any(|param| {
+            let key = param.split('=').next().unwrap_or("");
+            key == "pretty"
+        })
+    });
+
+    let response = next.run(req).await;
+
+    if !wants_pretty {
+        return response;
+    }
+
+    // Only reformat if the response content-type is JSON
+    let is_json = response.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |ct| ct.contains("application/json"));
+
+    if !is_json {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+            let mut response = Response::from_parts(parts, Body::from(pretty));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            return response;
+        }
+    }
+
+    // Fallback: return original bytes if parsing failed
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -42,10 +95,17 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(handle_root))
         .route("/_cluster/health", get(cluster::get_health))
         .route("/_cluster/state", get(cluster::get_state))
+        // _cat APIs
+        .route("/_cat/nodes", get(cat::cat_nodes))
+        .route("/_cat/shards", get(cat::cat_shards))
+        .route("/_cat/indices", get(cat::cat_indices))
         // Index management
         .route("/{index}", put(index::create_index))
+        .route("/{index}", delete(index::delete_index))
         // Document operations
         .route("/{index}/_doc", post(index::index_document))
+        .route("/{index}/_doc/{id}", get(index::get_document))
+        .route("/{index}/_doc/{id}", delete(index::delete_document))
         .route("/{index}/_bulk", post(index::bulk_index))
         // Search
         .route("/{index}/_search", get(search::search_documents))
@@ -53,5 +113,6 @@ pub fn create_router(state: AppState) -> Router {
         // Maintenance
         .route("/{index}/_refresh", post(index::refresh_index))
         .route("/{index}/_flush", post(index::flush_index))
+        .layer(middleware::from_fn(pretty_json_middleware))
         .with_state(state)
 }

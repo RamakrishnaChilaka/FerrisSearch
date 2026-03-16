@@ -15,19 +15,18 @@ impl ClusterManager {
 
     /// Returns a cloned snapshot of the current state
     pub fn get_state(&self) -> ClusterState {
-        self.state.read().unwrap().clone()
+        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Safely add a node to the cluster
     pub fn add_node(&self, node: NodeInfo) {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.add_node(node);
-        // Normally this would trigger the TransportClient to broadcast the new state!
     }
 
     /// Overwrite the local state entirely (used when receiving update from Master)
     pub fn update_state(&self, mut new_state: ClusterState) {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         // Preserve last_seen since it's transient and not serialized over the network
         new_state.last_seen = std::mem::take(&mut state.last_seen);
         *state = new_state;
@@ -35,7 +34,7 @@ impl ClusterManager {
 
     /// Ping a node to update heartbeat timestamp
     pub fn ping_node(&self, node_id: &str) {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.ping_node(&node_id.to_string());
     }
 }

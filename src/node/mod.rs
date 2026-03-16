@@ -38,7 +38,7 @@ impl Node {
     pub fn new(config: AppConfig) -> anyhow::Result<Self> {
         let cluster_manager = Arc::new(ClusterManager::new(config.cluster_name.clone()));
         let transport_client = TransportClient::new();
-        // ShardManager owns all per-shard TantivyEngine instances; no engines created yet
+        // ShardManager owns all per-shard SearchEngine instances; no engines created yet
         // (engines are created on-demand when indices are created or documents arrive)
         let shard_manager = Arc::new(ShardManager::new(&config.data_dir, Duration::from_secs(5)));
         Ok(Self {
@@ -71,19 +71,26 @@ impl Node {
         let app_state = crate::api::AppState {
             cluster_manager: self.cluster_manager.clone(),
             shard_manager: self.shard_manager.clone(),
+            transport_client: self.transport_client.clone(),
             local_node_id: self.config.node_name.clone(),
         };
 
 
-        // 1. Start internal Transport Server (Port 9300)
-        let transport_app = crate::transport::server::create_transport_router(app_state.clone());
+        // 1. Start internal gRPC Transport Server (Port 9300)
+        let transport_service = crate::transport::server::create_transport_service(
+            self.cluster_manager.clone(),
+            self.shard_manager.clone(),
+        );
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));
-        info!("Transport API listening on {}", transport_addr);
-        let transport_listener = tokio::net::TcpListener::bind(transport_addr).await?;
-        
+        info!("gRPC Transport listening on {}", transport_addr);
+
         let transport_handle = tokio::spawn(async move {
-            if let Err(e) = axum::serve(transport_listener, transport_app).await {
-                tracing::error!("Transport server failed: {}", e);
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(transport_service)
+                .serve(transport_addr)
+                .await
+            {
+                tracing::error!("gRPC transport server failed: {}", e);
             }
         });
 
@@ -92,7 +99,7 @@ impl Node {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
         info!("HTTP API listening on {}", addr);
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        
+
         let http_handle = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("HTTP server failed: {}", e);
@@ -104,11 +111,11 @@ impl Node {
         let seed_hosts = self.config.seed_hosts.clone();
         let manager = self.cluster_manager.clone();
         let local_id = self.config.node_name.clone();
-        
+
         tokio::spawn(async move {
             // Give servers a tiny moment to bind
             tokio::time::sleep(Duration::from_millis(500)).await;
-            
+
             // Try to join the cluster
             if let Some(state) = client.join_cluster(&seed_hosts, &local_node).await {
                 manager.update_state(state);
@@ -120,21 +127,21 @@ impl Node {
             // Begin continuous lifecycle loop
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                
+
                 let state = manager.get_state();
-                
+
                 if let Some(master_id) = &state.master_node {
                     if master_id == &local_id {
                         // We are the master! Scan for dead nodes.
                         let now = Instant::now();
                         let mut dead_nodes = Vec::new();
-                        
+
                         for (node_id, last_seen) in &state.last_seen {
                             if node_id != &local_id && now.duration_since(*last_seen) > Duration::from_secs(15) {
                                 dead_nodes.push(node_id.clone());
                             }
                         }
-                        
+
                         if !dead_nodes.is_empty() {
                             let mut new_state = state.clone();
                             for dead in dead_nodes {
@@ -161,7 +168,7 @@ impl Node {
                 } else {
                      // No master? Election time.
                      elect_master(&manager, &local_id);
-                     
+
                      // If we became master after election, publish state.
                      let new_state = manager.get_state();
                      if new_state.master_node.as_ref() == Some(&local_id) {

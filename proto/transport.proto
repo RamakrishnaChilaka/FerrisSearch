@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+package transport;
+
+// ─── Cluster Coordination ────────────────────────────────────────────────────
+
+message NodeInfo {
+    string id = 1;
+    string name = 2;
+    string host = 3;
+    uint32 transport_port = 4;
+    uint32 http_port = 5;
+    repeated string roles = 6;  // "master", "data", "client"
+}
+
+message ShardAssignment {
+    uint32 shard_id = 1;
+    string node_id = 2;
+}
+
+message IndexMetadata {
+    string name = 1;
+    uint32 number_of_shards = 2;
+    repeated ShardAssignment shards = 3;
+}
+
+message ClusterState {
+    string cluster_name = 1;
+    uint64 version = 2;
+    optional string master_node = 3;
+    repeated NodeInfo nodes = 4;
+    repeated IndexMetadata indices = 5;
+}
+
+message JoinRequest {
+    NodeInfo node_info = 1;
+}
+
+message JoinResponse {
+    ClusterState state = 1;
+}
+
+message PublishStateRequest {
+    ClusterState state = 1;
+}
+
+message PingRequest {
+    string source_node_id = 1;
+}
+
+message Empty {}
+
+// ─── Shard-level Operations ──────────────────────────────────────────────────
+
+message ShardDocRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    bytes payload_json = 3;   // JSON document as bytes (avoids double-encode)
+    string doc_id = 4;        // document _id
+}
+
+message ShardDocResponse {
+    bool success = 1;
+    string doc_id = 2;
+    string error = 3;         // empty on success
+}
+
+message ShardDeleteRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    string doc_id = 3;
+}
+
+message ShardDeleteResponse {
+    bool success = 1;
+    uint64 deleted = 2;
+    string error = 3;
+}
+
+message ShardGetRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    string doc_id = 3;
+}
+
+message ShardGetResponse {
+    bool found = 1;
+    bytes source_json = 2;    // _source as JSON bytes (empty if not found)
+    string error = 3;
+}
+
+message ShardBulkRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    repeated bytes documents_json = 3; // each element is a JSON doc as bytes
+}
+
+message ShardBulkResponse {
+    bool success = 1;
+    repeated string doc_ids = 2;
+    string error = 3;
+}
+
+message ShardSearchRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    string query = 3;         // simple query string for q= searches
+}
+
+message ShardSearchDslRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    bytes search_request_json = 3; // SearchRequest serialized as JSON bytes
+}
+
+message SearchHit {
+    bytes source_json = 1;    // _source document as JSON bytes
+}
+
+message ShardSearchResponse {
+    bool success = 1;
+    repeated SearchHit hits = 2;
+    string error = 3;
+}
+
+// ─── Service Definition ─────────────────────────────────────────────────────
+
+service InternalTransport {
+    // Cluster coordination
+    rpc JoinCluster(JoinRequest) returns (JoinResponse);
+    rpc PublishState(PublishStateRequest) returns (Empty);
+    rpc Ping(PingRequest) returns (Empty);
+
+    // Shard-level document operations
+    rpc IndexDoc(ShardDocRequest) returns (ShardDocResponse);
+    rpc BulkIndex(ShardBulkRequest) returns (ShardBulkResponse);
+    rpc DeleteDoc(ShardDeleteRequest) returns (ShardDeleteResponse);
+    rpc GetDoc(ShardGetRequest) returns (ShardGetResponse);
+
+    // Shard-level search
+    rpc SearchShard(ShardSearchRequest) returns (ShardSearchResponse);
+    rpc SearchShardDsl(ShardSearchDslRequest) returns (ShardSearchResponse);
+}

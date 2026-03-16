@@ -1,11 +1,16 @@
+//! gRPC transport client — connects to remote nodes via the InternalTransport service.
+
 use crate::cluster::state::{ClusterState, NodeInfo};
-use reqwest::{Client, Error};
+use crate::transport::proto::internal_transport_client::InternalTransportClient;
+use crate::transport::proto::*;
+use crate::transport::server::{cluster_state_to_proto, proto_to_cluster_state};
 use std::time::Duration;
+use tonic::transport::Channel;
 use tracing::{debug, error, info};
 
 #[derive(Clone)]
 pub struct TransportClient {
-    client: Client,
+    timeout: Duration,
 }
 
 impl Default for TransportClient {
@@ -17,11 +22,18 @@ impl Default for TransportClient {
 impl TransportClient {
     pub fn new() -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
+            timeout: Duration::from_secs(5),
         }
+    }
+
+    /// Connect to a remote node's gRPC transport endpoint
+    async fn connect(&self, host: &str, port: u16) -> Result<InternalTransportClient<Channel>, tonic::transport::Error> {
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}:{}", host, port))
+            .expect("valid endpoint URI")
+            .timeout(self.timeout)
+            .connect_timeout(self.timeout);
+        let channel = endpoint.connect().await?;
+        Ok(InternalTransportClient::new(channel))
     }
 
     /// Attempts to join the cluster by contacting the seed hosts
@@ -32,17 +44,28 @@ impl TransportClient {
     ) -> Option<ClusterState> {
         for host in seed_hosts {
             debug!("Attempting to join cluster via seed host: {}", host);
-            let url = format!("http://{}/_internal/discovery/join", host);
 
-            match self.client.post(&url).json(local_node).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        if let Ok(state) = response.json::<ClusterState>().await {
-                            info!("Successfully joined cluster via {}", host);
-                            return Some(state);
+            // Parse "host:port" format
+            let (h, p) = match host.rsplit_once(':') {
+                Some((h, p)) => (h, p.parse::<u16>().unwrap_or(9300)),
+                None => (host.as_str(), 9300u16),
+            };
+
+            match self.connect(h, p).await {
+                Ok(mut client) => {
+                    let proto_node = node_info_to_proto(local_node);
+                    let request = tonic::Request::new(JoinRequest {
+                        node_info: Some(proto_node),
+                    });
+                    match client.join_cluster(request).await {
+                        Ok(response) => {
+                            if let Some(state) = response.into_inner().state {
+                                let cs = proto_to_cluster_state(&state);
+                                info!("Successfully joined cluster via {}", host);
+                                return Some(cs);
+                            }
                         }
-                    } else {
-                        debug!("Seed {} returned status: {}", host, response.status());
+                        Err(e) => debug!("Join RPC to {} failed: {}", host, e),
                     }
                 }
                 Err(e) => debug!("Failed to connect to seed {}: {}", host, e),
@@ -55,31 +78,49 @@ impl TransportClient {
 
     /// (Master Only) Broadcasts state to all active nodes
     pub async fn publish_state(&self, state: &ClusterState) {
+        let proto_state = cluster_state_to_proto(state);
         for node in state.nodes.values() {
-            let url = format!(
-                "http://{}:{}/_internal/cluster/state",
-                node.host, node.transport_port
-            );
-            if let Err(e) = self.client.post(&url).json(state).send().await {
-                error!("Failed to publish state to node {}: {}", node.id, e);
+            match self.connect(&node.host, node.transport_port).await {
+                Ok(mut client) => {
+                    let request = tonic::Request::new(PublishStateRequest {
+                        state: Some(proto_state.clone()),
+                    });
+                    if let Err(e) = client.publish_state(request).await {
+                        error!("Failed to publish state to node {}: {}", node.id, e);
+                    }
+                }
+                Err(e) => error!("Failed to connect to node {} for state publish: {}", node.id, e),
             }
         }
     }
 
-    /// Forward a single document to the specific shard on a node
+    /// Forward a single document to a specific shard on a node
     pub async fn forward_index_to_shard(
         &self,
         node: &NodeInfo,
         index_name: &str,
         shard_id: u32,
+        doc_id: &str,
         payload: &serde_json::Value,
-    ) -> Result<serde_json::Value, Error> {
-        let url = format!(
-            "http://{}:{}/_internal/index/{}/shard/{}/_doc",
-            node.host, node.transport_port, index_name, shard_id
-        );
-        let response = self.client.post(&url).json(payload).send().await?;
-        response.json().await
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(ShardDocRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            payload_json: serde_json::to_vec(payload)?,
+            doc_id: doc_id.to_string(),
+        });
+        let response = client.index_doc(request).await?.into_inner();
+        if response.success {
+            Ok(serde_json::json!({
+                "_index": index_name,
+                "_id": response.doc_id,
+                "_shard": shard_id,
+                "result": "created"
+            }))
+        } else {
+            Ok(serde_json::json!({ "error": response.error }))
+        }
     }
 
     /// Forward a bulk batch to a specific shard on a node
@@ -88,14 +129,106 @@ impl TransportClient {
         node: &NodeInfo,
         index_name: &str,
         shard_id: u32,
-        docs: &[serde_json::Value],
-    ) -> Result<serde_json::Value, Error> {
-        let url = format!(
-            "http://{}:{}/_internal/index/{}/shard/{}/_bulk",
-            node.host, node.transport_port, index_name, shard_id
-        );
-        let response = self.client.post(&url).json(docs).send().await?;
-        response.json().await
+        docs: &[(String, serde_json::Value)],
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let documents_json: Vec<Vec<u8>> = docs.iter()
+            .map(|(id, payload)| serde_json::to_vec(&serde_json::json!({
+                "_doc_id": id,
+                "_source": payload
+            })).unwrap_or_default())
+            .collect();
+        let request = tonic::Request::new(ShardBulkRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            documents_json,
+        });
+        let response = client.bulk_index(request).await?.into_inner();
+        if response.success {
+            Ok(serde_json::json!({
+                "took": 0,
+                "errors": false,
+                "items": response.doc_ids.iter().map(|id| serde_json::json!({ "index": { "_id": id, "result": "created" } })).collect::<Vec<_>>()
+            }))
+        } else {
+            Ok(serde_json::json!({ "error": response.error }))
+        }
+    }
+
+    /// Forward a delete operation to a specific shard on a node
+    pub async fn forward_delete_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        doc_id: &str,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(ShardDeleteRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            doc_id: doc_id.to_string(),
+        });
+        let response = client.delete_doc(request).await?.into_inner();
+        if response.success {
+            Ok(serde_json::json!({
+                "_index": index_name,
+                "_id": doc_id,
+                "_shard": shard_id,
+                "result": "deleted"
+            }))
+        } else {
+            Err(anyhow::anyhow!("Delete failed: {}", response.error))
+        }
+    }
+
+    /// Forward a get-by-ID request to a specific shard on a node
+    pub async fn forward_get_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        doc_id: &str,
+    ) -> Result<Option<serde_json::Value>, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(ShardGetRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            doc_id: doc_id.to_string(),
+        });
+        let response = client.get_doc(request).await?.into_inner();
+        if response.found {
+            let source: serde_json::Value = serde_json::from_slice(&response.source_json)?;
+            Ok(Some(source))
+        } else if !response.error.is_empty() {
+            Err(anyhow::anyhow!("Get failed: {}", response.error))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Forward a query-string search to a specific shard on a remote node
+    pub async fn forward_search_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        query: &str,
+    ) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(ShardSearchRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            query: query.to_string(),
+        });
+        let response = client.search_shard(request).await?.into_inner();
+        if response.success {
+            Ok(response.hits.iter()
+                .filter_map(|h| serde_json::from_slice(&h.source_json).ok())
+                .collect())
+        } else {
+            Err(anyhow::anyhow!("Shard search failed: {}", response.error))
+        }
     }
 
     /// Forward a DSL search to a specific shard
@@ -105,22 +238,47 @@ impl TransportClient {
         index_name: &str,
         shard_id: u32,
         req: &crate::search::SearchRequest,
-    ) -> Result<Vec<serde_json::Value>, Error> {
-        let url = format!(
-            "http://{}:{}/_internal/index/{}/shard/{}/_search",
-            node.host, node.transport_port, index_name, shard_id
-        );
-        let response = self.client.post(&url).json(req).send().await?;
-        response.json().await
+    ) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(ShardSearchDslRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            search_request_json: serde_json::to_vec(req)?,
+        });
+        let response = client.search_shard_dsl(request).await?.into_inner();
+        if response.success {
+            Ok(response.hits.iter()
+                .filter_map(|h| serde_json::from_slice(&h.source_json).ok())
+                .collect())
+        } else {
+            Err(anyhow::anyhow!("Shard DSL search failed: {}", response.error))
+        }
     }
 
     /// Sends a heartbeat ping to another node
-    pub async fn send_ping(&self, target_node: &NodeInfo, local_node_id: &str) -> Result<(), Error> {
-        let url = format!(
-            "http://{}:{}/_internal/cluster/ping",
-            target_node.host, target_node.transport_port
-        );
-        self.client.post(&url).json(&local_node_id).send().await?;
+    pub async fn send_ping(&self, target_node: &NodeInfo, local_node_id: &str) -> Result<(), anyhow::Error> {
+        let mut client = self.connect(&target_node.host, target_node.transport_port).await?;
+        let request = tonic::Request::new(PingRequest {
+            source_node_id: local_node_id.to_string(),
+        });
+        client.ping(request).await?;
         Ok(())
+    }
+}
+
+// ─── Helper to convert domain NodeInfo → proto NodeInfo ─────────────────────
+
+fn node_info_to_proto(n: &NodeInfo) -> crate::transport::proto::NodeInfo {
+    crate::transport::proto::NodeInfo {
+        id: n.id.clone(),
+        name: n.name.clone(),
+        host: n.host.clone(),
+        transport_port: n.transport_port as u32,
+        http_port: n.http_port as u32,
+        roles: n.roles.iter().map(|r| match r {
+            crate::cluster::state::NodeRole::Master => "master".into(),
+            crate::cluster::state::NodeRole::Data => "data".into(),
+            crate::cluster::state::NodeRole::Client => "client".into(),
+        }).collect(),
     }
 }

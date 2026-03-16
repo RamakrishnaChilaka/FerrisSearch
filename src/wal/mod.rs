@@ -1,9 +1,9 @@
-//! Translog (Write-Ahead Log)
+//! Write-Ahead Log (WAL)
 //!
 //! Provides crash durability for indexed documents.
-//! Every index operation is appended here BEFORE being written to the Tantivy buffer.
+//! Every index operation is appended here BEFORE being written to the engine buffer.
 //! On crash + restart, uncommitted entries are replayed into the engine.
-//! After a successful flush (Tantivy commit), the translog is truncated.
+//! After a successful flush (engine commit), the WAL is truncated.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-/// A single translog entry, representing one indexing operation.
+/// A single WAL entry, representing one indexing operation.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TranslogEntry {
     /// Monotonically increasing sequence number for ordering
@@ -23,17 +23,34 @@ pub struct TranslogEntry {
     pub payload: serde_json::Value,
 }
 
-/// Append-only Write-Ahead Log for durability.
+/// Trait abstracting a Write-Ahead Log backend.
+/// The current default is `HotTranslog` (JSONL file, fsync-per-write).
+/// Future implementations could use memory-only WAL, remote WAL, etc.
+pub trait WriteAheadLog: Send + Sync {
+    /// Append a single operation and fsync for durability.
+    fn append(&self, op: &str, payload: serde_json::Value) -> Result<TranslogEntry>;
+
+    /// Append multiple operations with a single fsync (bulk optimization).
+    fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>>;
+
+    /// Read all pending entries (used for replay on startup).
+    fn read_all(&self) -> Result<Vec<TranslogEntry>>;
+
+    /// Truncate after a successful commit — data is safe in engine segments.
+    fn truncate(&self) -> Result<()>;
+}
+
+/// Hot translog — JSONL-backed, fsync-on-every-write WAL for maximum durability.
 ///
 /// Stored as newline-delimited JSON (JSONL) at `<data_dir>/translog.jsonl`.
 /// Each line is a serialized `TranslogEntry`. The file is fsynced on every write
 /// (request-level durability) to guarantee no ops are lost on crash.
-pub struct Translog {
+pub struct HotTranslog {
     file: Mutex<File>,
     seq_no: Mutex<u64>,
 }
 
-impl Translog {
+impl HotTranslog {
     /// Open or create the translog at the given directory.
     pub fn open<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
         let path = data_dir.as_ref().join("translog.jsonl");
@@ -60,8 +77,26 @@ impl Translog {
         })
     }
 
-    /// Append an operation to the translog and fsync for durability.
-    pub fn append(&self, op: &str, payload: serde_json::Value) -> Result<TranslogEntry> {
+    /// Helper to read entries directly from a path (used during open to check existing state)
+    fn read_entries_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<TranslogEntry>> {
+        let file = OpenOptions::new().read(true).open(&path)?;
+        let reader = BufReader::new(file);
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<TranslogEntry>(&line) {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+}
+
+impl WriteAheadLog for HotTranslog {
+    fn append(&self, op: &str, payload: serde_json::Value) -> Result<TranslogEntry> {
         let mut seq = self.seq_no.lock().unwrap();
         let entry = TranslogEntry {
             seq_no: *seq,
@@ -75,15 +110,12 @@ impl Translog {
 
         let mut file = self.file.lock().unwrap();
         file.write_all(line.as_bytes())?;
-        // fsync — guarantee this is durable on disk before we confirm the write
         file.sync_data()?;
 
         Ok(entry)
     }
 
-    /// Append multiple operations to the translog with a single fsync.
-    /// Much cheaper than calling append() in a loop for bulk indexing.
-    pub fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
+    fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
         let mut seq = self.seq_no.lock().unwrap();
         let mut entries = Vec::with_capacity(ops.len());
         let mut buf = String::new();
@@ -102,15 +134,14 @@ impl Translog {
 
         let mut file = self.file.lock().unwrap();
         file.write_all(buf.as_bytes())?;
-        // Single fsync for the entire batch
         file.sync_data()?;
 
         Ok(entries)
     }
 
-    /// Read all translog entries (used for replay on startup).
-    pub fn read_all(&self) -> Result<Vec<TranslogEntry>> {
-        let file = self.file.lock().unwrap();
+    fn read_all(&self) -> Result<Vec<TranslogEntry>> {
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(0))?;
         let reader = BufReader::new(&*file);
         let mut entries = Vec::new();
         for line in reader.lines() {
@@ -125,35 +156,15 @@ impl Translog {
         Ok(entries)
     }
 
-    /// Truncate the translog to zero bytes after a successful commit.
-    /// The data is now safely committed to Tantivy segments, so we no longer need it.
-    pub fn truncate(&self) -> Result<()> {
+    fn truncate(&self) -> Result<()> {
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(0))?;
         file.set_len(0)?;
         file.sync_data()?;
-        // Reset seq_no since we have a clean slate
         drop(file);
         let mut seq = self.seq_no.lock().unwrap();
         *seq = 0;
         tracing::info!("Translog truncated after flush.");
         Ok(())
-    }
-
-    /// Helper to read entries directly from a path (used during open to check existing state)
-    fn read_entries_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<TranslogEntry>> {
-        let file = OpenOptions::new().read(true).open(&path)?;
-        let reader = BufReader::new(file);
-        let mut entries = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<TranslogEntry>(&line) {
-                entries.push(entry);
-            }
-        }
-        Ok(entries)
     }
 }
