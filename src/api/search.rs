@@ -10,7 +10,12 @@ use futures::future::join_all;
 
 #[derive(Deserialize)]
 pub struct SearchParams {
+    #[serde(default = "default_query")]
     q: String,
+}
+
+fn default_query() -> String {
+    "*".to_string()
 }
 
 /// GET /{index}/_search?q=... — query-string search across all shards (local + remote) for this index.
