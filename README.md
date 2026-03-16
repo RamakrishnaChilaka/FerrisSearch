@@ -18,6 +18,7 @@ ROpenSearch is a lightweight, Rust-native search engine with OpenSearch-compatib
 ## Highlights
 
 - **OpenSearch-compatible REST API** — drop-in `PUT /{index}`, `POST /_doc`, `GET /_search` endpoints
+- **Raft consensus** — cluster state managed by [openraft](https://github.com/datafuselabs/openraft); quorum-based leader election, linearizable writes, automatic failover
 - **Distributed clustering** — multi-node clusters with shard-based data distribution
 - **Synchronous replication** — primary-replica replication over gRPC; writes acknowledged only after all in-sync replicas confirm
 - **Scatter-gather search** — queries fan out across shards, results merged and returned
@@ -48,12 +49,14 @@ curl http://localhost:9200/
 
 ```bash
 # Terminal 1
-./dev_cluster.sh 1    # HTTP 9200 · Transport 9300
+./dev_cluster.sh 1    # HTTP 9200 · Transport 9300 · Raft ID 1
 
 # Terminal 2
-./dev_cluster.sh 2    # HTTP 9201 · Transport 9301
-```
+./dev_cluster.sh 2    # HTTP 9201 · Transport 9301 · Raft ID 2
 
+# Terminal 3
+./dev_cluster.sh 3    # HTTP 9202 · Transport 9302 · Raft ID 3
+```
 ### Configuration
 
 Configure via `config/ropensearch.yml` or `ROPENSEARCH_*` environment variables:
@@ -66,6 +69,7 @@ Configure via `config/ropensearch.yml` or `ROPENSEARCH_*` environment variables:
 | `transport_port` | `9300` | gRPC transport port |
 | `data_dir` | `./data` | Data storage directory |
 | `seed_hosts` | `["127.0.0.1:9300"]` | Seed nodes for discovery |
+| `raft_node_id` | `1` | Unique Raft consensus node ID |
 
 ## API Reference
 
@@ -130,17 +134,30 @@ curl -X POST 'http://localhost:9200/my-index/_flush'      # Fsync translog to di
 
 ```bash
 curl 'http://localhost:9200/_cluster/health'    # Cluster health
-curl 'http://localhost:9200/_cluster/state'     # Cluster state
+curl 'http://localhost:9200/_cluster/state'     # Cluster state (nodes, indices, master)
 curl 'http://localhost:9200/_cat/nodes'         # List nodes
+curl 'http://localhost:9200/_cat/master'        # Current master node
 curl 'http://localhost:9200/_cat/shards'        # List shards
 curl 'http://localhost:9200/_cat/indices'       # List indices
 ```
 
 > Append `?pretty` to any endpoint for formatted JSON.
 
-## Replication
+## Consensus & Replication
 
-ROpenSearch implements synchronous primary-replica replication:
+ROpenSearch uses two complementary replication mechanisms:
+
+### Cluster state (Raft consensus)
+All cluster metadata — node membership, index definitions, shard assignments, master identity — is managed by Raft:
+
+1. Mutations are proposed to the Raft leader via `client_write(ClusterCommand)`
+2. Leader replicates the log entry to a majority of voters
+3. Once committed, every node's state machine applies the change identically
+4. Leader election happens automatically if the current leader dies (1.5–3s timeout)
+5. Dead nodes are detected after 15s of missed heartbeats and removed from the cluster
+
+### Document data (gRPC replication)
+Document writes use direct primary-to-replica replication:
 
 1. Client writes to the primary shard
 2. Primary persists to its engine and WAL
@@ -151,9 +168,10 @@ ROpenSearch implements synchronous primary-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All tests
-cargo test --lib                                # Unit tests
-cargo test --test replication_integration        # Integration tests
+cargo test                                      # All 144 tests
+cargo test --lib                                # Unit tests (119)
+cargo test --test consensus_integration          # Raft consensus tests (14)
+cargo test --test replication_integration        # Replication tests (11)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.
@@ -165,15 +183,16 @@ src/
 ├── api/           REST API handlers (Axum)
 ├── cluster/       Cluster state, membership, shard routing
 ├── config/        Configuration loading
+├── consensus/     Raft consensus (openraft): types, store, state machine, network
 ├── engine/        Tantivy search engine wrapper
 ├── replication/   Primary → replica replication
 ├── shard/         Shard lifecycle management
-├── transport/     gRPC client & server (tonic)
+├── transport/     gRPC client & server (tonic) + Raft RPCs
 ├── wal/           Write-ahead log
 └── main.rs
 
-proto/             gRPC service definitions
-tests/             Integration tests
+proto/             gRPC service definitions (including Raft RPCs)
+tests/             Integration tests (consensus + replication)
 config/            Default configuration
 ```
 
@@ -185,7 +204,7 @@ config/            Default configuration
 - [ ] Bool queries (`must`, `should`, `must_not`, `filter`)
 - [ ] Range queries (`gt`, `gte`, `lt`, `lte`)
 - [ ] Wildcard and prefix queries
-- [ ] Return `_score` in search results
+- [x] Return `_score` in search results
 - [ ] Aggregations (terms, histogram, stats)
 
 ### Index Management
@@ -198,12 +217,15 @@ config/            Default configuration
 - [ ] Document versioning and optimistic concurrency control
 
 ### Cluster Reliability
-- [ ] Leader election with quorum consensus (Raft)
+- [x] Leader election with quorum consensus (Raft)
+- [x] Node failure detection and automatic removal
+- [x] Leader failover with automatic re-election
 - [ ] Automatic shard rebalancing across nodes
-- [ ] Node failure detection with shard reassignment
+- [ ] Shard reassignment on node failure
 - [ ] Replica promotion on primary failure
 - [ ] Shard awareness (co-location prevention)
 - [ ] Delayed allocation for rolling restarts
+- [ ] Persistent Raft log (disk-backed storage)
 
 ### Replication & Recovery
 - [ ] Replica recovery (catch-up from primary after downtime)
