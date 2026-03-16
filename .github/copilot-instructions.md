@@ -42,9 +42,22 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterCommand::SetMaster { node_id }`
 
 ## Test Suite
-- 116 unit tests + 11 consensus integration + 11 replication integration = 138 total
+- 119 unit tests + 14 consensus integration + 11 replication integration = 144 total
 - Run with: `cargo test`
-- Dev cluster: `./dev_cluster.sh 1` and `./dev_cluster.sh 2` (sets unique RAFT_NODE_ID per node)
+- Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
+
+## Node Lifecycle (Raft-driven)
+- First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
+- Joining node: sends JoinCluster gRPC (with raft_node_id) → leader does `AddNode` + `add_learner` + `change_membership`
+- Joining node does NOT call `update_state` — Raft log replication propagates state
+- Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader)
+- Follower lifecycle loop: pings the master for liveness
+
+## Important Design Decisions
+- `ClusterManager::update_state()` is a full overwrite — never use it to replace Raft-managed state
+- `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft. Populated by `add_node()` and `ping_node()`
+- New leader gets a 20s grace period (`leader_since`) before scanning for dead nodes to avoid false positives
+- `raft_node_id` field on NodeInfo is critical for Raft membership changes — must be non-zero for Raft-managed nodes
 
 ## Config
 - `config/ropensearch.yml` for defaults

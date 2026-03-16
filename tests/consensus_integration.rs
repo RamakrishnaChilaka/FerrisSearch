@@ -303,3 +303,74 @@ async fn write_after_remove_node() {
     assert!(state.nodes.contains_key("c"));
     assert_eq!(state.nodes.len(), 2);
 }
+
+#[tokio::test]
+async fn client_write_set_master() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19311".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Initially no master
+    {
+        let state = state_handle.read().unwrap();
+        assert!(state.master_node.is_none());
+    }
+
+    // Set master via Raft
+    raft.client_write(ClusterCommand::SetMaster { node_id: "node-1".into() })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(state.master_node.as_deref(), Some("node-1"));
+}
+
+#[tokio::test]
+async fn raft_node_id_preserved_through_add_node() {
+    // Regression: raft_node_id must survive the Raft SM apply roundtrip
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19312".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let mut node = make_node("data-1");
+    node.raft_node_id = 42;
+
+    raft.client_write(ClusterCommand::AddNode { node }).await.unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(
+        state.nodes["data-1"].raft_node_id, 42,
+        "raft_node_id must be preserved through Raft apply"
+    );
+}
+
+#[tokio::test]
+async fn set_master_then_remove_master_node_clears_master() {
+    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19313".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    raft.client_write(ClusterCommand::AddNode { node: make_node("m") }).await.unwrap();
+    raft.client_write(ClusterCommand::SetMaster { node_id: "m".into() }).await.unwrap();
+    {
+        let state = state_handle.read().unwrap();
+        assert_eq!(state.master_node.as_deref(), Some("m"));
+    }
+
+    raft.client_write(ClusterCommand::RemoveNode { node_id: "m".into() }).await.unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert!(state.master_node.is_none(), "removing master node should clear master_node");
+}

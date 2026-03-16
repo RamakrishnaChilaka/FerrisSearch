@@ -102,6 +102,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/_cat/nodes", get(cat::cat_nodes))
         .route("/_cat/shards", get(cat::cat_shards))
         .route("/_cat/indices", get(cat::cat_indices))
+        .route("/_cat/master", get(cat::cat_master))
         // Index management
         .route("/{index}", put(index::create_index))
         .route("/{index}", delete(index::delete_index))

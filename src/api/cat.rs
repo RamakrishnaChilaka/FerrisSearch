@@ -175,3 +175,32 @@ pub async fn cat_indices(
 
     text_response(out)
 }
+
+/// GET /_cat/master — show the current master node
+pub async fn cat_master(
+    State(state): State<AppState>,
+    params: Query<CatParams>,
+) -> Response {
+    let cs = state.cluster_manager.get_state();
+
+    let mut out = String::new();
+    if wants_headers(&params) {
+        writeln!(out, "{:<40} {:<20} {:<15} {:<6}",
+            "id", "host", "ip", "node"
+        ).unwrap();
+    }
+
+    if let Some(master_id) = &cs.master_node {
+        if let Some(master) = cs.nodes.get(master_id) {
+            writeln!(out, "{:<40} {:<20} {:<15} {:<6}",
+                master.id, master.host, master.host, master.name
+            ).unwrap();
+        } else {
+            writeln!(out, "{:<40} {:<20} {:<15} {:<6}",
+                master_id, "-", "-", "-"
+            ).unwrap();
+        }
+    }
+
+    text_response(out)
+}

@@ -121,9 +121,27 @@ impl Node {
 
             // ── Bootstrap or join ──────────────────────────────────────
             if let Some(ref raft) = raft {
+                // Filter out seed hosts that point to ourselves
+                let remote_seeds: Vec<String> = seed_hosts.iter()
+                    .filter(|h| {
+                        let port = h.rsplit_once(':')
+                            .and_then(|(_, p)| p.parse::<u16>().ok())
+                            .unwrap_or(9300);
+                        port != local_node.transport_port
+                    })
+                    .cloned()
+                    .collect();
+
                 // Try to join an existing cluster (leader handles Raft membership)
-                if let Some(state) = client.join_cluster(&seed_hosts, &local_node, raft_node_id).await {
-                    manager.update_state(state);
+                let joined = if !remote_seeds.is_empty() {
+                    client.join_cluster(&remote_seeds, &local_node, raft_node_id).await
+                } else {
+                    None
+                };
+
+                if joined.is_some() {
+                    // Don't call update_state — Raft log replication will
+                    // propagate the authoritative state to our state machine.
                     info!("Joined existing cluster via seed hosts (Raft membership managed by leader)");
                 } else {
                     // No peers reachable — bootstrap a single-node Raft cluster
@@ -155,6 +173,8 @@ impl Node {
             }
 
             // ── Lifecycle loop ─────────────────────────────────────────
+            let mut leader_since: Option<Instant> = None;
+
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -162,6 +182,10 @@ impl Node {
 
                 if let Some(ref raft) = raft {
                     if raft.is_leader() {
+                        // Track when we became leader for grace period
+                        let now = Instant::now();
+                        let became_leader_at = *leader_since.get_or_insert(now);
+
                         // ── Leader duties ──────────────────────────
                         // Ensure master_node is set to us
                         if state.master_node.as_deref() != Some(&local_id) {
@@ -172,13 +196,16 @@ impl Node {
                             }
                         }
 
-                        // Scan for dead nodes
-                        let now = Instant::now();
+                        // Grace period: don't scan for dead nodes until followers
+                        // have had time to discover and ping the new leader.
+                        let leader_age = now.duration_since(became_leader_at);
                         let mut dead_nodes = Vec::new();
 
-                        for (node_id, last_seen) in &state.last_seen {
-                            if node_id != &local_id && now.duration_since(*last_seen) > Duration::from_secs(15) {
-                                dead_nodes.push(node_id.clone());
+                        if leader_age > Duration::from_secs(20) {
+                            for (node_id, last_seen) in &state.last_seen {
+                                if node_id != &local_id && now.duration_since(*last_seen) > Duration::from_secs(15) {
+                                    dead_nodes.push(node_id.clone());
+                                }
                             }
                         }
 
@@ -207,6 +234,9 @@ impl Node {
                             }
                         }
                     } else {
+                        // Reset leader_since when we're not leader
+                        leader_since = None;
+
                         // ── Follower duties ────────────────────────
                         // Ping the master for health monitoring
                         if let Some(master_id) = &state.master_node {
