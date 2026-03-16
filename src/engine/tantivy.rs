@@ -196,7 +196,7 @@ impl HotEngine {
             .unwrap_or_else(|e| e.into_inner());
 
         let mut results = Vec::new();
-        for (_score, doc_address) in top_docs {
+        for (score, doc_address) in top_docs {
             let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
             // Get _id
             let doc_id = retrieved_doc.get_all(registry.id_field)
@@ -210,6 +210,7 @@ impl HotEngine {
                     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text) {
                         results.push(serde_json::json!({
                             "_id": doc_id,
+                            "_score": score,
                             "_source": json_val
                         }));
                     }

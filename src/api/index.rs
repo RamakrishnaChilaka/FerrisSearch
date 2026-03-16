@@ -348,6 +348,7 @@ pub async fn search_documents_dsl(
                     all_hits.push(serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
                         "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "_score": hit.get("_score"),
                         "_source": hit.get("_source").unwrap_or(&hit)
                     }));
                 }
@@ -389,6 +390,7 @@ pub async fn search_documents_dsl(
                     all_hits.push(serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
                         "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "_score": hit.get("_score"),
                         "_source": hit.get("_source").unwrap_or(&hit)
                     }));
                 }
