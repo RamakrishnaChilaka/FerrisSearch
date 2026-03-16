@@ -78,12 +78,12 @@ pub async fn cat_shards(
 
     for idx_name in index_names {
         let meta = &cs.indices[idx_name];
-        let mut shard_ids: Vec<u32> = meta.shards.keys().copied().collect();
+        let mut shard_ids: Vec<u32> = meta.shard_routing.keys().copied().collect();
         shard_ids.sort();
 
         for shard_id in shard_ids {
-            let node_id = &meta.shards[&shard_id];
-            let node_name = cs.nodes.get(node_id)
+            let routing = &meta.shard_routing[&shard_id];
+            let node_name = cs.nodes.get(&routing.primary)
                 .map(|n| n.name.as_str())
                 .unwrap_or("UNASSIGNED");
 
@@ -96,6 +96,20 @@ pub async fn cat_shards(
             writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<40}",
                 idx_name, shard_id, "p", docs, node_name
             ).unwrap();
+
+            // Also list replica shards
+            for replica_node_id in &routing.replicas {
+                let replica_name = cs.nodes.get(replica_node_id)
+                    .map(|n| n.name.as_str())
+                    .unwrap_or("UNASSIGNED");
+                let replica_docs = state.shard_manager
+                    .get_shard(idx_name, shard_id)
+                    .map(|e| e.doc_count().to_string())
+                    .unwrap_or_else(|| "-".into());
+                writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<40}",
+                    idx_name, shard_id, "r", replica_docs, replica_name
+                ).unwrap();
+            }
         }
     }
 
@@ -117,9 +131,14 @@ pub async fn cat_indices(
             .filter(|n| n.roles.contains(&NodeRole::Data))
             .map(|n| &n.id)
             .collect();
-        for node_id in meta.shards.values() {
-            if !data_node_ids.contains(node_id) {
+        for routing in meta.shard_routing.values() {
+            if !data_node_ids.contains(&routing.primary) {
                 return "yellow";
+            }
+            for replica in &routing.replicas {
+                if !data_node_ids.contains(replica) {
+                    return "yellow";
+                }
             }
         }
         "green"

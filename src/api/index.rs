@@ -25,6 +25,10 @@ pub async fn create_index(
         .pointer("/settings/number_of_shards")
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u32;
+    let num_replicas = settings
+        .pointer("/settings/number_of_replicas")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
 
     let cluster_state = state.cluster_manager.get_state();
 
@@ -44,16 +48,29 @@ pub async fn create_index(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "No data nodes available to assign shards" })));
     }
 
-    let mut shard_assignment: HashMap<u32, String> = HashMap::new();
+    let mut shard_assignment: HashMap<u32, crate::cluster::state::ShardRoutingEntry> = HashMap::new();
     for shard_id in 0..num_shards {
-        let node_id = data_nodes[(shard_id as usize) % data_nodes.len()].clone();
-        shard_assignment.insert(shard_id, node_id);
+        let primary_node = data_nodes[(shard_id as usize) % data_nodes.len()].clone();
+        // Assign replicas round-robin from different nodes than the primary
+        let mut replicas = Vec::new();
+        for r in 0..num_replicas {
+            let replica_idx = ((shard_id as usize) + 1 + (r as usize)) % data_nodes.len();
+            let replica_node = &data_nodes[replica_idx];
+            if *replica_node != primary_node {
+                replicas.push(replica_node.clone());
+            }
+        }
+        shard_assignment.insert(shard_id, crate::cluster::state::ShardRoutingEntry {
+            primary: primary_node,
+            replicas,
+        });
     }
 
     let metadata = IndexMetadata {
         name: index_name.clone(),
         number_of_shards: num_shards,
-        shards: shard_assignment.clone(),
+        number_of_replicas: num_replicas,
+        shard_routing: shard_assignment.clone(),
     };
 
     // Register in cluster state (this node is master for now)
@@ -64,16 +81,16 @@ pub async fn create_index(
     // Broadcast updated state to all nodes so they learn about the new index
     state.transport_client.publish_state(&new_state).await;
 
-    // Open local shard engines for shards assigned to this node
-    for (shard_id, node_id) in &shard_assignment {
-        if *node_id == state.local_node_id {
+    // Open local shard engines for shards assigned to this node (primary or replica)
+    for (shard_id, routing) in &shard_assignment {
+        if routing.primary == state.local_node_id || routing.replicas.contains(&state.local_node_id) {
             if let Err(e) = state.shard_manager.open_shard(&index_name, *shard_id) {
                 tracing::error!("Failed to open shard {} for {}: {}", shard_id, index_name, e);
             }
         }
     }
 
-    tracing::info!("Created index '{}' with {} shards: {:?}", index_name, num_shards, shard_assignment);
+    tracing::info!("Created index '{}' with {} shards, {} replicas", index_name, num_shards, num_replicas);
 
     (StatusCode::OK, Json(serde_json::json!({
         "acknowledged": true,
@@ -110,12 +127,16 @@ pub async fn index_document(
         m.clone()
     } else {
         tracing::warn!("Index '{}' not found, auto-creating with 1 shard", index_name);
-        let mut shard_assignment = HashMap::new();
-        shard_assignment.insert(0u32, state.local_node_id.clone());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(0u32, crate::cluster::state::ShardRoutingEntry {
+            primary: state.local_node_id.clone(),
+            replicas: vec![],
+        });
         let m = IndexMetadata {
             name: index_name.clone(),
             number_of_shards: 1,
-            shards: shard_assignment,
+            number_of_replicas: 0,
+            shard_routing,
         };
         let mut new_state = cluster_state.clone();
         new_state.add_index(m.clone());
@@ -127,7 +148,7 @@ pub async fn index_document(
 
     // Route document to the correct shard
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
-    let target_node_id = match metadata.shards.get(&shard_id) {
+    let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
         None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Shard has no assigned node" }))),
     };
@@ -239,12 +260,16 @@ pub async fn bulk_index(
     let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
         m.clone()
     } else {
-        let mut shard_assignment = HashMap::new();
-        shard_assignment.insert(0u32, state.local_node_id.clone());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(0u32, crate::cluster::state::ShardRoutingEntry {
+            primary: state.local_node_id.clone(),
+            replicas: vec![],
+        });
         let m = IndexMetadata {
             name: index_name.clone(),
             number_of_shards: 1,
-            shards: shard_assignment,
+            number_of_replicas: 0,
+            shard_routing,
         };
         let mut new_state = cluster_state.clone();
         new_state.add_index(m.clone());
@@ -259,7 +284,7 @@ pub async fn bulk_index(
 
     for (doc_id, payload) in &docs {
         let shard_id = crate::engine::routing::calculate_shard(doc_id, metadata.number_of_shards);
-        if let Some(node_id) = metadata.shards.get(&shard_id) {
+        if let Some(node_id) = metadata.primary_node(shard_id) {
             shard_batches.entry((node_id.clone(), shard_id)).or_default().push((doc_id.clone(), payload.clone()));
         }
     }
@@ -339,11 +364,11 @@ pub async fn search_documents_dsl(
         .collect();
 
     let mut remote_futures = Vec::new();
-    for (shard_id, node_id) in &metadata.shards {
+    for (shard_id, routing) in &metadata.shard_routing {
         if local_shard_ids.contains(shard_id) {
             continue; // already queried locally
         }
-        if let Some(node_info) = cluster_state.nodes.get(node_id) {
+        if let Some(node_info) = cluster_state.nodes.get(&routing.primary) {
             let client = state.transport_client.clone();
             let node_info = node_info.clone();
             let index = index_name.clone();
@@ -401,7 +426,7 @@ pub async fn get_document(
     };
 
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
-    let target_node_id = match metadata.shards.get(&shard_id) {
+    let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
         None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Shard has no assigned node" }))),
     };
@@ -438,7 +463,7 @@ pub async fn delete_document(
     };
 
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
-    let target_node_id = match metadata.shards.get(&shard_id) {
+    let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
         None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Shard has no assigned node" }))),
     };

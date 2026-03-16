@@ -264,6 +264,63 @@ impl TransportClient {
         client.ping(request).await?;
         Ok(())
     }
+
+    /// Replicate a single document operation to a replica shard on a remote node.
+    pub async fn replicate_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        doc_id: &str,
+        payload: &serde_json::Value,
+        op: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(ReplicateDocRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            doc_id: doc_id.to_string(),
+            payload_json: serde_json::to_vec(payload)?,
+            op: op.to_string(),
+        });
+        let response = client.replicate_doc(request).await?.into_inner();
+        if response.success {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Replication failed: {}", response.error))
+        }
+    }
+
+    /// Replicate a bulk set of document operations to a replica shard on a remote node.
+    pub async fn replicate_bulk_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        docs: &[(String, serde_json::Value)],
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let ops: Vec<ReplicateDocRequest> = docs.iter()
+            .map(|(id, payload)| ReplicateDocRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                doc_id: id.clone(),
+                payload_json: serde_json::to_vec(payload).unwrap_or_default(),
+                op: "index".to_string(),
+            })
+            .collect();
+        let request = tonic::Request::new(ReplicateBulkRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            ops,
+        });
+        let response = client.replicate_bulk(request).await?.into_inner();
+        if response.success {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Bulk replication failed: {}", response.error))
+        }
+    }
 }
 
 // ─── Helper to convert domain NodeInfo → proto NodeInfo ─────────────────────
