@@ -56,7 +56,7 @@ async fn wait_for_leader(raft: &consensus::types::RaftInstance) {
 
 #[tokio::test]
 async fn single_node_bootstrap_and_leader_election() {
-    let (raft, _state) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, _state) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .expect("create_raft_instance should succeed");
 
@@ -72,7 +72,7 @@ async fn single_node_bootstrap_and_leader_election() {
 
 #[tokio::test]
 async fn double_bootstrap_fails() {
-    let (raft, _state) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, _state) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
 
@@ -87,7 +87,7 @@ async fn double_bootstrap_fails() {
 
 #[tokio::test]
 async fn client_write_add_node() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19302".into())
@@ -108,7 +108,7 @@ async fn client_write_add_node() {
 
 #[tokio::test]
 async fn client_write_remove_node() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19303".into())
@@ -135,7 +135,7 @@ async fn client_write_remove_node() {
 
 #[tokio::test]
 async fn client_write_create_and_delete_index() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19304".into())
@@ -166,7 +166,7 @@ async fn client_write_create_and_delete_index() {
 
 #[tokio::test]
 async fn multiple_writes_are_ordered() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19305".into())
@@ -191,7 +191,7 @@ async fn multiple_writes_are_ordered() {
 
 #[tokio::test]
 async fn cluster_manager_reads_raft_state() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19306".into())
@@ -215,7 +215,7 @@ async fn cluster_manager_reads_raft_state() {
 
 #[tokio::test]
 async fn state_version_increments_on_writes() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19307".into())
@@ -246,7 +246,7 @@ async fn state_version_increments_on_writes() {
 
 #[tokio::test]
 async fn is_leader_after_bootstrap() {
-    let (raft, _state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, _state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19308".into())
@@ -259,7 +259,7 @@ async fn is_leader_after_bootstrap() {
 
 #[tokio::test]
 async fn create_multiple_indices() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19309".into())
@@ -283,7 +283,7 @@ async fn create_multiple_indices() {
 
 #[tokio::test]
 async fn write_after_remove_node() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19310".into())
@@ -306,7 +306,7 @@ async fn write_after_remove_node() {
 
 #[tokio::test]
 async fn client_write_set_master() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19311".into())
@@ -332,7 +332,7 @@ async fn client_write_set_master() {
 #[tokio::test]
 async fn raft_node_id_preserved_through_add_node() {
     // Regression: raft_node_id must survive the Raft SM apply roundtrip
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19312".into())
@@ -354,7 +354,7 @@ async fn raft_node_id_preserved_through_add_node() {
 
 #[tokio::test]
 async fn set_master_then_remove_master_node_clears_master() {
-    let (raft, state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19313".into())
@@ -378,7 +378,7 @@ async fn set_master_then_remove_master_node_clears_master() {
 #[tokio::test]
 async fn transfer_leader_to_self_succeeds() {
     // In a single-node cluster, transferring to self should succeed (no-op).
-    let (raft, _state_handle) = consensus::create_raft_instance(1, "test-cluster".into())
+    let (raft, _state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
         .await
         .unwrap();
     consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19314".into())

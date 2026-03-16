@@ -25,8 +25,11 @@ impl Node {
         // Create Raft consensus instance — the state machine owns the
         // authoritative ClusterState, so ClusterManager shares it.
         let (raft, state_handle) =
-            crate::consensus::create_raft_instance(config.raft_node_id, config.cluster_name.clone())
-                .await?;
+            crate::consensus::create_raft_instance(
+                config.raft_node_id,
+                config.cluster_name.clone(),
+                &config.data_dir,
+            ).await?;
 
         let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle));
         let transport_client = TransportClient::new();
@@ -121,54 +124,62 @@ impl Node {
 
             // ── Bootstrap or join ──────────────────────────────────────
             if let Some(ref raft) = raft {
-                // Filter out seed hosts that point to ourselves
-                let remote_seeds: Vec<String> = seed_hosts.iter()
-                    .filter(|h| {
-                        let port = h.rsplit_once(':')
-                            .and_then(|(_, p)| p.parse::<u16>().ok())
-                            .unwrap_or(9300);
-                        port != local_node.transport_port
-                    })
-                    .cloned()
-                    .collect();
+                // If Raft is already initialized (recovered from disk), skip
+                // bootstrap/join — just wait for the cluster to catch up.
+                let already_initialized = raft.is_initialized().await.unwrap_or(false);
 
-                // Try to join an existing cluster (leader handles Raft membership)
-                let joined = if !remote_seeds.is_empty() {
-                    client.join_cluster(&remote_seeds, &local_node, raft_node_id).await
+                if already_initialized {
+                    info!("Raft already initialized (recovered from disk), rejoining cluster");
                 } else {
-                    None
-                };
+                    // Filter out seed hosts that point to ourselves
+                    let remote_seeds: Vec<String> = seed_hosts.iter()
+                        .filter(|h| {
+                            let port = h.rsplit_once(':')
+                                .and_then(|(_, p)| p.parse::<u16>().ok())
+                                .unwrap_or(9300);
+                            port != local_node.transport_port
+                        })
+                        .cloned()
+                        .collect();
 
-                if joined.is_some() {
-                    // Don't call update_state — Raft log replication will
-                    // propagate the authoritative state to our state machine.
-                    info!("Joined existing cluster via seed hosts (Raft membership managed by leader)");
-                } else {
-                    // No peers reachable — bootstrap a single-node Raft cluster
-                    info!("No cluster found, bootstrapping single-node Raft cluster");
-                    let transport_addr = format!("127.0.0.1:{}", local_node.transport_port);
-                    if let Err(e) = crate::consensus::bootstrap_single_node(
-                        raft, raft_node_id, transport_addr,
-                    ).await {
-                        tracing::warn!("Raft bootstrap failed (may already be initialised): {}", e);
-                    }
+                    // Try to join an existing cluster (leader handles Raft membership)
+                    let joined = if !remote_seeds.is_empty() {
+                        client.join_cluster(&remote_seeds, &local_node, raft_node_id).await
+                    } else {
+                        None
+                    };
 
-                    // Wait for leader election
-                    for _ in 0..50 {
-                        if raft.current_leader().await.is_some() {
-                            break;
+                    if joined.is_some() {
+                        // Don't call update_state — Raft log replication will
+                        // propagate the authoritative state to our state machine.
+                        info!("Joined existing cluster via seed hosts (Raft membership managed by leader)");
+                    } else {
+                        // No peers reachable — bootstrap a single-node Raft cluster
+                        info!("No cluster found, bootstrapping single-node Raft cluster");
+                        let transport_addr = format!("127.0.0.1:{}", local_node.transport_port);
+                        if let Err(e) = crate::consensus::bootstrap_single_node(
+                            raft, raft_node_id, transport_addr,
+                        ).await {
+                            tracing::warn!("Raft bootstrap failed (may already be initialised): {}", e);
                         }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
 
-                    // Register self and set master through Raft
-                    if let Err(e) = raft.client_write(ClusterCommand::AddNode { node: local_node.clone() }).await {
-                        tracing::error!("Failed to register self via Raft: {}", e);
+                        // Wait for leader election
+                        for _ in 0..50 {
+                            if raft.current_leader().await.is_some() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+
+                        // Register self and set master through Raft
+                        if let Err(e) = raft.client_write(ClusterCommand::AddNode { node: local_node.clone() }).await {
+                            tracing::error!("Failed to register self via Raft: {}", e);
+                        }
+                        if let Err(e) = raft.client_write(ClusterCommand::SetMaster { node_id: local_id.clone() }).await {
+                            tracing::error!("Failed to set master via Raft: {}", e);
+                        }
+                        info!("Bootstrapped as master: {}", local_id);
                     }
-                    if let Err(e) = raft.client_write(ClusterCommand::SetMaster { node_id: local_id.clone() }).await {
-                        tracing::error!("Failed to set master via Raft: {}", e);
-                    }
-                    info!("Bootstrapped as master: {}", local_id);
                 }
             }
 

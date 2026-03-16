@@ -12,6 +12,7 @@ futures = "0.3.32"
 murmur3 = "0.5"
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "tokio-rt"] }
 prost = "0.13"
+redb = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
