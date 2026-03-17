@@ -12,6 +12,13 @@ pub fn calculate_shard(document_id: &str, number_of_shards: u32) -> u32 {
     hash % number_of_shards
 }
 
+/// Hash a string to a u64 key (used for USearch vector index keys).
+pub fn hash_string(s: &str) -> u64 {
+    let hash128 = murmur3::murmur3_x86_128(&mut Cursor::new(s.as_bytes()), 0)
+        .expect("murmur3 hashing from memory cursor cannot fail");
+    hash128 as u64
+}
+
 /// Given a document ID and the index metadata, determine exactly which Node ID should hold this document
 pub fn route_document(document_id: &str, index_metadata: &IndexMetadata) -> Option<String> {
     if index_metadata.number_of_shards == 0 {

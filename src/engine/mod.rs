@@ -1,17 +1,27 @@
+pub mod composite;
 pub mod routing;
 pub mod tantivy;
+pub mod vector;
 
 use anyhow::Result;
 
+pub use self::composite::CompositeEngine;
 pub use self::tantivy::HotEngine;
 
 /// Trait abstracting a search engine backend.
-/// Each shard is backed by one `SearchEngine` implementation.
-/// The current default is `HotEngine` (Tantivy-based, all data in-memory/mmap).
-/// Future implementations could include warm/cold storage engines,
-/// columnar engines, or remote storage backends.
+/// Each shard/split is backed by one `SearchEngine` implementation.
+/// Implementations handle both text and vector indexing/search.
+///
+/// Current implementations:
+/// - `CompositeEngine` — HotEngine (Tantivy) + optional VectorIndex (USearch)
+///
+/// Future implementations could include:
+/// - Shardless/split-based engines (Quickwit-style immutable segments)
+/// - Remote storage backends
+/// - Warm/cold tiered engines
 pub trait SearchEngine: Send + Sync {
     /// Index a single document with a given ID. Returns the document ID.
+    /// Implementations should handle both text and vector fields.
     fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String>;
 
     /// Bulk-index documents. Each tuple is (doc_id, payload). Returns document IDs.
@@ -34,6 +44,12 @@ pub trait SearchEngine: Send + Sync {
 
     /// Search using the OpenSearch Query DSL body.
     fn search_query(&self, req: &crate::search::SearchRequest) -> Result<Vec<serde_json::Value>>;
+
+    /// k-NN vector search. Returns hits with _id, _score, _source, _knn_distance.
+    /// Default implementation returns empty (no vector support).
+    fn search_knn(&self, _field: &str, _vector: &[f32], _k: usize) -> Result<Vec<serde_json::Value>> {
+        Ok(vec![])
+    }
 
     /// Returns the number of searchable documents.
     fn doc_count(&self) -> u64;

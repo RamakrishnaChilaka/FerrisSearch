@@ -2,7 +2,7 @@
 //! Each index has N primary shards. Each shard is backed by a `SearchEngine` implementation.
 //! The ShardManager owns all local shard engines on this node.
 
-use crate::engine::{HotEngine, SearchEngine};
+use crate::engine::{CompositeEngine, SearchEngine};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,13 +27,10 @@ impl ShardKey {
 }
 
 /// Manages all shard engines on this node.
-/// Each shard is backed by a `dyn SearchEngine` (currently `HotEngine`).
+/// Each shard is backed by a `CompositeEngine` (Tantivy text + USearch vector).
 pub struct ShardManager {
-    /// Base data directory for this node (e.g. `data/node-1`)
     data_dir: PathBuf,
-    /// Refresh interval applied to each new shard engine
     refresh_interval: Duration,
-    /// Map from (index, shard_id) → engine
     shards: RwLock<HashMap<ShardKey, Arc<dyn SearchEngine>>>,
 }
 
@@ -46,8 +43,8 @@ impl ShardManager {
         }
     }
 
-    /// Open or create the engine for a specific shard, starting its refresh loop.
-    /// Called when an index is created or when the node recovers a shard on startup.
+    /// Open or create the engine for a specific shard.
+    /// Uses CompositeEngine which handles both text and vector indexing.
     pub fn open_shard(&self, index: &str, shard_id: u32) -> Result<Arc<dyn SearchEngine>> {
         let key = ShardKey::new(index, shard_id);
         {
@@ -57,12 +54,16 @@ impl ShardManager {
             }
         }
 
-        // Create the shard data directory: <node_data_dir>/<index>/shard_<id>/
         let shard_dir = self.data_dir.join(&key.data_dir());
         std::fs::create_dir_all(&shard_dir)?;
 
-        let engine = Arc::new(HotEngine::new(&shard_dir, self.refresh_interval)?);
-        HotEngine::start_refresh_loop(engine.clone());
+        let engine = Arc::new(CompositeEngine::new(&shard_dir, self.refresh_interval)?);
+        CompositeEngine::start_refresh_loop(engine.clone());
+
+        // Rebuild vector index from persisted documents (covers crash recovery)
+        if let Err(e) = engine.rebuild_vectors() {
+            tracing::warn!("Failed to rebuild vectors for {}/shard_{}: {}", index, shard_id, e);
+        }
 
         tracing::info!("Opened shard engine for {}/{} at {:?}", index, shard_id, shard_dir);
 
@@ -72,13 +73,13 @@ impl ShardManager {
         Ok(dyn_engine)
     }
 
-    /// Get an already-open shard engine. Returns None if this shard isn't local.
+    /// Get an already-open shard engine.
     pub fn get_shard(&self, index: &str, shard_id: u32) -> Option<Arc<dyn SearchEngine>> {
         let key = ShardKey::new(index, shard_id);
         self.shards.read().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
     }
 
-    /// Return all local shard engines for a given index (for scatter-gather operations).
+    /// Return all local shard engines for a given index.
     pub fn get_index_shards(&self, index: &str) -> Vec<(u32, Arc<dyn SearchEngine>)> {
         self.shards.read().unwrap_or_else(|e| e.into_inner())
             .iter()
@@ -107,7 +108,6 @@ impl ShardManager {
         }
         drop(shards);
 
-        // Delete the index data directory on disk
         let index_dir = self.data_dir.join(index);
         if index_dir.exists() {
             std::fs::remove_dir_all(&index_dir)?;

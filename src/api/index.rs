@@ -359,7 +359,7 @@ pub async fn search_documents_dsl(
     let mut successful = 0u32;
     let mut failed = 0u32;
 
-    // Query local shards directly
+    // Query local shards directly (text search)
     for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
         match engine.search_query(&search_req) {
             Ok(hits) => {
@@ -374,6 +374,33 @@ pub async fn search_documents_dsl(
                 }
             }
             Err(e) => { tracing::error!("Shard {}/{} search failed: {}", index_name, shard_id, e); failed += 1; }
+        }
+    }
+
+    // k-NN vector search on local shards (if knn clause present)
+    if let Some(ref knn) = search_req.knn {
+        if let Some((field_name, params)) = knn.fields.iter().next() {
+            for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
+                match engine.search_knn(field_name, &params.vector, params.k) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            all_hits.push(serde_json::json!({
+                                "_index": index_name,
+                                "_shard": shard_id,
+                                "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                "_score": hit.get("_score"),
+                                "_source": hit.get("_source"),
+                                "_knn_field": hit.get("_knn_field"),
+                                "_knn_distance": hit.get("_knn_distance"),
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Vector search on {}/shard_{} failed: {}", index_name, shard_id, e);
+                        failed += 1;
+                    }
+                }
+            }
         }
     }
 
