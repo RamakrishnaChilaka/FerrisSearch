@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="FerrisSearch" width="400">
+</p>
+
 # FerrisSearch
 
 <p align="center">
