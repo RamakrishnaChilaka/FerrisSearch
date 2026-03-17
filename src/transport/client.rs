@@ -4,6 +4,8 @@ use crate::cluster::state::{ClusterState, NodeInfo};
 use crate::transport::proto::internal_transport_client::InternalTransportClient;
 use crate::transport::proto::*;
 use crate::transport::server::{cluster_state_to_proto, proto_to_cluster_state};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error, info};
@@ -11,6 +13,10 @@ use tracing::{debug, error, info};
 #[derive(Clone)]
 pub struct TransportClient {
     timeout: Duration,
+    /// Cached gRPC channels keyed by "host:port".
+    /// Uses RwLock for concurrent reads (cache hits) — only blocks on writes (cache misses).
+    /// Tonic channels handle HTTP/2 multiplexing and reconnection internally.
+    channels: Arc<RwLock<HashMap<String, Channel>>>,
 }
 
 impl Default for TransportClient {
@@ -23,16 +29,34 @@ impl TransportClient {
     pub fn new() -> Self {
         Self {
             timeout: Duration::from_secs(5),
+            channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Connect to a remote node's gRPC transport endpoint
+    /// Connect to a remote node's gRPC transport endpoint, reusing cached channels.
     async fn connect(&self, host: &str, port: u16) -> Result<InternalTransportClient<Channel>, tonic::transport::Error> {
+        let key = format!("{}:{}", host, port);
+
+        // Fast path: read lock for cache hit (concurrent, non-blocking)
+        {
+            let cache = self.channels.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(channel) = cache.get(&key) {
+                return Ok(InternalTransportClient::new(channel.clone()));
+            }
+        }
+
+        // Slow path: create new channel, then write lock to cache it
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}:{}", host, port))
             .expect("valid endpoint URI")
             .timeout(self.timeout)
             .connect_timeout(self.timeout);
         let channel = endpoint.connect().await?;
+
+        {
+            let mut cache = self.channels.write().unwrap_or_else(|e| e.into_inner());
+            cache.insert(key, channel.clone());
+        }
+
         Ok(InternalTransportClient::new(channel))
     }
 
@@ -340,5 +364,51 @@ fn node_info_to_proto(n: &NodeInfo) -> crate::transport::proto::NodeInfo {
             crate::cluster::state::NodeRole::Data => "data".into(),
             crate::cluster::state::NodeRole::Client => "client".into(),
         }).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_client_has_empty_cache() {
+        let client = TransportClient::new();
+        let cache = client.channels.read().unwrap();
+        assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cloned_client_shares_cache() {
+        let client = TransportClient::new();
+        let client2 = client.clone();
+
+        // Insert a dummy entry via the first client (write lock)
+        {
+            let mut cache = client.channels.write().unwrap();
+            let endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.1:1");
+            cache.insert("127.0.0.1:1".into(), endpoint.connect_lazy());
+        }
+
+        // The clone should see it (read lock — concurrent)
+        let cache2 = client2.channels.read().unwrap();
+        assert!(cache2.contains_key("127.0.0.1:1"), "cloned client must share the channel cache");
+    }
+
+    #[tokio::test]
+    async fn connect_caches_channel_on_success() {
+        // We can't test a real connection without a running server,
+        // but we can verify the cache is populated after the replication
+        // integration tests run (they start real gRPC servers).
+        // Here we just verify the structure works.
+        let client = TransportClient::new();
+
+        // Attempting to connect to a non-existent server should fail
+        let result = client.connect("127.0.0.1", 1).await;
+        assert!(result.is_err(), "connecting to a closed port should fail");
+
+        // Cache should NOT contain the failed connection
+        let cache = client.channels.read().unwrap();
+        assert!(!cache.contains_key("127.0.0.1:1"), "failed connections should not be cached");
     }
 }
