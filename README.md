@@ -284,7 +284,7 @@ config/            Default configuration
 - [ ] Slow replica detection and backpressure
 
 ### Transport & Resilience
-- [ ] Connection pooling (reuse gRPC channels)
+- [x] Connection pooling (reuse gRPC channels)
 - [ ] Retry with exponential backoff
 - [ ] Circuit breaker for unresponsive nodes
 - [ ] TLS encryption for gRPC transport
