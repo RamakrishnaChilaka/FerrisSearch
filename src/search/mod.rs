@@ -57,6 +57,10 @@ pub enum QueryClause {
     Bool(BoolQuery),
     /// Range query: `{ "range": { "field": { "gte": 10, "lt": 100 } } }`
     Range(HashMap<String, RangeCondition>),
+    /// Wildcard query: `{ "wildcard": { "field": "ru*t" } }` — `*` matches any chars, `?` matches one char
+    Wildcard(HashMap<String, serde_json::Value>),
+    /// Prefix query: `{ "prefix": { "field": "sea" } }` — matches terms starting with the value
+    Prefix(HashMap<String, serde_json::Value>),
 }
 
 /// Range condition with optional gt/gte/lt/lte bounds.
@@ -411,5 +415,54 @@ mod tests {
         // query should default to match_all
         assert!(matches!(req.query, QueryClause::MatchAll(_)));
         assert!(req.knn.is_some());
+    }
+
+    // ── Wildcard / Prefix deserialization ────────────────────────────────
+
+    #[test]
+    fn deserialize_wildcard_query() {
+        let body = json!({
+            "query": { "wildcard": { "title": "rust*" } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Wildcard(fields) => {
+                assert_eq!(fields["title"], "rust*");
+            }
+            _ => panic!("expected Wildcard query"),
+        }
+    }
+
+    #[test]
+    fn deserialize_prefix_query() {
+        let body = json!({
+            "query": { "prefix": { "title": "sea" } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Prefix(fields) => {
+                assert_eq!(fields["title"], "sea");
+            }
+            _ => panic!("expected Prefix query"),
+        }
+    }
+
+    #[test]
+    fn wildcard_inside_bool_filter() {
+        let body = json!({
+            "query": {
+                "bool": {
+                    "must": [{ "match": { "body": "search" } }],
+                    "filter": [{ "wildcard": { "title": "r?st" } }]
+                }
+            }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Bool(bq) => {
+                assert!(matches!(&bq.filter[0], QueryClause::Wildcard(_)));
+            }
+            _ => panic!("expected Bool"),
+        }
     }
 }

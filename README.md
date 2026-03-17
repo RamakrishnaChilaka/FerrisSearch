@@ -246,8 +246,8 @@ Document writes use direct primary-to-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All 188 tests
-cargo test --lib                                # Unit tests (162)
+cargo test                                      # All 228 tests
+cargo test --lib                                # Unit tests (202)
 cargo test --test consensus_integration          # Raft consensus tests (15)
 cargo test --test replication_integration        # Replication tests (11)
 ```
@@ -281,7 +281,7 @@ config/            Default configuration
 - [ ] Sort by field and `_score`
 - [x] Bool queries (`must`, `should`, `must_not`, `filter`)
 - [x] Range queries (`gt`, `gte`, `lt`, `lte`)
-- [ ] Wildcard and prefix queries
+- [x] Wildcard and prefix queries
 - [x] Return `_score` in search results
 - [ ] Aggregations (terms, histogram, stats)
 
