@@ -8,7 +8,7 @@ use crate::cluster::state::{IndexMetadata, NodeInfo};
 // ─── Raft Type Config ───────────────────────────────────────────────────────
 
 openraft::declare_raft_types!(
-    /// Type configuration for the ROpenSearch Raft consensus layer.
+    /// Type configuration for the FerrisSearch Raft consensus layer.
     pub TypeConfig:
         D = ClusterCommand,
         R = ClusterResponse,

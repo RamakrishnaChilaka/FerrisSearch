@@ -3,18 +3,18 @@
 //! These tests spin up real gRPC transport servers (in-process) and exercise the
 //! full write → replicate → read path, similar to OpenSearch's ESIntegTestCase.
 
-use ropensearch::cluster::manager::ClusterManager;
-use ropensearch::cluster::state::{
+use ferrissearch::cluster::manager::ClusterManager;
+use ferrissearch::cluster::state::{
     IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
 };
-use ropensearch::shard::ShardManager;
-use ropensearch::transport::proto::internal_transport_client::InternalTransportClient;
-use ropensearch::transport::proto::{
+use ferrissearch::shard::ShardManager;
+use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
+use ferrissearch::transport::proto::{
     self, JoinRequest, PublishStateRequest, ReplicateBulkRequest, ReplicateDocRequest,
     ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest,
 };
-use ropensearch::transport::server::create_transport_service;
-use ropensearch::transport::TransportClient;
+use ferrissearch::transport::server::create_transport_service;
+use ferrissearch::transport::TransportClient;
 
 use std::collections::HashMap;
 use std::sync::Arc;

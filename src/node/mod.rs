@@ -47,7 +47,7 @@ impl Node {
     /// Starts the node, including all subsystems (HTTP, Transport, Cluster, Engine)
     pub async fn start(&self) -> anyhow::Result<()> {
         info!(
-            "Starting ROpenSearch Node: {} (Cluster: {}, raft_id={})",
+            "Starting FerrisSearch Node: {} (Cluster: {}, raft_id={})",
             self.config.node_name, self.config.cluster_name, self.config.raft_node_id
         );
         info!("Data directory: {}", self.config.data_dir);

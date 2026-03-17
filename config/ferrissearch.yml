@@ -1,0 +1,10 @@
+# Node identity
+node_name: "ferrissearch-dev-1"
+cluster_name: "ferrissearch-local"
+
+# Networking
+http_port: 9200
+transport_port: 9300
+
+# Storage
+# data_dir: "./data/ferrissearch-dev-1"

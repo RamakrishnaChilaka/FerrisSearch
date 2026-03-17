@@ -69,7 +69,7 @@ pub async fn get_state(State(state): State<AppState>) -> Json<ClusterState> {
     Json(state.cluster_manager.get_state())
 }
 
-// ─── Transfer Master (ROpenSearch-only) ─────────────────────────────────────
+// ─── Transfer Master (FerrisSearch-only) ─────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct TransferMasterRequest {
@@ -80,7 +80,7 @@ pub struct TransferMasterRequest {
 /// Handler for `POST /_cluster/transfer_master`
 ///
 /// Gracefully transfers Raft leadership to the specified node.
-/// This is a ROpenSearch-specific API — not present in OpenSearch.
+/// This is a FerrisSearch-specific API — not present in OpenSearch.
 pub async fn transfer_master(
     State(state): State<AppState>,
     Json(req): Json<TransferMasterRequest>,

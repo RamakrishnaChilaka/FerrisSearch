@@ -23,7 +23,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             node_name: "node-1".into(),
-            cluster_name: "ropensearch".into(),
+            cluster_name: "ferrissearch".into(),
             http_port: 9200,
             transport_port: 9300,
             data_dir: "./data".into(),
@@ -46,8 +46,8 @@ impl AppConfig {
             .set_default("data_dir", default.data_dir)?
             .set_default("seed_hosts", default.seed_hosts)?
             .set_default("raft_node_id", default.raft_node_id)?
-            .add_source(File::with_name("config/ropensearch").required(false))
-            .add_source(Environment::with_prefix("ROPENSEARCH").list_separator(","));
+            .add_source(File::with_name("config/ferrissearch").required(false))
+            .add_source(Environment::with_prefix("FERRISSEARCH").list_separator(","));
 
         let config = builder.build()?;
         let app_config: AppConfig = config.try_deserialize()?;

@@ -23,15 +23,15 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/ropensearch /usr/local/bin/ropensearch
-COPY config/ /etc/ropensearch/config/
+COPY --from=builder /app/target/release/ferrissearch /usr/local/bin/ferrissearch
+COPY config/ /etc/ferrissearch/config/
 
 WORKDIR /data
 
-ENV ROPENSEARCH_DATA_DIR=/data
-ENV ROPENSEARCH_HTTP_PORT=9200
-ENV ROPENSEARCH_TRANSPORT_PORT=9300
+ENV FERRISSEARCH_DATA_DIR=/data
+ENV FERRISSEARCH_HTTP_PORT=9200
+ENV FERRISSEARCH_TRANSPORT_PORT=9300
 
 EXPOSE 9200 9300
 
-ENTRYPOINT ["ropensearch"]
+ENTRYPOINT ["ferrissearch"]

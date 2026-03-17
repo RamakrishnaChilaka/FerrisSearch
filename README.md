@@ -1,4 +1,4 @@
-# ROpenSearch
+# FerrisSearch
 
 <p align="center">
   <strong>A distributed search engine written in Rust, powered by <a href="https://github.com/quickwit-oss/tantivy">Tantivy</a></strong>
@@ -13,7 +13,7 @@
 
 ---
 
-ROpenSearch is a lightweight, Rust-native search engine with OpenSearch-compatible REST APIs. Built for teams that want the familiar OpenSearch interface with the performance and safety of Rust.
+FerrisSearch is a lightweight, Rust-native search engine with OpenSearch-compatible REST APIs. Built for teams that want the familiar OpenSearch interface with the performance and safety of Rust.
 
 ## Highlights
 
@@ -41,15 +41,15 @@ cargo run
 ### Docker
 
 ```bash
-docker build -t ropensearch .
-docker run -p 9200:9200 -p 9300:9300 ropensearch
+docker build -t ferrissearch .
+docker run -p 9200:9200 -p 9300:9300 ferrissearch
 ```
 
 ```bash
 curl http://localhost:9200/
 ```
 ```json
-{"name": "ropensearch-node", "version": "0.1.0", "engine": "tantivy"}
+{"name": "ferrissearch-node", "version": "0.1.0", "engine": "tantivy"}
 ```
 
 ### Multi-node cluster
@@ -66,12 +66,12 @@ curl http://localhost:9200/
 ```
 ### Configuration
 
-Configure via `config/ropensearch.yml` or `ROPENSEARCH_*` environment variables:
+Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variables:
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `node_name` | `node-1` | Node identifier |
-| `cluster_name` | `ropensearch` | Cluster name |
+| `cluster_name` | `ferrissearch` | Cluster name |
 | `http_port` | `9200` | REST API port |
 | `transport_port` | `9300` | gRPC transport port |
 | `data_dir` | `./data` | Data storage directory |
@@ -194,7 +194,7 @@ curl 'http://localhost:9200/_cat/indices'       # List indices
 
 ## Consensus & Replication
 
-ROpenSearch uses two complementary replication mechanisms:
+FerrisSearch uses two complementary replication mechanisms:
 
 ### Cluster state (Raft consensus)
 All cluster metadata — node membership, index definitions, shard assignments, master identity — is managed by Raft:

@@ -3,12 +3,12 @@
 //! These tests spin up real Raft instances (single-node) and exercise the full
 //! flow: bootstrap → leader election → client_write → state machine apply.
 
-use ropensearch::cluster::manager::ClusterManager;
-use ropensearch::cluster::state::{
+use ferrissearch::cluster::manager::ClusterManager;
+use ferrissearch::cluster::state::{
     IndexMetadata, NodeInfo, NodeRole, ShardRoutingEntry,
 };
-use ropensearch::consensus;
-use ropensearch::consensus::types::{ClusterCommand, ClusterResponse};
+use ferrissearch::consensus;
+use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
 
 use std::collections::HashMap;
 use std::sync::Arc;

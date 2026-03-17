@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # dev_cluster.sh
-# A quick helper script to spin up isolated local nodes for ROpenSearch testing
+# A quick helper script to spin up isolated local nodes for FerrisSearch testing
 
 if [ -z "$1" ]; then
     echo "Usage: ./dev_cluster.sh <node_id> [port_offset]"
@@ -17,13 +17,13 @@ OFFSET=$((NODE_ID - 1))
 HTTP_PORT=$((9200 + OFFSET))
 TRANSPORT_PORT=$((9300 + OFFSET))
 
-export ROPENSEARCH_NODE_NAME="node-$NODE_ID"
-export ROPENSEARCH_HTTP_PORT=$HTTP_PORT
-export ROPENSEARCH_TRANSPORT_PORT=$TRANSPORT_PORT
-export ROPENSEARCH_DATA_DIR="./data/node-$NODE_ID"
-export ROPENSEARCH_RAFT_NODE_ID=$NODE_ID
+export FERRISSEARCH_NODE_NAME="node-$NODE_ID"
+export FERRISSEARCH_HTTP_PORT=$HTTP_PORT
+export FERRISSEARCH_TRANSPORT_PORT=$TRANSPORT_PORT
+export FERRISSEARCH_DATA_DIR="./data/node-$NODE_ID"
+export FERRISSEARCH_RAFT_NODE_ID=$NODE_ID
 
-echo "Starting ROpenSearch Node $NODE_ID..."
+echo "Starting FerrisSearch Node $NODE_ID..."
 echo "HTTP Port: $HTTP_PORT | Transport Port: $TRANSPORT_PORT"
 
 cargo run

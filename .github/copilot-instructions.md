@@ -1,4 +1,4 @@
-# ROpenSearch — Copilot Context
+# FerrisSearch — Copilot Context
 
 ## Project Overview
 Distributed search engine in Rust, inspired by OpenSearch/Elasticsearch.
@@ -60,8 +60,8 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `raft_node_id` field on NodeInfo is critical for Raft membership changes — must be non-zero for Raft-managed nodes
 
 ## Config
-- `config/ropensearch.yml` for defaults
-- `ROPENSEARCH_*` env vars override (e.g., ROPENSEARCH_RAFT_NODE_ID, ROPENSEARCH_NODE_NAME)
+- `config/ferrissearch.yml` for defaults
+- `FERRISSEARCH_*` env vars override (e.g., FERRISSEARCH_RAFT_NODE_ID, FERRISSEARCH_NODE_NAME)
 
 ## Development Workflow
 When implementing any feature or fix:

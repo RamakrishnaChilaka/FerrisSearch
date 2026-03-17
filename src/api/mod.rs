@@ -30,7 +30,7 @@ struct NodeInfoResponse {
 
 async fn handle_root() -> Json<NodeInfoResponse> {
     Json(NodeInfoResponse {
-        name: "ropensearch-node".into(),
+        name: "ferrissearch-node".into(),
         version: "0.1.0".into(),
         engine: "tantivy".into(),
     })

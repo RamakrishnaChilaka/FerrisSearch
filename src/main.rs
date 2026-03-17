@@ -1,5 +1,5 @@
-use ropensearch::config::AppConfig;
-use ropensearch::node::Node;
+use ferrissearch::config::AppConfig;
+use ferrissearch::node::Node;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set default tracing subscriber");
 
-    // Load config from defaults, config/ropensearch.yml, and ROPENSEARCH_* env vars
+    // Load config from defaults, config/ferrissearch.yml, and FERRISSEARCH_* env vars
     let config = AppConfig::load()?;
 
     // Initialize and start the node
