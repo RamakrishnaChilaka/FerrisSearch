@@ -7,15 +7,40 @@ use std::collections::HashMap;
 /// Top-level search request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
+    #[serde(default = "default_query")]
     pub query: QueryClause,
     #[serde(default = "default_size")]
     pub size: usize,
     #[serde(default)]
     pub from: usize,
+    /// Optional k-NN vector search clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn: Option<KnnQuery>,
+}
+
+fn default_query() -> QueryClause {
+    QueryClause::MatchAll(serde_json::Value::Object(Default::default()))
 }
 
 fn default_size() -> usize {
     10
+}
+
+/// k-NN search clause: `{ "knn": { "field_name": { "vector": [...], "k": 10 } } }`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnnQuery {
+    /// The field name containing the vector (flattened from the map).
+    #[serde(flatten)]
+    pub fields: HashMap<String, KnnParams>,
+}
+
+/// Parameters for a k-NN search on a single field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnnParams {
+    /// Query vector.
+    pub vector: Vec<f32>,
+    /// Number of nearest neighbors to return.
+    pub k: usize,
 }
 
 /// A query clause: term, match, match_all, bool, or range.
@@ -133,6 +158,7 @@ mod tests {
             query: QueryClause::MatchAll(json!({})),
             size: 20,
             from: 5,
+            knn: None,
         };
         let json_str = serde_json::to_string(&req).unwrap();
         let req2: SearchRequest = serde_json::from_str(&json_str).unwrap();
@@ -255,6 +281,7 @@ mod tests {
             }),
             size: 5,
             from: 10,
+            knn: None,
         };
         let json_str = serde_json::to_string(&req).unwrap();
         let req2: SearchRequest = serde_json::from_str(&json_str).unwrap();
@@ -338,5 +365,51 @@ mod tests {
             }
             _ => panic!("expected Bool query"),
         }
+    }
+
+    // ── k-NN deserialization tests ──────────────────────────────────────
+
+    #[test]
+    fn deserialize_knn_query() {
+        let body = json!({
+            "knn": { "embedding": { "vector": [0.1, 0.2, 0.3], "k": 10 } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        let knn = req.knn.unwrap();
+        let params = knn.fields.get("embedding").unwrap();
+        assert_eq!(params.vector, vec![0.1, 0.2, 0.3]);
+        assert_eq!(params.k, 10);
+    }
+
+    #[test]
+    fn deserialize_knn_with_text_query() {
+        let body = json!({
+            "query": { "match": { "title": "search" } },
+            "knn": { "embedding": { "vector": [0.1, 0.2], "k": 5 } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert!(matches!(req.query, QueryClause::Match(_)));
+        let knn = req.knn.unwrap();
+        assert_eq!(knn.fields.get("embedding").unwrap().k, 5);
+    }
+
+    #[test]
+    fn deserialize_no_knn_defaults_to_none() {
+        let body = json!({
+            "query": { "match_all": {} }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert!(req.knn.is_none());
+    }
+
+    #[test]
+    fn deserialize_knn_only_no_query() {
+        let body = json!({
+            "knn": { "vec_field": { "vector": [1.0, 2.0, 3.0, 4.0], "k": 3 } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        // query should default to match_all
+        assert!(matches!(req.query, QueryClause::MatchAll(_)));
+        assert!(req.knn.is_some());
     }
 }

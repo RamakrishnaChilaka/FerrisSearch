@@ -26,8 +26,8 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/node/mod.rs` — Node startup, Raft bootstrap, lifecycle loop
 - `src/transport/` — gRPC server (with Raft RPCs) and client
 - `src/api/` — Axum HTTP handlers (index CRUD routes through Raft)
-- `src/engine/` — Tantivy search engine abstraction
-- `src/shard/` — Shard management
+- `src/engine/` — Search engine abstraction: mod.rs (SearchEngine trait), composite.rs, tantivy.rs, vector.rs
+- `src/shard/` — Shard management (uses CompositeEngine)
 
 ## openraft 0.10.0-alpha.17 API Gotchas
 - `Vote::new(term: u64, node_id: u64)` — NOT `Vote::new(LeaderId, bool)`
@@ -42,7 +42,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterCommand::SetMaster { node_id }`
 
 ## Test Suite
-- 119 unit tests + 14 consensus integration + 11 replication integration = 144 total
+- 194 unit tests + 15 consensus integration + 11 replication integration = 220 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 

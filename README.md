@@ -19,6 +19,7 @@ FerrisSearch is a lightweight, Rust-native search engine with OpenSearch-compati
 
 - **OpenSearch-compatible REST API** — drop-in `PUT /{index}`, `POST /_doc`, `GET /_search` endpoints
 - **Raft consensus** — cluster state managed by [openraft](https://github.com/datafuselabs/openraft); quorum-based leader election, linearizable writes, automatic failover, persistent log storage via [redb](https://github.com/cberner/redb)
+- **Vector search** — k-NN approximate nearest neighbor search via [USearch](https://github.com/unum-cloud/usearch) (HNSW algorithm); hybrid full-text + vector queries
 - **Distributed clustering** — multi-node clusters with shard-based data distribution
 - **Synchronous replication** — primary-replica replication over gRPC; writes acknowledged only after all in-sync replicas confirm
 - **Scatter-gather search** — queries fan out across shards, results merged and returned
@@ -158,6 +159,30 @@ curl -X POST 'http://localhost:9200/my-index/_search' \
   }'
 ```
 
+### Vector Search (k-NN)
+
+```bash
+# Index documents with embedding vectors
+curl -X POST 'http://localhost:9200/my-index/_doc' \
+  -H 'Content-Type: application/json' \
+  -d '{"_id": "doc-1", "title": "Rust search engine", "embedding": [1.0, 0.0, 0.0]}'
+
+# k-NN search: find 3 nearest neighbors
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{"knn": {"embedding": {"vector": [1.0, 0.0, 0.0], "k": 3}}}'
+
+# Hybrid: full-text + vector search
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {"match": {"title": "rust"}},
+    "knn": {"embedding": {"vector": [1.0, 0.0, 0.0], "k": 5}}
+  }'
+```
+
+Vector fields are auto-detected when an array of numbers is indexed. Uses [USearch](https://github.com/unum-cloud/usearch) (HNSW algorithm) with cosine similarity by default.
+
 ```bash
 # DSL: range query (inside bool filter)
 curl -X POST 'http://localhost:9200/my-index/_search' \
@@ -257,11 +282,11 @@ config/            Default configuration
 - [ ] Aggregations (terms, histogram, stats)
 
 ### Vector Search (k-NN)
-- [ ] USearch integration for HNSW-based approximate nearest neighbor search
-- [ ] `knn_vector` field type in index mappings
-- [ ] Index vectors alongside documents (`PUT /_doc` with embedding field)
-- [ ] k-NN search API (`POST /_search` with `knn` clause)
-- [ ] Distance metrics: cosine, L2 (euclidean), inner product
+- [x] USearch integration for HNSW-based approximate nearest neighbor search
+- [x] `knn_vector` field type in index mappings
+- [x] Index vectors alongside documents (`PUT /_doc` with embedding field)
+- [x] k-NN search API (`POST /_search` with `knn` clause)
+- [x] Distance metrics: cosine, L2 (euclidean), inner product
 - [ ] Hybrid search: combine BM25 full-text scores + vector similarity in one query
 - [ ] k-NN across shards (scatter-gather for vector queries)
 - [ ] Quantization support (f16, i8) for memory efficiency

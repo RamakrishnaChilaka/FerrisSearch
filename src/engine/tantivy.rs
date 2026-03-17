@@ -558,6 +558,7 @@ mod tests {
             query: QueryClause::MatchAll(json!({})),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
@@ -576,6 +577,7 @@ mod tests {
             query: QueryClause::Match(fields),
             size: 10,
             from: 0,
+        knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
@@ -676,6 +678,7 @@ mod tests {
             query: crate::search::QueryClause::MatchAll(json!({})),
             size: 5,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 20, "engine returns all matching docs for coordinator to slice");
@@ -694,6 +697,7 @@ mod tests {
             query: crate::search::QueryClause::MatchAll(json!({})),
             size: 10,
             from: 0,
+            knn: None,
         };
         let all_results = engine.search_query(&req_all).unwrap();
         assert_eq!(all_results.len(), 10);
@@ -703,6 +707,7 @@ mod tests {
             query: crate::search::QueryClause::MatchAll(json!({})),
             size: 10,
             from: 7,
+            knn: None,
         };
         let paged_results = engine.search_query(&req_paged).unwrap();
         assert_eq!(paged_results.len(), 10, "engine returns all available hits; coordinator slices");
@@ -720,6 +725,7 @@ mod tests {
             query: crate::search::QueryClause::MatchAll(json!({})),
             size: 10,
             from: 100,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 5, "engine returns all 5 hits; coordinator will slice to empty");
@@ -739,6 +745,7 @@ mod tests {
             query: crate::search::QueryClause::MatchAll(json!({})),
             size: 5,
             from: 0,
+            knn: None,
         };
         let all_hits = engine.search_query(&req).unwrap();
         let total = all_hits.len(); // This is what hits.total.value should be
@@ -768,6 +775,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "must:rust should match d1 and d3");
@@ -793,6 +801,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "must_not:python should exclude d2");
@@ -824,6 +833,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "should match d1 (rust) and d2 (python), not d3");
@@ -847,6 +857,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1, "filter:rust should match only d1");
@@ -863,6 +874,7 @@ mod tests {
             query: QueryClause::Bool(crate::search::BoolQuery::default()),
             size: 10,
             from: 0,
+        knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty bool should match all docs");
@@ -893,6 +905,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1, "must:rust + must_not:web should only match d1");
@@ -928,6 +941,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1, "nested bool + must_not should match only d1");
@@ -946,6 +960,7 @@ mod tests {
             query: QueryClause::Match(HashMap::new()),
             size: 10,
             from: 0,
+        knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty Match should fall back to match all");
@@ -963,6 +978,7 @@ mod tests {
             query: QueryClause::Term(HashMap::new()),
             size: 10,
             from: 0,
+        knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty Term should fall back to match all");
@@ -984,6 +1000,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1, "match with numeric value should find doc with '42'");
@@ -1006,6 +1023,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
@@ -1035,6 +1053,7 @@ mod tests {
             query: QueryClause::Range(fields),
             size: 10,
             from: 0,
+        knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
@@ -1062,6 +1081,7 @@ mod tests {
             query: QueryClause::Range(fields),
             size: 10,
             from: 0,
+        knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
@@ -1081,6 +1101,7 @@ mod tests {
             query: QueryClause::Range(HashMap::new()),
             size: 10,
             from: 0,
+        knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty Range should fall back to match all");
@@ -1114,6 +1135,7 @@ mod tests {
             }),
             size: 10,
             from: 0,
+            knn: None,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
