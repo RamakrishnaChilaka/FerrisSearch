@@ -326,6 +326,62 @@ impl HotEngine {
                     Ok(Box::new(AllQuery))
                 }
             }
+            QueryClause::Wildcard(fields) => {
+                use tantivy::query::RegexQuery;
+                if let Some((field_name, value)) = fields.iter().next() {
+                    let pattern = match value {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    // Convert OpenSearch wildcard syntax to regex:
+                    // Escape regex special chars first, then convert * → .* and ? → .
+                    let mut regex_pattern = String::new();
+                    for ch in pattern.chars() {
+                        match ch {
+                            '*' => regex_pattern.push_str(".*"),
+                            '?' => regex_pattern.push('.'),
+                            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                                regex_pattern.push('\\');
+                                regex_pattern.push(ch);
+                            }
+                            _ => regex_pattern.push(ch),
+                        }
+                    }
+                    let target_field = self.resolve_field(field_name);
+                    let query = RegexQuery::from_pattern(&regex_pattern, target_field)
+                        .map_err(|e| anyhow::anyhow!("Invalid wildcard pattern: {}", e))?;
+                    Ok(Box::new(query))
+                } else {
+                    Ok(Box::new(AllQuery))
+                }
+            }
+            QueryClause::Prefix(fields) => {
+                use tantivy::query::RegexQuery;
+                if let Some((field_name, value)) = fields.iter().next() {
+                    let prefix = match value {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    // Escape the prefix for regex safety, then append .*
+                    let mut escaped = String::new();
+                    for ch in prefix.chars() {
+                        match ch {
+                            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                                escaped.push('\\');
+                                escaped.push(ch);
+                            }
+                            _ => escaped.push(ch),
+                        }
+                    }
+                    let regex_pattern = format!("{}.*", escaped);
+                    let target_field = self.resolve_field(field_name);
+                    let query = RegexQuery::from_pattern(&regex_pattern, target_field)
+                        .map_err(|e| anyhow::anyhow!("Invalid prefix pattern: {}", e))?;
+                    Ok(Box::new(query))
+                } else {
+                    Ok(Box::new(AllQuery))
+                }
+            }
         }
     }
 }
@@ -1140,5 +1196,114 @@ mod tests {
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["_id"], "d1");
+    }
+
+    // ── Wildcard / Prefix query tests ───────────────────────────────────
+
+    #[test]
+    fn wildcard_star_matches_suffix() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rustacean"})).unwrap();
+        engine.add_document("d2", json!({"title": "python"})).unwrap();
+        engine.add_document("d3", json!({"title": "rusty"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Wildcard({
+                let mut m = HashMap::new();
+                m.insert("body".into(), json!("rust*"));
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d1"));
+        assert!(ids.contains(&"d3"));
+    }
+
+    #[test]
+    fn wildcard_question_mark_matches_single_char() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust"})).unwrap();
+        engine.add_document("d2", json!({"title": "rest"})).unwrap();
+        engine.add_document("d3", json!({"title": "roast"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Wildcard({
+                let mut m = HashMap::new();
+                m.insert("body".into(), json!("r?st"));
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let results = engine.search_query(&req).unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d1"), "rust should match r?st");
+        assert!(ids.contains(&"d2"), "rest should match r?st");
+        assert!(!ids.contains(&"d3"), "roast should NOT match r?st");
+    }
+
+    #[test]
+    fn prefix_query_matches_beginning() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "search engine"})).unwrap();
+        engine.add_document("d2", json!({"title": "sea turtle"})).unwrap();
+        engine.add_document("d3", json!({"title": "mountain"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Prefix({
+                let mut m = HashMap::new();
+                m.insert("body".into(), json!("sea"));
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let results = engine.search_query(&req).unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d1"), "search should match prefix 'sea'");
+        assert!(ids.contains(&"d2"), "sea should match prefix 'sea'");
+        assert!(!ids.contains(&"d3"), "mountain should NOT match prefix 'sea'");
+    }
+
+    #[test]
+    fn wildcard_empty_fields_returns_all() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "a"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Wildcard(HashMap::new()),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn prefix_empty_fields_returns_all() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "a"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Prefix(HashMap::new()),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }
