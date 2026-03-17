@@ -382,6 +382,17 @@ impl HotEngine {
                     Ok(Box::new(AllQuery))
                 }
             }
+            QueryClause::Fuzzy(fields) => {
+                use tantivy::query::FuzzyTermQuery;
+                if let Some((field_name, params)) = fields.iter().next() {
+                    let target_field = self.resolve_field(field_name);
+                    let term = Term::from_field_text(target_field, &params.value);
+                    let query = FuzzyTermQuery::new(term, params.fuzziness, true);
+                    Ok(Box::new(query))
+                } else {
+                    Ok(Box::new(AllQuery))
+                }
+            }
         }
     }
 }
@@ -1299,6 +1310,72 @@ mod tests {
 
         let req = SearchRequest {
             query: QueryClause::Prefix(HashMap::new()),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    // ── Fuzzy query tests ───────────────────────────────────────────────
+
+    #[test]
+    fn fuzzy_matches_typo() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust"})).unwrap();
+        engine.add_document("d2", json!({"title": "python"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Fuzzy({
+                let mut m = HashMap::new();
+                m.insert("body".into(), crate::search::FuzzyParams {
+                    value: "rsut".into(),
+                    fuzziness: 2,
+                });
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["_id"], "d1", "fuzzy should match 'rust' for 'rsut'");
+    }
+
+    #[test]
+    fn fuzzy_fuzziness_0_is_exact() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Fuzzy({
+                let mut m = HashMap::new();
+                m.insert("body".into(), crate::search::FuzzyParams {
+                    value: "rsut".into(),
+                    fuzziness: 0,
+                });
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert!(results.is_empty(), "fuzziness 0 should be exact match only");
+    }
+
+    #[test]
+    fn fuzzy_empty_fields_returns_all() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "a"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Fuzzy(HashMap::new()),
             size: 10,
             from: 0,
             knn: None,

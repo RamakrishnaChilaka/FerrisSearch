@@ -163,6 +163,13 @@ curl -X POST 'http://localhost:9200/my-index/_search' \
   }'
 ```
 
+```bash
+# Fuzzy query (typo-tolerant search)
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": {"fuzzy": {"title": {"value": "rsut", "fuzziness": 2}}}}'
+```
+
 ### Vector Search (k-NN)
 
 ```bash
@@ -246,8 +253,8 @@ Document writes use direct primary-to-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All 228 tests
-cargo test --lib                                # Unit tests (202)
+cargo test                                      # All 233 tests
+cargo test --lib                                # Unit tests (207)
 cargo test --test consensus_integration          # Raft consensus tests (15)
 cargo test --test replication_integration        # Replication tests (11)
 ```

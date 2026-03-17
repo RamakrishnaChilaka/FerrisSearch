@@ -61,6 +61,22 @@ pub enum QueryClause {
     Wildcard(HashMap<String, serde_json::Value>),
     /// Prefix query: `{ "prefix": { "field": "sea" } }` — matches terms starting with the value
     Prefix(HashMap<String, serde_json::Value>),
+    /// Fuzzy query: `{ "fuzzy": { "field": { "value": "rsut", "fuzziness": 1 } } }`
+    Fuzzy(HashMap<String, FuzzyParams>),
+}
+
+/// Fuzzy query parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzyParams {
+    /// The term to search for (possibly misspelled).
+    pub value: String,
+    /// Maximum edit distance (default: 1). Valid values: 0, 1, 2.
+    #[serde(default = "default_fuzziness")]
+    pub fuzziness: u8,
+}
+
+fn default_fuzziness() -> u8 {
+    1
 }
 
 /// Range condition with optional gt/gte/lt/lte bounds.
@@ -463,6 +479,36 @@ mod tests {
                 assert!(matches!(&bq.filter[0], QueryClause::Wildcard(_)));
             }
             _ => panic!("expected Bool"),
+        }
+    }
+
+    #[test]
+    fn deserialize_fuzzy_query() {
+        let body = json!({
+            "query": { "fuzzy": { "title": { "value": "rsut", "fuzziness": 2 } } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Fuzzy(fields) => {
+                let params = fields.get("title").unwrap();
+                assert_eq!(params.value, "rsut");
+                assert_eq!(params.fuzziness, 2);
+            }
+            _ => panic!("expected Fuzzy query"),
+        }
+    }
+
+    #[test]
+    fn deserialize_fuzzy_default_fuzziness() {
+        let body = json!({
+            "query": { "fuzzy": { "title": { "value": "serch" } } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        match &req.query {
+            QueryClause::Fuzzy(fields) => {
+                assert_eq!(fields["title"].fuzziness, 1, "default fuzziness should be 1");
+            }
+            _ => panic!("expected Fuzzy query"),
         }
     }
 }
