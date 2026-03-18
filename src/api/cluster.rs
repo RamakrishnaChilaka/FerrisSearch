@@ -11,41 +11,55 @@ pub struct ClusterHealth {
     pub timed_out: bool,
     pub number_of_nodes: usize,
     pub number_of_data_nodes: usize,
+    pub unassigned_shards: u32,
 }
 
 /// Compute cluster health status based on shard allocation.
-/// - "green": all shards assigned to known data nodes
-/// - "yellow": some shards unassigned (no replicas yet counts as yellow)
-/// - "red": no data nodes or no indices at all with data nodes missing
-fn compute_health_status(cs: &ClusterState) -> &'static str {
+/// - "green": all primary and replica shards are assigned
+/// - "yellow": all primaries assigned, but some replicas are unassigned
+/// - "red": no data nodes, or a primary shard is assigned to a missing node
+fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
     let data_node_ids: std::collections::HashSet<&String> = cs.nodes.values()
         .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
         .map(|n| &n.id)
         .collect();
 
     if data_node_ids.is_empty() {
-        return "red";
+        return ("red", 0);
     }
 
     if cs.indices.is_empty() {
-        return "green";
+        return ("green", 0);
     }
 
-    let mut all_assigned = true;
+    let mut total_unassigned = 0u32;
+    let mut primary_missing = false;
+
     for index_meta in cs.indices.values() {
+        // Count explicitly tracked unassigned replicas
+        total_unassigned += index_meta.unassigned_replica_count();
+
         for routing in index_meta.shard_routing.values() {
+            // Primary assigned to a node that no longer exists → red
             if !data_node_ids.contains(&routing.primary) {
-                all_assigned = false;
+                primary_missing = true;
             }
+            // Replica assigned to a node that no longer exists → unassigned
             for replica in &routing.replicas {
                 if !data_node_ids.contains(replica) {
-                    all_assigned = false;
+                    total_unassigned += 1;
                 }
             }
         }
     }
 
-    if all_assigned { "green" } else { "yellow" }
+    if primary_missing {
+        ("red", total_unassigned)
+    } else if total_unassigned > 0 {
+        ("yellow", total_unassigned)
+    } else {
+        ("green", total_unassigned)
+    }
 }
 
 /// Handler for `GET /_cluster/health`
@@ -54,13 +68,14 @@ pub async fn get_health(State(state): State<AppState>) -> Json<ClusterHealth> {
     let data_nodes = cs.nodes.values()
         .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
         .count();
-    let status = compute_health_status(&cs).to_string();
+    let (status, unassigned) = compute_health_status(&cs);
     Json(ClusterHealth {
         cluster_name: cs.cluster_name,
-        status,
+        status: status.to_string(),
         timed_out: false,
         number_of_nodes: cs.nodes.len(),
         number_of_data_nodes: data_nodes,
+        unassigned_shards: unassigned,
     })
 }
 

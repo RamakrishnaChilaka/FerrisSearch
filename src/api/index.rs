@@ -143,6 +143,7 @@ pub async fn index_document(
         shard_routing.insert(0u32, crate::cluster::state::ShardRoutingEntry {
             primary: state.local_node_id.clone(),
             replicas: vec![],
+            unassigned_replicas: 0,
         });
         let m = IndexMetadata {
             name: index_name.clone(),
@@ -211,6 +212,7 @@ pub async fn index_document_with_id(
         shard_routing.insert(0u32, crate::cluster::state::ShardRoutingEntry {
             primary: state.local_node_id.clone(),
             replicas: vec![],
+            unassigned_replicas: 0,
         });
         let m = IndexMetadata {
             name: index_name.clone(),
@@ -352,6 +354,7 @@ pub async fn bulk_index(
         shard_routing.insert(0u32, crate::cluster::state::ShardRoutingEntry {
             primary: state.local_node_id.clone(),
             replicas: vec![],
+            unassigned_replicas: 0,
         });
         let m = IndexMetadata {
             name: index_name.clone(),

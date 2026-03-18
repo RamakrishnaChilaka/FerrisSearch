@@ -78,6 +78,10 @@ pub trait WriteAheadLog: Send + Sync {
 
     /// Truncate after a successful commit — data is safe in engine segments.
     fn truncate(&self) -> Result<()>;
+
+    /// Get the last assigned sequence number (highest seq_no written so far).
+    /// Returns 0 if no writes have occurred.
+    fn last_seq_no(&self) -> u64;
 }
 
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
@@ -124,24 +128,41 @@ fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
 /// Stored at `<data_dir>/translog.bin`. Each entry is a bincode-encoded frame
 /// preceded by a 4-byte little-endian length. The file is fsynced on every write
 /// (request-level durability) to guarantee no ops are lost on crash.
+///
+/// The sequence number is monotonically increasing and *never resets*, even after
+/// truncation. This enables replica recovery via seq_no-based translog replay.
 pub struct HotTranslog {
     file: Mutex<File>,
     seq_no: Mutex<u64>,
+    /// Path to the file that persists the seq_no high-water mark across truncations.
+    seq_no_path: std::path::PathBuf,
 }
 
 impl HotTranslog {
     /// Open or create the translog at the given directory.
     pub fn open<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
-        let path = data_dir.as_ref().join("translog.bin");
+        let data_dir = data_dir.as_ref();
+        let path = data_dir.join("translog.bin");
+        let seq_no_path = data_dir.join("translog.seqno");
+
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(&path)?;
 
-        // Figure out the highest sequence number already on disk
+        // Load the persisted high-water mark (survives truncation)
+        let persisted_seq = if seq_no_path.exists() {
+            let s = std::fs::read_to_string(&seq_no_path)?;
+            s.trim().parse::<u64>().unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Check translog entries — take the max of persisted and on-disk entries
         let existing = Self::read_entries_from_path(&path)?;
-        let next_seq = existing.last().map(|e| e.seq_no + 1).unwrap_or(0);
+        let entry_max = existing.last().map(|e| e.seq_no + 1).unwrap_or(0);
+        let next_seq = std::cmp::max(persisted_seq, entry_max);
 
         // Seek to end for subsequent appends
         let mut f = file;
@@ -157,7 +178,13 @@ impl HotTranslog {
         Ok(Self {
             file: Mutex::new(f),
             seq_no: Mutex::new(next_seq),
+            seq_no_path,
         })
+    }
+
+    /// Get the current (next) sequence number without incrementing.
+    pub fn current_seq_no(&self) -> u64 {
+        *self.seq_no.lock().unwrap()
     }
 
     /// Helper to read entries directly from a path (used during open to check existing state)
@@ -223,10 +250,19 @@ impl WriteAheadLog for HotTranslog {
         file.set_len(0)?;
         file.sync_data()?;
         drop(file);
-        let mut seq = self.seq_no.lock().unwrap();
-        *seq = 0;
-        tracing::info!("Translog truncated after flush.");
+
+        // Persist the current seq_no so it survives truncation.
+        // This ensures seq_no never goes backward after flush.
+        let seq = self.seq_no.lock().unwrap();
+        std::fs::write(&self.seq_no_path, seq.to_string())?;
+
+        tracing::info!("Translog truncated after flush (seq_no preserved at {}).", *seq);
         Ok(())
+    }
+
+    fn last_seq_no(&self) -> u64 {
+        let seq = self.seq_no.lock().unwrap();
+        if *seq == 0 { 0 } else { *seq - 1 }
     }
 }
 
@@ -308,13 +344,13 @@ mod tests {
     }
 
     #[test]
-    fn truncate_resets_seq_no() {
+    fn truncate_preserves_seq_no() {
         let (_dir, tl) = open_translog();
         tl.append("index", json!({"a": 1})).unwrap();
         tl.truncate().unwrap();
 
         let e = tl.append("index", json!({"b": 2})).unwrap();
-        assert_eq!(e.seq_no, 0, "seq_no should restart from 0 after truncate");
+        assert_eq!(e.seq_no, 1, "seq_no should continue from where it left off after truncate");
     }
 
     // ── persistence across reopen ───────────────────────────────────────

@@ -67,4 +67,13 @@ pub trait SearchEngine: Send + Sync {
 
     /// Returns the number of searchable documents.
     fn doc_count(&self) -> u64;
+
+    /// Get the local checkpoint: highest contiguous seq_no applied to this shard copy.
+    /// Returns 0 if no seq_no tracking is configured (backward compat).
+    fn local_checkpoint(&self) -> u64 {
+        0
+    }
+
+    /// Update the local checkpoint after applying a replicated operation.
+    fn update_local_checkpoint(&self, _seq_no: u64) {}
 }

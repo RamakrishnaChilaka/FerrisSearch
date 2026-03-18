@@ -78,8 +78,8 @@ mod tests {
     fn route_document_returns_correct_node() {
         use crate::cluster::state::ShardRoutingEntry;
         let mut shard_routing = HashMap::new();
-        shard_routing.insert(0, ShardRoutingEntry { primary: "node-A".into(), replicas: vec![] });
-        shard_routing.insert(1, ShardRoutingEntry { primary: "node-B".into(), replicas: vec![] });
+        shard_routing.insert(0, ShardRoutingEntry { primary: "node-A".into(), replicas: vec![], unassigned_replicas: 0 });
+        shard_routing.insert(1, ShardRoutingEntry { primary: "node-B".into(), replicas: vec![], unassigned_replicas: 0 });
         let meta = IndexMetadata {
             name: "test-index".into(),
             number_of_shards: 2,

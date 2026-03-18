@@ -32,6 +32,7 @@ fn make_index(name: &str) -> IndexMetadata {
     shard_routing.insert(0, ShardRoutingEntry {
         primary: "node-1".into(),
         replicas: vec![],
+        unassigned_replicas: 0,
     });
     IndexMetadata {
         name: name.into(),
@@ -409,4 +410,104 @@ async fn transfer_leader_to_self_succeeds() {
 
     // Node should still be leader
     assert!(raft.is_leader(), "node should remain leader after self-transfer");
+}
+
+// ─── Shard allocator integration tests ──────────────────────────────────────
+
+#[tokio::test]
+async fn update_index_via_raft_assigns_replicas() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "alloc-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19310".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Create index with 1 shard, 2 replicas on 1 node → 2 unassigned
+    let idx = IndexMetadata::build_shard_routing("movies", 1, 2, &["node-1".into()]);
+    raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
+        .await
+        .unwrap();
+
+    {
+        let state = state_handle.read().unwrap();
+        assert_eq!(state.indices["movies"].unassigned_replica_count(), 2);
+    }
+
+    // Simulate allocator: assign replicas to new nodes
+    let mut updated = {
+        let state = state_handle.read().unwrap();
+        state.indices["movies"].clone()
+    };
+    updated.allocate_unassigned_replicas(&["node-1".into(), "node-2".into(), "node-3".into()]);
+    assert_eq!(updated.unassigned_replica_count(), 0);
+
+    // Write updated routing via Raft
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
+
+    // Verify via Raft state
+    let state = state_handle.read().unwrap();
+    let routing = &state.indices["movies"].shard_routing[&0];
+    assert_eq!(routing.replicas.len(), 2, "both replicas should be assigned");
+    assert_eq!(routing.unassigned_replicas, 0);
+    assert!(routing.replicas.contains(&"node-2".to_string()));
+    assert!(routing.replicas.contains(&"node-3".to_string()));
+}
+
+#[tokio::test]
+async fn update_index_partial_allocation_two_nodes() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "partial-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19311".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Create with 1 shard, 2 replicas, 1 node → 2 unassigned
+    let idx = IndexMetadata::build_shard_routing("products", 1, 2, &["node-1".into()]);
+    raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
+        .await
+        .unwrap();
+
+    // Only 2 nodes available → should assign 1 replica, 1 still unassigned
+    let mut updated = {
+        let state = state_handle.read().unwrap();
+        state.indices["products"].clone()
+    };
+    updated.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]);
+
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    let routing = &state.indices["products"].shard_routing[&0];
+    assert_eq!(routing.replicas.len(), 1, "1 replica assigned to node-2");
+    assert_eq!(routing.unassigned_replicas, 1, "1 still unassigned (need 3rd node)");
+    assert_eq!(routing.replicas[0], "node-2");
+}
+
+#[tokio::test]
+async fn create_index_on_three_nodes_all_replicas_assigned() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "three-node-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19312".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Create index with 3 nodes available → all replicas assigned immediately
+    let idx = IndexMetadata::build_shard_routing("logs", 1, 2, &["n1".into(), "n2".into(), "n3".into()]);
+    raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(state.indices["logs"].unassigned_replica_count(), 0, "all replicas assigned on creation");
+    assert_eq!(state.indices["logs"].shard_routing[&0].replicas.len(), 2);
 }

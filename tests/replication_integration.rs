@@ -95,6 +95,7 @@ fn setup_two_node_cluster_state(
     shard_routing.insert(0, ShardRoutingEntry {
         primary: "primary-node".into(),
         replicas: vec!["replica-node".into()],
+        unassigned_replicas: 0,
     });
     cs.add_index(IndexMetadata {
         name: index_name.into(),
@@ -250,6 +251,7 @@ async fn replicate_doc_index_via_grpc() {
             doc_id: "rep-1".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
             op: "index".into(),
+            seq_no: 0,
         }))
         .await
         .unwrap()
@@ -294,6 +296,7 @@ async fn replicate_doc_delete_via_grpc() {
             doc_id: "to-delete".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
             op: "index".into(),
+            seq_no: 0,
         }))
         .await
         .unwrap();
@@ -306,6 +309,7 @@ async fn replicate_doc_delete_via_grpc() {
             doc_id: "to-delete".into(),
             payload_json: vec![],
             op: "delete".into(),
+            seq_no: 0,
         }))
         .await
         .unwrap()
@@ -343,6 +347,7 @@ async fn replicate_bulk_via_grpc() {
             doc_id: format!("bulk-rep-{}", i),
             payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
             op: "index".into(),
+            seq_no: 0,
         })
         .collect();
 
@@ -428,6 +433,7 @@ async fn publish_state_updates_cluster_and_closes_deleted_indices() {
         shard_routing.insert(0, ShardRoutingEntry {
             primary: "local".into(),
             replicas: vec![],
+            unassigned_replicas: 0,
         });
         initial_state.add_index(IndexMetadata {
             name: "old-index".into(),

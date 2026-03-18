@@ -58,6 +58,10 @@ impl ClusterStateMachine {
                 state.master_node = Some(node_id.clone());
                 state.version += 1;
             }
+            ClusterCommand::UpdateIndex { metadata } => {
+                state.indices.insert(metadata.name.clone(), metadata.clone());
+                state.version += 1;
+            }
         }
     }
 }
@@ -215,6 +219,7 @@ mod tests {
         shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            unassigned_replicas: 0,
         });
         IndexMetadata {
             name: name.into(),
@@ -290,6 +295,45 @@ mod tests {
         let handle = sm.state_handle();
         let state = handle.read().unwrap();
         assert!(!state.indices.contains_key("idx"));
+    }
+
+    #[test]
+    fn apply_update_index_command() {
+        let sm = ClusterStateMachine::new("test".into());
+        // Create index with unassigned replicas
+        let mut idx = IndexMetadata::build_shard_routing("products", 1, 2, &["node-1".into()]);
+        assert_eq!(idx.unassigned_replica_count(), 2);
+        sm.apply_command(&ClusterCommand::CreateIndex { metadata: idx.clone() });
+
+        // Simulate allocator: assign replicas
+        idx.allocate_unassigned_replicas(&["node-1".into(), "node-2".into(), "node-3".into()]);
+        assert_eq!(idx.unassigned_replica_count(), 0);
+
+        // Apply UpdateIndex
+        sm.apply_command(&ClusterCommand::UpdateIndex { metadata: idx });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        let updated = &state.indices["products"];
+        assert_eq!(updated.unassigned_replica_count(), 0);
+        assert_eq!(updated.shard_routing[&0].replicas.len(), 2);
+    }
+
+    #[test]
+    fn update_index_preserves_other_indices() {
+        let sm = ClusterStateMachine::new("test".into());
+        sm.apply_command(&ClusterCommand::CreateIndex { metadata: make_index("idx-a") });
+        sm.apply_command(&ClusterCommand::CreateIndex { metadata: make_index("idx-b") });
+
+        // Update only idx-a
+        let mut updated_a = make_index("idx-a");
+        updated_a.number_of_replicas = 99;
+        sm.apply_command(&ClusterCommand::UpdateIndex { metadata: updated_a });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert_eq!(state.indices["idx-a"].number_of_replicas, 99);
+        assert_eq!(state.indices["idx-b"].number_of_replicas, 0, "idx-b should be untouched");
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub struct CompositeEngine {
     text: HotEngine,
     vector: RwLock<Option<VectorIndex>>,
     data_dir: std::path::PathBuf,
+    /// Local checkpoint: highest contiguous seq_no applied to this shard copy.
+    /// Used for replication tracking and replica recovery.
+    checkpoint: std::sync::atomic::AtomicU64,
 }
 
 impl CompositeEngine {
@@ -52,6 +55,7 @@ impl CompositeEngine {
             text,
             vector: RwLock::new(vector),
             data_dir,
+            checkpoint: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -277,6 +281,14 @@ impl SearchEngine for CompositeEngine {
 
     fn doc_count(&self) -> u64 {
         self.text.doc_count()
+    }
+
+    fn local_checkpoint(&self) -> u64 {
+        self.checkpoint.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn update_local_checkpoint(&self, seq_no: u64) {
+        self.checkpoint.fetch_max(seq_no, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

@@ -51,6 +51,10 @@ pub enum ClusterCommand {
     SetMaster {
         node_id: String,
     },
+    /// Update an existing index's metadata (e.g. shard routing after replica allocation).
+    UpdateIndex {
+        metadata: IndexMetadata,
+    },
 }
 
 impl std::fmt::Display for ClusterCommand {
@@ -61,6 +65,7 @@ impl std::fmt::Display for ClusterCommand {
             ClusterCommand::CreateIndex { metadata } => write!(f, "CreateIndex({})", metadata.name),
             ClusterCommand::DeleteIndex { index_name } => write!(f, "DeleteIndex({})", index_name),
             ClusterCommand::SetMaster { node_id } => write!(f, "SetMaster({})", node_id),
+            ClusterCommand::UpdateIndex { metadata } => write!(f, "UpdateIndex({})", metadata.name),
         }
     }
 }
@@ -160,6 +165,7 @@ mod tests {
         shard_routing.insert(0, ShardRoutingEntry {
             primary: "n1".into(),
             replicas: vec!["n2".into()],
+            unassigned_replicas: 0,
         });
         let cmd = ClusterCommand::CreateIndex {
             metadata: IndexMetadata {
