@@ -93,17 +93,41 @@ curl -X PUT 'http://localhost:9200/my-index' \
   -H 'Content-Type: application/json' \
   -d '{"settings": {"number_of_shards": 1, "number_of_replicas": 1}}'
 
+# Create an index with field mappings
+curl -X PUT 'http://localhost:9200/movies' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "settings": {"number_of_shards": 3, "number_of_replicas": 1},
+    "mappings": {
+      "properties": {
+        "title":     {"type": "text"},
+        "genre":     {"type": "keyword"},
+        "year":      {"type": "integer"},
+        "rating":    {"type": "float"},
+        "embedding": {"type": "knn_vector", "dimension": 3}
+      }
+    }
+  }'
+
 # Delete an index
 curl -X DELETE 'http://localhost:9200/my-index'
 ```
 
+**Supported field types:** `text` (analyzed), `keyword` (exact match), `integer`, `float`, `boolean`, `knn_vector`.
+Unmapped fields are indexed into a catch-all "body" field for backward compatibility.
+
 ### Documents
 
 ```bash
-# Index a document
+# Index a document (auto-generated ID)
 curl -X POST 'http://localhost:9200/my-index/_doc' \
   -H 'Content-Type: application/json' \
   -d '{"title": "Hello World", "tags": "rust search"}'
+
+# Index a document with explicit ID
+curl -X PUT 'http://localhost:9200/my-index/_doc/1' \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "Hello World", "year": 2024}'
 
 # Get a document
 curl 'http://localhost:9200/my-index/_doc/{id}'
@@ -174,16 +198,29 @@ curl -X POST 'http://localhost:9200/my-index/_search' \
 
 ```bash
 # Index documents with embedding vectors
-curl -X POST 'http://localhost:9200/my-index/_doc' \
+curl -X PUT 'http://localhost:9200/my-index/_doc/1' \
   -H 'Content-Type: application/json' \
-  -d '{"_id": "doc-1", "title": "Rust search engine", "embedding": [1.0, 0.0, 0.0]}'
+  -d '{"title": "Rust search engine", "embedding": [1.0, 0.0, 0.0]}'
 
 # k-NN search: find 3 nearest neighbors
 curl -X POST 'http://localhost:9200/my-index/_search' \
   -H 'Content-Type: application/json' \
   -d '{"knn": {"embedding": {"vector": [1.0, 0.0, 0.0], "k": 3}}}'
 
-# Hybrid: full-text + vector search
+# k-NN with pre-filter: only search within matching documents
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "knn": {
+      "embedding": {
+        "vector": [1.0, 0.0, 0.0],
+        "k": 5,
+        "filter": {"match": {"genre": "action"}}
+      }
+    }
+  }'
+
+# Hybrid: full-text + vector search (merged with Reciprocal Rank Fusion)
 curl -X POST 'http://localhost:9200/my-index/_search' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -192,7 +229,28 @@ curl -X POST 'http://localhost:9200/my-index/_search' \
   }'
 ```
 
-Vector fields are auto-detected when an array of numbers is indexed. Uses [USearch](https://github.com/unum-cloud/usearch) (HNSW algorithm) with cosine similarity by default.
+Vector fields are auto-detected when an array of numbers is indexed. Uses [USearch](https://github.com/unum-cloud/usearch) (HNSW algorithm) with cosine similarity by default. See [docs/vector-search.md](docs/vector-search.md) for architecture details.
+
+### Sorting
+
+```bash
+# Sort by field ascending
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": {"match_all": {}}, "sort": [{"year": "asc"}]}'
+
+# Sort by field descending with _score tiebreaker
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": {"match_all": {}}, "sort": [{"year": "desc"}, "_score"]}'
+
+# Sort with object syntax
+curl -X POST 'http://localhost:9200/my-index/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": {"match_all": {}}, "sort": [{"rating": {"order": "desc"}}]}'
+```
+
+Default sort (no `sort` clause) is by `_score` descending. Nulls sort last.
 
 ```bash
 # DSL: range query (inside bool filter)
@@ -253,7 +311,7 @@ Document writes use direct primary-to-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All 233 tests
+cargo test                                      # All 290 tests
 cargo test --lib                                # Unit tests (207)
 cargo test --test consensus_integration          # Raft consensus tests (15)
 cargo test --test replication_integration        # Replication tests (11)
@@ -285,7 +343,7 @@ config/            Default configuration
 
 ### Search & Query
 - [x] Pagination support (`from` / `size` parameters)
-- [ ] Sort by field and `_score`
+- [x] Sort by field and `_score`
 - [x] Bool queries (`must`, `should`, `must_not`, `filter`)
 - [x] Range queries (`gt`, `gte`, `lt`, `lte`)
 - [x] Wildcard and prefix queries

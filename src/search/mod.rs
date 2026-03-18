@@ -16,6 +16,43 @@ pub struct SearchRequest {
     /// Optional k-NN vector search clause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn: Option<KnnQuery>,
+    /// Optional sort clauses. Default: sort by `_score` descending.
+    /// Example: `[{"year": "desc"}, "_score"]`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sort: Vec<SortClause>,
+}
+
+/// A single sort clause. Supports field sort and `_score` sort.
+///
+/// OpenSearch-compatible formats:
+/// - `"_score"` — sort by relevance score descending
+/// - `{"year": "desc"}` — sort by field value
+/// - `{"year": {"order": "asc"}}` — explicit order object
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SortClause {
+    /// Simple string: `"_score"` or `"field_name"`
+    Simple(String),
+    /// Field with order: `{"year": "desc"}` or `{"year": {"order": "asc"}}`
+    Field(HashMap<String, SortOrder>),
+}
+
+/// Sort order for a field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SortOrder {
+    /// Simple string: `"asc"` or `"desc"`
+    Direction(SortDirection),
+    /// Object with order: `{"order": "asc"}`
+    Object { order: SortDirection },
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    Asc,
+    Desc,
 }
 
 fn default_query() -> QueryClause {
@@ -106,6 +143,94 @@ pub struct BoolQuery {
     pub must_not: Vec<QueryClause>,
     #[serde(default)]
     pub filter: Vec<QueryClause>,
+}
+
+/// Sort a list of search hits according to the given sort clauses.
+/// Each hit is a JSON object with `_score` and `_source` fields.
+/// Sort clauses are applied in order (primary sort first).
+/// If no sort clauses are given, sorts by `_score` descending (default).
+pub fn sort_hits(hits: &mut Vec<serde_json::Value>, sort_clauses: &[SortClause]) {
+    if sort_clauses.is_empty() {
+        // Default: sort by _score descending
+        hits.sort_by(|a, b| {
+            let sa = a.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let sb = b.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        return;
+    }
+
+    hits.sort_by(|a, b| {
+        for clause in sort_clauses {
+            let (field_name, direction) = match clause {
+                SortClause::Simple(name) => {
+                    if name == "_score" {
+                        (name.as_str(), SortDirection::Desc)
+                    } else {
+                        (name.as_str(), SortDirection::Asc)
+                    }
+                }
+                SortClause::Field(map) => {
+                    if let Some((name, order)) = map.iter().next() {
+                        let dir = match order {
+                            SortOrder::Direction(d) => d.clone(),
+                            SortOrder::Object { order } => order.clone(),
+                        };
+                        (name.as_str(), dir)
+                    } else {
+                        continue;
+                    }
+                }
+            };
+
+            let (va, vb) = if field_name == "_score" {
+                (
+                    a.get("_score").cloned().unwrap_or(serde_json::Value::Null),
+                    b.get("_score").cloned().unwrap_or(serde_json::Value::Null),
+                )
+            } else {
+                (
+                    a.get("_source")
+                        .and_then(|s| s.get(field_name))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    b.get("_source")
+                        .and_then(|s| s.get(field_name))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            };
+
+            let cmp = compare_json_values(&va, &vb);
+            let ordered = match direction {
+                SortDirection::Asc => cmp,
+                SortDirection::Desc => cmp.reverse(),
+            };
+            if ordered != std::cmp::Ordering::Equal {
+                return ordered;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// Compare two JSON values for sorting. Numbers are compared numerically,
+/// strings lexicographically, nulls sort last.
+fn compare_json_values(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater, // nulls last
+        (_, Value::Null) => std::cmp::Ordering::Less,
+        (Value::Number(na), Value::Number(nb)) => {
+            let fa = na.as_f64().unwrap_or(0.0);
+            let fb = nb.as_f64().unwrap_or(0.0);
+            fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::String(sa), Value::String(sb)) => sa.cmp(sb),
+        (Value::Bool(ba), Value::Bool(bb)) => ba.cmp(bb),
+        _ => std::cmp::Ordering::Equal,
+    }
 }
 
 /// Reciprocal Rank Fusion (RRF) constant. Higher values smooth out rank differences.
@@ -312,6 +437,7 @@ mod tests {
             size: 20,
             from: 5,
             knn: None,
+            sort: vec![],
         };
         let json_str = serde_json::to_string(&req).unwrap();
         let req2: SearchRequest = serde_json::from_str(&json_str).unwrap();
@@ -435,6 +561,7 @@ mod tests {
             size: 5,
             from: 10,
             knn: None,
+            sort: vec![],
         };
         let json_str = serde_json::to_string(&req).unwrap();
         let req2: SearchRequest = serde_json::from_str(&json_str).unwrap();
@@ -848,5 +975,189 @@ mod tests {
         let merged = merge_hybrid_hits(text, knn);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["_id"], "d1");
+    }
+
+    // ── Sort tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn sort_default_by_score_desc() {
+        let mut hits = vec![
+            json!({"_id": "d1", "_score": 0.5, "_source": {}}),
+            json!({"_id": "d2", "_score": 0.9, "_source": {}}),
+            json!({"_id": "d3", "_score": 0.1, "_source": {}}),
+        ];
+        sort_hits(&mut hits, &[]);
+        assert_eq!(hits[0]["_id"], "d2");
+        assert_eq!(hits[1]["_id"], "d1");
+        assert_eq!(hits[2]["_id"], "d3");
+    }
+
+    #[test]
+    fn sort_by_numeric_field_asc() {
+        let mut hits = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"year": 2010}}),
+            json!({"_id": "d2", "_score": 0.5, "_source": {"year": 1999}}),
+            json!({"_id": "d3", "_score": 0.8, "_source": {"year": 2024}}),
+        ];
+        let sort = vec![SortClause::Field({
+            let mut m = HashMap::new();
+            m.insert("year".to_string(), SortOrder::Direction(SortDirection::Asc));
+            m
+        })];
+        sort_hits(&mut hits, &sort);
+        assert_eq!(hits[0]["_id"], "d2", "1999 first");
+        assert_eq!(hits[1]["_id"], "d1", "2010 second");
+        assert_eq!(hits[2]["_id"], "d3", "2024 third");
+    }
+
+    #[test]
+    fn sort_by_numeric_field_desc() {
+        let mut hits = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"rating": 8.5}}),
+            json!({"_id": "d2", "_score": 0.5, "_source": {"rating": 9.2}}),
+            json!({"_id": "d3", "_score": 0.8, "_source": {"rating": 7.0}}),
+        ];
+        let sort = vec![SortClause::Field({
+            let mut m = HashMap::new();
+            m.insert("rating".to_string(), SortOrder::Direction(SortDirection::Desc));
+            m
+        })];
+        sort_hits(&mut hits, &sort);
+        assert_eq!(hits[0]["_id"], "d2", "9.2 first");
+        assert_eq!(hits[1]["_id"], "d1", "8.5 second");
+        assert_eq!(hits[2]["_id"], "d3", "7.0 third");
+    }
+
+    #[test]
+    fn sort_by_string_field_asc() {
+        let mut hits = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"title": "Inception"}}),
+            json!({"_id": "d2", "_score": 0.5, "_source": {"title": "Avatar"}}),
+            json!({"_id": "d3", "_score": 0.8, "_source": {"title": "Matrix"}}),
+        ];
+        let sort = vec![SortClause::Field({
+            let mut m = HashMap::new();
+            m.insert("title".to_string(), SortOrder::Direction(SortDirection::Asc));
+            m
+        })];
+        sort_hits(&mut hits, &sort);
+        assert_eq!(hits[0]["_id"], "d2", "Avatar first");
+        assert_eq!(hits[1]["_id"], "d1", "Inception second");
+        assert_eq!(hits[2]["_id"], "d3", "Matrix third");
+    }
+
+    #[test]
+    fn sort_by_score_explicit() {
+        let mut hits = vec![
+            json!({"_id": "d1", "_score": 0.3, "_source": {}}),
+            json!({"_id": "d2", "_score": 0.9, "_source": {}}),
+        ];
+        let sort = vec![SortClause::Simple("_score".to_string())];
+        sort_hits(&mut hits, &sort);
+        assert_eq!(hits[0]["_id"], "d2", "_score 0.9 first (desc default for _score)");
+    }
+
+    #[test]
+    fn sort_by_field_then_score_tiebreaker() {
+        let mut hits = vec![
+            json!({"_id": "d1", "_score": 0.5, "_source": {"year": 2020}}),
+            json!({"_id": "d2", "_score": 0.9, "_source": {"year": 2020}}),
+            json!({"_id": "d3", "_score": 0.1, "_source": {"year": 2010}}),
+        ];
+        let sort = vec![
+            SortClause::Field({
+                let mut m = HashMap::new();
+                m.insert("year".to_string(), SortOrder::Direction(SortDirection::Desc));
+                m
+            }),
+            SortClause::Simple("_score".to_string()),
+        ];
+        sort_hits(&mut hits, &sort);
+        // year 2020 first (d1 and d2), then tie-broken by _score desc
+        assert_eq!(hits[0]["_id"], "d2", "year=2020, score=0.9");
+        assert_eq!(hits[1]["_id"], "d1", "year=2020, score=0.5");
+        assert_eq!(hits[2]["_id"], "d3", "year=2010");
+    }
+
+    #[test]
+    fn sort_nulls_last() {
+        let mut hits = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"year": 2020}}),
+            json!({"_id": "d2", "_score": 1.0, "_source": {}}), // no year field
+            json!({"_id": "d3", "_score": 1.0, "_source": {"year": 2010}}),
+        ];
+        let sort = vec![SortClause::Field({
+            let mut m = HashMap::new();
+            m.insert("year".to_string(), SortOrder::Direction(SortDirection::Asc));
+            m
+        })];
+        sort_hits(&mut hits, &sort);
+        assert_eq!(hits[0]["_id"], "d3", "2010 first");
+        assert_eq!(hits[1]["_id"], "d1", "2020 second");
+        assert_eq!(hits[2]["_id"], "d2", "null last");
+    }
+
+    #[test]
+    fn sort_with_object_order_syntax() {
+        let mut hits = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"year": 2020}}),
+            json!({"_id": "d2", "_score": 1.0, "_source": {"year": 1999}}),
+        ];
+        let sort = vec![SortClause::Field({
+            let mut m = HashMap::new();
+            m.insert("year".to_string(), SortOrder::Object { order: SortDirection::Asc });
+            m
+        })];
+        sort_hits(&mut hits, &sort);
+        assert_eq!(hits[0]["_id"], "d2", "1999 first");
+    }
+
+    #[test]
+    fn deserialize_sort_simple_string() {
+        let body = json!({"query": {"match_all": {}}, "sort": ["_score"]});
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.sort.len(), 1);
+        assert!(matches!(&req.sort[0], SortClause::Simple(s) if s == "_score"));
+    }
+
+    #[test]
+    fn deserialize_sort_field_with_direction() {
+        let body = json!({"query": {"match_all": {}}, "sort": [{"year": "desc"}]});
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.sort.len(), 1);
+        match &req.sort[0] {
+            SortClause::Field(m) => {
+                assert!(m.contains_key("year"));
+                match m.get("year").unwrap() {
+                    SortOrder::Direction(d) => assert_eq!(*d, SortDirection::Desc),
+                    _ => panic!("expected Direction"),
+                }
+            }
+            _ => panic!("expected Field sort clause"),
+        }
+    }
+
+    #[test]
+    fn deserialize_sort_field_with_object() {
+        let body = json!({"query": {"match_all": {}}, "sort": [{"year": {"order": "asc"}}]});
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.sort.len(), 1);
+    }
+
+    #[test]
+    fn deserialize_sort_mixed() {
+        let body = json!({
+            "query": {"match_all": {}},
+            "sort": [{"year": "desc"}, "_score"]
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.sort.len(), 2);
+    }
+
+    #[test]
+    fn deserialize_no_sort_defaults_to_empty() {
+        let body = json!({"query": {"match_all": {}}});
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert!(req.sort.is_empty());
     }
 }
