@@ -540,17 +540,14 @@ pub async fn search_documents_dsl(
     }
 
     // Merge results: use RRF for hybrid, plain sort otherwise
-    let all_hits = if is_hybrid {
+    let mut all_hits = if is_hybrid {
         crate::search::merge_hybrid_hits(text_hits, knn_hits)
     } else {
-        let mut hits = text_hits;
-        hits.sort_by(|a, b| {
-            let sa = a.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let sb = b.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hits
+        text_hits
     };
+
+    // Apply user-specified sort (or default _score desc)
+    crate::search::sort_hits(&mut all_hits, &search_req.sort);
 
     let total = all_hits.len();
     let paginated: Vec<_> = all_hits.into_iter().skip(search_req.from).take(search_req.size).collect();

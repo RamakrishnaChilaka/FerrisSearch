@@ -137,6 +137,7 @@ impl CompositeEngine {
             size: 100_000,
             from: 0,
             knn: None,
+            sort: vec![],
         };
         let docs = self.text.search_query(&req).unwrap_or_default();
         if docs.is_empty() {
@@ -345,6 +346,7 @@ mod tests {
             size: 10,
             from: 0,
             knn: None,
+            sort: vec![],
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
@@ -553,6 +555,7 @@ mod tests {
             size: 10,
             from: 0,
             knn: None,
+            sort: vec![],
         };
         let text_hits = engine.search_query(&req).unwrap();
         assert_eq!(text_hits.len(), 3, "match_all should return all 3 docs");
@@ -586,6 +589,7 @@ mod tests {
             size: 10,
             from: 0,
             knn: None,
+            sort: vec![],
         };
         let hits = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 2, "match on 'movie' should find d1 and d2");
