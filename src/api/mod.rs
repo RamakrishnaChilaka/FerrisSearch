@@ -139,6 +139,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_refresh", post(index::refresh_index))
         .route("/{index}/_refresh", get(index::refresh_index))
         .route("/{index}/_flush", post(index::flush_index))
+        .route("/{index}/_flush", get(index::flush_index))
         .layer(middleware::from_fn(pretty_json_middleware))
         .with_state(state)
 }

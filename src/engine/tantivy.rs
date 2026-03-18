@@ -529,6 +529,7 @@ impl HotEngine {
         let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         writer.commit()?;
         drop(writer);
+        self.reader.reload()?;
         let tl = self.translog.lock().unwrap();
         if global_checkpoint > 0 {
             tl.truncate_below(global_checkpoint)?;
@@ -649,6 +650,7 @@ impl super::SearchEngine for HotEngine {
         let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         writer.commit()?;
         drop(writer); // release lock before translog truncate
+        self.reader.reload()?;
         let tl = self.translog.lock().unwrap();
         tl.truncate()?;
         Ok(())

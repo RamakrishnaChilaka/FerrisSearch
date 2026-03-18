@@ -518,7 +518,8 @@ pub async fn refresh_index(
     )
 }
 
-/// POST /{index}/_flush — Scatter flush to all local shard engines for this index.
+/// POST|GET /{index}/_flush — Scatter flush to all local shard engines for this index.
+/// If no local shards are open but the index exists in cluster state, opens them first.
 pub async fn flush_index(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
@@ -531,7 +532,40 @@ pub async fn flush_index(
         );
     }
 
-    let shards = state.shard_manager.get_index_shards(&index_name);
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = cluster_state.indices.get(&index_name);
+
+    let mut shards = state.shard_manager.get_index_shards(&index_name);
+    if shards.is_empty() {
+        if let Some(meta) = metadata {
+            for (shard_id, routing) in &meta.shard_routing {
+                if routing.primary == state.local_node_id
+                    || routing.replicas.contains(&state.local_node_id)
+                {
+                    if let Err(e) = state.shard_manager.open_shard_with_mappings(
+                        &index_name,
+                        *shard_id,
+                        &meta.mappings,
+                    ) {
+                        tracing::error!(
+                            "Flush: failed to open shard {}/{}: {}",
+                            index_name,
+                            shard_id,
+                            e
+                        );
+                    }
+                }
+            }
+            shards = state.shard_manager.get_index_shards(&index_name);
+        } else {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name),
+            );
+        }
+    }
+
     let mut successful = 0;
     let mut failed = 0;
 
