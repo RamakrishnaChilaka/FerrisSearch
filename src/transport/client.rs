@@ -169,11 +169,14 @@ impl TransportClient {
         let documents_json: Vec<Vec<u8>> = docs
             .iter()
             .map(|(id, payload)| {
-                serde_json::to_vec(&serde_json::json!({
-                    "_doc_id": id,
-                    "_source": payload
-                }))
-                .unwrap_or_default()
+                // Write directly to buffer — avoids creating intermediate serde_json::Value
+                let mut buf = Vec::with_capacity(128 + id.len());
+                buf.extend_from_slice(b"{\"_doc_id\":");
+                serde_json::to_writer(&mut buf, id).unwrap_or_default();
+                buf.extend_from_slice(b",\"_source\":");
+                serde_json::to_writer(&mut buf, payload).unwrap_or_default();
+                buf.push(b'}');
+                buf
             })
             .collect();
         let request = tonic::Request::new(ShardBulkRequest {
