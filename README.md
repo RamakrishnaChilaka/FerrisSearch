@@ -355,6 +355,8 @@ All cluster metadata — node membership, index definitions, shard assignments, 
 3. Once committed, every node's state machine applies the change identically
 4. Leader election happens automatically if the current leader dies (1.5–3s timeout)
 5. Dead nodes are detected after 15s of missed heartbeats and removed from the cluster
+6. When a dead node held a primary shard, the best in-sync replica is promoted to primary
+7. New leader observes a 20s grace period before scanning for dead nodes to avoid false positives
 
 ### Document data (gRPC replication)
 Document writes use direct primary-to-replica replication with sequence number tracking:
@@ -371,9 +373,9 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 383 tests
-cargo test --lib                                # Unit tests (334)
-cargo test --test consensus_integration          # Raft consensus tests (18)
+cargo test                                      # All 390 tests
+cargo test --lib                                # Unit tests (339)
+cargo test --test consensus_integration          # Raft consensus tests (20)
 cargo test --test replication_integration        # Replication tests (31)
 ```
 
@@ -436,8 +438,8 @@ config/            Default configuration
 - [x] Node failure detection and automatic removal
 - [x] Leader failover with automatic re-election
 - [ ] Automatic shard rebalancing across nodes
-- [ ] Shard reassignment on node failure
-- [ ] Replica promotion on primary failure
+- [x] Shard reassignment on node failure
+- [x] Replica promotion on primary failure (ISR-aware: picks replica with highest checkpoint)
 - [ ] Shard awareness (co-location prevention)
 - [ ] Delayed allocation for rolling restarts
 - [x] Persistent Raft log (disk-backed storage)

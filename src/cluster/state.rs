@@ -196,6 +196,19 @@ impl IndexMetadata {
         false
     }
 
+    /// Promote a specific replica to primary for a given shard.
+    /// The chosen replica is removed from the replicas list and becomes primary.
+    /// Returns true if promotion occurred.
+    pub fn promote_replica_to(&mut self, shard_id: u32, new_primary: &str) -> bool {
+        if let Some(routing) = self.shard_routing.get_mut(&shard_id) {
+            if let Some(pos) = routing.replicas.iter().position(|n| n == new_primary) {
+                routing.primary = routing.replicas.remove(pos);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Remove a node from all shard routing entries (both primary and replica).
     /// Returns shard IDs where this node was the primary (need promotion or reassignment).
     pub fn remove_node(&mut self, node_id: &NodeId) -> Vec<u32> {
@@ -886,5 +899,142 @@ mod tests {
         // Only node available is the same as primary
         let changed = meta.allocate_unassigned_replicas(&["node-1".into()]);
         assert!(!changed, "should not assign replica to primary node");
+    }
+
+    // ── promote_replica_to tests ────────────────────────────────────────
+
+    #[test]
+    fn promote_replica_to_specific_node() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 2,
+            shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into(), "node-C".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        // Promote node-C (skipping node-B which is first)
+        assert!(meta.promote_replica_to(0, "node-C"));
+        assert_eq!(meta.shard_routing[&0].primary, "node-C");
+        assert_eq!(meta.shard_routing[&0].replicas, vec!["node-B".to_string()]);
+    }
+
+    #[test]
+    fn promote_replica_to_nonexistent_node_fails() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        assert!(!meta.promote_replica_to(0, "node-X"));
+        assert_eq!(
+            meta.shard_routing[&0].primary, "node-A",
+            "primary should not change"
+        );
+    }
+
+    #[test]
+    fn promote_replica_to_unknown_shard_fails() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        assert!(!meta.promote_replica_to(99, "node-B"));
+    }
+
+    // ── remove_node + promote flow tests ────────────────────────────────
+
+    #[test]
+    fn remove_primary_node_and_promote() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 2,
+            number_of_replicas: 1,
+            shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into()],
+                unassigned_replicas: 0,
+            },
+        );
+        meta.shard_routing.insert(
+            1,
+            ShardRoutingEntry {
+                primary: "node-B".into(),
+                replicas: vec!["node-A".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        // Remove node-A: orphans shard 0's primary, removed from shard 1's replicas
+        let orphaned = meta.remove_node(&"node-A".to_string());
+        assert_eq!(orphaned, vec![0]);
+
+        // shard 1's replicas should no longer include node-A
+        assert!(meta.shard_routing[&1].replicas.is_empty());
+
+        // Promote for shard 0
+        assert!(meta.promote_replica(0));
+        assert_eq!(meta.shard_routing[&0].primary, "node-B");
+        assert!(meta.shard_routing[&0].replicas.is_empty());
+    }
+
+    #[test]
+    fn remove_node_returns_empty_for_replica_only() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into(), "node-C".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        // Remove a replica-only node — no orphaned primaries
+        let orphaned = meta.remove_node(&"node-B".to_string());
+        assert!(orphaned.is_empty());
+        assert_eq!(meta.shard_routing[&0].replicas, vec!["node-C".to_string()]);
     }
 }

@@ -42,7 +42,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterCommand::SetMaster { node_id }`
 
 ## Test Suite
-- 194 unit tests + 15 consensus integration + 11 replication integration = 220 total
+- 339 unit tests + 20 consensus integration + 31 replication integration = 390 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -50,13 +50,16 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
 - Joining node: sends JoinCluster gRPC (with raft_node_id) → leader does `AddNode` + `add_learner` + `change_membership`
 - Joining node does NOT call `update_state` — Raft log replication propagates state
-- Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader)
+- Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader), shard failover (promote best ISR replica to primary for orphaned shards)
 - Follower lifecycle loop: pings the master for liveness
 
 ## Important Design Decisions
 - `ClusterManager::update_state()` is a full overwrite — never use it to replace Raft-managed state
 - `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft. Populated by `add_node()` and `ping_node()`
 - New leader gets a 20s grace period (`leader_since`) before scanning for dead nodes to avoid false positives
+- Dead node handling: leader removes node from Raft + cluster, promotes best ISR replica for orphaned primary shards (highest checkpoint wins), increments `unassigned_replicas` for lost replica slots
+- `promote_replica_to(shard_id, node_name)` for targeted promotion; `promote_replica()` as fallback (first available)
+- Shard failover uses existing `UpdateIndex` Raft command — no new command variant needed
 - `raft_node_id` field on NodeInfo is critical for Raft membership changes — must be non-zero for Raft-managed nodes
 
 ## Config

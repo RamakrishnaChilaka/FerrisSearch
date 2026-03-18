@@ -584,3 +584,117 @@ async fn create_index_on_three_nodes_all_replicas_assigned() {
     );
     assert_eq!(state.indices["logs"].shard_routing[&0].replicas.len(), 2);
 }
+
+// ─── Replica promotion via UpdateIndex (simulates dead primary) ────────
+
+#[tokio::test]
+async fn update_index_promotes_replica_after_primary_death() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "promote-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19320".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Create index with primary=node-A, replicas=[node-B, node-C]
+    let idx = IndexMetadata::build_shard_routing(
+        "promo",
+        1,
+        2,
+        &["node-A".into(), "node-B".into(), "node-C".into()],
+    );
+    raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
+        .await
+        .unwrap();
+
+    {
+        let state = state_handle.read().unwrap();
+        assert_eq!(state.indices["promo"].shard_routing[&0].primary, "node-A");
+    }
+
+    // Simulate what the leader does when node-A dies:
+    // 1. remove_node from index metadata → gets orphaned primaries
+    // 2. promote_replica_to with chosen node
+    // 3. UpdateIndex via Raft
+    let mut updated = {
+        let state = state_handle.read().unwrap();
+        state.indices["promo"].clone()
+    };
+    let orphaned = updated.remove_node(&"node-A".to_string());
+    assert_eq!(orphaned, vec![0], "shard 0 primary was node-A");
+
+    // Promote node-C (simulating ISR tracker picked it as highest checkpoint)
+    assert!(updated.promote_replica_to(0, "node-C"));
+    // Lost replica slot → mark as unassigned
+    if let Some(routing) = updated.shard_routing.get_mut(&0) {
+        routing.unassigned_replicas += 1;
+    }
+
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(
+        state.indices["promo"].shard_routing[&0].primary, "node-C",
+        "node-C should be promoted to primary"
+    );
+    assert_eq!(
+        state.indices["promo"].shard_routing[&0].replicas,
+        vec!["node-B".to_string()],
+        "node-B should remain as replica"
+    );
+    assert_eq!(
+        state.indices["promo"].shard_routing[&0].unassigned_replicas, 1,
+        "one replica slot lost (was node-A's promotion + dead node)"
+    );
+}
+
+#[tokio::test]
+async fn update_index_removes_dead_replica_and_marks_unassigned() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "replica-death".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19321".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Create index: primary=node-A, replicas=[node-B]
+    let idx =
+        IndexMetadata::build_shard_routing("rdeath", 1, 1, &["node-A".into(), "node-B".into()]);
+    raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
+        .await
+        .unwrap();
+
+    // Simulate node-B dying (replica only)
+    let mut updated = {
+        let state = state_handle.read().unwrap();
+        state.indices["rdeath"].clone()
+    };
+    let orphaned = updated.remove_node(&"node-B".to_string());
+    assert!(orphaned.is_empty(), "node-B was only a replica");
+
+    // Mark the lost replica slot as unassigned
+    if let Some(routing) = updated.shard_routing.get_mut(&0) {
+        routing.unassigned_replicas += 1;
+    }
+
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(state.indices["rdeath"].shard_routing[&0].primary, "node-A");
+    assert!(
+        state.indices["rdeath"].shard_routing[&0]
+            .replicas
+            .is_empty(),
+        "node-B should be removed"
+    );
+    assert_eq!(
+        state.indices["rdeath"].shard_routing[&0].unassigned_replicas, 1,
+        "lost replica slot marked for reallocation"
+    );
+}
