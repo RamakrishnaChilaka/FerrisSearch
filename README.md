@@ -135,6 +135,11 @@ curl 'http://localhost:9200/my-index/_doc/{id}'
 # Delete a document
 curl -X DELETE 'http://localhost:9200/my-index/_doc/{id}'
 
+# Partial update a document (merge fields)
+curl -X POST 'http://localhost:9200/my-index/_update/1' \
+  -H 'Content-Type: application/json' \
+  -d '{"doc": {"rating": 9.5, "genre": "scifi"}}'
+
 # Bulk index
 curl -X POST 'http://localhost:9200/my-index/_bulk' \
   -H 'Content-Type: application/json' \
@@ -363,7 +368,7 @@ Document writes use direct primary-to-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All 305 tests
+cargo test                                      # All 307 tests
 cargo test --lib                                # Unit tests (207)
 cargo test --test consensus_integration          # Raft consensus tests (15)
 cargo test --test replication_integration        # Replication tests (11)
@@ -417,7 +422,7 @@ config/            Default configuration
 ### Index Management
 - [x] Field mappings in `PUT /{index}` (explicit schema definition)
 - [ ] Dynamic vs. strict mapping modes
-- [ ] Update document API (`POST /{index}/_update/{id}`)
+- [x] Update document API (`POST /{index}/_update/{id}`)
 - [ ] Index aliases
 - [ ] Index templates
 - [ ] Dynamic settings updates (`number_of_replicas`, `refresh_interval`)

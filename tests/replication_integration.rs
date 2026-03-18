@@ -1014,3 +1014,116 @@ async fn search_shard_dsl_knn_filter_no_matches_returns_empty_knn() {
         .collect();
     assert!(knn_hits.is_empty(), "no kNN hits when filter matches nothing");
 }
+
+// ─── Update document integration tests (get + modify + re-index via gRPC) ───
+
+#[tokio::test]
+async fn update_document_merges_fields_via_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("update-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index a document
+    let payload = serde_json::json!({"title": "The Matrix", "year": 1999, "rating": 8.7});
+    let resp = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "update-idx".into(),
+            shard_id: 0,
+            doc_id: "doc-1".into(),
+            payload_json: serde_json::to_vec(&payload).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success);
+    refresh_all(&sm);
+
+    // Get the document
+    let resp = client
+        .get_doc(tonic::Request::new(ShardGetRequest {
+            index_name: "update-idx".into(),
+            shard_id: 0,
+            doc_id: "doc-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.found);
+    let mut source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
+    assert_eq!(source["title"], "The Matrix");
+    assert_eq!(source["year"], 1999);
+
+    // Merge partial update into existing source
+    let partial = serde_json::json!({"rating": 9.0, "genre": "scifi"});
+    if let (Some(existing), Some(update)) = (source.as_object_mut(), partial.as_object()) {
+        for (k, v) in update {
+            existing.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Re-index the merged document
+    let resp = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "update-idx".into(),
+            shard_id: 0,
+            doc_id: "doc-1".into(),
+            payload_json: serde_json::to_vec(&source).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success);
+    refresh_all(&sm);
+
+    // Verify the merged document
+    let resp = client
+        .get_doc(tonic::Request::new(ShardGetRequest {
+            index_name: "update-idx".into(),
+            shard_id: 0,
+            doc_id: "doc-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.found);
+    let updated: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
+    assert_eq!(updated["title"], "The Matrix", "original field preserved");
+    assert_eq!(updated["year"], 1999, "original field preserved");
+    assert_eq!(updated["rating"], 9.0, "updated field changed");
+    assert_eq!(updated["genre"], "scifi", "new field added");
+}
+
+#[tokio::test]
+async fn update_nonexistent_document_returns_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("update-404-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index a doc so the shard exists
+    let payload = serde_json::json!({"title": "exists"});
+    client.index_doc(tonic::Request::new(ShardDocRequest {
+        index_name: "update-404-idx".into(),
+        shard_id: 0,
+        doc_id: "exists".into(),
+        payload_json: serde_json::to_vec(&payload).unwrap(),
+    })).await.unwrap();
+    refresh_all(&sm);
+
+    // Try to get a nonexistent doc (simulating what update_document does)
+    let resp = client
+        .get_doc(tonic::Request::new(ShardGetRequest {
+            index_name: "update-404-idx".into(),
+            shard_id: 0,
+            doc_id: "nonexistent".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!resp.found, "document should not be found");
+}

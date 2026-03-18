@@ -613,6 +613,66 @@ pub async fn get_document(
     }
 }
 
+/// POST /{index}/_update/{id} — Partial update a document by merging fields.
+/// Body: `{ "doc": { "field": "new_value" } }`
+/// Fetches the existing document, merges the provided fields, and re-indexes.
+pub async fn update_document(
+    State(state): State<AppState>,
+    Path((index_name, doc_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(msg) = crate::common::validate_index_name(&index_name) {
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
+    }
+
+    let partial = match body.get("doc") {
+        Some(d) if d.is_object() => d.clone(),
+        _ => return crate::api::error_response(StatusCode::BAD_REQUEST, "action_request_validation_exception", "update requires a 'doc' object"),
+    };
+
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = match cluster_state.indices.get(&index_name) {
+        Some(m) => m.clone(),
+        None => return crate::api::error_response(StatusCode::NOT_FOUND, "index_not_found_exception", format!("no such index [{}]", index_name)),
+    };
+
+    let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
+    let target_node_id = match metadata.primary_node(shard_id) {
+        Some(id) => id.clone(),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "shard_not_available_exception", "Shard has no assigned node"),
+    };
+    let target_node = match cluster_state.nodes.get(&target_node_id) {
+        Some(n) => n.clone(),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "node_not_found_exception", "Target node not in cluster state"),
+    };
+
+    // 1. Fetch the existing document
+    let existing = match state.transport_client.forward_get_to_shard(&target_node, &index_name, shard_id, &doc_id).await {
+        Ok(Some(source)) => source,
+        Ok(None) => return crate::api::error_response(StatusCode::NOT_FOUND, "document_missing_exception", format!("[{}]: document missing", doc_id)),
+        Err(e) => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "get_exception", format!("{}", e)),
+    };
+
+    // 2. Merge: overlay partial fields onto existing _source
+    let merged = if let (Some(existing_obj), Some(partial_obj)) = (existing.as_object(), partial.as_object()) {
+        let mut merged_obj = existing_obj.clone();
+        for (key, value) in partial_obj {
+            merged_obj.insert(key.clone(), value.clone());
+        }
+        serde_json::Value::Object(merged_obj)
+    } else {
+        partial
+    };
+
+    // 3. Re-index the merged document
+    match state.transport_client.forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &merged).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({
+            "_index": index_name, "_id": doc_id, "_shard": shard_id, "result": "updated"
+        }))),
+        Err(e) => crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "forward_exception", format!("Update failed: {}", e)),
+    }
+}
+
 /// DELETE /{index}/_doc/{id} — Delete a document by its ID.
 pub async fn delete_document(
     State(state): State<AppState>,

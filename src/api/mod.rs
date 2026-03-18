@@ -124,6 +124,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_doc/{id}", put(index::index_document_with_id))
         .route("/{index}/_doc/{id}", get(index::get_document))
         .route("/{index}/_doc/{id}", delete(index::delete_document))
+        .route("/{index}/_update/{id}", post(index::update_document))
         .route("/{index}/_bulk", post(index::bulk_index))
         // Search
         .route("/{index}/_search", get(search::search_documents))
