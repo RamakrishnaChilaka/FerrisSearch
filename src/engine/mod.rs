@@ -51,6 +51,20 @@ pub trait SearchEngine: Send + Sync {
         Ok(vec![])
     }
 
+    /// k-NN vector search with an optional pre-filter query.
+    /// When a filter is provided, candidates are oversampled from the vector index
+    /// then post-filtered against the query, keeping the top k matches.
+    /// Default implementation ignores the filter and delegates to search_knn.
+    fn search_knn_filtered(
+        &self,
+        field: &str,
+        vector: &[f32],
+        k: usize,
+        _filter: Option<&crate::search::QueryClause>,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.search_knn(field, vector, k)
+    }
+
     /// Returns the number of searchable documents.
     fn doc_count(&self) -> u64;
 }

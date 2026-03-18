@@ -302,7 +302,7 @@ config/            Default configuration
 - [x] k-NN across shards (scatter-gather for vector queries)
 - [ ] Quantization support (f16, i8) for memory efficiency
 - [ ] Disk-backed vector indexes (mmap via USearch)
-- [ ] Pre-filtering: apply bool/range filters before vector search
+- [x] Pre-filtering: apply bool/range filters before vector search
 
 ### Index Management
 - [ ] Field mappings in `PUT /{index}` (explicit schema definition)

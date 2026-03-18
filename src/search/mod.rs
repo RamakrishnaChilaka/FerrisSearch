@@ -41,6 +41,9 @@ pub struct KnnParams {
     pub vector: Vec<f32>,
     /// Number of nearest neighbors to return.
     pub k: usize,
+    /// Optional pre-filter: only return neighbors matching this query clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<QueryClause>,
 }
 
 /// A query clause: term, match, match_all, bool, or range.
@@ -561,6 +564,62 @@ mod tests {
         // query should default to match_all
         assert!(matches!(req.query, QueryClause::MatchAll(_)));
         assert!(req.knn.is_some());
+    }
+
+    #[test]
+    fn deserialize_knn_with_filter() {
+        let body = json!({
+            "knn": { "embedding": { "vector": [0.1, 0.2, 0.3], "k": 5, "filter": { "match": { "genre": "action" } } } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        let knn = req.knn.unwrap();
+        let params = knn.fields.get("embedding").unwrap();
+        assert_eq!(params.k, 5);
+        assert!(params.filter.is_some());
+        assert!(matches!(params.filter.as_ref().unwrap(), QueryClause::Match(_)));
+    }
+
+    #[test]
+    fn deserialize_knn_without_filter_defaults_to_none() {
+        let body = json!({
+            "knn": { "embedding": { "vector": [0.1, 0.2], "k": 3 } }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        let params = req.knn.unwrap().fields.into_values().next().unwrap();
+        assert!(params.filter.is_none());
+    }
+
+    #[test]
+    fn deserialize_knn_filter_with_bool_query() {
+        let body = json!({
+            "knn": { "emb": { "vector": [0.5], "k": 10, "filter": {
+                "bool": {
+                    "must": [{ "match": { "status": "active" } }],
+                    "filter": [{ "range": { "year": { "gte": 2020 } } }]
+                }
+            }}}
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        let params = req.knn.unwrap().fields.get("emb").unwrap().clone();
+        assert!(matches!(params.filter.unwrap(), QueryClause::Bool(_)));
+    }
+
+    #[test]
+    fn knn_filter_roundtrip_serde() {
+        let filter = QueryClause::Match({
+            let mut m = HashMap::new();
+            m.insert("title".to_string(), json!("rust"));
+            m
+        });
+        let params = KnnParams {
+            vector: vec![1.0, 2.0],
+            k: 5,
+            filter: Some(filter),
+        };
+        let json_str = serde_json::to_string(&params).unwrap();
+        let params2: KnnParams = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(params2.k, 5);
+        assert!(params2.filter.is_some());
     }
 
     // ── Wildcard / Prefix deserialization ────────────────────────────────

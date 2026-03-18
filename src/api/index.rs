@@ -46,30 +46,8 @@ pub async fn create_index(
         return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "no_data_nodes_exception", "No data nodes available to assign shards");
     }
 
-    let mut shard_assignment: HashMap<u32, crate::cluster::state::ShardRoutingEntry> = HashMap::new();
-    for shard_id in 0..num_shards {
-        let primary_node = data_nodes[(shard_id as usize) % data_nodes.len()].clone();
-        // Assign replicas round-robin from different nodes than the primary
-        let mut replicas = Vec::new();
-        for r in 0..num_replicas {
-            let replica_idx = ((shard_id as usize) + 1 + (r as usize)) % data_nodes.len();
-            let replica_node = &data_nodes[replica_idx];
-            if *replica_node != primary_node {
-                replicas.push(replica_node.clone());
-            }
-        }
-        shard_assignment.insert(shard_id, crate::cluster::state::ShardRoutingEntry {
-            primary: primary_node,
-            replicas,
-        });
-    }
-
-    let metadata = IndexMetadata {
-        name: index_name.clone(),
-        number_of_shards: num_shards,
-        number_of_replicas: num_replicas,
-        shard_routing: shard_assignment.clone(),
-    };
+    let metadata = IndexMetadata::build_shard_routing(&index_name, num_shards, num_replicas, &data_nodes);
+    let shard_assignment = metadata.shard_routing.clone();
 
     // Write through Raft if available (leader only), otherwise fallback
     if let Some(ref raft) = state.raft {
@@ -450,7 +428,7 @@ pub async fn search_documents_dsl(
     if let Some(ref knn) = search_req.knn {
         if let Some((field_name, params)) = knn.fields.iter().next() {
             for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
-                match engine.search_knn(field_name, &params.vector, params.k) {
+                match engine.search_knn_filtered(field_name, &params.vector, params.k, params.filter.as_ref()) {
                     Ok(hits) => {
                         for hit in hits {
                             knn_hits.push(serde_json::json!({

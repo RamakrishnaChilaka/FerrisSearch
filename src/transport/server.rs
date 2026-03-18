@@ -351,7 +351,7 @@ impl InternalTransport for TransportService {
         // k-NN vector search (if knn clause present)
         if let Some(ref knn) = search_req.knn {
             if let Some((field_name, params)) = knn.fields.iter().next() {
-                match engine.search_knn(field_name, &params.vector, params.k) {
+                match engine.search_knn_filtered(field_name, &params.vector, params.k, params.filter.as_ref()) {
                     Ok(hits) => all_hits.extend(hits),
                     Err(e) => {
                         tracing::error!("Vector search on remote shard failed: {}", e);

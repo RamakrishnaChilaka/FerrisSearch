@@ -222,6 +222,27 @@ impl HotEngine {
         Ok(results)
     }
 
+    /// Return the set of document IDs matching a query clause.
+    /// Used by CompositeEngine for pre-filtering kNN results.
+    pub fn matching_doc_ids(&self, clause: &crate::search::QueryClause) -> Result<std::collections::HashSet<String>> {
+        let query = self.build_query(clause)?;
+        let searcher = self.reader.searcher();
+        let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
+        // Collect up to 100k matching docs — a reasonable ceiling for filter sets
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(100_000))?;
+        let mut ids = std::collections::HashSet::new();
+        for (_score, doc_address) in top_docs {
+            let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
+            if let Some(doc_id) = retrieved_doc.get_all(registry.id_field)
+                .next()
+                .and_then(|v| v.as_str())
+            {
+                ids.insert(doc_id.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
     /// Recursively convert a QueryClause into a Tantivy Query.
     fn build_query(&self, clause: &crate::search::QueryClause) -> Result<Box<dyn tantivy::query::Query>> {
         use crate::search::QueryClause;

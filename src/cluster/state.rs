@@ -46,6 +46,39 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    /// Build shard routing for a new index, distributing primaries and replicas
+    /// round-robin across the given data nodes. Guarantees that a shard's primary
+    /// and replicas are never assigned to the same node.
+    pub fn build_shard_routing(
+        name: &str,
+        num_shards: u32,
+        num_replicas: u32,
+        data_nodes: &[String],
+    ) -> Self {
+        let mut shard_routing = HashMap::new();
+        for shard_id in 0..num_shards {
+            let primary_node = data_nodes[(shard_id as usize) % data_nodes.len()].clone();
+            let mut replicas = Vec::new();
+            for r in 0..num_replicas {
+                let replica_idx = ((shard_id as usize) + 1 + (r as usize)) % data_nodes.len();
+                let replica_node = &data_nodes[replica_idx];
+                if *replica_node != primary_node {
+                    replicas.push(replica_node.clone());
+                }
+            }
+            shard_routing.insert(shard_id, ShardRoutingEntry {
+                primary: primary_node,
+                replicas,
+            });
+        }
+        Self {
+            name: name.to_string(),
+            number_of_shards: num_shards,
+            number_of_replicas: num_replicas,
+            shard_routing,
+        }
+    }
+
     /// Get the primary node for a given shard.
     pub fn primary_node(&self, shard_id: u32) -> Option<&NodeId> {
         self.shard_routing.get(&shard_id).map(|r| &r.primary)

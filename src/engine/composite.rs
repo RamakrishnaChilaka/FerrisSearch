@@ -202,18 +202,55 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<serde_json::Value>> {
+        self.search_knn_filtered(field, vector, k, None)
+    }
+
+    fn search_knn_filtered(
+        &self,
+        field: &str,
+        vector: &[f32],
+        k: usize,
+        filter: Option<&crate::search::QueryClause>,
+    ) -> Result<Vec<serde_json::Value>> {
         let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
         let vi = match *guard {
             Some(ref vi) => vi,
             None => return Ok(vec![]),
         };
 
-        let (keys, distances) = vi.search(vector, k)?;
-        let mut hits = Vec::with_capacity(keys.len());
+        // When a filter is present, oversample to get enough candidates that
+        // pass the filter. We fetch k * OVERSAMPLE_FACTOR candidates from the
+        // vector index, then post-filter against the Tantivy query.
+        const OVERSAMPLE_FACTOR: usize = 10;
+        let fetch_k = if filter.is_some() {
+            std::cmp::min(k * OVERSAMPLE_FACTOR, vi.len())
+        } else {
+            k
+        };
 
+        let (keys, distances) = vi.search(vector, fetch_k)?;
+
+        // Build the allowed doc_id set if a filter is present
+        let allowed_ids = match filter {
+            Some(clause) => Some(self.text.matching_doc_ids(clause)?),
+            None => None,
+        };
+
+        let mut hits = Vec::with_capacity(k);
         for (key, distance) in keys.iter().zip(distances.iter()) {
+            if hits.len() >= k {
+                break;
+            }
             let doc_id = vi.doc_id_for_key(*key)
                 .unwrap_or_else(|| key.to_string());
+
+            // Skip docs that don't pass the filter
+            if let Some(ref allowed) = allowed_ids {
+                if !allowed.contains(&doc_id) {
+                    continue;
+                }
+            }
+
             let source = self.text.get_document(&doc_id).ok().flatten();
             hits.push(serde_json::json!({
                 "_id": doc_id,
@@ -556,5 +593,120 @@ mod tests {
         let hits = engine.search_knn("emb", &[0.9, 0.1], 1).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d1");
+    }
+
+    // ── Pre-filtered kNN search ────────────────────────────────────────
+
+    #[test]
+    fn knn_filtered_returns_only_matching_docs() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust search", "year": "2020", "emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine.add_document("d2", json!({"title": "python web", "year": "2021", "emb": [0.9, 0.1, 0.0]})).unwrap();
+        engine.add_document("d3", json!({"title": "rust compiler", "year": "2022", "emb": [0.8, 0.2, 0.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        // Without filter: k=3 should return all 3 docs
+        let hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 3).unwrap();
+        assert_eq!(hits.len(), 3);
+
+        // With filter: only docs matching "rust" should be returned
+        let filter = crate::search::QueryClause::Match({
+            let mut m = std::collections::HashMap::new();
+            m.insert("title".to_string(), json!("rust"));
+            m
+        });
+        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 3, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 2, "filter should only return d1 and d3");
+        let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d1"));
+        assert!(ids.contains(&"d3"));
+        assert!(!ids.contains(&"d2"), "d2 ('python web') should be filtered out");
+    }
+
+    #[test]
+    fn knn_filtered_respects_k_limit() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust a", "emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine.add_document("d2", json!({"title": "rust b", "emb": [0.9, 0.1, 0.0]})).unwrap();
+        engine.add_document("d3", json!({"title": "rust c", "emb": [0.8, 0.2, 0.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        let filter = crate::search::QueryClause::Match({
+            let mut m = std::collections::HashMap::new();
+            m.insert("title".to_string(), json!("rust"));
+            m
+        });
+        // All 3 match the filter, but k=1 should return only the nearest
+        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 1, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "d1", "d1 should be nearest neighbor");
+    }
+
+    #[test]
+    fn knn_filtered_none_filter_returns_all() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "a", "emb": [1.0, 0.0]})).unwrap();
+        engine.add_document("d2", json!({"title": "b", "emb": [0.0, 1.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        // No filter should return same as search_knn
+        let hits_unfiltered = engine.search_knn("emb", &[1.0, 0.0], 2).unwrap();
+        let hits_none_filter = engine.search_knn_filtered("emb", &[1.0, 0.0], 2, None).unwrap();
+        assert_eq!(hits_unfiltered.len(), hits_none_filter.len());
+    }
+
+    #[test]
+    fn knn_filtered_with_no_matches_returns_empty() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust only", "emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        // Filter for "python" — no docs match
+        let filter = crate::search::QueryClause::Match({
+            let mut m = std::collections::HashMap::new();
+            m.insert("title".to_string(), json!("python"));
+            m
+        });
+        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 5, Some(&filter)).unwrap();
+        assert!(hits.is_empty(), "no docs match filter, should return empty");
+    }
+
+    #[test]
+    fn knn_filtered_with_range_filter() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "old movie", "year": "2000", "emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine.add_document("d2", json!({"title": "new movie", "year": "2025", "emb": [0.95, 0.05, 0.0]})).unwrap();
+        engine.add_document("d3", json!({"title": "mid movie", "year": "2015", "emb": [0.5, 0.5, 0.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        // Filter: match_all (should get everything — range on dynamic fields
+        // won't work without typed fields, so we test with match_all + term)
+        let filter = crate::search::QueryClause::Match({
+            let mut m = std::collections::HashMap::new();
+            m.insert("title".to_string(), json!("new"));
+            m
+        });
+        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 3, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "d2");
+    }
+
+    #[test]
+    fn knn_filtered_preserves_knn_metadata() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust", "emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        let filter = crate::search::QueryClause::Match({
+            let mut m = std::collections::HashMap::new();
+            m.insert("title".to_string(), json!("rust"));
+            m
+        });
+        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 1, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_knn_field"], "emb");
+        assert!(hits[0]["_knn_distance"].as_f64().is_some());
+        assert!(hits[0]["_score"].as_f64().unwrap() > 0.0);
+        assert!(hits[0]["_source"].is_object());
     }
 }

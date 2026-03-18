@@ -927,3 +927,88 @@ async fn search_shard_dsl_nonexistent_shard_returns_error() {
     assert!(!resp.success, "should fail for nonexistent shard");
     assert!(resp.error.contains("not found"), "error should mention shard not found: {}", resp.error);
 }
+
+#[tokio::test]
+async fn search_shard_dsl_knn_with_filter_via_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("filter-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index docs with text + vectors
+    assert!(index_doc_with_vectors(&mut client, "filter-idx", 0, "d1",
+        serde_json::json!({"title": "rust search", "emb": [1.0, 0.0, 0.0]})).await);
+    assert!(index_doc_with_vectors(&mut client, "filter-idx", 0, "d2",
+        serde_json::json!({"title": "python web", "emb": [0.9, 0.1, 0.0]})).await);
+    assert!(index_doc_with_vectors(&mut client, "filter-idx", 0, "d3",
+        serde_json::json!({"title": "rust compiler", "emb": [0.8, 0.2, 0.0]})).await);
+    refresh_all(&sm);
+
+    // kNN search WITH filter: only "rust" docs
+    let search_req = serde_json::json!({
+        "knn": { "emb": { "vector": [1.0, 0.0, 0.0], "k": 3, "filter": { "match": { "title": "rust" } } } }
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "filter-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "filtered kNN search failed: {}", resp.error);
+    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+        .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
+        .collect();
+
+    // kNN hits should only contain d1 and d3 (matching "rust"), not d2 ("python")
+    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+        .filter(|h| h.get("_knn_field").is_some())
+        .collect();
+    assert_eq!(knn_hits.len(), 2, "expected 2 filtered kNN hits (d1, d3)");
+    let ids: Vec<&str> = knn_hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"d1"), "d1 should pass the filter");
+    assert!(ids.contains(&"d3"), "d3 should pass the filter");
+    assert!(!ids.contains(&"d2"), "d2 ('python') should be filtered out");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_knn_filter_no_matches_returns_empty_knn() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("nofilter-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    assert!(index_doc_with_vectors(&mut client, "nofilter-idx", 0, "d1",
+        serde_json::json!({"title": "rust only", "emb": [1.0, 0.0, 0.0]})).await);
+    refresh_all(&sm);
+
+    // Filter for "python" — no docs match
+    let search_req = serde_json::json!({
+        "knn": { "emb": { "vector": [1.0, 0.0, 0.0], "k": 5, "filter": { "match": { "title": "python" } } } }
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "nofilter-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "should succeed even with no matches: {}", resp.error);
+    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+        .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
+        .collect();
+    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+        .filter(|h| h.get("_knn_field").is_some())
+        .collect();
+    assert!(knn_hits.is_empty(), "no kNN hits when filter matches nothing");
+}
