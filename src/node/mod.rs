@@ -252,6 +252,93 @@ impl Node {
                         for dead in &dead_nodes {
                             tracing::warn!("Node {} has died. Removing via Raft.", dead);
 
+                            // ── Shard failover: promote replicas for orphaned primaries ──
+                            // Before removing the node, handle shard routing updates:
+                            // 1. Find all indices where the dead node hosts a primary or replica
+                            // 2. For orphaned primaries: pick best replica (highest checkpoint) and promote
+                            // 3. For lost replicas: increment unassigned count for re-allocation
+                            for (_idx_name, idx_meta) in &state.indices {
+                                let mut updated = idx_meta.clone();
+                                let orphaned_primaries = updated.remove_node(dead);
+                                let mut changed = false;
+
+                                for shard_id in &orphaned_primaries {
+                                    // Pick the best replica from ISR (highest checkpoint)
+                                    let cps = manager_clone
+                                        .isr_tracker
+                                        .replica_checkpoints(&idx_meta.name, *shard_id);
+
+                                    let promoted = if let Some((best_node, best_cp)) = cps
+                                        .iter()
+                                        .filter(|(nid, _)| nid != dead)
+                                        .max_by_key(|(_, cp)| *cp)
+                                    {
+                                        tracing::info!(
+                                            "Promoting replica '{}' (checkpoint={}) to primary for {}/shard_{}",
+                                            best_node,
+                                            best_cp,
+                                            idx_meta.name,
+                                            shard_id
+                                        );
+                                        updated.promote_replica_to(*shard_id, best_node)
+                                    } else {
+                                        // No ISR data — fall back to first available replica
+                                        tracing::info!(
+                                            "Promoting first available replica for {}/shard_{} (no ISR data)",
+                                            idx_meta.name,
+                                            shard_id
+                                        );
+                                        updated.promote_replica(*shard_id)
+                                    };
+
+                                    if promoted {
+                                        changed = true;
+                                        // The promoted replica's old slot is now lost — mark as unassigned
+                                        if let Some(routing) =
+                                            updated.shard_routing.get_mut(shard_id)
+                                        {
+                                            routing.unassigned_replicas += 1;
+                                        }
+                                    } else {
+                                        tracing::error!(
+                                            "No replicas available to promote for {}/shard_{} — shard is unavailable!",
+                                            idx_meta.name,
+                                            shard_id
+                                        );
+                                    }
+                                }
+
+                                // If dead node was a replica (not primary), its slot was removed by remove_node.
+                                // Increment unassigned_replicas so the allocator can reassign it.
+                                if orphaned_primaries.is_empty() {
+                                    // Dead node was a replica for some shards in this index
+                                    for (shard_id, routing) in &idx_meta.shard_routing {
+                                        if routing.replicas.contains(dead) {
+                                            if let Some(r) = updated.shard_routing.get_mut(shard_id)
+                                            {
+                                                r.unassigned_replicas += 1;
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if changed {
+                                    if let Err(e) = raft
+                                        .client_write(ClusterCommand::UpdateIndex {
+                                            metadata: updated,
+                                        })
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Failed to update shard routing for '{}' after node death: {}",
+                                            idx_meta.name,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
                             // Remove from Raft membership first
                             if let Some(dead_info) = state.nodes.get(dead) {
                                 if dead_info.raft_node_id > 0 {
