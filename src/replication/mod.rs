@@ -18,6 +18,7 @@ pub async fn replicate_write(
     doc_id: &str,
     payload: &serde_json::Value,
     op: &str,
+    seq_no: u64,
 ) -> Result<(), Vec<String>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
@@ -41,7 +42,7 @@ pub async fn replicate_write(
         };
 
         if let Err(e) = transport_client
-            .replicate_to_shard(node_info, index_name, shard_id, doc_id, payload, op)
+            .replicate_to_shard(node_info, index_name, shard_id, doc_id, payload, op, seq_no)
             .await
         {
             error!(
@@ -66,6 +67,7 @@ pub async fn replicate_bulk(
     index_name: &str,
     shard_id: u32,
     docs: &[(String, serde_json::Value)],
+    start_seq_no: u64,
 ) -> Result<(), Vec<String>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
@@ -89,7 +91,7 @@ pub async fn replicate_bulk(
         };
 
         if let Err(e) = transport_client
-            .replicate_bulk_to_shard(node_info, index_name, shard_id, docs)
+            .replicate_bulk_to_shard(node_info, index_name, shard_id, docs, start_seq_no)
             .await
         {
             error!(
@@ -141,6 +143,7 @@ mod tests {
         shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-1".into(),
             replicas,
+            unassigned_replicas: 0,
         });
         cs.add_index(IndexMetadata {
             name: name.into(),
@@ -159,7 +162,7 @@ mod tests {
         let cs = make_cluster_state_with_nodes();
         let result = replicate_write(
             &client, &cs, "nonexistent", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index",
+            &serde_json::json!({"field": "value"}), "index", 0,
         ).await;
         assert!(result.is_ok());
     }
@@ -171,7 +174,7 @@ mod tests {
         add_index_with_routing(&mut cs, "test-idx", vec![]);
         let result = replicate_write(
             &client, &cs, "test-idx", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index",
+            &serde_json::json!({"field": "value"}), "index", 0,
         ).await;
         assert!(result.is_ok());
     }
@@ -184,7 +187,7 @@ mod tests {
         // Shard 99 doesn't exist in routing table → no replicas → Ok
         let result = replicate_write(
             &client, &cs, "test-idx", 99, "doc1",
-            &serde_json::json!({"field": "value"}), "index",
+            &serde_json::json!({"field": "value"}), "index", 0,
         ).await;
         assert!(result.is_ok());
     }
@@ -196,7 +199,7 @@ mod tests {
         add_index_with_routing(&mut cs, "test-idx", vec!["ghost-node".into()]);
         let result = replicate_write(
             &client, &cs, "test-idx", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index",
+            &serde_json::json!({"field": "value"}), "index", 0,
         ).await;
         assert!(result.is_err());
         let errors = result.unwrap_err();
@@ -212,7 +215,7 @@ mod tests {
         add_index_with_routing(&mut cs, "test-idx", vec!["node-2".into()]);
         let result = replicate_write(
             &client, &cs, "test-idx", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index",
+            &serde_json::json!({"field": "value"}), "index", 0,
         ).await;
         assert!(result.is_err());
         let errors = result.unwrap_err();
@@ -228,7 +231,7 @@ mod tests {
         add_index_with_routing(&mut cs, "test-idx", vec!["ghost".into(), "node-2".into()]);
         let result = replicate_write(
             &client, &cs, "test-idx", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index",
+            &serde_json::json!({"field": "value"}), "index", 0,
         ).await;
         assert!(result.is_err());
         let errors = result.unwrap_err();
@@ -242,7 +245,7 @@ mod tests {
         let client = TransportClient::new();
         let cs = make_cluster_state_with_nodes();
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "nonexistent", 0, &docs).await;
+        let result = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0).await;
         assert!(result.is_ok());
     }
 
@@ -252,7 +255,7 @@ mod tests {
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec![]);
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs).await;
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0).await;
         assert!(result.is_ok());
     }
 
@@ -265,7 +268,7 @@ mod tests {
             ("d1".into(), serde_json::json!({"a": 1})),
             ("d2".into(), serde_json::json!({"b": 2})),
         ];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs).await;
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0).await;
         assert!(result.is_err());
         assert!(result.unwrap_err()[0].contains("phantom"));
     }
@@ -276,7 +279,7 @@ mod tests {
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec!["node-2".into()]);
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs).await;
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0).await;
         assert!(result.is_err());
     }
 }

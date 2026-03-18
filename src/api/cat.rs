@@ -68,8 +68,8 @@ pub async fn cat_shards(
 
     let mut out = String::new();
     if wants_headers(&params) {
-        writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<40}",
-            "index", "shard", "prirep", "docs", "node"
+        writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+            "index", "shard", "prirep", "state", "docs", "node"
         ).unwrap();
     }
 
@@ -86,6 +86,7 @@ pub async fn cat_shards(
             let node_name = cs.nodes.get(&routing.primary)
                 .map(|n| n.name.as_str())
                 .unwrap_or("UNASSIGNED");
+            let primary_state = if cs.nodes.contains_key(&routing.primary) { "STARTED" } else { "UNASSIGNED" };
 
             // If this shard is local, grab doc count from the engine
             let docs = state.shard_manager
@@ -93,21 +94,29 @@ pub async fn cat_shards(
                 .map(|e| e.doc_count().to_string())
                 .unwrap_or_else(|| "-".into());
 
-            writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<40}",
-                idx_name, shard_id, "p", docs, node_name
+            writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+                idx_name, shard_id, "p", primary_state, docs, node_name
             ).unwrap();
 
-            // Also list replica shards
+            // List assigned replica shards
             for replica_node_id in &routing.replicas {
                 let replica_name = cs.nodes.get(replica_node_id)
                     .map(|n| n.name.as_str())
                     .unwrap_or("UNASSIGNED");
+                let replica_state = if cs.nodes.contains_key(replica_node_id) { "STARTED" } else { "UNASSIGNED" };
                 let replica_docs = state.shard_manager
                     .get_shard(idx_name, shard_id)
                     .map(|e| e.doc_count().to_string())
                     .unwrap_or_else(|| "-".into());
-                writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<40}",
-                    idx_name, shard_id, "r", replica_docs, replica_name
+                writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+                    idx_name, shard_id, "r", replica_state, replica_docs, replica_name
+                ).unwrap();
+            }
+
+            // List unassigned replica shards (couldn't be placed)
+            for _ in 0..routing.unassigned_replicas {
+                writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+                    idx_name, shard_id, "r", "UNASSIGNED", "-", ""
                 ).unwrap();
             }
         }

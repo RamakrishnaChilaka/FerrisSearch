@@ -301,7 +301,8 @@ impl TransportClient {
         doc_id: &str,
         payload: &serde_json::Value,
         op: &str,
-    ) -> Result<(), anyhow::Error> {
+        seq_no: u64,
+    ) -> Result<u64, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let request = tonic::Request::new(ReplicateDocRequest {
             index_name: index_name.to_string(),
@@ -309,10 +310,11 @@ impl TransportClient {
             doc_id: doc_id.to_string(),
             payload_json: serde_json::to_vec(payload)?,
             op: op.to_string(),
+            seq_no,
         });
         let response = client.replicate_doc(request).await?.into_inner();
         if response.success {
-            Ok(())
+            Ok(response.local_checkpoint)
         } else {
             Err(anyhow::anyhow!("Replication failed: {}", response.error))
         }
@@ -325,15 +327,18 @@ impl TransportClient {
         index_name: &str,
         shard_id: u32,
         docs: &[(String, serde_json::Value)],
+        start_seq_no: u64,
     ) -> Result<(), anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let ops: Vec<ReplicateDocRequest> = docs.iter()
-            .map(|(id, payload)| ReplicateDocRequest {
+            .enumerate()
+            .map(|(i, (id, payload))| ReplicateDocRequest {
                 index_name: index_name.to_string(),
                 shard_id,
                 doc_id: id.clone(),
                 payload_json: serde_json::to_vec(payload).unwrap_or_default(),
                 op: "index".to_string(),
+                seq_no: start_seq_no + i as u64,
             })
             .collect();
         let request = tonic::Request::new(ReplicateBulkRequest {

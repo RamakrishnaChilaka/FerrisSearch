@@ -28,11 +28,31 @@ pub struct NodeInfo {
     pub raft_node_id: u64,
 }
 
+/// The allocation state of a shard copy (primary or replica).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShardState {
+    /// Shard is assigned to a node and active.
+    Started,
+    /// Shard needs a node but none is available (e.g. not enough data nodes for replicas).
+    Unassigned,
+}
+
+/// A single shard copy — either the primary or a replica — with its assignment state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardCopy {
+    pub node_id: Option<NodeId>,
+    pub state: ShardState,
+}
+
 /// Routing entry for a single shard: who is the primary, who are the replicas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardRoutingEntry {
     pub primary: NodeId,
     pub replicas: Vec<NodeId>,
+    /// Replica copies that couldn't be assigned (not enough distinct nodes).
+    #[serde(default)]
+    pub unassigned_replicas: u32,
 }
 
 /// The type of a mapped field in an index.
@@ -90,16 +110,20 @@ impl IndexMetadata {
         for shard_id in 0..num_shards {
             let primary_node = data_nodes[(shard_id as usize) % data_nodes.len()].clone();
             let mut replicas = Vec::new();
+            let mut unassigned = 0u32;
             for r in 0..num_replicas {
                 let replica_idx = ((shard_id as usize) + 1 + (r as usize)) % data_nodes.len();
                 let replica_node = &data_nodes[replica_idx];
                 if *replica_node != primary_node {
                     replicas.push(replica_node.clone());
+                } else {
+                    unassigned += 1;
                 }
             }
             shard_routing.insert(shard_id, ShardRoutingEntry {
                 primary: primary_node,
                 replicas,
+                unassigned_replicas: unassigned,
             });
         }
         Self {
@@ -114,6 +138,35 @@ impl IndexMetadata {
     /// Get the primary node for a given shard.
     pub fn primary_node(&self, shard_id: u32) -> Option<&NodeId> {
         self.shard_routing.get(&shard_id).map(|r| &r.primary)
+    }
+
+    /// Returns the total number of unassigned replica copies across all shards.
+    pub fn unassigned_replica_count(&self) -> u32 {
+        self.shard_routing.values().map(|r| r.unassigned_replicas).sum()
+    }
+
+    /// Try to assign unassigned replicas to available data nodes.
+    /// Returns true if any assignments were made (caller should persist via Raft).
+    pub fn allocate_unassigned_replicas(&mut self, data_nodes: &[String]) -> bool {
+        let mut changed = false;
+        for routing in self.shard_routing.values_mut() {
+            while routing.unassigned_replicas > 0 {
+                // Find a data node not already used by this shard (primary or existing replicas)
+                let used: std::collections::HashSet<&str> = std::iter::once(routing.primary.as_str())
+                    .chain(routing.replicas.iter().map(|s| s.as_str()))
+                    .collect();
+                let candidate = data_nodes.iter()
+                    .find(|n| !used.contains(n.as_str()));
+                if let Some(node) = candidate {
+                    routing.replicas.push(node.clone());
+                    routing.unassigned_replicas -= 1;
+                    changed = true;
+                } else {
+                    break; // No more distinct nodes available
+                }
+            }
+        }
+        changed
     }
 
     /// Get replica nodes for a given shard.
@@ -325,6 +378,7 @@ mod tests {
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec!["node-B".into(), "node-C".into()],
+            unassigned_replicas: 0,
         });
 
         assert!(meta.promote_replica(0));
@@ -344,6 +398,7 @@ mod tests {
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec![],
+            unassigned_replicas: 0,
         });
 
         assert!(!meta.promote_replica(0));
@@ -361,10 +416,12 @@ mod tests {
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec!["node-B".into()],
+            unassigned_replicas: 0,
         });
         meta.shard_routing.insert(1, ShardRoutingEntry {
             primary: "node-B".into(),
             replicas: vec!["node-A".into()],
+            unassigned_replicas: 0,
         });
 
         let orphaned = meta.remove_node(&"node-A".into());
@@ -386,10 +443,12 @@ mod tests {
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec!["node-B".into()],
+            unassigned_replicas: 0,
         });
         meta.shard_routing.insert(1, ShardRoutingEntry {
             primary: "node-B".into(),
             replicas: vec!["node-A".into()],
+            unassigned_replicas: 0,
         });
         assert_eq!(meta.primary_node(0), Some(&"node-A".to_string()));
         assert_eq!(meta.primary_node(1), Some(&"node-B".to_string()));
@@ -408,6 +467,7 @@ mod tests {
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec!["node-B".into(), "node-C".into()],
+            unassigned_replicas: 0,
         });
         let replicas = meta.replica_nodes(0);
         assert_eq!(replicas.len(), 2);
@@ -439,6 +499,7 @@ mod tests {
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec!["node-B".into(), "node-C".into()],
+            unassigned_replicas: 0,
         });
 
         // First promotion: B becomes primary
@@ -479,14 +540,17 @@ mod tests {
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec!["node-B".into()],
+            unassigned_replicas: 0,
         });
         meta.shard_routing.insert(1, ShardRoutingEntry {
             primary: "node-B".into(),
             replicas: vec!["node-A".into()],
+            unassigned_replicas: 0,
         });
         meta.shard_routing.insert(2, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec!["node-C".into()],
+            unassigned_replicas: 0,
         });
 
         let mut orphaned = meta.remove_node(&"node-A".into());
@@ -510,6 +574,7 @@ mod tests {
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
             replicas: vec!["node-B".into()],
+            unassigned_replicas: 0,
         });
 
         let orphaned = meta.remove_node(&"node-Z".into());
@@ -577,5 +642,148 @@ mod tests {
                 FieldType::Float | FieldType::Boolean | FieldType::KnnVector
             ));
         }
+    }
+
+    // ── Shard state tracking tests ──────────────────────────────────────
+
+    #[test]
+    fn single_node_with_replicas_tracks_unassigned() {
+        let meta = IndexMetadata::build_shard_routing("test", 1, 2, &["node-1".into()]);
+        let routing = &meta.shard_routing[&0];
+        assert_eq!(routing.primary, "node-1");
+        assert!(routing.replicas.is_empty(), "no replicas can be placed on single node");
+        assert_eq!(routing.unassigned_replicas, 2, "both replicas should be unassigned");
+        assert_eq!(meta.unassigned_replica_count(), 2);
+    }
+
+    #[test]
+    fn two_nodes_one_replica_fully_assigned() {
+        let meta = IndexMetadata::build_shard_routing("test", 1, 1, &["node-1".into(), "node-2".into()]);
+        let routing = &meta.shard_routing[&0];
+        assert_eq!(routing.primary, "node-1");
+        assert_eq!(routing.replicas, vec!["node-2".to_string()]);
+        assert_eq!(routing.unassigned_replicas, 0);
+        assert_eq!(meta.unassigned_replica_count(), 0);
+    }
+
+    #[test]
+    fn two_nodes_two_replicas_one_unassigned() {
+        let meta = IndexMetadata::build_shard_routing("test", 1, 2, &["node-1".into(), "node-2".into()]);
+        let routing = &meta.shard_routing[&0];
+        assert_eq!(routing.replicas.len(), 1, "only 1 replica can be placed on 2 nodes");
+        assert_eq!(routing.unassigned_replicas, 1, "1 replica unassigned");
+    }
+
+    #[test]
+    fn three_nodes_two_replicas_all_assigned() {
+        let meta = IndexMetadata::build_shard_routing("test", 1, 2, &["n1".into(), "n2".into(), "n3".into()]);
+        let routing = &meta.shard_routing[&0];
+        assert_eq!(routing.replicas.len(), 2);
+        assert_eq!(routing.unassigned_replicas, 0);
+    }
+
+    #[test]
+    fn multi_shard_unassigned_tracking() {
+        let meta = IndexMetadata::build_shard_routing("test", 3, 1, &["node-1".into()]);
+        // Each shard has 1 requested replica, but only 1 node → all unassigned
+        assert_eq!(meta.unassigned_replica_count(), 3);
+        for routing in meta.shard_routing.values() {
+            assert!(routing.replicas.is_empty());
+            assert_eq!(routing.unassigned_replicas, 1);
+        }
+    }
+
+    #[test]
+    fn zero_replicas_no_unassigned() {
+        let meta = IndexMetadata::build_shard_routing("test", 3, 0, &["node-1".into()]);
+        assert_eq!(meta.unassigned_replica_count(), 0);
+    }
+
+    #[test]
+    fn shard_state_serde_roundtrip() {
+        let entry = ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec!["node-2".into()],
+            unassigned_replicas: 1,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let entry2: ShardRoutingEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry2.unassigned_replicas, 1);
+        assert_eq!(entry2.replicas, vec!["node-2".to_string()]);
+    }
+
+    #[test]
+    fn shard_routing_without_unassigned_field_defaults_to_zero() {
+        let json = r#"{"primary":"node-1","replicas":["node-2"]}"#;
+        let entry: ShardRoutingEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.unassigned_replicas, 0, "missing field should default to 0");
+    }
+
+    // ── Shard allocator tests ───────────────────────────────────────────
+
+    #[test]
+    fn allocate_assigns_replica_when_new_node_available() {
+        // Created with 1 node → 2 unassigned replicas
+        let mut meta = IndexMetadata::build_shard_routing("test", 1, 2, &["node-1".into()]);
+        assert_eq!(meta.unassigned_replica_count(), 2);
+
+        // Add node-2 → should assign 1 replica
+        let changed = meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]);
+        assert!(changed);
+        assert_eq!(meta.shard_routing[&0].replicas, vec!["node-2".to_string()]);
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 1, "1 still unassigned (need 3rd node)");
+    }
+
+    #[test]
+    fn allocate_assigns_all_replicas_with_enough_nodes() {
+        let mut meta = IndexMetadata::build_shard_routing("test", 1, 2, &["node-1".into()]);
+        assert_eq!(meta.unassigned_replica_count(), 2);
+
+        // Add node-2 and node-3 → both replicas assigned
+        let changed = meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into(), "node-3".into()]);
+        assert!(changed);
+        assert_eq!(meta.shard_routing[&0].replicas.len(), 2);
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 0);
+        assert_eq!(meta.unassigned_replica_count(), 0);
+    }
+
+    #[test]
+    fn allocate_no_change_when_already_fully_assigned() {
+        let mut meta = IndexMetadata::build_shard_routing("test", 1, 1, &["node-1".into(), "node-2".into()]);
+        assert_eq!(meta.unassigned_replica_count(), 0);
+
+        let changed = meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]);
+        assert!(!changed, "nothing to allocate");
+    }
+
+    #[test]
+    fn allocate_no_change_when_no_new_nodes() {
+        let mut meta = IndexMetadata::build_shard_routing("test", 1, 2, &["node-1".into()]);
+        // Still only 1 node available
+        let changed = meta.allocate_unassigned_replicas(&["node-1".into()]);
+        assert!(!changed, "no new nodes to assign to");
+        assert_eq!(meta.unassigned_replica_count(), 2);
+    }
+
+    #[test]
+    fn allocate_multi_shard_assigns_to_different_nodes() {
+        let mut meta = IndexMetadata::build_shard_routing("test", 2, 1, &["node-1".into()]);
+        assert_eq!(meta.unassigned_replica_count(), 2); // 2 shards × 1 unassigned each
+
+        let changed = meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]);
+        assert!(changed);
+        assert_eq!(meta.unassigned_replica_count(), 0);
+        // Each shard's replica should be on node-2 (the only non-primary node)
+        for routing in meta.shard_routing.values() {
+            assert!(routing.replicas.contains(&"node-2".to_string()));
+        }
+    }
+
+    #[test]
+    fn allocate_prevents_replica_on_same_node_as_primary() {
+        let mut meta = IndexMetadata::build_shard_routing("test", 1, 1, &["node-1".into()]);
+        // Only node available is the same as primary
+        let changed = meta.allocate_unassigned_replicas(&["node-1".into()]);
+        assert!(!changed, "should not assign replica to primary node");
     }
 }

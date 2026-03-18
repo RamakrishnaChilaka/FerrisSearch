@@ -244,6 +244,29 @@ impl Node {
                                 tracing::error!("Failed to remove dead node {} via Raft: {}", dead, e);
                             }
                         }
+
+                        // ── Shard allocator: assign unassigned replicas to available nodes ──
+                        let data_nodes: Vec<String> = state.nodes.values()
+                            .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
+                            .map(|n| n.id.clone())
+                            .collect();
+
+                        for (_idx_name, idx_meta) in &state.indices {
+                            if idx_meta.unassigned_replica_count() > 0 {
+                                let mut updated = idx_meta.clone();
+                                if updated.allocate_unassigned_replicas(&data_nodes) {
+                                    tracing::info!(
+                                        "Allocating unassigned replicas for index '{}' ({} remaining)",
+                                        updated.name, updated.unassigned_replica_count()
+                                    );
+                                    if let Err(e) = raft.client_write(ClusterCommand::UpdateIndex {
+                                        metadata: updated,
+                                    }).await {
+                                        tracing::error!("Failed to update shard routing via Raft: {}", e);
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         // Reset leader_since when we're not leader
                         leader_since = None;

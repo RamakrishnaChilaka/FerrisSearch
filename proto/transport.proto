@@ -134,11 +134,13 @@ message ReplicateDocRequest {
     string doc_id = 3;
     bytes payload_json = 4;   // document body as JSON bytes
     string op = 5;            // "index" or "delete"
+    uint64 seq_no = 6;        // monotonic sequence number from primary WAL
 }
 
 message ReplicateDocResponse {
     bool success = 1;
     string error = 2;
+    uint64 local_checkpoint = 3;  // replica's highest contiguous seq_no after apply
 }
 
 message ReplicateBulkRequest {

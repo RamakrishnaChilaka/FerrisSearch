@@ -86,6 +86,7 @@ pub fn proto_to_cluster_state(p: &ClusterState) -> crate::cluster::state::Cluste
             shard_routing.insert(sa.shard_id, crate::cluster::state::ShardRoutingEntry {
                 primary: sa.node_id.clone(),
                 replicas: sa.replica_node_ids.clone(),
+                unassigned_replicas: 0,
             });
         }
         state.indices.insert(idx.name.clone(), crate::cluster::state::IndexMetadata {
@@ -188,10 +189,13 @@ impl InternalTransport for TransportService {
         info!("gRPC: index doc '{}' into {}/shard_{}", doc_id, req.index_name, req.shard_id);
         match engine.add_document(&doc_id, payload.clone()) {
             Ok(id) => {
-                // Replicate to replica shards
+                // Get the seq_no assigned by the WAL during add_document
+                let seq_no = engine.local_checkpoint();
+
+                // Replicate to replica shards with seq_no
                 let cs = self.cluster_manager.get_state();
                 if let Err(errors) = crate::replication::replicate_write(
-                    &self.transport_client, &cs, &req.index_name, req.shard_id, &id, &payload, "index",
+                    &self.transport_client, &cs, &req.index_name, req.shard_id, &id, &payload, "index", seq_no,
                 ).await {
                     tracing::warn!("Replication errors for {}/shard_{}: {:?}", req.index_name, req.shard_id, errors);
                 }
@@ -232,10 +236,12 @@ impl InternalTransport for TransportService {
         info!("gRPC: bulk {} docs into {}/shard_{}", docs.len(), req.index_name, req.shard_id);
         match engine.bulk_add_documents(docs.clone()) {
             Ok(ids) => {
+                let seq_no = engine.local_checkpoint();
                 // Replicate to replica shards
                 let cs = self.cluster_manager.get_state();
+                let start_seq_no = seq_no.saturating_sub(ids.len().saturating_sub(1) as u64);
                 if let Err(errors) = crate::replication::replicate_bulk(
-                    &self.transport_client, &cs, &req.index_name, req.shard_id, &docs,
+                    &self.transport_client, &cs, &req.index_name, req.shard_id, &docs, start_seq_no,
                 ).await {
                     tracing::warn!("Bulk replication errors for {}/shard_{}: {:?}", req.index_name, req.shard_id, errors);
                 }
@@ -259,11 +265,12 @@ impl InternalTransport for TransportService {
         info!("gRPC: delete doc '{}' from {}/shard_{}", req.doc_id, req.index_name, req.shard_id);
         match engine.delete_document(&req.doc_id) {
             Ok(deleted) => {
+                let seq_no = engine.local_checkpoint();
                 // Replicate delete to replica shards
                 let cs = self.cluster_manager.get_state();
                 if let Err(errors) = crate::replication::replicate_write(
                     &self.transport_client, &cs, &req.index_name, req.shard_id,
-                    &req.doc_id, &serde_json::json!({}), "delete",
+                    &req.doc_id, &serde_json::json!({}), "delete", seq_no,
                 ).await {
                     tracing::warn!("Delete replication errors for {}/shard_{}: {:?}", req.index_name, req.shard_id, errors);
                 }
@@ -375,7 +382,7 @@ impl InternalTransport for TransportService {
         let req = request.into_inner();
         let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
 
-        info!("gRPC: replicate {} doc '{}' to {}/shard_{}", req.op, req.doc_id, req.index_name, req.shard_id);
+        info!("gRPC: replicate {} doc '{}' (seq_no={}) to {}/shard_{}", req.op, req.doc_id, req.seq_no, req.index_name, req.shard_id);
 
         let result = match req.op.as_str() {
             "index" => {
@@ -388,13 +395,19 @@ impl InternalTransport for TransportService {
         };
 
         match result {
-            Ok(()) => Ok(Response::new(ReplicateDocResponse {
-                success: true,
-                error: String::new(),
-            })),
+            Ok(()) => {
+                // Update replica's local checkpoint
+                engine.update_local_checkpoint(req.seq_no);
+                Ok(Response::new(ReplicateDocResponse {
+                    success: true,
+                    error: String::new(),
+                    local_checkpoint: engine.local_checkpoint(),
+                }))
+            }
             Err(e) => Ok(Response::new(ReplicateDocResponse {
                 success: false,
                 error: e.to_string(),
+                local_checkpoint: engine.local_checkpoint(),
             })),
         }
     }
@@ -564,10 +577,12 @@ mod tests {
         shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec!["node-2".into()],
+            unassigned_replicas: 0,
         });
         shard_routing.insert(1, ShardRoutingEntry {
             primary: "node-2".into(),
             replicas: vec!["node-1".into()],
+            unassigned_replicas: 0,
         });
 
         cs.add_index(DomainIndexMetadata {
@@ -654,6 +669,7 @@ mod tests {
         shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            unassigned_replicas: 0,
         });
         cs.add_index(DomainIndexMetadata {
             name: "logs".into(),
