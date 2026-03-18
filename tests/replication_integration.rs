@@ -12,6 +12,7 @@ use ferrissearch::transport::proto::internal_transport_client::InternalTransport
 use ferrissearch::transport::proto::{
     self, JoinRequest, PublishStateRequest, ReplicateBulkRequest, ReplicateDocRequest,
     ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest,
+    ShardSearchDslRequest, ShardSearchRequest,
 };
 use ferrissearch::transport::server::create_transport_service;
 use ferrissearch::transport::TransportClient;
@@ -624,4 +625,300 @@ async fn primary_bulk_replicates_to_replica_node() {
             .into_inner();
         assert!(resp.found, "repl-bulk-{} not replicated to replica", i);
     }
+}
+
+// ─── Search integration tests ───────────────────────────────────────────────
+
+/// Helper: index a document with vectors via gRPC and return success.
+async fn index_doc_with_vectors(
+    client: &mut InternalTransportClient<tonic::transport::Channel>,
+    index_name: &str,
+    shard_id: u32,
+    doc_id: &str,
+    payload: serde_json::Value,
+) -> bool {
+    let resp = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: index_name.into(),
+            shard_id,
+            doc_id: doc_id.into(),
+            payload_json: serde_json::to_vec(&payload).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    resp.success
+}
+
+#[tokio::test]
+async fn search_shard_simple_query_string_via_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("search-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index two documents
+    let payload1 = serde_json::json!({"title": "rust programming language"});
+    let payload2 = serde_json::json!({"title": "python web framework"});
+    assert!(index_doc_with_vectors(&mut client, "search-idx", 0, "d1", payload1).await);
+    assert!(index_doc_with_vectors(&mut client, "search-idx", 0, "d2", payload2).await);
+    refresh_all(&sm);
+
+    // Simple query string search
+    let resp = client
+        .search_shard(tonic::Request::new(ShardSearchRequest {
+            index_name: "search-idx".into(),
+            shard_id: 0,
+            query: "rust".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "search failed: {}", resp.error);
+    assert_eq!(resp.hits.len(), 1, "expected 1 hit for 'rust'");
+    let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
+    assert_eq!(hit["_id"], "d1");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_match_query_via_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("dsl-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index documents
+    assert!(index_doc_with_vectors(&mut client, "dsl-idx", 0, "d1", serde_json::json!({"title": "the matrix"})).await);
+    assert!(index_doc_with_vectors(&mut client, "dsl-idx", 0, "d2", serde_json::json!({"title": "inception movie"})).await);
+    assert!(index_doc_with_vectors(&mut client, "dsl-idx", 0, "d3", serde_json::json!({"title": "the dark knight"})).await);
+    refresh_all(&sm);
+
+    // DSL match query
+    let search_req = serde_json::json!({
+        "query": {"match": {"title": "matrix"}},
+        "size": 10,
+        "from": 0
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "dsl-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "DSL search failed: {}", resp.error);
+    assert_eq!(resp.hits.len(), 1, "expected 1 hit for 'matrix'");
+    let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
+    assert_eq!(hit["_id"], "d1");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_match_all_via_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("matchall-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    for i in 0..4 {
+        let payload = serde_json::json!({"title": format!("doc-{}", i)});
+        assert!(index_doc_with_vectors(&mut client, "all-idx", 0, &format!("d{}", i), payload).await);
+    }
+    refresh_all(&sm);
+
+    let search_req = serde_json::json!({"query": {"match_all": {}}, "size": 10});
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "all-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "match_all failed: {}", resp.error);
+    assert_eq!(resp.hits.len(), 4, "expected 4 hits for match_all");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_knn_only_via_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("knn-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index documents with vector embeddings
+    assert!(index_doc_with_vectors(&mut client, "knn-idx", 0, "d1",
+        serde_json::json!({"title": "nearest", "emb": [1.0, 0.0, 0.0]})).await);
+    assert!(index_doc_with_vectors(&mut client, "knn-idx", 0, "d2",
+        serde_json::json!({"title": "middle", "emb": [0.5, 0.5, 0.0]})).await);
+    assert!(index_doc_with_vectors(&mut client, "knn-idx", 0, "d3",
+        serde_json::json!({"title": "farthest", "emb": [0.0, 0.0, 1.0]})).await);
+    refresh_all(&sm);
+
+    // kNN-only search: closest to [1.0, 0.0, 0.0] should return d1 first
+    let search_req = serde_json::json!({
+        "knn": {"emb": {"vector": [1.0, 0.0, 0.0], "k": 2}}
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "knn-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "kNN search failed: {}", resp.error);
+    // match_all (default query) returns 3 text hits + 2 knn hits = 5 total
+    assert!(resp.hits.len() >= 2, "expected at least 2 kNN hits, got {}", resp.hits.len());
+
+    // Find the kNN hits (they have _knn_field)
+    let knn_hits: Vec<serde_json::Value> = resp.hits.iter()
+        .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
+        .filter(|h| h.get("_knn_field").is_some())
+        .collect();
+    assert_eq!(knn_hits.len(), 2, "expected 2 kNN hits");
+    assert_eq!(knn_hits[0]["_id"], "d1", "d1 should be nearest to query vector");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_hybrid_text_and_knn_via_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("hybrid-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index documents with text and vector fields
+    assert!(index_doc_with_vectors(&mut client, "hybrid-idx", 0, "d1",
+        serde_json::json!({"title": "the matrix", "emb": [0.9, 0.1, 0.0]})).await);
+    assert!(index_doc_with_vectors(&mut client, "hybrid-idx", 0, "d2",
+        serde_json::json!({"title": "inception", "emb": [0.1, 0.9, 0.0]})).await);
+    assert!(index_doc_with_vectors(&mut client, "hybrid-idx", 0, "d3",
+        serde_json::json!({"title": "matrix reloaded", "emb": [0.85, 0.15, 0.0]})).await);
+    assert!(index_doc_with_vectors(&mut client, "hybrid-idx", 0, "d4",
+        serde_json::json!({"title": "dark knight", "emb": [0.0, 0.0, 1.0]})).await);
+    refresh_all(&sm);
+
+    // Hybrid: text match "matrix" + kNN closest to [0.9, 0.1, 0.0]
+    let search_req = serde_json::json!({
+        "query": {"match": {"title": "matrix"}},
+        "knn": {"emb": {"vector": [0.9, 0.1, 0.0], "k": 3}}
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "hybrid-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "hybrid search failed: {}", resp.error);
+
+    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+        .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
+        .collect();
+
+    // Text hits: match on "matrix" should find d1 and d3
+    let text_hits: Vec<&serde_json::Value> = all_hits.iter()
+        .filter(|h| h.get("_knn_field").is_none())
+        .collect();
+    assert_eq!(text_hits.len(), 2, "expected 2 text hits for 'matrix'");
+    let text_ids: Vec<&str> = text_hits.iter()
+        .map(|h| h["_id"].as_str().unwrap())
+        .collect();
+    assert!(text_ids.contains(&"d1"), "text hits should include d1");
+    assert!(text_ids.contains(&"d3"), "text hits should include d3");
+
+    // kNN hits: closest to [0.9, 0.1, 0.0] should include d1 (nearest)
+    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+        .filter(|h| h.get("_knn_field").is_some())
+        .collect();
+    assert_eq!(knn_hits.len(), 3, "expected 3 kNN hits (k=3)");
+    assert_eq!(knn_hits[0]["_id"], "d1", "d1 should be nearest vector match");
+
+    // Total hits = text (2) + knn (3) = 5
+    assert_eq!(all_hits.len(), 5, "expected 5 total hits (2 text + 3 kNN)");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_knn_returns_empty_when_no_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("no-vec-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index text-only documents (no vectors)
+    assert!(index_doc_with_vectors(&mut client, "novecs-idx", 0, "d1",
+        serde_json::json!({"title": "text only doc"})).await);
+    refresh_all(&sm);
+
+    // kNN search should still succeed but return only text results (no kNN hits)
+    let search_req = serde_json::json!({
+        "query": {"match_all": {}},
+        "knn": {"emb": {"vector": [1.0, 0.0, 0.0], "k": 5}}
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "novecs-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "search should not fail: {}", resp.error);
+    // Only text hits (match_all returns 1), no kNN hits
+    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+        .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
+        .collect();
+    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+        .filter(|h| h.get("_knn_field").is_some())
+        .collect();
+    assert!(knn_hits.is_empty(), "no kNN hits expected when no vectors indexed");
+    assert_eq!(all_hits.len(), 1, "should return 1 text hit from match_all");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_nonexistent_shard_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("noshard-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let search_req = serde_json::json!({"query": {"match_all": {}}});
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "nonexistent".into(),
+            shard_id: 99,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!resp.success, "should fail for nonexistent shard");
+    assert!(resp.error.contains("not found"), "error should mention shard not found: {}", resp.error);
 }

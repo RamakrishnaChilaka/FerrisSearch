@@ -338,18 +338,36 @@ impl InternalTransport for TransportService {
         let search_req: crate::search::SearchRequest = serde_json::from_slice(&req.search_request_json)
             .map_err(|e| Status::invalid_argument(format!("invalid SearchRequest JSON: {}", e)))?;
 
+        let mut all_hits = Vec::new();
+
+        // Text / DSL search
         match engine.search_query(&search_req) {
-            Ok(hits) => Ok(Response::new(ShardSearchResponse {
-                success: true,
-                hits: hits.into_iter().map(|v| SearchHit {
-                    source_json: serde_json::to_vec(&v).unwrap_or_default(),
-                }).collect(),
-                error: String::new(),
-            })),
-            Err(e) => Ok(Response::new(ShardSearchResponse {
+            Ok(hits) => all_hits.extend(hits),
+            Err(e) => return Ok(Response::new(ShardSearchResponse {
                 success: false, hits: vec![], error: e.to_string(),
             })),
         }
+
+        // k-NN vector search (if knn clause present)
+        if let Some(ref knn) = search_req.knn {
+            if let Some((field_name, params)) = knn.fields.iter().next() {
+                match engine.search_knn(field_name, &params.vector, params.k) {
+                    Ok(hits) => all_hits.extend(hits),
+                    Err(e) => {
+                        tracing::error!("Vector search on remote shard failed: {}", e);
+                        // Non-fatal: text results still returned
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(ShardSearchResponse {
+            success: true,
+            hits: all_hits.into_iter().map(|v| SearchHit {
+                source_json: serde_json::to_vec(&v).unwrap_or_default(),
+            }).collect(),
+            error: String::new(),
+        }))
     }
 
     async fn replicate_doc(&self, request: Request<ReplicateDocRequest>) -> Result<Response<ReplicateDocResponse>, Status> {

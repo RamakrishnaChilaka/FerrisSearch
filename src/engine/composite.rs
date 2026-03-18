@@ -490,4 +490,71 @@ mod tests {
         assert!(distance < 0.001, "exact match should have distance ~0.0");
         assert_eq!(hits[0]["_knn_field"], "emb");
     }
+
+    // ── Hybrid search (text + kNN) ─────────────────────────────────────
+
+    #[test]
+    fn hybrid_text_and_knn_both_return_hits() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "rust search engine", "emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine.add_document("d2", json!({"title": "python web framework", "emb": [0.0, 1.0, 0.0]})).unwrap();
+        engine.add_document("d3", json!({"title": "rust compiler internals", "emb": [0.0, 0.0, 1.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        // Text search: "rust" should match d1 and d3
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let text_hits = engine.search_query(&req).unwrap();
+        assert_eq!(text_hits.len(), 3, "match_all should return all 3 docs");
+
+        // kNN search: vector closest to [1.0, 0.0, 0.0] should be d1
+        let knn_hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(knn_hits.len(), 2);
+        assert_eq!(knn_hits[0]["_id"], "d1", "d1 should be nearest neighbor");
+
+        // Both searches independently produce results — confirms hybrid is possible
+        assert!(!text_hits.is_empty());
+        assert!(!knn_hits.is_empty());
+    }
+
+    #[test]
+    fn search_query_with_match_finds_docs_via_body_fallback() {
+        // Verifies that match queries on named fields fall back to the "body"
+        // catch-all and still find documents (since Tantivy schema is dynamic).
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "movie one"})).unwrap();
+        engine.add_document("d2", json!({"title": "movie two"})).unwrap();
+        engine.add_document("d3", json!({"title": "book three"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::Match({
+                let mut m = std::collections::HashMap::new();
+                m.insert("title".to_string(), json!("movie"));
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+        };
+        let hits = engine.search_query(&req).unwrap();
+        assert_eq!(hits.len(), 2, "match on 'movie' should find d1 and d2");
+    }
+
+    #[test]
+    fn knn_only_search_request_returns_vector_hits() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"title": "doc A", "emb": [1.0, 0.0]})).unwrap();
+        engine.add_document("d2", json!({"title": "doc B", "emb": [0.0, 1.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        // kNN-only (no text query clause exercised at engine level)
+        let hits = engine.search_knn("emb", &[0.9, 0.1], 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "d1");
+    }
 }

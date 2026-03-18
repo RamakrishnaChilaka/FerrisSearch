@@ -178,6 +178,73 @@ pub async fn index_document(
     }
 }
 
+/// PUT /{index}/_doc/{id} — Index a single document with an explicit ID.
+pub async fn index_document_with_id(
+    State(state): State<AppState>,
+    Path((index_name, doc_id)): Path<(String, String)>,
+    Json(mut payload): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(msg) = crate::common::validate_index_name(&index_name) {
+        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
+    }
+
+    // Remove _id from stored payload if present — it's metadata, not document source
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("_id");
+    }
+
+    let cluster_state = state.cluster_manager.get_state();
+
+    // Auto-create index with 1 shard if it doesn't exist (like OpenSearch)
+    let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
+        m.clone()
+    } else {
+        tracing::warn!("Index '{}' not found, auto-creating with 1 shard", index_name);
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(0u32, crate::cluster::state::ShardRoutingEntry {
+            primary: state.local_node_id.clone(),
+            replicas: vec![],
+        });
+        let m = IndexMetadata {
+            name: index_name.clone(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+        };
+        if let Some(ref raft) = state.raft {
+            let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata: m.clone() };
+            if let Err(e) = raft.client_write(cmd).await {
+                return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "raft_write_exception", format!("Auto-create index via Raft failed: {}", e));
+            }
+        } else {
+            let mut new_state = cluster_state.clone();
+            new_state.add_index(m.clone());
+            state.cluster_manager.update_state(new_state.clone());
+            state.transport_client.publish_state(&new_state).await;
+        }
+        let _ = state.shard_manager.open_shard(&index_name, 0);
+        m
+    };
+
+    // Route document to the correct shard
+    let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
+    let target_node_id = match metadata.primary_node(shard_id) {
+        Some(id) => id.clone(),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "shard_not_available_exception", "Shard has no assigned node"),
+    };
+
+    // Forward to the node owning the shard (may be ourselves)
+    let target_node = match cluster_state.nodes.get(&target_node_id) {
+        Some(n) => n.clone(),
+        None => return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "node_not_found_exception", "Target node not in cluster state"),
+    };
+
+    match state.transport_client.forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &payload).await {
+        Ok(res) => (StatusCode::CREATED, Json(res)),
+        Err(e) => crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "forward_exception", format!("Forward failed: {}", e)),
+    }
+}
+
 /// POST /{index}/_refresh — Scatter refresh to all local shard engines for this index.
 pub async fn refresh_index(
     State(state): State<AppState>,
