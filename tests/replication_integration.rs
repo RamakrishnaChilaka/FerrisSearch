@@ -783,12 +783,14 @@ async fn search_shard_dsl_knn_only_via_grpc() {
         .into_inner();
 
     assert!(resp.success, "kNN search failed: {}", resp.error);
-    // match_all (default query) returns 3 text hits + 2 knn hits = 5 total
-    assert!(resp.hits.len() >= 2, "expected at least 2 kNN hits, got {}", resp.hits.len());
+    // gRPC returns raw concatenated results: 3 text (match_all) + 2 kNN = 5 total
+    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+        .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
+        .collect();
+    assert!(all_hits.len() >= 2, "expected at least 2 hits, got {}", all_hits.len());
 
     // Find the kNN hits (they have _knn_field)
-    let knn_hits: Vec<serde_json::Value> = resp.hits.iter()
-        .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
+    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
         .filter(|h| h.get("_knn_field").is_some())
         .collect();
     assert_eq!(knn_hits.len(), 2, "expected 2 kNN hits");
@@ -836,6 +838,12 @@ async fn search_shard_dsl_hybrid_text_and_knn_via_grpc() {
         .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
         .collect();
 
+    // gRPC returns raw concatenated results from a single shard:
+    //   text hits: d1, d3 (match "matrix")
+    //   kNN hits:  d1, d3, d2 (k=3, closest to [0.9, 0.1, 0.0])
+    //   Total: 5 (d1 and d3 appear twice — RRF dedup happens at coordinator)
+    assert_eq!(all_hits.len(), 5, "gRPC should return 5 raw hits (2 text + 3 kNN)");
+
     // Text hits: match on "matrix" should find d1 and d3
     let text_hits: Vec<&serde_json::Value> = all_hits.iter()
         .filter(|h| h.get("_knn_field").is_none())
@@ -853,9 +861,6 @@ async fn search_shard_dsl_hybrid_text_and_knn_via_grpc() {
         .collect();
     assert_eq!(knn_hits.len(), 3, "expected 3 kNN hits (k=3)");
     assert_eq!(knn_hits[0]["_id"], "d1", "d1 should be nearest vector match");
-
-    // Total hits = text (2) + knn (3) = 5
-    assert_eq!(all_hits.len(), 5, "expected 5 total hits (2 text + 3 kNN)");
 }
 
 #[tokio::test]

@@ -105,6 +105,136 @@ pub struct BoolQuery {
     pub filter: Vec<QueryClause>,
 }
 
+/// Reciprocal Rank Fusion (RRF) constant. Higher values smooth out rank differences.
+/// OpenSearch uses k=60 by default.
+const RRF_K: f64 = 60.0;
+
+/// Merge text and kNN hit lists using Reciprocal Rank Fusion (RRF).
+///
+/// Each hit is a JSON object with at least `_id` (string) and `_score` (number).
+/// Hits from text search and kNN search are ranked independently, then
+/// combined into a single score: `rrf_score = 1/(k + rank_text) + 1/(k + rank_knn)`.
+///
+/// Duplicate `_id`s are collapsed into a single hit. The `_source` is taken from
+/// whichever list provided it. kNN metadata (`_knn_distance`, `_knn_field`) is
+/// preserved from the kNN hit when present.
+///
+/// Returns hits sorted by RRF score descending.
+pub fn merge_hybrid_hits(
+    text_hits: Vec<serde_json::Value>,
+    knn_hits: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    // If only one list has hits, skip the merge entirely
+    if knn_hits.is_empty() {
+        return text_hits;
+    }
+    if text_hits.is_empty() {
+        return knn_hits;
+    }
+
+    // Build rank maps (1-based ranking by position, which is already score-sorted)
+    let mut doc_map: HashMap<String, MergedHit> = HashMap::new();
+
+    for (rank, hit) in text_hits.iter().enumerate() {
+        let id = hit.get("_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let entry = doc_map.entry(id).or_insert_with(|| MergedHit::new(hit));
+        entry.text_rank = Some(rank + 1);
+        if entry.source.is_none() {
+            entry.source = hit.get("_source").cloned();
+        }
+    }
+
+    for (rank, hit) in knn_hits.iter().enumerate() {
+        let id = hit.get("_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let entry = doc_map.entry(id).or_insert_with(|| MergedHit::new(hit));
+        entry.knn_rank = Some(rank + 1);
+        // Prefer kNN hit's _source (it may include vector fields)
+        if let Some(src) = hit.get("_source") {
+            entry.source = Some(src.clone());
+        }
+        entry.knn_distance = hit.get("_knn_distance").and_then(|v| v.as_f64());
+        entry.knn_field = hit.get("_knn_field").and_then(|v| v.as_str()).map(String::from);
+    }
+
+    // Compute RRF scores and build result hits
+    let mut results: Vec<serde_json::Value> = doc_map
+        .into_iter()
+        .map(|(id, merged)| {
+            let rrf_score = merged.rrf_score();
+            let mut hit = serde_json::json!({
+                "_id": id,
+                "_score": rrf_score,
+                "_source": merged.source,
+            });
+            // Preserve envelope fields from the original hit
+            if let Some(idx) = merged.index {
+                hit["_index"] = serde_json::Value::String(idx);
+            }
+            if let Some(shard) = merged.shard {
+                hit["_shard"] = serde_json::json!(shard);
+            }
+            if let Some(dist) = merged.knn_distance {
+                hit["_knn_distance"] = serde_json::json!(dist);
+            }
+            if let Some(ref field) = merged.knn_field {
+                hit["_knn_field"] = serde_json::Value::String(field.clone());
+            }
+            hit
+        })
+        .collect();
+
+    results.sort_by(|a, b| {
+        let sa = a.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sb = b.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    results
+}
+
+/// Internal helper for tracking a doc across text and kNN result sets.
+struct MergedHit {
+    text_rank: Option<usize>,
+    knn_rank: Option<usize>,
+    source: Option<serde_json::Value>,
+    index: Option<String>,
+    shard: Option<u32>,
+    knn_distance: Option<f64>,
+    knn_field: Option<String>,
+}
+
+impl MergedHit {
+    fn new(hit: &serde_json::Value) -> Self {
+        Self {
+            text_rank: None,
+            knn_rank: None,
+            source: hit.get("_source").cloned(),
+            index: hit.get("_index").and_then(|v| v.as_str()).map(String::from),
+            shard: hit.get("_shard").and_then(|v| v.as_u64()).map(|v| v as u32),
+            knn_distance: None,
+            knn_field: None,
+        }
+    }
+
+    fn rrf_score(&self) -> f64 {
+        let text_component = self
+            .text_rank
+            .map(|r| 1.0 / (RRF_K + r as f64))
+            .unwrap_or(0.0);
+        let knn_component = self
+            .knn_rank
+            .map(|r| 1.0 / (RRF_K + r as f64))
+            .unwrap_or(0.0);
+        text_component + knn_component
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +640,154 @@ mod tests {
             }
             _ => panic!("expected Fuzzy query"),
         }
+    }
+
+    // ── RRF merge tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn merge_deduplicates_by_id() {
+        let text = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"title": "hello"}}),
+            json!({"_id": "d2", "_score": 0.5, "_source": {"title": "world"}}),
+        ];
+        let knn = vec![
+            json!({"_id": "d1", "_score": 0.9, "_source": {"title": "hello"}, "_knn_field": "emb", "_knn_distance": 0.01}),
+            json!({"_id": "d3", "_score": 0.8, "_source": {"title": "new"}, "_knn_field": "emb", "_knn_distance": 0.1}),
+        ];
+        let merged = merge_hybrid_hits(text, knn);
+
+        let ids: Vec<&str> = merged.iter()
+            .map(|h| h["_id"].as_str().unwrap())
+            .collect();
+        // d1 appears once (deduplicated), d2 and d3 each once = 3 total
+        assert_eq!(ids.len(), 3, "should have 3 unique docs");
+        assert_eq!(ids.iter().filter(|&&id| id == "d1").count(), 1, "d1 should appear exactly once");
+    }
+
+    #[test]
+    fn merge_rrf_score_both_lists_ranks_higher() {
+        // d1 appears in both lists → higher RRF score than d2 (text only) or d3 (knn only)
+        let text = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"t": "a"}}),
+            json!({"_id": "d2", "_score": 0.5, "_source": {"t": "b"}}),
+        ];
+        let knn = vec![
+            json!({"_id": "d1", "_score": 0.9, "_source": {"t": "a"}, "_knn_field": "emb", "_knn_distance": 0.01}),
+            json!({"_id": "d3", "_score": 0.8, "_source": {"t": "c"}, "_knn_field": "emb", "_knn_distance": 0.1}),
+        ];
+        let merged = merge_hybrid_hits(text, knn);
+
+        // d1 should be ranked first (RRF from rank 1 in both lists)
+        assert_eq!(merged[0]["_id"], "d1", "d1 should rank first (appears in both lists)");
+
+        let d1_score = merged[0]["_score"].as_f64().unwrap();
+        let d2_score = merged.iter().find(|h| h["_id"] == "d2").unwrap()["_score"].as_f64().unwrap();
+        let d3_score = merged.iter().find(|h| h["_id"] == "d3").unwrap()["_score"].as_f64().unwrap();
+
+        assert!(d1_score > d2_score, "d1 (both lists) should score higher than d2 (text only)");
+        assert!(d1_score > d3_score, "d1 (both lists) should score higher than d3 (knn only)");
+    }
+
+    #[test]
+    fn merge_preserves_knn_metadata() {
+        let text = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"title": "hello"}}),
+        ];
+        let knn = vec![
+            json!({"_id": "d1", "_score": 0.9, "_source": {"title": "hello"}, "_knn_field": "emb", "_knn_distance": 0.05}),
+        ];
+        let merged = merge_hybrid_hits(text, knn);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["_knn_field"], "emb");
+        let dist = merged[0]["_knn_distance"].as_f64().unwrap();
+        assert!((dist - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_preserves_index_and_shard() {
+        let text = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {}, "_index": "movies", "_shard": 2}),
+        ];
+        let knn = vec![];
+        let merged = merge_hybrid_hits(text, knn);
+        assert_eq!(merged[0]["_index"], "movies");
+        assert_eq!(merged[0]["_shard"], 2);
+    }
+
+    #[test]
+    fn merge_empty_knn_returns_text_as_is() {
+        let text = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"t": "a"}}),
+            json!({"_id": "d2", "_score": 0.5, "_source": {"t": "b"}}),
+        ];
+        let merged = merge_hybrid_hits(text.clone(), vec![]);
+        assert_eq!(merged.len(), 2);
+        // Should return text hits unchanged (no RRF applied)
+        assert_eq!(merged[0]["_id"], text[0]["_id"]);
+        assert_eq!(merged[1]["_id"], text[1]["_id"]);
+    }
+
+    #[test]
+    fn merge_empty_text_returns_knn_as_is() {
+        let knn = vec![
+            json!({"_id": "d1", "_score": 0.9, "_source": {"t": "a"}, "_knn_field": "emb", "_knn_distance": 0.01}),
+        ];
+        let merged = merge_hybrid_hits(vec![], knn.clone());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["_id"], knn[0]["_id"]);
+    }
+
+    #[test]
+    fn merge_both_empty_returns_empty() {
+        let merged = merge_hybrid_hits(vec![], vec![]);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_rrf_scores_are_descending() {
+        let text = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {}}),
+            json!({"_id": "d2", "_score": 0.8, "_source": {}}),
+            json!({"_id": "d3", "_score": 0.5, "_source": {}}),
+        ];
+        let knn = vec![
+            json!({"_id": "d3", "_score": 0.9, "_source": {}, "_knn_field": "e", "_knn_distance": 0.01}),
+            json!({"_id": "d4", "_score": 0.7, "_source": {}, "_knn_field": "e", "_knn_distance": 0.1}),
+        ];
+        let merged = merge_hybrid_hits(text, knn);
+        for w in merged.windows(2) {
+            let s0 = w[0]["_score"].as_f64().unwrap();
+            let s1 = w[1]["_score"].as_f64().unwrap();
+            assert!(s0 >= s1, "scores should be descending: {} >= {}", s0, s1);
+        }
+    }
+
+    #[test]
+    fn merge_no_overlap_returns_all() {
+        let text = vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"t": "a"}}),
+        ];
+        let knn = vec![
+            json!({"_id": "d2", "_score": 0.9, "_source": {"t": "b"}, "_knn_field": "e", "_knn_distance": 0.01}),
+        ];
+        let merged = merge_hybrid_hits(text, knn);
+        assert_eq!(merged.len(), 2, "non-overlapping union should produce 2 hits");
+        let ids: Vec<&str> = merged.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d1"));
+        assert!(ids.contains(&"d2"));
+    }
+
+    #[test]
+    fn merge_skips_hits_without_id() {
+        let text = vec![
+            json!({"_score": 1.0, "_source": {}}), // no _id
+            json!({"_id": "d1", "_score": 0.8, "_source": {}}),
+        ];
+        let knn = vec![
+            json!({"_id": "", "_score": 0.9, "_source": {}, "_knn_field": "e"}), // empty _id
+        ];
+        let merged = merge_hybrid_hits(text, knn);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["_id"], "d1");
     }
 }

@@ -422,9 +422,11 @@ pub async fn search_documents_dsl(
         None => return crate::api::error_response(StatusCode::NOT_FOUND, "index_not_found_exception", format!("no such index [{}]", index_name)),
     };
 
-    let mut all_hits = Vec::new();
+    let mut text_hits = Vec::new();
+    let mut knn_hits = Vec::new();
     let mut successful = 0u32;
     let mut failed = 0u32;
+    let is_hybrid = search_req.knn.is_some();
 
     // Query local shards directly (text search)
     for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
@@ -432,7 +434,7 @@ pub async fn search_documents_dsl(
             Ok(hits) => {
                 successful += 1;
                 for hit in hits {
-                    all_hits.push(serde_json::json!({
+                    text_hits.push(serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
                         "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
                         "_score": hit.get("_score"),
@@ -451,7 +453,7 @@ pub async fn search_documents_dsl(
                 match engine.search_knn(field_name, &params.vector, params.k) {
                     Ok(hits) => {
                         for hit in hits {
-                            all_hits.push(serde_json::json!({
+                            knn_hits.push(serde_json::json!({
                                 "_index": index_name,
                                 "_shard": shard_id,
                                 "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
@@ -501,12 +503,20 @@ pub async fn search_documents_dsl(
             Ok((shard_id, Ok(hits))) => {
                 successful += 1;
                 for hit in hits {
-                    all_hits.push(serde_json::json!({
+                    let enriched = serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
                         "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
                         "_score": hit.get("_score"),
-                        "_source": hit.get("_source").unwrap_or(&hit)
-                    }));
+                        "_source": hit.get("_source").unwrap_or(&hit),
+                        "_knn_field": hit.get("_knn_field"),
+                        "_knn_distance": hit.get("_knn_distance"),
+                    });
+                    // Classify remote hits by type
+                    if hit.get("_knn_field").is_some() {
+                        knn_hits.push(enriched);
+                    } else {
+                        text_hits.push(enriched);
+                    }
                 }
             }
             Ok((shard_id, Err(e))) => {
@@ -520,12 +530,18 @@ pub async fn search_documents_dsl(
         }
     }
 
-    // Sort by _score descending, then apply from/size pagination
-    all_hits.sort_by(|a, b| {
-        let sa = a.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let sb = b.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Merge results: use RRF for hybrid, plain sort otherwise
+    let all_hits = if is_hybrid {
+        crate::search::merge_hybrid_hits(text_hits, knn_hits)
+    } else {
+        let mut hits = text_hits;
+        hits.sort_by(|a, b| {
+            let sa = a.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let sb = b.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits
+    };
 
     let total = all_hits.len();
     let paginated: Vec<_> = all_hits.into_iter().skip(search_req.from).take(search_req.size).collect();

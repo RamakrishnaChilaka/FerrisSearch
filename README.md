@@ -298,8 +298,8 @@ config/            Default configuration
 - [x] Index vectors alongside documents (`PUT /_doc` with embedding field)
 - [x] k-NN search API (`POST /_search` with `knn` clause)
 - [x] Distance metrics: cosine, L2 (euclidean), inner product
-- [ ] Hybrid search: combine BM25 full-text scores + vector similarity in one query
-- [ ] k-NN across shards (scatter-gather for vector queries)
+- [x] Hybrid search: combine BM25 full-text scores + vector similarity in one query
+- [x] k-NN across shards (scatter-gather for vector queries)
 - [ ] Quantization support (f16, i8) for memory efficiency
 - [ ] Disk-backed vector indexes (mmap via USearch)
 - [ ] Pre-filtering: apply bool/range filters before vector search
