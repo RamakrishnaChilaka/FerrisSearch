@@ -188,10 +188,48 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
-        let ids = self.text.bulk_add_documents(docs.clone())?;
-        for (i, (_, payload)) in docs.iter().enumerate() {
-            if let Some(id) = ids.get(i) {
-                self.index_vectors(id, payload);
+        // Extract vector fields before passing docs to text engine (avoids cloning)
+        let mut vec_fields: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
+        for (_, payload) in &docs {
+            let mut found = None;
+            if let Some(obj) = payload.as_object() {
+                for (_field, value) in obj {
+                    if let Some(arr) = value.as_array() {
+                        let floats: Option<Vec<f32>> =
+                            arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
+                        if let Some(ref vec) = floats {
+                            if !vec.is_empty() {
+                                found = floats;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            vec_fields.push(found);
+        }
+
+        let ids = self.text.bulk_add_documents(docs)?;
+
+        // Collect (doc_id, vector) pairs and bulk-add to vector index
+        let mut vec_batch: Vec<(String, Vec<f32>)> = Vec::new();
+        for (i, vec_opt) in vec_fields.into_iter().enumerate() {
+            if let (Some(id), Some(vec)) = (ids.get(i), vec_opt) {
+                if self.ensure_vector_index(vec.len()).is_ok() {
+                    vec_batch.push((id.clone(), vec));
+                }
+            }
+        }
+        if !vec_batch.is_empty() {
+            let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref vi) = *guard {
+                let refs: Vec<(&str, &[f32])> = vec_batch
+                    .iter()
+                    .map(|(id, v)| (id.as_str(), v.as_slice()))
+                    .collect();
+                if let Err(e) = vi.bulk_add_with_doc_ids(&refs) {
+                    tracing::warn!("Failed to bulk-add vectors: {}", e);
+                }
             }
         }
         self.update_local_checkpoint(self.text.last_seq_no());
@@ -542,6 +580,57 @@ mod tests {
             vector_path.exists(),
             "flush should save vectors.usearch to disk"
         );
+    }
+
+    #[test]
+    fn flush_saves_doc_id_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("vectors.docids.bin");
+
+        {
+            let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            engine
+                .add_document("doc_one", json!({"emb": [1.0, 0.0, 0.0]}))
+                .unwrap();
+            engine
+                .add_document("doc_two", json!({"emb": [0.0, 1.0, 0.0]}))
+                .unwrap();
+            engine.flush().unwrap();
+        }
+
+        assert!(
+            sidecar_path.exists(),
+            "flush should save doc_id sidecar alongside vector index"
+        );
+    }
+
+    #[test]
+    fn flush_reopen_knn_preserves_doc_ids() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: add docs with vectors, flush everything
+        {
+            let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            engine
+                .add_document("alpha", json!({"title": "a", "emb": [1.0, 0.0, 0.0]}))
+                .unwrap();
+            engine
+                .add_document("beta", json!({"title": "b", "emb": [0.0, 1.0, 0.0]}))
+                .unwrap();
+            engine.flush().unwrap();
+        }
+
+        // Phase 2: reopen, rebuild vectors, knn should return correct doc_ids
+        {
+            let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            assert_eq!(engine.doc_count(), 2);
+            engine.rebuild_vectors().unwrap();
+
+            let hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 2).unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0]["_id"], "alpha");
+            assert_eq!(hits[1]["_id"], "beta");
+        }
     }
 
     #[test]

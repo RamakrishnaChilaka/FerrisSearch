@@ -150,18 +150,31 @@ impl HotEngine {
             .field_registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
+        Self::build_tantivy_doc_inner(&registry, doc_id, payload)
+    }
+
+    /// Build a Tantivy document using an already-acquired registry reference.
+    /// Used by bulk paths to avoid per-doc RwLock acquisition.
+    fn build_tantivy_doc_inner(
+        registry: &FieldRegistry,
+        doc_id: &str,
+        payload: &serde_json::Value,
+    ) -> TantivyDocument {
         let mut doc = TantivyDocument::new();
 
         // Store the document ID
         doc.add_text(registry.id_field, doc_id);
 
-        // Store the raw JSON in _source
-        doc.add_text(registry.source_field, payload.to_string());
+        // Store the raw JSON in _source (serde_json::to_string is faster than Display)
+        if let Ok(json_str) = serde_json::to_string(payload) {
+            doc.add_text(registry.source_field, json_str);
+        }
 
         let body_field = *registry.fields.get("body").expect("body field must exist");
 
         if let Some(obj) = payload.as_object() {
-            let mut body_parts = Vec::new();
+            // Build body catch-all with a single String buffer (avoids Vec<String> + join)
+            let mut body_buf = String::new();
 
             for (key, value) in obj {
                 // If this field has a named Tantivy field, index into it by type
@@ -172,7 +185,6 @@ impl HotEngine {
                                 doc.add_text(field, s);
                             }
                             serde_json::Value::Number(n) => {
-                                // Try to add as the field's native type
                                 if let Some(i) = n.as_i64() {
                                     doc.add_i64(field, i);
                                 } else if let Some(f) = n.as_f64() {
@@ -187,20 +199,36 @@ impl HotEngine {
                     }
                 }
 
-                // Always add text representation to body catch-all
+                // Append text representation to body catch-all buffer
                 match value {
-                    serde_json::Value::String(s) => body_parts.push(s.clone()),
-                    serde_json::Value::Number(n) => body_parts.push(n.to_string()),
-                    serde_json::Value::Bool(b) => body_parts.push(b.to_string()),
+                    serde_json::Value::String(s) => {
+                        if !body_buf.is_empty() {
+                            body_buf.push(' ');
+                        }
+                        body_buf.push_str(s);
+                    }
+                    serde_json::Value::Number(n) => {
+                        if !body_buf.is_empty() {
+                            body_buf.push(' ');
+                        }
+                        use std::fmt::Write;
+                        let _ = write!(body_buf, "{n}");
+                    }
+                    serde_json::Value::Bool(b) => {
+                        if !body_buf.is_empty() {
+                            body_buf.push(' ');
+                        }
+                        body_buf.push_str(if *b { "true" } else { "false" });
+                    }
                     _ => {}
                 }
             }
 
-            if !body_parts.is_empty() {
-                doc.add_text(body_field, body_parts.join(" "));
+            if !body_buf.is_empty() {
+                doc.add_text(body_field, body_buf);
             }
-        } else {
-            doc.add_text(body_field, payload.to_string());
+        } else if let Ok(s) = serde_json::to_string(payload) {
+            doc.add_text(body_field, s);
         }
 
         doc
@@ -569,27 +597,27 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
-        // 1. Write all ops to translog with a single fsync
+        // 1. Write all ops to translog with a single fsync (write_bulk skips entry construction)
         let ops: Vec<(&str, serde_json::Value)> = docs
             .iter()
             .map(|(id, p)| ("index", serde_json::json!({ "_doc_id": id, "_source": p })))
             .collect();
         {
             let tl = self.translog.lock().unwrap();
-            tl.append_bulk(&ops)?;
+            tl.write_bulk(&ops)?;
         }
 
         // 2. Write all docs to Tantivy in-memory buffer under one lock
-        let id_field = self
+        // Acquire registry once for the entire batch (not per-doc)
+        let registry = self
             .field_registry
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .id_field;
+            .unwrap_or_else(|e| e.into_inner());
         let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         let mut doc_ids = Vec::with_capacity(docs.len());
         for (doc_id, payload) in &docs {
-            writer.delete_term(Term::from_field_text(id_field, doc_id));
-            let doc = self.build_tantivy_doc(doc_id, payload);
+            writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
+            let doc = Self::build_tantivy_doc_inner(&registry, doc_id, payload);
             writer.add_document(doc)?;
             doc_ids.push(doc_id.clone());
         }

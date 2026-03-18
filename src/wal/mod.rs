@@ -73,6 +73,10 @@ pub trait WriteAheadLog: Send + Sync {
     /// Append multiple operations with a single fsync (bulk optimization).
     fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>>;
 
+    /// Write multiple operations to WAL with a single fsync, without constructing
+    /// return entries. Faster than `append_bulk` when the caller doesn't need the entries.
+    fn write_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<()>;
+
     /// Read all pending entries (used for replay on startup).
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
 
@@ -94,6 +98,21 @@ pub trait WriteAheadLog: Send + Sync {
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
 fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
     let wire = WireEntry::from_translog(entry)?;
+    let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
+    let len = encoded.len() as u32;
+    let mut frame = Vec::with_capacity(4 + encoded.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&encoded);
+    Ok(frame)
+}
+
+/// Encode directly from borrowed values — avoids cloning the payload.
+fn encode_entry_borrowed(seq_no: u64, op: &str, payload: &serde_json::Value) -> Result<Vec<u8>> {
+    let wire = WireEntry {
+        seq_no,
+        op: op.to_string(),
+        payload_json: serde_json::to_string(payload)?,
+    };
     let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
     let len = encoded.len() as u32;
     let mut frame = Vec::with_capacity(4 + encoded.len());
@@ -227,17 +246,17 @@ impl WriteAheadLog for HotTranslog {
     fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
         let mut seq = self.seq_no.lock().unwrap();
         let mut entries = Vec::with_capacity(ops.len());
-        let mut buf = Vec::new();
+        // Pre-estimate buffer size: ~200 bytes per entry is a reasonable guess
+        let mut buf = Vec::with_capacity(ops.len() * 200);
 
         for (op, payload) in ops {
-            let entry = TranslogEntry {
+            buf.extend_from_slice(&encode_entry_borrowed(*seq, op, payload)?);
+            entries.push(TranslogEntry {
                 seq_no: *seq,
                 op: op.to_string(),
                 payload: payload.clone(),
-            };
+            });
             *seq += 1;
-            buf.extend_from_slice(&encode_entry(&entry)?);
-            entries.push(entry);
         }
 
         let mut file = self.file.lock().unwrap();
@@ -245,6 +264,22 @@ impl WriteAheadLog for HotTranslog {
         file.sync_data()?;
 
         Ok(entries)
+    }
+
+    fn write_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<()> {
+        let mut seq = self.seq_no.lock().unwrap();
+        let mut buf = Vec::with_capacity(ops.len() * 200);
+
+        for (op, payload) in ops {
+            buf.extend_from_slice(&encode_entry_borrowed(*seq, op, payload)?);
+            *seq += 1;
+        }
+
+        let mut file = self.file.lock().unwrap();
+        file.write_all(&buf)?;
+        file.sync_data()?;
+
+        Ok(())
     }
 
     fn read_all(&self) -> Result<Vec<TranslogEntry>> {
