@@ -34,7 +34,11 @@ impl TransportClient {
     }
 
     /// Connect to a remote node's gRPC transport endpoint, reusing cached channels.
-    async fn connect(&self, host: &str, port: u16) -> Result<InternalTransportClient<Channel>, tonic::transport::Error> {
+    async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<InternalTransportClient<Channel>, tonic::transport::Error> {
         let key = format!("{}:{}", host, port);
 
         // Fast path: read lock for cache hit (concurrent, non-blocking)
@@ -116,7 +120,10 @@ impl TransportClient {
                         error!("Failed to publish state to node {}: {}", node.id, e);
                     }
                 }
-                Err(e) => error!("Failed to connect to node {} for state publish: {}", node.id, e),
+                Err(e) => error!(
+                    "Failed to connect to node {} for state publish: {}",
+                    node.id, e
+                ),
             }
         }
     }
@@ -159,11 +166,15 @@ impl TransportClient {
         docs: &[(String, serde_json::Value)],
     ) -> Result<serde_json::Value, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let documents_json: Vec<Vec<u8>> = docs.iter()
-            .map(|(id, payload)| serde_json::to_vec(&serde_json::json!({
-                "_doc_id": id,
-                "_source": payload
-            })).unwrap_or_default())
+        let documents_json: Vec<Vec<u8>> = docs
+            .iter()
+            .map(|(id, payload)| {
+                serde_json::to_vec(&serde_json::json!({
+                    "_doc_id": id,
+                    "_source": payload
+                }))
+                .unwrap_or_default()
+            })
             .collect();
         let request = tonic::Request::new(ShardBulkRequest {
             index_name: index_name.to_string(),
@@ -250,7 +261,9 @@ impl TransportClient {
         });
         let response = client.search_shard(request).await?.into_inner();
         if response.success {
-            Ok(response.hits.iter()
+            Ok(response
+                .hits
+                .iter()
                 .filter_map(|h| serde_json::from_slice(&h.source_json).ok())
                 .collect())
         } else {
@@ -274,17 +287,28 @@ impl TransportClient {
         });
         let response = client.search_shard_dsl(request).await?.into_inner();
         if response.success {
-            Ok(response.hits.iter()
+            Ok(response
+                .hits
+                .iter()
                 .filter_map(|h| serde_json::from_slice(&h.source_json).ok())
                 .collect())
         } else {
-            Err(anyhow::anyhow!("Shard DSL search failed: {}", response.error))
+            Err(anyhow::anyhow!(
+                "Shard DSL search failed: {}",
+                response.error
+            ))
         }
     }
 
     /// Sends a heartbeat ping to another node
-    pub async fn send_ping(&self, target_node: &NodeInfo, local_node_id: &str) -> Result<(), anyhow::Error> {
-        let mut client = self.connect(&target_node.host, target_node.transport_port).await?;
+    pub async fn send_ping(
+        &self,
+        target_node: &NodeInfo,
+        local_node_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&target_node.host, target_node.transport_port)
+            .await?;
         let request = tonic::Request::new(PingRequest {
             source_node_id: local_node_id.to_string(),
         });
@@ -328,9 +352,10 @@ impl TransportClient {
         shard_id: u32,
         docs: &[(String, serde_json::Value)],
         start_seq_no: u64,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<u64, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let ops: Vec<ReplicateDocRequest> = docs.iter()
+        let ops: Vec<ReplicateDocRequest> = docs
+            .iter()
             .enumerate()
             .map(|(i, (id, payload))| ReplicateDocRequest {
                 index_name: index_name.to_string(),
@@ -348,11 +373,50 @@ impl TransportClient {
         });
         let response = client.replicate_bulk(request).await?.into_inner();
         if response.success {
-            Ok(())
+            Ok(response.local_checkpoint)
         } else {
-            Err(anyhow::anyhow!("Bulk replication failed: {}", response.error))
+            Err(anyhow::anyhow!(
+                "Bulk replication failed: {}",
+                response.error
+            ))
         }
     }
+
+    /// Request recovery from the primary: send our local checkpoint,
+    /// primary returns translog entries for replay.
+    pub async fn request_recovery(
+        &self,
+        primary_node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        local_checkpoint: u64,
+    ) -> Result<RecoveryResult, anyhow::Error> {
+        let mut client = self
+            .connect(&primary_node.host, primary_node.transport_port)
+            .await?;
+        let request = tonic::Request::new(RecoverReplicaRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            local_checkpoint,
+        });
+        let response = client.recover_replica(request).await?.into_inner();
+        if response.success {
+            Ok(RecoveryResult {
+                ops_replayed: response.ops_replayed,
+                primary_checkpoint: response.primary_checkpoint,
+                operations: response.operations,
+            })
+        } else {
+            Err(anyhow::anyhow!("Recovery failed: {}", response.error))
+        }
+    }
+}
+
+/// Result of a recovery request from the primary.
+pub struct RecoveryResult {
+    pub ops_replayed: u64,
+    pub primary_checkpoint: u64,
+    pub operations: Vec<RecoverReplicaOp>,
 }
 
 // ─── Helper to convert domain NodeInfo → proto NodeInfo ─────────────────────
@@ -364,11 +428,15 @@ fn node_info_to_proto(n: &NodeInfo) -> crate::transport::proto::NodeInfo {
         host: n.host.clone(),
         transport_port: n.transport_port as u32,
         http_port: n.http_port as u32,
-        roles: n.roles.iter().map(|r| match r {
-            crate::cluster::state::NodeRole::Master => "master".into(),
-            crate::cluster::state::NodeRole::Data => "data".into(),
-            crate::cluster::state::NodeRole::Client => "client".into(),
-        }).collect(),
+        roles: n
+            .roles
+            .iter()
+            .map(|r| match r {
+                crate::cluster::state::NodeRole::Master => "master".into(),
+                crate::cluster::state::NodeRole::Data => "data".into(),
+                crate::cluster::state::NodeRole::Client => "client".into(),
+            })
+            .collect(),
     }
 }
 
@@ -397,7 +465,10 @@ mod tests {
 
         // The clone should see it (read lock — concurrent)
         let cache2 = client2.channels.read().unwrap();
-        assert!(cache2.contains_key("127.0.0.1:1"), "cloned client must share the channel cache");
+        assert!(
+            cache2.contains_key("127.0.0.1:1"),
+            "cloned client must share the channel cache"
+        );
     }
 
     #[tokio::test]
@@ -414,6 +485,9 @@ mod tests {
 
         // Cache should NOT contain the failed connection
         let cache = client.channels.read().unwrap();
-        assert!(!cache.contains_key("127.0.0.1:1"), "failed connections should not be cached");
+        assert!(
+            !cache.contains_key("127.0.0.1:1"),
+            "failed connections should not be cached"
+        );
     }
 }

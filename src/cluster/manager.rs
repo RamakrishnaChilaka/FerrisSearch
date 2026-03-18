@@ -48,7 +48,7 @@ impl ClusterManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::state::{NodeRole, ClusterState};
+    use crate::cluster::state::{ClusterState, NodeRole};
     use std::sync::Arc;
 
     fn make_node(id: &str, raft_id: u64) -> NodeInfo {

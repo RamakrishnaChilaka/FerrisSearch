@@ -76,8 +76,15 @@ pub trait WriteAheadLog: Send + Sync {
     /// Read all pending entries (used for replay on startup).
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
 
+    /// Read entries with seq_no > the given checkpoint (for replica recovery).
+    fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;
+
     /// Truncate after a successful commit — data is safe in engine segments.
     fn truncate(&self) -> Result<()>;
+
+    /// Truncate only entries with seq_no <= the global checkpoint.
+    /// Entries above the global checkpoint are retained for replica recovery.
+    fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;
 
     /// Get the last assigned sequence number (highest seq_no written so far).
     /// Returns 0 if no writes have occurred.
@@ -111,7 +118,10 @@ fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Partial entry at end of file — truncated write, skip it
-                tracing::warn!("Translog has partial entry at end, ignoring {} bytes", payload_len);
+                tracing::warn!(
+                    "Translog has partial entry at end, ignoring {} bytes",
+                    payload_len
+                );
                 break;
             }
             Err(e) => return Err(e.into()),
@@ -244,6 +254,14 @@ impl WriteAheadLog for HotTranslog {
         decode_entries(&mut reader)
     }
 
+    fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>> {
+        let all = self.read_all()?;
+        Ok(all
+            .into_iter()
+            .filter(|e| e.seq_no > after_seq_no)
+            .collect())
+    }
+
     fn truncate(&self) -> Result<()> {
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(0))?;
@@ -256,7 +274,48 @@ impl WriteAheadLog for HotTranslog {
         let seq = self.seq_no.lock().unwrap();
         std::fs::write(&self.seq_no_path, seq.to_string())?;
 
-        tracing::info!("Translog truncated after flush (seq_no preserved at {}).", *seq);
+        tracing::info!(
+            "Translog truncated after flush (seq_no preserved at {}).",
+            *seq
+        );
+        Ok(())
+    }
+
+    fn truncate_below(&self, global_checkpoint: u64) -> Result<()> {
+        // Read all entries, keep only those above the global checkpoint
+        let entries = self.read_all()?;
+        let retained: Vec<&TranslogEntry> = entries
+            .iter()
+            .filter(|e| e.seq_no > global_checkpoint)
+            .collect();
+
+        let retained_count = retained.len();
+
+        // Rewrite the file with only retained entries
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(0))?;
+        file.set_len(0)?;
+
+        let mut buf = Vec::new();
+        for entry in &retained {
+            buf.extend_from_slice(&encode_entry(entry)?);
+        }
+        if !buf.is_empty() {
+            file.write_all(&buf)?;
+        }
+        file.sync_data()?;
+        drop(file);
+
+        // Persist seq_no high-water mark
+        let seq = self.seq_no.lock().unwrap();
+        std::fs::write(&self.seq_no_path, seq.to_string())?;
+
+        tracing::info!(
+            "Translog compacted: removed entries <= seq_no {}, retained {} entries (seq_no at {}).",
+            global_checkpoint,
+            retained_count,
+            *seq
+        );
         Ok(())
     }
 
@@ -310,9 +369,8 @@ mod tests {
     #[test]
     fn append_bulk_writes_atomically() {
         let (_dir, tl) = open_translog();
-        let ops: Vec<(&str, serde_json::Value)> = (0..5)
-            .map(|i| ("index", json!({"doc": i})))
-            .collect();
+        let ops: Vec<(&str, serde_json::Value)> =
+            (0..5).map(|i| ("index", json!({"doc": i}))).collect();
         let entries = tl.append_bulk(&ops).unwrap();
         assert_eq!(entries.len(), 5);
         assert_eq!(entries[4].seq_no, 4);
@@ -324,7 +382,8 @@ mod tests {
     #[test]
     fn bulk_then_single_seq_no_continues() {
         let (_dir, tl) = open_translog();
-        tl.append_bulk(&[("index", json!({"a": 1})), ("index", json!({"b": 2}))]).unwrap();
+        tl.append_bulk(&[("index", json!({"a": 1})), ("index", json!({"b": 2}))])
+            .unwrap();
         let e = tl.append("index", json!({"c": 3})).unwrap();
         assert_eq!(e.seq_no, 2);
     }
@@ -350,7 +409,10 @@ mod tests {
         tl.truncate().unwrap();
 
         let e = tl.append("index", json!({"b": 2})).unwrap();
-        assert_eq!(e.seq_no, 1, "seq_no should continue from where it left off after truncate");
+        assert_eq!(
+            e.seq_no, 1,
+            "seq_no should continue from where it left off after truncate"
+        );
     }
 
     // ── persistence across reopen ───────────────────────────────────────
@@ -380,7 +442,10 @@ mod tests {
         }
         let tl2 = HotTranslog::open(dir.path()).unwrap();
         let e = tl2.append("index", json!({"c": 3})).unwrap();
-        assert_eq!(e.seq_no, 2, "seq_no should continue from where previous instance left off");
+        assert_eq!(
+            e.seq_no, 2,
+            "seq_no should continue from where previous instance left off"
+        );
     }
 
     // ── binary format correctness ───────────────────────────────────────
@@ -419,7 +484,11 @@ mod tests {
 
         let mut reader = std::io::Cursor::new(&frame);
         let decoded = decode_entries(&mut reader).unwrap();
-        assert_eq!(decoded.len(), 1, "should recover the first valid entry and skip the partial");
+        assert_eq!(
+            decoded.len(),
+            1,
+            "should recover the first valid entry and skip the partial"
+        );
     }
 
     // ── edge cases ──────────────────────────────────────────────────────
@@ -438,5 +507,141 @@ mod tests {
         tl.append("index", json!({"data": big})).unwrap();
         let entries = tl.read_all().unwrap();
         assert_eq!(entries[0].payload["data"].as_str().unwrap().len(), 100_000);
+    }
+
+    // ── read_from ───────────────────────────────────────────────────────
+
+    #[test]
+    fn read_from_returns_entries_after_checkpoint() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap(); // seq 0
+        tl.append("index", json!({"b": 2})).unwrap(); // seq 1
+        tl.append("index", json!({"c": 3})).unwrap(); // seq 2
+
+        let entries = tl.read_from(0).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq_no, 1);
+        assert_eq!(entries[1].seq_no, 2);
+    }
+
+    #[test]
+    fn read_from_zero_returns_all() {
+        let (_dir, tl) = open_translog();
+        // read_from(0) should return entries with seq_no > 0
+        // But if we want all entries, we need to use a sentinel below first seq.
+        tl.append("index", json!({"a": 1})).unwrap(); // seq 0
+        tl.append("index", json!({"b": 2})).unwrap(); // seq 1
+
+        // read_from filters > after_seq_no, so read_from(0) skips seq 0
+        let entries = tl.read_from(0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq_no, 1);
+    }
+
+    #[test]
+    fn read_from_returns_empty_when_all_below_checkpoint() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+
+        let entries = tl.read_from(5).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn read_from_on_empty_translog_returns_empty() {
+        let (_dir, tl) = open_translog();
+        let entries = tl.read_from(0).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    // ── truncate_below ──────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_below_retains_entries_above_checkpoint() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap(); // seq 0
+        tl.append("index", json!({"b": 2})).unwrap(); // seq 1
+        tl.append("index", json!({"c": 3})).unwrap(); // seq 2
+        tl.append("index", json!({"d": 4})).unwrap(); // seq 3
+
+        tl.truncate_below(1).unwrap();
+
+        let entries = tl.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq_no, 2);
+        assert_eq!(entries[1].seq_no, 3);
+    }
+
+    #[test]
+    fn truncate_below_preserves_seq_no() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+
+        tl.truncate_below(0).unwrap();
+
+        let e = tl.append("index", json!({"c": 3})).unwrap();
+        assert_eq!(e.seq_no, 2, "seq_no should continue after truncate_below");
+    }
+
+    #[test]
+    fn truncate_below_at_max_clears_all() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+
+        tl.truncate_below(10).unwrap();
+
+        let entries = tl.read_all().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn truncate_below_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let tl = HotTranslog::open(dir.path()).unwrap();
+            tl.append("index", json!({"a": 1})).unwrap();
+            tl.append("index", json!({"b": 2})).unwrap();
+            tl.append("index", json!({"c": 3})).unwrap();
+            tl.truncate_below(1).unwrap();
+        }
+        let tl2 = HotTranslog::open(dir.path()).unwrap();
+        let entries = tl2.read_all().unwrap();
+        assert_eq!(entries.len(), 1, "only seq 2 should survive reopen");
+        assert_eq!(entries[0].seq_no, 2);
+        // seq_no should continue from 3
+        let e = tl2.append("index", json!({"d": 4})).unwrap();
+        assert_eq!(e.seq_no, 3);
+    }
+
+    // ── last_seq_no ─────────────────────────────────────────────────────
+
+    #[test]
+    fn last_seq_no_returns_zero_on_empty() {
+        let (_dir, tl) = open_translog();
+        assert_eq!(tl.last_seq_no(), 0);
+    }
+
+    #[test]
+    fn last_seq_no_returns_highest_written() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+        assert_eq!(tl.last_seq_no(), 1);
+    }
+
+    #[test]
+    fn last_seq_no_preserved_after_truncate() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+        tl.truncate().unwrap();
+        assert_eq!(
+            tl.last_seq_no(),
+            1,
+            "last_seq_no should persist after truncate"
+        );
     }
 }

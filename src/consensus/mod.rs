@@ -17,9 +17,9 @@ use std::sync::{Arc, RwLock};
 use openraft::{BasicNode, Config};
 
 use crate::cluster::state::ClusterState;
+use disk_store::DiskLogStore;
 use state_machine::ClusterStateMachine;
 use store::MemLogStore;
-use disk_store::DiskLogStore;
 use types::RaftInstance;
 
 /// Create a new Raft instance and return it together with a shared handle to
@@ -56,15 +56,9 @@ pub async fn create_raft_instance(
 
     let network = network::RaftNetworkFactoryImpl;
 
-    let raft = openraft::Raft::new(
-        node_id,
-        Arc::new(config),
-        network,
-        log_store,
-        state_machine,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to create Raft instance: {}", e))?;
+    let raft = openraft::Raft::new(node_id, Arc::new(config), network, log_store, state_machine)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create Raft instance: {}", e))?;
 
     Ok((Arc::new(raft), state_handle))
 }
@@ -87,15 +81,9 @@ pub async fn create_raft_instance_mem(
     let log_store = MemLogStore::new();
     let network = network::RaftNetworkFactoryImpl;
 
-    let raft = openraft::Raft::new(
-        node_id,
-        Arc::new(config),
-        network,
-        log_store,
-        state_machine,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to create Raft instance: {}", e))?;
+    let raft = openraft::Raft::new(node_id, Arc::new(config), network, log_store, state_machine)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create Raft instance: {}", e))?;
 
     Ok((Arc::new(raft), state_handle))
 }

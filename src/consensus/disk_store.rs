@@ -39,11 +39,14 @@ impl DiskLogStore {
 
         // Ensure tables exist
         {
-            let tx = db.begin_write()
+            let tx = db
+                .begin_write()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write: {}", e)))?;
-            let _ = tx.open_table(META_TABLE)
+            let _ = tx
+                .open_table(META_TABLE)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb table: {}", e)))?;
-            let _ = tx.open_table(LOG_TABLE)
+            let _ = tx
+                .open_table(LOG_TABLE)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb table: {}", e)))?;
             tx.commit()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit: {}", e)))?;
@@ -74,8 +77,8 @@ impl DiskLogStore {
 
     fn write_meta<T: serde::Serialize>(&self, key: &str, value: &T) -> io::Result<()> {
         let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        let data = serde_json::to_vec(value)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data =
+            serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tx = db.begin_write().map_err(Self::io_err)?;
         {
             let mut table = tx.open_table(META_TABLE).map_err(Self::io_err)?;
@@ -170,7 +173,11 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
         self.read_meta("committed")
     }
 
-    async fn append<I>(&mut self, entries: I, callback: IOFlushed<TypeConfig>) -> Result<(), io::Error>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: IOFlushed<TypeConfig>,
+    ) -> Result<(), io::Error>
     where
         I: IntoIterator<Item = types::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
@@ -267,11 +274,11 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::state::{NodeInfo, NodeRole};
+    use crate::consensus::types::ClusterCommand;
+    use openraft::impls::leader_id_adv::LeaderId;
     use openraft::storage::RaftLogStorage;
     use openraft::{EntryPayload, RaftLogReader};
-    use crate::consensus::types::ClusterCommand;
-    use crate::cluster::state::{NodeInfo, NodeRole};
-    use openraft::impls::leader_id_adv::LeaderId;
 
     fn make_leader_id(term: u64) -> LeaderId<u64, u64> {
         LeaderId { term, node_id: 1 }
@@ -513,7 +520,10 @@ mod tests {
         {
             let mut store = DiskLogStore::open(&path).unwrap();
             store
-                .append(vec![make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)], IOFlushed::noop())
+                .append(
+                    vec![make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)],
+                    IOFlushed::noop(),
+                )
                 .await
                 .unwrap();
             let purge_id = openraft::LogId::new(make_leader_id(1), 2);
@@ -563,19 +573,28 @@ mod tests {
 
             // Bootstrap single-node
             let mut members = std::collections::BTreeMap::new();
-            members.insert(1u64, openraft::BasicNode { addr: "127.0.0.1:19400".into() });
+            members.insert(
+                1u64,
+                openraft::BasicNode {
+                    addr: "127.0.0.1:19400".into(),
+                },
+            );
             raft.initialize(members).await.unwrap();
 
             // Wait for leader
             for _ in 0..50 {
-                if raft.current_leader().await.is_some() { break; }
+                if raft.current_leader().await.is_some() {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
 
             // Write something
-            raft.client_write(ClusterCommand::SetMaster { node_id: "n1".into() })
-                .await
-                .unwrap();
+            raft.client_write(ClusterCommand::SetMaster {
+                node_id: "n1".into(),
+            })
+            .await
+            .unwrap();
 
             raft.shutdown().await.ok();
         }
@@ -602,7 +621,10 @@ mod tests {
             .unwrap();
 
             let initialized = raft.is_initialized().await.unwrap();
-            assert!(initialized, "Raft must be initialized after recovering from disk");
+            assert!(
+                initialized,
+                "Raft must be initialized after recovering from disk"
+            );
 
             raft.shutdown().await.ok();
         }

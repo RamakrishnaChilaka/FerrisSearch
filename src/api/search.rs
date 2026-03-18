@@ -1,12 +1,12 @@
 use crate::api::AppState;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
+use futures::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
-use futures::future::join_all;
 
 #[derive(Deserialize)]
 pub struct SearchParams {
@@ -33,13 +33,23 @@ pub async fn search_documents(
     Query(params): Query<SearchParams>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(StatusCode::BAD_REQUEST, "invalid_index_name_exception", msg);
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_index_name_exception",
+            msg,
+        );
     }
 
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(&index_name) {
         Some(m) => m.clone(),
-        None => return crate::api::error_response(StatusCode::NOT_FOUND, "index_not_found_exception", format!("no such index [{}]", index_name)),
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name),
+            );
+        }
     };
 
     let mut all_hits = Vec::new();
@@ -48,7 +58,8 @@ pub async fn search_documents(
 
     // Query local shard engines directly
     let local_shards = state.shard_manager.get_index_shards(&index_name);
-    let local_shard_ids: std::collections::HashSet<u32> = local_shards.iter().map(|(id, _)| *id).collect();
+    let local_shard_ids: std::collections::HashSet<u32> =
+        local_shards.iter().map(|(id, _)| *id).collect();
 
     for (shard_id, engine) in &local_shards {
         match engine.search(&params.q) {
@@ -84,7 +95,12 @@ pub async fn search_documents(
             let sid = *shard_id;
             let query = params.q.clone();
             remote_futures.push(tokio::spawn(async move {
-                (sid, client.forward_search_to_shard(&node_info, &index, sid, &query).await)
+                (
+                    sid,
+                    client
+                        .forward_search_to_shard(&node_info, &index, sid, &query)
+                        .await,
+                )
             }));
         }
     }
@@ -104,7 +120,12 @@ pub async fn search_documents(
                 }
             }
             Ok((shard_id, Err(e))) => {
-                tracing::error!("Remote shard {}/{} search failed: {}", index_name, shard_id, e);
+                tracing::error!(
+                    "Remote shard {}/{} search failed: {}",
+                    index_name,
+                    shard_id,
+                    e
+                );
                 failed_shards += 1;
             }
             Err(e) => {
@@ -126,15 +147,18 @@ pub async fn search_documents(
     let size = params.size;
     let paginated: Vec<_> = all_hits.into_iter().skip(from).take(size).collect();
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "_shards": {
-            "total": successful_shards + failed_shards,
-            "successful": successful_shards,
-            "failed": failed_shards
-        },
-        "hits": {
-            "total": { "value": total, "relation": "eq" },
-            "hits": paginated
-        }
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "_shards": {
+                "total": successful_shards + failed_shards,
+                "successful": successful_shards,
+                "failed": failed_shards
+            },
+            "hits": {
+                "total": { "value": total, "relation": "eq" },
+                "hits": paginated
+            }
+        })),
+    )
 }

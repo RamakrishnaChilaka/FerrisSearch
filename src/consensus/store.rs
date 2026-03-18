@@ -100,7 +100,11 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
         Ok(inner.committed)
     }
 
-    async fn append<I>(&mut self, entries: I, callback: IOFlushed<TypeConfig>) -> Result<(), io::Error>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: IOFlushed<TypeConfig>,
+    ) -> Result<(), io::Error>
     where
         I: IntoIterator<Item = types::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
@@ -120,11 +124,8 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match last_log_id {
             Some(id) => {
-                let keys_to_remove: Vec<u64> = inner
-                    .log
-                    .range((id.index + 1)..)
-                    .map(|(k, _)| *k)
-                    .collect();
+                let keys_to_remove: Vec<u64> =
+                    inner.log.range((id.index + 1)..).map(|(k, _)| *k).collect();
                 for k in keys_to_remove {
                     inner.log.remove(&k);
                 }
@@ -138,11 +139,7 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
 
     async fn purge(&mut self, upto: types::LogId) -> Result<(), io::Error> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let keys_to_remove: Vec<u64> = inner
-            .log
-            .range(..=upto.index)
-            .map(|(k, _)| *k)
-            .collect();
+        let keys_to_remove: Vec<u64> = inner.log.range(..=upto.index).map(|(k, _)| *k).collect();
         for k in keys_to_remove {
             inner.log.remove(&k);
         }
@@ -154,10 +151,10 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::state::{NodeInfo, NodeRole};
+    use crate::consensus::types::ClusterCommand;
     use openraft::storage::RaftLogStorage;
     use openraft::{EntryPayload, RaftLogReader};
-    use crate::consensus::types::ClusterCommand;
-    use crate::cluster::state::{NodeInfo, NodeRole};
 
     use openraft::impls::leader_id_adv::LeaderId;
 
@@ -200,11 +197,7 @@ mod tests {
     #[tokio::test]
     async fn append_and_read_entries() {
         let mut store = MemLogStore::new();
-        let entries = vec![
-            make_entry(1, 1),
-            make_entry(2, 1),
-            make_entry(3, 1),
-        ];
+        let entries = vec![make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)];
         store.append(entries, IOFlushed::noop()).await.unwrap();
 
         let state = store.get_log_state().await.unwrap();
@@ -321,11 +314,7 @@ mod tests {
     #[tokio::test]
     async fn purge_removes_prefix() {
         let mut store = MemLogStore::new();
-        let entries = vec![
-            make_entry(1, 1),
-            make_entry(2, 1),
-            make_entry(3, 1),
-        ];
+        let entries = vec![make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)];
         store.append(entries, IOFlushed::noop()).await.unwrap();
 
         let log_id = openraft::LogId::new(make_leader_id(1), 2);
@@ -348,7 +337,10 @@ mod tests {
         assert_eq!(read.len(), 2);
 
         // Append more entries via the store — reader should see them
-        store.append(vec![make_entry(3, 1)], IOFlushed::noop()).await.unwrap();
+        store
+            .append(vec![make_entry(3, 1)], IOFlushed::noop())
+            .await
+            .unwrap();
         let read = reader.try_get_log_entries(1..=3).await.unwrap();
         assert_eq!(read.len(), 3);
     }

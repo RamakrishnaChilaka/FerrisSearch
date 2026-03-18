@@ -39,6 +39,13 @@ pub trait SearchEngine: Send + Sync {
     /// Flush: commit to disk and truncate the write-ahead log.
     fn flush(&self) -> Result<()>;
 
+    /// Flush with translog retention: commit to disk and truncate WAL entries
+    /// only up to the global checkpoint. Entries above the checkpoint are retained
+    /// for replica recovery.
+    fn flush_with_global_checkpoint(&self) -> Result<()> {
+        self.flush()
+    }
+
     /// Search using a simple query string (e.g. `?q=...`).
     fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>>;
 
@@ -47,7 +54,12 @@ pub trait SearchEngine: Send + Sync {
 
     /// k-NN vector search. Returns hits with _id, _score, _source, _knn_distance.
     /// Default implementation returns empty (no vector support).
-    fn search_knn(&self, _field: &str, _vector: &[f32], _k: usize) -> Result<Vec<serde_json::Value>> {
+    fn search_knn(
+        &self,
+        _field: &str,
+        _vector: &[f32],
+        _k: usize,
+    ) -> Result<Vec<serde_json::Value>> {
         Ok(vec![])
     }
 
@@ -76,4 +88,13 @@ pub trait SearchEngine: Send + Sync {
 
     /// Update the local checkpoint after applying a replicated operation.
     fn update_local_checkpoint(&self, _seq_no: u64) {}
+
+    /// Get the global checkpoint: min of all in-sync replica checkpoints.
+    /// Only meaningful on the primary shard.
+    fn global_checkpoint(&self) -> u64 {
+        0
+    }
+
+    /// Update the global checkpoint (called by primary after collecting replica checkpoints).
+    fn update_global_checkpoint(&self, _checkpoint: u64) {}
 }

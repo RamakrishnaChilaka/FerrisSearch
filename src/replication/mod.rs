@@ -9,7 +9,8 @@ use crate::transport::TransportClient;
 use tracing::error;
 
 /// Replicate a single document write to all replica nodes for a shard.
-/// Returns Ok(()) if all replicas acknowledged, Err with details otherwise.
+/// Returns Ok(replica_checkpoints) if all replicas acknowledged, Err with details otherwise.
+/// The returned Vec contains (node_id, local_checkpoint) for each replica.
 pub async fn replicate_write(
     transport_client: &TransportClient,
     cluster_state: &ClusterState,
@@ -19,48 +20,58 @@ pub async fn replicate_write(
     payload: &serde_json::Value,
     op: &str,
     seq_no: u64,
-) -> Result<(), Vec<String>> {
+) -> Result<Vec<(String, u64)>, Vec<String>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
-        None => return Ok(()), // no index metadata, nothing to replicate
+        None => return Ok(vec![]), // no index metadata, nothing to replicate
     };
 
     let replica_node_ids = metadata.replica_nodes(shard_id);
     if replica_node_ids.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
 
     let mut errors = Vec::new();
+    let mut checkpoints = Vec::new();
 
     for replica_node_id in &replica_node_ids {
         let node_info = match cluster_state.nodes.get(*replica_node_id) {
             Some(n) => n,
             None => {
-                errors.push(format!("Replica node {} not in cluster state", replica_node_id));
+                errors.push(format!(
+                    "Replica node {} not in cluster state",
+                    replica_node_id
+                ));
                 continue;
             }
         };
 
-        if let Err(e) = transport_client
+        match transport_client
             .replicate_to_shard(node_info, index_name, shard_id, doc_id, payload, op, seq_no)
             .await
         {
-            error!(
-                "Replication to {} for {}/shard_{} failed: {}",
-                replica_node_id, index_name, shard_id, e
-            );
-            errors.push(format!("{}: {}", replica_node_id, e));
+            Ok(replica_checkpoint) => {
+                checkpoints.push((replica_node_id.to_string(), replica_checkpoint));
+            }
+            Err(e) => {
+                error!(
+                    "Replication to {} for {}/shard_{} failed: {}",
+                    replica_node_id, index_name, shard_id, e
+                );
+                errors.push(format!("{}: {}", replica_node_id, e));
+            }
         }
     }
 
     if errors.is_empty() {
-        Ok(())
+        Ok(checkpoints)
     } else {
         Err(errors)
     }
 }
 
 /// Replicate a bulk set of writes to all replica nodes for a shard.
+/// Returns Ok(replica_checkpoints) with (node_id, local_checkpoint) for each replica.
 pub async fn replicate_bulk(
     transport_client: &TransportClient,
     cluster_state: &ClusterState,
@@ -68,42 +79,51 @@ pub async fn replicate_bulk(
     shard_id: u32,
     docs: &[(String, serde_json::Value)],
     start_seq_no: u64,
-) -> Result<(), Vec<String>> {
+) -> Result<Vec<(String, u64)>, Vec<String>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
-        None => return Ok(()),
+        None => return Ok(vec![]),
     };
 
     let replica_node_ids = metadata.replica_nodes(shard_id);
     if replica_node_ids.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
 
     let mut errors = Vec::new();
+    let mut checkpoints = Vec::new();
 
     for replica_node_id in &replica_node_ids {
         let node_info = match cluster_state.nodes.get(*replica_node_id) {
             Some(n) => n,
             None => {
-                errors.push(format!("Replica node {} not in cluster state", replica_node_id));
+                errors.push(format!(
+                    "Replica node {} not in cluster state",
+                    replica_node_id
+                ));
                 continue;
             }
         };
 
-        if let Err(e) = transport_client
+        match transport_client
             .replicate_bulk_to_shard(node_info, index_name, shard_id, docs, start_seq_no)
             .await
         {
-            error!(
-                "Bulk replication to {} for {}/shard_{} failed: {}",
-                replica_node_id, index_name, shard_id, e
-            );
-            errors.push(format!("{}: {}", replica_node_id, e));
+            Ok(replica_checkpoint) => {
+                checkpoints.push((replica_node_id.to_string(), replica_checkpoint));
+            }
+            Err(e) => {
+                error!(
+                    "Bulk replication to {} for {}/shard_{} failed: {}",
+                    replica_node_id, index_name, shard_id, e
+                );
+                errors.push(format!("{}: {}", replica_node_id, e));
+            }
         }
     }
 
     if errors.is_empty() {
-        Ok(())
+        Ok(checkpoints)
     } else {
         Err(errors)
     }
@@ -140,11 +160,14 @@ mod tests {
 
     fn add_index_with_routing(cs: &mut ClusterState, name: &str, replicas: Vec<String>) {
         let mut shard_routing = HashMap::new();
-        shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-1".into(),
-            replicas,
-            unassigned_replicas: 0,
-        });
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas,
+                unassigned_replicas: 0,
+            },
+        );
         cs.add_index(IndexMetadata {
             name: name.into(),
             number_of_shards: 1,
@@ -161,9 +184,16 @@ mod tests {
         let client = TransportClient::new();
         let cs = make_cluster_state_with_nodes();
         let result = replicate_write(
-            &client, &cs, "nonexistent", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index", 0,
-        ).await;
+            &client,
+            &cs,
+            "nonexistent",
+            0,
+            "doc1",
+            &serde_json::json!({"field": "value"}),
+            "index",
+            0,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -173,9 +203,16 @@ mod tests {
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec![]);
         let result = replicate_write(
-            &client, &cs, "test-idx", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index", 0,
-        ).await;
+            &client,
+            &cs,
+            "test-idx",
+            0,
+            "doc1",
+            &serde_json::json!({"field": "value"}),
+            "index",
+            0,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -186,9 +223,16 @@ mod tests {
         add_index_with_routing(&mut cs, "test-idx", vec!["node-2".into()]);
         // Shard 99 doesn't exist in routing table → no replicas → Ok
         let result = replicate_write(
-            &client, &cs, "test-idx", 99, "doc1",
-            &serde_json::json!({"field": "value"}), "index", 0,
-        ).await;
+            &client,
+            &cs,
+            "test-idx",
+            99,
+            "doc1",
+            &serde_json::json!({"field": "value"}),
+            "index",
+            0,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -198,9 +242,16 @@ mod tests {
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec!["ghost-node".into()]);
         let result = replicate_write(
-            &client, &cs, "test-idx", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index", 0,
-        ).await;
+            &client,
+            &cs,
+            "test-idx",
+            0,
+            "doc1",
+            &serde_json::json!({"field": "value"}),
+            "index",
+            0,
+        )
+        .await;
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors.len(), 1);
@@ -214,9 +265,16 @@ mod tests {
         // node-2 is in cluster state but no gRPC server running → connection refused
         add_index_with_routing(&mut cs, "test-idx", vec!["node-2".into()]);
         let result = replicate_write(
-            &client, &cs, "test-idx", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index", 0,
-        ).await;
+            &client,
+            &cs,
+            "test-idx",
+            0,
+            "doc1",
+            &serde_json::json!({"field": "value"}),
+            "index",
+            0,
+        )
+        .await;
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors.len(), 1);
@@ -230,9 +288,16 @@ mod tests {
         // Both replicas will fail: one not in state, one unreachable
         add_index_with_routing(&mut cs, "test-idx", vec!["ghost".into(), "node-2".into()]);
         let result = replicate_write(
-            &client, &cs, "test-idx", 0, "doc1",
-            &serde_json::json!({"field": "value"}), "index", 0,
-        ).await;
+            &client,
+            &cs,
+            "test-idx",
+            0,
+            "doc1",
+            &serde_json::json!({"field": "value"}),
+            "index",
+            0,
+        )
+        .await;
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors.len(), 2);
@@ -281,5 +346,37 @@ mod tests {
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
         let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0).await;
         assert!(result.is_err());
+    }
+
+    // ── Return type: checkpoints ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_noop_returns_empty_checkpoints() {
+        let client = TransportClient::new();
+        let cs = make_cluster_state_with_nodes();
+        let checkpoints = replicate_write(
+            &client,
+            &cs,
+            "nonexistent",
+            0,
+            "doc1",
+            &serde_json::json!({"f": 1}),
+            "index",
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(checkpoints.is_empty(), "no replicas → empty checkpoints");
+    }
+
+    #[tokio::test]
+    async fn bulk_noop_returns_empty_checkpoints() {
+        let client = TransportClient::new();
+        let cs = make_cluster_state_with_nodes();
+        let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
+        let checkpoints = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0)
+            .await
+            .unwrap();
+        assert!(checkpoints.is_empty());
     }
 }

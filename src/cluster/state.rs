@@ -120,11 +120,14 @@ impl IndexMetadata {
                     unassigned += 1;
                 }
             }
-            shard_routing.insert(shard_id, ShardRoutingEntry {
-                primary: primary_node,
-                replicas,
-                unassigned_replicas: unassigned,
-            });
+            shard_routing.insert(
+                shard_id,
+                ShardRoutingEntry {
+                    primary: primary_node,
+                    replicas,
+                    unassigned_replicas: unassigned,
+                },
+            );
         }
         Self {
             name: name.to_string(),
@@ -142,7 +145,10 @@ impl IndexMetadata {
 
     /// Returns the total number of unassigned replica copies across all shards.
     pub fn unassigned_replica_count(&self) -> u32 {
-        self.shard_routing.values().map(|r| r.unassigned_replicas).sum()
+        self.shard_routing
+            .values()
+            .map(|r| r.unassigned_replicas)
+            .sum()
     }
 
     /// Try to assign unassigned replicas to available data nodes.
@@ -152,11 +158,11 @@ impl IndexMetadata {
         for routing in self.shard_routing.values_mut() {
             while routing.unassigned_replicas > 0 {
                 // Find a data node not already used by this shard (primary or existing replicas)
-                let used: std::collections::HashSet<&str> = std::iter::once(routing.primary.as_str())
-                    .chain(routing.replicas.iter().map(|s| s.as_str()))
-                    .collect();
-                let candidate = data_nodes.iter()
-                    .find(|n| !used.contains(n.as_str()));
+                let used: std::collections::HashSet<&str> =
+                    std::iter::once(routing.primary.as_str())
+                        .chain(routing.replicas.iter().map(|s| s.as_str()))
+                        .collect();
+                let candidate = data_nodes.iter().find(|n| !used.contains(n.as_str()));
                 if let Some(node) = candidate {
                     routing.replicas.push(node.clone());
                     routing.unassigned_replicas -= 1;
@@ -375,11 +381,14 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
         };
-        meta.shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec!["node-B".into(), "node-C".into()],
-            unassigned_replicas: 0,
-        });
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into(), "node-C".into()],
+                unassigned_replicas: 0,
+            },
+        );
 
         assert!(meta.promote_replica(0));
         assert_eq!(meta.shard_routing[&0].primary, "node-B");
@@ -395,11 +404,14 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
         };
-        meta.shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec![],
-            unassigned_replicas: 0,
-        });
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
 
         assert!(!meta.promote_replica(0));
     }
@@ -413,16 +425,22 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
         };
-        meta.shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec!["node-B".into()],
-            unassigned_replicas: 0,
-        });
-        meta.shard_routing.insert(1, ShardRoutingEntry {
-            primary: "node-B".into(),
-            replicas: vec!["node-A".into()],
-            unassigned_replicas: 0,
-        });
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into()],
+                unassigned_replicas: 0,
+            },
+        );
+        meta.shard_routing.insert(
+            1,
+            ShardRoutingEntry {
+                primary: "node-B".into(),
+                replicas: vec!["node-A".into()],
+                unassigned_replicas: 0,
+            },
+        );
 
         let orphaned = meta.remove_node(&"node-A".into());
         assert_eq!(orphaned, vec![0]); // shard 0 lost its primary
@@ -440,16 +458,22 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
         };
-        meta.shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec!["node-B".into()],
-            unassigned_replicas: 0,
-        });
-        meta.shard_routing.insert(1, ShardRoutingEntry {
-            primary: "node-B".into(),
-            replicas: vec!["node-A".into()],
-            unassigned_replicas: 0,
-        });
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into()],
+                unassigned_replicas: 0,
+            },
+        );
+        meta.shard_routing.insert(
+            1,
+            ShardRoutingEntry {
+                primary: "node-B".into(),
+                replicas: vec!["node-A".into()],
+                unassigned_replicas: 0,
+            },
+        );
         assert_eq!(meta.primary_node(0), Some(&"node-A".to_string()));
         assert_eq!(meta.primary_node(1), Some(&"node-B".to_string()));
         assert_eq!(meta.primary_node(99), None);
@@ -464,11 +488,14 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
         };
-        meta.shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec!["node-B".into(), "node-C".into()],
-            unassigned_replicas: 0,
-        });
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into(), "node-C".into()],
+                unassigned_replicas: 0,
+            },
+        );
         let replicas = meta.replica_nodes(0);
         assert_eq!(replicas.len(), 2);
         assert!(replicas.contains(&&"node-B".to_string()));
@@ -496,11 +523,14 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
         };
-        meta.shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec!["node-B".into(), "node-C".into()],
-            unassigned_replicas: 0,
-        });
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into(), "node-C".into()],
+                unassigned_replicas: 0,
+            },
+        );
 
         // First promotion: B becomes primary
         assert!(meta.promote_replica(0));
@@ -537,21 +567,30 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
         };
-        meta.shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec!["node-B".into()],
-            unassigned_replicas: 0,
-        });
-        meta.shard_routing.insert(1, ShardRoutingEntry {
-            primary: "node-B".into(),
-            replicas: vec!["node-A".into()],
-            unassigned_replicas: 0,
-        });
-        meta.shard_routing.insert(2, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec!["node-C".into()],
-            unassigned_replicas: 0,
-        });
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into()],
+                unassigned_replicas: 0,
+            },
+        );
+        meta.shard_routing.insert(
+            1,
+            ShardRoutingEntry {
+                primary: "node-B".into(),
+                replicas: vec!["node-A".into()],
+                unassigned_replicas: 0,
+            },
+        );
+        meta.shard_routing.insert(
+            2,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-C".into()],
+                unassigned_replicas: 0,
+            },
+        );
 
         let mut orphaned = meta.remove_node(&"node-A".into());
         orphaned.sort();
@@ -571,11 +610,14 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
         };
-        meta.shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-A".into(),
-            replicas: vec!["node-B".into()],
-            unassigned_replicas: 0,
-        });
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec!["node-B".into()],
+                unassigned_replicas: 0,
+            },
+        );
 
         let orphaned = meta.remove_node(&"node-Z".into());
         assert!(orphaned.is_empty());
@@ -588,7 +630,10 @@ mod tests {
 
     #[test]
     fn field_mapping_serde_roundtrip() {
-        let fm = FieldMapping { field_type: FieldType::Text, dimension: None };
+        let fm = FieldMapping {
+            field_type: FieldType::Text,
+            dimension: None,
+        };
         let json = serde_json::to_string(&fm).unwrap();
         let fm2: FieldMapping = serde_json::from_str(&json).unwrap();
         assert_eq!(fm2.field_type, FieldType::Text);
@@ -597,7 +642,10 @@ mod tests {
 
     #[test]
     fn knn_vector_mapping_with_dimension() {
-        let fm = FieldMapping { field_type: FieldType::KnnVector, dimension: Some(128) };
+        let fm = FieldMapping {
+            field_type: FieldType::KnnVector,
+            dimension: Some(128),
+        };
         let json = serde_json::to_string(&fm).unwrap();
         assert!(json.contains("knn_vector"));
         assert!(json.contains("128"));
@@ -615,8 +663,20 @@ mod tests {
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
         };
-        meta.mappings.insert("title".into(), FieldMapping { field_type: FieldType::Text, dimension: None });
-        meta.mappings.insert("year".into(), FieldMapping { field_type: FieldType::Integer, dimension: None });
+        meta.mappings.insert(
+            "title".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        meta.mappings.insert(
+            "year".into(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
 
         let json = serde_json::to_string(&meta).unwrap();
         let meta2: IndexMetadata = serde_json::from_str(&json).unwrap();
@@ -627,19 +687,35 @@ mod tests {
 
     #[test]
     fn index_metadata_without_mappings_defaults_to_empty() {
-        let json = r#"{"name":"test","number_of_shards":1,"number_of_replicas":0,"shard_routing":{}}"#;
+        let json =
+            r#"{"name":"test","number_of_shards":1,"number_of_replicas":0,"shard_routing":{}}"#;
         let meta: IndexMetadata = serde_json::from_str(json).unwrap();
-        assert!(meta.mappings.is_empty(), "missing mappings field should default to empty");
+        assert!(
+            meta.mappings.is_empty(),
+            "missing mappings field should default to empty"
+        );
     }
 
     #[test]
     fn all_field_types_deserialize() {
-        for type_str in &["text", "keyword", "integer", "float", "boolean", "knn_vector"] {
+        for type_str in &[
+            "text",
+            "keyword",
+            "integer",
+            "float",
+            "boolean",
+            "knn_vector",
+        ] {
             let json = format!(r#"{{"type":"{}"}}"#, type_str);
             let fm: FieldMapping = serde_json::from_str(&json).unwrap();
-            assert!(matches!(fm.field_type,
-                FieldType::Text | FieldType::Keyword | FieldType::Integer |
-                FieldType::Float | FieldType::Boolean | FieldType::KnnVector
+            assert!(matches!(
+                fm.field_type,
+                FieldType::Text
+                    | FieldType::Keyword
+                    | FieldType::Integer
+                    | FieldType::Float
+                    | FieldType::Boolean
+                    | FieldType::KnnVector
             ));
         }
     }
@@ -651,14 +727,21 @@ mod tests {
         let meta = IndexMetadata::build_shard_routing("test", 1, 2, &["node-1".into()]);
         let routing = &meta.shard_routing[&0];
         assert_eq!(routing.primary, "node-1");
-        assert!(routing.replicas.is_empty(), "no replicas can be placed on single node");
-        assert_eq!(routing.unassigned_replicas, 2, "both replicas should be unassigned");
+        assert!(
+            routing.replicas.is_empty(),
+            "no replicas can be placed on single node"
+        );
+        assert_eq!(
+            routing.unassigned_replicas, 2,
+            "both replicas should be unassigned"
+        );
         assert_eq!(meta.unassigned_replica_count(), 2);
     }
 
     #[test]
     fn two_nodes_one_replica_fully_assigned() {
-        let meta = IndexMetadata::build_shard_routing("test", 1, 1, &["node-1".into(), "node-2".into()]);
+        let meta =
+            IndexMetadata::build_shard_routing("test", 1, 1, &["node-1".into(), "node-2".into()]);
         let routing = &meta.shard_routing[&0];
         assert_eq!(routing.primary, "node-1");
         assert_eq!(routing.replicas, vec!["node-2".to_string()]);
@@ -668,15 +751,25 @@ mod tests {
 
     #[test]
     fn two_nodes_two_replicas_one_unassigned() {
-        let meta = IndexMetadata::build_shard_routing("test", 1, 2, &["node-1".into(), "node-2".into()]);
+        let meta =
+            IndexMetadata::build_shard_routing("test", 1, 2, &["node-1".into(), "node-2".into()]);
         let routing = &meta.shard_routing[&0];
-        assert_eq!(routing.replicas.len(), 1, "only 1 replica can be placed on 2 nodes");
+        assert_eq!(
+            routing.replicas.len(),
+            1,
+            "only 1 replica can be placed on 2 nodes"
+        );
         assert_eq!(routing.unassigned_replicas, 1, "1 replica unassigned");
     }
 
     #[test]
     fn three_nodes_two_replicas_all_assigned() {
-        let meta = IndexMetadata::build_shard_routing("test", 1, 2, &["n1".into(), "n2".into(), "n3".into()]);
+        let meta = IndexMetadata::build_shard_routing(
+            "test",
+            1,
+            2,
+            &["n1".into(), "n2".into(), "n3".into()],
+        );
         let routing = &meta.shard_routing[&0];
         assert_eq!(routing.replicas.len(), 2);
         assert_eq!(routing.unassigned_replicas, 0);
@@ -716,7 +809,10 @@ mod tests {
     fn shard_routing_without_unassigned_field_defaults_to_zero() {
         let json = r#"{"primary":"node-1","replicas":["node-2"]}"#;
         let entry: ShardRoutingEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.unassigned_replicas, 0, "missing field should default to 0");
+        assert_eq!(
+            entry.unassigned_replicas, 0,
+            "missing field should default to 0"
+        );
     }
 
     // ── Shard allocator tests ───────────────────────────────────────────
@@ -731,7 +827,10 @@ mod tests {
         let changed = meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]);
         assert!(changed);
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-2".to_string()]);
-        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 1, "1 still unassigned (need 3rd node)");
+        assert_eq!(
+            meta.shard_routing[&0].unassigned_replicas, 1,
+            "1 still unassigned (need 3rd node)"
+        );
     }
 
     #[test]
@@ -740,7 +839,8 @@ mod tests {
         assert_eq!(meta.unassigned_replica_count(), 2);
 
         // Add node-2 and node-3 → both replicas assigned
-        let changed = meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into(), "node-3".into()]);
+        let changed =
+            meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into(), "node-3".into()]);
         assert!(changed);
         assert_eq!(meta.shard_routing[&0].replicas.len(), 2);
         assert_eq!(meta.shard_routing[&0].unassigned_replicas, 0);
@@ -749,7 +849,8 @@ mod tests {
 
     #[test]
     fn allocate_no_change_when_already_fully_assigned() {
-        let mut meta = IndexMetadata::build_shard_routing("test", 1, 1, &["node-1".into(), "node-2".into()]);
+        let mut meta =
+            IndexMetadata::build_shard_routing("test", 1, 1, &["node-1".into(), "node-2".into()]);
         assert_eq!(meta.unassigned_replica_count(), 0);
 
         let changed = meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]);

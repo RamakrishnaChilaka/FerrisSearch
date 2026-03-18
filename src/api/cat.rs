@@ -23,54 +23,61 @@ fn text_response(body: String) -> Response {
 }
 
 /// GET /_cat/nodes — tabular node listing
-pub async fn cat_nodes(
-    State(state): State<AppState>,
-    params: Query<CatParams>,
-) -> Response {
+pub async fn cat_nodes(State(state): State<AppState>, params: Query<CatParams>) -> Response {
     let cs = state.cluster_manager.get_state();
 
     let mut out = String::new();
     if wants_headers(&params) {
-        writeln!(out, "{:<40} {:<20} {:<15} {:<8} {:<10} {:<6}",
+        writeln!(
+            out,
+            "{:<40} {:<20} {:<15} {:<8} {:<10} {:<6}",
             "id", "name", "host", "http", "transport", "roles"
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     let mut nodes: Vec<_> = cs.nodes.values().collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
 
     for n in &nodes {
-        let roles: String = n.roles.iter().map(|r| match r {
-            NodeRole::Master => 'm',
-            NodeRole::Data   => 'd',
-            NodeRole::Client => 'c',
-        }).collect();
+        let roles: String = n
+            .roles
+            .iter()
+            .map(|r| match r {
+                NodeRole::Master => 'm',
+                NodeRole::Data => 'd',
+                NodeRole::Client => 'c',
+            })
+            .collect();
         let is_master = cs.master_node.as_ref() == Some(&n.id);
         let roles_display = if is_master {
             format!("{}*", roles)
         } else {
             roles
         };
-        writeln!(out, "{:<40} {:<20} {:<15} {:<8} {:<10} {:<6}",
+        writeln!(
+            out,
+            "{:<40} {:<20} {:<15} {:<8} {:<10} {:<6}",
             n.id, n.name, n.host, n.http_port, n.transport_port, roles_display
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     text_response(out)
 }
 
 /// GET /_cat/shards — tabular shard listing
-pub async fn cat_shards(
-    State(state): State<AppState>,
-    params: Query<CatParams>,
-) -> Response {
+pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>) -> Response {
     let cs = state.cluster_manager.get_state();
 
     let mut out = String::new();
     if wants_headers(&params) {
-        writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+        writeln!(
+            out,
+            "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
             "index", "shard", "prirep", "state", "docs", "node"
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     let mut index_names: Vec<&String> = cs.indices.keys().collect();
@@ -83,41 +90,64 @@ pub async fn cat_shards(
 
         for shard_id in shard_ids {
             let routing = &meta.shard_routing[&shard_id];
-            let node_name = cs.nodes.get(&routing.primary)
+            let node_name = cs
+                .nodes
+                .get(&routing.primary)
                 .map(|n| n.name.as_str())
                 .unwrap_or("UNASSIGNED");
-            let primary_state = if cs.nodes.contains_key(&routing.primary) { "STARTED" } else { "UNASSIGNED" };
+            let primary_state = if cs.nodes.contains_key(&routing.primary) {
+                "STARTED"
+            } else {
+                "UNASSIGNED"
+            };
 
             // If this shard is local, grab doc count from the engine
-            let docs = state.shard_manager
+            let docs = state
+                .shard_manager
                 .get_shard(idx_name, shard_id)
                 .map(|e| e.doc_count().to_string())
                 .unwrap_or_else(|| "-".into());
 
-            writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+            writeln!(
+                out,
+                "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
                 idx_name, shard_id, "p", primary_state, docs, node_name
-            ).unwrap();
+            )
+            .unwrap();
 
             // List assigned replica shards
             for replica_node_id in &routing.replicas {
-                let replica_name = cs.nodes.get(replica_node_id)
+                let replica_name = cs
+                    .nodes
+                    .get(replica_node_id)
                     .map(|n| n.name.as_str())
                     .unwrap_or("UNASSIGNED");
-                let replica_state = if cs.nodes.contains_key(replica_node_id) { "STARTED" } else { "UNASSIGNED" };
-                let replica_docs = state.shard_manager
+                let replica_state = if cs.nodes.contains_key(replica_node_id) {
+                    "STARTED"
+                } else {
+                    "UNASSIGNED"
+                };
+                let replica_docs = state
+                    .shard_manager
                     .get_shard(idx_name, shard_id)
                     .map(|e| e.doc_count().to_string())
                     .unwrap_or_else(|| "-".into());
-                writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+                writeln!(
+                    out,
+                    "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
                     idx_name, shard_id, "r", replica_state, replica_docs, replica_name
-                ).unwrap();
+                )
+                .unwrap();
             }
 
             // List unassigned replica shards (couldn't be placed)
             for _ in 0..routing.unassigned_replicas {
-                writeln!(out, "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+                writeln!(
+                    out,
+                    "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
                     idx_name, shard_id, "r", "UNASSIGNED", "-", ""
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
     }
@@ -126,17 +156,16 @@ pub async fn cat_shards(
 }
 
 /// GET /_cat/indices — tabular index listing
-pub async fn cat_indices(
-    State(state): State<AppState>,
-    params: Query<CatParams>,
-) -> Response {
+pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>) -> Response {
     let cs = state.cluster_manager.get_state();
     let health_fn = |idx_name: &str| -> &'static str {
         let meta = match cs.indices.get(idx_name) {
             Some(m) => m,
             None => return "red",
         };
-        let data_node_ids: std::collections::HashSet<&String> = cs.nodes.values()
+        let data_node_ids: std::collections::HashSet<&String> = cs
+            .nodes
+            .values()
             .filter(|n| n.roles.contains(&NodeRole::Data))
             .map(|n| &n.id)
             .collect();
@@ -155,9 +184,12 @@ pub async fn cat_indices(
 
     let mut out = String::new();
     if wants_headers(&params) {
-        writeln!(out, "{:<8} {:<25} {:<8} {:<10} {:<10}",
+        writeln!(
+            out,
+            "{:<8} {:<25} {:<8} {:<10} {:<10}",
             "health", "index", "shards", "docs", "status"
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     let mut index_names: Vec<&String> = cs.indices.keys().collect();
@@ -170,44 +202,49 @@ pub async fn cat_indices(
         // Sum doc counts from local shards; remote shards show as 0 here
         let total_docs: u64 = (0..meta.number_of_shards)
             .map(|sid| {
-                state.shard_manager
+                state
+                    .shard_manager
                     .get_shard(idx_name, sid)
                     .map(|e| e.doc_count())
                     .unwrap_or(0)
             })
             .sum();
 
-        writeln!(out, "{:<8} {:<25} {:<8} {:<10} {:<10}",
+        writeln!(
+            out,
+            "{:<8} {:<25} {:<8} {:<10} {:<10}",
             health, idx_name, meta.number_of_shards, total_docs, "open"
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     text_response(out)
 }
 
 /// GET /_cat/master — show the current master node
-pub async fn cat_master(
-    State(state): State<AppState>,
-    params: Query<CatParams>,
-) -> Response {
+pub async fn cat_master(State(state): State<AppState>, params: Query<CatParams>) -> Response {
     let cs = state.cluster_manager.get_state();
 
     let mut out = String::new();
     if wants_headers(&params) {
-        writeln!(out, "{:<40} {:<20} {:<15} {:<6}",
+        writeln!(
+            out,
+            "{:<40} {:<20} {:<15} {:<6}",
             "id", "host", "ip", "node"
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     if let Some(master_id) = &cs.master_node {
         if let Some(master) = cs.nodes.get(master_id) {
-            writeln!(out, "{:<40} {:<20} {:<15} {:<6}",
+            writeln!(
+                out,
+                "{:<40} {:<20} {:<15} {:<6}",
                 master.id, master.host, master.host, master.name
-            ).unwrap();
+            )
+            .unwrap();
         } else {
-            writeln!(out, "{:<40} {:<20} {:<15} {:<6}",
-                master_id, "-", "-", "-"
-            ).unwrap();
+            writeln!(out, "{:<40} {:<20} {:<15} {:<6}", master_id, "-", "-", "-").unwrap();
         }
     }
 

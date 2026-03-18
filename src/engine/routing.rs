@@ -42,7 +42,12 @@ mod tests {
             for i in 0..200 {
                 let doc_id = format!("doc-{}", i);
                 let shard = calculate_shard(&doc_id, num_shards);
-                assert!(shard < num_shards, "shard {} out of range for {} shards", shard, num_shards);
+                assert!(
+                    shard < num_shards,
+                    "shard {} out of range for {} shards",
+                    shard,
+                    num_shards
+                );
             }
         }
     }
@@ -78,8 +83,22 @@ mod tests {
     fn route_document_returns_correct_node() {
         use crate::cluster::state::ShardRoutingEntry;
         let mut shard_routing = HashMap::new();
-        shard_routing.insert(0, ShardRoutingEntry { primary: "node-A".into(), replicas: vec![], unassigned_replicas: 0 });
-        shard_routing.insert(1, ShardRoutingEntry { primary: "node-B".into(), replicas: vec![], unassigned_replicas: 0 });
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-A".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        shard_routing.insert(
+            1,
+            ShardRoutingEntry {
+                primary: "node-B".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
         let meta = IndexMetadata {
             name: "test-index".into(),
             number_of_shards: 2,

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, STRING, STORED, TEXT};
+use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use super::SearchEngine;
@@ -64,8 +64,12 @@ impl HotEngine {
             let field = match mapping.field_type {
                 FieldType::Text => schema_builder.add_text_field(name, TEXT | STORED),
                 FieldType::Keyword => schema_builder.add_text_field(name, STRING | STORED),
-                FieldType::Integer => schema_builder.add_i64_field(name, tantivy::schema::INDEXED | STORED),
-                FieldType::Float => schema_builder.add_f64_field(name, tantivy::schema::INDEXED | STORED),
+                FieldType::Integer => {
+                    schema_builder.add_i64_field(name, tantivy::schema::INDEXED | STORED)
+                }
+                FieldType::Float => {
+                    schema_builder.add_f64_field(name, tantivy::schema::INDEXED | STORED)
+                }
                 FieldType::Boolean => schema_builder.add_text_field(name, STRING | STORED),
                 FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
             };
@@ -126,7 +130,10 @@ impl HotEngine {
     /// With Tantivy, once an index is created, the schema is fixed — so we look up
     /// pre-existing fields. If a field doesn't exist, we fall back to the "body" field.
     fn resolve_field(&self, field_name: &str) -> Field {
-        let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(f) = registry.fields.get(field_name) {
             return *f;
         }
@@ -139,7 +146,10 @@ impl HotEngine {
     /// proper field types. All text values also go into the "body" catch-all
     /// for backward-compatible `?q=` query string searches.
     fn build_tantivy_doc(&self, doc_id: &str, payload: &serde_json::Value) -> TantivyDocument {
-        let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut doc = TantivyDocument::new();
 
         // Store the document ID
@@ -215,18 +225,22 @@ impl HotEngine {
 
         let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         for entry in &entries {
-            let doc_id = entry.payload.get("_doc_id")
+            let doc_id = entry
+                .payload
+                .get("_doc_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let source = entry.payload.get("_source")
-                .unwrap_or(&entry.payload);
+            let source = entry.payload.get("_source").unwrap_or(&entry.payload);
             let doc = self.build_tantivy_doc(doc_id, source);
             writer.add_document(doc)?;
         }
         writer.commit()?;
         self.reader.reload()?;
 
-        tracing::info!("Translog replay complete. {} documents recovered.", entries.len());
+        tracing::info!(
+            "Translog replay complete. {} documents recovered.",
+            entries.len()
+        );
         Ok(())
     }
 
@@ -247,17 +261,25 @@ impl HotEngine {
 
     /// Shared search execution helper — returns _id + _source from each hit.
     /// `limit` controls how many top docs Tantivy collects.
-    fn execute_search(&self, searcher: tantivy::Searcher, query: &dyn tantivy::query::Query, limit: usize) -> Result<Vec<serde_json::Value>> {
+    fn execute_search(
+        &self,
+        searcher: tantivy::Searcher,
+        query: &dyn tantivy::query::Query,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
         let effective_limit = if limit == 0 { 1 } else { limit };
         let top_docs = searcher.search(query, &TopDocs::with_limit(effective_limit))?;
-        let registry = self.field_registry.read()
+        let registry = self
+            .field_registry
+            .read()
             .unwrap_or_else(|e| e.into_inner());
 
         let mut results = Vec::new();
         for (score, doc_address) in top_docs {
             let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
             // Get _id
-            let doc_id = retrieved_doc.get_all(registry.id_field)
+            let doc_id = retrieved_doc
+                .get_all(registry.id_field)
                 .next()
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
@@ -280,16 +302,23 @@ impl HotEngine {
 
     /// Return the set of document IDs matching a query clause.
     /// Used by CompositeEngine for pre-filtering kNN results.
-    pub fn matching_doc_ids(&self, clause: &crate::search::QueryClause) -> Result<std::collections::HashSet<String>> {
+    pub fn matching_doc_ids(
+        &self,
+        clause: &crate::search::QueryClause,
+    ) -> Result<std::collections::HashSet<String>> {
         let query = self.build_query(clause)?;
         let searcher = self.reader.searcher();
-        let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         // Collect up to 100k matching docs — a reasonable ceiling for filter sets
         let top_docs = searcher.search(&*query, &TopDocs::with_limit(100_000))?;
         let mut ids = std::collections::HashSet::new();
         for (_score, doc_address) in top_docs {
             let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
-            if let Some(doc_id) = retrieved_doc.get_all(registry.id_field)
+            if let Some(doc_id) = retrieved_doc
+                .get_all(registry.id_field)
                 .next()
                 .and_then(|v| v.as_str())
             {
@@ -300,11 +329,14 @@ impl HotEngine {
     }
 
     /// Recursively convert a QueryClause into a Tantivy Query.
-    fn build_query(&self, clause: &crate::search::QueryClause) -> Result<Box<dyn tantivy::query::Query>> {
+    fn build_query(
+        &self,
+        clause: &crate::search::QueryClause,
+    ) -> Result<Box<dyn tantivy::query::Query>> {
         use crate::search::QueryClause;
+        use tantivy::Term;
         use tantivy::query::{AllQuery, BooleanQuery, Occur, TermQuery};
         use tantivy::schema::IndexRecordOption;
-        use tantivy::Term;
 
         match clause {
             QueryClause::MatchAll(_) => Ok(Box::new(AllQuery)),
@@ -417,7 +449,8 @@ impl HotEngine {
                         match ch {
                             '*' => regex_pattern.push_str(".*"),
                             '?' => regex_pattern.push('.'),
-                            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+                            | '\\' => {
                                 regex_pattern.push('\\');
                                 regex_pattern.push(ch);
                             }
@@ -443,7 +476,8 @@ impl HotEngine {
                     let mut escaped = String::new();
                     for ch in prefix.chars() {
                         match ch {
-                            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^'
+                            | '$' | '|' | '\\' => {
                                 escaped.push('\\');
                                 escaped.push(ch);
                             }
@@ -472,6 +506,28 @@ impl HotEngine {
             }
         }
     }
+
+    /// Flush with translog retention: commit to disk and truncate WAL entries
+    /// only up to the given global checkpoint. Entries above the checkpoint
+    /// are retained for replica recovery via translog replay.
+    /// Returns the highest seq_no written to the WAL.
+    pub fn last_seq_no(&self) -> u64 {
+        let tl = self.translog.lock().unwrap();
+        tl.last_seq_no()
+    }
+
+    pub fn flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<()> {
+        let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+        writer.commit()?;
+        drop(writer);
+        let tl = self.translog.lock().unwrap();
+        if global_checkpoint > 0 {
+            tl.truncate_below(global_checkpoint)?;
+        } else {
+            tl.truncate()?;
+        }
+        Ok(())
+    }
 }
 
 impl super::SearchEngine for HotEngine {
@@ -487,7 +543,11 @@ impl super::SearchEngine for HotEngine {
         }
 
         // 2. Delete any existing doc with same _id (upsert semantics)
-        let id_field = self.field_registry.read().unwrap_or_else(|e| e.into_inner()).id_field;
+        let id_field = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .id_field;
         let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         writer.delete_term(Term::from_field_text(id_field, doc_id));
 
@@ -510,7 +570,11 @@ impl super::SearchEngine for HotEngine {
         }
 
         // 2. Write all docs to Tantivy in-memory buffer under one lock
-        let id_field = self.field_registry.read().unwrap_or_else(|e| e.into_inner()).id_field;
+        let id_field = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .id_field;
         let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         let mut doc_ids = Vec::with_capacity(docs.len());
         for (doc_id, payload) in &docs {
@@ -531,7 +595,11 @@ impl super::SearchEngine for HotEngine {
         }
 
         // 2. Delete from Tantivy
-        let id_field = self.field_registry.read().unwrap_or_else(|e| e.into_inner()).id_field;
+        let id_field = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .id_field;
         let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
         // delete_term returns an OpStamp, not a count — we report 1 optimistically
@@ -540,7 +608,10 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
-        let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let searcher = self.reader.searcher();
         let term = Term::from_field_text(registry.id_field, doc_id);
         let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
@@ -614,7 +685,9 @@ mod tests {
     #[test]
     fn add_and_get_document() {
         let (_dir, engine) = create_engine();
-        engine.add_document("doc1", json!({"title": "hello world"})).unwrap();
+        engine
+            .add_document("doc1", json!({"title": "hello world"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let doc = engine.get_document("doc1").unwrap();
@@ -648,7 +721,9 @@ mod tests {
     #[test]
     fn delete_document() {
         let (_dir, engine) = create_engine();
-        engine.add_document("doc1", json!({"title": "delete me"})).unwrap();
+        engine
+            .add_document("doc1", json!({"title": "delete me"}))
+            .unwrap();
         engine.refresh().unwrap();
         assert_eq!(engine.doc_count(), 1);
 
@@ -681,9 +756,15 @@ mod tests {
     #[test]
     fn simple_query_string_search() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust programming language"})).unwrap();
-        engine.add_document("d2", json!({"title": "python programming language"})).unwrap();
-        engine.add_document("d3", json!({"title": "cooking recipes"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust programming language"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python programming language"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "cooking recipes"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let results = engine.search("rust").unwrap();
@@ -713,8 +794,12 @@ mod tests {
     #[test]
     fn search_match_query() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "database internals"})).unwrap();
-        engine.add_document("d2", json!({"title": "web development"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "database internals"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "web development"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let mut fields = HashMap::new();
@@ -723,9 +808,9 @@ mod tests {
             query: QueryClause::Match(fields),
             size: 10,
             from: 0,
-        knn: None,
-        sort: vec![],
-        aggs: std::collections::HashMap::new(),
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
@@ -737,7 +822,9 @@ mod tests {
     #[test]
     fn documents_not_visible_before_refresh() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "invisible"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "invisible"}))
+            .unwrap();
         // doc_count uses the reader which hasn't been reloaded yet
         assert_eq!(engine.doc_count(), 0);
 
@@ -766,7 +853,9 @@ mod tests {
         // Simulate: write docs but never flush (simulating crash before commit)
         {
             let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
-            engine.add_document("crash-doc", json!({"recovered": true})).unwrap();
+            engine
+                .add_document("crash-doc", json!({"recovered": true}))
+                .unwrap();
             // intentionally do NOT flush — translog has the entry, Tantivy segments may not
         }
 
@@ -774,7 +863,10 @@ mod tests {
         let engine2 = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
         // After replay, the engine commits and reloads
         let doc = engine2.get_document("crash-doc").unwrap();
-        assert!(doc.is_some(), "document should be recovered from translog replay");
+        assert!(
+            doc.is_some(),
+            "document should be recovered from translog replay"
+        );
         assert_eq!(doc.unwrap()["recovered"], true);
     }
 
@@ -783,14 +875,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
-            engine.add_document("safe", json!({"flushed": true})).unwrap();
+            engine
+                .add_document("safe", json!({"flushed": true}))
+                .unwrap();
             engine.flush().unwrap();
         }
         // Reopen
         let engine2 = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
         let tl = engine2.translog.lock().unwrap();
         let entries = tl.read_all().unwrap();
-        assert!(entries.is_empty(), "translog should be empty after flush + reopen");
+        assert!(
+            entries.is_empty(),
+            "translog should be empty after flush + reopen"
+        );
     }
 
     // ── doc_count ───────────────────────────────────────────────────────
@@ -816,7 +913,9 @@ mod tests {
     fn search_query_respects_size() {
         let (_dir, engine) = create_engine();
         for i in 0..20 {
-            engine.add_document(&format!("doc-{}", i), json!({"title": "hello world"})).unwrap();
+            engine
+                .add_document(&format!("doc-{}", i), json!({"title": "hello world"}))
+                .unwrap();
         }
         engine.refresh().unwrap();
 
@@ -831,14 +930,20 @@ mod tests {
             aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
-        assert_eq!(results.len(), 20, "engine returns all matching docs for coordinator to slice");
+        assert_eq!(
+            results.len(),
+            20,
+            "engine returns all matching docs for coordinator to slice"
+        );
     }
 
     #[test]
     fn search_query_from_skips_results() {
         let (_dir, engine) = create_engine();
         for i in 0..10 {
-            engine.add_document(&format!("doc-{}", i), json!({"title": "hello world"})).unwrap();
+            engine
+                .add_document(&format!("doc-{}", i), json!({"title": "hello world"}))
+                .unwrap();
         }
         engine.refresh().unwrap();
 
@@ -864,14 +969,20 @@ mod tests {
             aggs: std::collections::HashMap::new(),
         };
         let paged_results = engine.search_query(&req_paged).unwrap();
-        assert_eq!(paged_results.len(), 10, "engine returns all available hits; coordinator slices");
+        assert_eq!(
+            paged_results.len(),
+            10,
+            "engine returns all available hits; coordinator slices"
+        );
     }
 
     #[test]
     fn search_query_from_beyond_total_returns_all_available() {
         let (_dir, engine) = create_engine();
         for i in 0..5 {
-            engine.add_document(&format!("doc-{}", i), json!({"title": "test"})).unwrap();
+            engine
+                .add_document(&format!("doc-{}", i), json!({"title": "test"}))
+                .unwrap();
         }
         engine.refresh().unwrap();
 
@@ -884,7 +995,11 @@ mod tests {
             aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
-        assert_eq!(results.len(), 5, "engine returns all 5 hits; coordinator will slice to empty");
+        assert_eq!(
+            results.len(),
+            5,
+            "engine returns all 5 hits; coordinator will slice to empty"
+        );
     }
 
     #[test]
@@ -893,7 +1008,9 @@ mod tests {
         // report total from full set, then slice with from/size.
         let (_dir, engine) = create_engine();
         for i in 0..15 {
-            engine.add_document(&format!("doc-{}", i), json!({"title": "hello"})).unwrap();
+            engine
+                .add_document(&format!("doc-{}", i), json!({"title": "hello"}))
+                .unwrap();
         }
         engine.refresh().unwrap();
 
@@ -917,9 +1034,15 @@ mod tests {
     #[test]
     fn bool_must_filters_documents() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
-        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
-        engine.add_document("d3", json!({"title": "rust web server"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust search engine"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python web framework"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "rust web server"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -944,9 +1067,15 @@ mod tests {
     #[test]
     fn bool_must_not_excludes_documents() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
-        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
-        engine.add_document("d3", json!({"title": "rust web server"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust search engine"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python web framework"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "rust web server"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -972,9 +1101,15 @@ mod tests {
     #[test]
     fn bool_should_with_no_must_matches_any() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search"})).unwrap();
-        engine.add_document("d2", json!({"title": "python search"})).unwrap();
-        engine.add_document("d3", json!({"title": "java build"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust search"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python search"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "java build"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -1000,14 +1135,22 @@ mod tests {
             aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
-        assert_eq!(results.len(), 2, "should match d1 (rust) and d2 (python), not d3");
+        assert_eq!(
+            results.len(),
+            2,
+            "should match d1 (rust) and d2 (python), not d3"
+        );
     }
 
     #[test]
     fn bool_filter_acts_like_must() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
-        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust search engine"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python web framework"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -1040,9 +1183,9 @@ mod tests {
             query: QueryClause::Bool(crate::search::BoolQuery::default()),
             size: 10,
             from: 0,
-        knn: None,
-        sort: vec![],
-        aggs: std::collections::HashMap::new(),
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty bool should match all docs");
@@ -1051,9 +1194,15 @@ mod tests {
     #[test]
     fn bool_combined_must_and_must_not() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
-        engine.add_document("d2", json!({"title": "rust web server"})).unwrap();
-        engine.add_document("d3", json!({"title": "python search tool"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust search engine"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "rust web server"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "python search tool"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // must: rust, must_not: web → should only match d1
@@ -1078,17 +1227,29 @@ mod tests {
             aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
-        assert_eq!(results.len(), 1, "must:rust + must_not:web should only match d1");
+        assert_eq!(
+            results.len(),
+            1,
+            "must:rust + must_not:web should only match d1"
+        );
         assert_eq!(results[0]["_id"], "d1");
     }
 
     #[test]
     fn bool_nested_bool_inside_must() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
-        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
-        engine.add_document("d3", json!({"title": "rust web server"})).unwrap();
-        engine.add_document("d4", json!({"title": "java build tool"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust search engine"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python web framework"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "rust web server"}))
+            .unwrap();
+        engine
+            .add_document("d4", json!({"title": "java build tool"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // Nested: must[ bool{ should[rust, python] } ], must_not[web]
@@ -1097,8 +1258,16 @@ mod tests {
             query: QueryClause::Bool(crate::search::BoolQuery {
                 must: vec![QueryClause::Bool(crate::search::BoolQuery {
                     should: vec![
-                        QueryClause::Match({ let mut m = HashMap::new(); m.insert("body".into(), json!("rust")); m }),
-                        QueryClause::Match({ let mut m = HashMap::new(); m.insert("body".into(), json!("python")); m }),
+                        QueryClause::Match({
+                            let mut m = HashMap::new();
+                            m.insert("body".into(), json!("rust"));
+                            m
+                        }),
+                        QueryClause::Match({
+                            let mut m = HashMap::new();
+                            m.insert("body".into(), json!("python"));
+                            m
+                        }),
                     ],
                     ..Default::default()
                 })],
@@ -1116,7 +1285,11 @@ mod tests {
             aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
-        assert_eq!(results.len(), 1, "nested bool + must_not should match only d1");
+        assert_eq!(
+            results.len(),
+            1,
+            "nested bool + must_not should match only d1"
+        );
         assert_eq!(results[0]["_id"], "d1");
     }
 
@@ -1124,37 +1297,49 @@ mod tests {
     fn build_query_match_empty_fields_returns_all() {
         // Match with empty HashMap should return AllQuery (match all)
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "hello"})).unwrap();
-        engine.add_document("d2", json!({"title": "world"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "hello"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "world"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
             query: QueryClause::Match(HashMap::new()),
             size: 10,
             from: 0,
-        knn: None,
-        sort: vec![],
-        aggs: std::collections::HashMap::new(),
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
-        assert_eq!(results.len(), 2, "empty Match should fall back to match all");
+        assert_eq!(
+            results.len(),
+            2,
+            "empty Match should fall back to match all"
+        );
     }
 
     #[test]
     fn build_query_term_empty_fields_returns_all() {
         // Term with empty HashMap should return AllQuery (match all)
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "hello"})).unwrap();
-        engine.add_document("d2", json!({"title": "world"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "hello"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "world"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
             query: QueryClause::Term(HashMap::new()),
             size: 10,
             from: 0,
-        knn: None,
-        sort: vec![],
-        aggs: std::collections::HashMap::new(),
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty Term should fall back to match all");
@@ -1164,8 +1349,12 @@ mod tests {
     fn build_query_match_with_numeric_value() {
         // Match with a non-string value should stringify it
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "document 42"})).unwrap();
-        engine.add_document("d2", json!({"title": "other text"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "document 42"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "other text"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -1181,7 +1370,11 @@ mod tests {
             aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
-        assert_eq!(results.len(), 1, "match with numeric value should find doc with '42'");
+        assert_eq!(
+            results.len(),
+            1,
+            "match with numeric value should find doc with '42'"
+        );
         assert_eq!(results[0]["_id"], "d1");
     }
 
@@ -1189,8 +1382,12 @@ mod tests {
     fn build_query_term_via_search_query() {
         // Verify term query works through search_query (build_query path)
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"status": "published"})).unwrap();
-        engine.add_document("d2", json!({"status": "draft"})).unwrap();
+        engine
+            .add_document("d1", json!({"status": "published"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"status": "draft"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -1218,24 +1415,29 @@ mod tests {
         let (_dir, engine) = create_engine();
         engine.add_document("d1", json!({"name": "alice"})).unwrap();
         engine.add_document("d2", json!({"name": "bob"})).unwrap();
-        engine.add_document("d3", json!({"name": "charlie"})).unwrap();
+        engine
+            .add_document("d3", json!({"name": "charlie"}))
+            .unwrap();
         engine.add_document("d4", json!({"name": "dave"})).unwrap();
         engine.refresh().unwrap();
 
         // gte "b", lt "d" → should match "bob" and "charlie"
         let mut fields = HashMap::new();
-        fields.insert("body".into(), crate::search::RangeCondition {
-            gte: Some(json!("b")),
-            lt: Some(json!("d")),
-            ..Default::default()
-        });
+        fields.insert(
+            "body".into(),
+            crate::search::RangeCondition {
+                gte: Some(json!("b")),
+                lt: Some(json!("d")),
+                ..Default::default()
+            },
+        );
         let req = SearchRequest {
             query: QueryClause::Range(fields),
             size: 10,
             from: 0,
-        knn: None,
-        sort: vec![],
-        aggs: std::collections::HashMap::new(),
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
@@ -1249,29 +1451,37 @@ mod tests {
         let (_dir, engine) = create_engine();
         engine.add_document("d1", json!({"name": "alice"})).unwrap();
         engine.add_document("d2", json!({"name": "bob"})).unwrap();
-        engine.add_document("d3", json!({"name": "charlie"})).unwrap();
+        engine
+            .add_document("d3", json!({"name": "charlie"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // gt "alice", lte "charlie" → bob and charlie
         let mut fields = HashMap::new();
-        fields.insert("body".into(), crate::search::RangeCondition {
-            gt: Some(json!("alice")),
-            lte: Some(json!("charlie")),
-            ..Default::default()
-        });
+        fields.insert(
+            "body".into(),
+            crate::search::RangeCondition {
+                gt: Some(json!("alice")),
+                lte: Some(json!("charlie")),
+                ..Default::default()
+            },
+        );
         let req = SearchRequest {
             query: QueryClause::Range(fields),
             size: 10,
             from: 0,
-        knn: None,
-        sort: vec![],
-        aggs: std::collections::HashMap::new(),
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d2"), "bob should match");
         assert!(ids.contains(&"d3"), "charlie should match");
-        assert!(!ids.contains(&"d1"), "alice should be excluded (gt, not gte)");
+        assert!(
+            !ids.contains(&"d1"),
+            "alice should be excluded (gt, not gte)"
+        );
     }
 
     #[test]
@@ -1285,30 +1495,43 @@ mod tests {
             query: QueryClause::Range(HashMap::new()),
             size: 10,
             from: 0,
-        knn: None,
-        sort: vec![],
-        aggs: std::collections::HashMap::new(),
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
-        assert_eq!(results.len(), 2, "empty Range should fall back to match all");
+        assert_eq!(
+            results.len(),
+            2,
+            "empty Range should fall back to match all"
+        );
     }
 
     #[test]
     fn range_inside_bool_filter_engine() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust alpha"})).unwrap();
-        engine.add_document("d2", json!({"title": "rust beta"})).unwrap();
-        engine.add_document("d3", json!({"title": "python gamma"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust alpha"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "rust beta"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "python gamma"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // must: match "rust", filter: range body >= "alpha" and < "beta"
         // "alpha" matches d1, "beta" is excluded → only d1
         let mut range_fields = HashMap::new();
-        range_fields.insert("body".into(), crate::search::RangeCondition {
-            gte: Some(json!("alpha")),
-            lt: Some(json!("beta")),
-            ..Default::default()
-        });
+        range_fields.insert(
+            "body".into(),
+            crate::search::RangeCondition {
+                gte: Some(json!("alpha")),
+                lt: Some(json!("beta")),
+                ..Default::default()
+            },
+        );
         let req = SearchRequest {
             query: QueryClause::Bool(crate::search::BoolQuery {
                 must: vec![QueryClause::Match({
@@ -1335,9 +1558,15 @@ mod tests {
     #[test]
     fn wildcard_star_matches_suffix() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rustacean"})).unwrap();
-        engine.add_document("d2", json!({"title": "python"})).unwrap();
-        engine.add_document("d3", json!({"title": "rusty"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rustacean"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "rusty"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -1364,7 +1593,9 @@ mod tests {
         let (_dir, engine) = create_engine();
         engine.add_document("d1", json!({"title": "rust"})).unwrap();
         engine.add_document("d2", json!({"title": "rest"})).unwrap();
-        engine.add_document("d3", json!({"title": "roast"})).unwrap();
+        engine
+            .add_document("d3", json!({"title": "roast"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -1389,9 +1620,15 @@ mod tests {
     #[test]
     fn prefix_query_matches_beginning() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "search engine"})).unwrap();
-        engine.add_document("d2", json!({"title": "sea turtle"})).unwrap();
-        engine.add_document("d3", json!({"title": "mountain"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "search engine"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "sea turtle"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "mountain"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -1410,7 +1647,10 @@ mod tests {
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d1"), "search should match prefix 'sea'");
         assert!(ids.contains(&"d2"), "sea should match prefix 'sea'");
-        assert!(!ids.contains(&"d3"), "mountain should NOT match prefix 'sea'");
+        assert!(
+            !ids.contains(&"d3"),
+            "mountain should NOT match prefix 'sea'"
+        );
     }
 
     #[test]
@@ -1455,16 +1695,21 @@ mod tests {
     fn fuzzy_matches_typo() {
         let (_dir, engine) = create_engine();
         engine.add_document("d1", json!({"title": "rust"})).unwrap();
-        engine.add_document("d2", json!({"title": "python"})).unwrap();
+        engine
+            .add_document("d2", json!({"title": "python"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
             query: QueryClause::Fuzzy({
                 let mut m = HashMap::new();
-                m.insert("body".into(), crate::search::FuzzyParams {
-                    value: "rsut".into(),
-                    fuzziness: 2,
-                });
+                m.insert(
+                    "body".into(),
+                    crate::search::FuzzyParams {
+                        value: "rsut".into(),
+                        fuzziness: 2,
+                    },
+                );
                 m
             }),
             size: 10,
@@ -1475,7 +1720,10 @@ mod tests {
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["_id"], "d1", "fuzzy should match 'rust' for 'rsut'");
+        assert_eq!(
+            results[0]["_id"], "d1",
+            "fuzzy should match 'rust' for 'rsut'"
+        );
     }
 
     #[test]
@@ -1487,10 +1735,13 @@ mod tests {
         let req = SearchRequest {
             query: QueryClause::Fuzzy({
                 let mut m = HashMap::new();
-                m.insert("body".into(), crate::search::FuzzyParams {
-                    value: "rsut".into(),
-                    fuzziness: 0,
-                });
+                m.insert(
+                    "body".into(),
+                    crate::search::FuzzyParams {
+                        value: "rsut".into(),
+                        fuzziness: 0,
+                    },
+                );
                 m
             }),
             size: 10,
@@ -1523,9 +1774,12 @@ mod tests {
 
     // ── Field mappings tests ────────────────────────────────────────────
 
-    fn create_engine_with_mappings(mappings: HashMap<String, crate::cluster::state::FieldMapping>) -> (tempfile::TempDir, HotEngine) {
+    fn create_engine_with_mappings(
+        mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> (tempfile::TempDir, HotEngine) {
         let dir = tempfile::tempdir().unwrap();
-        let engine = HotEngine::new_with_mappings(dir.path(), Duration::from_secs(60), &mappings).unwrap();
+        let engine =
+            HotEngine::new_with_mappings(dir.path(), Duration::from_secs(60), &mappings).unwrap();
         (dir, engine)
     }
 
@@ -1533,11 +1787,21 @@ mod tests {
     fn mapped_text_field_is_searchable_by_name() {
         use crate::cluster::state::{FieldMapping, FieldType};
         let mut mappings = HashMap::new();
-        mappings.insert("title".to_string(), FieldMapping { field_type: FieldType::Text, dimension: None });
+        mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
 
         let (_dir, engine) = create_engine_with_mappings(mappings);
-        engine.add_document("d1", json!({"title": "rust programming"})).unwrap();
-        engine.add_document("d2", json!({"title": "python scripting"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust programming"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python scripting"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // Match query on "title" field should hit the named text field, not just body
@@ -1547,7 +1811,10 @@ mod tests {
                 m.insert("title".to_string(), json!("rust"));
                 m
             }),
-            size: 10, from: 0, knn: None, sort: vec![],
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
         let hits = engine.search_query(&req).unwrap();
@@ -1559,11 +1826,21 @@ mod tests {
     fn mapped_keyword_field_supports_term_query() {
         use crate::cluster::state::{FieldMapping, FieldType};
         let mut mappings = HashMap::new();
-        mappings.insert("status".to_string(), FieldMapping { field_type: FieldType::Keyword, dimension: None });
+        mappings.insert(
+            "status".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
 
         let (_dir, engine) = create_engine_with_mappings(mappings);
-        engine.add_document("d1", json!({"status": "published", "title": "a"})).unwrap();
-        engine.add_document("d2", json!({"status": "draft", "title": "b"})).unwrap();
+        engine
+            .add_document("d1", json!({"status": "published", "title": "a"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"status": "draft", "title": "b"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
@@ -1572,7 +1849,10 @@ mod tests {
                 m.insert("status".to_string(), json!("published"));
                 m
             }),
-            size: 10, from: 0, knn: None, sort: vec![],
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
         let hits = engine.search_query(&req).unwrap();
@@ -1584,24 +1864,44 @@ mod tests {
     fn mapped_integer_field_supports_range_query() {
         use crate::cluster::state::{FieldMapping, FieldType};
         let mut mappings = HashMap::new();
-        mappings.insert("year".to_string(), FieldMapping { field_type: FieldType::Integer, dimension: None });
+        mappings.insert(
+            "year".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
 
         let (_dir, engine) = create_engine_with_mappings(mappings);
-        engine.add_document("d1", json!({"title": "old", "year": 1999})).unwrap();
-        engine.add_document("d2", json!({"title": "new", "year": 2024})).unwrap();
-        engine.add_document("d3", json!({"title": "mid", "year": 2010})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "old", "year": 1999}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "new", "year": 2024}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "mid", "year": 2010}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
             query: QueryClause::Range({
                 let mut m = HashMap::new();
-                m.insert("year".to_string(), crate::search::RangeCondition {
-                    gte: Some(json!(2010)),
-                    lt: None, lte: None, gt: None,
-                });
+                m.insert(
+                    "year".to_string(),
+                    crate::search::RangeCondition {
+                        gte: Some(json!(2010)),
+                        lt: None,
+                        lte: None,
+                        gt: None,
+                    },
+                );
                 m
             }),
-            size: 10, from: 0, knn: None, sort: vec![],
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
         let hits = engine.search_query(&req).unwrap();
@@ -1615,23 +1915,41 @@ mod tests {
     fn mapped_float_field_supports_range_query() {
         use crate::cluster::state::{FieldMapping, FieldType};
         let mut mappings = HashMap::new();
-        mappings.insert("price".to_string(), FieldMapping { field_type: FieldType::Float, dimension: None });
+        mappings.insert(
+            "price".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
 
         let (_dir, engine) = create_engine_with_mappings(mappings);
-        engine.add_document("d1", json!({"title": "cheap", "price": 9.99})).unwrap();
-        engine.add_document("d2", json!({"title": "expensive", "price": 99.99})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "cheap", "price": 9.99}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "expensive", "price": 99.99}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = SearchRequest {
             query: QueryClause::Range({
                 let mut m = HashMap::new();
-                m.insert("price".to_string(), crate::search::RangeCondition {
-                    gt: Some(json!(50.0)),
-                    gte: None, lt: None, lte: None,
-                });
+                m.insert(
+                    "price".to_string(),
+                    crate::search::RangeCondition {
+                        gt: Some(json!(50.0)),
+                        gte: None,
+                        lt: None,
+                        lte: None,
+                    },
+                );
                 m
             }),
-            size: 10, from: 0, knn: None, sort: vec![],
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
         let hits = engine.search_query(&req).unwrap();
@@ -1643,21 +1961,38 @@ mod tests {
     fn unmapped_fields_still_searchable_via_body() {
         use crate::cluster::state::{FieldMapping, FieldType};
         let mut mappings = HashMap::new();
-        mappings.insert("title".to_string(), FieldMapping { field_type: FieldType::Text, dimension: None });
+        mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
 
         let (_dir, engine) = create_engine_with_mappings(mappings);
         // "description" is not mapped — should still be searchable via body catch-all
-        engine.add_document("d1", json!({"title": "test", "description": "rust programming"})).unwrap();
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "test", "description": "rust programming"}),
+            )
+            .unwrap();
         engine.refresh().unwrap();
 
         let hits = engine.search("rust").unwrap();
-        assert_eq!(hits.len(), 1, "unmapped field should be searchable via body");
+        assert_eq!(
+            hits.len(),
+            1,
+            "unmapped field should be searchable via body"
+        );
     }
 
     #[test]
     fn empty_mappings_behave_like_default_engine() {
         let (_dir, engine) = create_engine_with_mappings(HashMap::new());
-        engine.add_document("d1", json!({"title": "hello world"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "hello world"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let hits = engine.search("hello").unwrap();
@@ -1668,15 +2003,103 @@ mod tests {
     fn knn_vector_mapping_is_skipped_in_tantivy_schema() {
         use crate::cluster::state::{FieldMapping, FieldType};
         let mut mappings = HashMap::new();
-        mappings.insert("embedding".to_string(), FieldMapping { field_type: FieldType::KnnVector, dimension: Some(3) });
-        mappings.insert("title".to_string(), FieldMapping { field_type: FieldType::Text, dimension: None });
+        mappings.insert(
+            "embedding".to_string(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(3),
+            },
+        );
+        mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
 
         let (_dir, engine) = create_engine_with_mappings(mappings);
         // knn_vector should be ignored by Tantivy — no field created for it
-        engine.add_document("d1", json!({"title": "test", "embedding": [1.0, 0.0, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "test", "embedding": [1.0, 0.0, 0.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let hits = engine.search("test").unwrap();
-        assert_eq!(hits.len(), 1, "doc should be searchable despite knn_vector field");
+        assert_eq!(
+            hits.len(),
+            1,
+            "doc should be searchable despite knn_vector field"
+        );
+    }
+
+    // ── last_seq_no and flush_with_global_checkpoint ────────────────────
+
+    #[test]
+    fn last_seq_no_returns_zero_on_empty_engine() {
+        let (_dir, engine) = create_engine();
+        assert_eq!(engine.last_seq_no(), 0);
+    }
+
+    #[test]
+    fn last_seq_no_tracks_writes() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        assert_eq!(engine.last_seq_no(), 0);
+
+        engine.add_document("d2", json!({"x": 2})).unwrap();
+        assert_eq!(engine.last_seq_no(), 1);
+    }
+
+    #[test]
+    fn last_seq_no_after_bulk() {
+        let (_dir, engine) = create_engine();
+        engine
+            .bulk_add_documents(vec![
+                ("a".into(), json!({"x": 1})),
+                ("b".into(), json!({"x": 2})),
+                ("c".into(), json!({"x": 3})),
+            ])
+            .unwrap();
+        assert_eq!(engine.last_seq_no(), 2, "3 entries → seq_nos 0,1,2");
+    }
+
+    #[test]
+    fn flush_with_global_checkpoint_retains_above() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+
+        engine.add_document("d1", json!({"x": 1})).unwrap(); // seq_no=0
+        engine.add_document("d2", json!({"x": 2})).unwrap(); // seq_no=1
+        engine.add_document("d3", json!({"x": 3})).unwrap(); // seq_no=2
+
+        // Flush retaining entries above global_checkpoint=1
+        engine.flush_with_global_checkpoint(1).unwrap();
+
+        // Seq_no should be preserved
+        assert_eq!(engine.last_seq_no(), 2);
+
+        // All docs should still be searchable
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 3);
+    }
+
+    #[test]
+    fn flush_with_global_checkpoint_zero_truncates_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        engine.add_document("d2", json!({"x": 2})).unwrap();
+
+        // global_checkpoint=0 → truncate() (discard all)
+        engine.flush_with_global_checkpoint(0).unwrap();
+
+        // Seq_no preserved
+        assert_eq!(engine.last_seq_no(), 1);
+
+        // Docs still searchable (committed)
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 2);
     }
 }

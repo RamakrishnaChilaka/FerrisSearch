@@ -4,9 +4,7 @@
 //! flow: bootstrap → leader election → client_write → state machine apply.
 
 use ferrissearch::cluster::manager::ClusterManager;
-use ferrissearch::cluster::state::{
-    IndexMetadata, NodeInfo, NodeRole, ShardRoutingEntry,
-};
+use ferrissearch::cluster::state::{IndexMetadata, NodeInfo, NodeRole, ShardRoutingEntry};
 use ferrissearch::consensus;
 use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
 
@@ -29,11 +27,14 @@ fn make_node(id: &str) -> NodeInfo {
 
 fn make_index(name: &str) -> IndexMetadata {
     let mut shard_routing = HashMap::new();
-    shard_routing.insert(0, ShardRoutingEntry {
-        primary: "node-1".into(),
-        replicas: vec![],
-        unassigned_replicas: 0,
-    });
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
     IndexMetadata {
         name: name.into(),
         number_of_shards: 1,
@@ -97,8 +98,13 @@ async fn client_write_add_node() {
         .unwrap();
     wait_for_leader(&raft).await;
 
-    let cmd = ClusterCommand::AddNode { node: make_node("data-node-1") };
-    let resp = raft.client_write(cmd).await.expect("client_write should succeed");
+    let cmd = ClusterCommand::AddNode {
+        node: make_node("data-node-1"),
+    };
+    let resp = raft
+        .client_write(cmd)
+        .await
+        .expect("client_write should succeed");
 
     assert!(matches!(resp.data, ClusterResponse::Ok));
     assert!(resp.log_id.index > 0, "applied log should have index > 0");
@@ -119,17 +125,21 @@ async fn client_write_remove_node() {
     wait_for_leader(&raft).await;
 
     // Add then remove
-    raft.client_write(ClusterCommand::AddNode { node: make_node("ephemeral") })
-        .await
-        .unwrap();
+    raft.client_write(ClusterCommand::AddNode {
+        node: make_node("ephemeral"),
+    })
+    .await
+    .unwrap();
     {
         let state = state_handle.read().unwrap();
         assert!(state.nodes.contains_key("ephemeral"));
     }
 
-    raft.client_write(ClusterCommand::RemoveNode { node_id: "ephemeral".into() })
-        .await
-        .unwrap();
+    raft.client_write(ClusterCommand::RemoveNode {
+        node_id: "ephemeral".into(),
+    })
+    .await
+    .unwrap();
 
     let state = state_handle.read().unwrap();
     assert!(!state.nodes.contains_key("ephemeral"));
@@ -158,9 +168,11 @@ async fn client_write_create_and_delete_index() {
     }
 
     // Delete index
-    raft.client_write(ClusterCommand::DeleteIndex { index_name: "products".into() })
-        .await
-        .unwrap();
+    raft.client_write(ClusterCommand::DeleteIndex {
+        index_name: "products".into(),
+    })
+    .await
+    .unwrap();
 
     let state = state_handle.read().unwrap();
     assert!(!state.indices.contains_key("products"));
@@ -205,9 +217,11 @@ async fn cluster_manager_reads_raft_state() {
     let cm = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
 
     // Write via Raft
-    raft.client_write(ClusterCommand::AddNode { node: make_node("raft-node") })
-        .await
-        .unwrap();
+    raft.client_write(ClusterCommand::AddNode {
+        node: make_node("raft-node"),
+    })
+    .await
+    .unwrap();
 
     // Read via ClusterManager
     let state = cm.get_state();
@@ -227,21 +241,27 @@ async fn state_version_increments_on_writes() {
 
     let v0 = state_handle.read().unwrap().version;
 
-    raft.client_write(ClusterCommand::AddNode { node: make_node("v1") })
-        .await
-        .unwrap();
+    raft.client_write(ClusterCommand::AddNode {
+        node: make_node("v1"),
+    })
+    .await
+    .unwrap();
     let v1 = state_handle.read().unwrap().version;
     assert!(v1 > v0, "version should increase after AddNode");
 
-    raft.client_write(ClusterCommand::CreateIndex { metadata: make_index("idx") })
-        .await
-        .unwrap();
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: make_index("idx"),
+    })
+    .await
+    .unwrap();
     let v2 = state_handle.read().unwrap().version;
     assert!(v2 > v1, "version should increase after CreateIndex");
 
-    raft.client_write(ClusterCommand::DeleteIndex { index_name: "idx".into() })
-        .await
-        .unwrap();
+    raft.client_write(ClusterCommand::DeleteIndex {
+        index_name: "idx".into(),
+    })
+    .await
+    .unwrap();
     let v3 = state_handle.read().unwrap().version;
     assert!(v3 > v2, "version should increase after DeleteIndex");
 }
@@ -256,7 +276,10 @@ async fn is_leader_after_bootstrap() {
         .unwrap();
     wait_for_leader(&raft).await;
 
-    assert!(raft.is_leader(), "single-node cluster should report is_leader = true");
+    assert!(
+        raft.is_leader(),
+        "single-node cluster should report is_leader = true"
+    );
 }
 
 #[tokio::test]
@@ -294,10 +317,26 @@ async fn write_after_remove_node() {
     wait_for_leader(&raft).await;
 
     // Add two nodes, remove one, add another
-    raft.client_write(ClusterCommand::AddNode { node: make_node("a") }).await.unwrap();
-    raft.client_write(ClusterCommand::AddNode { node: make_node("b") }).await.unwrap();
-    raft.client_write(ClusterCommand::RemoveNode { node_id: "a".into() }).await.unwrap();
-    raft.client_write(ClusterCommand::AddNode { node: make_node("c") }).await.unwrap();
+    raft.client_write(ClusterCommand::AddNode {
+        node: make_node("a"),
+    })
+    .await
+    .unwrap();
+    raft.client_write(ClusterCommand::AddNode {
+        node: make_node("b"),
+    })
+    .await
+    .unwrap();
+    raft.client_write(ClusterCommand::RemoveNode {
+        node_id: "a".into(),
+    })
+    .await
+    .unwrap();
+    raft.client_write(ClusterCommand::AddNode {
+        node: make_node("c"),
+    })
+    .await
+    .unwrap();
 
     let state = state_handle.read().unwrap();
     assert!(!state.nodes.contains_key("a"));
@@ -323,9 +362,11 @@ async fn client_write_set_master() {
     }
 
     // Set master via Raft
-    raft.client_write(ClusterCommand::SetMaster { node_id: "node-1".into() })
-        .await
-        .unwrap();
+    raft.client_write(ClusterCommand::SetMaster {
+        node_id: "node-1".into(),
+    })
+    .await
+    .unwrap();
 
     let state = state_handle.read().unwrap();
     assert_eq!(state.master_node.as_deref(), Some("node-1"));
@@ -345,7 +386,9 @@ async fn raft_node_id_preserved_through_add_node() {
     let mut node = make_node("data-1");
     node.raft_node_id = 42;
 
-    raft.client_write(ClusterCommand::AddNode { node }).await.unwrap();
+    raft.client_write(ClusterCommand::AddNode { node })
+        .await
+        .unwrap();
 
     let state = state_handle.read().unwrap();
     assert_eq!(
@@ -364,17 +407,32 @@ async fn set_master_then_remove_master_node_clears_master() {
         .unwrap();
     wait_for_leader(&raft).await;
 
-    raft.client_write(ClusterCommand::AddNode { node: make_node("m") }).await.unwrap();
-    raft.client_write(ClusterCommand::SetMaster { node_id: "m".into() }).await.unwrap();
+    raft.client_write(ClusterCommand::AddNode {
+        node: make_node("m"),
+    })
+    .await
+    .unwrap();
+    raft.client_write(ClusterCommand::SetMaster {
+        node_id: "m".into(),
+    })
+    .await
+    .unwrap();
     {
         let state = state_handle.read().unwrap();
         assert_eq!(state.master_node.as_deref(), Some("m"));
     }
 
-    raft.client_write(ClusterCommand::RemoveNode { node_id: "m".into() }).await.unwrap();
+    raft.client_write(ClusterCommand::RemoveNode {
+        node_id: "m".into(),
+    })
+    .await
+    .unwrap();
 
     let state = state_handle.read().unwrap();
-    assert!(state.master_node.is_none(), "removing master node should clear master_node");
+    assert!(
+        state.master_node.is_none(),
+        "removing master node should clear master_node"
+    );
 }
 
 #[tokio::test]
@@ -409,7 +467,10 @@ async fn transfer_leader_to_self_succeeds() {
         .expect("transfer_leader to self should succeed in single-node cluster");
 
     // Node should still be leader
-    assert!(raft.is_leader(), "node should remain leader after self-transfer");
+    assert!(
+        raft.is_leader(),
+        "node should remain leader after self-transfer"
+    );
 }
 
 // ─── Shard allocator integration tests ──────────────────────────────────────
@@ -451,7 +512,11 @@ async fn update_index_via_raft_assigns_replicas() {
     // Verify via Raft state
     let state = state_handle.read().unwrap();
     let routing = &state.indices["movies"].shard_routing[&0];
-    assert_eq!(routing.replicas.len(), 2, "both replicas should be assigned");
+    assert_eq!(
+        routing.replicas.len(),
+        2,
+        "both replicas should be assigned"
+    );
     assert_eq!(routing.unassigned_replicas, 0);
     assert!(routing.replicas.contains(&"node-2".to_string()));
     assert!(routing.replicas.contains(&"node-3".to_string()));
@@ -487,7 +552,10 @@ async fn update_index_partial_allocation_two_nodes() {
     let state = state_handle.read().unwrap();
     let routing = &state.indices["products"].shard_routing[&0];
     assert_eq!(routing.replicas.len(), 1, "1 replica assigned to node-2");
-    assert_eq!(routing.unassigned_replicas, 1, "1 still unassigned (need 3rd node)");
+    assert_eq!(
+        routing.unassigned_replicas, 1,
+        "1 still unassigned (need 3rd node)"
+    );
     assert_eq!(routing.replicas[0], "node-2");
 }
 
@@ -502,12 +570,17 @@ async fn create_index_on_three_nodes_all_replicas_assigned() {
     wait_for_leader(&raft).await;
 
     // Create index with 3 nodes available → all replicas assigned immediately
-    let idx = IndexMetadata::build_shard_routing("logs", 1, 2, &["n1".into(), "n2".into(), "n3".into()]);
+    let idx =
+        IndexMetadata::build_shard_routing("logs", 1, 2, &["n1".into(), "n2".into(), "n3".into()]);
     raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
         .await
         .unwrap();
 
     let state = state_handle.read().unwrap();
-    assert_eq!(state.indices["logs"].unassigned_replica_count(), 0, "all replicas assigned on creation");
+    assert_eq!(
+        state.indices["logs"].unassigned_replica_count(),
+        0,
+        "all replicas assigned on creation"
+    );
     assert_eq!(state.indices["logs"].shard_routing[&0].replicas.len(), 2);
 }
