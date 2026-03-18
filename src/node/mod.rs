@@ -24,12 +24,12 @@ impl Node {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
         // Create Raft consensus instance — the state machine owns the
         // authoritative ClusterState, so ClusterManager shares it.
-        let (raft, state_handle) =
-            crate::consensus::create_raft_instance(
-                config.raft_node_id,
-                config.cluster_name.clone(),
-                &config.data_dir,
-            ).await?;
+        let (raft, state_handle) = crate::consensus::create_raft_instance(
+            config.raft_node_id,
+            config.cluster_name.clone(),
+            &config.data_dir,
+        )
+        .await?;
 
         let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle));
         let transport_client = TransportClient::new();
@@ -117,6 +117,7 @@ impl Node {
         let local_id = self.config.node_name.clone();
         let raft = self.raft.clone();
         let raft_node_id = self.config.raft_node_id;
+        let manager_clone = self.shard_manager.clone();
 
         tokio::spawn(async move {
             // Give servers a tiny moment to bind
@@ -132,9 +133,11 @@ impl Node {
                     info!("Raft already initialized (recovered from disk), rejoining cluster");
                 } else {
                     // Filter out seed hosts that point to ourselves
-                    let remote_seeds: Vec<String> = seed_hosts.iter()
+                    let remote_seeds: Vec<String> = seed_hosts
+                        .iter()
                         .filter(|h| {
-                            let port = h.rsplit_once(':')
+                            let port = h
+                                .rsplit_once(':')
                                 .and_then(|(_, p)| p.parse::<u16>().ok())
                                 .unwrap_or(9300);
                             port != local_node.transport_port
@@ -144,7 +147,9 @@ impl Node {
 
                     // Try to join an existing cluster (leader handles Raft membership)
                     let joined = if !remote_seeds.is_empty() {
-                        client.join_cluster(&remote_seeds, &local_node, raft_node_id).await
+                        client
+                            .join_cluster(&remote_seeds, &local_node, raft_node_id)
+                            .await
                     } else {
                         None
                     };
@@ -152,15 +157,24 @@ impl Node {
                     if joined.is_some() {
                         // Don't call update_state — Raft log replication will
                         // propagate the authoritative state to our state machine.
-                        info!("Joined existing cluster via seed hosts (Raft membership managed by leader)");
+                        info!(
+                            "Joined existing cluster via seed hosts (Raft membership managed by leader)"
+                        );
                     } else {
                         // No peers reachable — bootstrap a single-node Raft cluster
                         info!("No cluster found, bootstrapping single-node Raft cluster");
                         let transport_addr = format!("127.0.0.1:{}", local_node.transport_port);
                         if let Err(e) = crate::consensus::bootstrap_single_node(
-                            raft, raft_node_id, transport_addr,
-                        ).await {
-                            tracing::warn!("Raft bootstrap failed (may already be initialised): {}", e);
+                            raft,
+                            raft_node_id,
+                            transport_addr,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Raft bootstrap failed (may already be initialised): {}",
+                                e
+                            );
                         }
 
                         // Wait for leader election
@@ -172,10 +186,20 @@ impl Node {
                         }
 
                         // Register self and set master through Raft
-                        if let Err(e) = raft.client_write(ClusterCommand::AddNode { node: local_node.clone() }).await {
+                        if let Err(e) = raft
+                            .client_write(ClusterCommand::AddNode {
+                                node: local_node.clone(),
+                            })
+                            .await
+                        {
                             tracing::error!("Failed to register self via Raft: {}", e);
                         }
-                        if let Err(e) = raft.client_write(ClusterCommand::SetMaster { node_id: local_id.clone() }).await {
+                        if let Err(e) = raft
+                            .client_write(ClusterCommand::SetMaster {
+                                node_id: local_id.clone(),
+                            })
+                            .await
+                        {
                             tracing::error!("Failed to set master via Raft: {}", e);
                         }
                         info!("Bootstrapped as master: {}", local_id);
@@ -200,9 +224,12 @@ impl Node {
                         // ── Leader duties ──────────────────────────
                         // Ensure master_node is set to us
                         if state.master_node.as_deref() != Some(&local_id) {
-                            if let Err(e) = raft.client_write(ClusterCommand::SetMaster {
-                                node_id: local_id.clone(),
-                            }).await {
+                            if let Err(e) = raft
+                                .client_write(ClusterCommand::SetMaster {
+                                    node_id: local_id.clone(),
+                                })
+                                .await
+                            {
                                 tracing::warn!("Failed to set master: {}", e);
                             }
                         }
@@ -214,7 +241,9 @@ impl Node {
 
                         if leader_age > Duration::from_secs(20) {
                             for (node_id, last_seen) in &state.last_seen {
-                                if node_id != &local_id && now.duration_since(*last_seen) > Duration::from_secs(15) {
+                                if node_id != &local_id
+                                    && now.duration_since(*last_seen) > Duration::from_secs(15)
+                                {
                                     dead_nodes.push(node_id.clone());
                                 }
                             }
@@ -226,27 +255,43 @@ impl Node {
                             // Remove from Raft membership first
                             if let Some(dead_info) = state.nodes.get(dead) {
                                 if dead_info.raft_node_id > 0 {
-                                    let remaining: std::collections::BTreeSet<u64> = raft.voter_ids()
+                                    let remaining: std::collections::BTreeSet<u64> = raft
+                                        .voter_ids()
                                         .filter(|id| *id != dead_info.raft_node_id)
                                         .collect();
                                     if !remaining.is_empty() {
-                                        if let Err(e) = raft.change_membership(remaining, false).await {
-                                            tracing::error!("Failed to remove {} from Raft: {}", dead, e);
+                                        if let Err(e) =
+                                            raft.change_membership(remaining, false).await
+                                        {
+                                            tracing::error!(
+                                                "Failed to remove {} from Raft: {}",
+                                                dead,
+                                                e
+                                            );
                                         }
                                     }
                                 }
                             }
 
                             // Then remove from cluster state via Raft
-                            if let Err(e) = raft.client_write(ClusterCommand::RemoveNode {
-                                node_id: dead.clone(),
-                            }).await {
-                                tracing::error!("Failed to remove dead node {} via Raft: {}", dead, e);
+                            if let Err(e) = raft
+                                .client_write(ClusterCommand::RemoveNode {
+                                    node_id: dead.clone(),
+                                })
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to remove dead node {} via Raft: {}",
+                                    dead,
+                                    e
+                                );
                             }
                         }
 
                         // ── Shard allocator: assign unassigned replicas to available nodes ──
-                        let data_nodes: Vec<String> = state.nodes.values()
+                        let data_nodes: Vec<String> = state
+                            .nodes
+                            .values()
                             .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
                             .map(|n| n.id.clone())
                             .collect();
@@ -257,12 +302,19 @@ impl Node {
                                 if updated.allocate_unassigned_replicas(&data_nodes) {
                                     tracing::info!(
                                         "Allocating unassigned replicas for index '{}' ({} remaining)",
-                                        updated.name, updated.unassigned_replica_count()
+                                        updated.name,
+                                        updated.unassigned_replica_count()
                                     );
-                                    if let Err(e) = raft.client_write(ClusterCommand::UpdateIndex {
-                                        metadata: updated,
-                                    }).await {
-                                        tracing::error!("Failed to update shard routing via Raft: {}", e);
+                                    if let Err(e) = raft
+                                        .client_write(ClusterCommand::UpdateIndex {
+                                            metadata: updated,
+                                        })
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Failed to update shard routing via Raft: {}",
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -280,6 +332,65 @@ impl Node {
                                 }
                             }
                         }
+
+                        // ── Replica recovery ────────────────────────
+                        // Check if we host any replica shards that need translog-based recovery.
+                        // For each shard where we are a replica, compare our local checkpoint
+                        // against the primary and request missing operations if behind.
+                        for (_idx_name, idx_meta) in &state.indices {
+                            for (shard_id, routing) in &idx_meta.shard_routing {
+                                // Only process shards where we are a replica
+                                if !routing.replicas.contains(&local_id) {
+                                    continue;
+                                }
+                                let primary_node = match state.nodes.get(&routing.primary) {
+                                    Some(n) => n,
+                                    None => continue,
+                                };
+
+                                // Check if we have the shard open and get its checkpoint
+                                let engine =
+                                    match manager_clone.get_shard(&idx_meta.name, *shard_id) {
+                                        Some(e) => e,
+                                        None => continue, // shard not open yet
+                                    };
+
+                                let local_cp = engine.local_checkpoint();
+                                if local_cp == 0 {
+                                    // Never received any data — request full recovery
+                                    match client
+                                        .request_recovery(
+                                            primary_node,
+                                            &idx_meta.name,
+                                            *shard_id,
+                                            0,
+                                        )
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            if !result.operations.is_empty() {
+                                                apply_recovery_ops(&engine, &result.operations);
+                                                tracing::info!(
+                                                    "Replica recovery for {}/shard_{}: applied {} ops (primary at {})",
+                                                    idx_meta.name,
+                                                    shard_id,
+                                                    result.ops_replayed,
+                                                    result.primary_checkpoint
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Recovery request for {}/shard_{} failed: {}",
+                                                idx_meta.name,
+                                                shard_id,
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -288,5 +399,167 @@ impl Node {
         let _ = tokio::try_join!(http_handle, transport_handle)?;
 
         Ok(())
+    }
+}
+
+/// Apply recovered translog operations from the primary to a replica shard engine.
+fn apply_recovery_ops(
+    engine: &Arc<dyn crate::engine::SearchEngine>,
+    operations: &[crate::transport::proto::RecoverReplicaOp],
+) {
+    for op in operations {
+        match op.op.as_str() {
+            "index" => {
+                if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&op.payload_json) {
+                    if let Err(e) = engine.add_document(&op.doc_id, payload) {
+                        tracing::error!("Recovery: failed to index doc '{}': {}", op.doc_id, e);
+                    } else {
+                        engine.update_local_checkpoint(op.seq_no);
+                    }
+                }
+            }
+            "delete" => {
+                if let Err(e) = engine.delete_document(&op.doc_id) {
+                    tracing::error!("Recovery: failed to delete doc '{}': {}", op.doc_id, e);
+                } else {
+                    engine.update_local_checkpoint(op.seq_no);
+                }
+            }
+            other => {
+                tracing::warn!("Recovery: unknown op type '{}'", other);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::CompositeEngine;
+    use crate::transport::proto::RecoverReplicaOp;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn make_engine() -> (tempfile::TempDir, Arc<dyn crate::engine::SearchEngine>) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        (dir, Arc::new(engine))
+    }
+
+    #[test]
+    fn apply_recovery_ops_indexes_documents() {
+        let (_dir, engine) = make_engine();
+        let ops = vec![
+            RecoverReplicaOp {
+                seq_no: 0,
+                op: "index".into(),
+                doc_id: "r1".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"x": 1})).unwrap(),
+            },
+            RecoverReplicaOp {
+                seq_no: 1,
+                op: "index".into(),
+                doc_id: "r2".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"x": 2})).unwrap(),
+            },
+        ];
+
+        apply_recovery_ops(&engine, &ops);
+
+        engine.refresh().unwrap();
+        assert!(engine.get_document("r1").unwrap().is_some());
+        assert!(engine.get_document("r2").unwrap().is_some());
+        assert!(engine.local_checkpoint() >= 1);
+    }
+
+    #[test]
+    fn apply_recovery_ops_deletes_documents() {
+        let (_dir, engine) = make_engine();
+        engine
+            .add_document("d1", serde_json::json!({"x": 1}))
+            .unwrap();
+        engine.refresh().unwrap();
+        assert!(engine.get_document("d1").unwrap().is_some());
+
+        let ops = vec![RecoverReplicaOp {
+            seq_no: 5,
+            op: "delete".into(),
+            doc_id: "d1".into(),
+            payload_json: vec![],
+        }];
+
+        apply_recovery_ops(&engine, &ops);
+
+        engine.refresh().unwrap();
+        assert!(
+            engine.get_document("d1").unwrap().is_none(),
+            "document should be deleted"
+        );
+        assert!(engine.local_checkpoint() >= 5);
+    }
+
+    #[test]
+    fn apply_recovery_ops_skips_unknown_ops() {
+        let (_dir, engine) = make_engine();
+        let cp_before = engine.local_checkpoint();
+
+        let ops = vec![RecoverReplicaOp {
+            seq_no: 10,
+            op: "unknown_op".into(),
+            doc_id: "x".into(),
+            payload_json: vec![],
+        }];
+
+        apply_recovery_ops(&engine, &ops);
+
+        // Checkpoint should not change for unknown ops
+        assert_eq!(engine.local_checkpoint(), cp_before);
+    }
+
+    #[test]
+    fn apply_recovery_ops_empty_is_noop() {
+        let (_dir, engine) = make_engine();
+        let cp_before = engine.local_checkpoint();
+        apply_recovery_ops(&engine, &[]);
+        assert_eq!(engine.local_checkpoint(), cp_before);
+    }
+
+    #[test]
+    fn apply_recovery_ops_mixed_index_and_delete() {
+        let (_dir, engine) = make_engine();
+
+        let ops = vec![
+            RecoverReplicaOp {
+                seq_no: 0,
+                op: "index".into(),
+                doc_id: "m1".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"v": 1})).unwrap(),
+            },
+            RecoverReplicaOp {
+                seq_no: 1,
+                op: "index".into(),
+                doc_id: "m2".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"v": 2})).unwrap(),
+            },
+            RecoverReplicaOp {
+                seq_no: 2,
+                op: "delete".into(),
+                doc_id: "m1".into(),
+                payload_json: vec![],
+            },
+        ];
+
+        apply_recovery_ops(&engine, &ops);
+
+        engine.refresh().unwrap();
+        assert!(
+            engine.get_document("m1").unwrap().is_none(),
+            "m1 should be deleted"
+        );
+        assert!(
+            engine.get_document("m2").unwrap().is_some(),
+            "m2 should exist"
+        );
+        assert!(engine.local_checkpoint() >= 2);
     }
 }

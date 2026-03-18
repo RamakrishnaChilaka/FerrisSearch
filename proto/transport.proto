@@ -152,6 +152,31 @@ message ReplicateBulkRequest {
 message ReplicateBulkResponse {
     bool success = 1;
     string error = 2;
+    uint64 local_checkpoint = 3;  // replica's highest contiguous seq_no after bulk apply
+}
+
+// ─── Replica Recovery ───────────────────────────────────────────────────────
+
+message RecoverReplicaRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    uint64 local_checkpoint = 3;  // replica's highest seq_no — primary replays from here
+}
+
+message RecoverReplicaResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 ops_replayed = 3;      // number of operations sent to the replica
+    uint64 primary_checkpoint = 4; // primary's current seq_no after replay
+    repeated RecoverReplicaOp operations = 5; // the actual translog entries for replay
+}
+
+// A single operation in a recovery response (matches translog entry).
+message RecoverReplicaOp {
+    uint64 seq_no = 1;
+    string op = 2;           // "index" or "delete"
+    string doc_id = 3;
+    bytes payload_json = 4;  // document body
 }
 
 // ─── Raft Consensus ─────────────────────────────────────────────────────────
@@ -189,6 +214,9 @@ service InternalTransport {
     // Primary-to-replica replication
     rpc ReplicateDoc(ReplicateDocRequest) returns (ReplicateDocResponse);
     rpc ReplicateBulk(ReplicateBulkRequest) returns (ReplicateBulkResponse);
+
+    // Replica recovery: replica sends its checkpoint, primary replays translog
+    rpc RecoverReplica(RecoverReplicaRequest) returns (RecoverReplicaResponse);
 
     // Raft consensus RPCs
     rpc RaftVote(RaftRequest) returns (RaftReply);

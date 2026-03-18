@@ -16,8 +16,13 @@ pub fn validate_index_name(name: &str) -> std::result::Result<(), &'static str> 
         return Err("Index name must not start with '.' or '_'");
     }
     // Only allow lowercase alphanumeric, hyphens, and underscores
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
-        return Err("Index name must only contain lowercase letters, digits, hyphens, or underscores");
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(
+            "Index name must only contain lowercase letters, digits, hyphens, or underscores",
+        );
     }
     Ok(())
 }

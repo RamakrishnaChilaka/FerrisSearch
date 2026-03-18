@@ -24,14 +24,18 @@ impl VectorIndex {
             dimensions,
             metric,
             quantization: ScalarKind::F32,
-            connectivity: 16,       // HNSW M parameter (edges per node)
-            expansion_add: 128,     // ef_construction
-            expansion_search: 64,   // ef_search
+            connectivity: 16,     // HNSW M parameter (edges per node)
+            expansion_add: 128,   // ef_construction
+            expansion_search: 64, // ef_search
             multi: false,
         };
         let index = usearch::Index::new(&options)
             .map_err(|e| anyhow::anyhow!("Failed to create vector index: {}", e))?;
-        Ok(Self { index, dimensions, key_to_doc_id: RwLock::new(HashMap::new()) })
+        Ok(Self {
+            index,
+            dimensions,
+            key_to_doc_id: RwLock::new(HashMap::new()),
+        })
     }
 
     /// Open or create a persistent vector index at the given path.
@@ -39,11 +43,13 @@ impl VectorIndex {
         let vi = Self::new(dimensions, metric)?;
         let path = path.as_ref();
         if path.exists() {
-            vi.index.load(path.to_str().unwrap_or(""))
+            vi.index
+                .load(path.to_str().unwrap_or(""))
                 .map_err(|e| anyhow::anyhow!("Failed to load vector index: {}", e))?;
         }
         // Reserve capacity for growth
-        vi.index.reserve(10_000)
+        vi.index
+            .reserve(10_000)
             .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {}", e))?;
         Ok(vi)
     }
@@ -71,7 +77,8 @@ impl VectorIndex {
                 vector.len()
             ));
         }
-        self.index.add(key, vector)
+        self.index
+            .add(key, vector)
             .map_err(|e| anyhow::anyhow!("Failed to add vector: {}", e))?;
         Ok(())
     }
@@ -81,7 +88,10 @@ impl VectorIndex {
     pub fn add_with_doc_id(&self, doc_id: &str, vector: &[f32]) -> Result<u64> {
         let key = crate::engine::routing::hash_string(doc_id);
         self.add(key, vector)?;
-        let mut map = self.key_to_doc_id.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .key_to_doc_id
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         map.insert(key, doc_id.to_string());
         Ok(key)
     }
@@ -94,7 +104,8 @@ impl VectorIndex {
 
     /// Remove a vector by key.
     pub fn remove(&self, key: u64) -> Result<()> {
-        self.index.remove(key)
+        self.index
+            .remove(key)
             .map_err(|e| anyhow::anyhow!("Failed to remove vector: {}", e))?;
         Ok(())
     }
@@ -109,14 +120,17 @@ impl VectorIndex {
                 query.len()
             ));
         }
-        let results = self.index.search(query, k)
+        let results = self
+            .index
+            .search(query, k)
             .map_err(|e| anyhow::anyhow!("Vector search failed: {}", e))?;
         Ok((results.keys.to_vec(), results.distances.to_vec()))
     }
 
     /// Save the index to disk.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        self.index.save(path.as_ref().to_str().unwrap_or(""))
+        self.index
+            .save(path.as_ref().to_str().unwrap_or(""))
             .map_err(|e| anyhow::anyhow!("Failed to save vector index: {}", e))?;
         Ok(())
     }
@@ -161,7 +175,12 @@ mod tests {
 
         let result = vi.add(1, &[1.0, 0.0]); // 2D instead of 3D
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("dimension mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("dimension mismatch")
+        );
 
         let result = vi.search(&[1.0, 0.0], 1); // 2D query on 3D index
         assert!(result.is_err());
@@ -237,7 +256,10 @@ mod tests {
         vi.remove(1).unwrap();
         // After removal, searching for [1,0,0] should not return key 1
         let (keys, _) = vi.search(&[1.0, 0.0, 0.0], 2).unwrap();
-        assert!(!keys.contains(&1), "removed key should not appear in results");
+        assert!(
+            !keys.contains(&1),
+            "removed key should not appear in results"
+        );
     }
 
     #[test]

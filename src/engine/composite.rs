@@ -10,9 +10,9 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use super::SearchEngine;
 use super::tantivy::HotEngine;
 use super::vector::VectorIndex;
-use super::SearchEngine;
 
 /// A composite engine that owns both a text index (Tantivy) and an optional
 /// vector index (USearch). All document operations go through here — vector
@@ -22,14 +22,19 @@ pub struct CompositeEngine {
     vector: RwLock<Option<VectorIndex>>,
     data_dir: std::path::PathBuf,
     /// Local checkpoint: highest contiguous seq_no applied to this shard copy.
-    /// Used for replication tracking and replica recovery.
     checkpoint: std::sync::atomic::AtomicU64,
+    /// Global checkpoint: min of all in-sync replica checkpoints (primary only).
+    global_cp: std::sync::atomic::AtomicU64,
 }
 
 impl CompositeEngine {
     /// Create a new composite engine at the given data directory.
     pub fn new(data_dir: impl AsRef<Path>, refresh_interval: Duration) -> Result<Self> {
-        Self::new_with_mappings(data_dir, refresh_interval, &std::collections::HashMap::new())
+        Self::new_with_mappings(
+            data_dir,
+            refresh_interval,
+            &std::collections::HashMap::new(),
+        )
     }
 
     /// Create a new composite engine with explicit field mappings.
@@ -56,6 +61,7 @@ impl CompositeEngine {
             vector: RwLock::new(vector),
             data_dir,
             checkpoint: std::sync::atomic::AtomicU64::new(0),
+            global_cp: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -103,16 +109,19 @@ impl CompositeEngine {
         if let Some(obj) = payload.as_object() {
             for (_field, value) in obj {
                 if let Some(arr) = value.as_array() {
-                    let floats: Option<Vec<f32>> = arr.iter()
-                        .map(|v| v.as_f64().map(|f| f as f32))
-                        .collect();
+                    let floats: Option<Vec<f32>> =
+                        arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
                     if let Some(vec) = floats {
                         if !vec.is_empty() {
                             if self.ensure_vector_index(vec.len()).is_ok() {
                                 let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
                                 if let Some(ref vi) = *guard {
                                     if let Err(e) = vi.add_with_doc_id(doc_id, &vec) {
-                                        tracing::warn!("Failed to index vector for doc '{}': {}", doc_id, e);
+                                        tracing::warn!(
+                                            "Failed to index vector for doc '{}': {}",
+                                            doc_id,
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -137,7 +146,9 @@ impl CompositeEngine {
     /// Called on startup to recover vectors from persisted text documents.
     pub fn rebuild_vectors(&self) -> Result<()> {
         let req = crate::search::SearchRequest {
-            query: crate::search::QueryClause::MatchAll(serde_json::Value::Object(Default::default())),
+            query: crate::search::QueryClause::MatchAll(serde_json::Value::Object(
+                Default::default(),
+            )),
             size: 100_000,
             from: 0,
             knn: None,
@@ -152,7 +163,9 @@ impl CompositeEngine {
         let mut count = 0;
         for doc in &docs {
             let doc_id = doc.get("_id").and_then(|v| v.as_str()).unwrap_or("");
-            if doc_id.is_empty() { continue; }
+            if doc_id.is_empty() {
+                continue;
+            }
             if let Some(source) = doc.get("_source") {
                 self.index_vectors(doc_id, source);
                 count += 1;
@@ -170,6 +183,7 @@ impl SearchEngine for CompositeEngine {
     fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String> {
         let id = self.text.add_document(doc_id, payload.clone())?;
         self.index_vectors(&id, &payload);
+        self.update_local_checkpoint(self.text.last_seq_no());
         Ok(id)
     }
 
@@ -180,6 +194,7 @@ impl SearchEngine for CompositeEngine {
                 self.index_vectors(id, payload);
             }
         }
+        self.update_local_checkpoint(self.text.last_seq_no());
         Ok(ids)
     }
 
@@ -191,7 +206,9 @@ impl SearchEngine for CompositeEngine {
             let _ = vi.remove(key); // ignore errors on missing keys
         }
         drop(guard);
-        self.text.delete_document(doc_id)
+        let result = self.text.delete_document(doc_id)?;
+        self.update_local_checkpoint(self.text.last_seq_no());
+        Ok(result)
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -204,6 +221,13 @@ impl SearchEngine for CompositeEngine {
 
     fn flush(&self) -> Result<()> {
         self.text.flush()?;
+        self.save_vectors()?;
+        Ok(())
+    }
+
+    fn flush_with_global_checkpoint(&self) -> Result<()> {
+        self.text
+            .flush_with_global_checkpoint(self.global_checkpoint())?;
         self.save_vectors()?;
         Ok(())
     }
@@ -256,8 +280,7 @@ impl SearchEngine for CompositeEngine {
             if hits.len() >= k {
                 break;
             }
-            let doc_id = vi.doc_id_for_key(*key)
-                .unwrap_or_else(|| key.to_string());
+            let doc_id = vi.doc_id_for_key(*key).unwrap_or_else(|| key.to_string());
 
             // Skip docs that don't pass the filter
             if let Some(ref allowed) = allowed_ids {
@@ -288,7 +311,17 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn update_local_checkpoint(&self, seq_no: u64) {
-        self.checkpoint.fetch_max(seq_no, std::sync::atomic::Ordering::Relaxed);
+        self.checkpoint
+            .fetch_max(seq_no, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn global_checkpoint(&self) -> u64 {
+        self.global_cp.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn update_global_checkpoint(&self, checkpoint: u64) {
+        self.global_cp
+            .store(checkpoint, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -314,7 +347,9 @@ mod tests {
     #[test]
     fn add_and_get_text_document() {
         let (_dir, engine) = create_engine();
-        let id = engine.add_document("d1", json!({"title": "hello world"})).unwrap();
+        let id = engine
+            .add_document("d1", json!({"title": "hello world"}))
+            .unwrap();
         assert_eq!(id, "d1");
         engine.refresh().unwrap();
 
@@ -339,8 +374,12 @@ mod tests {
     #[test]
     fn text_search_works() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search engine"})).unwrap();
-        engine.add_document("d2", json!({"title": "python web framework"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust search engine"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "python web framework"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let results = engine.search("rust").unwrap();
@@ -351,7 +390,9 @@ mod tests {
     #[test]
     fn dsl_search_works() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "hello world"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "hello world"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = crate::search::SearchRequest {
@@ -371,8 +412,15 @@ mod tests {
     #[test]
     fn add_document_with_vector_auto_indexes() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust", "embedding": [1.0, 0.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "python", "embedding": [0.0, 1.0, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust", "embedding": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "python", "embedding": [0.0, 1.0, 0.0]}),
+            )
+            .unwrap();
         engine.refresh().unwrap();
 
         // Vector index should have been created
@@ -384,22 +432,35 @@ mod tests {
     #[test]
     fn search_knn_returns_nearest_neighbors() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust", "embedding": [1.0, 0.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "python", "embedding": [0.0, 1.0, 0.0]})).unwrap();
-        engine.add_document("d3", json!({"title": "go", "embedding": [0.9, 0.1, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust", "embedding": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "python", "embedding": [0.0, 1.0, 0.0]}),
+            )
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "go", "embedding": [0.9, 0.1, 0.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let hits = engine.search_knn("embedding", &[1.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0]["_id"], "d1", "exact match should be first");
         assert_eq!(hits[1]["_id"], "d3", "close vector should be second");
-        assert!(hits[0]["_knn_distance"].as_f64().unwrap() < hits[1]["_knn_distance"].as_f64().unwrap());
+        assert!(
+            hits[0]["_knn_distance"].as_f64().unwrap() < hits[1]["_knn_distance"].as_f64().unwrap()
+        );
     }
 
     #[test]
     fn search_knn_returns_source() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust", "embedding": [1.0, 0.0, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust", "embedding": [1.0, 0.0, 0.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let hits = engine.search_knn("embedding", &[1.0, 0.0, 0.0], 1).unwrap();
@@ -412,7 +473,9 @@ mod tests {
     fn search_knn_no_vector_index_returns_empty() {
         let (_dir, engine) = create_engine();
         // Only text, no vector fields
-        engine.add_document("d1", json!({"title": "hello"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "hello"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let hits = engine.search_knn("embedding", &[1.0, 0.0, 0.0], 5).unwrap();
@@ -438,8 +501,12 @@ mod tests {
     #[test]
     fn delete_removes_from_vector_index() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "a", "embedding": [1.0, 0.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "b", "embedding": [0.0, 1.0, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "a", "embedding": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "b", "embedding": [0.0, 1.0, 0.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         engine.delete_document("d1").unwrap();
@@ -447,7 +514,10 @@ mod tests {
         // knn search should not find d1 anymore
         let hits = engine.search_knn("embedding", &[1.0, 0.0, 0.0], 5).unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
-        assert!(!ids.contains(&"d1"), "deleted doc should not appear in knn results");
+        assert!(
+            !ids.contains(&"d1"),
+            "deleted doc should not appear in knn results"
+        );
     }
 
     // ── Flush & persistence ─────────────────────────────────────────────
@@ -459,11 +529,16 @@ mod tests {
 
         {
             let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
-            engine.add_document("d1", json!({"emb": [1.0, 0.0, 0.0]})).unwrap();
+            engine
+                .add_document("d1", json!({"emb": [1.0, 0.0, 0.0]}))
+                .unwrap();
             engine.flush().unwrap();
         }
 
-        assert!(vector_path.exists(), "flush should save vectors.usearch to disk");
+        assert!(
+            vector_path.exists(),
+            "flush should save vectors.usearch to disk"
+        );
     }
 
     #[test]
@@ -473,8 +548,12 @@ mod tests {
         // Phase 1: add docs with vectors, flush text only (not vectors)
         {
             let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
-            engine.add_document("d1", json!({"title": "a", "emb": [1.0, 0.0, 0.0]})).unwrap();
-            engine.add_document("d2", json!({"title": "b", "emb": [0.0, 1.0, 0.0]})).unwrap();
+            engine
+                .add_document("d1", json!({"title": "a", "emb": [1.0, 0.0, 0.0]}))
+                .unwrap();
+            engine
+                .add_document("d2", json!({"title": "b", "emb": [0.0, 1.0, 0.0]}))
+                .unwrap();
             // Only flush text — don't save vectors
             engine.text.flush().unwrap();
         }
@@ -502,7 +581,9 @@ mod tests {
     #[test]
     fn document_without_vectors_skips_vector_indexing() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "no vectors here"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "no vectors here"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // Vector index should NOT be created
@@ -513,9 +594,15 @@ mod tests {
     #[test]
     fn mixed_docs_with_and_without_vectors() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "text only"})).unwrap();
-        engine.add_document("d2", json!({"title": "with vec", "emb": [1.0, 0.0]})).unwrap();
-        engine.add_document("d3", json!({"title": "text only too"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "text only"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "with vec", "emb": [1.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "text only too"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         assert_eq!(engine.doc_count(), 3);
@@ -529,7 +616,9 @@ mod tests {
     #[test]
     fn non_numeric_array_not_treated_as_vector() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"tags": ["rust", "search"]})).unwrap();
+        engine
+            .add_document("d1", json!({"tags": ["rust", "search"]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // String arrays should NOT create a vector index
@@ -540,7 +629,9 @@ mod tests {
     #[test]
     fn search_knn_includes_score_and_distance() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 1).unwrap();
@@ -558,9 +649,24 @@ mod tests {
     #[test]
     fn hybrid_text_and_knn_both_return_hits() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search engine", "emb": [1.0, 0.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "python web framework", "emb": [0.0, 1.0, 0.0]})).unwrap();
-        engine.add_document("d3", json!({"title": "rust compiler internals", "emb": [0.0, 0.0, 1.0]})).unwrap();
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "rust search engine", "emb": [1.0, 0.0, 0.0]}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "python web framework", "emb": [0.0, 1.0, 0.0]}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d3",
+                json!({"title": "rust compiler internals", "emb": [0.0, 0.0, 1.0]}),
+            )
+            .unwrap();
         engine.refresh().unwrap();
 
         // Text search: "rust" should match d1 and d3
@@ -590,9 +696,15 @@ mod tests {
         // Verifies that match queries on named fields fall back to the "body"
         // catch-all and still find documents (since Tantivy schema is dynamic).
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "movie one"})).unwrap();
-        engine.add_document("d2", json!({"title": "movie two"})).unwrap();
-        engine.add_document("d3", json!({"title": "book three"})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "movie one"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "movie two"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "book three"}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let req = crate::search::SearchRequest {
@@ -614,8 +726,12 @@ mod tests {
     #[test]
     fn knn_only_search_request_returns_vector_hits() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "doc A", "emb": [1.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "doc B", "emb": [0.0, 1.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "doc A", "emb": [1.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "doc B", "emb": [0.0, 1.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // kNN-only (no text query clause exercised at engine level)
@@ -629,9 +745,24 @@ mod tests {
     #[test]
     fn knn_filtered_returns_only_matching_docs() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust search", "year": "2020", "emb": [1.0, 0.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "python web", "year": "2021", "emb": [0.9, 0.1, 0.0]})).unwrap();
-        engine.add_document("d3", json!({"title": "rust compiler", "year": "2022", "emb": [0.8, 0.2, 0.0]})).unwrap();
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "rust search", "year": "2020", "emb": [1.0, 0.0, 0.0]}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "python web", "year": "2021", "emb": [0.9, 0.1, 0.0]}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d3",
+                json!({"title": "rust compiler", "year": "2022", "emb": [0.8, 0.2, 0.0]}),
+            )
+            .unwrap();
         engine.refresh().unwrap();
 
         // Without filter: k=3 should return all 3 docs
@@ -644,20 +775,31 @@ mod tests {
             m.insert("title".to_string(), json!("rust"));
             m
         });
-        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 3, Some(&filter)).unwrap();
+        let hits = engine
+            .search_knn_filtered("emb", &[1.0, 0.0, 0.0], 3, Some(&filter))
+            .unwrap();
         assert_eq!(hits.len(), 2, "filter should only return d1 and d3");
         let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d1"));
         assert!(ids.contains(&"d3"));
-        assert!(!ids.contains(&"d2"), "d2 ('python web') should be filtered out");
+        assert!(
+            !ids.contains(&"d2"),
+            "d2 ('python web') should be filtered out"
+        );
     }
 
     #[test]
     fn knn_filtered_respects_k_limit() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust a", "emb": [1.0, 0.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "rust b", "emb": [0.9, 0.1, 0.0]})).unwrap();
-        engine.add_document("d3", json!({"title": "rust c", "emb": [0.8, 0.2, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust a", "emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "rust b", "emb": [0.9, 0.1, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "rust c", "emb": [0.8, 0.2, 0.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let filter = crate::search::QueryClause::Match({
@@ -666,7 +808,9 @@ mod tests {
             m
         });
         // All 3 match the filter, but k=1 should return only the nearest
-        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 1, Some(&filter)).unwrap();
+        let hits = engine
+            .search_knn_filtered("emb", &[1.0, 0.0, 0.0], 1, Some(&filter))
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d1", "d1 should be nearest neighbor");
     }
@@ -674,20 +818,28 @@ mod tests {
     #[test]
     fn knn_filtered_none_filter_returns_all() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "a", "emb": [1.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "b", "emb": [0.0, 1.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "a", "emb": [1.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "b", "emb": [0.0, 1.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // No filter should return same as search_knn
         let hits_unfiltered = engine.search_knn("emb", &[1.0, 0.0], 2).unwrap();
-        let hits_none_filter = engine.search_knn_filtered("emb", &[1.0, 0.0], 2, None).unwrap();
+        let hits_none_filter = engine
+            .search_knn_filtered("emb", &[1.0, 0.0], 2, None)
+            .unwrap();
         assert_eq!(hits_unfiltered.len(), hits_none_filter.len());
     }
 
     #[test]
     fn knn_filtered_with_no_matches_returns_empty() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust only", "emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust only", "emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         // Filter for "python" — no docs match
@@ -696,16 +848,33 @@ mod tests {
             m.insert("title".to_string(), json!("python"));
             m
         });
-        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 5, Some(&filter)).unwrap();
+        let hits = engine
+            .search_knn_filtered("emb", &[1.0, 0.0, 0.0], 5, Some(&filter))
+            .unwrap();
         assert!(hits.is_empty(), "no docs match filter, should return empty");
     }
 
     #[test]
     fn knn_filtered_with_range_filter() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "old movie", "year": "2000", "emb": [1.0, 0.0, 0.0]})).unwrap();
-        engine.add_document("d2", json!({"title": "new movie", "year": "2025", "emb": [0.95, 0.05, 0.0]})).unwrap();
-        engine.add_document("d3", json!({"title": "mid movie", "year": "2015", "emb": [0.5, 0.5, 0.0]})).unwrap();
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "old movie", "year": "2000", "emb": [1.0, 0.0, 0.0]}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "new movie", "year": "2025", "emb": [0.95, 0.05, 0.0]}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d3",
+                json!({"title": "mid movie", "year": "2015", "emb": [0.5, 0.5, 0.0]}),
+            )
+            .unwrap();
         engine.refresh().unwrap();
 
         // Filter: match_all (should get everything — range on dynamic fields
@@ -715,7 +884,9 @@ mod tests {
             m.insert("title".to_string(), json!("new"));
             m
         });
-        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 3, Some(&filter)).unwrap();
+        let hits = engine
+            .search_knn_filtered("emb", &[1.0, 0.0, 0.0], 3, Some(&filter))
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d2");
     }
@@ -723,7 +894,9 @@ mod tests {
     #[test]
     fn knn_filtered_preserves_knn_metadata() {
         let (_dir, engine) = create_engine();
-        engine.add_document("d1", json!({"title": "rust", "emb": [1.0, 0.0, 0.0]})).unwrap();
+        engine
+            .add_document("d1", json!({"title": "rust", "emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
         engine.refresh().unwrap();
 
         let filter = crate::search::QueryClause::Match({
@@ -731,11 +904,155 @@ mod tests {
             m.insert("title".to_string(), json!("rust"));
             m
         });
-        let hits = engine.search_knn_filtered("emb", &[1.0, 0.0, 0.0], 1, Some(&filter)).unwrap();
+        let hits = engine
+            .search_knn_filtered("emb", &[1.0, 0.0, 0.0], 1, Some(&filter))
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_knn_field"], "emb");
         assert!(hits[0]["_knn_distance"].as_f64().is_some());
         assert!(hits[0]["_score"].as_f64().unwrap() > 0.0);
         assert!(hits[0]["_source"].is_object());
+    }
+
+    // ── Checkpoint tracking ─────────────────────────────────────────────
+
+    #[test]
+    fn local_checkpoint_starts_at_zero() {
+        let (_dir, engine) = create_engine();
+        assert_eq!(engine.local_checkpoint(), 0);
+    }
+
+    #[test]
+    fn update_local_checkpoint_advances() {
+        let (_dir, engine) = create_engine();
+        engine.update_local_checkpoint(5);
+        assert_eq!(engine.local_checkpoint(), 5);
+
+        // fetch_max semantics: only advances
+        engine.update_local_checkpoint(3);
+        assert_eq!(
+            engine.local_checkpoint(),
+            5,
+            "checkpoint should not go backward"
+        );
+
+        engine.update_local_checkpoint(10);
+        assert_eq!(engine.local_checkpoint(), 10);
+    }
+
+    #[test]
+    fn global_checkpoint_starts_at_zero() {
+        let (_dir, engine) = create_engine();
+        assert_eq!(engine.global_checkpoint(), 0);
+    }
+
+    #[test]
+    fn update_global_checkpoint_stores_value() {
+        let (_dir, engine) = create_engine();
+        engine.update_global_checkpoint(42);
+        assert_eq!(engine.global_checkpoint(), 42);
+    }
+
+    #[test]
+    fn flush_with_global_checkpoint_retains_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+
+        // Index 3 documents — each creates a WAL entry
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        engine.add_document("d2", json!({"x": 2})).unwrap();
+        engine.add_document("d3", json!({"x": 3})).unwrap();
+
+        // Set global checkpoint to 1 (entries 0 and 1 are safe to discard)
+        engine.update_global_checkpoint(1);
+
+        // Flush with checkpoint-aware truncation
+        engine.flush_with_global_checkpoint().unwrap();
+
+        // Verify documents are still searchable
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 3);
+    }
+
+    // ── Checkpoint auto-update on writes ────────────────────────────────
+
+    #[test]
+    fn add_document_advances_local_checkpoint() {
+        let (_dir, engine) = create_engine();
+        assert_eq!(engine.local_checkpoint(), 0);
+
+        engine.add_document("a", json!({"x": 1})).unwrap();
+        assert_eq!(engine.local_checkpoint(), 0, "first WAL entry is seq_no 0");
+
+        engine.add_document("b", json!({"x": 2})).unwrap();
+        assert_eq!(engine.local_checkpoint(), 1);
+
+        engine.add_document("c", json!({"x": 3})).unwrap();
+        assert_eq!(engine.local_checkpoint(), 2);
+    }
+
+    #[test]
+    fn bulk_add_documents_advances_local_checkpoint() {
+        let (_dir, engine) = create_engine();
+        let docs = vec![
+            ("b1".into(), json!({"x": 1})),
+            ("b2".into(), json!({"x": 2})),
+            ("b3".into(), json!({"x": 3})),
+        ];
+        engine.bulk_add_documents(docs).unwrap();
+        assert_eq!(
+            engine.local_checkpoint(),
+            2,
+            "3 docs → seq_nos 0,1,2 → checkpoint=2"
+        );
+    }
+
+    #[test]
+    fn delete_document_advances_local_checkpoint() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        let cp_after_add = engine.local_checkpoint();
+
+        engine.delete_document("d1").unwrap();
+        assert!(
+            engine.local_checkpoint() > cp_after_add,
+            "delete should advance checkpoint"
+        );
+    }
+
+    #[test]
+    fn mixed_writes_advance_checkpoint_monotonically() {
+        let (_dir, engine) = create_engine();
+
+        engine.add_document("a", json!({"v": 1})).unwrap();
+        let cp1 = engine.local_checkpoint();
+
+        engine
+            .bulk_add_documents(vec![
+                ("b".into(), json!({"v": 2})),
+                ("c".into(), json!({"v": 3})),
+            ])
+            .unwrap();
+        let cp2 = engine.local_checkpoint();
+        assert!(cp2 > cp1, "bulk after single should advance");
+
+        engine.delete_document("a").unwrap();
+        let cp3 = engine.local_checkpoint();
+        assert!(cp3 > cp2, "delete after bulk should advance");
+
+        engine.add_document("d", json!({"v": 4})).unwrap();
+        let cp4 = engine.local_checkpoint();
+        assert!(cp4 > cp3, "add after delete should advance");
+    }
+
+    #[test]
+    fn update_global_checkpoint_can_overwrite() {
+        let (_dir, engine) = create_engine();
+        engine.update_global_checkpoint(10);
+        assert_eq!(engine.global_checkpoint(), 10);
+
+        // store semantics — can go lower (advance_global_checkpoint prevents this)
+        engine.update_global_checkpoint(5);
+        assert_eq!(engine.global_checkpoint(), 5);
     }
 }

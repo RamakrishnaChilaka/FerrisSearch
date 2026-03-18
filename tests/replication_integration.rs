@@ -8,14 +8,14 @@ use ferrissearch::cluster::state::{
     IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
 };
 use ferrissearch::shard::ShardManager;
+use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
 use ferrissearch::transport::proto::{
     self, JoinRequest, PublishStateRequest, ReplicateBulkRequest, ReplicateDocRequest,
-    ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest,
-    ShardSearchDslRequest, ShardSearchRequest,
+    ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest, ShardSearchDslRequest,
+    ShardSearchRequest,
 };
 use ferrissearch::transport::server::create_transport_service;
-use ferrissearch::transport::TransportClient;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,11 +66,7 @@ fn refresh_all(sm: &ShardManager) {
 }
 
 /// Build cluster state for two-node replication tests.
-fn setup_two_node_cluster_state(
-    cm: &ClusterManager,
-    index_name: &str,
-    replica_port: u16,
-) {
+fn setup_two_node_cluster_state(cm: &ClusterManager, index_name: &str, replica_port: u16) {
     let mut cs = cm.get_state();
     cs.add_node(DomainNodeInfo {
         id: "primary-node".into(),
@@ -92,11 +88,14 @@ fn setup_two_node_cluster_state(
     });
 
     let mut shard_routing = HashMap::new();
-    shard_routing.insert(0, ShardRoutingEntry {
-        primary: "primary-node".into(),
-        replicas: vec!["replica-node".into()],
-        unassigned_replicas: 0,
-    });
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "primary-node".into(),
+            replicas: vec!["replica-node".into()],
+            unassigned_replicas: 0,
+        },
+    );
     cs.add_index(IndexMetadata {
         name: index_name.into(),
         number_of_shards: 1,
@@ -430,11 +429,14 @@ async fn publish_state_updates_cluster_and_closes_deleted_indices() {
     {
         let mut initial_state = cm.get_state();
         let mut shard_routing = HashMap::new();
-        shard_routing.insert(0, ShardRoutingEntry {
-            primary: "local".into(),
-            replicas: vec![],
-            unassigned_replicas: 0,
-        });
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "local".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
         initial_state.add_index(IndexMetadata {
             name: "old-index".into(),
             number_of_shards: 1,
@@ -477,12 +479,18 @@ async fn publish_state_updates_cluster_and_closes_deleted_indices() {
 async fn primary_write_replicates_to_replica_node() {
     let replica_dir = tempfile::tempdir().unwrap();
     let replica_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
-    let replica_sm = Arc::new(ShardManager::new(replica_dir.path(), Duration::from_secs(60)));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
     let replica_addr = start_grpc_server(replica_cm, replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
-    let primary_sm = Arc::new(ShardManager::new(primary_dir.path(), Duration::from_secs(60)));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
 
     setup_two_node_cluster_state(&primary_cm, "replicated-idx", replica_addr.port());
 
@@ -528,12 +536,18 @@ async fn primary_write_replicates_to_replica_node() {
 async fn primary_delete_replicates_to_replica_node() {
     let replica_dir = tempfile::tempdir().unwrap();
     let replica_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
-    let replica_sm = Arc::new(ShardManager::new(replica_dir.path(), Duration::from_secs(60)));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
     let replica_addr = start_grpc_server(replica_cm, replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
-    let primary_sm = Arc::new(ShardManager::new(primary_dir.path(), Duration::from_secs(60)));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
 
     setup_two_node_cluster_state(&primary_cm, "del-repl-idx", replica_addr.port());
 
@@ -582,12 +596,18 @@ async fn primary_delete_replicates_to_replica_node() {
 async fn primary_bulk_replicates_to_replica_node() {
     let replica_dir = tempfile::tempdir().unwrap();
     let replica_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
-    let replica_sm = Arc::new(ShardManager::new(replica_dir.path(), Duration::from_secs(60)));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
     let replica_addr = start_grpc_server(replica_cm, replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
-    let primary_sm = Arc::new(ShardManager::new(primary_dir.path(), Duration::from_secs(60)));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
 
     setup_two_node_cluster_state(&primary_cm, "bulk-repl-idx", replica_addr.port());
 
@@ -701,9 +721,36 @@ async fn search_shard_dsl_match_query_via_grpc() {
     let mut client = connect_client(addr).await;
 
     // Index documents
-    assert!(index_doc_with_vectors(&mut client, "dsl-idx", 0, "d1", serde_json::json!({"title": "the matrix"})).await);
-    assert!(index_doc_with_vectors(&mut client, "dsl-idx", 0, "d2", serde_json::json!({"title": "inception movie"})).await);
-    assert!(index_doc_with_vectors(&mut client, "dsl-idx", 0, "d3", serde_json::json!({"title": "the dark knight"})).await);
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "dsl-idx",
+            0,
+            "d1",
+            serde_json::json!({"title": "the matrix"})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "dsl-idx",
+            0,
+            "d2",
+            serde_json::json!({"title": "inception movie"})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "dsl-idx",
+            0,
+            "d3",
+            serde_json::json!({"title": "the dark knight"})
+        )
+        .await
+    );
     refresh_all(&sm);
 
     // DSL match query
@@ -739,7 +786,9 @@ async fn search_shard_dsl_match_all_via_grpc() {
 
     for i in 0..4 {
         let payload = serde_json::json!({"title": format!("doc-{}", i)});
-        assert!(index_doc_with_vectors(&mut client, "all-idx", 0, &format!("d{}", i), payload).await);
+        assert!(
+            index_doc_with_vectors(&mut client, "all-idx", 0, &format!("d{}", i), payload).await
+        );
     }
     refresh_all(&sm);
 
@@ -768,12 +817,36 @@ async fn search_shard_dsl_knn_only_via_grpc() {
     let mut client = connect_client(addr).await;
 
     // Index documents with vector embeddings
-    assert!(index_doc_with_vectors(&mut client, "knn-idx", 0, "d1",
-        serde_json::json!({"title": "nearest", "emb": [1.0, 0.0, 0.0]})).await);
-    assert!(index_doc_with_vectors(&mut client, "knn-idx", 0, "d2",
-        serde_json::json!({"title": "middle", "emb": [0.5, 0.5, 0.0]})).await);
-    assert!(index_doc_with_vectors(&mut client, "knn-idx", 0, "d3",
-        serde_json::json!({"title": "farthest", "emb": [0.0, 0.0, 1.0]})).await);
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "knn-idx",
+            0,
+            "d1",
+            serde_json::json!({"title": "nearest", "emb": [1.0, 0.0, 0.0]})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "knn-idx",
+            0,
+            "d2",
+            serde_json::json!({"title": "middle", "emb": [0.5, 0.5, 0.0]})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "knn-idx",
+            0,
+            "d3",
+            serde_json::json!({"title": "farthest", "emb": [0.0, 0.0, 1.0]})
+        )
+        .await
+    );
     refresh_all(&sm);
 
     // kNN-only search: closest to [1.0, 0.0, 0.0] should return d1 first
@@ -792,17 +865,27 @@ async fn search_shard_dsl_knn_only_via_grpc() {
 
     assert!(resp.success, "kNN search failed: {}", resp.error);
     // gRPC returns raw concatenated results: 3 text (match_all) + 2 kNN = 5 total
-    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+    let all_hits: Vec<serde_json::Value> = resp
+        .hits
+        .iter()
         .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
         .collect();
-    assert!(all_hits.len() >= 2, "expected at least 2 hits, got {}", all_hits.len());
+    assert!(
+        all_hits.len() >= 2,
+        "expected at least 2 hits, got {}",
+        all_hits.len()
+    );
 
     // Find the kNN hits (they have _knn_field)
-    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+    let knn_hits: Vec<&serde_json::Value> = all_hits
+        .iter()
         .filter(|h| h.get("_knn_field").is_some())
         .collect();
     assert_eq!(knn_hits.len(), 2, "expected 2 kNN hits");
-    assert_eq!(knn_hits[0]["_id"], "d1", "d1 should be nearest to query vector");
+    assert_eq!(
+        knn_hits[0]["_id"], "d1",
+        "d1 should be nearest to query vector"
+    );
 }
 
 #[tokio::test]
@@ -815,14 +898,46 @@ async fn search_shard_dsl_hybrid_text_and_knn_via_grpc() {
     let mut client = connect_client(addr).await;
 
     // Index documents with text and vector fields
-    assert!(index_doc_with_vectors(&mut client, "hybrid-idx", 0, "d1",
-        serde_json::json!({"title": "the matrix", "emb": [0.9, 0.1, 0.0]})).await);
-    assert!(index_doc_with_vectors(&mut client, "hybrid-idx", 0, "d2",
-        serde_json::json!({"title": "inception", "emb": [0.1, 0.9, 0.0]})).await);
-    assert!(index_doc_with_vectors(&mut client, "hybrid-idx", 0, "d3",
-        serde_json::json!({"title": "matrix reloaded", "emb": [0.85, 0.15, 0.0]})).await);
-    assert!(index_doc_with_vectors(&mut client, "hybrid-idx", 0, "d4",
-        serde_json::json!({"title": "dark knight", "emb": [0.0, 0.0, 1.0]})).await);
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "hybrid-idx",
+            0,
+            "d1",
+            serde_json::json!({"title": "the matrix", "emb": [0.9, 0.1, 0.0]})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "hybrid-idx",
+            0,
+            "d2",
+            serde_json::json!({"title": "inception", "emb": [0.1, 0.9, 0.0]})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "hybrid-idx",
+            0,
+            "d3",
+            serde_json::json!({"title": "matrix reloaded", "emb": [0.85, 0.15, 0.0]})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "hybrid-idx",
+            0,
+            "d4",
+            serde_json::json!({"title": "dark knight", "emb": [0.0, 0.0, 1.0]})
+        )
+        .await
+    );
     refresh_all(&sm);
 
     // Hybrid: text match "matrix" + kNN closest to [0.9, 0.1, 0.0]
@@ -842,7 +957,9 @@ async fn search_shard_dsl_hybrid_text_and_knn_via_grpc() {
 
     assert!(resp.success, "hybrid search failed: {}", resp.error);
 
-    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+    let all_hits: Vec<serde_json::Value> = resp
+        .hits
+        .iter()
         .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
         .collect();
 
@@ -850,25 +967,35 @@ async fn search_shard_dsl_hybrid_text_and_knn_via_grpc() {
     //   text hits: d1, d3 (match "matrix")
     //   kNN hits:  d1, d3, d2 (k=3, closest to [0.9, 0.1, 0.0])
     //   Total: 5 (d1 and d3 appear twice — RRF dedup happens at coordinator)
-    assert_eq!(all_hits.len(), 5, "gRPC should return 5 raw hits (2 text + 3 kNN)");
+    assert_eq!(
+        all_hits.len(),
+        5,
+        "gRPC should return 5 raw hits (2 text + 3 kNN)"
+    );
 
     // Text hits: match on "matrix" should find d1 and d3
-    let text_hits: Vec<&serde_json::Value> = all_hits.iter()
+    let text_hits: Vec<&serde_json::Value> = all_hits
+        .iter()
         .filter(|h| h.get("_knn_field").is_none())
         .collect();
     assert_eq!(text_hits.len(), 2, "expected 2 text hits for 'matrix'");
-    let text_ids: Vec<&str> = text_hits.iter()
+    let text_ids: Vec<&str> = text_hits
+        .iter()
         .map(|h| h["_id"].as_str().unwrap())
         .collect();
     assert!(text_ids.contains(&"d1"), "text hits should include d1");
     assert!(text_ids.contains(&"d3"), "text hits should include d3");
 
     // kNN hits: closest to [0.9, 0.1, 0.0] should include d1 (nearest)
-    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+    let knn_hits: Vec<&serde_json::Value> = all_hits
+        .iter()
         .filter(|h| h.get("_knn_field").is_some())
         .collect();
     assert_eq!(knn_hits.len(), 3, "expected 3 kNN hits (k=3)");
-    assert_eq!(knn_hits[0]["_id"], "d1", "d1 should be nearest vector match");
+    assert_eq!(
+        knn_hits[0]["_id"], "d1",
+        "d1 should be nearest vector match"
+    );
 }
 
 #[tokio::test]
@@ -881,8 +1008,16 @@ async fn search_shard_dsl_knn_returns_empty_when_no_vectors() {
     let mut client = connect_client(addr).await;
 
     // Index text-only documents (no vectors)
-    assert!(index_doc_with_vectors(&mut client, "novecs-idx", 0, "d1",
-        serde_json::json!({"title": "text only doc"})).await);
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "novecs-idx",
+            0,
+            "d1",
+            serde_json::json!({"title": "text only doc"})
+        )
+        .await
+    );
     refresh_all(&sm);
 
     // kNN search should still succeed but return only text results (no kNN hits)
@@ -902,13 +1037,19 @@ async fn search_shard_dsl_knn_returns_empty_when_no_vectors() {
 
     assert!(resp.success, "search should not fail: {}", resp.error);
     // Only text hits (match_all returns 1), no kNN hits
-    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+    let all_hits: Vec<serde_json::Value> = resp
+        .hits
+        .iter()
         .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
         .collect();
-    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+    let knn_hits: Vec<&serde_json::Value> = all_hits
+        .iter()
         .filter(|h| h.get("_knn_field").is_some())
         .collect();
-    assert!(knn_hits.is_empty(), "no kNN hits expected when no vectors indexed");
+    assert!(
+        knn_hits.is_empty(),
+        "no kNN hits expected when no vectors indexed"
+    );
     assert_eq!(all_hits.len(), 1, "should return 1 text hit from match_all");
 }
 
@@ -933,7 +1074,11 @@ async fn search_shard_dsl_nonexistent_shard_returns_error() {
         .into_inner();
 
     assert!(!resp.success, "should fail for nonexistent shard");
-    assert!(resp.error.contains("not found"), "error should mention shard not found: {}", resp.error);
+    assert!(
+        resp.error.contains("not found"),
+        "error should mention shard not found: {}",
+        resp.error
+    );
 }
 
 #[tokio::test]
@@ -946,12 +1091,36 @@ async fn search_shard_dsl_knn_with_filter_via_grpc() {
     let mut client = connect_client(addr).await;
 
     // Index docs with text + vectors
-    assert!(index_doc_with_vectors(&mut client, "filter-idx", 0, "d1",
-        serde_json::json!({"title": "rust search", "emb": [1.0, 0.0, 0.0]})).await);
-    assert!(index_doc_with_vectors(&mut client, "filter-idx", 0, "d2",
-        serde_json::json!({"title": "python web", "emb": [0.9, 0.1, 0.0]})).await);
-    assert!(index_doc_with_vectors(&mut client, "filter-idx", 0, "d3",
-        serde_json::json!({"title": "rust compiler", "emb": [0.8, 0.2, 0.0]})).await);
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "filter-idx",
+            0,
+            "d1",
+            serde_json::json!({"title": "rust search", "emb": [1.0, 0.0, 0.0]})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "filter-idx",
+            0,
+            "d2",
+            serde_json::json!({"title": "python web", "emb": [0.9, 0.1, 0.0]})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "filter-idx",
+            0,
+            "d3",
+            serde_json::json!({"title": "rust compiler", "emb": [0.8, 0.2, 0.0]})
+        )
+        .await
+    );
     refresh_all(&sm);
 
     // kNN search WITH filter: only "rust" docs
@@ -969,16 +1138,22 @@ async fn search_shard_dsl_knn_with_filter_via_grpc() {
         .into_inner();
 
     assert!(resp.success, "filtered kNN search failed: {}", resp.error);
-    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+    let all_hits: Vec<serde_json::Value> = resp
+        .hits
+        .iter()
         .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
         .collect();
 
     // kNN hits should only contain d1 and d3 (matching "rust"), not d2 ("python")
-    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+    let knn_hits: Vec<&serde_json::Value> = all_hits
+        .iter()
         .filter(|h| h.get("_knn_field").is_some())
         .collect();
     assert_eq!(knn_hits.len(), 2, "expected 2 filtered kNN hits (d1, d3)");
-    let ids: Vec<&str> = knn_hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+    let ids: Vec<&str> = knn_hits
+        .iter()
+        .map(|h| h["_id"].as_str().unwrap())
+        .collect();
     assert!(ids.contains(&"d1"), "d1 should pass the filter");
     assert!(ids.contains(&"d3"), "d3 should pass the filter");
     assert!(!ids.contains(&"d2"), "d2 ('python') should be filtered out");
@@ -993,8 +1168,16 @@ async fn search_shard_dsl_knn_filter_no_matches_returns_empty_knn() {
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
 
-    assert!(index_doc_with_vectors(&mut client, "nofilter-idx", 0, "d1",
-        serde_json::json!({"title": "rust only", "emb": [1.0, 0.0, 0.0]})).await);
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "nofilter-idx",
+            0,
+            "d1",
+            serde_json::json!({"title": "rust only", "emb": [1.0, 0.0, 0.0]})
+        )
+        .await
+    );
     refresh_all(&sm);
 
     // Filter for "python" — no docs match
@@ -1011,14 +1194,24 @@ async fn search_shard_dsl_knn_filter_no_matches_returns_empty_knn() {
         .unwrap()
         .into_inner();
 
-    assert!(resp.success, "should succeed even with no matches: {}", resp.error);
-    let all_hits: Vec<serde_json::Value> = resp.hits.iter()
+    assert!(
+        resp.success,
+        "should succeed even with no matches: {}",
+        resp.error
+    );
+    let all_hits: Vec<serde_json::Value> = resp
+        .hits
+        .iter()
         .filter_map(|h| serde_json::from_slice::<serde_json::Value>(&h.source_json).ok())
         .collect();
-    let knn_hits: Vec<&serde_json::Value> = all_hits.iter()
+    let knn_hits: Vec<&serde_json::Value> = all_hits
+        .iter()
         .filter(|h| h.get("_knn_field").is_some())
         .collect();
-    assert!(knn_hits.is_empty(), "no kNN hits when filter matches nothing");
+    assert!(
+        knn_hits.is_empty(),
+        "no kNN hits when filter matches nothing"
+    );
 }
 
 // ─── Update document integration tests (get + modify + re-index via gRPC) ───
@@ -1113,12 +1306,15 @@ async fn update_nonexistent_document_returns_not_found() {
 
     // Index a doc so the shard exists
     let payload = serde_json::json!({"title": "exists"});
-    client.index_doc(tonic::Request::new(ShardDocRequest {
-        index_name: "update-404-idx".into(),
-        shard_id: 0,
-        doc_id: "exists".into(),
-        payload_json: serde_json::to_vec(&payload).unwrap(),
-    })).await.unwrap();
+    client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "update-404-idx".into(),
+            shard_id: 0,
+            doc_id: "exists".into(),
+            payload_json: serde_json::to_vec(&payload).unwrap(),
+        }))
+        .await
+        .unwrap();
     refresh_all(&sm);
 
     // Try to get a nonexistent doc (simulating what update_document does)
@@ -1132,4 +1328,461 @@ async fn update_nonexistent_document_returns_not_found() {
         .unwrap()
         .into_inner();
     assert!(!resp.found, "document should not be found");
+}
+
+// ─── Recovery & Checkpoint integration tests ────────────────────────────────
+
+#[tokio::test]
+async fn replicate_doc_returns_local_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("integ-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    // First replicate — checkpoint should be 0 (or whatever the first seq_no is)
+    let payload = serde_json::json!({"title": "checkpoint test 1"});
+    let resp = client
+        .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+            index_name: "cp-idx".into(),
+            shard_id: 0,
+            doc_id: "cp-1".into(),
+            payload_json: serde_json::to_vec(&payload).unwrap(),
+            op: "index".into(),
+            seq_no: 5,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success);
+    assert_eq!(
+        resp.local_checkpoint, 5,
+        "local checkpoint should match the seq_no we sent"
+    );
+
+    // Second replicate with higher seq_no
+    let payload2 = serde_json::json!({"title": "checkpoint test 2"});
+    let resp2 = client
+        .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+            index_name: "cp-idx".into(),
+            shard_id: 0,
+            doc_id: "cp-2".into(),
+            payload_json: serde_json::to_vec(&payload2).unwrap(),
+            op: "index".into(),
+            seq_no: 10,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp2.success);
+    assert_eq!(
+        resp2.local_checkpoint, 10,
+        "checkpoint should advance to 10"
+    );
+}
+
+#[tokio::test]
+async fn replicate_bulk_returns_local_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("integ-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let ops: Vec<ReplicateDocRequest> = (0..3)
+        .map(|i| ReplicateDocRequest {
+            index_name: String::new(),
+            shard_id: 0,
+            doc_id: format!("bulk-cp-{}", i),
+            payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
+            op: "index".into(),
+            seq_no: 100 + i as u64,
+        })
+        .collect();
+
+    let resp = client
+        .replicate_bulk(tonic::Request::new(proto::ReplicateBulkRequest {
+            index_name: "bulk-cp-idx".into(),
+            shard_id: 0,
+            ops,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success);
+    assert_eq!(
+        resp.local_checkpoint, 102,
+        "checkpoint should equal highest seq_no in batch"
+    );
+}
+
+#[tokio::test]
+async fn primary_write_advances_global_checkpoint() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("gc-cluster".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_grpc_server(replica_cm, replica_sm.clone()).await;
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("gc-cluster".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+
+    setup_two_node_cluster_state(&primary_cm, "gc-idx", replica_addr.port());
+
+    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let mut client = connect_client(primary_addr).await;
+
+    // Write 3 documents — replication succeeds, global checkpoint should advance
+    for i in 0..3 {
+        let payload = serde_json::json!({"msg": format!("gc-doc-{}", i)});
+        let resp = client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "gc-idx".into(),
+                shard_id: 0,
+                doc_id: format!("gc-{}", i),
+                payload_json: serde_json::to_vec(&payload).unwrap(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success, "index_doc failed: {}", resp.error);
+    }
+
+    // After successful replication, primary's global checkpoint should be > 0
+    let primary_engine = primary_sm.get_shard("gc-idx", 0).unwrap();
+    let global_cp = primary_engine.global_checkpoint();
+    assert!(
+        global_cp > 0,
+        "global checkpoint should advance after successful replication, got {}",
+        global_cp
+    );
+
+    // And the ISR tracker should know about the replica
+    let isr =
+        primary_sm
+            .isr_tracker
+            .in_sync_replicas("gc-idx", 0, primary_engine.local_checkpoint());
+    assert!(!isr.is_empty(), "ISR should contain the replica node");
+}
+
+#[tokio::test]
+async fn recover_replica_returns_translog_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("recovery-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index some documents to build up the translog
+    for i in 0..5 {
+        let payload = serde_json::json!({"data": format!("doc-{}", i)});
+        let resp = client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "recover-idx".into(),
+                shard_id: 0,
+                doc_id: format!("rec-{}", i),
+                payload_json: serde_json::to_vec(&payload).unwrap(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+    }
+
+    // Request recovery from checkpoint 2 — should get entries 3 and 4
+    let resp = client
+        .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
+            index_name: "recover-idx".into(),
+            shard_id: 0,
+            local_checkpoint: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "recovery should succeed: {}", resp.error);
+    assert_eq!(
+        resp.ops_replayed, 2,
+        "should have 2 entries above checkpoint 2"
+    );
+    assert_eq!(resp.operations.len(), 2, "should return 2 operations");
+
+    // Verify the operations have correct seq_nos
+    assert_eq!(resp.operations[0].seq_no, 3);
+    assert_eq!(resp.operations[1].seq_no, 4);
+    assert_eq!(resp.operations[0].op, "index");
+}
+
+#[tokio::test]
+async fn recover_replica_returns_empty_when_caught_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("recovery-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    // Index 2 docs
+    for i in 0..2 {
+        let payload = serde_json::json!({"data": i});
+        client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "caught-up-idx".into(),
+                shard_id: 0,
+                doc_id: format!("cu-{}", i),
+                payload_json: serde_json::to_vec(&payload).unwrap(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    // Request recovery from checkpoint 100 — should get 0 entries
+    let resp = client
+        .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
+            index_name: "caught-up-idx".into(),
+            shard_id: 0,
+            local_checkpoint: 100,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success);
+    assert_eq!(resp.ops_replayed, 0);
+    assert!(resp.operations.is_empty());
+}
+
+// ─── Checkpoint + ISR integration tests ────────────────────────────────────
+
+#[tokio::test]
+async fn bulk_replication_advances_global_checkpoint() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("bulk-gc".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_grpc_server(replica_cm, replica_sm).await;
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("bulk-gc".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    setup_two_node_cluster_state(&primary_cm, "bgc-idx", replica_addr.port());
+
+    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let mut client = connect_client(primary_addr).await;
+
+    // Bulk index 5 docs
+    let documents_json: Vec<Vec<u8>> = (0..5)
+        .map(|i| {
+            let payload =
+                serde_json::json!({"_id": format!("b-{}", i), "msg": format!("bulk-{}", i)});
+            serde_json::to_vec(&payload).unwrap()
+        })
+        .collect();
+
+    let resp = client
+        .bulk_index(tonic::Request::new(proto::ShardBulkRequest {
+            index_name: "bgc-idx".into(),
+            shard_id: 0,
+            documents_json,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success, "bulk index failed: {}", resp.error);
+
+    let engine = primary_sm.get_shard("bgc-idx", 0).unwrap();
+    assert!(
+        engine.global_checkpoint() > 0,
+        "global checkpoint should advance after bulk replication, got {}",
+        engine.global_checkpoint()
+    );
+    assert!(
+        engine.local_checkpoint() > 0,
+        "local checkpoint should be set after bulk write"
+    );
+}
+
+#[tokio::test]
+async fn delete_replication_advances_global_checkpoint() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("del-gc".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_grpc_server(replica_cm, replica_sm).await;
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("del-gc".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    setup_two_node_cluster_state(&primary_cm, "dgc-idx", replica_addr.port());
+
+    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let mut client = connect_client(primary_addr).await;
+
+    // Index a doc first
+    let payload = serde_json::json!({"msg": "to-delete"});
+    client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "dgc-idx".into(),
+            shard_id: 0,
+            doc_id: "del-1".into(),
+            payload_json: serde_json::to_vec(&payload).unwrap(),
+        }))
+        .await
+        .unwrap();
+
+    let cp_after_index = primary_sm
+        .get_shard("dgc-idx", 0)
+        .unwrap()
+        .global_checkpoint();
+
+    // Delete the doc
+    let resp = client
+        .delete_doc(tonic::Request::new(proto::ShardDeleteRequest {
+            index_name: "dgc-idx".into(),
+            shard_id: 0,
+            doc_id: "del-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success);
+
+    let cp_after_delete = primary_sm
+        .get_shard("dgc-idx", 0)
+        .unwrap()
+        .global_checkpoint();
+    assert!(
+        cp_after_delete > cp_after_index,
+        "global checkpoint should advance after delete replication: {} > {}",
+        cp_after_delete,
+        cp_after_index
+    );
+}
+
+#[tokio::test]
+async fn isr_tracker_updated_after_replication() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("isr-it".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_grpc_server(replica_cm, replica_sm).await;
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("isr-it".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    setup_two_node_cluster_state(&primary_cm, "isr-idx", replica_addr.port());
+
+    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let mut client = connect_client(primary_addr).await;
+
+    // Index docs to trigger replication → ISR update
+    for i in 0..3 {
+        let payload = serde_json::json!({"data": i});
+        client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "isr-idx".into(),
+                shard_id: 0,
+                doc_id: format!("isr-{}", i),
+                payload_json: serde_json::to_vec(&payload).unwrap(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    // ISR tracker should have the replica checkpoint
+    let engine = primary_sm.get_shard("isr-idx", 0).unwrap();
+    let isr = primary_sm
+        .isr_tracker
+        .in_sync_replicas("isr-idx", 0, engine.local_checkpoint());
+    assert!(
+        !isr.is_empty(),
+        "ISR should contain the replica after successful replication"
+    );
+
+    // Replica checkpoints should be tracked
+    let cps = primary_sm.isr_tracker.replica_checkpoints("isr-idx", 0);
+    assert!(!cps.is_empty(), "replica checkpoints should be recorded");
+}
+
+#[tokio::test]
+async fn recover_replica_ops_have_correct_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("op-fields".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    // Index a doc, then delete it
+    let payload = serde_json::json!({"title": "recover-test"});
+    client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "opf-idx".into(),
+            shard_id: 0,
+            doc_id: "opf-1".into(),
+            payload_json: serde_json::to_vec(&payload).unwrap(),
+        }))
+        .await
+        .unwrap();
+
+    client
+        .delete_doc(tonic::Request::new(proto::ShardDeleteRequest {
+            index_name: "opf-idx".into(),
+            shard_id: 0,
+            doc_id: "opf-1".into(),
+        }))
+        .await
+        .unwrap();
+
+    // Recover from seq_no 0 — should get both index and delete ops
+    let resp = client
+        .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
+            index_name: "opf-idx".into(),
+            shard_id: 0,
+            local_checkpoint: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success);
+    assert!(!resp.operations.is_empty(), "should have recovery ops");
+
+    // Verify each op has required fields
+    for op in &resp.operations {
+        assert!(op.seq_no <= 10, "seq_no should be reasonable");
+        assert!(
+            op.op == "index" || op.op == "delete",
+            "op should be index or delete, got: {}",
+            op.op
+        );
+        assert!(!op.doc_id.is_empty(), "doc_id should not be empty");
+    }
 }

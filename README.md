@@ -27,7 +27,7 @@ FerrisSearch is a lightweight, Rust-native search engine with OpenSearch-compati
 - **Distributed clustering** — multi-node clusters with shard-based data distribution
 - **Synchronous replication** — primary-replica replication over gRPC; writes acknowledged only after all in-sync replicas confirm
 - **Scatter-gather search** — queries fan out across shards, results merged and returned
-- **Crash recovery** — binary write-ahead log (WAL) with fsync-on-write durability
+- **Crash recovery** — binary write-ahead log (WAL) with fsync-on-write durability; sequence number checkpointing and translog-based replica recovery
 - **Zero external dependencies** — no JVM, no Zookeeper, just a single binary
 
 ## Getting Started
@@ -357,21 +357,24 @@ All cluster metadata — node membership, index definitions, shard assignments, 
 5. Dead nodes are detected after 15s of missed heartbeats and removed from the cluster
 
 ### Document data (gRPC replication)
-Document writes use direct primary-to-replica replication:
+Document writes use direct primary-to-replica replication with sequence number tracking:
 
-1. Client writes to the primary shard
-2. Primary persists to its engine and WAL
-3. Primary forwards the operation to all in-sync replicas via gRPC
-4. Write is acknowledged only after all replicas confirm
-5. Replica shards are lazily initialized on first replication request
+1. Client writes to the primary shard; WAL assigns a monotonic seq_no
+2. Primary persists to its engine and WAL, updating its local checkpoint
+3. Primary forwards the operation (with seq_no) to all in-sync replicas via gRPC
+4. Each replica applies the write, updates its local checkpoint, and returns it
+5. Primary computes the global checkpoint (min of all checkpoints) and advances it
+6. Write is acknowledged to the client after all replicas confirm
+7. On flush, translog entries above the global checkpoint are retained for recovery
+8. A recovering replica requests missing ops from the primary's translog and replays them
 
 ## Testing
 
 ```bash
-cargo test                                      # All 307 tests
-cargo test --lib                                # Unit tests (207)
-cargo test --test consensus_integration          # Raft consensus tests (15)
-cargo test --test replication_integration        # Replication tests (11)
+cargo test                                      # All 383 tests
+cargo test --lib                                # Unit tests (334)
+cargo test --test consensus_integration          # Raft consensus tests (18)
+cargo test --test replication_integration        # Replication tests (31)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.
@@ -440,9 +443,10 @@ config/            Default configuration
 - [x] Persistent Raft log (disk-backed storage)
 
 ### Replication & Recovery
-- [ ] Replica recovery (catch-up from primary after downtime)
-- [ ] Sequence number checkpointing
-- [ ] In-sync replica set (ISR) tracking
+- [x] Sequence number checkpointing (local + global checkpoints)
+- [x] In-sync replica set (ISR) tracking
+- [x] Replica recovery (catch-up from primary via translog replay)
+- [x] Translog retention above global checkpoint for recovery
 - [ ] Segment-level replication (ship segment files instead of individual docs)
 - [ ] Slow replica detection and backpressure
 
@@ -457,7 +461,7 @@ config/            Default configuration
 - [ ] Snapshot and restore
 - [ ] Remote storage backends (S3, GCS, Azure Blob)
 - [ ] Tiered storage (hot/warm/cold)
-- [ ] Translog retention policies (size and time-based)
+- [x] Translog retention policies (checkpoint-based)
 - [ ] Rolling translog segments
 
 ### Observability

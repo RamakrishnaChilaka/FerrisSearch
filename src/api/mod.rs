@@ -11,12 +11,12 @@ use crate::consensus::types::RaftInstance;
 use crate::shard::ShardManager;
 use crate::transport::TransportClient;
 use axum::{
+    Json, Router,
     body::Body,
-    http::{header, Request, StatusCode},
+    http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -53,10 +53,13 @@ pub fn error_response(
     error_type: &str,
     reason: impl std::fmt::Display,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    (status, Json(serde_json::json!({
-        "error": { "type": error_type, "reason": reason.to_string() },
-        "status": status.as_u16()
-    })))
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "type": error_type, "reason": reason.to_string() },
+            "status": status.as_u16()
+        })),
+    )
 }
 
 /// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.
@@ -75,7 +78,8 @@ async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
     }
 
     // Only reformat if the response content-type is JSON
-    let is_json = response.headers()
+    let is_json = response
+        .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map_or(false, |ct| ct.contains("application/json"));

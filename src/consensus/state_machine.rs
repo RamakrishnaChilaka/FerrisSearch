@@ -59,7 +59,9 @@ impl ClusterStateMachine {
                 state.version += 1;
             }
             ClusterCommand::UpdateIndex { metadata } => {
-                state.indices.insert(metadata.name.clone(), metadata.clone());
+                state
+                    .indices
+                    .insert(metadata.name.clone(), metadata.clone());
                 state.version += 1;
             }
         }
@@ -75,8 +77,12 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
 
     async fn apply<Strm>(&mut self, entries: Strm) -> Result<(), io::Error>
     where
-        Strm: futures::Stream<Item = Result<(Entry, Option<openraft::storage::ApplyResponder<TypeConfig>>), io::Error>>
-            + Unpin
+        Strm: futures::Stream<
+                Item = Result<
+                    (Entry, Option<openraft::storage::ApplyResponder<TypeConfig>>),
+                    io::Error,
+                >,
+            > + Unpin
             + OptionalSend,
     {
         use futures::StreamExt;
@@ -95,8 +101,7 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
                     ClusterResponse::Ok
                 }
                 EntryPayload::Membership(ref mem) => {
-                    self.last_membership =
-                        StoredMembership::new(Some(entry.log_id), mem.clone());
+                    self.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
                     ClusterResponse::Ok
                 }
             };
@@ -144,13 +149,10 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, io::Error> {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let data = serde_json::to_vec(&state)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data =
+            serde_json::to_vec(&state).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        let snapshot_id = format!(
-            "snap-{}",
-            self.last_applied.map(|l| l.index).unwrap_or(0)
-        );
+        let snapshot_id = format!("snap-{}", self.last_applied.map(|l| l.index).unwrap_or(0));
 
         let meta = SnapshotMeta {
             last_log_id: self.last_applied,
@@ -175,13 +177,10 @@ pub struct ClusterSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for ClusterSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot, io::Error> {
-        let data = serde_json::to_vec(&self.state)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data =
+            serde_json::to_vec(&self.state).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        let snapshot_id = format!(
-            "snap-{}",
-            self.last_applied.map(|l| l.index).unwrap_or(0)
-        );
+        let snapshot_id = format!("snap-{}", self.last_applied.map(|l| l.index).unwrap_or(0));
 
         let meta = SnapshotMeta {
             last_log_id: self.last_applied,
@@ -199,7 +198,7 @@ impl RaftSnapshotBuilder<TypeConfig> for ClusterSnapshotBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::state::{NodeInfo, NodeRole, IndexMetadata, ShardRoutingEntry};
+    use crate::cluster::state::{IndexMetadata, NodeInfo, NodeRole, ShardRoutingEntry};
     use std::collections::HashMap;
 
     fn make_node(id: &str) -> NodeInfo {
@@ -216,11 +215,14 @@ mod tests {
 
     fn make_index(name: &str) -> IndexMetadata {
         let mut shard_routing = HashMap::new();
-        shard_routing.insert(0, ShardRoutingEntry {
-            primary: "node-1".into(),
-            replicas: vec![],
-            unassigned_replicas: 0,
-        });
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
         IndexMetadata {
             name: name.into(),
             number_of_shards: 1,
@@ -266,8 +268,12 @@ mod tests {
     #[test]
     fn apply_remove_node_command() {
         let sm = ClusterStateMachine::new("test".into());
-        sm.apply_command(&ClusterCommand::AddNode { node: make_node("n1") });
-        sm.apply_command(&ClusterCommand::RemoveNode { node_id: "n1".into() });
+        sm.apply_command(&ClusterCommand::AddNode {
+            node: make_node("n1"),
+        });
+        sm.apply_command(&ClusterCommand::RemoveNode {
+            node_id: "n1".into(),
+        });
 
         let handle = sm.state_handle();
         let state = handle.read().unwrap();
@@ -289,8 +295,12 @@ mod tests {
     #[test]
     fn apply_delete_index_command() {
         let sm = ClusterStateMachine::new("test".into());
-        sm.apply_command(&ClusterCommand::CreateIndex { metadata: make_index("idx") });
-        sm.apply_command(&ClusterCommand::DeleteIndex { index_name: "idx".into() });
+        sm.apply_command(&ClusterCommand::CreateIndex {
+            metadata: make_index("idx"),
+        });
+        sm.apply_command(&ClusterCommand::DeleteIndex {
+            index_name: "idx".into(),
+        });
 
         let handle = sm.state_handle();
         let state = handle.read().unwrap();
@@ -303,7 +313,9 @@ mod tests {
         // Create index with unassigned replicas
         let mut idx = IndexMetadata::build_shard_routing("products", 1, 2, &["node-1".into()]);
         assert_eq!(idx.unassigned_replica_count(), 2);
-        sm.apply_command(&ClusterCommand::CreateIndex { metadata: idx.clone() });
+        sm.apply_command(&ClusterCommand::CreateIndex {
+            metadata: idx.clone(),
+        });
 
         // Simulate allocator: assign replicas
         idx.allocate_unassigned_replicas(&["node-1".into(), "node-2".into(), "node-3".into()]);
@@ -322,18 +334,27 @@ mod tests {
     #[test]
     fn update_index_preserves_other_indices() {
         let sm = ClusterStateMachine::new("test".into());
-        sm.apply_command(&ClusterCommand::CreateIndex { metadata: make_index("idx-a") });
-        sm.apply_command(&ClusterCommand::CreateIndex { metadata: make_index("idx-b") });
+        sm.apply_command(&ClusterCommand::CreateIndex {
+            metadata: make_index("idx-a"),
+        });
+        sm.apply_command(&ClusterCommand::CreateIndex {
+            metadata: make_index("idx-b"),
+        });
 
         // Update only idx-a
         let mut updated_a = make_index("idx-a");
         updated_a.number_of_replicas = 99;
-        sm.apply_command(&ClusterCommand::UpdateIndex { metadata: updated_a });
+        sm.apply_command(&ClusterCommand::UpdateIndex {
+            metadata: updated_a,
+        });
 
         let handle = sm.state_handle();
         let state = handle.read().unwrap();
         assert_eq!(state.indices["idx-a"].number_of_replicas, 99);
-        assert_eq!(state.indices["idx-b"].number_of_replicas, 0, "idx-b should be untouched");
+        assert_eq!(
+            state.indices["idx-b"].number_of_replicas, 0,
+            "idx-b should be untouched"
+        );
     }
 
     #[test]
@@ -355,8 +376,12 @@ mod tests {
             let mut sm = ClusterStateMachine::new("snap-test".into());
 
             // Add some state
-            sm.apply_command(&ClusterCommand::AddNode { node: make_node("n1") });
-            sm.apply_command(&ClusterCommand::CreateIndex { metadata: make_index("idx1") });
+            sm.apply_command(&ClusterCommand::AddNode {
+                node: make_node("n1"),
+            });
+            sm.apply_command(&ClusterCommand::CreateIndex {
+                metadata: make_index("idx1"),
+            });
 
             // Get snapshot
             let snap = sm.get_current_snapshot().await.unwrap().unwrap();
@@ -376,7 +401,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut sm = ClusterStateMachine::new("original".into());
-            sm.apply_command(&ClusterCommand::AddNode { node: make_node("old") });
+            sm.apply_command(&ClusterCommand::AddNode {
+                node: make_node("old"),
+            });
 
             // Build snapshot data from a different state
             let mut new_state = ClusterState::new("replaced".into());
@@ -389,7 +416,9 @@ mod tests {
                 snapshot_id: "snap-install".into(),
             };
 
-            sm.install_snapshot(&meta, Cursor::new(snap_data)).await.unwrap();
+            sm.install_snapshot(&meta, Cursor::new(snap_data))
+                .await
+                .unwrap();
 
             let handle = sm.state_handle();
             let state = handle.read().unwrap();
@@ -404,7 +433,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut sm = ClusterStateMachine::new("builder-test".into());
-            sm.apply_command(&ClusterCommand::AddNode { node: make_node("b1") });
+            sm.apply_command(&ClusterCommand::AddNode {
+                node: make_node("b1"),
+            });
 
             let mut builder = sm.get_snapshot_builder().await;
             let snap = builder.build_snapshot().await.unwrap();
@@ -415,4 +446,3 @@ mod tests {
         });
     }
 }
-

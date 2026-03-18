@@ -24,7 +24,8 @@ pub type Entry = openraft::type_config::alias::EntryOf<TypeConfig>;
 pub type Vote = openraft::type_config::alias::VoteOf<TypeConfig>;
 
 /// The concrete Raft instance type for this application.
-pub type RaftInstance = openraft::Raft<TypeConfig, crate::consensus::state_machine::ClusterStateMachine>;
+pub type RaftInstance =
+    openraft::Raft<TypeConfig, crate::consensus::state_machine::ClusterStateMachine>;
 
 // ─── Commands (log entries applied to the state machine) ─────────────────────
 
@@ -32,40 +33,36 @@ pub type RaftInstance = openraft::Raft<TypeConfig, crate::consensus::state_machi
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterCommand {
     /// Register a new node in the cluster.
-    AddNode {
-        node: NodeInfo,
-    },
+    AddNode { node: NodeInfo },
     /// Remove a node from the cluster.
-    RemoveNode {
-        node_id: String,
-    },
+    RemoveNode { node_id: String },
     /// Create a new index with shard routing.
-    CreateIndex {
-        metadata: IndexMetadata,
-    },
+    CreateIndex { metadata: IndexMetadata },
     /// Delete an index.
-    DeleteIndex {
-        index_name: String,
-    },
+    DeleteIndex { index_name: String },
     /// Set the current cluster master (Raft leader).
-    SetMaster {
-        node_id: String,
-    },
+    SetMaster { node_id: String },
     /// Update an existing index's metadata (e.g. shard routing after replica allocation).
-    UpdateIndex {
-        metadata: IndexMetadata,
-    },
+    UpdateIndex { metadata: IndexMetadata },
 }
 
 impl std::fmt::Display for ClusterCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClusterCommand::AddNode { node } => write!(f, "AddNode({})", node.id),
-            ClusterCommand::RemoveNode { node_id } => write!(f, "RemoveNode({})", node_id),
-            ClusterCommand::CreateIndex { metadata } => write!(f, "CreateIndex({})", metadata.name),
-            ClusterCommand::DeleteIndex { index_name } => write!(f, "DeleteIndex({})", index_name),
+            ClusterCommand::RemoveNode { node_id } => {
+                write!(f, "RemoveNode({})", node_id)
+            }
+            ClusterCommand::CreateIndex { metadata } => {
+                write!(f, "CreateIndex({})", metadata.name)
+            }
+            ClusterCommand::DeleteIndex { index_name } => {
+                write!(f, "DeleteIndex({})", index_name)
+            }
             ClusterCommand::SetMaster { node_id } => write!(f, "SetMaster({})", node_id),
-            ClusterCommand::UpdateIndex { metadata } => write!(f, "UpdateIndex({})", metadata.name),
+            ClusterCommand::UpdateIndex { metadata } => {
+                write!(f, "UpdateIndex({})", metadata.name)
+            }
         }
     }
 }
@@ -82,7 +79,7 @@ pub enum ClusterResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::state::{NodeInfo, NodeRole, IndexMetadata, ShardRoutingEntry};
+    use crate::cluster::state::{IndexMetadata, NodeInfo, NodeRole, ShardRoutingEntry};
     use std::collections::HashMap;
 
     #[test]
@@ -103,7 +100,9 @@ mod tests {
 
     #[test]
     fn cluster_command_display_remove_node() {
-        let cmd = ClusterCommand::RemoveNode { node_id: "node-2".into() };
+        let cmd = ClusterCommand::RemoveNode {
+            node_id: "node-2".into(),
+        };
         assert_eq!(format!("{}", cmd), "RemoveNode(node-2)");
     }
 
@@ -123,7 +122,9 @@ mod tests {
 
     #[test]
     fn cluster_command_display_delete_index() {
-        let cmd = ClusterCommand::DeleteIndex { index_name: "old-idx".into() };
+        let cmd = ClusterCommand::DeleteIndex {
+            index_name: "old-idx".into(),
+        };
         assert_eq!(format!("{}", cmd), "DeleteIndex(old-idx)");
     }
 
@@ -162,11 +163,14 @@ mod tests {
     #[test]
     fn create_index_command_preserves_shard_routing() {
         let mut shard_routing = HashMap::new();
-        shard_routing.insert(0, ShardRoutingEntry {
-            primary: "n1".into(),
-            replicas: vec!["n2".into()],
-            unassigned_replicas: 0,
-        });
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "n1".into(),
+                replicas: vec!["n2".into()],
+                unassigned_replicas: 0,
+            },
+        );
         let cmd = ClusterCommand::CreateIndex {
             metadata: IndexMetadata {
                 name: "routed".into(),
@@ -189,4 +193,3 @@ mod tests {
         }
     }
 }
-

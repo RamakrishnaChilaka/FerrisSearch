@@ -5,16 +5,16 @@
 
 use std::future::Future;
 
+use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::{BasicNode, RaftNetworkV2};
 
 use crate::consensus::types::{self, TypeConfig};
-use crate::transport::proto::internal_transport_client::InternalTransportClient;
 use crate::transport::proto::RaftRequest;
+use crate::transport::proto::internal_transport_client::InternalTransportClient;
 
 // ─── Network Factory ────────────────────────────────────────────────────────
 
@@ -42,11 +42,10 @@ impl RaftNetworkConnection {
     async fn connect(
         &self,
     ) -> Result<InternalTransportClient<tonic::transport::Channel>, RPCError<TypeConfig>> {
-        let endpoint =
-            tonic::transport::Endpoint::from_shared(format!("http://{}", self.addr))
-                .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?
-                .timeout(std::time::Duration::from_secs(5))
-                .connect_timeout(std::time::Duration::from_secs(5));
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", self.addr))
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(5));
         let channel = endpoint
             .connect()
             .await
@@ -62,8 +61,8 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
         let mut client = self.connect().await?;
-        let data = serde_json::to_vec(&rpc)
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+        let data =
+            serde_json::to_vec(&rpc).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
 
         let resp = client
             .raft_append_entries(tonic::Request::new(RaftRequest { data }))
@@ -72,10 +71,9 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
             .into_inner();
 
         if !resp.error.is_empty() {
-            return Err(RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::Other,
-                resp.error,
-            ))));
+            return Err(RPCError::Unreachable(Unreachable::new(
+                &std::io::Error::new(std::io::ErrorKind::Other, resp.error),
+            )));
         }
 
         let result: AppendEntriesResponse<TypeConfig> = serde_json::from_slice(&resp.data)
@@ -89,8 +87,8 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
         let mut client = self.connect().await?;
-        let data = serde_json::to_vec(&rpc)
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+        let data =
+            serde_json::to_vec(&rpc).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
 
         let resp = client
             .raft_vote(tonic::Request::new(RaftRequest { data }))
@@ -99,10 +97,9 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
             .into_inner();
 
         if !resp.error.is_empty() {
-            return Err(RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::Other,
-                resp.error,
-            ))));
+            return Err(RPCError::Unreachable(Unreachable::new(
+                &std::io::Error::new(std::io::ErrorKind::Other, resp.error),
+            )));
         }
 
         let result: VoteResponse<TypeConfig> = serde_json::from_slice(&resp.data)
@@ -156,12 +153,13 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
             )));
         }
 
-        let result: SnapshotResponse<TypeConfig> = serde_json::from_slice(&resp.data).map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("{}", e),
-            )))
-        })?;
+        let result: SnapshotResponse<TypeConfig> =
+            serde_json::from_slice(&resp.data).map_err(|e| {
+                StreamingError::Unreachable(Unreachable::new(&std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("{}", e),
+                )))
+            })?;
         Ok(result)
     }
 }

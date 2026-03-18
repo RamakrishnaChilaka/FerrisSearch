@@ -1,6 +1,6 @@
 use crate::api::AppState;
 use crate::cluster::state::ClusterState;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use openraft::type_config::async_runtime::WatchReceiver;
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,9 @@ pub struct ClusterHealth {
 /// - "yellow": all primaries assigned, but some replicas are unassigned
 /// - "red": no data nodes, or a primary shard is assigned to a missing node
 fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
-    let data_node_ids: std::collections::HashSet<&String> = cs.nodes.values()
+    let data_node_ids: std::collections::HashSet<&String> = cs
+        .nodes
+        .values()
         .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
         .map(|n| &n.id)
         .collect();
@@ -65,7 +67,9 @@ fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
 /// Handler for `GET /_cluster/health`
 pub async fn get_health(State(state): State<AppState>) -> Json<ClusterHealth> {
     let cs = state.cluster_manager.get_state();
-    let data_nodes = cs.nodes.values()
+    let data_nodes = cs
+        .nodes
+        .values()
         .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
         .count();
     let (status, unassigned) = compute_health_status(&cs);
@@ -102,11 +106,13 @@ pub async fn transfer_master(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let raft = match state.raft {
         Some(ref r) => r,
-        None => return crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "raft_not_enabled_exception",
-            "Raft consensus is not enabled on this node",
-        ),
+        None => {
+            return crate::api::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "raft_not_enabled_exception",
+                "Raft consensus is not enabled on this node",
+            );
+        }
     };
 
     if !raft.is_leader() {
@@ -121,11 +127,13 @@ pub async fn transfer_master(
     let cs = state.cluster_manager.get_state();
     let target_info = match cs.nodes.get(&req.node_id) {
         Some(n) => n.clone(),
-        None => return crate::api::error_response(
-            StatusCode::NOT_FOUND,
-            "node_not_found_exception",
-            format!("Node '{}' not found in cluster state", req.node_id),
-        ),
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "node_not_found_exception",
+                format!("Node '{}' not found in cluster state", req.node_id),
+            );
+        }
     };
 
     if target_info.raft_node_id == 0 {
@@ -147,11 +155,8 @@ pub async fn transfer_master(
         m.borrow_watched().last_applied
     };
 
-    let transfer_req = openraft::raft::TransferLeaderRequest::new(
-        vote,
-        target_info.raft_node_id,
-        last_log_id,
-    );
+    let transfer_req =
+        openraft::raft::TransferLeaderRequest::new(vote, target_info.raft_node_id, last_log_id);
 
     if let Err(e) = raft.handle_transfer_leader(transfer_req).await {
         return crate::api::error_response(
@@ -161,8 +166,11 @@ pub async fn transfer_master(
         );
     }
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "acknowledged": true,
-        "message": format!("Leadership transfer initiated to node '{}'", req.node_id)
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "acknowledged": true,
+            "message": format!("Leadership transfer initiated to node '{}'", req.node_id)
+        })),
+    )
 }
