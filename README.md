@@ -20,7 +20,7 @@
 
 FerrisSearch is a high-performance, Rust-native distributed search engine with OpenSearch-compatible REST APIs. Built for teams that want the familiar OpenSearch interface with the performance and safety of Rust.
 
-> **⚡ Performance:** 2M documents — ingestion at **9,384 docs/sec**, search at **p50 = 28.9ms**, zero errors — [see benchmarks](#benchmarks)
+> **⚡ Performance:** 2M documents — ingestion at **9,376 docs/sec**, search at **134.2 queries/sec (p50 = 26.4ms)**, zero errors — [see benchmarks](#benchmarks)
 
 ## Highlights
 
@@ -386,10 +386,10 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 476 tests
-cargo test --lib                                # Unit tests (416)
+cargo test                                      # All 501 tests
+cargo test --lib                                # Unit tests (437)
 cargo test --test consensus_integration          # Raft consensus tests (29)
-cargo test --test replication_integration        # Replication tests (31)
+cargo test --test replication_integration        # Replication tests (35)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.
@@ -408,14 +408,14 @@ Integration tests run entirely in-process — they spin up real gRPC servers wit
 |--------|-------|
 | Documents | 2,000,000 |
 | Errors | 0 |
-| Total time | 213.1s |
-| Throughput | **9,384 docs/sec** |
+| Total time | 213.3s |
+| Throughput | **9,376 docs/sec** |
 
 **Bulk batch latency (400 batches × 5,000 docs):**
 
 | Min | Avg | p50 | p95 | p99 | Max |
 |-----|-----|-----|-----|-----|-----|
-| 307.8ms | 429.2ms | 380.3ms | 705.9ms | 946.4ms | 2117.3ms |
+| 314.2ms | 429.8ms | 380.0ms | 671.6ms | 813.9ms | 1658.7ms |
 
 ### Search
 
@@ -424,31 +424,31 @@ Integration tests run entirely in-process — they spin up real gRPC servers wit
 ```
 Query Type                 Count  Err      Min      Avg      p50      p95      p99      Max   Hits/q
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-agg_filtered                 500    0     9.8ms    32.4ms    18.1ms   140.5ms   170.2ms   327.2ms  250026
-agg_histogram_price          500    0    73.0ms   104.0ms    89.8ms   205.5ms   278.5ms   329.0ms 2000000
-agg_stats_price              500    0    34.3ms    59.1ms    49.0ms   148.7ms   193.1ms   286.0ms 2000000
-agg_terms_category           500    0   257.1ms   348.8ms   324.7ms   513.1ms   584.2ms   632.7ms 2000000
-bool_filter_range            500    0     9.9ms    31.9ms    19.8ms   140.0ms   167.6ms   291.0ms   21752
-bool_must                    500    0     8.7ms    29.9ms    16.3ms   137.6ms   170.3ms   253.4ms   82446
-bool_should                  500    0     7.8ms    29.2ms    16.0ms   138.0ms   167.4ms   284.7ms  335418
-complex_bool                 500    0    36.1ms    62.2ms    46.5ms   172.2ms   266.9ms   296.0ms  534522
-fuzzy_title                  500    0     6.1ms    23.7ms    12.7ms    78.2ms   161.5ms   188.9ms  122918
-match_all                    500    0    23.1ms    47.5ms    33.9ms   151.2ms   182.6ms   257.5ms 2000000
-match_description            500    0    21.4ms    42.9ms    30.9ms   147.4ms   178.6ms   209.3ms 1716614
-match_title                  500    0     5.5ms    25.7ms    12.9ms   132.6ms   179.8ms   303.6ms  124661
-paginated                    500    0    12.3ms    54.2ms    44.5ms   160.0ms   186.7ms   334.8ms 1246079
-prefix_title                 500    0     6.0ms    26.4ms    12.6ms   141.3ms   169.9ms   255.1ms  129316
-range_price                  500    0    11.0ms    37.6ms    24.6ms   146.2ms   171.2ms   213.9ms  506005
-range_rating                 500    0    20.6ms    48.3ms    35.9ms   156.4ms   183.2ms   241.4ms 1378638
-sort_price_asc               500    0    19.8ms    45.5ms    30.6ms   155.1ms   255.2ms   290.9ms 2000000
-sort_rating_desc             500    0     7.4ms    27.5ms    14.0ms   136.4ms   167.7ms   292.3ms  132315
-term_category                500    0     6.7ms    26.3ms    13.6ms   134.8ms   172.6ms   319.6ms  249987
-wildcard_title               500    0     6.2ms    25.0ms    13.0ms   126.3ms   156.2ms   276.4ms  132196
+agg_filtered                 500    0     5.4ms    15.4ms    11.0ms    37.6ms    55.4ms   101.1ms  250019
+agg_histogram_price          500    0    52.6ms    67.3ms    65.4ms    88.0ms    94.0ms   101.8ms 2000000
+agg_stats_price              500    0    16.3ms    29.1ms    26.0ms    50.1ms    78.2ms   148.8ms 2000000
+agg_terms_category           500    0    39.2ms    54.0ms    52.2ms    73.1ms    87.4ms   114.3ms 2000000
+bool_filter_range            500    0     9.3ms    22.7ms    19.1ms    45.8ms    60.1ms    78.2ms   25371
+bool_must                    500    0     9.1ms    20.4ms    16.1ms    42.4ms    56.3ms    70.2ms   77638
+bool_should                  500    0     7.9ms    20.5ms    15.7ms    43.2ms    65.8ms    76.9ms  328806
+complex_bool                 500    0    35.5ms    48.0ms    46.5ms    65.1ms    78.4ms    94.5ms  534321
+fuzzy_title                  500    0     6.0ms    17.9ms    13.1ms    39.3ms    53.2ms    73.8ms  137598
+match_all                    500    0    23.5ms    36.3ms    33.9ms    54.3ms    64.0ms    74.5ms 2000000
+match_description            500    0    20.8ms    34.4ms    31.8ms    53.2ms    66.4ms    71.1ms 1710882
+match_title                  500    0     6.4ms    16.7ms    12.4ms    38.9ms    55.5ms    80.7ms  120793
+paginated                    500    0    13.6ms    40.8ms    40.8ms    64.1ms    75.1ms    85.4ms 1245895
+prefix_title                 500    0     5.9ms    17.6ms    13.0ms    41.9ms    53.8ms    65.0ms  139038
+range_price                  500    0    11.2ms    25.7ms    22.8ms    47.6ms    56.6ms    76.5ms  506040
+range_rating                 500    0    21.2ms    38.5ms    36.8ms    57.2ms    68.1ms    81.9ms 1399221
+sort_price_asc               500    0    20.8ms    34.2ms    31.9ms    53.2ms    62.4ms    84.3ms 2000000
+sort_rating_desc             500    0     7.4ms    19.1ms    15.0ms    43.1ms    56.3ms    69.4ms  139983
+term_category                500    0     6.8ms    18.0ms    14.3ms    39.2ms    47.4ms    89.5ms  249995
+wildcard_title               500    0     6.3ms    17.4ms    12.6ms    40.8ms    49.8ms    57.5ms  142728
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-TOTAL                      10000    0     5.5ms    56.4ms    28.9ms   266.3ms   404.0ms   632.7ms
+TOTAL                      10000    0     5.4ms    29.7ms    26.4ms    63.5ms    79.0ms   148.8ms
 ```
 
-**10,000 queries | 0 errors | 70.8 queries/sec | p50 = 28.9ms | concurrency = 4**
+**10,000 queries | 0 errors | 134.2 queries/sec | p50 = 26.4ms | concurrency = 4**
 
 Reproduce with:
 ```bash

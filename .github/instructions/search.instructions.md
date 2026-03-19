@@ -68,9 +68,10 @@ pub struct KnnParams {
 | `Histogram` | `field, interval` | Fixed-interval numeric buckets |
 
 ### Aggregation Flow
-1. Per-shard: `compute_aggregations()` runs on local shard data
-2. Coordinator: `merge_aggregations()` combines per-shard results
-3. Returned in response under `"aggregations"` key
+1. Per-shard: `engine.search_query(req)` computes partial aggregations via Tantivy's `AggCollector`
+2. Remote shards serialize partials into the `partial_aggs_json` bytes field; local shards return partials directly
+3. Coordinator: `merge_aggregations()` combines per-shard partial results
+4. Returned in response under `"aggregations"` key
 
 ## Sort
 - `SortClause::Simple(String)` — `"_score"` or field name

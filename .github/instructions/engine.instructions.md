@@ -93,13 +93,16 @@ With FAST, Tantivy reads a columnar structure - orders of magnitude faster for r
 ### Fast-Field Aggregations (Single-Pass Collector)
 Aggregations run in the same Tantivy search pass as hit collection via `AggCollector` -- a custom
 `tantivy::collector::Collector` implementation. Combined with TopDocs via tuple collector:
-`(TopDocs, Option<AggCollector>, Count)`. When no aggs are requested, `None` adds zero overhead.
+`(TopDocs, Option<AggCollector>, Count)` for hit-returning requests, or `(Option<AggCollector>, Count)`
+for agg-only `size=0` requests. When no aggs are requested, `None` adds zero overhead.
 
 **Architecture (mirrors OpenSearch's aggregation design):**
 - `AggCollector` implements `Collector` -- `for_segment()` opens fast-field columns per segment
 - `AggSegmentCollector` implements `SegmentCollector` -- `collect(doc, score)` reads column values and accumulates
+- String `terms` aggs count term ords per segment in `collect()`, then resolve ord→string once in `harvest()`
 - `harvest()` returns per-segment data, `merge_fruits()` merges across segments into `HashMap<String, PartialAggResult>`
-- Per-shard partial results returned through gRPC, merged at coordinator via `merge_aggregations()`
+- Per-shard partial results are serialized with `bincode-next` into the `partial_aggs_json` bytes field over gRPC, then merged at coordinator via `merge_aggregations()`
+- Agg-only `size=0` requests skip `TopDocs` and hit materialization entirely
 
 **Supported aggregation types:**
 - **Numeric** (Stats, Min, Max, Avg, Sum, ValueCount): reads `NumCol` (wraps `Column<f64>` or `Column<i64>`)

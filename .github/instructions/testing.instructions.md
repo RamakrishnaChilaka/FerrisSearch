@@ -1,10 +1,10 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **416 unit tests** (`cargo test --lib`)
+- **437 unit tests** (`cargo test --lib`)
 - **29 consensus integration tests** (`cargo test --test consensus_integration`)
-- **31 replication integration tests** (`cargo test --test replication_integration`)
-- **476 total** (`cargo test`)
+- **35 replication integration tests** (`cargo test --test replication_integration`)
+- **501 total** (`cargo test`)
 
 ## Running Tests
 ```bash
