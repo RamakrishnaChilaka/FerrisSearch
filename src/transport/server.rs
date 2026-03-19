@@ -11,7 +11,7 @@ use crate::wal::WriteAheadLog;
 use openraft::type_config::async_runtime::WatchReceiver;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, trace};
 
 /// Shared state for the gRPC transport service.
 #[derive(Clone)]
@@ -350,7 +350,7 @@ impl InternalTransport for TransportService {
             docs.push((doc_id, payload));
         }
 
-        info!(
+        trace!(
             "gRPC: bulk {} docs into {}/shard_{}",
             docs.len(),
             req.index_name,
@@ -518,6 +518,7 @@ impl InternalTransport for TransportService {
                     hits: vec![],
                     error: "Shard not found on this node".into(),
                     total_hits: 0,
+                    partial_aggs_json: vec![],
                 }));
             }
         };
@@ -533,12 +534,14 @@ impl InternalTransport for TransportService {
                     .collect(),
                 error: String::new(),
                 total_hits: 0,
+                partial_aggs_json: vec![],
             })),
             Err(e) => Ok(Response::new(ShardSearchResponse {
                 success: false,
                 hits: vec![],
                 error: e.to_string(),
                 total_hits: 0,
+                partial_aggs_json: vec![],
             })),
         }
     }
@@ -556,6 +559,7 @@ impl InternalTransport for TransportService {
                     hits: vec![],
                     error: "Shard not found on this node".into(),
                     total_hits: 0,
+                    partial_aggs_json: vec![],
                 }));
             }
         };
@@ -569,20 +573,20 @@ impl InternalTransport for TransportService {
         let mut total_hits: usize = 0;
 
         // Text / DSL search
-        match engine.search_query(&search_req) {
-            Ok((hits, total)) => {
-                total_hits += total;
-                all_hits.extend(hits);
-            }
+        let (hits, total, partial_aggs) = match engine.search_query(&search_req) {
+            Ok(result) => result,
             Err(e) => {
                 return Ok(Response::new(ShardSearchResponse {
                     success: false,
                     hits: vec![],
                     error: e.to_string(),
                     total_hits: 0,
+                    partial_aggs_json: vec![],
                 }));
             }
-        }
+        };
+        total_hits += total;
+        all_hits.extend(hits);
 
         // k-NN vector search (if knn clause present)
         if let Some(ref knn) = search_req.knn
@@ -602,6 +606,12 @@ impl InternalTransport for TransportService {
             }
         }
 
+        let aggs_json = if partial_aggs.is_empty() {
+            vec![]
+        } else {
+            serde_json::to_vec(&partial_aggs).unwrap_or_default()
+        };
+
         Ok(Response::new(ShardSearchResponse {
             success: true,
             hits: all_hits
@@ -612,6 +622,7 @@ impl InternalTransport for TransportService {
                 .collect(),
             error: String::new(),
             total_hits: total_hits as u64,
+            partial_aggs_json: aggs_json,
         }))
     }
 

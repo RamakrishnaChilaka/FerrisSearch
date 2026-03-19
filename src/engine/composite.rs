@@ -98,7 +98,8 @@ impl CompositeEngine {
         mut refresh_rx: tokio::sync::watch::Receiver<std::time::Duration>,
     ) {
         tokio::spawn(async move {
-            let mut interval = *refresh_rx.borrow_and_update();
+            const MIN_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+            let mut interval = (*refresh_rx.borrow_and_update()).max(MIN_REFRESH);
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(interval) => {
@@ -109,7 +110,7 @@ impl CompositeEngine {
                     result = refresh_rx.changed() => {
                         match result {
                             Ok(()) => {
-                                interval = *refresh_rx.borrow_and_update();
+                                interval = (*refresh_rx.borrow_and_update()).max(MIN_REFRESH);
                                 tracing::info!("Refresh interval updated to {:?}", interval);
                             }
                             Err(_) => {
@@ -190,7 +191,7 @@ impl CompositeEngine {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (docs, _) = self.text.search_query(&req).unwrap_or_default();
+        let (docs, _, _) = self.text.search_query(&req).unwrap_or_default();
         if docs.is_empty() {
             return Ok(());
         }
@@ -312,7 +313,11 @@ impl SearchEngine for CompositeEngine {
     fn search_query(
         &self,
         req: &crate::search::SearchRequest,
-    ) -> Result<(Vec<serde_json::Value>, usize)> {
+    ) -> Result<(
+        Vec<serde_json::Value>,
+        usize,
+        std::collections::HashMap<String, crate::search::PartialAggResult>,
+    )> {
         self.text.search_query(req)
     }
 
@@ -479,7 +484,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -805,7 +810,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (text_hits, _) = engine.search_query(&req).unwrap();
+        let (text_hits, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(text_hits.len(), 3, "match_all should return all 3 docs");
 
         // kNN search: vector closest to [1.0, 0.0, 0.0] should be d1
@@ -846,7 +851,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, _) = engine.search_query(&req).unwrap();
+        let (hits, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 2, "match on 'movie' should find d1 and d2");
     }
 

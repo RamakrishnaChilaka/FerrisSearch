@@ -69,14 +69,18 @@ impl HotEngine {
             use crate::cluster::state::FieldType;
             let field = match mapping.field_type {
                 FieldType::Text => schema_builder.add_text_field(name, TEXT | STORED),
-                FieldType::Keyword => schema_builder.add_text_field(name, STRING | STORED),
+                FieldType::Keyword => {
+                    schema_builder.add_text_field(name, (STRING | STORED).set_fast(None))
+                }
                 FieldType::Integer => {
                     schema_builder.add_i64_field(name, tantivy::schema::INDEXED | STORED | FAST)
                 }
                 FieldType::Float => {
                     schema_builder.add_f64_field(name, tantivy::schema::INDEXED | STORED | FAST)
                 }
-                FieldType::Boolean => schema_builder.add_text_field(name, STRING | STORED),
+                FieldType::Boolean => {
+                    schema_builder.add_text_field(name, (STRING | STORED).set_fast(None))
+                }
                 FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
             };
             mapped_fields.insert(name.clone(), field);
@@ -604,6 +608,530 @@ impl HotEngine {
         }
         Ok(())
     }
+
+    /// Extract the primary sort field and direction from a SearchRequest,
+    /// if eligible for fast-field optimization (numeric FAST field, not _score).
+    fn extract_fast_field_sort(
+        &self,
+        req: &crate::search::SearchRequest,
+    ) -> Option<(String, tantivy::Order)> {
+        use crate::search::{SortClause, SortDirection, SortOrder};
+        if req.sort.is_empty() {
+            return None;
+        }
+        let clause = &req.sort[0];
+        match clause {
+            SortClause::Simple(name) if name != "_score" => {
+                let field = self.resolve_field(name);
+                let schema = self.index.schema();
+                let entry = schema.get_field_entry(field);
+                match entry.field_type() {
+                    tantivy::schema::FieldType::I64(opts)
+                    | tantivy::schema::FieldType::F64(opts)
+                    | tantivy::schema::FieldType::U64(opts)
+                        if opts.is_fast() =>
+                    {
+                        Some((name.clone(), tantivy::Order::Asc))
+                    }
+                    _ => None,
+                }
+            }
+            SortClause::Field(map) => {
+                if let Some((name, order)) = map.iter().next() {
+                    if name == "_score" {
+                        return None;
+                    }
+                    let field = self.resolve_field(name);
+                    let schema = self.index.schema();
+                    let entry = schema.get_field_entry(field);
+                    let is_fast = match entry.field_type() {
+                        tantivy::schema::FieldType::I64(opts)
+                        | tantivy::schema::FieldType::F64(opts)
+                        | tantivy::schema::FieldType::U64(opts) => opts.is_fast(),
+                        _ => false,
+                    };
+                    if !is_fast {
+                        return None;
+                    }
+                    let dir = match order {
+                        SortOrder::Direction(d) => d.clone(),
+                        SortOrder::Object { order } => order.clone(),
+                    };
+                    let tantivy_order = match dir {
+                        SortDirection::Asc => tantivy::Order::Asc,
+                        SortDirection::Desc => tantivy::Order::Desc,
+                    };
+                    Some((name.clone(), tantivy_order))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Collect hits from fast-field-sorted results (score is not meaningful).
+    fn collect_hits_sorted<T>(
+        &self,
+        searcher: &tantivy::Searcher,
+        top_docs: Vec<(T, tantivy::DocAddress)>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut results = Vec::new();
+        for (_sort_value, doc_address) in top_docs {
+            let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
+            let doc_id = retrieved_doc
+                .get_all(registry.id_field)
+                .next()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            for value in retrieved_doc.get_all(registry.source_field) {
+                if let Some(text) = value.as_str()
+                    && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text)
+                {
+                    results.push(serde_json::json!({
+                        "_id": doc_id,
+                        "_score": 0.0,
+                        "_source": json_val
+                    }));
+                }
+            }
+        }
+        Ok(results)
+    }
+}
+
+// -- Single-pass Aggregation Collector --
+// Implements tantivy::collector::Collector to compute aggregations in the same
+// pass as TopDocs hit collection, mirroring OpenSearch's aggregation architecture.
+
+enum NumCol {
+    F64(tantivy::columnar::Column<f64>),
+    I64(tantivy::columnar::Column<i64>),
+}
+
+impl NumCol {
+    #[inline]
+    fn first_f64(&self, doc: u32) -> Option<f64> {
+        match self {
+            NumCol::F64(c) => c.first(doc),
+            NumCol::I64(c) => c.first(doc).map(|v| v as f64),
+        }
+    }
+}
+
+fn open_num_col(
+    schema: &Schema,
+    fast_fields: &tantivy::fastfield::FastFieldReaders,
+    field_name: &str,
+) -> Option<NumCol> {
+    let field = schema.get_field(field_name).ok()?;
+    let entry = schema.get_field_entry(field);
+    match entry.field_type() {
+        tantivy::schema::FieldType::F64(_) => fast_fields.f64(entry.name()).ok().map(NumCol::F64),
+        tantivy::schema::FieldType::I64(_) => fast_fields.i64(entry.name()).ok().map(NumCol::I64),
+        tantivy::schema::FieldType::U64(_) => fast_fields.i64(entry.name()).ok().map(NumCol::I64),
+        _ => None,
+    }
+}
+
+pub(crate) enum SegmentAggData {
+    Stats {
+        count: u64,
+        sum: f64,
+        min: f64,
+        max: f64,
+    },
+    Histogram {
+        interval: f64,
+        buckets: std::collections::HashMap<i64, u64>,
+    },
+    Terms {
+        counts: std::collections::HashMap<String, u64>,
+    },
+}
+
+fn merge_segment_data(target: &mut SegmentAggData, source: &SegmentAggData) {
+    match (target, source) {
+        (
+            SegmentAggData::Stats {
+                count: ca,
+                sum: sa,
+                min: mna,
+                max: mxa,
+            },
+            SegmentAggData::Stats {
+                count: cb,
+                sum: sb,
+                min: mnb,
+                max: mxb,
+            },
+        ) => {
+            *ca += cb;
+            *sa += sb;
+            if *mnb < *mna {
+                *mna = *mnb;
+            }
+            if *mxb > *mxa {
+                *mxa = *mxb;
+            }
+        }
+        (
+            SegmentAggData::Histogram { buckets: ba, .. },
+            SegmentAggData::Histogram { buckets: bb, .. },
+        ) => {
+            for (k, v) in bb {
+                *ba.entry(*k).or_insert(0) += v;
+            }
+        }
+        (SegmentAggData::Terms { counts: ca }, SegmentAggData::Terms { counts: cb }) => {
+            for (k, v) in cb {
+                *ca.entry(k.clone()).or_insert(0) += v;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn convert_to_partial(kind: &AggKind, data: SegmentAggData) -> crate::search::PartialAggResult {
+    use crate::search::{HistogramBucket, PartialAggResult, TermsBucket};
+    match (kind, data) {
+        (
+            AggKind::Stats,
+            SegmentAggData::Stats {
+                count,
+                sum,
+                min,
+                max,
+            },
+        ) => PartialAggResult::Stats {
+            count,
+            sum,
+            min,
+            max,
+        },
+        (AggKind::Min, SegmentAggData::Stats { count, min, .. }) => PartialAggResult::Metric {
+            value: if count > 0 { Some(min) } else { None },
+        },
+        (AggKind::Max, SegmentAggData::Stats { count, max, .. }) => PartialAggResult::Metric {
+            value: if count > 0 { Some(max) } else { None },
+        },
+        (
+            AggKind::Avg,
+            SegmentAggData::Stats {
+                count,
+                sum,
+                min,
+                max,
+            },
+        ) => PartialAggResult::Stats {
+            count,
+            sum,
+            min,
+            max,
+        },
+        (AggKind::Sum, SegmentAggData::Stats { sum, .. }) => {
+            PartialAggResult::Metric { value: Some(sum) }
+        }
+        (AggKind::ValueCount, SegmentAggData::Stats { count, .. }) => PartialAggResult::Metric {
+            value: Some(count as f64),
+        },
+        (_, SegmentAggData::Histogram { interval, buckets }) => {
+            let mut hb: Vec<HistogramBucket> = buckets
+                .into_iter()
+                .map(|(k, c)| HistogramBucket {
+                    key: k as f64 * interval,
+                    doc_count: c,
+                })
+                .collect();
+            hb.sort_by(|a, b| {
+                a.key
+                    .partial_cmp(&b.key)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            PartialAggResult::Histogram { buckets: hb }
+        }
+        (AggKind::Terms, SegmentAggData::Terms { counts }) => {
+            let mut tb: Vec<TermsBucket> = counts
+                .into_iter()
+                .map(|(k, c)| TermsBucket {
+                    key: k,
+                    doc_count: c,
+                })
+                .collect();
+            tb.sort_by(|a, b| b.doc_count.cmp(&a.doc_count));
+            // Preserve every bucket in the shard partial. Coordinator merge is
+            // where the requested size is applied so distributed top terms stay correct.
+            PartialAggResult::Terms { buckets: tb }
+        }
+        _ => PartialAggResult::Metric { value: None },
+    }
+}
+
+#[derive(Clone)]
+enum AggKind {
+    Stats,
+    Min,
+    Max,
+    Avg,
+    Sum,
+    ValueCount,
+    Histogram { interval: f64 },
+    Terms,
+}
+
+struct ResolvedAggSpec {
+    name: String,
+    field_name: String,
+    kind: AggKind,
+}
+
+enum SegmentAggEntry {
+    NumericStats {
+        column: NumCol,
+        count: u64,
+        sum: f64,
+        min: f64,
+        max: f64,
+    },
+    Histogram {
+        column: NumCol,
+        interval: f64,
+        buckets: std::collections::HashMap<i64, u64>,
+    },
+    TermsStr {
+        column: tantivy::columnar::StrColumn,
+        counts: std::collections::HashMap<String, u64>,
+    },
+    TermsNum {
+        column: NumCol,
+        counts: std::collections::HashMap<String, u64>,
+    },
+    Skip,
+}
+
+/// Single-pass aggregation collector. Combine with TopDocs via tuple collector.
+pub(crate) struct AggCollector {
+    specs: Vec<ResolvedAggSpec>,
+    schema: Schema,
+}
+
+impl AggCollector {
+    pub(crate) fn from_request(
+        aggs: &std::collections::HashMap<String, crate::search::AggregationRequest>,
+        schema: Schema,
+    ) -> Self {
+        use crate::search::AggregationRequest;
+        let specs = aggs
+            .iter()
+            .map(|(name, req)| {
+                let (field_name, kind) = match req {
+                    AggregationRequest::Stats(p) => (p.field.clone(), AggKind::Stats),
+                    AggregationRequest::Min(p) => (p.field.clone(), AggKind::Min),
+                    AggregationRequest::Max(p) => (p.field.clone(), AggKind::Max),
+                    AggregationRequest::Avg(p) => (p.field.clone(), AggKind::Avg),
+                    AggregationRequest::Sum(p) => (p.field.clone(), AggKind::Sum),
+                    AggregationRequest::ValueCount(p) => (p.field.clone(), AggKind::ValueCount),
+                    AggregationRequest::Histogram(p) => (
+                        p.field.clone(),
+                        AggKind::Histogram {
+                            interval: p.interval,
+                        },
+                    ),
+                    AggregationRequest::Terms(p) => (p.field.clone(), AggKind::Terms),
+                };
+                ResolvedAggSpec {
+                    name: name.clone(),
+                    field_name,
+                    kind,
+                }
+            })
+            .collect();
+        Self { specs, schema }
+    }
+}
+
+pub(crate) struct AggSegmentCollector {
+    entries: Vec<(String, SegmentAggEntry)>,
+}
+
+impl tantivy::collector::Collector for AggCollector {
+    type Fruit = std::collections::HashMap<String, crate::search::PartialAggResult>;
+    type Child = AggSegmentCollector;
+
+    fn for_segment(
+        &self,
+        _seg_id: u32,
+        segment: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        let ff = segment.fast_fields();
+        let mut entries = Vec::with_capacity(self.specs.len());
+        for spec in &self.specs {
+            let entry = match &spec.kind {
+                AggKind::Stats
+                | AggKind::Min
+                | AggKind::Max
+                | AggKind::Avg
+                | AggKind::Sum
+                | AggKind::ValueCount => match open_num_col(&self.schema, ff, &spec.field_name) {
+                    Some(col) => SegmentAggEntry::NumericStats {
+                        column: col,
+                        count: 0,
+                        sum: 0.0,
+                        min: f64::INFINITY,
+                        max: f64::NEG_INFINITY,
+                    },
+                    None => SegmentAggEntry::Skip,
+                },
+                AggKind::Histogram { interval } => {
+                    match open_num_col(&self.schema, ff, &spec.field_name) {
+                        Some(col) => SegmentAggEntry::Histogram {
+                            column: col,
+                            interval: *interval,
+                            buckets: std::collections::HashMap::new(),
+                        },
+                        None => SegmentAggEntry::Skip,
+                    }
+                }
+                AggKind::Terms => {
+                    if let Ok(Some(str_col)) = ff.str(&spec.field_name) {
+                        SegmentAggEntry::TermsStr {
+                            column: str_col,
+                            counts: std::collections::HashMap::new(),
+                        }
+                    } else if let Some(num_col) = open_num_col(&self.schema, ff, &spec.field_name) {
+                        SegmentAggEntry::TermsNum {
+                            column: num_col,
+                            counts: std::collections::HashMap::new(),
+                        }
+                    } else {
+                        SegmentAggEntry::Skip
+                    }
+                }
+            };
+            entries.push((spec.name.clone(), entry));
+        }
+        Ok(AggSegmentCollector { entries })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<Vec<(String, SegmentAggData)>>,
+    ) -> tantivy::Result<Self::Fruit> {
+        let mut merged: std::collections::HashMap<String, SegmentAggData> =
+            std::collections::HashMap::new();
+        for fruit in segment_fruits {
+            for (name, data) in fruit {
+                merged
+                    .entry(name)
+                    .and_modify(|e| merge_segment_data(e, &data))
+                    .or_insert(data);
+            }
+        }
+        let mut results = std::collections::HashMap::new();
+        for spec in &self.specs {
+            if let Some(data) = merged.remove(&spec.name) {
+                results.insert(spec.name.clone(), convert_to_partial(&spec.kind, data));
+            }
+        }
+        Ok(results)
+    }
+}
+
+impl tantivy::collector::SegmentCollector for AggSegmentCollector {
+    type Fruit = Vec<(String, SegmentAggData)>;
+
+    #[inline]
+    fn collect(&mut self, doc: tantivy::DocId, _score: tantivy::Score) {
+        for (_, entry) in &mut self.entries {
+            match entry {
+                SegmentAggEntry::NumericStats {
+                    column,
+                    count,
+                    sum,
+                    min,
+                    max,
+                } => {
+                    if let Some(val) = column.first_f64(doc) {
+                        *count += 1;
+                        *sum += val;
+                        if val < *min {
+                            *min = val;
+                        }
+                        if val > *max {
+                            *max = val;
+                        }
+                    }
+                }
+                SegmentAggEntry::Histogram {
+                    column,
+                    interval,
+                    buckets,
+                } => {
+                    if let Some(val) = column.first_f64(doc) {
+                        *buckets.entry((val / *interval).floor() as i64).or_insert(0) += 1;
+                    }
+                }
+                SegmentAggEntry::TermsStr { column, counts } => {
+                    let mut s = String::new();
+                    for ord in column.term_ords(doc) {
+                        s.clear();
+                        if column.ord_to_str(ord, &mut s).unwrap_or(false) {
+                            *counts.entry(s.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                SegmentAggEntry::TermsNum { column, counts } => {
+                    if let Some(val) = column.first_f64(doc) {
+                        let key = if val.fract() == 0.0 {
+                            format!("{}", val as i64)
+                        } else {
+                            format!("{}", val)
+                        };
+                        *counts.entry(key).or_insert(0) += 1;
+                    }
+                }
+                SegmentAggEntry::Skip => {}
+            }
+        }
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        self.entries
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let data = match entry {
+                    SegmentAggEntry::NumericStats {
+                        count,
+                        sum,
+                        min,
+                        max,
+                        ..
+                    } => SegmentAggData::Stats {
+                        count,
+                        sum,
+                        min,
+                        max,
+                    },
+                    SegmentAggEntry::Histogram {
+                        interval, buckets, ..
+                    } => SegmentAggData::Histogram { interval, buckets },
+                    SegmentAggEntry::TermsStr { counts, .. }
+                    | SegmentAggEntry::TermsNum { counts, .. } => SegmentAggData::Terms { counts },
+                    SegmentAggEntry::Skip => return None,
+                };
+                Some((name, data))
+            })
+            .collect()
+    }
 }
 
 impl super::SearchEngine for HotEngine {
@@ -734,15 +1262,63 @@ impl super::SearchEngine for HotEngine {
     fn search_query(
         &self,
         req: &crate::search::SearchRequest,
-    ) -> Result<(Vec<serde_json::Value>, usize)> {
-        let limit = std::cmp::max(req.from + req.size, 100);
+    ) -> Result<(
+        Vec<serde_json::Value>,
+        usize,
+        std::collections::HashMap<String, crate::search::PartialAggResult>,
+    )> {
         let searcher = self.reader.searcher();
+        let limit = std::cmp::max(req.from + req.size, 100);
         let query = self.build_query(&req.query)?;
         let effective_limit = if limit == 0 { 1 } else { limit };
-        let (top_docs, total) =
-            searcher.search(&*query, &(TopDocs::with_limit(effective_limit), Count))?;
+
+        // Build optional aggregation collector (None = zero overhead when no aggs)
+        let agg_collector = if !req.aggs.is_empty() {
+            Some(AggCollector::from_request(&req.aggs, self.index.schema()))
+        } else {
+            None
+        };
+
+        // Fast-field sort: push sorting into Tantivy collector for numeric fields
+        if let Some((sort_field, order)) = self.extract_fast_field_sort(req) {
+            let schema = self.index.schema();
+            let field = self.resolve_field(&sort_field);
+            let field_type = schema.get_field_entry(field).field_type();
+            match field_type {
+                tantivy::schema::FieldType::F64(_) => {
+                    let td = TopDocs::with_limit(effective_limit)
+                        .order_by_fast_field::<f64>(&sort_field, order);
+                    let (top_docs, partial_aggs, total) =
+                        searcher.search(&*query, &(td, agg_collector, Count))?;
+                    let hits = self.collect_hits_sorted(&searcher, top_docs)?;
+                    return Ok((hits, total, partial_aggs.unwrap_or_default()));
+                }
+                tantivy::schema::FieldType::I64(_) => {
+                    let td = TopDocs::with_limit(effective_limit)
+                        .order_by_fast_field::<i64>(&sort_field, order);
+                    let (top_docs, partial_aggs, total) =
+                        searcher.search(&*query, &(td, agg_collector, Count))?;
+                    let hits = self.collect_hits_sorted(&searcher, top_docs)?;
+                    return Ok((hits, total, partial_aggs.unwrap_or_default()));
+                }
+                tantivy::schema::FieldType::U64(_) => {
+                    let td = TopDocs::with_limit(effective_limit)
+                        .order_by_fast_field::<u64>(&sort_field, order);
+                    let (top_docs, partial_aggs, total) =
+                        searcher.search(&*query, &(td, agg_collector, Count))?;
+                    let hits = self.collect_hits_sorted(&searcher, top_docs)?;
+                    return Ok((hits, total, partial_aggs.unwrap_or_default()));
+                }
+                _ => {} // fall through to default score-based collection
+            }
+        }
+
+        let (top_docs, partial_aggs, total) = searcher.search(
+            &*query,
+            &(TopDocs::with_limit(effective_limit), agg_collector, Count),
+        )?;
         let hits = self.collect_hits(&searcher, top_docs)?;
-        Ok((hits, total))
+        Ok((hits, total, partial_aggs.unwrap_or_default()))
     }
 
     fn doc_count(&self) -> u64 {
@@ -836,6 +1412,37 @@ mod tests {
         assert_eq!(doc["num"], 5);
     }
 
+    #[test]
+    fn terms_partial_keeps_all_buckets_for_coordinator_merge() {
+        let partial = convert_to_partial(
+            &AggKind::Terms,
+            SegmentAggData::Terms {
+                counts: std::collections::HashMap::from([
+                    ("a".to_string(), 100),
+                    ("global".to_string(), 99),
+                    ("other".to_string(), 42),
+                ]),
+            },
+        );
+
+        let crate::search::PartialAggResult::Terms { buckets } = partial else {
+            panic!("expected terms partial");
+        };
+
+        assert_eq!(buckets.len(), 3);
+        assert!(buckets.iter().any(|b| b.key == "a" && b.doc_count == 100));
+        assert!(
+            buckets
+                .iter()
+                .any(|b| b.key == "global" && b.doc_count == 99)
+        );
+        assert!(
+            buckets
+                .iter()
+                .any(|b| b.key == "other" && b.doc_count == 42)
+        );
+    }
+
     // ── search ──────────────────────────────────────────────────────────
 
     #[test]
@@ -872,7 +1479,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, total) = engine.search_query(&req).unwrap();
+        let (results, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(total, 2);
     }
@@ -897,7 +1504,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, total) = engine.search_query(&req).unwrap();
+        let (results, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 200, "total should count all matching docs");
         assert!(
             results.len() <= 100,
@@ -930,7 +1537,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, total) = engine.search_query(&req).unwrap();
+        let (results, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 50, "total should count all matching docs");
         assert!(results.len() <= 100);
     }
@@ -956,7 +1563,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["_id"], "d1");
     }
@@ -1073,7 +1680,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             20,
@@ -1100,7 +1707,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (all_results, _) = engine.search_query(&req_all).unwrap();
+        let (all_results, _, _) = engine.search_query(&req_all).unwrap();
         assert_eq!(all_results.len(), 10);
 
         // from=7, size=10 → engine fetches max(17,100)=100, returns all 10
@@ -1112,7 +1719,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (paged_results, _) = engine.search_query(&req_paged).unwrap();
+        let (paged_results, _, _) = engine.search_query(&req_paged).unwrap();
         assert_eq!(
             paged_results.len(),
             10,
@@ -1138,7 +1745,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             5,
@@ -1166,7 +1773,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (all_hits, _) = engine.search_query(&req).unwrap();
+        let (all_hits, _, _) = engine.search_query(&req).unwrap();
         let total = all_hits.len(); // This is what hits.total.value should be
         let paginated: Vec<_> = all_hits.into_iter().skip(req.from).take(req.size).collect();
         assert_eq!(total, 15, "total should reflect all matching docs");
@@ -1204,7 +1811,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "must:rust should match d1 and d3");
     }
 
@@ -1238,7 +1845,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "must_not:python should exclude d2");
     }
 
@@ -1278,7 +1885,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -1312,7 +1919,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1, "filter:rust should match only d1");
     }
 
@@ -1331,7 +1938,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty bool should match all docs");
     }
 
@@ -1370,7 +1977,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -1428,7 +2035,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -1457,7 +2064,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -1485,7 +2092,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty Term should fall back to match all");
     }
 
@@ -1513,7 +2120,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -1546,7 +2153,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["_id"], "d1");
     }
@@ -1583,7 +2190,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d2"), "bob should match");
@@ -1618,7 +2225,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d2"), "bob should match");
         assert!(ids.contains(&"d3"), "charlie should match");
@@ -1643,7 +2250,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -1692,7 +2299,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["_id"], "d1");
     }
@@ -1725,7 +2332,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d1"));
@@ -1754,7 +2361,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d1"), "rust should match r?st");
         assert!(ids.contains(&"d2"), "rest should match r?st");
@@ -1787,7 +2394,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d1"), "search should match prefix 'sea'");
         assert!(ids.contains(&"d2"), "sea should match prefix 'sea'");
@@ -1811,7 +2418,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1829,7 +2436,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1862,7 +2469,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0]["_id"], "d1",
@@ -1894,7 +2501,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert!(results.is_empty(), "fuzziness 0 should be exact match only");
     }
 
@@ -1912,7 +2519,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _) = engine.search_query(&req).unwrap();
+        let (results, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1966,7 +2573,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, _) = engine.search_query(&req).unwrap();
+        let (hits, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d1");
     }
@@ -2004,7 +2611,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, _) = engine.search_query(&req).unwrap();
+        let (hits, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d1");
     }
@@ -2053,7 +2660,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, _) = engine.search_query(&req).unwrap();
+        let (hits, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 2, "year >= 2010 should match d2 and d3");
         let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d2"));
@@ -2101,7 +2708,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, _) = engine.search_query(&req).unwrap();
+        let (hits, _, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d2");
     }
@@ -2144,7 +2751,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 1, "integer bounds on float field should match d2");
         assert_eq!(hits[0]["_id"], "d2");
     }
@@ -2178,7 +2785,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 1, "term query on integer field should match");
         assert_eq!(hits[0]["_id"], "d1");
     }
@@ -2263,7 +2870,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             total, 1,
             "complex bool with all clause types should match d1 only"
@@ -2308,7 +2915,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             total, 1,
             "integer value indexed on float field should be searchable"
@@ -2386,7 +2993,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             total, 2,
             "should-only bool should match d1 (rust) and d3 (go)"
@@ -2454,7 +3061,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             total, 2,
             "must_not + filter should return d1 and d3 (books only)"
@@ -2526,7 +3133,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             total, 2,
             "multiple must_not should exclude both books and education"
@@ -2619,7 +3226,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             total, 1,
             "nested bool should match only d1 (rust, books, price 25)"
@@ -2676,7 +3283,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 0, "must_not excluding all docs should return 0 hits");
         assert!(hits.is_empty());
     }
@@ -2845,7 +3452,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 0, "docs must not be visible before refresh");
         assert!(hits.is_empty());
 
@@ -2875,7 +3482,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 2);
         assert_eq!(hits.len(), 2);
         assert_eq!(engine.doc_count(), 2);
@@ -2898,7 +3505,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 0, "bulk docs must not be visible before refresh");
         assert!(hits.is_empty());
     }
@@ -2921,7 +3528,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (hits, total) = engine.search_query(&req).unwrap();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             total, 50,
             "all 50 bulk docs should be visible after refresh"

@@ -357,7 +357,7 @@ fn compute_stats(hits: &[serde_json::Value], field: &str) -> PartialAggResult {
     }
 }
 
-fn compute_terms(hits: &[serde_json::Value], field: &str, size: usize) -> PartialAggResult {
+fn compute_terms(hits: &[serde_json::Value], field: &str, _size: usize) -> PartialAggResult {
     let mut counts: HashMap<String, u64> = HashMap::new();
     for hit in hits {
         if let Some(val) = hit.get("_source").and_then(|s| s.get(field)) {
@@ -376,8 +376,9 @@ fn compute_terms(hits: &[serde_json::Value], field: &str, size: usize) -> Partia
         .map(|(key, doc_count)| TermsBucket { key, doc_count })
         .collect();
     buckets.sort_by(|a, b| b.doc_count.cmp(&a.doc_count));
-    buckets.truncate(size);
 
+    // Preserve the full per-shard term counts. The requested size is applied
+    // only after coordinator merge so globally top terms are not dropped.
     PartialAggResult::Terms { buckets }
 }
 
@@ -1725,6 +1726,47 @@ mod tests {
         let merged = merge_aggregations(vec![result], &aggs);
         let buckets = merged["colors"]["buckets"].as_array().unwrap();
         assert_eq!(buckets.len(), 2, "should be limited to size=2");
+    }
+
+    #[test]
+    fn terms_aggregation_merges_full_shard_partials_before_truncating() {
+        let mut shard_a = Vec::new();
+        let mut shard_b = Vec::new();
+        let mut shard_c = Vec::new();
+
+        for _ in 0..100 {
+            shard_a.push(json!({"genre": "a"}));
+            shard_b.push(json!({"genre": "b"}));
+            shard_c.push(json!({"genre": "c"}));
+        }
+        for _ in 0..99 {
+            shard_a.push(json!({"genre": "global"}));
+            shard_b.push(json!({"genre": "global"}));
+            shard_c.push(json!({"genre": "global"}));
+        }
+
+        let mut aggs = HashMap::new();
+        aggs.insert(
+            "genres".into(),
+            AggregationRequest::Terms(TermsAggParams {
+                field: "genre".into(),
+                size: 1,
+            }),
+        );
+
+        let merged = merge_aggregations(
+            vec![
+                compute_aggregations(&make_hits(shard_a), &aggs),
+                compute_aggregations(&make_hits(shard_b), &aggs),
+                compute_aggregations(&make_hits(shard_c), &aggs),
+            ],
+            &aggs,
+        );
+
+        let buckets = merged["genres"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0]["key"], "global");
+        assert_eq!(buckets[0]["doc_count"], 297);
     }
 
     #[test]

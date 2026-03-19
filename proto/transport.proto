@@ -125,6 +125,7 @@ message ShardSearchResponse {
     repeated SearchHit hits = 2;
     string error = 3;
     uint64 total_hits = 4;
+    bytes partial_aggs_json = 5;  // serialized HashMap<String, PartialAggResult>
 }
 
 // ─── Replication ──────────────────────────────────────────────────────────────

@@ -660,6 +660,181 @@ struct BulkDoc {
     payload: Value,
 }
 
+#[derive(Debug)]
+struct RoutedBulkDoc {
+    position: usize,
+    index_name: String,
+    doc_id: String,
+    payload: Value,
+    shard_id: u32,
+    node_id: String,
+}
+
+type BulkTargetKey = (String, String, u32);
+
+fn bulk_success_item(index_name: &str, doc_id: &str) -> Value {
+    serde_json::json!({
+        "index": {
+            "_index": index_name,
+            "_id": doc_id,
+            "_version": 1,
+            "result": "created",
+            "status": 201,
+            "_shards": { "total": 1, "successful": 1, "failed": 0 },
+            "_seq_no": 0,
+            "_primary_term": 1
+        }
+    })
+}
+
+fn bulk_error_item(
+    index_name: Option<&str>,
+    doc_id: &str,
+    status: StatusCode,
+    error_type: &str,
+    reason: impl std::fmt::Display,
+) -> Value {
+    let mut item = serde_json::json!({
+        "index": {
+            "_id": doc_id,
+            "status": status.as_u16(),
+            "error": {
+                "type": error_type,
+                "reason": reason.to_string(),
+            }
+        }
+    });
+
+    if let Some(index_name) = index_name {
+        item["index"]["_index"] = serde_json::json!(index_name);
+    }
+
+    item
+}
+
+fn route_bulk_doc(
+    position: usize,
+    index_name: String,
+    doc_id: String,
+    payload: Value,
+    metadata: &IndexMetadata,
+    cluster_state: &crate::cluster::state::ClusterState,
+) -> Result<RoutedBulkDoc, Value> {
+    let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
+    let node_id = match metadata.primary_node(shard_id) {
+        Some(node_id) => node_id.clone(),
+        None => {
+            return Err(bulk_error_item(
+                Some(&index_name),
+                &doc_id,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "shard_not_available_exception",
+                "Shard has no assigned primary",
+            ));
+        }
+    };
+
+    if !cluster_state.nodes.contains_key(&node_id) {
+        return Err(bulk_error_item(
+            Some(&index_name),
+            &doc_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "node_not_found_exception",
+            format!("Primary node [{}] not found in cluster state", node_id),
+        ));
+    }
+
+    Ok(RoutedBulkDoc {
+        position,
+        index_name,
+        doc_id,
+        payload,
+        shard_id,
+        node_id,
+    })
+}
+
+async fn forward_bulk_batches(
+    state: &AppState,
+    cluster_state: &crate::cluster::state::ClusterState,
+    routed_docs: &[RoutedBulkDoc],
+) -> std::collections::HashSet<BulkTargetKey> {
+    let mut shard_batches: HashMap<BulkTargetKey, Vec<(String, Value)>> = HashMap::new();
+    for doc in routed_docs {
+        shard_batches
+            .entry((doc.index_name.clone(), doc.node_id.clone(), doc.shard_id))
+            .or_default()
+            .push((doc.doc_id.clone(), doc.payload.clone()));
+    }
+
+    let mut futures = Vec::new();
+    let mut shard_keys = Vec::new();
+    let mut failed_targets = std::collections::HashSet::new();
+
+    for ((index_name, node_id, shard_id), batch) in shard_batches {
+        if let Some(node_info) = cluster_state.nodes.get(&node_id) {
+            let client = state.transport_client.clone();
+            let node_info = node_info.clone();
+            let batch_index = index_name.clone();
+            futures.push(tokio::spawn(async move {
+                client
+                    .forward_bulk_to_shard(&node_info, &batch_index, shard_id, &batch)
+                    .await
+            }));
+            shard_keys.push((index_name, node_id, shard_id));
+        } else {
+            failed_targets.insert((index_name, node_id, shard_id));
+        }
+    }
+
+    let results = join_all(futures).await;
+    for (key, result) in shard_keys.into_iter().zip(results.into_iter()) {
+        if !matches!(result, Ok(Ok(_))) {
+            failed_targets.insert(key);
+        }
+    }
+
+    failed_targets
+}
+
+fn finalize_bulk_items(
+    mut item_results: Vec<Option<Value>>,
+    routed_docs: Vec<RoutedBulkDoc>,
+    failed_targets: &std::collections::HashSet<BulkTargetKey>,
+) -> Vec<Value> {
+    for doc in routed_docs {
+        let target = (doc.index_name.clone(), doc.node_id.clone(), doc.shard_id);
+        let item = if failed_targets.contains(&target) {
+            bulk_error_item(
+                Some(&doc.index_name),
+                &doc.doc_id,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "shard_failure",
+                "Failed to index to shard",
+            )
+        } else {
+            bulk_success_item(&doc.index_name, &doc.doc_id)
+        };
+        item_results[doc.position] = Some(item);
+    }
+
+    item_results
+        .into_iter()
+        .enumerate()
+        .map(|(position, item)| {
+            item.unwrap_or_else(|| {
+                bulk_error_item(
+                    None,
+                    "",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "bulk_item_exception",
+                    format!("bulk item {} was dropped unexpectedly", position),
+                )
+            })
+        })
+        .collect()
+}
+
 /// Parse NDJSON bulk body into a list of documents.
 /// Supports standard OpenSearch format:
 ///   {"index": {"_index": "idx", "_id": "1"}}
@@ -745,102 +920,89 @@ pub async fn bulk_index_global(
         );
     }
 
-    // Group by index, then dispatch to per-index bulk logic
-    let mut by_index: HashMap<String, Vec<(String, Value)>> = HashMap::new();
-    for doc in &docs {
-        if let Some(ref idx) = doc.index {
+    let cluster_state = state.cluster_manager.get_state();
+    let mut item_results: Vec<Option<Value>> = vec![None; docs.len()];
+    let mut has_errors = false;
+    let mut by_index: HashMap<String, Vec<(usize, String, Value)>> = HashMap::new();
+
+    for (position, doc) in docs.into_iter().enumerate() {
+        if let Some(index_name) = doc.index {
             by_index
-                .entry(idx.clone())
+                .entry(index_name)
                 .or_default()
-                .push((doc.doc_id.clone(), doc.payload.clone()));
+                .push((position, doc.doc_id, doc.payload));
+        } else {
+            has_errors = true;
+            item_results[position] = Some(bulk_error_item(
+                None,
+                &doc.doc_id,
+                StatusCode::BAD_REQUEST,
+                "action_request_validation_exception",
+                "bulk action metadata must include _index",
+            ));
         }
     }
 
-    // For now, forward each index batch via the same shard-routing logic
-    let cluster_state = state.cluster_manager.get_state();
-    let mut all_items: Vec<Value> = Vec::new();
-    let mut has_errors = false;
-
-    for (index_name, batch) in &by_index {
-        let metadata = if let Some(m) = cluster_state.indices.get(index_name) {
+    let mut routed_docs = Vec::new();
+    for (index_name, batch) in by_index {
+        let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
             m.clone()
         } else {
-            match auto_create_index(&state, index_name, &cluster_state).await {
+            match auto_create_index(&state, &index_name, &cluster_state).await {
                 Ok(m) => m,
                 Err(_) => {
                     has_errors = true;
-                    for (id, _) in batch {
-                        all_items.push(serde_json::json!({
-                            "index": {
-                                "_index": index_name,
-                                "_id": id,
-                                "status": 500,
-                                "error": { "type": "auto_create_exception", "reason": "Failed to auto-create index" }
-                            }
-                        }));
+                    for (position, doc_id, _) in batch {
+                        item_results[position] = Some(bulk_error_item(
+                            Some(&index_name),
+                            &doc_id,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "auto_create_exception",
+                            "Failed to auto-create index",
+                        ));
                     }
                     continue;
                 }
             }
         };
 
-        // Route docs to shards
-        let mut shard_batches: HashMap<(String, u32), Vec<(String, Value)>> = HashMap::new();
-        for (doc_id, payload) in batch {
-            let shard_id =
-                crate::engine::routing::calculate_shard(doc_id, metadata.number_of_shards);
-            if let Some(node_id) = metadata.primary_node(shard_id) {
-                shard_batches
-                    .entry((node_id.clone(), shard_id))
-                    .or_default()
-                    .push((doc_id.clone(), payload.clone()));
-            }
-        }
-
-        let mut futures = Vec::new();
-        for ((node_id, shard_id), shard_batch) in shard_batches {
-            if let Some(node_info) = cluster_state.nodes.get(&node_id) {
-                let client = state.transport_client.clone();
-                let node_info = node_info.clone();
-                let idx = index_name.clone();
-                futures.push(tokio::spawn(async move {
-                    client
-                        .forward_bulk_to_shard(&node_info, &idx, shard_id, &shard_batch)
-                        .await
-                }));
-            }
-        }
-
-        let results = join_all(futures).await;
-        let successful = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
-        if successful < results.len() {
-            has_errors = true;
-        }
-
-        for (id, _) in batch {
-            all_items.push(serde_json::json!({
-                "index": {
-                    "_index": index_name,
-                    "_id": id,
-                    "_version": 1,
-                    "result": "created",
-                    "status": 201,
-                    "_shards": { "total": 1, "successful": 1, "failed": 0 },
-                    "_seq_no": 0,
-                    "_primary_term": 1
+        for (position, doc_id, payload) in batch {
+            match route_bulk_doc(
+                position,
+                index_name.clone(),
+                doc_id,
+                payload,
+                &metadata,
+                &cluster_state,
+            ) {
+                Ok(doc) => routed_docs.push(doc),
+                Err(item) => {
+                    has_errors = true;
+                    item_results[position] = Some(item);
                 }
-            }));
+            }
         }
+    }
+
+    let failed_targets = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
+    if !failed_targets.is_empty() {
+        has_errors = true;
     }
 
     // ?refresh=true: commit + reload all affected shards so docs are immediately searchable
     if refresh_param.should_refresh() {
-        for index_name in by_index.keys() {
-            for (_, engine) in state.shard_manager.get_index_shards(index_name) {
+        let affected_indices: std::collections::HashSet<String> = routed_docs
+            .iter()
+            .map(|doc| doc.index_name.clone())
+            .collect();
+        for index_name in affected_indices {
+            for (_, engine) in state.shard_manager.get_index_shards(&index_name) {
                 let _ = engine.refresh();
             }
         }
     }
+
+    let all_items = finalize_bulk_items(item_results, routed_docs, &failed_targets);
 
     (
         StatusCode::OK,
@@ -903,38 +1065,31 @@ pub async fn bulk_index(
         }
     };
 
-    // Group docs by (node_id, shard_id) — each shard on each node gets its own batch
-    let mut shard_batches: HashMap<(String, u32), Vec<(String, Value)>> = HashMap::new();
+    let mut item_results: Vec<Option<Value>> = vec![None; docs.len()];
+    let mut has_errors = false;
+    let mut routed_docs = Vec::new();
 
-    for (doc_id, payload) in &docs {
-        let shard_id = crate::engine::routing::calculate_shard(doc_id, metadata.number_of_shards);
-        if let Some(node_id) = metadata.primary_node(shard_id) {
-            shard_batches
-                .entry((node_id.clone(), shard_id))
-                .or_default()
-                .push((doc_id.clone(), payload.clone()));
+    for (position, (doc_id, payload)) in docs.into_iter().enumerate() {
+        match route_bulk_doc(
+            position,
+            index_name.clone(),
+            doc_id,
+            payload,
+            &metadata,
+            &cluster_state,
+        ) {
+            Ok(doc) => routed_docs.push(doc),
+            Err(item) => {
+                has_errors = true;
+                item_results[position] = Some(item);
+            }
         }
     }
 
-    // Forward each batch to the owning node's specific shard
-    let mut all_futures = Vec::new();
-
-    for ((node_id, shard_id), batch) in shard_batches {
-        if let Some(node_info) = cluster_state.nodes.get(&node_id) {
-            let client = state.transport_client.clone();
-            let node_info = node_info.clone();
-            let index = index_name.clone();
-            all_futures.push(tokio::spawn(async move {
-                client
-                    .forward_bulk_to_shard(&node_info, &index, shard_id, &batch)
-                    .await
-            }));
-        }
+    let failed_targets = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
+    if !failed_targets.is_empty() {
+        has_errors = true;
     }
-
-    let results = join_all(all_futures).await;
-    let successful = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
-    let has_errors = successful < results.len();
 
     // ?refresh=true: commit + reload all affected shards so docs are immediately searchable
     if refresh_param.should_refresh() {
@@ -943,23 +1098,14 @@ pub async fn bulk_index(
         }
     }
 
+    let items = finalize_bulk_items(item_results, routed_docs, &failed_targets);
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "took": 0,
             "errors": has_errors,
-            "items": docs.iter().map(|(id, _)| serde_json::json!({
-                "index": {
-                    "_index": index_name,
-                    "_id": id,
-                    "_version": 1,
-                    "result": "created",
-                    "status": 201,
-                    "_shards": { "total": 1, "successful": 1, "failed": 0 },
-                    "_seq_no": 0,
-                    "_primary_term": 1
-                }
-            })).collect::<Vec<_>>()
+            "items": items
         })),
     )
 }
@@ -1008,12 +1154,19 @@ pub async fn search_documents_dsl(
     let mut total_hits: usize = 0;
     let is_hybrid = search_req.knn.is_some();
 
+    let mut all_partial_aggs: Vec<
+        std::collections::HashMap<String, crate::search::PartialAggResult>,
+    > = Vec::new();
+
     // Query local shards directly (text search)
     for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
         match engine.search_query(&search_req) {
-            Ok((hits, shard_total)) => {
+            Ok((hits, shard_total, partial_aggs)) => {
                 successful += 1;
                 total_hits += shard_total;
+                if !partial_aggs.is_empty() {
+                    all_partial_aggs.push(partial_aggs);
+                }
                 for hit in hits {
                     text_hits.push(serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
@@ -1100,9 +1253,12 @@ pub async fn search_documents_dsl(
     let remote_results = join_all(remote_futures).await;
     for result in remote_results {
         match result {
-            Ok((shard_id, Ok((hits, shard_total)))) => {
+            Ok((shard_id, Ok((hits, shard_total, partial_aggs)))) => {
                 successful += 1;
                 total_hits += shard_total;
+                if !partial_aggs.is_empty() {
+                    all_partial_aggs.push(partial_aggs);
+                }
                 for hit in hits {
                     let enriched = serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
@@ -1146,15 +1302,9 @@ pub async fn search_documents_dsl(
     // Apply user-specified sort (or default _score desc)
     crate::search::sort_hits(&mut all_hits, &search_req.sort);
 
-    // Compute aggregations across all hits (coordinator-level)
-    let aggregations = if !search_req.aggs.is_empty() {
-        crate::search::compute_aggregations(&all_hits, &search_req.aggs)
-    } else {
-        std::collections::HashMap::new()
-    };
-    // For multi-shard, merge partial results (here we compute once from all gathered hits)
-    let merged_aggs = if !aggregations.is_empty() {
-        crate::search::merge_aggregations(vec![aggregations], &search_req.aggs)
+    // Merge per-shard partial aggregations at coordinator level
+    let merged_aggs = if !all_partial_aggs.is_empty() {
+        crate::search::merge_aggregations(all_partial_aggs, &search_req.aggs)
     } else {
         std::collections::HashMap::new()
     };
@@ -1730,6 +1880,11 @@ pub async fn delete_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::state::{
+        ClusterState, IndexSettings, NodeInfo, NodeRole, ShardRoutingEntry,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn parse_opensearch_ndjson_format() {
@@ -1863,5 +2018,126 @@ mod tests {
         let docs = parse_bulk_ndjson(input);
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].doc_id, "1");
+    }
+
+    fn make_test_node(id: &str) -> NodeInfo {
+        NodeInfo {
+            id: id.into(),
+            name: id.into(),
+            host: "127.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 1,
+        }
+    }
+
+    fn make_test_metadata(primary: Option<&str>) -> IndexMetadata {
+        let mut shard_routing = HashMap::new();
+        if let Some(primary) = primary {
+            shard_routing.insert(
+                0,
+                ShardRoutingEntry {
+                    primary: primary.to_string(),
+                    replicas: vec![],
+                    unassigned_replicas: 0,
+                },
+            );
+        }
+        IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        }
+    }
+
+    fn make_test_app_state(cluster_state: ClusterState) -> (tempfile::TempDir, AppState) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = crate::cluster::ClusterManager::new(cluster_state.cluster_name.clone());
+        manager.update_state(cluster_state);
+        let state = AppState {
+            cluster_manager: Arc::new(manager),
+            shard_manager: Arc::new(crate::shard::ShardManager::new(
+                temp_dir.path(),
+                Duration::from_secs(60),
+            )),
+            transport_client: crate::transport::TransportClient::new(),
+            local_node_id: "node-1".into(),
+            raft: None,
+        };
+        (temp_dir, state)
+    }
+
+    #[test]
+    fn route_bulk_doc_reports_missing_primary() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+
+        let err = route_bulk_doc(
+            0,
+            "idx".into(),
+            "doc-1".into(),
+            serde_json::json!({"title": "hello"}),
+            &make_test_metadata(None),
+            &cluster_state,
+        )
+        .unwrap_err();
+
+        assert_eq!(err["index"]["status"], 500);
+        assert_eq!(
+            err["index"]["error"]["type"],
+            "shard_not_available_exception"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_index_reports_missing_primary_node_as_item_error() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        cluster_state.add_index(make_test_metadata(Some("missing-node")));
+
+        let (_tmp, state) = make_test_app_state(cluster_state);
+        let input = axum::body::Bytes::from("{\"index\":{\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n");
+
+        let (status, Json(body)) = bulk_index(
+            State(state),
+            Path("idx".to_string()),
+            Query(RefreshParam { refresh: None }),
+            input,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["errors"], true);
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["index"]["status"], 500);
+        assert_eq!(
+            body["items"][0]["index"]["error"]["type"],
+            "node_not_found_exception"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_index_global_reports_missing_action_index() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+
+        let (_tmp, state) = make_test_app_state(cluster_state);
+        let input = axum::body::Bytes::from("{\"index\":{\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n");
+
+        let (status, Json(body)) =
+            bulk_index_global(State(state), Query(RefreshParam { refresh: None }), input).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["errors"], true);
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["index"]["status"], 400);
+        assert_eq!(
+            body["items"][0]["index"]["error"]["type"],
+            "action_request_validation_exception"
+        );
     }
 }
