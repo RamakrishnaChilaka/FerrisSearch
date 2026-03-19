@@ -2,6 +2,8 @@
 //! Each index has N primary shards. Each shard is backed by a `SearchEngine` implementation.
 //! The ShardManager owns all local shard engines on this node.
 
+use crate::cluster::settings::SettingsManager;
+use crate::cluster::state::IndexSettings;
 use crate::engine::{CompositeEngine, SearchEngine};
 use crate::wal::TranslogDurability;
 use anyhow::Result;
@@ -151,8 +153,9 @@ impl IsrTracker {
 /// Each shard is backed by a `CompositeEngine` (Tantivy text + USearch vector).
 pub struct ShardManager {
     data_dir: PathBuf,
-    refresh_interval: Duration,
     shards: RwLock<HashMap<ShardKey, Arc<dyn SearchEngine>>>,
+    /// Per-index reactive settings managers.
+    settings_managers: RwLock<HashMap<String, Arc<SettingsManager>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
     pub isr_tracker: IsrTracker,
     /// Translog durability mode for new shards.
@@ -166,13 +169,13 @@ impl ShardManager {
 
     pub fn new_with_durability(
         data_dir: impl Into<PathBuf>,
-        refresh_interval: Duration,
+        _refresh_interval: Duration,
         durability: TranslogDurability,
     ) -> Self {
         Self {
             data_dir: data_dir.into(),
-            refresh_interval,
             shards: RwLock::new(HashMap::new()),
+            settings_managers: RwLock::new(HashMap::new()),
             isr_tracker: IsrTracker::new(1000),
             durability,
         }
@@ -189,12 +192,48 @@ impl ShardManager {
         self.open_shard_with_mappings(index, shard_id, &HashMap::new())
     }
 
+    /// Ensure a SettingsManager exists for this index, creating one if necessary.
+    fn ensure_settings_manager(
+        &self,
+        index: &str,
+        settings: &IndexSettings,
+    ) -> Arc<SettingsManager> {
+        {
+            let managers = self
+                .settings_managers
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(mgr) = managers.get(index) {
+                return mgr.clone();
+            }
+        }
+        let mgr = Arc::new(SettingsManager::new(settings));
+        let mut managers = self
+            .settings_managers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        managers.entry(index.to_string()).or_insert(mgr).clone()
+    }
+
     /// Open or create the engine for a specific shard with explicit field mappings.
     pub fn open_shard_with_mappings(
         &self,
         index: &str,
         shard_id: u32,
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        self.open_shard_with_settings(index, shard_id, mappings, &IndexSettings::default())
+    }
+
+    /// Open or create the engine for a specific shard with explicit field mappings
+    /// and per-index settings. The settings manager provides a watch channel so
+    /// the refresh loop automatically adjusts when settings change.
+    pub fn open_shard_with_settings(
+        &self,
+        index: &str,
+        shard_id: u32,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: &IndexSettings,
     ) -> Result<Arc<dyn SearchEngine>> {
         let key = ShardKey::new(index, shard_id);
         {
@@ -204,6 +243,11 @@ impl ShardManager {
             }
         }
 
+        // Ensure a settings manager exists for this index
+        let settings_mgr = self.ensure_settings_manager(index, settings);
+        let refresh_interval = settings_mgr.refresh_interval();
+        let refresh_rx = settings_mgr.watch_refresh_interval();
+
         let shard_dir = self.data_dir.join(&key.data_dir());
         std::fs::create_dir_all(&shard_dir)?;
 
@@ -212,7 +256,7 @@ impl ShardManager {
         // orphaned directory and retry with a fresh index.
         let engine = match CompositeEngine::new_with_mappings(
             &shard_dir,
-            self.refresh_interval,
+            refresh_interval,
             mappings,
             self.durability,
         ) {
@@ -229,7 +273,7 @@ impl ShardManager {
                     std::fs::create_dir_all(&shard_dir)?;
                     Arc::new(CompositeEngine::new_with_mappings(
                         &shard_dir,
-                        self.refresh_interval,
+                        refresh_interval,
                         mappings,
                         self.durability,
                     )?)
@@ -238,7 +282,7 @@ impl ShardManager {
                 }
             }
         };
-        CompositeEngine::start_refresh_loop(engine.clone());
+        CompositeEngine::start_refresh_loop_reactive(engine.clone(), refresh_rx);
 
         // Rebuild vector index from persisted documents (covers crash recovery)
         if let Err(e) = engine.rebuild_vectors() {
@@ -310,6 +354,15 @@ impl ShardManager {
         // Clean ISR tracking for this index
         self.isr_tracker.remove_index(index);
 
+        // Clean settings manager for this index
+        {
+            let mut managers = self
+                .settings_managers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            managers.remove(index);
+        }
+
         let index_dir = self.data_dir.join(index);
         if index_dir.exists() {
             std::fs::remove_dir_all(&index_dir)?;
@@ -320,6 +373,22 @@ impl ShardManager {
             );
         }
         Ok(())
+    }
+
+    /// Apply updated settings to a running index.
+    /// This notifies all shard engines' consumers (e.g. refresh loop) via watch channels.
+    pub fn apply_settings(&self, index: &str, new_settings: &IndexSettings) {
+        let settings_mgr = self.ensure_settings_manager(index, new_settings);
+        settings_mgr.update(new_settings);
+    }
+
+    /// Get the settings manager for an index, if one exists.
+    pub fn get_settings_manager(&self, index: &str) -> Option<Arc<SettingsManager>> {
+        self.settings_managers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index)
+            .cloned()
     }
 }
 
@@ -533,5 +602,124 @@ mod tests {
 
         assert!(mgr.isr_tracker.replica_checkpoints("my-idx", 0).is_empty());
         assert_eq!(mgr.isr_tracker.replica_checkpoints("other-idx", 0).len(), 1);
+    }
+
+    // ── Settings manager integration ────────────────────────────────
+
+    #[tokio::test]
+    async fn open_shard_with_settings_creates_settings_manager() {
+        let (_dir, mgr) = create_shard_manager();
+        let settings = IndexSettings {
+            refresh_interval_ms: Some(2000),
+        };
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings)
+            .unwrap();
+
+        let sm = mgr.get_settings_manager("idx");
+        assert!(sm.is_some());
+        assert_eq!(
+            sm.unwrap().refresh_interval(),
+            std::time::Duration::from_millis(2000)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_settings_manager_returns_none_for_unknown_index() {
+        let (_dir, mgr) = create_shard_manager();
+        assert!(mgr.get_settings_manager("no-such-index").is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_settings_updates_refresh_interval() {
+        let (_dir, mgr) = create_shard_manager();
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default())
+            .unwrap();
+
+        let sm = mgr.get_settings_manager("idx").unwrap();
+        let rx = sm.watch_refresh_interval();
+        assert_eq!(
+            *rx.borrow(),
+            std::time::Duration::from_millis(crate::cluster::settings::DEFAULT_REFRESH_INTERVAL_MS)
+        );
+
+        mgr.apply_settings(
+            "idx",
+            &IndexSettings {
+                refresh_interval_ms: Some(3000),
+            },
+        );
+        assert_eq!(*rx.borrow(), std::time::Duration::from_millis(3000));
+    }
+
+    #[tokio::test]
+    async fn apply_settings_for_new_index_creates_manager() {
+        let (_dir, mgr) = create_shard_manager();
+        assert!(mgr.get_settings_manager("new-idx").is_none());
+
+        mgr.apply_settings(
+            "new-idx",
+            &IndexSettings {
+                refresh_interval_ms: Some(7000),
+            },
+        );
+
+        let sm = mgr.get_settings_manager("new-idx").unwrap();
+        assert_eq!(
+            sm.refresh_interval(),
+            std::time::Duration::from_millis(7000)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_index_shards_removes_settings_manager() {
+        let (_dir, mgr) = create_shard_manager();
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default())
+            .unwrap();
+        assert!(mgr.get_settings_manager("idx").is_some());
+
+        mgr.close_index_shards("idx").unwrap();
+        assert!(mgr.get_settings_manager("idx").is_none());
+    }
+
+    #[tokio::test]
+    async fn open_shard_with_default_settings_uses_cluster_default() {
+        let (_dir, mgr) = create_shard_manager();
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default())
+            .unwrap();
+
+        let sm = mgr.get_settings_manager("idx").unwrap();
+        assert_eq!(
+            sm.refresh_interval(),
+            std::time::Duration::from_millis(crate::cluster::settings::DEFAULT_REFRESH_INTERVAL_MS)
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_shards_share_settings_manager() {
+        let (_dir, mgr) = create_shard_manager();
+        let settings = IndexSettings {
+            refresh_interval_ms: Some(4000),
+        };
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings)
+            .unwrap();
+        mgr.open_shard_with_settings("idx", 1, &HashMap::new(), &settings)
+            .unwrap();
+
+        let sm0 = mgr.get_settings_manager("idx").unwrap();
+        // Both shards use the same settings manager
+        assert_eq!(
+            sm0.refresh_interval(),
+            std::time::Duration::from_millis(4000)
+        );
+
+        // Updating settings affects both shards' watcher
+        let rx = sm0.watch_refresh_interval();
+        mgr.apply_settings(
+            "idx",
+            &IndexSettings {
+                refresh_interval_ms: Some(9000),
+            },
+        );
+        assert_eq!(*rx.borrow(), std::time::Duration::from_millis(9000));
     }
 }

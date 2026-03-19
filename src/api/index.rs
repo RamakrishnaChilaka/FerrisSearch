@@ -68,6 +68,9 @@ pub async fn create_index(
         .pointer("/settings/number_of_replicas")
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u32;
+    let refresh_interval_ms = settings
+        .pointer("/settings/refresh_interval_ms")
+        .and_then(|v| v.as_u64());
 
     let cluster_state = state.cluster_manager.get_state();
 
@@ -97,6 +100,11 @@ pub async fn create_index(
 
     let mut metadata =
         IndexMetadata::build_shard_routing(&index_name, num_shards, num_replicas, &data_nodes);
+
+    // Apply per-index settings
+    if let Some(ms) = refresh_interval_ms {
+        metadata.settings.refresh_interval_ms = Some(ms);
+    }
 
     // Parse field mappings: { "mappings": { "properties": { "title": { "type": "text" }, ... } } }
     if let Some(properties) = settings
@@ -154,15 +162,49 @@ pub async fn create_index(
 
     let shard_assignment = metadata.shard_routing.clone();
     let index_mappings = metadata.mappings.clone();
+    let index_settings = metadata.settings.clone();
 
-    // Write through Raft if available (leader only), otherwise fallback
+    // Write through Raft if available, otherwise fallback
     if let Some(ref raft) = state.raft {
         if !raft.is_leader() {
-            return crate::api::error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "master_not_discovered_exception",
-                "This node is not the Raft leader. Send index creation requests to the master node.",
-            );
+            // Forward to the master via gRPC — this node acts as coordinator
+            let cluster_state_for_fwd = state.cluster_manager.get_state();
+            let master_id = match cluster_state_for_fwd.master_node.as_ref() {
+                Some(id) => id,
+                None => {
+                    return crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        "No master node available to forward index creation",
+                    );
+                }
+            };
+            let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
+                Some(n) => n.clone(),
+                None => {
+                    return crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        "Master node info not found in cluster state",
+                    );
+                }
+            };
+            match state
+                .transport_client
+                .forward_create_index(&master_node, &index_name, &body)
+                .await
+            {
+                Ok(resp) => {
+                    return (StatusCode::OK, Json(resp));
+                }
+                Err(e) => {
+                    return crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "forward_exception",
+                        format!("Failed to forward index creation to master: {}", e),
+                    );
+                }
+            }
         }
         let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
         if let Err(e) = raft.client_write(cmd).await {
@@ -183,10 +225,11 @@ pub async fn create_index(
     for (shard_id, routing) in &shard_assignment {
         if routing.primary == state.local_node_id || routing.replicas.contains(&state.local_node_id)
         {
-            if let Err(e) = state.shard_manager.open_shard_with_mappings(
+            if let Err(e) = state.shard_manager.open_shard_with_settings(
                 &index_name,
                 *shard_id,
                 &index_mappings,
+                &index_settings,
             ) {
                 tracing::error!(
                     "Failed to open shard {} for {}: {}",
@@ -266,6 +309,7 @@ pub async fn index_document(
             number_of_replicas: 0,
             shard_routing,
             mappings: HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         if let Some(ref raft) = state.raft {
             let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
@@ -379,6 +423,7 @@ pub async fn index_document_with_id(
             number_of_replicas: 0,
             shard_routing,
             mappings: HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         if let Some(ref raft) = state.raft {
             let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
@@ -716,6 +761,7 @@ pub async fn bulk_index_global(
                 number_of_replicas: 0,
                 shard_routing,
                 mappings: HashMap::new(),
+                settings: crate::cluster::state::IndexSettings::default(),
             };
             if let Some(ref raft) = state.raft {
                 let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
@@ -873,6 +919,7 @@ pub async fn bulk_index(
             number_of_replicas: 0,
             shard_routing,
             mappings: HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         if let Some(ref raft) = state.raft {
             let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
@@ -1422,6 +1469,209 @@ pub async fn delete_document(
 }
 
 /// DELETE /{index} — Delete an entire index (remove from cluster state, close shards, delete data).
+/// GET /{index}/_settings — Get the current index settings.
+pub async fn get_index_settings(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(msg) = crate::common::validate_index_name(&index_name) {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_index_name_exception",
+            msg,
+        );
+    }
+
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = match cluster_state.indices.get(&index_name) {
+        Some(m) => m,
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name),
+            );
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            index_name.clone(): {
+                "settings": {
+                    "index": {
+                        "number_of_shards": metadata.number_of_shards,
+                        "number_of_replicas": metadata.number_of_replicas,
+                        "refresh_interval_ms": metadata.settings.refresh_interval_ms,
+                    }
+                }
+            }
+        })),
+    )
+}
+
+/// PUT /{index}/_settings — Update dynamic index settings.
+///
+/// Supported dynamic settings:
+/// - `index.number_of_replicas` (u32) — adjusts replica count
+/// - `index.refresh_interval_ms` (u64 | null) — per-index refresh interval
+///
+/// Immutable settings (rejected with 400):
+/// - `index.number_of_shards`
+///
+/// Body format (OpenSearch-compatible):
+/// ```json
+/// {
+///   "index": {
+///     "number_of_replicas": 2,
+///     "refresh_interval_ms": 10000
+///   }
+/// }
+/// ```
+pub async fn update_index_settings(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(msg) = crate::common::validate_index_name(&index_name) {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_index_name_exception",
+            msg,
+        );
+    }
+
+    // Reject static settings
+    if body.pointer("/index/number_of_shards").is_some() {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "index.number_of_shards is immutable and cannot be changed after index creation",
+        );
+    }
+
+    let cluster_state = state.cluster_manager.get_state();
+    let mut metadata = match cluster_state.indices.get(&index_name) {
+        Some(m) => m.clone(),
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name),
+            );
+        }
+    };
+
+    let mut changed = false;
+
+    // Update number_of_replicas
+    if let Some(new_replicas) = body
+        .pointer("/index/number_of_replicas")
+        .and_then(|v| v.as_u64())
+    {
+        let new_replicas = new_replicas as u32;
+        if new_replicas != metadata.number_of_replicas {
+            metadata.update_number_of_replicas(new_replicas);
+            changed = true;
+        }
+    }
+
+    // Update refresh_interval_ms
+    if let Some(val) = body.pointer("/index/refresh_interval_ms") {
+        if val.is_null() {
+            if metadata.settings.refresh_interval_ms.is_some() {
+                metadata.settings.refresh_interval_ms = None;
+                changed = true;
+            }
+        } else if let Some(ms) = val.as_u64() {
+            if metadata.settings.refresh_interval_ms != Some(ms) {
+                metadata.settings.refresh_interval_ms = Some(ms);
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "acknowledged": true })),
+        );
+    }
+
+    // Persist via Raft
+    if let Some(ref raft) = state.raft {
+        if !raft.is_leader() {
+            // Forward to the master via gRPC
+            let cluster_state_for_fwd = state.cluster_manager.get_state();
+            let master_id = match cluster_state_for_fwd.master_node.as_ref() {
+                Some(id) => id,
+                None => {
+                    return crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        "No master node available to forward settings update",
+                    );
+                }
+            };
+            let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
+                Some(n) => n.clone(),
+                None => {
+                    return crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        "Master node info not found in cluster state",
+                    );
+                }
+            };
+            match state
+                .transport_client
+                .forward_update_settings(&master_node, &index_name, &body)
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    return crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "forward_exception",
+                        format!("Failed to forward settings update to master: {}", e),
+                    );
+                }
+            }
+        } else {
+            let cmd = crate::consensus::types::ClusterCommand::UpdateIndex {
+                metadata: metadata.clone(),
+            };
+            if let Err(e) = raft.client_write(cmd).await {
+                return crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "raft_write_exception",
+                    format!("Raft write failed: {}", e),
+                );
+            }
+        }
+    } else {
+        let mut new_state = cluster_state.clone();
+        new_state
+            .indices
+            .insert(index_name.clone(), metadata.clone());
+        new_state.version += 1;
+        state.cluster_manager.update_state(new_state.clone());
+        state.transport_client.publish_state(&new_state).await;
+    }
+
+    // Apply settings to live engines on this node via watch channels
+    state
+        .shard_manager
+        .apply_settings(&index_name, &metadata.settings);
+
+    tracing::info!("Updated settings for index '{}'", index_name);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "acknowledged": true })),
+    )
+}
+
 pub async fn delete_index(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
@@ -1447,21 +1697,53 @@ pub async fn delete_index(
     // Remove from cluster state via Raft if available, otherwise fallback
     if let Some(ref raft) = state.raft {
         if !raft.is_leader() {
-            return crate::api::error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "master_not_discovered_exception",
-                "This node is not the Raft leader. Send index deletion requests to the master node.",
-            );
-        }
-        let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
-            index_name: index_name.clone(),
-        };
-        if let Err(e) = raft.client_write(cmd).await {
-            return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "raft_write_exception",
-                format!("Raft write failed: {}", e),
-            );
+            // Forward to the master via gRPC — this node acts as coordinator
+            let cluster_state_for_fwd = state.cluster_manager.get_state();
+            let master_id = match cluster_state_for_fwd.master_node.as_ref() {
+                Some(id) => id,
+                None => {
+                    return crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        "No master node available to forward index deletion",
+                    );
+                }
+            };
+            let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
+                Some(n) => n.clone(),
+                None => {
+                    return crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        "Master node info not found in cluster state",
+                    );
+                }
+            };
+            match state
+                .transport_client
+                .forward_delete_index(&master_node, &index_name)
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    return crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "forward_exception",
+                        format!("Failed to forward index deletion to master: {}", e),
+                    );
+                }
+            }
+        } else {
+            let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
+                index_name: index_name.clone(),
+            };
+            if let Err(e) = raft.client_write(cmd).await {
+                return crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "raft_write_exception",
+                    format!("Raft write failed: {}", e),
+                );
+            }
         }
     } else {
         let mut new_state = cluster_state.clone();

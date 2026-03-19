@@ -105,6 +105,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing,
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
 
         let routed = route_document("some-doc", &meta);
@@ -121,6 +122,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         assert!(route_document("doc", &meta).is_none());
     }

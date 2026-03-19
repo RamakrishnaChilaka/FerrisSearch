@@ -7,9 +7,14 @@ use ferrissearch::cluster::manager::ClusterManager;
 use ferrissearch::cluster::state::{IndexMetadata, NodeInfo, NodeRole, ShardRoutingEntry};
 use ferrissearch::consensus;
 use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
+use ferrissearch::shard::ShardManager;
+use ferrissearch::transport::TransportClient;
+use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
+use ferrissearch::transport::server::create_transport_service_with_raft;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -41,6 +46,7 @@ fn make_index(name: &str) -> IndexMetadata {
         number_of_replicas: 0,
         shard_routing,
         mappings: std::collections::HashMap::new(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
     }
 }
 
@@ -697,4 +703,397 @@ async fn update_index_removes_dead_replica_and_marks_unassigned() {
         state.indices["rdeath"].shard_routing[&0].unassigned_replicas, 1,
         "lost replica slot marked for reallocation"
     );
+}
+
+// ─── Dynamic Settings Integration Tests ─────────────────────────────────
+
+#[tokio::test]
+async fn update_index_settings_via_raft() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19350".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Create an index with default settings
+    let idx = make_index("settings-test");
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: idx.clone(),
+    })
+    .await
+    .unwrap();
+
+    {
+        let state = state_handle.read().unwrap();
+        assert_eq!(
+            state.indices["settings-test"].settings.refresh_interval_ms,
+            None
+        );
+    }
+
+    // Update settings via UpdateIndex
+    let mut updated = idx.clone();
+    updated.settings.refresh_interval_ms = Some(2000);
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(
+        state.indices["settings-test"].settings.refresh_interval_ms,
+        Some(2000)
+    );
+}
+
+#[tokio::test]
+async fn update_index_settings_preserves_shard_routing() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19351".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let idx = make_index("preserve-routing");
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: idx.clone(),
+    })
+    .await
+    .unwrap();
+
+    // Modify settings but keep routing intact
+    let mut updated = idx.clone();
+    updated.settings.refresh_interval_ms = Some(8000);
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    let meta = &state.indices["preserve-routing"];
+    assert_eq!(meta.settings.refresh_interval_ms, Some(8000));
+    assert_eq!(meta.number_of_shards, 1);
+    assert_eq!(meta.shard_routing[&0].primary, "node-1");
+}
+
+#[tokio::test]
+async fn update_index_replicas_via_raft() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19352".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let idx = make_index("replicas-test");
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: idx.clone(),
+    })
+    .await
+    .unwrap();
+
+    // Increase replicas from 0 to 2
+    let mut updated = idx.clone();
+    updated.update_number_of_replicas(2);
+    updated.settings.refresh_interval_ms = Some(3000);
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    let meta = &state.indices["replicas-test"];
+    assert_eq!(meta.number_of_replicas, 2);
+    assert_eq!(meta.shard_routing[&0].unassigned_replicas, 2);
+    assert_eq!(meta.settings.refresh_interval_ms, Some(3000));
+}
+
+#[tokio::test]
+async fn update_index_settings_reset_to_default() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "test-cluster".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19353".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Create with custom refresh
+    let mut idx = make_index("reset-test");
+    idx.settings.refresh_interval_ms = Some(1000);
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: idx.clone(),
+    })
+    .await
+    .unwrap();
+
+    {
+        let state = state_handle.read().unwrap();
+        assert_eq!(
+            state.indices["reset-test"].settings.refresh_interval_ms,
+            Some(1000)
+        );
+    }
+
+    // Reset to default by setting to None
+    let mut updated = idx.clone();
+    updated.settings.refresh_interval_ms = None;
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
+
+    let state = state_handle.read().unwrap();
+    assert_eq!(
+        state.indices["reset-test"].settings.refresh_interval_ms,
+        None
+    );
+}
+
+// ─── gRPC Coordinator Integration Tests ─────────────────────────────────
+
+/// Start a gRPC server backed by a Raft leader.
+async fn start_raft_grpc_server(
+    raft: Arc<consensus::types::RaftInstance>,
+    state_handle: Arc<std::sync::RwLock<ferrissearch::cluster::state::ClusterState>>,
+) -> std::net::SocketAddr {
+    let cm = Arc::new(ClusterManager::with_shared_state(state_handle));
+    // Add a data node so create_index has nodes to assign shards to
+    {
+        let mut s = cm.get_state();
+        s.add_node(NodeInfo {
+            id: "data-1".into(),
+            name: "data-1".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 0,
+        });
+        cm.update_state(s);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let tc = TransportClient::new();
+    let service = create_transport_service_with_raft(cm, sm, tc, raft);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+        // Keep dir alive so shard data isn't deleted
+        let _ = dir;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+async fn connect_grpc(
+    addr: std::net::SocketAddr,
+) -> InternalTransportClient<tonic::transport::Channel> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    InternalTransportClient::new(channel)
+}
+
+#[tokio::test]
+async fn grpc_create_index_on_leader() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-test".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19360".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+
+    let body = serde_json::json!({
+        "settings": {"number_of_shards": 2, "number_of_replicas": 0}
+    });
+    let resp = client
+        .create_index(tonic::Request::new(
+            ferrissearch::transport::proto::CreateIndexRequest {
+                index_name: "grpc-idx".into(),
+                body_json: serde_json::to_vec(&body).unwrap(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.acknowledged);
+    assert!(resp.error.is_empty());
+
+    let state = state_handle.read().unwrap();
+    assert!(state.indices.contains_key("grpc-idx"));
+    assert_eq!(state.indices["grpc-idx"].number_of_shards, 2);
+}
+
+#[tokio::test]
+async fn grpc_create_index_duplicate_returns_error() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-dup".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19361".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+
+    let body = serde_json::json!({"settings": {"number_of_shards": 1}});
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    // First create succeeds
+    let resp1 = client
+        .create_index(tonic::Request::new(
+            ferrissearch::transport::proto::CreateIndexRequest {
+                index_name: "dup-idx".into(),
+                body_json: body_bytes.clone(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp1.acknowledged);
+
+    // Duplicate returns error
+    let resp2 = client
+        .create_index(tonic::Request::new(
+            ferrissearch::transport::proto::CreateIndexRequest {
+                index_name: "dup-idx".into(),
+                body_json: body_bytes,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!resp2.acknowledged);
+    assert!(resp2.error.contains("already exists"));
+}
+
+#[tokio::test]
+async fn grpc_delete_index_on_leader() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-del".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19362".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    // Pre-create via Raft
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: make_index("to-delete"),
+    })
+    .await
+    .unwrap();
+    {
+        let state = state_handle.read().unwrap();
+        assert!(state.indices.contains_key("to-delete"));
+    }
+
+    let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+
+    let resp = client
+        .delete_index(tonic::Request::new(
+            ferrissearch::transport::proto::DeleteIndexRequest {
+                index_name: "to-delete".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.acknowledged);
+    assert!(resp.error.is_empty());
+
+    let state = state_handle.read().unwrap();
+    assert!(!state.indices.contains_key("to-delete"));
+}
+
+#[tokio::test]
+async fn grpc_delete_nonexistent_index_returns_not_found() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-del-nf".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19363".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let addr = start_raft_grpc_server(raft, state_handle).await;
+    let mut client = connect_grpc(addr).await;
+
+    let result = client
+        .delete_index(tonic::Request::new(
+            ferrissearch::transport::proto::DeleteIndexRequest {
+                index_name: "ghost".into(),
+            },
+        ))
+        .await;
+
+    assert!(result.is_err());
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn grpc_create_index_with_mappings_and_settings() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-map".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19364".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+
+    let body = serde_json::json!({
+        "settings": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+            "refresh_interval_ms": 3000
+        },
+        "mappings": {
+            "properties": {
+                "title": {"type": "text"},
+                "year": {"type": "integer"}
+            }
+        }
+    });
+    let resp = client
+        .create_index(tonic::Request::new(
+            ferrissearch::transport::proto::CreateIndexRequest {
+                index_name: "mapped-idx".into(),
+                body_json: serde_json::to_vec(&body).unwrap(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.acknowledged);
+
+    let state = state_handle.read().unwrap();
+    let meta = &state.indices["mapped-idx"];
+    assert_eq!(meta.settings.refresh_interval_ms, Some(3000));
+    assert!(meta.mappings.contains_key("title"));
+    assert!(meta.mappings.contains_key("year"));
 }

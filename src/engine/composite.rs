@@ -87,6 +87,43 @@ impl CompositeEngine {
         });
     }
 
+    /// Start a reactive refresh loop that adjusts its interval when the
+    /// setting changes via the provided `watch::Receiver`.
+    ///
+    /// Uses `tokio::select!` to either:
+    /// - Sleep for the current interval, then refresh
+    /// - Wake up immediately when the interval setting changes
+    pub fn start_refresh_loop_reactive(
+        engine: Arc<Self>,
+        mut refresh_rx: tokio::sync::watch::Receiver<std::time::Duration>,
+    ) {
+        tokio::spawn(async move {
+            let mut interval = *refresh_rx.borrow_and_update();
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {
+                        if let Err(e) = engine.text.refresh() {
+                            tracing::error!("Background refresh failed: {}", e);
+                        }
+                    }
+                    result = refresh_rx.changed() => {
+                        match result {
+                            Ok(()) => {
+                                interval = *refresh_rx.borrow_and_update();
+                                tracing::info!("Refresh interval updated to {:?}", interval);
+                            }
+                            Err(_) => {
+                                // Sender dropped — settings manager is gone (index deleted)
+                                tracing::info!("Settings channel closed, stopping refresh loop");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Ensure a vector index exists with the given dimensions.
     /// Creates one if it doesn't exist, or returns the existing one.
     fn ensure_vector_index(&self, dimensions: usize) -> Result<()> {

@@ -113,6 +113,14 @@ curl -X PUT 'http://localhost:9200/movies' \
 
 # Delete an index
 curl -X DELETE 'http://localhost:9200/my-index'
+
+# Get index settings
+curl 'http://localhost:9200/my-index/_settings'
+
+# Update dynamic settings (refresh_interval, number_of_replicas)
+curl -X PUT 'http://localhost:9200/my-index/_settings' \
+  -H 'Content-Type: application/json' \
+  -d '{"index": {"refresh_interval": "2s", "number_of_replicas": 2}}'
 ```
 
 **Supported field types:** `text` (analyzed), `keyword` (exact match), `integer`, `float`, `boolean`, `knn_vector`.
@@ -375,9 +383,9 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 436 tests
-cargo test --lib                                # Unit tests (385)
-cargo test --test consensus_integration          # Raft consensus tests (20)
+cargo test                                      # All 476 tests
+cargo test --lib                                # Unit tests (416)
+cargo test --test consensus_integration          # Raft consensus tests (29)
 cargo test --test replication_integration        # Replication tests (31)
 ```
 
@@ -432,7 +440,7 @@ config/            Default configuration
 - [x] Update document API (`POST /{index}/_update/{id}`)
 - [ ] Index aliases
 - [ ] Index templates
-- [ ] Dynamic settings updates (`number_of_replicas`, `refresh_interval`)
+- [x] Dynamic settings updates (`number_of_replicas`, `refresh_interval`)
 - [ ] Document versioning and optimistic concurrency control
 
 ### Cluster Reliability

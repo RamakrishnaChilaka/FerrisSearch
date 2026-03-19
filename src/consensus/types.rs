@@ -115,6 +115,7 @@ mod tests {
                 number_of_replicas: 0,
                 shard_routing: HashMap::new(),
                 mappings: std::collections::HashMap::new(),
+                settings: crate::cluster::state::IndexSettings::default(),
             },
         };
         assert_eq!(format!("{}", cmd), "CreateIndex(test-idx)");
@@ -178,6 +179,7 @@ mod tests {
                 number_of_replicas: 1,
                 shard_routing,
                 mappings: std::collections::HashMap::new(),
+                settings: crate::cluster::state::IndexSettings::default(),
             },
         };
 
