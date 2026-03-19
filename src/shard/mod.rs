@@ -3,6 +3,7 @@
 //! The ShardManager owns all local shard engines on this node.
 
 use crate::engine::{CompositeEngine, SearchEngine};
+use crate::wal::TranslogDurability;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -154,15 +155,26 @@ pub struct ShardManager {
     shards: RwLock<HashMap<ShardKey, Arc<dyn SearchEngine>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
     pub isr_tracker: IsrTracker,
+    /// Translog durability mode for new shards.
+    durability: TranslogDurability,
 }
 
 impl ShardManager {
     pub fn new(data_dir: impl Into<PathBuf>, refresh_interval: Duration) -> Self {
+        Self::new_with_durability(data_dir, refresh_interval, TranslogDurability::Request)
+    }
+
+    pub fn new_with_durability(
+        data_dir: impl Into<PathBuf>,
+        refresh_interval: Duration,
+        durability: TranslogDurability,
+    ) -> Self {
         Self {
             data_dir: data_dir.into(),
             refresh_interval,
             shards: RwLock::new(HashMap::new()),
-            isr_tracker: IsrTracker::new(1000), // default: replicas within 1000 seq_nos are in-sync
+            isr_tracker: IsrTracker::new(1000),
+            durability,
         }
     }
 
@@ -199,7 +211,7 @@ impl ShardManager {
         // from a previous run whose index was already deleted/re-created), wipe the
         // orphaned directory and retry with a fresh index.
         let engine =
-            match CompositeEngine::new_with_mappings(&shard_dir, self.refresh_interval, mappings) {
+            match CompositeEngine::new_with_mappings(&shard_dir, self.refresh_interval, mappings, self.durability) {
                 Ok(e) => Arc::new(e),
                 Err(first_err) => {
                     let err_msg = first_err.to_string();
@@ -215,6 +227,7 @@ impl ShardManager {
                             &shard_dir,
                             self.refresh_interval,
                             mappings,
+                            self.durability,
                         )?)
                     } else {
                         return Err(first_err);

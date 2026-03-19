@@ -13,10 +13,21 @@ pub struct AppConfig {
     /// Unique numeric node ID for Raft consensus (must be unique across cluster).
     #[serde(default = "default_raft_node_id")]
     pub raft_node_id: u64,
+    /// Translog durability: "request" (fsync per write, default) or "async" (timer-based fsync).
+    #[serde(default = "default_translog_durability")]
+    pub translog_durability: String,
+    /// Interval in ms for background translog fsync. Only used when durability is "async".
+    /// Defaults to 5000ms if unset.
+    #[serde(default)]
+    pub translog_sync_interval_ms: Option<u64>,
 }
 
 fn default_raft_node_id() -> u64 {
     1
+}
+
+fn default_translog_durability() -> String {
+    "request".to_string()
 }
 
 impl Default for AppConfig {
@@ -29,6 +40,8 @@ impl Default for AppConfig {
             data_dir: "./data".into(),
             seed_hosts: vec!["127.0.0.1:9300".into()],
             raft_node_id: 1,
+            translog_durability: "request".to_string(),
+            translog_sync_interval_ms: None,
         }
     }
 }
@@ -46,6 +59,7 @@ impl AppConfig {
             .set_default("data_dir", default.data_dir)?
             .set_default("seed_hosts", default.seed_hosts)?
             .set_default("raft_node_id", default.raft_node_id)?
+            .set_default("translog_durability", default.translog_durability)?
             .add_source(File::with_name("config/ferrissearch").required(false))
             .add_source(Environment::with_prefix("FERRISSEARCH").list_separator(","));
 
@@ -53,5 +67,70 @@ impl AppConfig {
         let app_config: AppConfig = config.try_deserialize()?;
 
         Ok(app_config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_translog_durability_is_request() {
+        let config = AppConfig::default();
+        assert_eq!(config.translog_durability, "request");
+    }
+
+    #[test]
+    fn default_translog_sync_interval_is_none() {
+        let config = AppConfig::default();
+        assert!(config.translog_sync_interval_ms.is_none());
+    }
+
+    #[test]
+    fn deserialize_async_durability_with_interval() {
+        let json = r#"{
+            "node_name": "n1",
+            "cluster_name": "test",
+            "http_port": 9200,
+            "transport_port": 9300,
+            "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "translog_durability": "async",
+            "translog_sync_interval_ms": 3000
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.translog_durability, "async");
+        assert_eq!(config.translog_sync_interval_ms, Some(3000));
+    }
+
+    #[test]
+    fn deserialize_request_durability_without_interval() {
+        let json = r#"{
+            "node_name": "n1",
+            "cluster_name": "test",
+            "http_port": 9200,
+            "transport_port": 9300,
+            "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "translog_durability": "request"
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.translog_durability, "request");
+        assert!(config.translog_sync_interval_ms.is_none());
+    }
+
+    #[test]
+    fn deserialize_omitted_durability_defaults_to_request() {
+        let json = r#"{
+            "node_name": "n1",
+            "cluster_name": "test",
+            "http_port": 9200,
+            "transport_port": 9300,
+            "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"]
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.translog_durability, "request");
+        assert!(config.translog_sync_interval_ms.is_none());
     }
 }

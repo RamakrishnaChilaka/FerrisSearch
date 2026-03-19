@@ -42,7 +42,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterCommand::SetMaster { node_id }`
 
 ## Test Suite
-- 358 unit tests + 20 consensus integration + 31 replication integration = 409 total
+- 385 unit tests + 20 consensus integration + 31 replication integration = 436 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -65,6 +65,8 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 ## Config
 - `config/ferrissearch.yml` for defaults
 - `FERRISSEARCH_*` env vars override (e.g., FERRISSEARCH_RAFT_NODE_ID, FERRISSEARCH_NODE_NAME)
+- `translog_durability`: `"request"` (default, fsync per write) or `"async"` (timer-based fsync)
+- `translog_sync_interval_ms`: background fsync interval for async mode (default 5000ms, only used when durability is `"async"`)
 
 ## Development Workflow
 When implementing any feature or fix:

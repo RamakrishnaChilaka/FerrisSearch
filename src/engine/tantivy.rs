@@ -9,7 +9,7 @@ use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use super::SearchEngine;
-use crate::wal::{HotTranslog, WriteAheadLog};
+use crate::wal::{HotTranslog, TranslogDurability, WriteAheadLog};
 
 /// Dynamic field registry — maps user-facing field names to Tantivy Field handles.
 /// New fields are added on first encounter (dynamic mapping, like OpenSearch).
@@ -37,7 +37,7 @@ pub struct HotEngine {
 
 impl HotEngine {
     pub fn new<P: AsRef<Path>>(data_dir: P, refresh_interval: Duration) -> Result<Self> {
-        Self::new_with_mappings(data_dir, refresh_interval, &HashMap::new())
+        Self::new_with_mappings(data_dir, refresh_interval, &HashMap::new(), TranslogDurability::Request)
     }
 
     /// Create a new HotEngine with explicit field mappings.
@@ -47,6 +47,7 @@ impl HotEngine {
         data_dir: P,
         refresh_interval: Duration,
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         let index_path = data_dir.join("index");
@@ -103,7 +104,10 @@ impl HotEngine {
             .try_into()?;
 
         // Open or create the translog in the data directory (not index_path)
-        let translog = HotTranslog::open(data_dir)?;
+        let translog = HotTranslog::open_with_durability(data_dir, durability)?;
+        if matches!(durability, TranslogDurability::Async { .. }) {
+            translog.start_sync_task();
+        }
 
         let field_registry = FieldRegistry {
             id_field,
@@ -1884,7 +1888,7 @@ mod tests {
     ) -> (tempfile::TempDir, HotEngine) {
         let dir = tempfile::tempdir().unwrap();
         let engine =
-            HotEngine::new_with_mappings(dir.path(), Duration::from_secs(60), &mappings).unwrap();
+            HotEngine::new_with_mappings(dir.path(), Duration::from_secs(60), &mappings, TranslogDurability::Request).unwrap();
         (dir, engine)
     }
 

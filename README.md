@@ -27,7 +27,7 @@ FerrisSearch is a lightweight, Rust-native search engine with OpenSearch-compati
 - **Distributed clustering** — multi-node clusters with shard-based data distribution
 - **Synchronous replication** — primary-replica replication over gRPC; writes acknowledged only after all in-sync replicas confirm
 - **Scatter-gather search** — queries fan out across shards, results merged and returned
-- **Crash recovery** — binary write-ahead log (WAL) with fsync-on-write durability; sequence number checkpointing and translog-based replica recovery
+- **Crash recovery** — binary write-ahead log (WAL) with configurable durability (`request` fsync-per-write or `async` timer-based); sequence number checkpointing and translog-based replica recovery
 - **Zero external dependencies** — no JVM, no Zookeeper, just a single binary
 
 ## Getting Started
@@ -82,6 +82,8 @@ Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variable
 | `data_dir` | `./data` | Data storage directory |
 | `seed_hosts` | `["127.0.0.1:9300"]` | Seed nodes for discovery |
 | `raft_node_id` | `1` | Unique Raft consensus node ID |
+| `translog_durability` | `request` | Translog fsync mode: `request` (per-write) or `async` (timer) |
+| `translog_sync_interval_ms` | (unset) | Background fsync interval when durability is `async` (default: 5000) |
 
 ## API Reference
 
@@ -373,8 +375,8 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 409 tests
-cargo test --lib                                # Unit tests (358)
+cargo test                                      # All 436 tests
+cargo test --lib                                # Unit tests (385)
 cargo test --test consensus_integration          # Raft consensus tests (20)
 cargo test --test replication_integration        # Replication tests (31)
 ```
@@ -464,6 +466,7 @@ config/            Default configuration
 - [ ] Remote storage backends (S3, GCS, Azure Blob)
 - [ ] Tiered storage (hot/warm/cold)
 - [x] Translog retention policies (checkpoint-based)
+- [x] Configurable translog durability (`request` / `async`)
 - [ ] Rolling translog segments
 
 ### Observability
