@@ -308,7 +308,7 @@ impl TransportClient {
             let partial_aggs = if response.partial_aggs_json.is_empty() {
                 std::collections::HashMap::new()
             } else {
-                serde_json::from_slice(&response.partial_aggs_json).unwrap_or_default()
+                crate::search::decode_partial_aggs(&response.partial_aggs_json).unwrap_or_default()
             };
             Ok((hits, response.total_hits as usize, partial_aggs))
         } else {

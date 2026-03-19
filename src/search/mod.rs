@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
+
 /// Top-level search request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
@@ -223,6 +225,92 @@ pub enum PartialAggResult {
     Metric { value: Option<f64> },
     /// Histogram buckets: key → doc_count
     Histogram { buckets: Vec<HistogramBucket> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum WirePartialAggResult {
+    Terms {
+        buckets: Vec<TermsBucket>,
+    },
+    Stats {
+        count: u64,
+        sum: f64,
+        min: f64,
+        max: f64,
+    },
+    Metric {
+        value: Option<f64>,
+    },
+    Histogram {
+        buckets: Vec<HistogramBucket>,
+    },
+}
+
+impl From<&PartialAggResult> for WirePartialAggResult {
+    fn from(value: &PartialAggResult) -> Self {
+        match value {
+            PartialAggResult::Terms { buckets } => Self::Terms {
+                buckets: buckets.clone(),
+            },
+            PartialAggResult::Stats {
+                count,
+                sum,
+                min,
+                max,
+            } => Self::Stats {
+                count: *count,
+                sum: *sum,
+                min: *min,
+                max: *max,
+            },
+            PartialAggResult::Metric { value } => Self::Metric { value: *value },
+            PartialAggResult::Histogram { buckets } => Self::Histogram {
+                buckets: buckets.clone(),
+            },
+        }
+    }
+}
+
+impl From<WirePartialAggResult> for PartialAggResult {
+    fn from(value: WirePartialAggResult) -> Self {
+        match value {
+            WirePartialAggResult::Terms { buckets } => Self::Terms { buckets },
+            WirePartialAggResult::Stats {
+                count,
+                sum,
+                min,
+                max,
+            } => Self::Stats {
+                count,
+                sum,
+                min,
+                max,
+            },
+            WirePartialAggResult::Metric { value } => Self::Metric { value },
+            WirePartialAggResult::Histogram { buckets } => Self::Histogram { buckets },
+        }
+    }
+}
+
+pub fn encode_partial_aggs(
+    partials: &HashMap<String, PartialAggResult>,
+) -> Result<Vec<u8>, bincode_next::error::EncodeError> {
+    let wire: HashMap<String, WirePartialAggResult> = partials
+        .iter()
+        .map(|(name, partial)| (name.clone(), WirePartialAggResult::from(partial)))
+        .collect();
+    bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
+}
+
+pub fn decode_partial_aggs(
+    bytes: &[u8],
+) -> Result<HashMap<String, PartialAggResult>, bincode_next::error::DecodeError> {
+    let (wire, _): (HashMap<String, WirePartialAggResult>, usize) =
+        bincode_next::serde::decode_from_slice(bytes, BINCODE_CONFIG)?;
+    Ok(wire
+        .into_iter()
+        .map(|(name, partial)| (name, partial.into()))
+        .collect())
 }
 
 /// A single bucket in a terms aggregation result.
@@ -1914,6 +2002,60 @@ mod tests {
         assert_eq!(buckets[0]["doc_count"], 3); // 2 + 1
         assert_eq!(buckets[1]["key"], "action");
         assert_eq!(buckets[1]["doc_count"], 1);
+    }
+
+    #[test]
+    fn partial_agg_bincode_roundtrip() {
+        let partials = HashMap::from([
+            (
+                "genres".to_string(),
+                PartialAggResult::Terms {
+                    buckets: vec![
+                        TermsBucket {
+                            key: "books".into(),
+                            doc_count: 2,
+                        },
+                        TermsBucket {
+                            key: "toys".into(),
+                            doc_count: 1,
+                        },
+                    ],
+                },
+            ),
+            (
+                "price_stats".to_string(),
+                PartialAggResult::Stats {
+                    count: 3,
+                    sum: 60.0,
+                    min: 10.0,
+                    max: 30.0,
+                },
+            ),
+        ]);
+
+        let bytes = encode_partial_aggs(&partials).unwrap();
+        let decoded = decode_partial_aggs(&bytes).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        let PartialAggResult::Terms { buckets } = &decoded["genres"] else {
+            panic!("expected terms partial");
+        };
+        assert_eq!(buckets[0].key, "books");
+        assert_eq!(buckets[0].doc_count, 2);
+
+        let PartialAggResult::Stats {
+            count,
+            sum,
+            min,
+            max,
+        } = decoded["price_stats"]
+        else {
+            panic!("expected stats partial");
+        };
+        assert_eq!(count, 3);
+        assert_eq!(sum, 60.0);
+        assert_eq!(min, 10.0);
+        assert_eq!(max, 30.0);
     }
 
     #[test]

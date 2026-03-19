@@ -905,7 +905,7 @@ enum SegmentAggEntry {
     },
     TermsStr {
         column: tantivy::columnar::StrColumn,
-        counts: std::collections::HashMap<String, u64>,
+        counts: std::collections::HashMap<u64, u64>,
     },
     TermsNum {
         column: NumCol,
@@ -1081,12 +1081,8 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
                     }
                 }
                 SegmentAggEntry::TermsStr { column, counts } => {
-                    let mut s = String::new();
                     for ord in column.term_ords(doc) {
-                        s.clear();
-                        if column.ord_to_str(ord, &mut s).unwrap_or(false) {
-                            *counts.entry(s.clone()).or_insert(0) += 1;
-                        }
+                        *counts.entry(ord).or_insert(0) += 1;
                     }
                 }
                 SegmentAggEntry::TermsNum { column, counts } => {
@@ -1124,8 +1120,18 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
                     SegmentAggEntry::Histogram {
                         interval, buckets, ..
                     } => SegmentAggData::Histogram { interval, buckets },
-                    SegmentAggEntry::TermsStr { counts, .. }
-                    | SegmentAggEntry::TermsNum { counts, .. } => SegmentAggData::Terms { counts },
+                    SegmentAggEntry::TermsStr { column, counts } => {
+                        let mut resolved = std::collections::HashMap::with_capacity(counts.len());
+                        let mut s = String::new();
+                        for (ord, count) in counts {
+                            s.clear();
+                            if column.ord_to_str(ord, &mut s).unwrap_or(false) {
+                                *resolved.entry(s.clone()).or_insert(0) += count;
+                            }
+                        }
+                        SegmentAggData::Terms { counts: resolved }
+                    }
+                    SegmentAggEntry::TermsNum { counts, .. } => SegmentAggData::Terms { counts },
                     SegmentAggEntry::Skip => return None,
                 };
                 Some((name, data))
@@ -1278,6 +1284,12 @@ impl super::SearchEngine for HotEngine {
         } else {
             None
         };
+
+        // size=0 requests never need hits, so skip TopDocs entirely.
+        if req.size == 0 {
+            let (partial_aggs, total) = searcher.search(&*query, &(agg_collector, Count))?;
+            return Ok((Vec::new(), total, partial_aggs.unwrap_or_default()));
+        }
 
         // Fast-field sort: push sorting into Tantivy collector for numeric fields
         if let Some((sort_field, order)) = self.extract_fast_field_sort(req) {
@@ -1495,7 +1507,7 @@ mod tests {
         }
         engine.refresh().unwrap();
 
-        // With size=0, only 100 hits are collected, but total should be 200
+        // With size=0, hits are skipped entirely but total should still count all matches.
         let req = SearchRequest {
             query: QueryClause::MatchAll(json!({})),
             size: 0,
@@ -1506,10 +1518,71 @@ mod tests {
         };
         let (results, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 200, "total should count all matching docs");
-        assert!(
-            results.len() <= 100,
-            "hits should be limited by max(from+size, 100)"
+        assert!(results.is_empty(), "size=0 should skip hit materialization");
+    }
+
+    #[test]
+    fn size_zero_with_aggs_returns_no_hits_and_partial_aggs() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::{AggregationRequest, MetricAggParams, TermsAggParams};
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "category".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
         );
+        mappings.insert(
+            "price".into(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document("d1", json!({"category": "books", "price": 10.0}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"category": "books", "price": 20.0}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"category": "toys", "price": 30.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let mut aggs = HashMap::new();
+        aggs.insert(
+            "top_categories".into(),
+            AggregationRequest::Terms(TermsAggParams {
+                field: "category".into(),
+                size: 10,
+            }),
+        );
+        aggs.insert(
+            "price_stats".into(),
+            AggregationRequest::Stats(MetricAggParams {
+                field: "price".into(),
+            }),
+        );
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs,
+        };
+        let (results, total, partial_aggs) = engine.search_query(&req).unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(total, 3);
+        assert!(partial_aggs.contains_key("top_categories"));
+        assert!(partial_aggs.contains_key("price_stats"));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use ferrissearch::cluster::manager::ClusterManager;
 use ferrissearch::cluster::state::{
-    IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
+    FieldMapping, FieldType, IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
 };
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
@@ -807,6 +807,130 @@ async fn search_shard_dsl_match_all_via_grpc() {
 
     assert!(resp.success, "match_all failed: {}", resp.error);
     assert_eq!(resp.hits.len(), 4, "expected 4 hits for match_all");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("agg-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+
+    let mut mappings = HashMap::new();
+    mappings.insert(
+        "category".into(),
+        FieldMapping {
+            field_type: FieldType::Keyword,
+            dimension: None,
+        },
+    );
+    mappings.insert(
+        "price".into(),
+        FieldMapping {
+            field_type: FieldType::Float,
+            dimension: None,
+        },
+    );
+
+    let mut cs = cm.get_state();
+    cs.add_index(IndexMetadata {
+        name: "agg-idx".into(),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings,
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    cm.update_state(cs);
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "agg-idx",
+            0,
+            "d1",
+            serde_json::json!({"category": "books", "price": 10.0})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "agg-idx",
+            0,
+            "d2",
+            serde_json::json!({"category": "books", "price": 20.0})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut client,
+            "agg-idx",
+            0,
+            "d3",
+            serde_json::json!({"category": "toys", "price": 30.0})
+        )
+        .await
+    );
+    refresh_all(&sm);
+
+    let search_req = serde_json::json!({
+        "query": {"match_all": {}},
+        "size": 0,
+        "aggs": {
+            "top_categories": {"terms": {"field": "category", "size": 10}},
+            "price_stats": {"stats": {"field": "price"}}
+        }
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "agg-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "agg search failed: {}", resp.error);
+    assert!(resp.hits.is_empty(), "size=0 should not return hits");
+
+    let partial_aggs = ferrissearch::search::decode_partial_aggs(&resp.partial_aggs_json).unwrap();
+
+    let ferrissearch::search::PartialAggResult::Terms { buckets } =
+        partial_aggs["top_categories"].clone()
+    else {
+        panic!("expected terms partial result");
+    };
+    assert_eq!(buckets[0].key, "books");
+    assert_eq!(buckets[0].doc_count, 2);
+
+    let ferrissearch::search::PartialAggResult::Stats {
+        count,
+        sum,
+        min,
+        max,
+    } = partial_aggs["price_stats"].clone()
+    else {
+        panic!("expected stats partial result");
+    };
+    assert_eq!(count, 3);
+    assert_eq!(sum, 60.0);
+    assert_eq!(min, 10.0);
+    assert_eq!(max, 30.0);
 }
 
 #[tokio::test]

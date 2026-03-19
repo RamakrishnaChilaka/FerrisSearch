@@ -609,7 +609,7 @@ impl InternalTransport for TransportService {
         let aggs_json = if partial_aggs.is_empty() {
             vec![]
         } else {
-            serde_json::to_vec(&partial_aggs).unwrap_or_default()
+            crate::search::encode_partial_aggs(&partial_aggs).unwrap_or_default()
         };
 
         Ok(Response::new(ShardSearchResponse {
