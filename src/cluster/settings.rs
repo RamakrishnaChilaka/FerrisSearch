@@ -51,7 +51,6 @@ pub struct SettingsManager {
     values: std::sync::RwLock<IndexSettings>,
 
     // ── Watch channels (one per reactive setting) ───────────────────
-
     /// Refresh interval watch channel — consumed by the background refresh loop.
     refresh_interval_tx: watch::Sender<Duration>,
 }

@@ -103,11 +103,9 @@ pub struct FieldMapping {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct IndexSettings {
     // ── Common settings ─────────────────────────────────────────────
-
     /// Refresh interval in milliseconds. `None` = use cluster default (5000ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_interval_ms: Option<u64>,
-
     // ── Future: shardless engine settings ────────────────────────────
     // When switching to a Quickwit-style engine, add fields here:
     //   pub split_max_merge_factor: Option<u32>,

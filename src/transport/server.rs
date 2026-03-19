@@ -843,8 +843,8 @@ impl InternalTransport for TransportService {
             ));
         }
 
-        let body: serde_json::Value = serde_json::from_slice(&req.body_json)
-            .unwrap_or(serde_json::json!({}));
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body_json).unwrap_or(serde_json::json!({}));
 
         let num_shards = body
             .pointer("/settings/number_of_shards")
@@ -880,7 +880,10 @@ impl InternalTransport for TransportService {
         }
 
         let mut metadata = crate::cluster::state::IndexMetadata::build_shard_routing(
-            index_name, num_shards, num_replicas, &data_nodes,
+            index_name,
+            num_shards,
+            num_replicas,
+            &data_nodes,
         );
 
         if let Some(ms) = refresh_interval_ms {
@@ -979,10 +982,7 @@ impl InternalTransport for TransportService {
 
         let cluster_state = self.cluster_manager.get_state();
         if !cluster_state.indices.contains_key(index_name) {
-            return Err(Status::not_found(format!(
-                "no such index [{}]",
-                index_name
-            )));
+            return Err(Status::not_found(format!("no such index [{}]", index_name)));
         }
 
         let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
@@ -994,11 +994,7 @@ impl InternalTransport for TransportService {
 
         // Close local shard engines and delete data on this (leader) node
         if let Err(e) = self.shard_manager.close_index_shards(index_name) {
-            tracing::error!(
-                "Failed to close shards for index '{}': {}",
-                index_name,
-                e
-            );
+            tracing::error!("Failed to close shards for index '{}': {}", index_name, e);
         }
 
         tracing::info!("gRPC: deleted index '{}'", index_name);
@@ -1048,11 +1044,8 @@ impl InternalTransport for TransportService {
             m.borrow_watched().last_applied
         };
 
-        let transfer_req = openraft::raft::TransferLeaderRequest::new(
-            vote,
-            target_info.raft_node_id,
-            last_log_id,
-        );
+        let transfer_req =
+            openraft::raft::TransferLeaderRequest::new(vote, target_info.raft_node_id, last_log_id);
         raft.handle_transfer_leader(transfer_req)
             .await
             .map_err(|e| Status::internal(format!("Transfer leader failed: {}", e)))?;

@@ -46,7 +46,7 @@ fn make_index(name: &str) -> IndexMetadata {
         number_of_replicas: 0,
         shard_routing,
         mappings: std::collections::HashMap::new(),
-            settings: ferrissearch::cluster::state::IndexSettings::default(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
     }
 }
 
@@ -736,11 +736,9 @@ async fn update_index_settings_via_raft() {
     // Update settings via UpdateIndex
     let mut updated = idx.clone();
     updated.settings.refresh_interval_ms = Some(2000);
-    raft.client_write(ClusterCommand::UpdateIndex {
-        metadata: updated,
-    })
-    .await
-    .unwrap();
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
 
     let state = state_handle.read().unwrap();
     assert_eq!(
@@ -769,11 +767,9 @@ async fn update_index_settings_preserves_shard_routing() {
     // Modify settings but keep routing intact
     let mut updated = idx.clone();
     updated.settings.refresh_interval_ms = Some(8000);
-    raft.client_write(ClusterCommand::UpdateIndex {
-        metadata: updated,
-    })
-    .await
-    .unwrap();
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
 
     let state = state_handle.read().unwrap();
     let meta = &state.indices["preserve-routing"];
@@ -803,11 +799,9 @@ async fn update_index_replicas_via_raft() {
     let mut updated = idx.clone();
     updated.update_number_of_replicas(2);
     updated.settings.refresh_interval_ms = Some(3000);
-    raft.client_write(ClusterCommand::UpdateIndex {
-        metadata: updated,
-    })
-    .await
-    .unwrap();
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
 
     let state = state_handle.read().unwrap();
     let meta = &state.indices["replicas-test"];
@@ -846,11 +840,9 @@ async fn update_index_settings_reset_to_default() {
     // Reset to default by setting to None
     let mut updated = idx.clone();
     updated.settings.refresh_interval_ms = None;
-    raft.client_write(ClusterCommand::UpdateIndex {
-        metadata: updated,
-    })
-    .await
-    .unwrap();
+    raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
+        .await
+        .unwrap();
 
     let state = state_handle.read().unwrap();
     assert_eq!(
@@ -903,7 +895,9 @@ async fn start_raft_grpc_server(
     addr
 }
 
-async fn connect_grpc(addr: std::net::SocketAddr) -> InternalTransportClient<tonic::transport::Channel> {
+async fn connect_grpc(
+    addr: std::net::SocketAddr,
+) -> InternalTransportClient<tonic::transport::Channel> {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
         .unwrap()
         .connect()

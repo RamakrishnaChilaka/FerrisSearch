@@ -647,9 +647,7 @@ mod tests {
             roles: vec![],
             raft_node_id: 1,
         };
-        let result = client
-            .forward_transfer_master(&master, "target-node")
-            .await;
+        let result = client.forward_transfer_master(&master, "target-node").await;
         assert!(result.is_err());
     }
 }

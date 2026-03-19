@@ -102,7 +102,7 @@ fn setup_two_node_cluster_state(cm: &ClusterManager, index_name: &str, replica_p
         number_of_replicas: 1,
         shard_routing,
         mappings: std::collections::HashMap::new(),
-            settings: ferrissearch::cluster::state::IndexSettings::default(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
     cm.update_state(cs);
 }

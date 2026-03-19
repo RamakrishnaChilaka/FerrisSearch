@@ -193,15 +193,25 @@ impl ShardManager {
     }
 
     /// Ensure a SettingsManager exists for this index, creating one if necessary.
-    fn ensure_settings_manager(&self, index: &str, settings: &IndexSettings) -> Arc<SettingsManager> {
+    fn ensure_settings_manager(
+        &self,
+        index: &str,
+        settings: &IndexSettings,
+    ) -> Arc<SettingsManager> {
         {
-            let managers = self.settings_managers.read().unwrap_or_else(|e| e.into_inner());
+            let managers = self
+                .settings_managers
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(mgr) = managers.get(index) {
                 return mgr.clone();
             }
         }
         let mgr = Arc::new(SettingsManager::new(settings));
-        let mut managers = self.settings_managers.write().unwrap_or_else(|e| e.into_inner());
+        let mut managers = self
+            .settings_managers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         managers.entry(index.to_string()).or_insert(mgr).clone()
     }
 
@@ -346,7 +356,10 @@ impl ShardManager {
 
         // Clean settings manager for this index
         {
-            let mut managers = self.settings_managers.write().unwrap_or_else(|e| e.into_inner());
+            let mut managers = self
+                .settings_managers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             managers.remove(index);
         }
 
