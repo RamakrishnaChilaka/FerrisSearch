@@ -51,11 +51,11 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 
 ## Fast-Field Aggregations (Single-Pass Collector)
 - Aggregations run in the same Tantivy pass as hit collection via custom `AggCollector` (implements `tantivy::collector::Collector`)
-- Combined with TopDocs via tuple collector: `(TopDocs, Option<AggCollector>, Count)` -- `None` = zero overhead when no aggs
-- `AggSegmentCollector::collect(doc, score)` reads fast-field columns and accumulates stats/terms/histogram per segment
+- Hit-returning queries combine collectors as `(TopDocs, Option<AggCollector>, Count)`; agg-only `size=0` queries skip `TopDocs` entirely and run `(Option<AggCollector>, Count)`
+- `AggSegmentCollector::collect(doc, score)` reads fast-field columns and accumulates stats/terms/histogram per segment; string `terms` aggs count ords per segment and resolve ord→string once in `harvest()`
 - `merge_fruits()` merges per-segment data, returns `HashMap<String, PartialAggResult>` per shard
-- Per-shard partial results returned through gRPC `partial_aggs_json`, merged at coordinator via `merge_aggregations()`
-- O(matching_docs) with minimal memory -- no JSON materialization, single query execution pass
+- Per-shard partial results are serialized into the gRPC `partial_aggs_json` bytes field with `bincode-next`, then merged at coordinator via `merge_aggregations()`
+- O(matching_docs) with minimal memory; agg-only queries avoid hit materialization and still run in a single query execution pass
 
 ## Tantivy Type Safety Gotchas
 - **NEVER** create `Term` objects directly with `Term::from_field_text/i64/f64` in query building — always use `self.typed_term(field, value)` which checks the schema field type
@@ -76,7 +76,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 416 unit tests + 29 consensus integration + 31 replication integration = 476 total
+- 437 unit tests + 29 consensus integration + 35 replication integration = 501 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -315,7 +315,7 @@ KnnParams { vector: Vec<f32>, k: usize, filter: Option<QueryClause> }  // option
 - `Stats { field }` — min, max, sum, count, avg
 - `Min/Max/Avg/Sum/ValueCount { field }` — single metric
 - `Histogram { field, interval }` — fixed-interval numeric buckets
-- Per-shard: `compute_aggregations()` → coordinator: `merge_aggregations()`
+- Per-shard: Tantivy `AggCollector` produces partial results → coordinator: `merge_aggregations()`
 
 ### Sort
 - `SortClause::Simple(String)` — `"_score"` or field name
