@@ -48,14 +48,18 @@ pub struct TransportService {
 Implements `InternalTransport` trait. All RPC handlers check Raft leadership or route to the correct shard.
 
 ### Key Handler Patterns
-- **join_cluster**: Leader registers node via Raft (`AddNode` + `add_learner` + `change_membership`)
-- **index_doc / delete_doc / get_doc**: Look up shard in ShardManager, execute engine operation
+- **join_cluster**: If leader → registers node via Raft (`AddNode` + `add_learner` + `change_membership`). If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
+- **index_doc / bulk_index / delete_doc**: Look up shard in ShardManager, execute engine operation, replicate to all replicas. **Returns `success: false` if replication fails** — write is only acknowledged after all ISR replicas confirm (synchronous replication contract).
 - **replicate_doc / replicate_bulk**: Apply to local replica engine, return checkpoint
 - **recover_replica**: Read WAL entries via `read_from()`, return operations
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **raft_vote / raft_append_entries / raft_snapshot**: Deserialize JSON, forward to Raft instance
 - **create_index / delete_index**: Must be leader; execute via `raft.client_write()`
 - **update_settings**: Must be leader; apply via `UpdateIndex` Raft command
+
+### Critical Invariants
+- **join_cluster MUST forward on followers**: A follower receiving a JoinCluster RPC must forward it to the Raft leader. It must NEVER fall through to `cluster_manager.add_node()` when Raft is active, as this would add the node to local state without Raft membership.
+- **Shard writes MUST fail on replication failure**: The `index_doc`, `bulk_index`, and `delete_doc` handlers must return `success: false` when `replicate_write()` / `replicate_bulk()` returns `Err`. Logging the error and returning `success: true` violates the synchronous replication contract.
 
 ## TransportClient (src/transport/client.rs)
 ```rust
@@ -64,21 +68,24 @@ pub struct TransportClient {
 }
 ```
 - **Connection pooling**: reuses gRPC channels per node address
-- `get_or_connect(addr)` — lazy connection establishment
+- `connect(host, port)` — lazy connection establishment (public, used by server for join forwarding)
 
 ### Forwarding Methods
 | Method | Purpose |
-|--------|---------|
+|--------|--------|
 | `forward_create_index()` | Forward index creation to leader |
 | `forward_delete_index()` | Forward index deletion to leader |
 | `forward_update_settings()` | Forward settings update to leader |
 | `forward_transfer_master()` | Forward leadership transfer |
-| `forward_index_to_shard()` | Route doc write to shard primary |
-| `forward_delete_to_shard()` | Route doc delete to shard primary |
+| `forward_index_to_shard()` | Route doc write to shard primary — returns `Err` on shard failure |
+| `forward_delete_to_shard()` | Route doc delete to shard primary — returns `Err` on shard failure |
 | `forward_get_to_shard()` | Route doc get to shard primary |
-| `forward_bulk_to_shard()` | Route bulk write to shard primary |
+| `forward_bulk_to_shard()` | Route bulk write to shard primary — returns `Err` on shard failure |
 | `forward_search_to_shard()` | Scatter search to remote shard |
 | `forward_search_dsl_to_shard()` | Scatter DSL search to remote shard |
 | `replicate_to_shard()` | Primary → replica single write |
 | `replicate_bulk_to_shard()` | Primary → replica batch write |
 | `recover_replica()` | Request missed ops from primary's WAL |
+
+### Critical Invariant: Shard Forwarding Must Propagate Errors
+`forward_index_to_shard()` and `forward_bulk_to_shard()` MUST return `Err(...)` when the shard RPC returns `success: false`. Never wrap a shard failure in `Ok(json!({"error": ...}))` — this hides failures from API handlers, causing them to return HTTP 201 for failed writes.

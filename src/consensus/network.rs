@@ -72,7 +72,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
 
         if !resp.error.is_empty() {
             return Err(RPCError::Unreachable(Unreachable::new(
-                &std::io::Error::new(std::io::ErrorKind::Other, resp.error),
+                &std::io::Error::other(resp.error),
             )));
         }
 
@@ -98,7 +98,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
 
         if !resp.error.is_empty() {
             return Err(RPCError::Unreachable(Unreachable::new(
-                &std::io::Error::new(std::io::ErrorKind::Other, resp.error),
+                &std::io::Error::other(resp.error),
             )));
         }
 
@@ -115,10 +115,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
         let mut client = self.connect().await.map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("{}", e),
-            )))
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!("{}", e))))
         })?;
 
         // Read snapshot data
@@ -130,35 +127,32 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
             "data": snapshot_data,
         });
         let data = serde_json::to_vec(&payload).map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("{}", e),
-            )))
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!("{}", e))))
         })?;
 
         let resp = client
             .raft_snapshot(tonic::Request::new(RaftRequest { data }))
             .await
             .map_err(|e| {
-                StreamingError::Unreachable(Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("{}", e),
-                )))
+                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                    "{}",
+                    e
+                ))))
             })?
             .into_inner();
 
         if !resp.error.is_empty() {
             return Err(StreamingError::Unreachable(Unreachable::new(
-                &std::io::Error::new(std::io::ErrorKind::Other, resp.error),
+                &std::io::Error::other(resp.error),
             )));
         }
 
         let result: SnapshotResponse<TypeConfig> =
             serde_json::from_slice(&resp.data).map_err(|e| {
-                StreamingError::Unreachable(Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("{}", e),
-                )))
+                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                    "{}",
+                    e
+                ))))
             })?;
         Ok(result)
     }

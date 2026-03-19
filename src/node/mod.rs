@@ -235,15 +235,14 @@ impl Node {
 
                         // ── Leader duties ──────────────────────────
                         // Ensure master_node is set to us
-                        if state.master_node.as_deref() != Some(&local_id) {
-                            if let Err(e) = raft
+                        if state.master_node.as_deref() != Some(&local_id)
+                            && let Err(e) = raft
                                 .client_write(ClusterCommand::SetMaster {
                                     node_id: local_id.clone(),
                                 })
                                 .await
-                            {
-                                tracing::warn!("Failed to set master: {}", e);
-                            }
+                        {
+                            tracing::warn!("Failed to set master: {}", e);
                         }
 
                         // Grace period: don't scan for dead nodes until followers
@@ -269,7 +268,7 @@ impl Node {
                             // 1. Find all indices where the dead node hosts a primary or replica
                             // 2. For orphaned primaries: pick best replica (highest checkpoint) and promote
                             // 3. For lost replicas: increment unassigned count for re-allocation
-                            for (_idx_name, idx_meta) in &state.indices {
+                            for idx_meta in state.indices.values() {
                                 let mut updated = idx_meta.clone();
                                 let orphaned_primaries = updated.remove_node(dead);
                                 let mut changed = false;
@@ -325,50 +324,42 @@ impl Node {
                                 if orphaned_primaries.is_empty() {
                                     // Dead node was a replica for some shards in this index
                                     for (shard_id, routing) in &idx_meta.shard_routing {
-                                        if routing.replicas.contains(dead) {
-                                            if let Some(r) = updated.shard_routing.get_mut(shard_id)
-                                            {
-                                                r.unassigned_replicas += 1;
-                                                changed = true;
-                                            }
+                                        if routing.replicas.contains(dead)
+                                            && let Some(r) = updated.shard_routing.get_mut(shard_id)
+                                        {
+                                            r.unassigned_replicas += 1;
+                                            changed = true;
                                         }
                                     }
                                 }
 
-                                if changed {
-                                    if let Err(e) = raft
+                                if changed
+                                    && let Err(e) = raft
                                         .client_write(ClusterCommand::UpdateIndex {
                                             metadata: updated,
                                         })
                                         .await
-                                    {
-                                        tracing::error!(
-                                            "Failed to update shard routing for '{}' after node death: {}",
-                                            idx_meta.name,
-                                            e
-                                        );
-                                    }
+                                {
+                                    tracing::error!(
+                                        "Failed to update shard routing for '{}' after node death: {}",
+                                        idx_meta.name,
+                                        e
+                                    );
                                 }
                             }
 
                             // Remove from Raft membership first
-                            if let Some(dead_info) = state.nodes.get(dead) {
-                                if dead_info.raft_node_id > 0 {
-                                    let remaining: std::collections::BTreeSet<u64> = raft
-                                        .voter_ids()
-                                        .filter(|id| *id != dead_info.raft_node_id)
-                                        .collect();
-                                    if !remaining.is_empty() {
-                                        if let Err(e) =
-                                            raft.change_membership(remaining, false).await
-                                        {
-                                            tracing::error!(
-                                                "Failed to remove {} from Raft: {}",
-                                                dead,
-                                                e
-                                            );
-                                        }
-                                    }
+                            if let Some(dead_info) = state.nodes.get(dead)
+                                && dead_info.raft_node_id > 0
+                            {
+                                let remaining: std::collections::BTreeSet<u64> = raft
+                                    .voter_ids()
+                                    .filter(|id| *id != dead_info.raft_node_id)
+                                    .collect();
+                                if !remaining.is_empty()
+                                    && let Err(e) = raft.change_membership(remaining, false).await
+                                {
+                                    tracing::error!("Failed to remove {} from Raft: {}", dead, e);
                                 }
                             }
 
@@ -395,7 +386,7 @@ impl Node {
                             .map(|n| n.id.clone())
                             .collect();
 
-                        for (_idx_name, idx_meta) in &state.indices {
+                        for idx_meta in state.indices.values() {
                             if idx_meta.unassigned_replica_count() > 0 {
                                 let mut updated = idx_meta.clone();
                                 if updated.allocate_unassigned_replicas(&data_nodes) {
@@ -424,19 +415,18 @@ impl Node {
 
                         // ── Follower duties ────────────────────────
                         // Ping the master for health monitoring
-                        if let Some(master_id) = &state.master_node {
-                            if let Some(master_info) = state.nodes.get(master_id) {
-                                if let Err(e) = client.send_ping(master_info, &local_id).await {
-                                    tracing::warn!("Failed to ping master {}: {}", master_id, e);
-                                }
-                            }
+                        if let Some(master_id) = &state.master_node
+                            && let Some(master_info) = state.nodes.get(master_id)
+                            && let Err(e) = client.send_ping(master_info, &local_id).await
+                        {
+                            tracing::warn!("Failed to ping master {}: {}", master_id, e);
                         }
 
                         // ── Replica recovery ────────────────────────
                         // Check if we host any replica shards that need translog-based recovery.
                         // For each shard where we are a replica, compare our local checkpoint
                         // against the primary and request missing operations if behind.
-                        for (_idx_name, idx_meta) in &state.indices {
+                        for idx_meta in state.indices.values() {
                             for (shard_id, routing) in &idx_meta.shard_routing {
                                 // Only process shards where we are a replica
                                 if !routing.replicas.contains(&local_id) {

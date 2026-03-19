@@ -9,6 +9,104 @@ use futures::future::join_all;
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Auto-create an index with 1 shard, respecting the coordinator pattern.
+/// If Raft is active and this node is NOT the leader, forwards to the master.
+async fn auto_create_index(
+    state: &AppState,
+    index_name: &str,
+    cluster_state: &crate::cluster::state::ClusterState,
+) -> Result<IndexMetadata, (StatusCode, Json<Value>)> {
+    tracing::warn!(
+        "Index '{}' not found, auto-creating with 1 shard",
+        index_name
+    );
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(
+        0u32,
+        crate::cluster::state::ShardRoutingEntry {
+            primary: state.local_node_id.clone(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    let m = IndexMetadata {
+        name: index_name.to_string(),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings: HashMap::new(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    };
+    if let Some(ref raft) = state.raft {
+        if !raft.is_leader() {
+            // Forward auto-create to the leader via gRPC
+            let master_id = match cluster_state.master_node.as_ref() {
+                Some(id) => id,
+                None => {
+                    return Err(crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        "No master node available to forward auto-create index",
+                    ));
+                }
+            };
+            let master_node = match cluster_state.nodes.get(master_id) {
+                Some(n) => n.clone(),
+                None => {
+                    return Err(crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        "Master node info not found in cluster state",
+                    ));
+                }
+            };
+            let body = serde_json::json!({
+                "settings": { "number_of_shards": 1, "number_of_replicas": 0 }
+            });
+            let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+            match state
+                .transport_client
+                .forward_create_index(&master_node, index_name, &body_bytes)
+                .await
+            {
+                Ok(_) => {
+                    // Re-read cluster state after leader has created the index
+                    let updated_cs = state.cluster_manager.get_state();
+                    if let Some(created_meta) = updated_cs.indices.get(index_name) {
+                        return Ok(created_meta.clone());
+                    }
+                    // Raft replication may not have arrived yet; use our local metadata
+                    return Ok(m);
+                }
+                Err(e) => {
+                    return Err(crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "forward_exception",
+                        format!("Auto-create index forward to master failed: {}", e),
+                    ));
+                }
+            }
+        }
+        let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
+            metadata: m.clone(),
+        };
+        if let Err(e) = raft.client_write(cmd).await {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "raft_write_exception",
+                format!("Auto-create index via Raft failed: {}", e),
+            ));
+        }
+    } else {
+        let mut new_state = cluster_state.clone();
+        new_state.add_index(m.clone());
+        state.cluster_manager.update_state(new_state.clone());
+        state.transport_client.publish_state(&new_state).await;
+    }
+    let _ = state.shard_manager.open_shard(index_name, 0);
+    Ok(m)
+}
+
 /// Query parameter for `?refresh=true|false|wait_for`.
 /// Matches the OpenSearch refresh parameter on indexing endpoints.
 #[derive(serde::Deserialize, Default)]
@@ -20,10 +118,7 @@ impl RefreshParam {
     /// Returns true when the caller explicitly requested an immediate refresh.
     /// OpenSearch treats `?refresh`, `?refresh=true`, and `?refresh=""` as "refresh now".
     fn should_refresh(&self) -> bool {
-        match self.as_deref() {
-            Some("true") | Some("") => true,
-            _ => false,
-        }
+        matches!(self.as_deref(), Some("true") | Some(""))
     }
 
     fn as_deref(&self) -> Option<&str> {
@@ -223,21 +318,21 @@ pub async fn create_index(
 
     // Open local shard engines for shards assigned to this node (primary or replica)
     for (shard_id, routing) in &shard_assignment {
-        if routing.primary == state.local_node_id || routing.replicas.contains(&state.local_node_id)
-        {
-            if let Err(e) = state.shard_manager.open_shard_with_settings(
+        if (routing.primary == state.local_node_id
+            || routing.replicas.contains(&state.local_node_id))
+            && let Err(e) = state.shard_manager.open_shard_with_settings(
                 &index_name,
                 *shard_id,
                 &index_mappings,
                 &index_settings,
-            ) {
-                tracing::error!(
-                    "Failed to open shard {} for {}: {}",
-                    shard_id,
-                    index_name,
-                    e
-                );
-            }
+            )
+        {
+            tracing::error!(
+                "Failed to open shard {} for {}: {}",
+                shard_id,
+                index_name,
+                e
+            );
         }
     }
 
@@ -290,46 +385,10 @@ pub async fn index_document(
     let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
         m.clone()
     } else {
-        tracing::warn!(
-            "Index '{}' not found, auto-creating with 1 shard",
-            index_name
-        );
-        let mut shard_routing = HashMap::new();
-        shard_routing.insert(
-            0u32,
-            crate::cluster::state::ShardRoutingEntry {
-                primary: state.local_node_id.clone(),
-                replicas: vec![],
-                unassigned_replicas: 0,
-            },
-        );
-        let m = IndexMetadata {
-            name: index_name.clone(),
-            number_of_shards: 1,
-            number_of_replicas: 0,
-            shard_routing,
-            mappings: HashMap::new(),
-            settings: crate::cluster::state::IndexSettings::default(),
-        };
-        if let Some(ref raft) = state.raft {
-            let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
-                metadata: m.clone(),
-            };
-            if let Err(e) = raft.client_write(cmd).await {
-                return crate::api::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "raft_write_exception",
-                    format!("Auto-create index via Raft failed: {}", e),
-                );
-            }
-        } else {
-            let mut new_state = cluster_state.clone();
-            new_state.add_index(m.clone());
-            state.cluster_manager.update_state(new_state.clone());
-            state.transport_client.publish_state(&new_state).await;
+        match auto_create_index(&state, &index_name, &cluster_state).await {
+            Ok(m) => m,
+            Err(err_resp) => return err_resp,
         }
-        let _ = state.shard_manager.open_shard(&index_name, 0);
-        m
     };
 
     // Route document to the correct shard
@@ -363,10 +422,10 @@ pub async fn index_document(
         .await
     {
         Ok(res) => {
-            if refresh_param.should_refresh() {
-                if let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id) {
-                    let _ = engine.refresh();
-                }
+            if refresh_param.should_refresh()
+                && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
+            {
+                let _ = engine.refresh();
             }
             (StatusCode::CREATED, Json(res))
         }
@@ -404,46 +463,10 @@ pub async fn index_document_with_id(
     let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
         m.clone()
     } else {
-        tracing::warn!(
-            "Index '{}' not found, auto-creating with 1 shard",
-            index_name
-        );
-        let mut shard_routing = HashMap::new();
-        shard_routing.insert(
-            0u32,
-            crate::cluster::state::ShardRoutingEntry {
-                primary: state.local_node_id.clone(),
-                replicas: vec![],
-                unassigned_replicas: 0,
-            },
-        );
-        let m = IndexMetadata {
-            name: index_name.clone(),
-            number_of_shards: 1,
-            number_of_replicas: 0,
-            shard_routing,
-            mappings: HashMap::new(),
-            settings: crate::cluster::state::IndexSettings::default(),
-        };
-        if let Some(ref raft) = state.raft {
-            let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
-                metadata: m.clone(),
-            };
-            if let Err(e) = raft.client_write(cmd).await {
-                return crate::api::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "raft_write_exception",
-                    format!("Auto-create index via Raft failed: {}", e),
-                );
-            }
-        } else {
-            let mut new_state = cluster_state.clone();
-            new_state.add_index(m.clone());
-            state.cluster_manager.update_state(new_state.clone());
-            state.transport_client.publish_state(&new_state).await;
+        match auto_create_index(&state, &index_name, &cluster_state).await {
+            Ok(m) => m,
+            Err(err_resp) => return err_resp,
         }
-        let _ = state.shard_manager.open_shard(&index_name, 0);
-        m
     };
 
     // Route document to the correct shard
@@ -477,10 +500,10 @@ pub async fn index_document_with_id(
         .await
     {
         Ok(res) => {
-            if refresh_param.should_refresh() {
-                if let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id) {
-                    let _ = engine.refresh();
-                }
+            if refresh_param.should_refresh()
+                && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
+            {
+                let _ = engine.refresh();
             }
             (StatusCode::CREATED, Json(res))
         }
@@ -515,21 +538,20 @@ pub async fn refresh_index(
     if shards.is_empty() {
         if let Some(meta) = metadata {
             for (shard_id, routing) in &meta.shard_routing {
-                if routing.primary == state.local_node_id
-                    || routing.replicas.contains(&state.local_node_id)
-                {
-                    if let Err(e) = state.shard_manager.open_shard_with_mappings(
+                if (routing.primary == state.local_node_id
+                    || routing.replicas.contains(&state.local_node_id))
+                    && let Err(e) = state.shard_manager.open_shard_with_mappings(
                         &index_name,
                         *shard_id,
                         &meta.mappings,
-                    ) {
-                        tracing::error!(
-                            "Refresh: failed to open shard {}/{}: {}",
-                            index_name,
-                            shard_id,
-                            e
-                        );
-                    }
+                    )
+                {
+                    tracing::error!(
+                        "Refresh: failed to open shard {}/{}: {}",
+                        index_name,
+                        shard_id,
+                        e
+                    );
                 }
             }
             shards = state.shard_manager.get_index_shards(&index_name);
@@ -584,21 +606,20 @@ pub async fn flush_index(
     if shards.is_empty() {
         if let Some(meta) = metadata {
             for (shard_id, routing) in &meta.shard_routing {
-                if routing.primary == state.local_node_id
-                    || routing.replicas.contains(&state.local_node_id)
-                {
-                    if let Err(e) = state.shard_manager.open_shard_with_mappings(
+                if (routing.primary == state.local_node_id
+                    || routing.replicas.contains(&state.local_node_id))
+                    && let Err(e) = state.shard_manager.open_shard_with_mappings(
                         &index_name,
                         *shard_id,
                         &meta.mappings,
-                    ) {
-                        tracing::error!(
-                            "Flush: failed to open shard {}/{}: {}",
-                            index_name,
-                            shard_id,
-                            e
-                        );
-                    }
+                    )
+                {
+                    tracing::error!(
+                        "Flush: failed to open shard {}/{}: {}",
+                        index_name,
+                        shard_id,
+                        e
+                    );
                 }
             }
             shards = state.shard_manager.get_index_shards(&index_name);
@@ -648,52 +669,51 @@ fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
     let mut docs = Vec::new();
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     while let Some(action_line) = lines.next() {
-        if let Some(doc_line) = lines.next() {
-            if let Ok(mut doc) = serde_json::from_str::<Value>(doc_line) {
-                // Parse action metadata
-                let action_meta =
-                    serde_json::from_str::<Value>(action_line)
-                        .ok()
-                        .and_then(|action| {
-                            action
-                                .as_object()
-                                .and_then(|obj| obj.values().next().cloned())
-                        });
-
-                let action_id = action_meta
-                    .as_ref()
-                    .and_then(|m| m.get("_id").and_then(|v| v.as_str().map(String::from)));
-
-                let action_index = action_meta
-                    .as_ref()
-                    .and_then(|m| m.get("_index").and_then(|v| v.as_str().map(String::from)));
-
-                let doc_id = if let Some(id) = action_id {
-                    id
-                } else if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
-                    id.to_string()
-                } else if let Some(id) = doc.get("_doc_id").and_then(|v| v.as_str()) {
-                    id.to_string()
-                } else {
-                    uuid::Uuid::new_v4().to_string()
-                };
-                // Strip id metadata from stored payload
-                if let Some(obj) = doc.as_object_mut() {
-                    obj.remove("_id");
-                    obj.remove("_doc_id");
-                }
-                // If doc has _source wrapper, unwrap it
-                let payload = if let Some(source) = doc.get("_source").cloned() {
-                    source
-                } else {
-                    doc
-                };
-                docs.push(BulkDoc {
-                    doc_id,
-                    index: action_index,
-                    payload,
+        if let Some(doc_line) = lines.next()
+            && let Ok(mut doc) = serde_json::from_str::<Value>(doc_line)
+        {
+            // Parse action metadata
+            let action_meta = serde_json::from_str::<Value>(action_line)
+                .ok()
+                .and_then(|action| {
+                    action
+                        .as_object()
+                        .and_then(|obj| obj.values().next().cloned())
                 });
+
+            let action_id = action_meta
+                .as_ref()
+                .and_then(|m| m.get("_id").and_then(|v| v.as_str().map(String::from)));
+
+            let action_index = action_meta
+                .as_ref()
+                .and_then(|m| m.get("_index").and_then(|v| v.as_str().map(String::from)));
+
+            let doc_id = if let Some(id) = action_id {
+                id
+            } else if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
+                id.to_string()
+            } else if let Some(id) = doc.get("_doc_id").and_then(|v| v.as_str()) {
+                id.to_string()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            // Strip id metadata from stored payload
+            if let Some(obj) = doc.as_object_mut() {
+                obj.remove("_id");
+                obj.remove("_doc_id");
             }
+            // If doc has _source wrapper, unwrap it
+            let payload = if let Some(source) = doc.get("_source").cloned() {
+                source
+            } else {
+                doc
+            };
+            docs.push(BulkDoc {
+                doc_id,
+                index: action_index,
+                payload,
+            });
         }
     }
     docs
@@ -745,29 +765,9 @@ pub async fn bulk_index_global(
         let metadata = if let Some(m) = cluster_state.indices.get(index_name) {
             m.clone()
         } else {
-            // Auto-create index
-            let mut shard_routing = HashMap::new();
-            shard_routing.insert(
-                0u32,
-                crate::cluster::state::ShardRoutingEntry {
-                    primary: state.local_node_id.clone(),
-                    replicas: vec![],
-                    unassigned_replicas: 0,
-                },
-            );
-            let m = IndexMetadata {
-                name: index_name.clone(),
-                number_of_shards: 1,
-                number_of_replicas: 0,
-                shard_routing,
-                mappings: HashMap::new(),
-                settings: crate::cluster::state::IndexSettings::default(),
-            };
-            if let Some(ref raft) = state.raft {
-                let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
-                    metadata: m.clone(),
-                };
-                if let Err(e) = raft.client_write(cmd).await {
+            match auto_create_index(&state, index_name, &cluster_state).await {
+                Ok(m) => m,
+                Err(_) => {
                     has_errors = true;
                     for (id, _) in batch {
                         all_items.push(serde_json::json!({
@@ -775,20 +775,13 @@ pub async fn bulk_index_global(
                                 "_index": index_name,
                                 "_id": id,
                                 "status": 500,
-                                "error": { "type": "raft_write_exception", "reason": format!("{}", e) }
+                                "error": { "type": "auto_create_exception", "reason": "Failed to auto-create index" }
                             }
                         }));
                     }
                     continue;
                 }
-            } else {
-                let mut new_state = cluster_state.clone();
-                new_state.add_index(m.clone());
-                state.cluster_manager.update_state(new_state.clone());
-                state.transport_client.publish_state(&new_state).await;
             }
-            let _ = state.shard_manager.open_shard(index_name, 0);
-            m
         };
 
         // Route docs to shards
@@ -904,42 +897,10 @@ pub async fn bulk_index(
     let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
         m.clone()
     } else {
-        let mut shard_routing = HashMap::new();
-        shard_routing.insert(
-            0u32,
-            crate::cluster::state::ShardRoutingEntry {
-                primary: state.local_node_id.clone(),
-                replicas: vec![],
-                unassigned_replicas: 0,
-            },
-        );
-        let m = IndexMetadata {
-            name: index_name.clone(),
-            number_of_shards: 1,
-            number_of_replicas: 0,
-            shard_routing,
-            mappings: HashMap::new(),
-            settings: crate::cluster::state::IndexSettings::default(),
-        };
-        if let Some(ref raft) = state.raft {
-            let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
-                metadata: m.clone(),
-            };
-            if let Err(e) = raft.client_write(cmd).await {
-                return crate::api::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "raft_write_exception",
-                    format!("Auto-create index via Raft failed: {}", e),
-                );
-            }
-        } else {
-            let mut new_state = cluster_state.clone();
-            new_state.add_index(m.clone());
-            state.cluster_manager.update_state(new_state.clone());
-            state.transport_client.publish_state(&new_state).await;
+        match auto_create_index(&state, &index_name, &cluster_state).await {
+            Ok(m) => m,
+            Err(err_resp) => return err_resp,
         }
-        let _ = state.shard_manager.open_shard(&index_name, 0);
-        m
     };
 
     // Group docs by (node_id, shard_id) — each shard on each node gets its own batch
@@ -1070,37 +1031,37 @@ pub async fn search_documents_dsl(
     }
 
     // k-NN vector search on local shards (if knn clause present)
-    if let Some(ref knn) = search_req.knn {
-        if let Some((field_name, params)) = knn.fields.iter().next() {
-            for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
-                match engine.search_knn_filtered(
-                    field_name,
-                    &params.vector,
-                    params.k,
-                    params.filter.as_ref(),
-                ) {
-                    Ok(hits) => {
-                        for hit in hits {
-                            knn_hits.push(serde_json::json!({
-                                "_index": index_name,
-                                "_shard": shard_id,
-                                "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
-                                "_score": hit.get("_score"),
-                                "_source": hit.get("_source"),
-                                "_knn_field": hit.get("_knn_field"),
-                                "_knn_distance": hit.get("_knn_distance"),
-                            }));
-                        }
+    if let Some(ref knn) = search_req.knn
+        && let Some((field_name, params)) = knn.fields.iter().next()
+    {
+        for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
+            match engine.search_knn_filtered(
+                field_name,
+                &params.vector,
+                params.k,
+                params.filter.as_ref(),
+            ) {
+                Ok(hits) => {
+                    for hit in hits {
+                        knn_hits.push(serde_json::json!({
+                            "_index": index_name,
+                            "_shard": shard_id,
+                            "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "_score": hit.get("_score"),
+                            "_source": hit.get("_source"),
+                            "_knn_field": hit.get("_knn_field"),
+                            "_knn_distance": hit.get("_knn_distance"),
+                        }));
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            "Vector search on {}/shard_{} failed: {}",
-                            index_name,
-                            shard_id,
-                            e
-                        );
-                        failed += 1;
-                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Vector search on {}/shard_{} failed: {}",
+                        index_name,
+                        shard_id,
+                        e
+                    );
+                    failed += 1;
                 }
             }
         }
@@ -1583,11 +1544,11 @@ pub async fn update_index_settings(
                 metadata.settings.refresh_interval_ms = None;
                 changed = true;
             }
-        } else if let Some(ms) = val.as_u64() {
-            if metadata.settings.refresh_interval_ms != Some(ms) {
-                metadata.settings.refresh_interval_ms = Some(ms);
-                changed = true;
-            }
+        } else if let Some(ms) = val.as_u64()
+            && metadata.settings.refresh_interval_ms != Some(ms)
+        {
+            metadata.settings.refresh_interval_ms = Some(ms);
+            changed = true;
         }
     }
 

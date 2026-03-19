@@ -30,7 +30,7 @@ pub async fn replicate_bulk(
 2. Primary writes to WAL → assigns monotonic `seq_no`
 3. Primary indexes in Tantivy + USearch, updates local checkpoint
 4. Primary calls `replicate_write()` / `replicate_bulk()`
-5. gRPC sends to ALL replicas in shard's routing entry (in parallel)
+5. gRPC sends to ALL replicas concurrently via `tokio::spawn` + `join_all` (fan-out)
 6. Each replica: applies write, updates its local checkpoint, returns checkpoint
 7. Primary updates ISR tracker with returned checkpoints
 8. Primary computes global checkpoint (min of all replica checkpoints)
@@ -52,6 +52,8 @@ pub async fn replicate_bulk(
 
 ## Key Design Decisions
 - **Synchronous replication**: primary waits for ALL ISR replicas before ACK
+- **Concurrent fan-out**: replicas are contacted in parallel via `tokio::spawn` + `join_all` — write latency = max(replica RTTs), not sum
 - Replicas are identified by node_id in `ShardRoutingEntry.replicas`
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - ISR tracking is on the primary via `ShardManager.isr_tracker`
+- Primary shard handlers (`index_doc`, `bulk_index`, `delete_doc`) MUST return `success: false` when replication fails — never swallow replication errors

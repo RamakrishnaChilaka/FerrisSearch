@@ -34,7 +34,7 @@ impl TransportClient {
     }
 
     /// Connect to a remote node's gRPC transport endpoint, reusing cached channels.
-    async fn connect(
+    pub async fn connect(
         &self,
         host: &str,
         port: u16,
@@ -153,7 +153,7 @@ impl TransportClient {
                 "result": "created"
             }))
         } else {
-            Ok(serde_json::json!({ "error": response.error }))
+            Err(anyhow::anyhow!("Shard index failed: {}", response.error))
         }
     }
 
@@ -192,7 +192,10 @@ impl TransportClient {
                 "items": response.doc_ids.iter().map(|id| serde_json::json!({ "index": { "_id": id, "result": "created" } })).collect::<Vec<_>>()
             }))
         } else {
-            Ok(serde_json::json!({ "error": response.error }))
+            Err(anyhow::anyhow!(
+                "Shard bulk index failed: {}",
+                response.error
+            ))
         }
     }
 
@@ -321,6 +324,7 @@ impl TransportClient {
     }
 
     /// Replicate a single document operation to a replica shard on a remote node.
+    #[allow(clippy::too_many_arguments)]
     pub async fn replicate_to_shard(
         &self,
         node: &NodeInfo,

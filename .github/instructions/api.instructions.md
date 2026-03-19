@@ -98,6 +98,19 @@ Used by: index, update, delete, bulk endpoints.
 - **`_source` wrapper**: unwrapped before storage
 - **Missing IDs**: UUID auto-generated
 
+## Auto-Create Index (Coordinator Pattern)
+Document and bulk handlers auto-create missing indices via `auto_create_index()`. This helper:
+- Checks `raft.is_leader()` before writing
+- If NOT leader → forwards `CreateIndex` to master via `forward_create_index()` gRPC
+- If leader → commits directly via `raft.client_write(CreateIndex)`
+- NEVER calls `raft.client_write()` from a follower node
+
+All four auto-create callsites use this shared helper:
+- `index_document()` (POST `/{index}/_doc`)
+- `index_document_with_id()` (PUT `/{index}/_doc/{id}`)
+- `bulk_index_global()` (POST `/_bulk`)
+- `bulk_index()` (POST `/{index}/_bulk`)
+
 ## Coordinator Pattern (CRITICAL)
 **Every node is a coordinator.** See copilot-instructions.md for the full pattern.
 NEVER return "not the leader" errors — always forward transparently.

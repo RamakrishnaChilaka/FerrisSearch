@@ -149,8 +149,7 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, io::Error> {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let data =
-            serde_json::to_vec(&state).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec(&state).map_err(io::Error::other)?;
 
         let snapshot_id = format!("snap-{}", self.last_applied.map(|l| l.index).unwrap_or(0));
 
@@ -177,8 +176,7 @@ pub struct ClusterSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for ClusterSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot, io::Error> {
-        let data =
-            serde_json::to_vec(&self.state).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec(&self.state).map_err(io::Error::other)?;
 
         let snapshot_id = format!("snap-{}", self.last_applied.map(|l| l.index).unwrap_or(0));
 

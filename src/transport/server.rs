@@ -146,9 +146,37 @@ impl InternalTransport for TransportService {
             ni.id, joining_raft_id
         );
 
-        // If Raft is active and we are the leader, register the node through Raft
+        // If Raft is active, only the leader can process joins.
+        // Followers must forward to the leader — never mutate cluster state locally.
         if let Some(ref raft) = self.raft {
-            if raft.is_leader() && joining_raft_id > 0 {
+            if !raft.is_leader() {
+                // Forward join to the Raft leader
+                let cs = self.cluster_manager.get_state();
+                let master_id = cs.master_node.as_ref().ok_or_else(|| {
+                    Status::unavailable("No master node available to forward join request")
+                })?;
+                let master_node = cs.nodes.get(master_id).ok_or_else(|| {
+                    Status::unavailable("Master node info not found in cluster state")
+                })?;
+                let proto_node_fwd = node_info_to_proto(&ni);
+                let mut client = self
+                    .transport_client
+                    .connect(&master_node.host, master_node.transport_port)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to connect to master for join: {}", e))
+                    })?;
+                let fwd_request = tonic::Request::new(JoinRequest {
+                    node_info: Some(proto_node_fwd),
+                    raft_node_id: joining_raft_id,
+                });
+                let fwd_response = client.join_cluster(fwd_request).await.map_err(|e| {
+                    Status::internal(format!("Failed to forward join to master: {}", e))
+                })?;
+                return Ok(fwd_response);
+            }
+
+            if joining_raft_id > 0 {
                 ni.raft_node_id = joining_raft_id;
 
                 // 1. Register the node in cluster state via Raft
@@ -179,7 +207,7 @@ impl InternalTransport for TransportService {
             }
         }
 
-        // Fallback: legacy join (no Raft or not leader)
+        // Fallback: legacy join (no Raft configured at all)
         self.cluster_manager.add_node(ni);
         let state = self.cluster_manager.get_state();
         Ok(Response::new(JoinResponse {
@@ -280,6 +308,11 @@ impl InternalTransport for TransportService {
                             req.shard_id,
                             errors
                         );
+                        return Ok(Response::new(ShardDocResponse {
+                            success: false,
+                            doc_id: id,
+                            error: format!("Replication failed: {}", errors.join("; ")),
+                        }));
                     }
                 }
                 Ok(Response::new(ShardDocResponse {
@@ -303,23 +336,19 @@ impl InternalTransport for TransportService {
         let req = request.into_inner();
         let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
 
-        let docs: Vec<(String, serde_json::Value)> = req
-            .documents_json
-            .iter()
-            .map(|b| {
-                let val: serde_json::Value = serde_json::from_slice(b).map_err(|e| {
-                    Status::invalid_argument(format!("invalid JSON in bulk: {}", e))
-                })?;
-                // Extract _id from the payload or generate one
-                let doc_id = val
-                    .get("_doc_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let payload = val.get("_source").cloned().unwrap_or(val.clone());
-                Ok((doc_id, payload))
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
+        let mut docs: Vec<(String, serde_json::Value)> =
+            Vec::with_capacity(req.documents_json.len());
+        for b in &req.documents_json {
+            let val: serde_json::Value = serde_json::from_slice(b)
+                .map_err(|e| Status::invalid_argument(format!("invalid JSON in bulk: {}", e)))?;
+            let doc_id = val
+                .get("_doc_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let payload = val.get("_source").cloned().unwrap_or(val.clone());
+            docs.push((doc_id, payload));
+        }
 
         info!(
             "gRPC: bulk {} docs into {}/shard_{}",
@@ -358,6 +387,11 @@ impl InternalTransport for TransportService {
                             req.shard_id,
                             errors
                         );
+                        return Ok(Response::new(ShardBulkResponse {
+                            success: false,
+                            doc_ids: ids,
+                            error: format!("Replication failed: {}", errors.join("; ")),
+                        }));
                     }
                 }
                 Ok(Response::new(ShardBulkResponse {
@@ -416,6 +450,11 @@ impl InternalTransport for TransportService {
                             req.shard_id,
                             errors
                         );
+                        return Ok(Response::new(ShardDeleteResponse {
+                            success: false,
+                            deleted,
+                            error: format!("Replication failed: {}", errors.join("; ")),
+                        }));
                     }
                 }
                 Ok(Response::new(ShardDeleteResponse {
@@ -546,19 +585,19 @@ impl InternalTransport for TransportService {
         }
 
         // k-NN vector search (if knn clause present)
-        if let Some(ref knn) = search_req.knn {
-            if let Some((field_name, params)) = knn.fields.iter().next() {
-                match engine.search_knn_filtered(
-                    field_name,
-                    &params.vector,
-                    params.k,
-                    params.filter.as_ref(),
-                ) {
-                    Ok(hits) => all_hits.extend(hits),
-                    Err(e) => {
-                        tracing::error!("Vector search on remote shard failed: {}", e);
-                        // Non-fatal: text results still returned
-                    }
+        if let Some(ref knn) = search_req.knn
+            && let Some((field_name, params)) = knn.fields.iter().next()
+        {
+            match engine.search_knn_filtered(
+                field_name,
+                &params.vector,
+                params.k,
+                params.filter.as_ref(),
+            ) {
+                Ok(hits) => all_hits.extend(hits),
+                Err(e) => {
+                    tracing::error!("Vector search on remote shard failed: {}", e);
+                    // Non-fatal: text results still returned
                 }
             }
         }
@@ -780,11 +819,11 @@ impl InternalTransport for TransportService {
                     metadata.settings.refresh_interval_ms = None;
                     changed = true;
                 }
-            } else if let Some(ms) = val.as_u64() {
-                if metadata.settings.refresh_interval_ms != Some(ms) {
-                    metadata.settings.refresh_interval_ms = Some(ms);
-                    changed = true;
-                }
+            } else if let Some(ms) = val.as_u64()
+                && metadata.settings.refresh_interval_ms != Some(ms)
+            {
+                metadata.settings.refresh_interval_ms = Some(ms);
+                changed = true;
             }
         }
 
@@ -1037,7 +1076,7 @@ impl InternalTransport for TransportService {
 
         let vote = {
             let m = raft.metrics();
-            m.borrow_watched().vote.clone()
+            m.borrow_watched().vote
         };
         let last_log_id = {
             let m = raft.metrics();
@@ -1146,6 +1185,7 @@ impl InternalTransport for TransportService {
 }
 
 impl TransportService {
+    #[allow(clippy::result_large_err)]
     fn get_or_open_shard(
         &self,
         index_name: &str,

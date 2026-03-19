@@ -151,20 +151,15 @@ impl CompositeEngine {
                 if let Some(arr) = value.as_array() {
                     let floats: Option<Vec<f32>> =
                         arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
-                    if let Some(vec) = floats {
-                        if !vec.is_empty() {
-                            if self.ensure_vector_index(vec.len()).is_ok() {
-                                let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
-                                if let Some(ref vi) = *guard {
-                                    if let Err(e) = vi.add_with_doc_id(doc_id, &vec) {
-                                        tracing::warn!(
-                                            "Failed to index vector for doc '{}': {}",
-                                            doc_id,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
+                    if let Some(vec) = floats
+                        && !vec.is_empty()
+                        && self.ensure_vector_index(vec.len()).is_ok()
+                    {
+                        let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
+                        if let Some(ref vi) = *guard
+                            && let Err(e) = vi.add_with_doc_id(doc_id, &vec)
+                        {
+                            tracing::warn!("Failed to index vector for doc '{}': {}", doc_id, e);
                         }
                     }
                 }
@@ -237,11 +232,11 @@ impl SearchEngine for CompositeEngine {
                     if let Some(arr) = value.as_array() {
                         let floats: Option<Vec<f32>> =
                             arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
-                        if let Some(ref vec) = floats {
-                            if !vec.is_empty() {
-                                found = floats;
-                                break;
-                            }
+                        if let Some(ref vec) = floats
+                            && !vec.is_empty()
+                        {
+                            found = floats;
+                            break;
                         }
                     }
                 }
@@ -254,10 +249,10 @@ impl SearchEngine for CompositeEngine {
         // Collect (doc_id, vector) pairs and bulk-add to vector index
         let mut vec_batch: Vec<(String, Vec<f32>)> = Vec::new();
         for (i, vec_opt) in vec_fields.into_iter().enumerate() {
-            if let (Some(id), Some(vec)) = (ids.get(i), vec_opt) {
-                if self.ensure_vector_index(vec.len()).is_ok() {
-                    vec_batch.push((id.clone(), vec));
-                }
+            if let (Some(id), Some(vec)) = (ids.get(i), vec_opt)
+                && self.ensure_vector_index(vec.len()).is_ok()
+            {
+                vec_batch.push((id.clone(), vec));
             }
         }
         if !vec_batch.is_empty() {
@@ -364,10 +359,10 @@ impl SearchEngine for CompositeEngine {
             let doc_id = vi.doc_id_for_key(*key).unwrap_or_else(|| key.to_string());
 
             // Skip docs that don't pass the filter
-            if let Some(ref allowed) = allowed_ids {
-                if !allowed.contains(&doc_id) {
-                    continue;
-                }
+            if let Some(ref allowed) = allowed_ids
+                && !allowed.contains(&doc_id)
+            {
+                continue;
             }
 
             let source = self.text.get_document(&doc_id).ok().flatten();

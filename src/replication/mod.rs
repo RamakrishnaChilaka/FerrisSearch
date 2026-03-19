@@ -11,6 +11,8 @@ use tracing::error;
 /// Replicate a single document write to all replica nodes for a shard.
 /// Returns Ok(replica_checkpoints) if all replicas acknowledged, Err with details otherwise.
 /// The returned Vec contains (node_id, local_checkpoint) for each replica.
+/// Replication is performed concurrently (fan-out) — latency = max(replica RTTs).
+#[allow(clippy::too_many_arguments)]
 pub async fn replicate_write(
     transport_client: &TransportClient,
     cluster_state: &ClusterState,
@@ -31,34 +33,60 @@ pub async fn replicate_write(
         return Ok(vec![]);
     }
 
-    let mut errors = Vec::new();
-    let mut checkpoints = Vec::new();
+    // Build futures for concurrent replication to all replicas
+    let mut futures = Vec::with_capacity(replica_node_ids.len());
 
     for replica_node_id in &replica_node_ids {
         let node_info = match cluster_state.nodes.get(*replica_node_id) {
-            Some(n) => n,
+            Some(n) => n.clone(),
             None => {
-                errors.push(format!(
-                    "Replica node {} not in cluster state",
-                    replica_node_id
-                ));
+                // Immediately record error for missing nodes — no future to spawn
+                let rid = replica_node_id.to_string();
+                futures.push(tokio::spawn(async move {
+                    (
+                        rid.clone(),
+                        Err::<u64, String>(format!("Replica node {} not in cluster state", rid)),
+                    )
+                }));
                 continue;
             }
         };
 
-        match transport_client
-            .replicate_to_shard(node_info, index_name, shard_id, doc_id, payload, op, seq_no)
-            .await
-        {
-            Ok(replica_checkpoint) => {
-                checkpoints.push((replica_node_id.to_string(), replica_checkpoint));
+        let client = transport_client.clone();
+        let idx = index_name.to_string();
+        let did = doc_id.to_string();
+        let pl = payload.clone();
+        let operation = op.to_string();
+        let rid = replica_node_id.to_string();
+
+        futures.push(tokio::spawn(async move {
+            match client
+                .replicate_to_shard(&node_info, &idx, shard_id, &did, &pl, &operation, seq_no)
+                .await
+            {
+                Ok(checkpoint) => (rid, Ok(checkpoint)),
+                Err(e) => (rid.clone(), Err(format!("{}: {}", rid, e))),
             }
-            Err(e) => {
+        }));
+    }
+
+    let results = futures::future::join_all(futures).await;
+    let mut errors = Vec::new();
+    let mut checkpoints = Vec::new();
+
+    for result in results {
+        match result {
+            Ok((rid, Ok(checkpoint))) => checkpoints.push((rid, checkpoint)),
+            Ok((rid, Err(e))) => {
                 error!(
                     "Replication to {} for {}/shard_{} failed: {}",
-                    replica_node_id, index_name, shard_id, e
+                    rid, index_name, shard_id, e
                 );
-                errors.push(format!("{}: {}", replica_node_id, e));
+                errors.push(e);
+            }
+            Err(e) => {
+                error!("Replication task panicked: {}", e);
+                errors.push(format!("task panicked: {}", e));
             }
         }
     }
@@ -72,6 +100,7 @@ pub async fn replicate_write(
 
 /// Replicate a bulk set of writes to all replica nodes for a shard.
 /// Returns Ok(replica_checkpoints) with (node_id, local_checkpoint) for each replica.
+/// Replication is performed concurrently (fan-out) — latency = max(replica RTTs).
 pub async fn replicate_bulk(
     transport_client: &TransportClient,
     cluster_state: &ClusterState,
@@ -90,34 +119,59 @@ pub async fn replicate_bulk(
         return Ok(vec![]);
     }
 
-    let mut errors = Vec::new();
-    let mut checkpoints = Vec::new();
+    let docs_owned: Vec<(String, serde_json::Value)> = docs.to_vec();
+
+    // Build futures for concurrent replication to all replicas
+    let mut futures = Vec::with_capacity(replica_node_ids.len());
 
     for replica_node_id in &replica_node_ids {
         let node_info = match cluster_state.nodes.get(*replica_node_id) {
-            Some(n) => n,
+            Some(n) => n.clone(),
             None => {
-                errors.push(format!(
-                    "Replica node {} not in cluster state",
-                    replica_node_id
-                ));
+                let rid = replica_node_id.to_string();
+                futures.push(tokio::spawn(async move {
+                    (
+                        rid.clone(),
+                        Err::<u64, String>(format!("Replica node {} not in cluster state", rid)),
+                    )
+                }));
                 continue;
             }
         };
 
-        match transport_client
-            .replicate_bulk_to_shard(node_info, index_name, shard_id, docs, start_seq_no)
-            .await
-        {
-            Ok(replica_checkpoint) => {
-                checkpoints.push((replica_node_id.to_string(), replica_checkpoint));
+        let client = transport_client.clone();
+        let idx = index_name.to_string();
+        let rid = replica_node_id.to_string();
+        let docs_clone = docs_owned.clone();
+
+        futures.push(tokio::spawn(async move {
+            match client
+                .replicate_bulk_to_shard(&node_info, &idx, shard_id, &docs_clone, start_seq_no)
+                .await
+            {
+                Ok(checkpoint) => (rid, Ok(checkpoint)),
+                Err(e) => (rid.clone(), Err(format!("{}: {}", rid, e))),
             }
-            Err(e) => {
+        }));
+    }
+
+    let results = futures::future::join_all(futures).await;
+    let mut errors = Vec::new();
+    let mut checkpoints = Vec::new();
+
+    for result in results {
+        match result {
+            Ok((rid, Ok(checkpoint))) => checkpoints.push((rid, checkpoint)),
+            Ok((rid, Err(e))) => {
                 error!(
                     "Bulk replication to {} for {}/shard_{} failed: {}",
-                    replica_node_id, index_name, shard_id, e
+                    rid, index_name, shard_id, e
                 );
-                errors.push(format!("{}: {}", replica_node_id, e));
+                errors.push(e);
+            }
+            Err(e) => {
+                error!("Bulk replication task panicked: {}", e);
+                errors.push(format!("task panicked: {}", e));
             }
         }
     }

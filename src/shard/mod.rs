@@ -248,7 +248,7 @@ impl ShardManager {
         let refresh_interval = settings_mgr.refresh_interval();
         let refresh_rx = settings_mgr.watch_refresh_interval();
 
-        let shard_dir = self.data_dir.join(&key.data_dir());
+        let shard_dir = self.data_dir.join(key.data_dir());
         std::fs::create_dir_all(&shard_dir)?;
 
         // Try to open the engine. If it fails with a schema mismatch (stale data

@@ -604,7 +604,7 @@ fn merge_histogram(parts: &[&PartialAggResult]) -> serde_json::Value {
 /// Each hit is a JSON object with `_score` and `_source` fields.
 /// Sort clauses are applied in order (primary sort first).
 /// If no sort clauses are given, sorts by `_score` descending (default).
-pub fn sort_hits(hits: &mut Vec<serde_json::Value>, sort_clauses: &[SortClause]) {
+pub fn sort_hits(hits: &mut [serde_json::Value], sort_clauses: &[SortClause]) {
     if sort_clauses.is_empty() {
         // Default: sort by _score descending
         hits.sort_by(|a, b| {

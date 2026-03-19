@@ -221,12 +221,12 @@ impl IndexMetadata {
     /// Promote the first replica to primary for a given shard.
     /// Returns true if promotion occurred.
     pub fn promote_replica(&mut self, shard_id: u32) -> bool {
-        if let Some(routing) = self.shard_routing.get_mut(&shard_id) {
-            if let Some(new_primary) = routing.replicas.first().cloned() {
-                routing.primary = new_primary;
-                routing.replicas.remove(0);
-                return true;
-            }
+        if let Some(routing) = self.shard_routing.get_mut(&shard_id)
+            && let Some(new_primary) = routing.replicas.first().cloned()
+        {
+            routing.primary = new_primary;
+            routing.replicas.remove(0);
+            return true;
         }
         false
     }
@@ -235,11 +235,11 @@ impl IndexMetadata {
     /// The chosen replica is removed from the replicas list and becomes primary.
     /// Returns true if promotion occurred.
     pub fn promote_replica_to(&mut self, shard_id: u32, new_primary: &str) -> bool {
-        if let Some(routing) = self.shard_routing.get_mut(&shard_id) {
-            if let Some(pos) = routing.replicas.iter().position(|n| n == new_primary) {
-                routing.primary = routing.replicas.remove(pos);
-                return true;
-            }
+        if let Some(routing) = self.shard_routing.get_mut(&shard_id)
+            && let Some(pos) = routing.replicas.iter().position(|n| n == new_primary)
+        {
+            routing.primary = routing.replicas.remove(pos);
+            return true;
         }
         false
     }

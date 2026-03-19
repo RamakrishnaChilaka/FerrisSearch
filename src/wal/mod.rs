@@ -26,21 +26,16 @@ use std::time::Duration;
 /// Controls when the translog is fsynced to disk.
 ///
 /// Matches OpenSearch's `index.translog.durability` setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TranslogDurability {
     /// Fsync after every write request (default). Maximum durability — no data
     /// loss on crash. Equivalent to OpenSearch `"request"`.
+    #[default]
     Request,
     /// Fsync on a timer interval. Faster writes but up to `sync_interval` of
     /// data may be lost on crash. Equivalent to OpenSearch `"async"`.
     /// Safe when replicas exist (data can be recovered from peers).
     Async { sync_interval_ms: u64 },
-}
-
-impl Default for TranslogDurability {
-    fn default() -> Self {
-        Self::Request
-    }
 }
 
 const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
@@ -208,6 +203,7 @@ impl HotTranslog {
 
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;

@@ -187,24 +187,24 @@ impl HotEngine {
 
             for (key, value) in obj {
                 // If this field has a named Tantivy field, index into it by type
-                if let Some(&field) = registry.fields.get(key.as_str()) {
-                    if field != body_field {
-                        match value {
-                            serde_json::Value::String(s) => {
-                                doc.add_text(field, s);
-                            }
-                            serde_json::Value::Number(n) => {
-                                if let Some(i) = n.as_i64() {
-                                    doc.add_i64(field, i);
-                                } else if let Some(f) = n.as_f64() {
-                                    doc.add_f64(field, f);
-                                }
-                            }
-                            serde_json::Value::Bool(b) => {
-                                doc.add_text(field, if *b { "true" } else { "false" });
-                            }
-                            _ => {}
+                if let Some(&field) = registry.fields.get(key.as_str())
+                    && field != body_field
+                {
+                    match value {
+                        serde_json::Value::String(s) => {
+                            doc.add_text(field, s);
                         }
+                        serde_json::Value::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                doc.add_i64(field, i);
+                            } else if let Some(f) = n.as_f64() {
+                                doc.add_f64(field, f);
+                            }
+                        }
+                        serde_json::Value::Bool(b) => {
+                            doc.add_text(field, if *b { "true" } else { "false" });
+                        }
+                        _ => {}
                     }
                 }
 
@@ -332,14 +332,14 @@ impl HotEngine {
                 .to_string();
             // Get _source
             for value in retrieved_doc.get_all(registry.source_field) {
-                if let Some(text) = value.as_str() {
-                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text) {
-                        results.push(serde_json::json!({
-                            "_id": doc_id,
-                            "_score": score,
-                            "_source": json_val
-                        }));
-                    }
+                if let Some(text) = value.as_str()
+                    && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text)
+                {
+                    results.push(serde_json::json!({
+                        "_id": doc_id,
+                        "_score": score,
+                        "_source": json_val
+                    }));
                 }
             }
         }
@@ -666,10 +666,10 @@ impl super::SearchEngine for HotEngine {
         if let Some((_score, doc_address)) = top_docs.first() {
             let retrieved_doc = searcher.doc::<TantivyDocument>(*doc_address)?;
             for value in retrieved_doc.get_all(registry.source_field) {
-                if let Some(text) = value.as_str() {
-                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text) {
-                        return Ok(Some(json_val));
-                    }
+                if let Some(text) = value.as_str()
+                    && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text)
+                {
+                    return Ok(Some(json_val));
                 }
             }
         }

@@ -186,7 +186,7 @@ pub async fn transfer_master(
     // Get current vote from metrics
     let vote = {
         let m = raft.metrics();
-        m.borrow_watched().vote.clone()
+        m.borrow_watched().vote
     };
 
     let last_log_id = {

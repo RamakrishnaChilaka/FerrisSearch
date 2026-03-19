@@ -36,6 +36,12 @@ pub struct MemLogStore {
     inner: Arc<Mutex<Inner>>,
 }
 
+impl Default for MemLogStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemLogStore {
     pub fn new() -> Self {
         Self {
@@ -61,7 +67,7 @@ impl RaftLogReader<TypeConfig> for MemLogStore {
 
     async fn read_vote(&mut self) -> Result<Option<types::Vote>, io::Error> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(inner.vote.clone())
+        Ok(inner.vote)
     }
 }
 
@@ -85,7 +91,7 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
 
     async fn save_vote(&mut self, vote: &types::Vote) -> Result<(), io::Error> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.vote = Some(vote.clone());
+        inner.vote = Some(*vote);
         Ok(())
     }
 

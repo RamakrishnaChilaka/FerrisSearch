@@ -456,7 +456,7 @@ async fn transfer_leader_to_self_succeeds() {
     let vote = {
         use openraft::type_config::async_runtime::WatchReceiver;
         let m = raft.metrics();
-        m.borrow_watched().vote.clone()
+        m.borrow_watched().vote
     };
 
     let last_log_id = {

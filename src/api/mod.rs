@@ -64,7 +64,7 @@ pub fn error_response(
 
 /// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.
 async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
-    let wants_pretty = req.uri().query().map_or(false, |q| {
+    let wants_pretty = req.uri().query().is_some_and(|q| {
         q.split('&').any(|param| {
             let key = param.split('=').next().unwrap_or("");
             key == "pretty"
@@ -82,7 +82,7 @@ async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| ct.contains("application/json"));
+        .is_some_and(|ct| ct.contains("application/json"));
 
     if !is_json {
         return response;
@@ -94,15 +94,15 @@ async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-            let mut response = Response::from_parts(parts, Body::from(pretty));
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("application/json; charset=utf-8"),
-            );
-            return response;
-        }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Ok(pretty) = serde_json::to_string_pretty(&value)
+    {
+        let mut response = Response::from_parts(parts, Body::from(pretty));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        return response;
     }
 
     // Fallback: return original bytes if parsing failed
