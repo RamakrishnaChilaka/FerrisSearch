@@ -150,6 +150,37 @@ impl HotEngine {
         *registry.fields.get("body").expect("body field must exist")
     }
 
+    /// Create a Tantivy Term that matches the schema type of the target field.
+    /// This prevents type mismatches (e.g., i64 term on an f64 field) that cause
+    /// silent 0-hit results.
+    fn typed_term(&self, field: Field, value: &serde_json::Value) -> Term {
+        use tantivy::schema::FieldType;
+        let schema = self.index.schema();
+        let field_type = schema.get_field_entry(field).field_type();
+        match value {
+            serde_json::Value::String(s) => Term::from_field_text(field, s),
+            serde_json::Value::Number(n) => match field_type {
+                FieldType::I64(_) => {
+                    let i = n.as_i64().unwrap_or(n.as_f64().unwrap_or(0.0) as i64);
+                    Term::from_field_i64(field, i)
+                }
+                FieldType::F64(_) => {
+                    let f = n.as_f64().unwrap_or(n.as_i64().unwrap_or(0) as f64);
+                    Term::from_field_f64(field, f)
+                }
+                FieldType::U64(_) => {
+                    let u = n.as_u64().unwrap_or(n.as_f64().unwrap_or(0.0) as u64);
+                    Term::from_field_u64(field, u)
+                }
+                _ => Term::from_field_text(field, &n.to_string()),
+            },
+            serde_json::Value::Bool(b) => {
+                Term::from_field_text(field, if *b { "true" } else { "false" })
+            }
+            other => Term::from_field_text(field, &other.to_string()),
+        }
+    }
+
     /// Build a Tantivy document from a JSON object.
     /// When typed fields exist in the registry, values are indexed into their
     /// proper field types. All text values also go into the "body" catch-all
@@ -159,13 +190,14 @@ impl HotEngine {
             .field_registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        Self::build_tantivy_doc_inner(&registry, doc_id, payload)
+        Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload)
     }
 
     /// Build a Tantivy document using an already-acquired registry reference.
     /// Used by bulk paths to avoid per-doc RwLock acquisition.
     fn build_tantivy_doc_inner(
         registry: &FieldRegistry,
+        schema: &Schema,
         doc_id: &str,
         payload: &serde_json::Value,
     ) -> TantivyDocument {
@@ -195,10 +227,21 @@ impl HotEngine {
                             doc.add_text(field, s);
                         }
                         serde_json::Value::Number(n) => {
-                            if let Some(i) = n.as_i64() {
-                                doc.add_i64(field, i);
-                            } else if let Some(f) = n.as_f64() {
-                                doc.add_f64(field, f);
+                            use tantivy::schema::FieldType;
+                            match schema.get_field_entry(field).field_type() {
+                                FieldType::F64(_) => {
+                                    let f = n.as_f64().unwrap_or(n.as_i64().unwrap_or(0) as f64);
+                                    doc.add_f64(field, f);
+                                }
+                                FieldType::I64(_) => {
+                                    let i = n.as_i64().unwrap_or(n.as_f64().unwrap_or(0.0) as i64);
+                                    doc.add_i64(field, i);
+                                }
+                                FieldType::U64(_) => {
+                                    let u = n.as_u64().unwrap_or(n.as_f64().unwrap_or(0.0) as u64);
+                                    doc.add_u64(field, u);
+                                }
+                                _ => {}
                             }
                         }
                         serde_json::Value::Bool(b) => {
@@ -402,12 +445,8 @@ impl HotEngine {
             }
             QueryClause::Term(fields) => {
                 if let Some((field_name, value)) = fields.iter().next() {
-                    let term_str = match value {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
                     let target_field = self.resolve_field(field_name);
-                    let term = Term::from_field_text(target_field, &term_str);
+                    let term = self.typed_term(target_field, value);
                     Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
                 } else {
                     Ok(Box::new(AllQuery))
@@ -444,21 +483,8 @@ impl HotEngine {
                 if let Some((field_name, condition)) = fields.iter().next() {
                     let target_field = self.resolve_field(field_name);
 
-                    let to_term = |v: &serde_json::Value| -> Term {
-                        match v {
-                            serde_json::Value::String(s) => Term::from_field_text(target_field, s),
-                            serde_json::Value::Number(n) => {
-                                if let Some(i) = n.as_i64() {
-                                    Term::from_field_i64(target_field, i)
-                                } else if let Some(f) = n.as_f64() {
-                                    Term::from_field_f64(target_field, f)
-                                } else {
-                                    Term::from_field_text(target_field, &n.to_string())
-                                }
-                            }
-                            other => Term::from_field_text(target_field, &other.to_string()),
-                        }
-                    };
+                    let to_term =
+                        |v: &serde_json::Value| -> Term { self.typed_term(target_field, v) };
 
                     let lower = if let Some(ref v) = condition.gt {
                         Bound::Excluded(to_term(v))
@@ -543,7 +569,10 @@ impl HotEngine {
                 use tantivy::query::FuzzyTermQuery;
                 if let Some((field_name, params)) = fields.iter().next() {
                     let target_field = self.resolve_field(field_name);
-                    let term = Term::from_field_text(target_field, &params.value);
+                    let term = self.typed_term(
+                        target_field,
+                        &serde_json::Value::String(params.value.clone()),
+                    );
                     let query = FuzzyTermQuery::new(term, params.fuzziness, true);
                     Ok(Box::new(query))
                 } else {
@@ -626,7 +655,8 @@ impl super::SearchEngine for HotEngine {
         let mut doc_ids = Vec::with_capacity(docs.len());
         for (doc_id, payload) in &docs {
             writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-            let doc = Self::build_tantivy_doc_inner(&registry, doc_id, payload);
+            let doc =
+                Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload);
             writer.add_document(doc)?;
             doc_ids.push(doc_id.clone());
         }
@@ -2074,6 +2104,581 @@ mod tests {
         let (hits, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d2");
+    }
+
+    #[test]
+    fn range_query_integer_bounds_on_float_field() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "price".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine.add_document("d1", json!({"price": 5.0})).unwrap();
+        engine.add_document("d2", json!({"price": 50.0})).unwrap();
+        engine.add_document("d3", json!({"price": 500.0})).unwrap();
+        engine.refresh().unwrap();
+
+        // Use integer JSON bounds (10, 100) on a float field — must still match
+        let req = SearchRequest {
+            query: QueryClause::Range({
+                let mut m = HashMap::new();
+                m.insert(
+                    "price".to_string(),
+                    crate::search::RangeCondition {
+                        gte: Some(json!(10)),
+                        lte: Some(json!(100)),
+                        ..Default::default()
+                    },
+                );
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 1, "integer bounds on float field should match d2");
+        assert_eq!(hits[0]["_id"], "d2");
+    }
+
+    #[test]
+    fn term_query_on_integer_field() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "year".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine.add_document("d1", json!({"year": 2024})).unwrap();
+        engine.add_document("d2", json!({"year": 2025})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Term({
+                let mut m = HashMap::new();
+                m.insert("year".to_string(), json!(2024));
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 1, "term query on integer field should match");
+        assert_eq!(hits[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn bool_all_clause_types_with_numeric_fields() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "category".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "rust book", "category": "books", "price": 29.99}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "rust course", "category": "education", "price": 49.99}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d3",
+                json!({"title": "python book", "category": "books", "price": 19.99}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // must: match "rust", must_not: category=education, filter: price 10-100 (integer bounds)
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("title".into(), json!("rust"));
+                    m
+                })],
+                must_not: vec![QueryClause::Term({
+                    let mut m = HashMap::new();
+                    m.insert("category".into(), json!("education"));
+                    m
+                })],
+                filter: vec![QueryClause::Range({
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "price".into(),
+                        crate::search::RangeCondition {
+                            gte: Some(json!(10)),
+                            lte: Some(json!(100)),
+                            ..Default::default()
+                        },
+                    );
+                    m
+                })],
+                should: vec![],
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(
+            total, 1,
+            "complex bool with all clause types should match d1 only"
+        );
+        assert_eq!(hits[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn float_field_indexed_with_integer_value_is_searchable() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "price".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        // Index with integer JSON value on a float field
+        engine.add_document("d1", json!({"price": 100})).unwrap();
+        engine.add_document("d2", json!({"price": 200})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Range({
+                let mut m = HashMap::new();
+                m.insert(
+                    "price".to_string(),
+                    crate::search::RangeCondition {
+                        gte: Some(json!(50.0)),
+                        lte: Some(json!(150.0)),
+                        ..Default::default()
+                    },
+                );
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(
+            total, 1,
+            "integer value indexed on float field should be searchable"
+        );
+        assert_eq!(hits[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn bool_should_only_matches_any_clause() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "category".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".into(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "rust book", "category": "books", "price": 29.99}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "python course", "category": "education", "price": 49.99}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d3",
+                json!({"title": "go tutorial", "category": "education", "price": 9.99}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // should with no must: any matching should clause is sufficient
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                should: vec![
+                    QueryClause::Match({
+                        let mut m = HashMap::new();
+                        m.insert("title".into(), json!("rust"));
+                        m
+                    }),
+                    QueryClause::Match({
+                        let mut m = HashMap::new();
+                        m.insert("title".into(), json!("go"));
+                        m
+                    }),
+                ],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(
+            total, 2,
+            "should-only bool should match d1 (rust) and d3 (go)"
+        );
+        let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d1"));
+        assert!(ids.contains(&"d3"));
+    }
+
+    #[test]
+    fn bool_must_not_with_filter_only() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "category".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".into(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document("d1", json!({"category": "books", "price": 10.0}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"category": "education", "price": 50.0}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"category": "books", "price": 100.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // must_not + filter, no must: exclude education, filter price >= 5
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must_not: vec![QueryClause::Term({
+                    let mut m = HashMap::new();
+                    m.insert("category".into(), json!("education"));
+                    m
+                })],
+                filter: vec![QueryClause::Range({
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "price".into(),
+                        crate::search::RangeCondition {
+                            gte: Some(json!(5)),
+                            ..Default::default()
+                        },
+                    );
+                    m
+                })],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(
+            total, 2,
+            "must_not + filter should return d1 and d3 (books only)"
+        );
+        let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d1"));
+        assert!(ids.contains(&"d3"));
+    }
+
+    #[test]
+    fn bool_multiple_must_not_excludes_all() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "category".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document("d1", json!({"title": "item one", "category": "books"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "item two", "category": "education"}))
+            .unwrap();
+        engine
+            .add_document("d3", json!({"title": "item three", "category": "sports"}))
+            .unwrap();
+        engine
+            .add_document("d4", json!({"title": "item four", "category": "toys"}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // Exclude books AND education simultaneously
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("title".into(), json!("item"));
+                    m
+                })],
+                must_not: vec![
+                    QueryClause::Term({
+                        let mut m = HashMap::new();
+                        m.insert("category".into(), json!("books"));
+                        m
+                    }),
+                    QueryClause::Term({
+                        let mut m = HashMap::new();
+                        m.insert("category".into(), json!("education"));
+                        m
+                    }),
+                ],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(
+            total, 2,
+            "multiple must_not should exclude both books and education"
+        );
+        let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d3"));
+        assert!(ids.contains(&"d4"));
+    }
+
+    #[test]
+    fn nested_bool_inside_must() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "category".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".into(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "rust guide", "category": "books", "price": 25.0}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "rust video", "category": "education", "price": 75.0}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d3",
+                json!({"title": "python guide", "category": "books", "price": 15.0}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // Outer: must match "rust". Inner (nested bool in filter): price 20-50 AND category != education
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("title".into(), json!("rust"));
+                    m
+                })],
+                filter: vec![QueryClause::Bool(crate::search::BoolQuery {
+                    filter: vec![QueryClause::Range({
+                        let mut m = HashMap::new();
+                        m.insert(
+                            "price".into(),
+                            crate::search::RangeCondition {
+                                gte: Some(json!(20)),
+                                lte: Some(json!(50)),
+                                ..Default::default()
+                            },
+                        );
+                        m
+                    })],
+                    must_not: vec![QueryClause::Term({
+                        let mut m = HashMap::new();
+                        m.insert("category".into(), json!("education"));
+                        m
+                    })],
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(
+            total, 1,
+            "nested bool should match only d1 (rust, books, price 25)"
+        );
+        assert_eq!(hits[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn bool_must_not_excludes_everything_returns_zero() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "category".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document("d1", json!({"title": "rust book", "category": "books"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "rust course", "category": "books"}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // must matches both, but must_not also excludes all (same category)
+        let req = SearchRequest {
+            query: QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![QueryClause::Match({
+                    let mut m = HashMap::new();
+                    m.insert("title".into(), json!("rust"));
+                    m
+                })],
+                must_not: vec![QueryClause::Term({
+                    let mut m = HashMap::new();
+                    m.insert("category".into(), json!("books"));
+                    m
+                })],
+                ..Default::default()
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 0, "must_not excluding all docs should return 0 hits");
+        assert!(hits.is_empty());
     }
 
     #[test]

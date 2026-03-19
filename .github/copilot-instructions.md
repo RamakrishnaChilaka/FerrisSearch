@@ -43,6 +43,12 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `MemLogStore::get_log_reader()` must return a shared-state handle (not a clone) because the SM worker holds the reader permanently
 - `raft.add_learner(node_id, BasicNode { addr }, blocking)` then `raft.change_membership(voter_set, false)` to add nodes
 
+## Tantivy Type Safety Gotchas
+- **NEVER** create `Term` objects directly with `Term::from_field_text/i64/f64` in query building — always use `self.typed_term(field, value)` which checks the schema field type
+- JSON integer `10` on a float field: `serde_json::Number::as_i64()` succeeds before `as_f64()`, creating an `i64` term on an `f64` field → silent 0-hit results. `typed_term()` prevents this.
+- `build_tantivy_doc_inner()` takes `&Schema` to check field types before adding numeric values — prevents indexing `i64` into `f64` fields
+- Tantivy does NOT error on type-mismatched terms — it silently returns 0 results. Always validate.
+
 ## Cluster Commands (Raft log entries)
 - `ClusterCommand::AddNode { node: NodeInfo }` — register/update a node in cluster state
 - `ClusterCommand::RemoveNode { node_id: String }` — remove node from cluster + Raft membership

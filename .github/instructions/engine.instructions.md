@@ -79,6 +79,41 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
 - `replay_translog()` — crash recovery from WAL
 
+### Type-Safe Term Creation (CRITICAL)
+All Tantivy `Term` objects MUST match the schema field type. A type mismatch (e.g., `i64` term
+on an `f64` field) causes **silent 0-hit results** — Tantivy won't error, just returns nothing.
+
+Use the `typed_term()` helper for ALL term creation in queries:
+```rust
+fn typed_term(&self, field: Field, value: &serde_json::Value) -> Term {
+    // Checks schema via self.index.schema().get_field_entry(field).field_type()
+    // Returns the correctly typed Term (from_field_f64, from_field_i64, from_field_text, etc.)
+}
+```
+
+**Where `typed_term()` is used:**
+- `QueryClause::Term` — exact match queries
+- `QueryClause::Range` — range bounds (gte/lte/gt/lt)
+- `QueryClause::Fuzzy` — fuzzy term construction
+
+**Common pitfall:** JSON integer `10` on a float field. `serde_json::Number::as_i64()` succeeds
+before `as_f64()`, creating the wrong term type. `typed_term()` checks the schema first to avoid this.
+
+### Type-Safe Document Indexing
+`build_tantivy_doc_inner()` takes a `&Schema` parameter and checks the field type before
+adding numeric values:
+```rust
+// For a Number value on a mapped field:
+match schema.get_field_entry(field).field_type() {
+    FieldType::F64(_) => doc.add_f64(field, ...),  // float fields always get f64
+    FieldType::I64(_) => doc.add_i64(field, ...),  // integer fields always get i64
+    FieldType::U64(_) => doc.add_u64(field, ...),
+    _ => {}
+}
+```
+This prevents JSON integer `99` being stored as `i64` in an `f64` field (which would make it
+unsearchable by float range queries).
+
 ## VectorIndex (src/engine/vector.rs)
 - USearch HNSW wrapper (connectivity=16, expansion_add=128, expansion_search=64)
 - `add_with_doc_id(doc_id, vector)`, `search(query, k) -> (keys, distances)`

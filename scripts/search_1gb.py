@@ -229,10 +229,10 @@ def query_complex_bool():
         "body": {
             "query": {
                 "bool": {
-                    "must": [{"match": {"description": f"{random.choice(WORDS)} {random.choice(WORDS)}"}}],
+                    "must": [{"match": {"description": random.choice(WORDS)}}],
                     "should": [{"match": {"title": random.choice(WORDS)}}],
                     "must_not": [{"term": {"category": random.choice(CATEGORIES)}}],
-                    "filter": [{"range": {"price": {"gte": 10, "lte": 500}}}],
+                    "filter": [{"range": {"price": {"gte": 10.0, "lte": 500.0}}}],
                 }
             },
             "sort": [{"rating": "desc"}],
