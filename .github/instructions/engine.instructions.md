@@ -22,7 +22,7 @@ pub trait SearchEngine: Send + Sync {
 
     // Search
     fn search(&self, query_str: &str) -> Result<Vec<Value>>;
-    fn search_query(&self, req: &SearchRequest) -> Result<(Vec<Value>, usize)>;
+    fn search_query(&self, req: &SearchRequest) -> Result<(Vec<Value>, usize, HashMap<String, PartialAggResult>)>;
     fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<Value>>;
     fn search_knn_filtered(&self, field: &str, vector: &[f32], k: usize, filter: Option<&QueryClause>) -> Result<Vec<Value>>;
 
@@ -86,8 +86,31 @@ Numeric fields use three Tantivy flags (mirrors OpenSearch default doc_values: t
 - FAST - columnar storage, critical for range queries, sorting, and aggregations
 
 Integer and Float fields get all three: INDEXED | STORED | FAST.
+Keyword and Boolean fields get: STRING | STORED + FAST (set_fast(None) for dictionary-encoded columnar).
 Without FAST, range queries scan the inverted index (slow on high-cardinality fields).
-With FAST, Tantivy reads a columnar structure - orders of magnitude faster.
+With FAST, Tantivy reads a columnar structure - orders of magnitude faster for range queries, sorting, and aggregations.
+
+### Fast-Field Aggregations (Single-Pass Collector)
+Aggregations run in the same Tantivy search pass as hit collection via `AggCollector` -- a custom
+`tantivy::collector::Collector` implementation. Combined with TopDocs via tuple collector:
+`(TopDocs, Option<AggCollector>, Count)`. When no aggs are requested, `None` adds zero overhead.
+
+**Architecture (mirrors OpenSearch's aggregation design):**
+- `AggCollector` implements `Collector` -- `for_segment()` opens fast-field columns per segment
+- `AggSegmentCollector` implements `SegmentCollector` -- `collect(doc, score)` reads column values and accumulates
+- `harvest()` returns per-segment data, `merge_fruits()` merges across segments into `HashMap<String, PartialAggResult>`
+- Per-shard partial results returned through gRPC, merged at coordinator via `merge_aggregations()`
+
+**Supported aggregation types:**
+- **Numeric** (Stats, Min, Max, Avg, Sum, ValueCount): reads `NumCol` (wraps `Column<f64>` or `Column<i64>`)
+- **Histogram**: reads numeric column, buckets by `floor(value / interval)`
+- **Terms**: reads `StrColumn` (dictionary-encoded keyword fields) or numeric column for numeric fields
+
+**Key types in `src/engine/tantivy.rs`:**
+- `NumCol` -- wraps i64/f64 fast-field columns with `first_f64()` coercion
+- `SegmentAggEntry` -- per-segment column + accumulator (NumericStats, Histogram, TermsStr, TermsNum, Skip)
+- `SegmentAggData` -- harvested per-segment result (Stats, Histogram, Terms)
+- `AggKind` / `ResolvedAggSpec` -- resolved from `AggregationRequest` before search
 
 ### Type-Safe Term Creation (CRITICAL)
 All Tantivy `Term` objects MUST match the schema field type. A type mismatch (e.g., `i64` term

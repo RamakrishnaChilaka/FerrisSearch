@@ -45,8 +45,17 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 
 ## Tantivy Field Schema Flags
 - Numeric fields (Integer, Float) use INDEXED | STORED | FAST (mirrors OpenSearch default doc_values: true)
+- Keyword and Boolean fields use STRING | STORED + set_fast(None) for dictionary-encoded columnar
 - FAST enables columnar storage - critical for range queries, sorting, and aggregations
 - Without FAST, range queries scan the inverted index (orders of magnitude slower on high-cardinality fields)
+
+## Fast-Field Aggregations (Single-Pass Collector)
+- Aggregations run in the same Tantivy pass as hit collection via custom `AggCollector` (implements `tantivy::collector::Collector`)
+- Combined with TopDocs via tuple collector: `(TopDocs, Option<AggCollector>, Count)` -- `None` = zero overhead when no aggs
+- `AggSegmentCollector::collect(doc, score)` reads fast-field columns and accumulates stats/terms/histogram per segment
+- `merge_fruits()` merges per-segment data, returns `HashMap<String, PartialAggResult>` per shard
+- Per-shard partial results returned through gRPC `partial_aggs_json`, merged at coordinator via `merge_aggregations()`
+- O(matching_docs) with minimal memory -- no JSON materialization, single query execution pass
 
 ## Tantivy Type Safety Gotchas
 - **NEVER** create `Term` objects directly with `Term::from_field_text/i64/f64` in query building — always use `self.typed_term(field, value)` which checks the schema field type

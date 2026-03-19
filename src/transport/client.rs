@@ -284,7 +284,14 @@ impl TransportClient {
         index_name: &str,
         shard_id: u32,
         req: &crate::search::SearchRequest,
-    ) -> Result<(Vec<serde_json::Value>, usize), anyhow::Error> {
+    ) -> Result<
+        (
+            Vec<serde_json::Value>,
+            usize,
+            std::collections::HashMap<String, crate::search::PartialAggResult>,
+        ),
+        anyhow::Error,
+    > {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let request = tonic::Request::new(ShardSearchDslRequest {
             index_name: index_name.to_string(),
@@ -298,7 +305,12 @@ impl TransportClient {
                 .iter()
                 .filter_map(|h| serde_json::from_slice(&h.source_json).ok())
                 .collect();
-            Ok((hits, response.total_hits as usize))
+            let partial_aggs = if response.partial_aggs_json.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                serde_json::from_slice(&response.partial_aggs_json).unwrap_or_default()
+            };
+            Ok((hits, response.total_hits as usize, partial_aggs))
         } else {
             Err(anyhow::anyhow!(
                 "Shard DSL search failed: {}",

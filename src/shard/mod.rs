@@ -365,7 +365,7 @@ impl ShardManager {
 
         let index_dir = self.data_dir.join(index);
         if index_dir.exists() {
-            std::fs::remove_dir_all(&index_dir)?;
+            Self::remove_dir_all_with_retry(&index_dir)?;
             tracing::info!(
                 "Removed shard data for index '{}' at {:?}",
                 index,
@@ -373,6 +373,27 @@ impl ShardManager {
             );
         }
         Ok(())
+    }
+
+    fn remove_dir_all_with_retry(path: &std::path::Path) -> Result<()> {
+        const MAX_ATTEMPTS: usize = 10;
+        const RETRY_DELAY: Duration = Duration::from_millis(20);
+
+        for attempt in 0..MAX_ATTEMPTS {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                        && attempt + 1 < MAX_ATTEMPTS =>
+                {
+                    std::thread::sleep(RETRY_DELAY);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        unreachable!("directory removal retry loop must return or error");
     }
 
     /// Apply updated settings to a running index.
