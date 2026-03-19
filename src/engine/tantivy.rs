@@ -37,7 +37,12 @@ pub struct HotEngine {
 
 impl HotEngine {
     pub fn new<P: AsRef<Path>>(data_dir: P, refresh_interval: Duration) -> Result<Self> {
-        Self::new_with_mappings(data_dir, refresh_interval, &HashMap::new(), TranslogDurability::Request)
+        Self::new_with_mappings(
+            data_dir,
+            refresh_interval,
+            &HashMap::new(),
+            TranslogDurability::Request,
+        )
     }
 
     /// Create a new HotEngine with explicit field mappings.
@@ -1887,8 +1892,13 @@ mod tests {
         mappings: HashMap<String, crate::cluster::state::FieldMapping>,
     ) -> (tempfile::TempDir, HotEngine) {
         let dir = tempfile::tempdir().unwrap();
-        let engine =
-            HotEngine::new_with_mappings(dir.path(), Duration::from_secs(60), &mappings, TranslogDurability::Request).unwrap();
+        let engine = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+        )
+        .unwrap();
         (dir, engine)
     }
 
