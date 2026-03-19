@@ -56,8 +56,8 @@ pub async fn search_documents(
     let mut successful_shards = 0u32;
     let mut failed_shards = 0u32;
 
-    // Query local shard engines directly
-    let local_shards = state.shard_manager.get_index_shards(&index_name);
+    let local_shards =
+        crate::api::index::ensure_local_index_shards_open(&state, &index_name, &metadata, "GET search");
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
 

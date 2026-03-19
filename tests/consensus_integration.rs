@@ -9,7 +9,9 @@ use ferrissearch::consensus;
 use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
-use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
+use ferrissearch::transport::proto::{
+    JoinRequest, NodeInfo as ProtoNodeInfo, internal_transport_client::InternalTransportClient,
+};
 use ferrissearch::transport::server::create_transport_service_with_raft;
 
 use std::collections::HashMap;
@@ -939,6 +941,56 @@ async fn grpc_create_index_on_leader() {
     let state = state_handle.read().unwrap();
     assert!(state.indices.contains_key("grpc-idx"));
     assert_eq!(state.indices["grpc-idx"].number_of_shards, 2);
+}
+
+#[tokio::test]
+async fn grpc_join_cluster_refreshes_existing_voter_registration() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-join-refresh".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19370".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+    let join_req = JoinRequest {
+        node_info: Some(ProtoNodeInfo {
+            id: "node-1".into(),
+            name: "node-1".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 19370,
+            http_port: 19270,
+            roles: vec!["master".into(), "data".into()],
+        }),
+        raft_node_id: 1,
+    };
+
+    let first = client
+        .join_cluster(tonic::Request::new(join_req.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.state.is_some());
+
+    {
+        let state = state_handle.read().unwrap();
+        let node = state.nodes.get("node-1").expect("node-1 should be re-registered");
+        assert_eq!(node.transport_port, 19370);
+        assert_eq!(node.http_port, 19270);
+        assert_eq!(node.raft_node_id, 1);
+    }
+
+    let second = client
+        .join_cluster(tonic::Request::new(join_req))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(second.state.is_some(), "repeat join should remain idempotent");
+
+    let state = state_handle.read().unwrap();
+    assert!(state.nodes.contains_key("node-1"));
 }
 
 #[tokio::test]

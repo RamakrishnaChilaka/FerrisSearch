@@ -386,10 +386,10 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 501 tests
-cargo test --lib                                # Unit tests (437)
+cargo test                                      # All 511 tests
+cargo test --lib                                # Unit tests (444)
 cargo test --test consensus_integration          # Raft consensus tests (29)
-cargo test --test replication_integration        # Replication tests (35)
+cargo test --test replication_integration        # Replication tests (38)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.

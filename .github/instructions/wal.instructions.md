@@ -28,6 +28,7 @@ pub trait WriteAheadLog: Send + Sync {
     fn truncate(&self) -> Result<()>;
     fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;  // retain above for recovery
     fn last_seq_no(&self) -> u64;
+    fn next_seq_no(&self) -> u64;
 }
 ```
 
@@ -39,12 +40,14 @@ pub trait WriteAheadLog: Send + Sync {
 - Seq numbers are monotonically increasing, persisted in `.seqno` sidecar file
 
 ### Files on Disk (per shard)
-- `{data_dir}/{index}/{shard_id}/translog.bin` — the WAL file
-- `{data_dir}/{index}/{shard_id}/translog.seqno` — last assigned sequence number
+- `{data_dir}/{index}/shard_{id}/translog.bin` — the WAL file
+- `{data_dir}/{index}/shard_{id}/translog.seqno` — last assigned sequence number
+- `{data_dir}/{index}/shard_{id}/translog.committed` — exclusive committed seq_no used to skip already committed entries on restart
 
 ## Key Behaviors
 - `append()` returns the assigned seq_no in the TranslogEntry
 - `read_from(seq_no)` reads all entries with seq_no > the given value (used for replica recovery)
 - `truncate_below(global_checkpoint)` removes entries ≤ global_checkpoint, keeps entries above for replica recovery
 - `truncate()` clears entire log (used on full flush)
+- `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths
 - Async durability: background task fsyncs every `sync_interval_ms` — safe when replicas provide durability

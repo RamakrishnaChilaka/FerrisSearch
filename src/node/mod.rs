@@ -130,6 +130,7 @@ impl Node {
         let raft = self.raft.clone();
         let raft_node_id = self.config.raft_node_id;
         let manager_clone = self.shard_manager.clone();
+        let remote_seeds = remote_seed_hosts(&seed_hosts, local_node.transport_port);
 
         tokio::spawn(async move {
             // Give servers a tiny moment to bind
@@ -138,25 +139,21 @@ impl Node {
             // ── Bootstrap or join ──────────────────────────────────────
             if let Some(ref raft) = raft {
                 // If Raft is already initialized (recovered from disk), skip
-                // bootstrap/join — just wait for the cluster to catch up.
+                // bootstrap, but still re-register with the leader so its
+                // recovered cluster state contains this node again.
                 let already_initialized = raft.is_initialized().await.unwrap_or(false);
 
                 if already_initialized {
                     info!("Raft already initialized (recovered from disk), rejoining cluster");
+                    if try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 20).await
+                    {
+                        info!("Recovered node re-registered with the cluster leader");
+                    } else if !remote_seeds.is_empty() {
+                        tracing::warn!(
+                            "Recovered node could not re-register via seed hosts yet; will retry in lifecycle loop"
+                        );
+                    }
                 } else {
-                    // Filter out seed hosts that point to ourselves
-                    let remote_seeds: Vec<String> = seed_hosts
-                        .iter()
-                        .filter(|h| {
-                            let port = h
-                                .rsplit_once(':')
-                                .and_then(|(_, p)| p.parse::<u16>().ok())
-                                .unwrap_or(9300);
-                            port != local_node.transport_port
-                        })
-                        .cloned()
-                        .collect();
-
                     // Try to join an existing cluster (leader handles Raft membership)
                     let joined = if !remote_seeds.is_empty() {
                         client
@@ -219,6 +216,9 @@ impl Node {
                 }
             }
 
+            let state = manager.get_state();
+            open_local_assigned_shards(&state, &local_id, manager_clone.as_ref());
+
             // ── Lifecycle loop ─────────────────────────────────────────
             let mut leader_since: Option<Instant> = None;
 
@@ -226,6 +226,7 @@ impl Node {
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
                 let state = manager.get_state();
+                open_local_assigned_shards(&state, &local_id, manager_clone.as_ref());
 
                 if let Some(ref raft) = raft {
                     if raft.is_leader() {
@@ -414,6 +415,22 @@ impl Node {
                         leader_since = None;
 
                         // ── Follower duties ────────────────────────
+                        if !state.nodes.contains_key(&local_id)
+                            && try_join_cluster(
+                                &client,
+                                &remote_seeds,
+                                &local_node,
+                                raft_node_id,
+                                1,
+                            )
+                            .await
+                        {
+                            tracing::info!(
+                                "Recovered follower {} re-registered with leader",
+                                local_id
+                            );
+                        }
+
                         // Ping the master for health monitoring
                         if let Some(master_id) = &state.master_node
                             && let Some(master_info) = state.nodes.get(master_id)
@@ -491,6 +508,81 @@ impl Node {
     }
 }
 
+fn open_local_assigned_shards(
+    state: &crate::cluster::state::ClusterState,
+    local_node_id: &str,
+    shard_manager: &ShardManager,
+) {
+    for (index_name, metadata) in &state.indices {
+        for (shard_id, routing) in &metadata.shard_routing {
+            let assigned_here = routing.primary == local_node_id
+                || routing
+                    .replicas
+                    .iter()
+                    .any(|node_id| node_id == local_node_id);
+            if !assigned_here || shard_manager.get_shard(index_name, *shard_id).is_some() {
+                continue;
+            }
+
+            if let Err(e) = shard_manager.open_shard_with_settings(
+                index_name,
+                *shard_id,
+                &metadata.mappings,
+                &metadata.settings,
+            ) {
+                tracing::warn!(
+                    "Failed to reopen local shard {}/{} during lifecycle reconciliation: {}",
+                    index_name,
+                    shard_id,
+                    e
+                );
+            }
+        }
+    }
+}
+
+fn remote_seed_hosts(seed_hosts: &[String], local_transport_port: u16) -> Vec<String> {
+    seed_hosts
+        .iter()
+        .filter(|h| {
+            let port = h
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .unwrap_or(9300);
+            port != local_transport_port
+        })
+        .cloned()
+        .collect()
+}
+
+async fn try_join_cluster(
+    client: &TransportClient,
+    remote_seeds: &[String],
+    local_node: &NodeInfo,
+    raft_node_id: u64,
+    attempts: usize,
+) -> bool {
+    if remote_seeds.is_empty() {
+        return false;
+    }
+
+    for attempt in 0..attempts {
+        if client
+            .join_cluster(remote_seeds, local_node, raft_node_id)
+            .await
+            .is_some()
+        {
+            return true;
+        }
+
+        if attempt + 1 < attempts {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    false
+}
+
 /// Apply recovered translog operations from the primary to a replica shard engine.
 fn apply_recovery_ops(
     engine: &Arc<dyn crate::engine::SearchEngine>,
@@ -524,8 +616,10 @@ fn apply_recovery_ops(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::state::{IndexMetadata, IndexSettings, ShardRoutingEntry};
     use crate::engine::CompositeEngine;
     use crate::transport::proto::RecoverReplicaOp;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -650,5 +744,50 @@ mod tests {
             "m2 should exist"
         );
         assert!(engine.local_checkpoint() >= 2);
+    }
+
+    #[tokio::test]
+    async fn open_local_assigned_shards_opens_unopened_local_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+
+        let mut state = crate::cluster::state::ClusterState::new("node-test".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec!["node-2".into()],
+                unassigned_replicas: 0,
+            },
+        );
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+
+        assert!(shard_manager.get_shard("idx", 0).is_none());
+        open_local_assigned_shards(&state, "node-1", &shard_manager);
+        assert!(shard_manager.get_shard("idx", 0).is_some());
+    }
+
+    #[test]
+    fn remote_seed_hosts_excludes_local_transport_port() {
+        let seeds = vec![
+            "127.0.0.1:9300".to_string(),
+            "127.0.0.1:9301".to_string(),
+            "127.0.0.1:9302".to_string(),
+        ];
+
+        let remote = remote_seed_hosts(&seeds, 9301);
+
+        assert_eq!(
+            remote,
+            vec!["127.0.0.1:9300".to_string(), "127.0.0.1:9302".to_string()]
+        );
     }
 }

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tantivy::collector::{Count, TopDocs};
@@ -33,6 +33,8 @@ pub struct HotEngine {
     pub refresh_interval: Duration,
     /// Write-ahead log for crash durability
     translog: Arc<Mutex<dyn WriteAheadLog>>,
+    /// Highest committed translog seq_no, stored as the next seq_no after commit.
+    committed_seq_no_path: PathBuf,
 }
 
 impl HotEngine {
@@ -65,25 +67,28 @@ impl HotEngine {
 
         // Create typed fields from mappings
         let mut mapped_fields: HashMap<String, Field> = HashMap::new();
-        for (name, mapping) in mappings {
+        let mut mapping_names: Vec<_> = mappings.keys().cloned().collect();
+        mapping_names.sort();
+        for name in mapping_names {
+            let mapping = &mappings[&name];
             use crate::cluster::state::FieldType;
             let field = match mapping.field_type {
-                FieldType::Text => schema_builder.add_text_field(name, TEXT | STORED),
+                FieldType::Text => schema_builder.add_text_field(&name, TEXT | STORED),
                 FieldType::Keyword => {
-                    schema_builder.add_text_field(name, (STRING | STORED).set_fast(None))
+                    schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
                 }
                 FieldType::Integer => {
-                    schema_builder.add_i64_field(name, tantivy::schema::INDEXED | STORED | FAST)
+                    schema_builder.add_i64_field(&name, tantivy::schema::INDEXED | STORED | FAST)
                 }
                 FieldType::Float => {
-                    schema_builder.add_f64_field(name, tantivy::schema::INDEXED | STORED | FAST)
+                    schema_builder.add_f64_field(&name, tantivy::schema::INDEXED | STORED | FAST)
                 }
                 FieldType::Boolean => {
-                    schema_builder.add_text_field(name, (STRING | STORED).set_fast(None))
+                    schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
                 }
                 FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
             };
-            mapped_fields.insert(name.clone(), field);
+            mapped_fields.insert(name, field);
         }
 
         let schema = schema_builder.build();
@@ -124,6 +129,8 @@ impl HotEngine {
             fields,
         };
 
+        let committed_seq_no_path = data_dir.join("translog.committed");
+
         let engine = Self {
             index,
             reader,
@@ -131,6 +138,7 @@ impl HotEngine {
             field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
+            committed_seq_no_path,
         };
 
         // Replay any uncommitted translog entries from before a crash
@@ -293,9 +301,13 @@ impl HotEngine {
     /// Replays all pending translog entries into the Tantivy buffer.
     /// Called on startup to recover from an unclean shutdown.
     fn replay_translog(&self) -> Result<()> {
+        let committed_next_seq = self.load_committed_next_seq_no()?;
         let entries = {
             let tl = self.translog.lock().unwrap();
             tl.read_all()?
+                .into_iter()
+                .filter(|entry| entry.seq_no >= committed_next_seq)
+                .collect::<Vec<_>>()
         };
 
         if entries.is_empty() {
@@ -303,8 +315,9 @@ impl HotEngine {
         }
 
         tracing::warn!(
-            "Replaying {} translog entries from unclean shutdown...",
-            entries.len()
+            "Replaying {} translog entries from seq_no {} after restart...",
+            entries.len(),
+            committed_next_seq
         );
 
         let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
@@ -320,11 +333,27 @@ impl HotEngine {
         }
         writer.commit()?;
         self.reader.reload()?;
+        self.persist_committed_next_seq_no(
+            entries.last().map(|entry| entry.seq_no + 1).unwrap_or(committed_next_seq),
+        )?;
 
         tracing::info!(
             "Translog replay complete. {} documents recovered.",
             entries.len()
         );
+        Ok(())
+    }
+
+    fn load_committed_next_seq_no(&self) -> Result<u64> {
+        if !self.committed_seq_no_path.exists() {
+            return Ok(0);
+        }
+        let s = std::fs::read_to_string(&self.committed_seq_no_path)?;
+        Ok(s.trim().parse::<u64>().unwrap_or(0))
+    }
+
+    fn persist_committed_next_seq_no(&self, next_seq_no: u64) -> Result<()> {
+        std::fs::write(&self.committed_seq_no_path, next_seq_no.to_string())?;
         Ok(())
     }
 
@@ -596,11 +625,13 @@ impl HotEngine {
     }
 
     pub fn flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<()> {
+        let tl = self.translog.lock().unwrap();
+        let committed_next_seq = tl.next_seq_no();
         let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         writer.commit()?;
         drop(writer);
         self.reader.reload()?;
-        let tl = self.translog.lock().unwrap();
+        self.persist_committed_next_seq_no(committed_next_seq)?;
         if global_checkpoint > 0 {
             tl.truncate_below(global_checkpoint)?;
         } else {
@@ -1241,18 +1272,26 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn refresh(&self) -> Result<()> {
-        let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        writer.commit()?;
+        let committed_next_seq = {
+            let tl = self.translog.lock().unwrap();
+            let next_seq = tl.next_seq_no();
+            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            writer.commit()?;
+            next_seq
+        };
+        self.persist_committed_next_seq_no(committed_next_seq)?;
         self.reader.reload()?;
         Ok(())
     }
 
     fn flush(&self) -> Result<()> {
+        let tl = self.translog.lock().unwrap();
+        let committed_next_seq = tl.next_seq_no();
         let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         writer.commit()?;
-        drop(writer); // release lock before translog truncate
+        drop(writer); // release lock before reader reload
         self.reader.reload()?;
-        let tl = self.translog.lock().unwrap();
+        self.persist_committed_next_seq_no(committed_next_seq)?;
         tl.truncate()?;
         Ok(())
     }
@@ -1712,6 +1751,123 @@ mod tests {
             entries.is_empty(),
             "translog should be empty after flush + reopen"
         );
+    }
+
+    #[test]
+    fn refresh_then_reopen_does_not_duplicate_committed_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            engine
+                .add_document("safe", json!({"refreshed": true}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        let engine2 = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::new(),
+        };
+        let (_hits, total, _) = engine2.search_query(&req).unwrap();
+        assert_eq!(total, 1, "refresh-committed docs must not replay twice");
+    }
+
+    #[test]
+    fn refresh_then_reopen_replays_only_uncommitted_entries_after_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            engine
+                .add_document("committed", json!({"kind": "committed"}))
+                .unwrap();
+            engine.refresh().unwrap();
+            engine
+                .add_document("pending", json!({"kind": "pending"}))
+                .unwrap();
+        }
+
+        let engine2 = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::new(),
+        };
+        let (_hits, total, _) = engine2.search_query(&req).unwrap();
+        assert_eq!(total, 2, "reopen should keep committed docs and replay only pending ones");
+        assert!(engine2.get_document("committed").unwrap().is_some());
+        assert!(engine2.get_document("pending").unwrap().is_some());
+    }
+
+    #[test]
+    fn reopen_with_same_mappings_in_different_hashmap_order_preserves_data() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut mappings = HashMap::new();
+            mappings.insert(
+                "title".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Text,
+                    dimension: None,
+                },
+            );
+            mappings.insert(
+                "category".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            );
+
+            let engine = HotEngine::new_with_mappings(
+                dir.path(),
+                Duration::from_secs(60),
+                &mappings,
+                TranslogDurability::Request,
+            )
+            .unwrap();
+            engine
+                .add_document("stable", json!({"title": "schema order", "category": "ok"}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        let mut reopened_mappings = HashMap::new();
+        reopened_mappings.insert(
+            "category".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        reopened_mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+
+        let reopened = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &reopened_mappings,
+            TranslogDurability::Request,
+        )
+        .unwrap();
+
+        let doc = reopened.get_document("stable").unwrap();
+        assert!(doc.is_some(), "document should survive reopen with reordered mappings");
+        assert_eq!(doc.unwrap()["title"], "schema order");
     }
 
     // ── doc_count ───────────────────────────────────────────────────────

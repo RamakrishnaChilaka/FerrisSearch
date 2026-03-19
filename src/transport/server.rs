@@ -185,20 +185,32 @@ impl InternalTransport for TransportService {
                     .await
                     .map_err(|e| Status::internal(format!("Raft AddNode failed: {}", e)))?;
 
-                // 2. Add as Raft learner (non-blocking — replication starts in background)
-                let addr = format!("{}:{}", ni.host, ni.transport_port);
-                raft.add_learner(joining_raft_id, openraft::BasicNode { addr }, false)
-                    .await
-                    .map_err(|e| Status::internal(format!("Raft add_learner failed: {}", e)))?;
-
-                // 3. Promote to voter
                 let voters: std::collections::BTreeSet<u64> = raft
                     .voter_ids()
-                    .chain(std::iter::once(joining_raft_id))
                     .collect();
-                raft.change_membership(voters, false).await.map_err(|e| {
-                    Status::internal(format!("Raft change_membership failed: {}", e))
-                })?;
+                let already_voter = voters.contains(&joining_raft_id);
+
+                if !already_voter {
+                    // 2. Add as Raft learner (non-blocking — replication starts in background)
+                    let addr = format!("{}:{}", ni.host, ni.transport_port);
+                    raft.add_learner(joining_raft_id, openraft::BasicNode { addr }, false)
+                        .await
+                        .map_err(|e| Status::internal(format!("Raft add_learner failed: {}", e)))?;
+
+                    // 3. Promote to voter
+                    let voters: std::collections::BTreeSet<u64> = voters
+                        .into_iter()
+                        .chain(std::iter::once(joining_raft_id))
+                        .collect();
+                    raft.change_membership(voters, false).await.map_err(|e| {
+                        Status::internal(format!("Raft change_membership failed: {}", e))
+                    })?;
+                } else {
+                    tracing::info!(
+                        "Join request for existing voter {} — refreshed cluster-state node registration only",
+                        ni.id
+                    );
+                }
 
                 let state = self.cluster_manager.get_state();
                 return Ok(Response::new(JoinResponse {
@@ -476,13 +488,13 @@ impl InternalTransport for TransportService {
         request: Request<ShardGetRequest>,
     ) -> Result<Response<ShardGetResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self.shard_manager.get_shard(&req.index_name, req.shard_id) {
-            Some(e) => e,
-            None => {
+        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+            Ok(engine) => engine,
+            Err(status) => {
                 return Ok(Response::new(ShardGetResponse {
                     found: false,
                     source_json: vec![],
-                    error: "Shard not found on this node".into(),
+                    error: status.message().to_string(),
                 }));
             }
         };
@@ -510,13 +522,13 @@ impl InternalTransport for TransportService {
         request: Request<ShardSearchRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self.shard_manager.get_shard(&req.index_name, req.shard_id) {
-            Some(e) => e,
-            None => {
+        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+            Ok(engine) => engine,
+            Err(status) => {
                 return Ok(Response::new(ShardSearchResponse {
                     success: false,
                     hits: vec![],
-                    error: "Shard not found on this node".into(),
+                    error: status.message().to_string(),
                     total_hits: 0,
                     partial_aggs_json: vec![],
                 }));
@@ -551,13 +563,13 @@ impl InternalTransport for TransportService {
         request: Request<ShardSearchDslRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self.shard_manager.get_shard(&req.index_name, req.shard_id) {
-            Some(e) => e,
-            None => {
+        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+            Ok(engine) => engine,
+            Err(status) => {
                 return Ok(Response::new(ShardSearchResponse {
                     success: false,
                     hits: vec![],
-                    error: "Shard not found on this node".into(),
+                    error: status.message().to_string(),
                     total_hits: 0,
                     partial_aggs_json: vec![],
                 }));
@@ -1116,6 +1128,7 @@ impl InternalTransport for TransportService {
         &self,
         _request: Request<ShardStatsRequest>,
     ) -> Result<Response<ShardStatsResponse>, Status> {
+        self.reopen_persisted_shards_from_disk();
         let all = self.shard_manager.all_shards();
         let shards = all
             .iter()
@@ -1223,16 +1236,96 @@ impl TransportService {
         if let Some(e) = self.shard_manager.get_shard(index_name, shard_id) {
             return Ok(e);
         }
-        // Look up mappings from cluster state if available
         let cs = self.cluster_manager.get_state();
-        let mappings = cs
-            .indices
-            .get(index_name)
+        let metadata = cs.indices.get(index_name);
+        let mappings = metadata
             .map(|m| m.mappings.clone())
             .unwrap_or_default();
+        let settings = metadata
+            .map(|m| m.settings.clone())
+            .unwrap_or_default();
         self.shard_manager
-            .open_shard_with_mappings(index_name, shard_id, &mappings)
+            .open_shard_with_settings(index_name, shard_id, &mappings, &settings)
             .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_or_open_search_shard(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
+        if let Some(engine) = self.shard_manager.get_shard(index_name, shard_id) {
+            return Ok(engine);
+        }
+
+        let cs = self.cluster_manager.get_state();
+        if let Some(metadata) = cs.indices.get(index_name) {
+            if !metadata.shard_routing.contains_key(&shard_id) {
+                return Err(Status::not_found(format!(
+                    "Shard [{index_name}][{shard_id}] not found on this node"
+                )));
+            }
+            return self
+                .shard_manager
+                .open_shard_with_settings(
+                    index_name,
+                    shard_id,
+                    &metadata.mappings,
+                    &metadata.settings,
+                )
+                .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)));
+        }
+
+        let shard_dir = self
+            .shard_manager
+            .data_dir()
+            .join(index_name)
+            .join(format!("shard_{shard_id}"));
+        if !shard_dir.exists() {
+            return Err(Status::not_found(format!(
+                "Shard [{index_name}][{shard_id}] not found on this node"
+            )));
+        }
+
+        self.shard_manager
+            .open_shard(index_name, shard_id)
+            .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
+    }
+
+    fn reopen_persisted_shards_from_disk(&self) {
+        let cs = self.cluster_manager.get_state();
+        for (index_name, metadata) in &cs.indices {
+            let index_dir = self.shard_manager.data_dir().join(index_name);
+            if !index_dir.exists() {
+                continue;
+            }
+
+            for shard_id in metadata.shard_routing.keys() {
+                if self.shard_manager.get_shard(index_name, *shard_id).is_some() {
+                    continue;
+                }
+
+                let shard_dir = index_dir.join(format!("shard_{shard_id}"));
+                if !shard_dir.exists() {
+                    continue;
+                }
+
+                if let Err(e) = self.shard_manager.open_shard_with_settings(
+                    index_name,
+                    *shard_id,
+                    &metadata.mappings,
+                    &metadata.settings,
+                ) {
+                    tracing::warn!(
+                        "Failed to reopen persisted shard {}/{} while collecting stats: {}",
+                        index_name,
+                        shard_id,
+                        e
+                    );
+                }
+            }
+        }
     }
 
     /// Compute and advance the global checkpoint for a shard.
@@ -1295,11 +1388,16 @@ pub fn create_transport_service_with_raft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::manager::ClusterManager;
     use crate::cluster::state::{
         ClusterState as DomainClusterState, IndexMetadata as DomainIndexMetadata,
         NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
     };
+    use crate::engine::{CompositeEngine, SearchEngine};
+    use crate::shard::ShardManager;
+    use serde_json::json;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn make_full_cluster_state() -> DomainClusterState {
         let mut cs = DomainClusterState::new("roundtrip-cluster".into());
@@ -1543,5 +1641,140 @@ mod tests {
             2,
             "slowest replica determines global checkpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn get_or_open_search_shard_reopens_persisted_shard_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let shard_dir = dir.path().join("restart-idx").join("shard_0");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+            engine
+                .add_document("d1", json!({"title": "rust restart unit"}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        let service = TransportService {
+            cluster_manager: Arc::new(ClusterManager::new("restart-unit".into())),
+            shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+            transport_client: crate::transport::TransportClient::new(),
+            raft: None,
+        };
+
+        let engine = service
+            .get_or_open_search_shard("restart-idx", 0)
+            .expect("persisted shard should reopen");
+        let hits = engine.search("rust").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "d1");
+    }
+
+    #[tokio::test]
+    async fn get_doc_reopens_persisted_shard_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let shard_dir = dir.path().join("restart-idx").join("shard_0");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+            engine
+                .add_document("d1", json!({"title": "rust restart unit"}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        let service = TransportService {
+            cluster_manager: Arc::new(ClusterManager::new("restart-unit".into())),
+            shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+            transport_client: crate::transport::TransportClient::new(),
+            raft: None,
+        };
+
+        let response = service
+            .get_doc(Request::new(ShardGetRequest {
+                index_name: "restart-idx".into(),
+                shard_id: 0,
+                doc_id: "d1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(response.found);
+        let source: serde_json::Value = serde_json::from_slice(&response.source_json).unwrap();
+        assert_eq!(source["title"], "rust restart unit");
+    }
+
+    #[tokio::test]
+    async fn get_shard_stats_reopens_persisted_shards_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let shard_dir = dir.path().join("stats-idx").join("shard_0");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+            engine
+                .add_document("d1", json!({"title": "stats restart unit"}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        let mut cluster_state = DomainClusterState::new("stats-cluster".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        cluster_state.add_index(DomainIndexMetadata {
+            name: "stats-idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
+        });
+
+        let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+        manager.update_state(cluster_state);
+
+        let service = TransportService {
+            cluster_manager: Arc::new(manager),
+            shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+            transport_client: crate::transport::TransportClient::new(),
+            raft: None,
+        };
+
+        let response = service
+            .get_shard_stats(Request::new(ShardStatsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.shards.len(), 1);
+        assert_eq!(response.shards[0].index_name, "stats-idx");
+        assert_eq!(response.shards[0].shard_id, 0);
+        assert_eq!(response.shards[0].doc_count, 1);
+    }
+
+    #[test]
+    fn get_or_open_search_shard_returns_not_found_for_unknown_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = TransportService {
+            cluster_manager: Arc::new(ClusterManager::new("missing-unit".into())),
+            shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+            transport_client: crate::transport::TransportClient::new(),
+            raft: None,
+        };
+
+        let err = match service.get_or_open_search_shard("missing-idx", 99) {
+            Ok(_) => panic!("unknown shard should not be opened"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(err.message().contains("not found"));
     }
 }

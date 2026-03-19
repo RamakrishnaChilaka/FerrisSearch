@@ -109,6 +109,10 @@ pub trait WriteAheadLog: Send + Sync {
     /// Get the last assigned sequence number (highest seq_no written so far).
     /// Returns 0 if no writes have occurred.
     fn last_seq_no(&self) -> u64;
+
+    /// Get the next sequence number that will be assigned on append.
+    /// This is exclusive: if seq_no 0 has been written, this returns 1.
+    fn next_seq_no(&self) -> u64;
 }
 
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
@@ -427,6 +431,10 @@ impl WriteAheadLog for HotTranslog {
     fn last_seq_no(&self) -> u64 {
         let seq = self.seq_no.lock().unwrap();
         if *seq == 0 { 0 } else { *seq - 1 }
+    }
+
+    fn next_seq_no(&self) -> u64 {
+        *self.seq_no.lock().unwrap()
     }
 }
 

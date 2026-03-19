@@ -77,7 +77,7 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - **Dynamic fields**: creates Tantivy fields on first encounter
 - **`body` field**: catch-all for unmapped textual content
 - `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
-- `replay_translog()` — crash recovery from WAL
+- `replay_translog()` — crash recovery from WAL, replaying only entries at or above the persisted committed checkpoint
 
 ### Field Schema Flags
 Numeric fields use three Tantivy flags (mirrors OpenSearch default doc_values: true):

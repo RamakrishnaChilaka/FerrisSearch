@@ -76,7 +76,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 437 unit tests + 29 consensus integration + 35 replication integration = 501 total
+- 444 unit tests + 29 consensus integration + 38 replication integration = 511 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -84,6 +84,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
 - Joining node: sends JoinCluster gRPC (with raft_node_id) → leader does `AddNode` + `add_learner` + `change_membership`
 - Joining node does NOT call `update_state` — Raft log replication propagates state
+- Nodes reopen locally assigned shards after startup and reconcile unopened assignments in the lifecycle loop
 - Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader), shard failover (promote best ISR replica to primary for orphaned shards)
 - Follower lifecycle loop: pings the master for liveness
 
@@ -357,7 +358,7 @@ pub trait SearchEngine: Send + Sync {
 - Dynamic field creation on first document encounter
 - `"body"` field as catch-all for textual content
 - `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
-- `replay_translog()` — crash recovery from WAL
+- `replay_translog()` — crash recovery from WAL, replaying only entries at or above the persisted committed checkpoint
 
 ### VectorIndex (src/engine/vector.rs)
 - USearch HNSW wrapper (connectivity=16, expansion_add=128, expansion_search=64)
@@ -414,12 +415,14 @@ trait WriteAheadLog: Send + Sync {
     fn truncate(&self) -> Result<()>;       // clear after commit
     fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;
     fn last_seq_no(&self) -> u64;
+    fn next_seq_no(&self) -> u64;
 }
 ```
 
 ### HotTranslog (Binary Format)
 - Length-prefixed: `[u32 LE: payload_len][bincode(WireEntry { seq_no, op, payload_json })]`
 - Seq numbers are monotonically increasing, survive truncation (persisted in `.seqno` file)
+- `translog.committed` stores the exclusive committed seq_no so restart replay skips already committed entries
 - Handles partial writes at EOF gracefully (skips/truncates)
 
 ## Replication Protocol (src/replication/mod.rs)

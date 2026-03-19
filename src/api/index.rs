@@ -8,6 +8,42 @@ use axum::{
 use futures::future::join_all;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+pub(crate) fn ensure_local_index_shards_open(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    context: &str,
+) -> Vec<(u32, Arc<dyn crate::engine::SearchEngine>)> {
+    for (shard_id, routing) in &metadata.shard_routing {
+        let assigned_here = routing.primary == state.local_node_id
+            || routing
+                .replicas
+                .iter()
+                .any(|node_id| node_id == &state.local_node_id);
+        if !assigned_here || state.shard_manager.get_shard(index_name, *shard_id).is_some() {
+            continue;
+        }
+
+        if let Err(e) = state.shard_manager.open_shard_with_settings(
+            index_name,
+            *shard_id,
+            &metadata.mappings,
+            &metadata.settings,
+        ) {
+            tracing::error!(
+                "{}: failed to open shard {}/{}: {}",
+                context,
+                index_name,
+                shard_id,
+                e
+            );
+        }
+    }
+
+    state.shard_manager.get_index_shards(index_name)
+}
 
 /// Auto-create an index with 1 shard, respecting the coordinator pattern.
 /// If Raft is active and this node is NOT the leader, forwards to the master.
@@ -532,37 +568,15 @@ pub async fn refresh_index(
     let cluster_state = state.cluster_manager.get_state();
     let metadata = cluster_state.indices.get(&index_name);
 
-    // If we have no locally-open shards but the index exists in cluster state,
-    // try to open local shards first (handles restart or stale shard state).
-    let mut shards = state.shard_manager.get_index_shards(&index_name);
-    if shards.is_empty() {
-        if let Some(meta) = metadata {
-            for (shard_id, routing) in &meta.shard_routing {
-                if (routing.primary == state.local_node_id
-                    || routing.replicas.contains(&state.local_node_id))
-                    && let Err(e) = state.shard_manager.open_shard_with_mappings(
-                        &index_name,
-                        *shard_id,
-                        &meta.mappings,
-                    )
-                {
-                    tracing::error!(
-                        "Refresh: failed to open shard {}/{}: {}",
-                        index_name,
-                        shard_id,
-                        e
-                    );
-                }
-            }
-            shards = state.shard_manager.get_index_shards(&index_name);
-        } else {
-            return crate::api::error_response(
-                StatusCode::NOT_FOUND,
-                "index_not_found_exception",
-                format!("no such index [{}]", index_name),
-            );
-        }
-    }
+    let shards = if let Some(meta) = metadata {
+        ensure_local_index_shards_open(&state, &index_name, meta, "Refresh")
+    } else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name),
+        );
+    };
 
     let mut successful = 0;
     let mut failed = 0;
@@ -602,35 +616,15 @@ pub async fn flush_index(
     let cluster_state = state.cluster_manager.get_state();
     let metadata = cluster_state.indices.get(&index_name);
 
-    let mut shards = state.shard_manager.get_index_shards(&index_name);
-    if shards.is_empty() {
-        if let Some(meta) = metadata {
-            for (shard_id, routing) in &meta.shard_routing {
-                if (routing.primary == state.local_node_id
-                    || routing.replicas.contains(&state.local_node_id))
-                    && let Err(e) = state.shard_manager.open_shard_with_mappings(
-                        &index_name,
-                        *shard_id,
-                        &meta.mappings,
-                    )
-                {
-                    tracing::error!(
-                        "Flush: failed to open shard {}/{}: {}",
-                        index_name,
-                        shard_id,
-                        e
-                    );
-                }
-            }
-            shards = state.shard_manager.get_index_shards(&index_name);
-        } else {
-            return crate::api::error_response(
-                StatusCode::NOT_FOUND,
-                "index_not_found_exception",
-                format!("no such index [{}]", index_name),
-            );
-        }
-    }
+    let shards = if let Some(meta) = metadata {
+        ensure_local_index_shards_open(&state, &index_name, meta, "Flush")
+    } else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name),
+        );
+    };
 
     let mut successful = 0;
     let mut failed = 0;
@@ -1158,8 +1152,11 @@ pub async fn search_documents_dsl(
         std::collections::HashMap<String, crate::search::PartialAggResult>,
     > = Vec::new();
 
+    let local_shards =
+        ensure_local_index_shards_open(&state, &index_name, &metadata, "DSL search");
+
     // Query local shards directly (text search)
-    for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
+    for (shard_id, engine) in &local_shards {
         match engine.search_query(&search_req) {
             Ok((hits, shard_total, partial_aggs)) => {
                 successful += 1;
@@ -1187,7 +1184,7 @@ pub async fn search_documents_dsl(
     if let Some(ref knn) = search_req.knn
         && let Some((field_name, params)) = knn.fields.iter().next()
     {
-        for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
+        for (shard_id, engine) in &local_shards {
             match engine.search_knn_filtered(
                 field_name,
                 &params.vector,
@@ -1221,12 +1218,8 @@ pub async fn search_documents_dsl(
     }
 
     // Scatter to remote shards (shards on other nodes)
-    let local_shard_ids: std::collections::HashSet<u32> = state
-        .shard_manager
-        .get_index_shards(&index_name)
-        .iter()
-        .map(|(id, _)| *id)
-        .collect();
+    let local_shard_ids: std::collections::HashSet<u32> =
+        local_shards.iter().map(|(id, _)| *id).collect();
 
     let mut remote_futures = Vec::new();
     for (shard_id, routing) in &metadata.shard_routing {

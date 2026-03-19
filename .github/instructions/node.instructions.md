@@ -37,10 +37,13 @@ pub struct Node {
    - Nodes not seen for 15s → dead
    - Call `remove_node()` on each dead node
    - Shard failover for orphaned primaries (see shard failover section)
-3. Allocate unassigned replicas to available data nodes
+3. Reopen any locally assigned shards that are still not open
+4. Allocate unassigned replicas to available data nodes
 
 ### Follower Duties (every 5s tick)
 1. Ping master node for liveness check
+2. Reopen any locally assigned shards that are still not open
+3. Request translog-based replica recovery for replica shards once opened
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` → returns orphaned primary shard IDs

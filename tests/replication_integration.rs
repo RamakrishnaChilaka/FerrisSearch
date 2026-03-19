@@ -7,6 +7,7 @@ use ferrissearch::cluster::manager::ClusterManager;
 use ferrissearch::cluster::state::{
     FieldMapping, FieldType, IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
 };
+use ferrissearch::engine::{CompositeEngine, SearchEngine};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
@@ -714,6 +715,40 @@ async fn search_shard_simple_query_string_via_grpc() {
 }
 
 #[tokio::test]
+async fn search_shard_reopens_persisted_shard_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let sm = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let engine = sm.open_shard("restart-idx", 0).unwrap();
+        engine
+            .add_document("d1", serde_json::json!({"title": "rust restart"}))
+            .unwrap();
+        engine.refresh().unwrap();
+    }
+
+    let cm = Arc::new(ClusterManager::new("restart-search-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let resp = client
+        .search_shard(tonic::Request::new(ShardSearchRequest {
+            index_name: "restart-idx".into(),
+            shard_id: 0,
+            query: "rust".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "restart search failed: {}", resp.error);
+    assert_eq!(resp.hits.len(), 1, "expected reopened shard to return 1 hit");
+    let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
+    assert_eq!(hit["_id"], "d1");
+}
+
+#[tokio::test]
 async fn search_shard_dsl_match_query_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("dsl-test".into()));
@@ -775,6 +810,202 @@ async fn search_shard_dsl_match_query_via_grpc() {
     assert_eq!(resp.hits.len(), 1, "expected 1 hit for 'matrix'");
     let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
     assert_eq!(hit["_id"], "d1");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let sm = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let engine = sm.open_shard("restart-dsl-idx", 0).unwrap();
+        engine
+            .add_document("d1", serde_json::json!({"title": "the restart matrix"}))
+            .unwrap();
+        engine.refresh().unwrap();
+    }
+
+    let cm = Arc::new(ClusterManager::new("restart-dsl-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let search_req = serde_json::json!({
+        "query": {"match": {"title": "restart"}},
+        "size": 10,
+        "from": 0
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "restart-dsl-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "restart DSL search failed: {}", resp.error);
+    assert_eq!(resp.hits.len(), 1, "expected reopened shard to return 1 hit");
+    let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
+    assert_eq!(hit["_id"], "d1");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let sm = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "category".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+
+        let engine = sm
+            .open_shard_with_mappings("restart-mapped-idx", 0, &mappings)
+            .unwrap();
+        engine
+            .add_document("d1", serde_json::json!({"title": "schema order", "category": "stable"}))
+            .unwrap();
+        engine.refresh().unwrap();
+    }
+
+    let cm = Arc::new(ClusterManager::new("restart-mapped-test".into()));
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+
+    let mut restarted_mappings = HashMap::new();
+    restarted_mappings.insert(
+        "category".into(),
+        FieldMapping {
+            field_type: FieldType::Keyword,
+            dimension: None,
+        },
+    );
+    restarted_mappings.insert(
+        "title".into(),
+        FieldMapping {
+            field_type: FieldType::Text,
+            dimension: None,
+        },
+    );
+
+    let mut cs = cm.get_state();
+    cs.add_index(IndexMetadata {
+        name: "restart-mapped-idx".into(),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings: restarted_mappings,
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    cm.update_state(cs);
+
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let search_req = serde_json::json!({
+        "query": {"match": {"title": "schema"}},
+        "size": 10,
+        "from": 0
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "restart-mapped-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        resp.success,
+        "restart mapped DSL search failed after reordered metadata: {}",
+        resp.error
+    );
+    assert_eq!(resp.hits.len(), 1, "expected reopened mapped shard to return 1 hit");
+    let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
+    assert_eq!(hit["_id"], "d1");
+}
+
+#[tokio::test]
+async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let shard_dir = dir.path().join("restart-replay-idx").join("shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+        engine
+            .add_document("d1", serde_json::json!({"title": "committed before restart"}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine
+            .add_document("d2", serde_json::json!({"title": "pending before restart"}))
+            .unwrap();
+    }
+
+    let cm = Arc::new(ClusterManager::new("restart-replay-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let search_req = serde_json::json!({
+        "query": {"match_all": {}},
+        "size": 10,
+        "from": 0
+    });
+    let resp = client
+        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+            index_name: "restart-replay-idx".into(),
+            shard_id: 0,
+            search_request_json: serde_json::to_vec(&search_req).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "restart replay DSL search failed: {}", resp.error);
+    assert_eq!(
+        resp.hits.len(),
+        2,
+        "expected committed doc plus one replayed pending doc"
+    );
+
+    let mut ids: Vec<String> = resp
+        .hits
+        .iter()
+        .map(|hit| {
+            serde_json::from_slice::<serde_json::Value>(&hit.source_json)
+                .unwrap()["_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["d1".to_string(), "d2".to_string()]);
 }
 
 #[tokio::test]
