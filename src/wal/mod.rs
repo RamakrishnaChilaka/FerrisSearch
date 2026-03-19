@@ -20,7 +20,28 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Controls when the translog is fsynced to disk.
+///
+/// Matches OpenSearch's `index.translog.durability` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslogDurability {
+    /// Fsync after every write request (default). Maximum durability — no data
+    /// loss on crash. Equivalent to OpenSearch `"request"`.
+    Request,
+    /// Fsync on a timer interval. Faster writes but up to `sync_interval` of
+    /// data may be lost on crash. Equivalent to OpenSearch `"async"`.
+    /// Safe when replicas exist (data can be recovered from peers).
+    Async { sync_interval_ms: u64 },
+}
+
+impl Default for TranslogDurability {
+    fn default() -> Self {
+        Self::Request
+    }
+}
 
 const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
 
@@ -161,15 +182,26 @@ fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
 /// The sequence number is monotonically increasing and *never resets*, even after
 /// truncation. This enables replica recovery via seq_no-based translog replay.
 pub struct HotTranslog {
-    file: Mutex<File>,
+    file: Arc<Mutex<File>>,
     seq_no: Mutex<u64>,
     /// Path to the file that persists the seq_no high-water mark across truncations.
     seq_no_path: std::path::PathBuf,
+    /// Controls whether writes are fsynced immediately or on a timer.
+    durability: TranslogDurability,
 }
 
 impl HotTranslog {
     /// Open or create the translog at the given directory.
+    /// Uses `TranslogDurability::Request` (fsync per write) by default.
     pub fn open<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
+        Self::open_with_durability(data_dir, TranslogDurability::Request)
+    }
+
+    /// Open or create the translog with explicit durability setting.
+    pub fn open_with_durability<P: AsRef<Path>>(
+        data_dir: P,
+        durability: TranslogDurability,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         let path = data_dir.join("translog.bin");
         let seq_no_path = data_dir.join("translog.seqno");
@@ -197,23 +229,55 @@ impl HotTranslog {
         let mut f = file;
         f.seek(SeekFrom::End(0))?;
 
+        let durability_label = match durability {
+            TranslogDurability::Request => "request".to_string(),
+            TranslogDurability::Async { sync_interval_ms } => format!("async ({}ms)", sync_interval_ms),
+        };
         tracing::info!(
-            "Translog opened at {:?} ({} pending entries, next seq_no: {})",
+            "Translog opened at {:?} ({} pending entries, next seq_no: {}, durability: {})",
             path,
             existing.len(),
-            next_seq
+            next_seq,
+            durability_label
         );
 
         Ok(Self {
-            file: Mutex::new(f),
+            file: Arc::new(Mutex::new(f)),
             seq_no: Mutex::new(next_seq),
             seq_no_path,
+            durability,
         })
     }
 
     /// Get the current (next) sequence number without incrementing.
     pub fn current_seq_no(&self) -> u64 {
         *self.seq_no.lock().unwrap()
+    }
+
+    /// Start a background task that periodically fsyncs the translog file.
+    /// Only useful in `Async` durability mode. Returns a join handle.
+    pub fn start_sync_task(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = match self.durability {
+            TranslogDurability::Async { sync_interval_ms } => Duration::from_millis(sync_interval_ms),
+            _ => return None,
+        };
+        let file = self.file.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let f = file.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = f.sync_data() {
+                    tracing::error!("Background translog fsync failed: {}", e);
+                }
+            }
+        }))
+    }
+
+    /// Manually trigger an fsync (useful for testing or explicit flush).
+    pub fn sync(&self) -> Result<()> {
+        let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        f.sync_data()?;
+        Ok(())
     }
 
     /// Helper to read entries directly from a path (used during open to check existing state)
@@ -238,7 +302,9 @@ impl WriteAheadLog for HotTranslog {
 
         let mut file = self.file.lock().unwrap();
         file.write_all(&frame)?;
-        file.sync_data()?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            file.sync_data()?;
+        }
 
         Ok(entry)
     }
@@ -261,7 +327,9 @@ impl WriteAheadLog for HotTranslog {
 
         let mut file = self.file.lock().unwrap();
         file.write_all(&buf)?;
-        file.sync_data()?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            file.sync_data()?;
+        }
 
         Ok(entries)
     }
@@ -277,7 +345,9 @@ impl WriteAheadLog for HotTranslog {
 
         let mut file = self.file.lock().unwrap();
         file.write_all(&buf)?;
-        file.sync_data()?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            file.sync_data()?;
+        }
 
         Ok(())
     }
@@ -678,5 +748,157 @@ mod tests {
             1,
             "last_seq_no should persist after truncate"
         );
+    }
+
+    // ── TranslogDurability ──────────────────────────────────────────────
+
+    #[test]
+    fn default_durability_is_request() {
+        assert_eq!(TranslogDurability::default(), TranslogDurability::Request);
+    }
+
+    #[test]
+    fn open_defaults_to_request_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open(dir.path()).unwrap();
+        assert_eq!(tl.durability, TranslogDurability::Request);
+    }
+
+    #[test]
+    fn open_with_request_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
+        assert_eq!(tl.durability, TranslogDurability::Request);
+    }
+
+    #[test]
+    fn open_with_async_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let durability = TranslogDurability::Async { sync_interval_ms: 3000 };
+        let tl = HotTranslog::open_with_durability(dir.path(), durability).unwrap();
+        assert_eq!(tl.durability, durability);
+    }
+
+    #[test]
+    fn async_durability_preserves_interval() {
+        let d = TranslogDurability::Async { sync_interval_ms: 7500 };
+        match d {
+            TranslogDurability::Async { sync_interval_ms } => assert_eq!(sync_interval_ms, 7500),
+            _ => panic!("expected Async variant"),
+        }
+    }
+
+    #[test]
+    fn async_mode_append_writes_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open_with_durability(
+            dir.path(),
+            TranslogDurability::Async { sync_interval_ms: 5000 },
+        )
+        .unwrap();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+
+        let entries = tl.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq_no, 0);
+        assert_eq!(entries[1].seq_no, 1);
+    }
+
+    #[test]
+    fn async_mode_append_bulk_writes_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open_with_durability(
+            dir.path(),
+            TranslogDurability::Async { sync_interval_ms: 5000 },
+        )
+        .unwrap();
+        let ops: Vec<(&str, serde_json::Value)> =
+            vec![("index", json!({"a": 1})), ("index", json!({"b": 2}))];
+        let entries = tl.append_bulk(&ops).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let all = tl.read_all().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn async_mode_write_bulk_writes_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open_with_durability(
+            dir.path(),
+            TranslogDurability::Async { sync_interval_ms: 5000 },
+        )
+        .unwrap();
+        let ops: Vec<(&str, serde_json::Value)> =
+            vec![("index", json!({"a": 1})), ("index", json!({"b": 2}))];
+        tl.write_bulk(&ops).unwrap();
+
+        let all = tl.read_all().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn async_mode_manual_sync_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open_with_durability(
+            dir.path(),
+            TranslogDurability::Async { sync_interval_ms: 5000 },
+        )
+        .unwrap();
+        tl.append("index", json!({"a": 1})).unwrap();
+        // Manual sync should succeed without error
+        tl.sync().unwrap();
+    }
+
+    #[test]
+    fn start_sync_task_returns_none_for_request_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open(dir.path()).unwrap();
+        assert!(tl.start_sync_task().is_none());
+    }
+
+    #[test]
+    fn async_mode_truncate_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open_with_durability(
+            dir.path(),
+            TranslogDurability::Async { sync_interval_ms: 5000 },
+        )
+        .unwrap();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+
+        tl.truncate().unwrap();
+        let entries = tl.read_all().unwrap();
+        assert!(entries.is_empty());
+
+        // seq_no preserved
+        let e = tl.append("index", json!({"c": 3})).unwrap();
+        assert_eq!(e.seq_no, 2);
+    }
+
+    #[test]
+    fn async_mode_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let durability = TranslogDurability::Async { sync_interval_ms: 5000 };
+        {
+            let tl = HotTranslog::open_with_durability(dir.path(), durability).unwrap();
+            tl.append("index", json!({"a": 1})).unwrap();
+            tl.sync().unwrap(); // ensure data is on disk
+        }
+        // Reopen in request mode — data should still be there
+        let tl2 = HotTranslog::open(dir.path()).unwrap();
+        let entries = tl2.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].payload["a"], 1);
+    }
+
+    #[test]
+    fn request_mode_sync_is_noop_succeeds() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        // sync() should succeed even in request mode (already fsynced)
+        tl.sync().unwrap();
     }
 }

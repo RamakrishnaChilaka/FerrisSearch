@@ -13,6 +13,7 @@ use std::time::Duration;
 use super::SearchEngine;
 use super::tantivy::HotEngine;
 use super::vector::VectorIndex;
+use crate::wal::TranslogDurability;
 
 /// A composite engine that owns both a text index (Tantivy) and an optional
 /// vector index (USearch). All document operations go through here — vector
@@ -34,6 +35,7 @@ impl CompositeEngine {
             data_dir,
             refresh_interval,
             &std::collections::HashMap::new(),
+            TranslogDurability::Request,
         )
     }
 
@@ -42,9 +44,10 @@ impl CompositeEngine {
         data_dir: impl AsRef<Path>,
         refresh_interval: Duration,
         mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        let text = HotEngine::new_with_mappings(&data_dir, refresh_interval, mappings)?;
+        let text = HotEngine::new_with_mappings(&data_dir, refresh_interval, mappings, durability)?;
 
         // Load existing vector index if present
         let vector_path = data_dir.join("vectors.usearch");

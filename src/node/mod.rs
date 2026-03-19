@@ -7,6 +7,7 @@ use crate::config::AppConfig;
 use crate::consensus::types::{ClusterCommand, RaftInstance};
 use crate::shard::ShardManager;
 use crate::transport::client::TransportClient;
+use crate::wal::TranslogDurability;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,7 +34,18 @@ impl Node {
 
         let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle));
         let transport_client = TransportClient::new();
-        let shard_manager = Arc::new(ShardManager::new(&config.data_dir, Duration::from_secs(5)));
+
+        let durability = match config.translog_durability.as_str() {
+            "async" => TranslogDurability::Async {
+                sync_interval_ms: config.translog_sync_interval_ms.unwrap_or(5000),
+            },
+            _ => TranslogDurability::Request,
+        };
+        let shard_manager = Arc::new(ShardManager::new_with_durability(
+            &config.data_dir,
+            Duration::from_secs(5),
+            durability,
+        ));
 
         Ok(Self {
             config,
