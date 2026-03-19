@@ -116,11 +116,50 @@ pub async fn transfer_master(
     };
 
     if !raft.is_leader() {
-        return crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "master_not_discovered_exception",
-            "This node is not the current master. Send transfer requests to the master node.",
-        );
+        // Forward to the master via gRPC — this node acts as coordinator
+        let cs = state.cluster_manager.get_state();
+        let master_id = match cs.master_node.as_ref() {
+            Some(id) => id,
+            None => {
+                return crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "No master node available to forward transfer request",
+                );
+            }
+        };
+        let master_node = match cs.nodes.get(master_id) {
+            Some(n) => n.clone(),
+            None => {
+                return crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "Master node info not found in cluster state",
+                );
+            }
+        };
+        match state
+            .transport_client
+            .forward_transfer_master(&master_node, &req.node_id)
+            .await
+        {
+            Ok(()) => {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "acknowledged": true,
+                        "message": format!("Leadership transfer initiated to node '{}'", req.node_id)
+                    })),
+                );
+            }
+            Err(e) => {
+                return crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "forward_exception",
+                    format!("Failed to forward transfer request to master: {}", e),
+                );
+            }
+        }
     }
 
     // Look up the target node's raft_node_id

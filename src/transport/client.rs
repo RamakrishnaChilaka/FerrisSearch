@@ -414,6 +414,112 @@ impl TransportClient {
             Err(anyhow::anyhow!("Recovery failed: {}", response.error))
         }
     }
+
+    /// Forward a settings update to the master node via gRPC.
+    /// The master applies the changes via Raft.
+    pub async fn forward_update_settings(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+        settings_body: &serde_json::Value,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {}", e))?;
+        let settings_json = serde_json::to_vec(settings_body)?;
+        let request = tonic::Request::new(UpdateSettingsRequest {
+            index_name: index_name.to_string(),
+            settings_json,
+        });
+        let resp = client
+            .update_settings(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("UpdateSettings RPC: {}", e))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
+
+    /// Forward an index creation request to the master node via gRPC.
+    /// The master parses the body, builds metadata, and commits via Raft.
+    pub async fn forward_create_index(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+        body: &[u8],
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {}", e))?;
+        let request = tonic::Request::new(CreateIndexRequest {
+            index_name: index_name.to_string(),
+            body_json: body.to_vec(),
+        });
+        let resp = client
+            .create_index(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("CreateIndex RPC: {}", e))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        let response: serde_json::Value = serde_json::from_slice(&inner.response_json)
+            .unwrap_or(serde_json::json!({"acknowledged": inner.acknowledged}));
+        Ok(response)
+    }
+
+    /// Forward an index deletion request to the master node via gRPC.
+    /// The master commits the deletion via Raft and cleans up local shards.
+    pub async fn forward_delete_index(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {}", e))?;
+        let request = tonic::Request::new(DeleteIndexRequest {
+            index_name: index_name.to_string(),
+        });
+        let resp = client
+            .delete_index(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("DeleteIndex RPC: {}", e))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
+
+    /// Forward a transfer-master request to the current master via gRPC.
+    pub async fn forward_transfer_master(
+        &self,
+        master: &NodeInfo,
+        target_node_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {}", e))?;
+        let request = tonic::Request::new(TransferMasterRequest {
+            target_node_id: target_node_id.to_string(),
+        });
+        let resp = client
+            .transfer_master(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("TransferMaster RPC: {}", e))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
 }
 
 /// Result of a recovery request from the primary.
@@ -493,5 +599,57 @@ mod tests {
             !cache.contains_key("127.0.0.1:1"),
             "failed connections should not be cached"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_create_index_unreachable_master_returns_error() {
+        let client = TransportClient::new();
+        let master = NodeInfo {
+            id: "master".into(),
+            name: "master".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 1, // unreachable
+            http_port: 9200,
+            roles: vec![],
+            raft_node_id: 1,
+        };
+        let result = client
+            .forward_create_index(&master, "test-idx", b"{}")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn forward_delete_index_unreachable_master_returns_error() {
+        let client = TransportClient::new();
+        let master = NodeInfo {
+            id: "master".into(),
+            name: "master".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 1, // unreachable
+            http_port: 9200,
+            roles: vec![],
+            raft_node_id: 1,
+        };
+        let result = client.forward_delete_index(&master, "test-idx").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn forward_transfer_master_unreachable_returns_error() {
+        let client = TransportClient::new();
+        let master = NodeInfo {
+            id: "master".into(),
+            name: "master".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 1, // unreachable
+            http_port: 9200,
+            roles: vec![],
+            raft_node_id: 1,
+        };
+        let result = client
+            .forward_transfer_master(&master, "target-node")
+            .await;
+        assert!(result.is_err());
     }
 }

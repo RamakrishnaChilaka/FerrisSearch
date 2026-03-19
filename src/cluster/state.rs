@@ -83,6 +83,38 @@ pub struct FieldMapping {
     pub dimension: Option<usize>,
 }
 
+/// Per-index settings that control engine behavior.
+///
+/// Settings are divided into two categories:
+///
+/// **Common settings** — apply regardless of engine type:
+/// - `refresh_interval_ms`: how often the index reader is reloaded
+///
+/// **Shard-based engine settings** — only apply when using the default
+/// shard-based engine (Tantivy + USearch). When moving to a shardless
+/// engine (e.g. Quickwit-style immutable splits), these fields will not
+/// apply and engine-specific settings (split policy, merge scheduler,
+/// retention, object store config) will be added here instead.
+///
+/// The `number_of_shards` and `number_of_replicas` fields live on
+/// `IndexMetadata` directly because they are structural — they determine
+/// shard routing and cluster topology. For a shardless engine, those
+/// fields and `shard_routing` would be absent.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct IndexSettings {
+    // ── Common settings ─────────────────────────────────────────────
+
+    /// Refresh interval in milliseconds. `None` = use cluster default (5000ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_interval_ms: Option<u64>,
+
+    // ── Future: shardless engine settings ────────────────────────────
+    // When switching to a Quickwit-style engine, add fields here:
+    //   pub split_max_merge_factor: Option<u32>,
+    //   pub retention_period_secs: Option<u64>,
+    //   pub object_store_uri: Option<String>,
+}
+
 /// Metadata defining how an index is sharded across the cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
@@ -94,6 +126,10 @@ pub struct IndexMetadata {
     /// Field name → mapping definition. Empty means dynamic (all-to-body).
     #[serde(default)]
     pub mappings: HashMap<String, FieldMapping>,
+    /// Per-index dynamic settings. Controls refresh interval, and will hold
+    /// engine-specific configuration when shardless mode is added.
+    #[serde(default)]
+    pub settings: IndexSettings,
 }
 
 impl IndexMetadata {
@@ -135,6 +171,7 @@ impl IndexMetadata {
             number_of_replicas: num_replicas,
             shard_routing,
             mappings: HashMap::new(),
+            settings: IndexSettings::default(),
         }
     }
 
@@ -220,6 +257,44 @@ impl IndexMetadata {
             }
         }
         orphaned_primaries
+    }
+
+    /// Update the number of replicas for this index.
+    ///
+    /// - **Increase**: adds `unassigned_replicas` to each shard routing entry.
+    ///   The leader's lifecycle loop will allocate them to available data nodes.
+    /// - **Decrease**: removes excess replica assignments from each shard.
+    ///   Returns the node IDs of removed replicas (caller should close their shard engines).
+    pub fn update_number_of_replicas(&mut self, new_replicas: u32) -> Vec<(u32, String)> {
+        let old_replicas = self.number_of_replicas;
+        self.number_of_replicas = new_replicas;
+
+        let mut removed = Vec::new();
+
+        if new_replicas > old_replicas {
+            // Increase: add unassigned replicas to each shard
+            let diff = new_replicas - old_replicas;
+            for routing in self.shard_routing.values_mut() {
+                routing.unassigned_replicas += diff;
+            }
+        } else if new_replicas < old_replicas {
+            // Decrease: trim excess replicas from each shard
+            for (shard_id, routing) in &mut self.shard_routing {
+                let total_desired = new_replicas as usize;
+                // First, reduce unassigned replicas
+                let can_reduce_unassigned =
+                    routing.unassigned_replicas.min(old_replicas - new_replicas);
+                routing.unassigned_replicas -= can_reduce_unassigned;
+                // Then, if still over-replicated, remove assigned replicas
+                while routing.replicas.len() > total_desired {
+                    if let Some(node) = routing.replicas.pop() {
+                        removed.push((*shard_id, node));
+                    }
+                }
+            }
+        }
+
+        removed
     }
 }
 
@@ -378,6 +453,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         state.add_index(meta);
         assert_eq!(state.version, 1);
@@ -393,6 +469,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -416,6 +493,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -437,6 +515,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -470,6 +549,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -500,6 +580,7 @@ mod tests {
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -523,6 +604,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         assert!(meta.replica_nodes(99).is_empty());
     }
@@ -535,6 +617,7 @@ mod tests {
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -567,6 +650,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         assert!(!meta.promote_replica(99));
     }
@@ -579,6 +663,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -622,6 +707,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -675,6 +761,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.mappings.insert(
             "title".into(),
@@ -911,6 +998,7 @@ mod tests {
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -935,6 +1023,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -960,6 +1049,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -983,6 +1073,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -1022,6 +1113,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
             0,
@@ -1036,5 +1128,240 @@ mod tests {
         let orphaned = meta.remove_node(&"node-B".to_string());
         assert!(orphaned.is_empty());
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-C".to_string()]);
+    }
+
+    // ── IndexSettings ───────────────────────────────────────────────
+
+    #[test]
+    fn index_settings_default_has_no_refresh_interval() {
+        let s = IndexSettings::default();
+        assert_eq!(s.refresh_interval_ms, None);
+    }
+
+    #[test]
+    fn index_settings_serde_roundtrip_with_value() {
+        let s = IndexSettings {
+            refresh_interval_ms: Some(2000),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: IndexSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.refresh_interval_ms, Some(2000));
+    }
+
+    #[test]
+    fn index_settings_serde_roundtrip_none_skips_field() {
+        let s = IndexSettings {
+            refresh_interval_ms: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("refresh_interval_ms"));
+        let back: IndexSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn index_settings_deserialize_empty_object() {
+        let back: IndexSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(back, IndexSettings::default());
+    }
+
+    #[test]
+    fn index_settings_equality() {
+        let a = IndexSettings {
+            refresh_interval_ms: Some(1000),
+        };
+        let b = IndexSettings {
+            refresh_interval_ms: Some(1000),
+        };
+        let c = IndexSettings {
+            refresh_interval_ms: Some(2000),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // ── update_number_of_replicas ───────────────────────────────────
+
+    #[test]
+    fn update_replicas_increase_adds_unassigned() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 2,
+            number_of_replicas: 0,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "A".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        meta.shard_routing.insert(
+            1,
+            ShardRoutingEntry {
+                primary: "B".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+
+        let removed = meta.update_number_of_replicas(2);
+        assert!(removed.is_empty());
+        assert_eq!(meta.number_of_replicas, 2);
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 2);
+        assert_eq!(meta.shard_routing[&1].unassigned_replicas, 2);
+    }
+
+    #[test]
+    fn update_replicas_decrease_removes_assigned() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 2,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "A".into(),
+                replicas: vec!["B".into(), "C".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        let removed = meta.update_number_of_replicas(1);
+        assert_eq!(meta.number_of_replicas, 1);
+        assert_eq!(meta.shard_routing[&0].replicas.len(), 1);
+        assert_eq!(removed.len(), 1);
+        // Last replica is removed first (vec::pop)
+        assert_eq!(removed[0], (0, "C".to_string()));
+    }
+
+    #[test]
+    fn update_replicas_decrease_reduces_unassigned_first() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 3,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "A".into(),
+                replicas: vec!["B".into()],
+                unassigned_replicas: 2,
+            },
+        );
+
+        // Decrease from 3 to 1: should remove 2 unassigned first, no assigned removed
+        let removed = meta.update_number_of_replicas(1);
+        assert_eq!(meta.number_of_replicas, 1);
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 0);
+        assert_eq!(meta.shard_routing[&0].replicas.len(), 1);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn update_replicas_same_value_is_noop() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "A".into(),
+                replicas: vec!["B".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        let removed = meta.update_number_of_replicas(1);
+        assert!(removed.is_empty());
+        assert_eq!(meta.shard_routing[&0].replicas.len(), 1);
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 0);
+    }
+
+    #[test]
+    fn update_replicas_to_zero_removes_all() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 1,
+            number_of_replicas: 2,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        };
+        meta.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "A".into(),
+                replicas: vec!["B".into(), "C".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        let removed = meta.update_number_of_replicas(0);
+        assert_eq!(meta.number_of_replicas, 0);
+        assert!(meta.shard_routing[&0].replicas.is_empty());
+        assert_eq!(removed.len(), 2);
+    }
+
+    #[test]
+    fn update_replicas_multi_shard() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            number_of_shards: 3,
+            number_of_replicas: 1,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        };
+        for s in 0..3 {
+            meta.shard_routing.insert(
+                s,
+                ShardRoutingEntry {
+                    primary: "A".into(),
+                    replicas: vec!["B".into()],
+                    unassigned_replicas: 0,
+                },
+            );
+        }
+
+        let removed = meta.update_number_of_replicas(0);
+        assert_eq!(removed.len(), 3);
+        for s in 0..3 {
+            assert!(meta.shard_routing[&s].replicas.is_empty());
+        }
+    }
+
+    #[test]
+    fn index_metadata_with_custom_settings_serializes() {
+        let meta = IndexMetadata {
+            name: "test".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            settings: IndexSettings {
+                refresh_interval_ms: Some(10000),
+            },
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.settings.refresh_interval_ms, Some(10000));
     }
 }

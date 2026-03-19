@@ -21,13 +21,20 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Data replication (document-level) still uses gossip/gRPC, separate from Raft.
 
 ## Key Modules
-- `src/consensus/` — Raft: types.rs, store.rs (MemLogStore with Arc<Mutex> shared state), state_machine.rs, network.rs, mod.rs
-- `src/cluster/` — ClusterManager + ClusterState
-- `src/node/mod.rs` — Node startup, Raft bootstrap, lifecycle loop
-- `src/transport/` — gRPC server (with Raft RPCs) and client
-- `src/api/` — Axum HTTP handlers (index CRUD routes through Raft)
-- `src/engine/` — Search engine abstraction: mod.rs (SearchEngine trait), composite.rs, tantivy.rs, vector.rs
-- `src/shard/` — Shard management (uses CompositeEngine)
+- `src/consensus/` — Raft: types.rs (TypeConfig, ClusterCommand, ClusterResponse), store.rs (MemLogStore), disk_store.rs, state_machine.rs, network.rs, mod.rs
+- `src/cluster/` — ClusterManager (manager.rs) + ClusterState (state.rs) + SettingsManager (settings.rs: reactive pub/sub via watch channels)
+- `src/node/mod.rs` — Node struct, startup, Raft bootstrap, lifecycle loop, AppState
+- `src/transport/` — gRPC server (server.rs: Raft RPCs + shard ops + replication) and client (client.rs: forwarding methods)
+- `src/api/` — Axum HTTP handlers: index.rs (index CRUD, doc ops), search.rs (query-string search), cat.rs (catalog), cluster.rs (health, state, transfer_master), mod.rs (router)
+- `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing)
+- `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
+- `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
+- `src/wal/` — HotTranslog (binary length-prefixed WAL), TranslogDurability, WriteAheadLog trait
+- `src/replication/` — replicate_write, replicate_bulk (sync to ISR replicas)
+- `src/common/` — `Result<T>` type alias (anyhow), `validate_index_name()`
+- `src/config/` — AppConfig (YAML + env var loading)
+- `src/storage/` — StorageManager placeholder (future: blob storage abstraction)
+- `proto/transport.proto` — gRPC service definition, all message types
 
 ## openraft 0.10.0-alpha.17 API Gotchas
 - `Vote::new(term: u64, node_id: u64)` — NOT `Vote::new(LeaderId, bool)`
@@ -37,12 +44,19 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `raft.add_learner(node_id, BasicNode { addr }, blocking)` then `raft.change_membership(voter_set, false)` to add nodes
 
 ## Cluster Commands (Raft log entries)
-- `ClusterCommand::AddNode { node }` / `RemoveNode { node_id }`
-- `ClusterCommand::CreateIndex { metadata }` / `DeleteIndex { index_name }`
-- `ClusterCommand::SetMaster { node_id }`
+- `ClusterCommand::AddNode { node: NodeInfo }` — register/update a node in cluster state
+- `ClusterCommand::RemoveNode { node_id: String }` — remove node from cluster + Raft membership
+- `ClusterCommand::CreateIndex { metadata: IndexMetadata }` — create index with shard routing
+- `ClusterCommand::DeleteIndex { index_name: String }` — delete index and all metadata
+- `ClusterCommand::SetMaster { node_id: String }` — set cluster master (Raft leader)
+- `ClusterCommand::UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replica changes, settings)
+
+## ClusterResponse
+- `ClusterResponse::Ok` — command applied successfully
+- `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 385 unit tests + 20 consensus integration + 31 replication integration = 436 total
+- 416 unit tests + 29 consensus integration + 31 replication integration = 476 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -54,6 +68,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Follower lifecycle loop: pings the master for liveness
 
 ## Important Design Decisions
+- **Coordinator pattern**: see dedicated section below — NEVER return "not the leader" or "send to master" errors
 - `ClusterManager::update_state()` is a full overwrite — never use it to replace Raft-managed state
 - `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft. Populated by `add_node()` and `ping_node()`
 - New leader gets a 20s grace period (`leader_since`) before scanning for dead nodes to avoid false positives
@@ -62,11 +77,419 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Shard failover uses existing `UpdateIndex` Raft command — no new command variant needed
 - `raft_node_id` field on NodeInfo is critical for Raft membership changes — must be non-zero for Raft-managed nodes
 
+## Dynamic Settings
+- `PUT /{index}/_settings` and `GET /{index}/_settings` API endpoints
+- `IndexSettings` struct on `IndexMetadata` holds `refresh_interval_ms: Option<u64>`
+- `SettingsManager` (src/cluster/settings.rs) uses `tokio::sync::watch` channels for reactive pub/sub
+- Consumers subscribe via `watch_refresh_interval()` and react in `tokio::select!` loops
+- Non-leader nodes forward settings updates to master via gRPC `UpdateSettings` RPC
+- Settings changes go through Raft (`UpdateIndex` command), then `ShardManager::apply_settings()` pushes to `SettingsManager::update()`
+- To add a new reactive setting: add field to `IndexSettings`, add `watch::Sender<T>` to `SettingsManager`, detect changes in `update()`, subscribe in consumer
+
+## AppState (shared across all API handlers)
+```rust
+pub struct AppState {
+    pub cluster_manager: Arc<ClusterManager>,
+    pub shard_manager: Arc<ShardManager>,
+    pub transport_client: TransportClient,
+    pub local_node_id: String,
+    pub raft: Option<Arc<RaftInstance>>,
+}
+```
+
+## Core Data Structures (src/cluster/state.rs)
+
+### Enums
+- `NodeRole` — `Master`, `Data`, `Client`
+- `ShardState` — `Started` (active), `Unassigned` (needs a node)
+- `FieldType` — `Text`, `Keyword`, `Integer`, `Float`, `Boolean`, `KnnVector`
+
+### Structs
+```
+NodeInfo { id: NodeId, name: String, host: String, transport_port: u16, http_port: u16, roles: Vec<NodeRole>, raft_node_id: u64 }
+FieldMapping { field_type: FieldType, dimension: Option<usize> }  // dimension for knn_vector only
+IndexSettings { refresh_interval_ms: Option<u64> }  // None = cluster default 5000ms
+ShardCopy { node_id: Option<NodeId>, state: ShardState }
+ShardRoutingEntry { primary: NodeId, replicas: Vec<NodeId>, unassigned_replicas: u32 }
+IndexMetadata { name, number_of_shards, number_of_replicas, shard_routing: HashMap<u32, ShardRoutingEntry>, mappings: HashMap<String, FieldMapping>, settings: IndexSettings }
+ClusterState { cluster_name, version: u64, master_node: Option<NodeId>, nodes: HashMap<NodeId, NodeInfo>, indices: HashMap<String, IndexMetadata>, last_seen: HashMap<NodeId, Instant> }
+```
+
+### Key Methods
+- `IndexMetadata::build_shard_routing(name, num_shards, num_replicas, data_nodes)` — round-robin distribution
+- `IndexMetadata::promote_replica(shard_id)` / `promote_replica_to(shard_id, new_primary)` — shard failover
+- `IndexMetadata::remove_node(node_id) -> Vec<u32>` — returns orphaned primary shard IDs
+- `IndexMetadata::update_number_of_replicas(new_replicas) -> Vec<(u32, String)>` — returns deleted replica slots
+- `IndexMetadata::allocate_unassigned_replicas(data_nodes) -> bool`
+- `ClusterState::add_node(node)`, `remove_node(node_id)`, `ping_node(node_id)`, `add_index(metadata)`
+
+## ClusterManager (src/cluster/manager.rs)
+```rust
+pub struct ClusterManager { state: Arc<RwLock<ClusterState>> }
+```
+- `new(cluster_name)` / `with_shared_state(state: Arc<RwLock<ClusterState>>)` — Raft SM shares state
+- `get_state() -> ClusterState` — cloned snapshot (read lock)
+- `add_node(node)`, `ping_node(node_id)`, `update_state(new_state)` — full overwrite, preserves `last_seen`
+
 ## Config
-- `config/ferrissearch.yml` for defaults
-- `FERRISSEARCH_*` env vars override (e.g., FERRISSEARCH_RAFT_NODE_ID, FERRISSEARCH_NODE_NAME)
-- `translog_durability`: `"request"` (default, fsync per write) or `"async"` (timer-based fsync)
-- `translog_sync_interval_ms`: background fsync interval for async mode (default 5000ms, only used when durability is `"async"`)
+```rust
+pub struct AppConfig {
+    pub node_name: String,              // default: "node-1"
+    pub cluster_name: String,           // default: "ferrissearch"
+    pub http_port: u16,                 // default: 9200
+    pub transport_port: u16,            // default: 9300
+    pub data_dir: String,               // default: "./data"
+    pub seed_hosts: Vec<String>,        // default: ["127.0.0.1:9300"]
+    pub raft_node_id: u64,              // default: 1
+    pub translog_durability: String,    // "request" (default) or "async"
+    pub translog_sync_interval_ms: Option<u64>,  // default: None (5000 if async)
+}
+```
+- Load order: defaults → `config/ferrissearch.yml` → `FERRISSEARCH_*` env vars
+- `translog_durability: "request"` = fsync per write (no data loss); `"async"` = background fsync timer
+
+## Coordinator Pattern (CRITICAL — read before writing any API handler)
+
+**Every node is a coordinator.** Any HTTP request landing on any node MUST be transparently routed to the correct node. The client should never need to know which node is the leader or which node owns a shard.
+
+### Rules
+1. **NEVER** return errors like "not the leader", "send to master", "SERVICE_UNAVAILABLE/master_not_discovered" from any API handler.
+2. If the handler needs the Raft leader (index CRUD, settings updates, cluster ops), check `raft.is_leader()`:
+   - If leader → execute locally via `raft.client_write(cmd)`
+   - If NOT leader → look up master from `cluster_state.master_node`, forward via gRPC, return the response
+3. If the handler needs a specific shard primary (document index/get/delete), use `calculate_shard()` → look up primary node → forward via gRPC `forward_*_to_shard()`
+4. If the handler is read-only from cluster state (health, cat, get settings) → serve locally, no forwarding needed
+
+### Forwarding implementation pattern
+```rust
+// In the API handler:
+if let Some(ref raft) = state.raft {
+    if !raft.is_leader() {
+        let cs = state.cluster_manager.get_state();
+        let master_id = cs.master_node.as_ref().ok_or(/* SERVICE_UNAVAILABLE only if no master exists at all */)?;
+        let master_node = cs.nodes.get(master_id).ok_or(...)?;
+        match state.transport_client.forward_<operation>(&master_node, ...).await {
+            Ok(resp) => return (StatusCode::OK, Json(resp)),
+            Err(e) => return error_response(INTERNAL_SERVER_ERROR, "forward_exception", ...),
+        }
+    }
+    // Leader path: execute via Raft
+    raft.client_write(cmd).await?;
+}
+```
+
+### Existing forwarding gRPC RPCs (proto/transport.proto)
+| RPC | Purpose | Client method |
+|-----|---------|---------------|
+| `CreateIndex` | Forward index creation to leader | `forward_create_index()` |
+| `DeleteIndex` | Forward index deletion to leader | `forward_delete_index()` |
+| `UpdateSettings` | Forward settings update to leader | `forward_update_settings()` |
+| `TransferMaster` | Forward leadership transfer to leader | `forward_transfer_master()` |
+| `IndexDoc` | Route doc write to shard primary | `forward_index_to_shard()` |
+| `DeleteDoc` | Route doc delete to shard primary | `forward_delete_to_shard()` |
+| `GetDoc` | Route doc get to shard primary | `forward_get_to_shard()` |
+| `BulkIndex` | Route bulk write to shard primary | `forward_bulk_to_shard()` |
+| `SearchShard` | Scatter search to remote shards | `forward_search_to_shard()` |
+| `SearchShardDsl` | Scatter DSL search to remote shards | `forward_search_dsl_to_shard()` |
+
+### Adding a new Raft-write API endpoint (checklist)
+1. Add proto messages (`<Op>Request` / `<Op>Response`) to `proto/transport.proto`
+2. Add the RPC to the `InternalTransport` service definition
+3. Add server handler in `src/transport/server.rs` (must check `is_leader()`, execute via Raft)
+4. Add client forwarding method `forward_<op>()` in `src/transport/client.rs`
+5. In the API handler: if not leader → call `forward_<op>()`, else → `raft.client_write()`
+6. **NEVER** return a "not the leader" error — always forward
+
+## API Endpoints
+
+### Cluster & Catalog (read-only, serve locally)
+| HTTP | Path | Handler | Purpose |
+|------|------|---------|--------
+| GET | `/` | `handle_root()` | Node info |
+| GET | `/_cluster/health` | `get_health()` | Cluster health (green/yellow/red) |
+| GET | `/_cluster/state` | `get_state()` | Full cluster state JSON |
+| GET | `/_cat/nodes` | `cat_nodes()` | Tabular node listing (`?v` for headers) |
+| GET | `/_cat/shards` | `cat_shards()` | Shard allocation (prirep=p/r, state, docs, node) |
+| GET | `/_cat/indices` | `cat_indices()` | Index listing (health, shards, docs) |
+| GET | `/_cat/master` | `cat_master()` | Current master node |
+
+### Index Management (Raft writes → forward to leader)
+| HTTP | Path | Handler | Purpose |
+|------|------|---------|--------|
+| HEAD | `/{index}` | `index_exists()` | Check if index exists (204/404) |
+| PUT | `/{index}` | `create_index()` | Create index with settings/mappings |
+| DELETE | `/{index}` | `delete_index()` | Delete index and all shards |
+| GET | `/{index}/_settings` | `get_index_settings()` | Get index settings (read-only, local) |
+| PUT | `/{index}/_settings` | `update_index_settings()` | Update settings (forwarded to leader) |
+| POST | `/_cluster/transfer_master` | `transfer_master()` | Leadership transfer (forwarded) |
+
+### Document Operations (routed to shard primary)
+| HTTP | Path | Handler | Purpose |
+|------|------|---------|--------|
+| POST | `/{index}/_doc` | `index_document()` | Index doc (auto-generate ID) |
+| PUT | `/{index}/_doc/{id}` | `index_document_with_id()` | Index doc with explicit ID |
+| GET | `/{index}/_doc/{id}` | `get_document()` | Retrieve document by ID |
+| DELETE | `/{index}/_doc/{id}` | `delete_document()` | Delete document by ID |
+| POST | `/{index}/_update/{id}` | `update_document()` | Partial document update |
+| POST | `/_bulk` | `bulk_index_global()` | Bulk indexing (no index in path) |
+| POST | `/{index}/_bulk` | `bulk_index()` | Bulk indexing (index in path) |
+
+### Search
+| HTTP | Path | Handler | Purpose |
+|------|------|---------|--------|
+| GET | `/{index}/_search` | `search_documents()` | Query-string search (q=, size, from) |
+| POST | `/{index}/_search` | `search_documents_dsl()` | DSL search (SearchRequest body) |
+
+### Maintenance
+| HTTP | Path | Handler | Purpose |
+|------|------|---------|--------|
+| POST/GET | `/{index}/_refresh` | `refresh_index()` | Refresh all local shards |
+| POST/GET | `/{index}/_flush` | `flush_index()` | Flush shards + truncate WAL |
+
+### Create Index Body Format
+```json
+{
+  "settings": { "number_of_shards": 3, "number_of_replicas": 1, "refresh_interval_ms": 5000 },
+  "mappings": {
+    "properties": {
+      "title": { "type": "text" },
+      "status": { "type": "keyword" },
+      "embedding": { "type": "knn_vector", "dimension": 768 }
+    }
+  }
+}
+```
+
+## Search & Query DSL (src/search/mod.rs)
+
+### SearchRequest
+```rust
+pub struct SearchRequest {
+    pub query: QueryClause,                         // default: MatchAll
+    pub size: usize,                                // default: 10
+    pub from: usize,                                // default: 0
+    pub knn: Option<KnnQuery>,                      // optional k-NN
+    pub sort: Vec<SortClause>,                      // default: sort by _score desc
+    pub aggs: HashMap<String, AggregationRequest>,  // aggregations
+}
+```
+
+### QueryClause Variants
+- `MatchAll(Value)` — match all documents
+- `Match(HashMap<String, Value>)` — full-text match on a field
+- `Term(HashMap<String, Value>)` — exact term match
+- `Wildcard(HashMap<String, Value>)` — wildcard pattern (`*` any, `?` single)
+- `Prefix(HashMap<String, Value>)` — prefix match
+- `Fuzzy(HashMap<String, FuzzyParams>)` — fuzzy match (edit distance 0-2, default 1)
+- `Range(HashMap<String, RangeCondition>)` — range: `{ "gt", "gte", "lt", "lte" }`
+- `Bool(BoolQuery)` — `{ must: [], should: [], must_not: [], filter: [] }`
+
+### k-NN Search
+```rust
+KnnQuery { fields: HashMap<String, KnnParams> }
+KnnParams { vector: Vec<f32>, k: usize, filter: Option<QueryClause> }  // optional pre-filter
+```
+
+### Aggregations
+- `Terms { field, size }` — top-N buckets by value (default size 10)
+- `Stats { field }` — min, max, sum, count, avg
+- `Min/Max/Avg/Sum/ValueCount { field }` — single metric
+- `Histogram { field, interval }` — fixed-interval numeric buckets
+- Per-shard: `compute_aggregations()` → coordinator: `merge_aggregations()`
+
+### Sort
+- `SortClause::Simple(String)` — `"_score"` or field name
+- `SortClause::Field(HashMap<String, SortOrder>)` — `{ "year": "desc" }`
+
+## Engine Layer
+
+### SearchEngine Trait (src/engine/mod.rs)
+```rust
+pub trait SearchEngine: Send + Sync {
+    fn add_document(&self, doc_id: &str, payload: Value) -> Result<String>;
+    fn bulk_add_documents(&self, docs: Vec<(String, Value)>) -> Result<Vec<String>>;
+    fn delete_document(&self, doc_id: &str) -> Result<u64>;
+    fn get_document(&self, doc_id: &str) -> Result<Option<Value>>;
+    fn refresh(&self) -> Result<()>;
+    fn flush(&self) -> Result<()>;
+    fn flush_with_global_checkpoint(&self) -> Result<()>;
+    fn search(&self, query_str: &str) -> Result<Vec<Value>>;           // simple query
+    fn search_query(&self, req: &SearchRequest) -> Result<(Vec<Value>, usize)>; // DSL
+    fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<Value>>;
+    fn search_knn_filtered(&self, field: &str, vector: &[f32], k: usize, filter: Option<&QueryClause>) -> Result<Vec<Value>>;
+    fn doc_count(&self) -> u64;
+    fn local_checkpoint(&self) -> u64;
+    fn update_local_checkpoint(&self, seq_no: u64);
+    fn global_checkpoint(&self) -> u64;
+    fn update_global_checkpoint(&self, checkpoint: u64);
+}
+```
+
+### CompositeEngine (src/engine/composite.rs)
+- Combines HotEngine (Tantivy, full-text) + VectorIndex (USearch, HNSW)
+- `new_with_mappings(data_dir, refresh_interval, mappings, durability)` — creates both engines
+- `start_refresh_loop_reactive(engine, refresh_rx)` — reactive to settings changes via watch channel
+- Auto-detects vectors in payloads and indexes to USearch
+- `rebuild_vectors()` — recovers vector index from persisted Tantivy docs on startup
+
+### HotEngine (src/engine/tantivy.rs)
+- `field_registry: RwLock<FieldRegistry>` — maps field names to Tantivy Field handles
+- Dynamic field creation on first document encounter
+- `"body"` field as catch-all for textual content
+- `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
+- `replay_translog()` — crash recovery from WAL
+
+### VectorIndex (src/engine/vector.rs)
+- USearch HNSW wrapper (connectivity=16, expansion_add=128, expansion_search=64)
+- `add_with_doc_id(doc_id, vector)`, `search(query, k) -> (keys, distances)`
+- Binary persistence: `save(path)` / `open(path, dimensions, metric)`
+- Doc ID ↔ numeric key mapping via `HashMap` + bincode serialization
+
+### Routing (src/engine/routing.rs)
+- `calculate_shard(doc_id, num_shards) -> u32` — Murmur3 hash modulo
+- `route_document(doc_id, metadata) -> Option<NodeId>` — returns primary node for doc
+
+## Shard Management (src/shard/mod.rs)
+
+### ShardManager
+```rust
+pub struct ShardManager {
+    data_dir: PathBuf,
+    shards: RwLock<HashMap<ShardKey, Arc<dyn SearchEngine>>>,
+    settings_managers: RwLock<HashMap<String, Arc<SettingsManager>>>,  // per-index
+    pub isr_tracker: IsrTracker,
+    durability: TranslogDurability,
+}
+```
+
+### Key Methods
+- `open_shard_with_settings(index, shard_id, mappings, settings)` — creates CompositeEngine, starts reactive refresh, rebuilds vectors
+- `get_shard(index, shard_id)`, `get_index_shards(index)`, `all_shards()`
+- `close_index_shards(index)` — remove engines, clean ISR, delete directory
+- `apply_settings(index, new_settings)` — notify consumers via watch channels
+
+### ISR Tracking
+```rust
+IsrTracker { replicas: HashMap<ShardKey, HashMap<String, ReplicaCheckpoint>>, max_lag: u64 }
+ReplicaCheckpoint { checkpoint: u64, last_updated: Instant }
+```
+- `update_replica_checkpoint(index, shard_id, node_id, checkpoint)`
+- `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>` — replicas within max_lag
+
+## WAL — Write-Ahead Log (src/wal/mod.rs)
+
+### TranslogDurability
+- `Request` — fsync per write (default, no data loss on crash)
+- `Async { sync_interval_ms }` — background fsync timer (up to sync_interval_ms data loss)
+
+### TranslogEntry & WriteAheadLog Trait
+```rust
+TranslogEntry { seq_no: u64, op: String /* "index"|"delete" */, payload: Value }
+
+trait WriteAheadLog: Send + Sync {
+    fn append(&self, op: &str, payload: Value) -> Result<TranslogEntry>;
+    fn append_bulk(&self, ops: &[(&str, Value)]) -> Result<Vec<TranslogEntry>>;
+    fn read_all(&self) -> Result<Vec<TranslogEntry>>;
+    fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;  // replica recovery
+    fn truncate(&self) -> Result<()>;       // clear after commit
+    fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;
+    fn last_seq_no(&self) -> u64;
+}
+```
+
+### HotTranslog (Binary Format)
+- Length-prefixed: `[u32 LE: payload_len][bincode(WireEntry { seq_no, op, payload_json })]`
+- Seq numbers are monotonically increasing, survive truncation (persisted in `.seqno` file)
+- Handles partial writes at EOF gracefully (skips/truncates)
+
+## Replication Protocol (src/replication/mod.rs)
+- `replicate_write(transport_client, cluster_state, index, shard_id, doc_id, payload, op, seq_no)` — sync single write to all replicas
+- `replicate_bulk(transport_client, cluster_state, index, shard_id, docs, start_seq_no)` — batch replication
+- Synchronous: primary waits for ALL ISR replicas before acknowledging client
+- Uses gRPC: `replicate_to_shard()` / `replicate_bulk_to_shard()`
+- Each replica returns `local_checkpoint` after applying
+- Replica recovery: `RecoverReplica` RPC fetches missed ops from primary's WAL via `read_from(checkpoint)`
+
+## Consensus Module (src/consensus/)
+
+### Raft Type Configuration (types.rs)
+```rust
+openraft::declare_raft_types!(
+    pub TypeConfig: D = ClusterCommand, R = ClusterResponse, Node = BasicNode
+);
+type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
+```
+
+### State Machine (state_machine.rs)
+```rust
+ClusterStateMachine { state: Arc<RwLock<ClusterState>>, last_applied: Option<LogId>, last_membership: StoredMembership }
+```
+- Apply: AddNode → `state.add_node()`, RemoveNode → `state.remove_node()`, CreateIndex → `state.add_index()`, DeleteIndex → remove from indices, SetMaster → set master_node, UpdateIndex → replace shard_routing
+- Snapshot format: JSON-serialized ClusterState, ID: `snap-{last_applied_index}`
+
+### Raft Config
+- heartbeat_interval: 500ms, election_timeout_min: 1500ms, election_timeout_max: 3000ms
+
+### Module Functions
+- `create_raft_instance(node_id, cluster_name, data_dir)` — persistent disk store (production)
+- `create_raft_instance_mem(node_id, cluster_name)` — in-memory (tests only)
+- `bootstrap_single_node(raft, node_id, addr)` — initialize single-node Raft cluster
+
+## gRPC Transport (proto/transport.proto)
+
+### InternalTransport Service — All RPCs
+```
+// Cluster coordination
+JoinCluster(JoinRequest) → JoinResponse
+PublishState(PublishStateRequest) → Empty
+Ping(PingRequest) → Empty
+
+// Shard document operations
+IndexDoc(ShardDocRequest) → ShardDocResponse
+BulkIndex(ShardBulkRequest) → ShardBulkResponse
+DeleteDoc(ShardDeleteRequest) → ShardDeleteResponse
+GetDoc(ShardGetRequest) → ShardGetResponse
+
+// Shard search
+SearchShard(ShardSearchRequest) → ShardSearchResponse
+SearchShardDsl(ShardSearchDslRequest) → ShardSearchResponse
+
+// Replication
+ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse
+ReplicateBulk(ReplicateBulkRequest) → ReplicateBulkResponse
+RecoverReplica(RecoverReplicaRequest) → RecoverReplicaResponse
+
+// Settings + index management (forwarded to leader)
+UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
+CreateIndex(CreateIndexRequest) → CreateIndexResponse
+DeleteIndex(DeleteIndexRequest) → DeleteIndexResponse
+TransferMaster(TransferMasterRequest) → TransferMasterResponse
+
+// Raft consensus (opaque JSON)
+RaftVote(RaftRequest) → RaftReply
+RaftAppendEntries(RaftRequest) → RaftReply
+RaftSnapshot(RaftRequest) → RaftReply
+```
+
+## Validation & Common (src/common/mod.rs)
+- `type Result<T> = std::result::Result<T, anyhow::Error>`
+- `validate_index_name(name)` — not empty, max 255 chars, cannot start with `.` or `_`, lowercase alphanumeric + hyphens + underscores only
+
+## Document Indexing Flow
+1. API handler receives JSON → generate/extract `_id`
+2. `calculate_shard(doc_id, num_shards)` → determine target shard
+3. If shard primary is local → index directly via `engine.add_document()`
+4. If shard primary is remote → forward via gRPC `forward_index_to_shard()`
+5. Primary writes to WAL → indexes in Tantivy + USearch → replicates to all ISR replicas
+6. Return `{ "_id", "_version", "result": "created|updated" }`
+
+## Search Flow (Scatter-Gather)
+1. Coordinator receives `POST /{index}/_search` with SearchRequest body
+2. Look up all shards for the index from cluster state
+3. For local shards → `engine.search_query(req)` directly
+4. For remote shards → scatter via gRPC `forward_search_dsl_to_shard()`
+5. Gather results, merge hits by score, merge aggregations, apply from/size
+6. Return unified `{ "_shards": {...}, "hits": { "total": {...}, "hits": [...] }, "aggregations": {...} }`
 
 ## Development Workflow
 When implementing any feature or fix:

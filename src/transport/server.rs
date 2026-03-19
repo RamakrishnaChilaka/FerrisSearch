@@ -8,6 +8,7 @@ use crate::transport::proto::internal_transport_server::{
 };
 use crate::transport::proto::*;
 use crate::wal::WriteAheadLog;
+use openraft::type_config::async_runtime::WatchReceiver;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -119,6 +120,7 @@ pub fn proto_to_cluster_state(p: &ClusterState) -> crate::cluster::state::Cluste
                 number_of_replicas: idx.number_of_replicas,
                 shard_routing,
                 mappings: std::collections::HashMap::new(),
+                settings: crate::cluster::state::IndexSettings::default(),
             },
         );
     }
@@ -737,6 +739,334 @@ impl InternalTransport for TransportService {
         }))
     }
 
+    // ─── Dynamic Settings ─────────────────────────────────────────────────────
+
+    async fn update_settings(
+        &self,
+        request: Request<UpdateSettingsRequest>,
+    ) -> Result<Response<UpdateSettingsResponse>, Status> {
+        let req = request.into_inner();
+        let index_name = &req.index_name;
+
+        let body: serde_json::Value = serde_json::from_slice(&req.settings_json)
+            .map_err(|e| Status::invalid_argument(format!("bad settings JSON: {}", e)))?;
+
+        // Look up current metadata
+        let cluster_state = self.cluster_manager.get_state();
+        let mut metadata = cluster_state
+            .indices
+            .get(index_name)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("no such index [{}]", index_name)))?;
+
+        let mut changed = false;
+
+        // Apply number_of_replicas
+        if let Some(new_replicas) = body
+            .pointer("/index/number_of_replicas")
+            .and_then(|v| v.as_u64())
+        {
+            let new_replicas = new_replicas as u32;
+            if new_replicas != metadata.number_of_replicas {
+                metadata.update_number_of_replicas(new_replicas);
+                changed = true;
+            }
+        }
+
+        // Apply refresh_interval_ms
+        if let Some(val) = body.pointer("/index/refresh_interval_ms") {
+            if val.is_null() {
+                if metadata.settings.refresh_interval_ms.is_some() {
+                    metadata.settings.refresh_interval_ms = None;
+                    changed = true;
+                }
+            } else if let Some(ms) = val.as_u64() {
+                if metadata.settings.refresh_interval_ms != Some(ms) {
+                    metadata.settings.refresh_interval_ms = Some(ms);
+                    changed = true;
+                }
+            }
+        }
+
+        if !changed {
+            return Ok(Response::new(UpdateSettingsResponse {
+                acknowledged: true,
+                error: String::new(),
+            }));
+        }
+
+        // This RPC should only be handled by the leader
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader",
+            ));
+        }
+
+        let cmd = crate::consensus::types::ClusterCommand::UpdateIndex {
+            metadata: metadata.clone(),
+        };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {}", e)))?;
+
+        // Apply settings to local engines
+        self.shard_manager
+            .apply_settings(index_name, &metadata.settings);
+
+        tracing::info!("gRPC: updated settings for index '{}'", index_name);
+        Ok(Response::new(UpdateSettingsResponse {
+            acknowledged: true,
+            error: String::new(),
+        }))
+    }
+
+    // ─── Index Management RPCs ──────────────────────────────────────────────
+
+    async fn create_index(
+        &self,
+        request: Request<CreateIndexRequest>,
+    ) -> Result<Response<CreateIndexResponse>, Status> {
+        let req = request.into_inner();
+        let index_name = &req.index_name;
+
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader",
+            ));
+        }
+
+        let body: serde_json::Value = serde_json::from_slice(&req.body_json)
+            .unwrap_or(serde_json::json!({}));
+
+        let num_shards = body
+            .pointer("/settings/number_of_shards")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        let num_replicas = body
+            .pointer("/settings/number_of_replicas")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        let refresh_interval_ms = body
+            .pointer("/settings/refresh_interval_ms")
+            .and_then(|v| v.as_u64());
+
+        let cluster_state = self.cluster_manager.get_state();
+
+        if cluster_state.indices.contains_key(index_name) {
+            return Ok(Response::new(CreateIndexResponse {
+                acknowledged: false,
+                error: format!("index [{}] already exists", index_name),
+                response_json: Vec::new(),
+            }));
+        }
+
+        let data_nodes: Vec<String> = cluster_state
+            .nodes
+            .values()
+            .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
+            .map(|n| n.id.clone())
+            .collect();
+
+        if data_nodes.is_empty() {
+            return Err(Status::internal("No data nodes available to assign shards"));
+        }
+
+        let mut metadata = crate::cluster::state::IndexMetadata::build_shard_routing(
+            index_name, num_shards, num_replicas, &data_nodes,
+        );
+
+        if let Some(ms) = refresh_interval_ms {
+            metadata.settings.refresh_interval_ms = Some(ms);
+        }
+
+        // Parse field mappings
+        if let Some(properties) = body
+            .pointer("/mappings/properties")
+            .and_then(|v| v.as_object())
+        {
+            for (field_name, field_def) in properties {
+                if let Some(type_str) = field_def.get("type").and_then(|v| v.as_str()) {
+                    let field_mapping = match type_str {
+                        "text" => Some(crate::cluster::state::FieldMapping {
+                            field_type: crate::cluster::state::FieldType::Text,
+                            dimension: None,
+                        }),
+                        "keyword" => Some(crate::cluster::state::FieldMapping {
+                            field_type: crate::cluster::state::FieldType::Keyword,
+                            dimension: None,
+                        }),
+                        "integer" | "long" => Some(crate::cluster::state::FieldMapping {
+                            field_type: crate::cluster::state::FieldType::Integer,
+                            dimension: None,
+                        }),
+                        "float" | "double" => Some(crate::cluster::state::FieldMapping {
+                            field_type: crate::cluster::state::FieldType::Float,
+                            dimension: None,
+                        }),
+                        "boolean" => Some(crate::cluster::state::FieldMapping {
+                            field_type: crate::cluster::state::FieldType::Boolean,
+                            dimension: None,
+                        }),
+                        "knn_vector" => {
+                            let dim = field_def
+                                .get("dimension")
+                                .and_then(|v| v.as_u64())
+                                .map(|d| d as usize);
+                            Some(crate::cluster::state::FieldMapping {
+                                field_type: crate::cluster::state::FieldType::KnnVector,
+                                dimension: dim,
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(fm) = field_mapping {
+                        metadata.mappings.insert(field_name.clone(), fm);
+                    }
+                }
+            }
+        }
+
+        let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {}", e)))?;
+
+        let resp_json = serde_json::to_vec(&serde_json::json!({
+            "acknowledged": true,
+            "shards_acknowledged": true,
+            "index": index_name
+        }))
+        .unwrap_or_default();
+
+        tracing::info!(
+            "gRPC: created index '{}' with {} shards, {} replicas",
+            index_name,
+            num_shards,
+            num_replicas
+        );
+
+        Ok(Response::new(CreateIndexResponse {
+            acknowledged: true,
+            error: String::new(),
+            response_json: resp_json,
+        }))
+    }
+
+    async fn delete_index(
+        &self,
+        request: Request<DeleteIndexRequest>,
+    ) -> Result<Response<DeleteIndexResponse>, Status> {
+        let req = request.into_inner();
+        let index_name = &req.index_name;
+
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader",
+            ));
+        }
+
+        let cluster_state = self.cluster_manager.get_state();
+        if !cluster_state.indices.contains_key(index_name) {
+            return Err(Status::not_found(format!(
+                "no such index [{}]",
+                index_name
+            )));
+        }
+
+        let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
+            index_name: index_name.clone(),
+        };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {}", e)))?;
+
+        // Close local shard engines and delete data on this (leader) node
+        if let Err(e) = self.shard_manager.close_index_shards(index_name) {
+            tracing::error!(
+                "Failed to close shards for index '{}': {}",
+                index_name,
+                e
+            );
+        }
+
+        tracing::info!("gRPC: deleted index '{}'", index_name);
+        Ok(Response::new(DeleteIndexResponse {
+            acknowledged: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn transfer_master(
+        &self,
+        request: Request<TransferMasterRequest>,
+    ) -> Result<Response<TransferMasterResponse>, Status> {
+        let req = request.into_inner();
+        let target_node_id = &req.target_node_id;
+
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader",
+            ));
+        }
+
+        let cs = self.cluster_manager.get_state();
+        let target_info = cs
+            .nodes
+            .get(target_node_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("Node '{}' not found", target_node_id)))?;
+
+        if target_info.raft_node_id == 0 {
+            return Err(Status::invalid_argument(format!(
+                "Node '{}' has no Raft ID assigned",
+                target_node_id
+            )));
+        }
+
+        let vote = {
+            let m = raft.metrics();
+            m.borrow_watched().vote.clone()
+        };
+        let last_log_id = {
+            let m = raft.metrics();
+            m.borrow_watched().last_applied
+        };
+
+        let transfer_req = openraft::raft::TransferLeaderRequest::new(
+            vote,
+            target_info.raft_node_id,
+            last_log_id,
+        );
+        raft.handle_transfer_leader(transfer_req)
+            .await
+            .map_err(|e| Status::internal(format!("Transfer leader failed: {}", e)))?;
+
+        tracing::info!(
+            "gRPC: leadership transfer initiated to node '{}'",
+            target_node_id
+        );
+        Ok(Response::new(TransferMasterResponse {
+            acknowledged: true,
+            error: String::new(),
+        }))
+    }
+
     // ─── Raft RPCs ────────────────────────────────────────────────────────────
 
     async fn raft_vote(
@@ -960,6 +1290,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing,
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         });
         cs.version = 42; // reset again after add_index
 
@@ -1049,6 +1380,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing,
             mappings: std::collections::HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
         });
 
         let proto = cluster_state_to_proto(&cs);
