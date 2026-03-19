@@ -207,13 +207,14 @@ impl VectorIndex {
         let bin_path = usearch_path.as_ref().with_extension("docids.bin");
         // Try binary format first, fall back to legacy JSON
         if let Ok(data) = std::fs::read(&bin_path) {
-            if let Ok((loaded, _)) =
-                bincode_next::serde::decode_from_slice::<HashMap<u64, String>, _>(
-                    &data,
-                    BINCODE_CONFIG,
-                )
-            {
-                let mut map = self.key_to_doc_id.write().unwrap_or_else(|e| e.into_inner());
+            if let Ok((loaded, _)) = bincode_next::serde::decode_from_slice::<HashMap<u64, String>, _>(
+                &data,
+                BINCODE_CONFIG,
+            ) {
+                let mut map = self
+                    .key_to_doc_id
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
                 *map = loaded;
                 return;
             }
@@ -222,7 +223,10 @@ impl VectorIndex {
         let json_path = usearch_path.as_ref().with_extension("docids.json");
         if let Ok(data) = std::fs::read_to_string(&json_path) {
             if let Ok(loaded) = serde_json::from_str::<HashMap<u64, String>>(&data) {
-                let mut map = self.key_to_doc_id.write().unwrap_or_else(|e| e.into_inner());
+                let mut map = self
+                    .key_to_doc_id
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
                 *map = loaded;
             }
         }

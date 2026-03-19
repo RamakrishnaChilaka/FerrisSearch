@@ -231,7 +231,9 @@ impl HotTranslog {
 
         let durability_label = match durability {
             TranslogDurability::Request => "request".to_string(),
-            TranslogDurability::Async { sync_interval_ms } => format!("async ({}ms)", sync_interval_ms),
+            TranslogDurability::Async { sync_interval_ms } => {
+                format!("async ({}ms)", sync_interval_ms)
+            }
         };
         tracing::info!(
             "Translog opened at {:?} ({} pending entries, next seq_no: {}, durability: {})",
@@ -258,7 +260,9 @@ impl HotTranslog {
     /// Only useful in `Async` durability mode. Returns a join handle.
     pub fn start_sync_task(&self) -> Option<tokio::task::JoinHandle<()>> {
         let interval = match self.durability {
-            TranslogDurability::Async { sync_interval_ms } => Duration::from_millis(sync_interval_ms),
+            TranslogDurability::Async { sync_interval_ms } => {
+                Duration::from_millis(sync_interval_ms)
+            }
             _ => return None,
         };
         let file = self.file.clone();
@@ -767,21 +771,26 @@ mod tests {
     #[test]
     fn open_with_request_durability() {
         let dir = tempfile::tempdir().unwrap();
-        let tl = HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
+        let tl =
+            HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
         assert_eq!(tl.durability, TranslogDurability::Request);
     }
 
     #[test]
     fn open_with_async_durability() {
         let dir = tempfile::tempdir().unwrap();
-        let durability = TranslogDurability::Async { sync_interval_ms: 3000 };
+        let durability = TranslogDurability::Async {
+            sync_interval_ms: 3000,
+        };
         let tl = HotTranslog::open_with_durability(dir.path(), durability).unwrap();
         assert_eq!(tl.durability, durability);
     }
 
     #[test]
     fn async_durability_preserves_interval() {
-        let d = TranslogDurability::Async { sync_interval_ms: 7500 };
+        let d = TranslogDurability::Async {
+            sync_interval_ms: 7500,
+        };
         match d {
             TranslogDurability::Async { sync_interval_ms } => assert_eq!(sync_interval_ms, 7500),
             _ => panic!("expected Async variant"),
@@ -793,7 +802,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tl = HotTranslog::open_with_durability(
             dir.path(),
-            TranslogDurability::Async { sync_interval_ms: 5000 },
+            TranslogDurability::Async {
+                sync_interval_ms: 5000,
+            },
         )
         .unwrap();
         tl.append("index", json!({"a": 1})).unwrap();
@@ -810,7 +821,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tl = HotTranslog::open_with_durability(
             dir.path(),
-            TranslogDurability::Async { sync_interval_ms: 5000 },
+            TranslogDurability::Async {
+                sync_interval_ms: 5000,
+            },
         )
         .unwrap();
         let ops: Vec<(&str, serde_json::Value)> =
@@ -827,7 +840,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tl = HotTranslog::open_with_durability(
             dir.path(),
-            TranslogDurability::Async { sync_interval_ms: 5000 },
+            TranslogDurability::Async {
+                sync_interval_ms: 5000,
+            },
         )
         .unwrap();
         let ops: Vec<(&str, serde_json::Value)> =
@@ -843,7 +858,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tl = HotTranslog::open_with_durability(
             dir.path(),
-            TranslogDurability::Async { sync_interval_ms: 5000 },
+            TranslogDurability::Async {
+                sync_interval_ms: 5000,
+            },
         )
         .unwrap();
         tl.append("index", json!({"a": 1})).unwrap();
@@ -863,7 +880,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tl = HotTranslog::open_with_durability(
             dir.path(),
-            TranslogDurability::Async { sync_interval_ms: 5000 },
+            TranslogDurability::Async {
+                sync_interval_ms: 5000,
+            },
         )
         .unwrap();
         tl.append("index", json!({"a": 1})).unwrap();
@@ -881,7 +900,9 @@ mod tests {
     #[test]
     fn async_mode_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let durability = TranslogDurability::Async { sync_interval_ms: 5000 };
+        let durability = TranslogDurability::Async {
+            sync_interval_ms: 5000,
+        };
         {
             let tl = HotTranslog::open_with_durability(dir.path(), durability).unwrap();
             tl.append("index", json!({"a": 1})).unwrap();
