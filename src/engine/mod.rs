@@ -24,11 +24,36 @@ pub trait SearchEngine: Send + Sync {
     /// Implementations should handle both text and vector fields.
     fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String>;
 
+    /// Index a single document using a caller-supplied sequence number.
+    /// Replica/recovery paths use this so WAL entries preserve primary-assigned seq_nos.
+    fn add_document_with_seq(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        _seq_no: u64,
+    ) -> Result<String> {
+        self.add_document(doc_id, payload)
+    }
+
     /// Bulk-index documents. Each tuple is (doc_id, payload). Returns document IDs.
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>>;
 
+    /// Bulk-index documents using caller-supplied contiguous sequence numbers.
+    fn bulk_add_documents_with_start_seq(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+        _start_seq_no: u64,
+    ) -> Result<Vec<String>> {
+        self.bulk_add_documents(docs)
+    }
+
     /// Delete a document by its `_id`. Returns the number of deleted documents.
     fn delete_document(&self, doc_id: &str) -> Result<u64>;
+
+    /// Delete a document using a caller-supplied sequence number.
+    fn delete_document_with_seq(&self, doc_id: &str, _seq_no: u64) -> Result<u64> {
+        self.delete_document(doc_id)
+    }
 
     /// Retrieve a document by its `_id`. Returns the `_source` JSON if found.
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>>;

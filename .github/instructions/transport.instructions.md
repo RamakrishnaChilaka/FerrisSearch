@@ -53,7 +53,7 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 ### Key Handler Patterns
 - **join_cluster**: If leader → registers node via Raft (`AddNode` + `add_learner` + `change_membership`). If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
 - **index_doc / bulk_index / delete_doc**: Look up shard in ShardManager, execute engine operation, replicate to all replicas. **Returns `success: false` if replication fails** — write is only acknowledged after all ISR replicas confirm (synchronous replication contract).
-- **replicate_doc / replicate_bulk**: Apply to local replica engine, return checkpoint
+- **replicate_doc / replicate_bulk**: Apply to local replica engine using the seq_no supplied by the primary, persist that same seq_no in the replica WAL, return checkpoint
 - **recover_replica**: Read WAL entries via `read_from()`, return operations
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **raft_vote / raft_append_entries / raft_snapshot**: Deserialize JSON, forward to Raft instance
@@ -63,6 +63,7 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 ### Critical Invariants
 - **join_cluster MUST forward on followers**: A follower receiving a JoinCluster RPC must forward it to the Raft leader. It must NEVER fall through to `cluster_manager.add_node()` when Raft is active, as this would add the node to local state without Raft membership.
 - **Shard writes MUST fail on replication failure**: The `index_doc`, `bulk_index`, and `delete_doc` handlers must return `success: false` when `replicate_write()` / `replicate_bulk()` returns `Err`. Logging the error and returning `success: true` violates the synchronous replication contract.
+- **Replica apply MUST preserve primary seq_nos**: `replicate_doc`, `replicate_bulk`, and recovery replay must call the explicit-seq engine methods. Do not route replicated writes through local seq allocation APIs.
 
 ## TransportClient (src/transport/client.rs)
 ```rust

@@ -86,12 +86,28 @@ pub trait WriteAheadLog: Send + Sync {
     /// Append a single operation and fsync for durability.
     fn append(&self, op: &str, payload: serde_json::Value) -> Result<TranslogEntry>;
 
+    /// Append a single operation using a caller-supplied sequence number.
+    /// Used for replica/recovery paths so shard copies persist the primary's seq_no.
+    fn append_with_seq(
+        &self,
+        seq_no: u64,
+        op: &str,
+        payload: serde_json::Value,
+    ) -> Result<TranslogEntry>;
+
     /// Append multiple operations with a single fsync (bulk optimization).
     fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>>;
 
     /// Write multiple operations to WAL with a single fsync, without constructing
     /// return entries. Faster than `append_bulk` when the caller doesn't need the entries.
     fn write_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<()>;
+
+    /// Write multiple operations with caller-supplied contiguous sequence numbers.
+    fn write_bulk_with_start_seq(
+        &self,
+        start_seq_no: u64,
+        ops: &[(&str, serde_json::Value)],
+    ) -> Result<()>;
 
     /// Read all pending entries (used for replay on startup).
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
@@ -313,6 +329,33 @@ impl WriteAheadLog for HotTranslog {
         Ok(entry)
     }
 
+    fn append_with_seq(
+        &self,
+        seq_no: u64,
+        op: &str,
+        payload: serde_json::Value,
+    ) -> Result<TranslogEntry> {
+        let entry = TranslogEntry {
+            seq_no,
+            op: op.to_string(),
+            payload,
+        };
+
+        let frame = encode_entry(&entry)?;
+
+        let mut file = self.file.lock().unwrap();
+        file.write_all(&frame)?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            file.sync_data()?;
+        }
+        drop(file);
+
+        let mut next_seq = self.seq_no.lock().unwrap();
+        *next_seq = (*next_seq).max(seq_no.saturating_add(1));
+
+        Ok(entry)
+    }
+
     fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
         let mut seq = self.seq_no.lock().unwrap();
         let mut entries = Vec::with_capacity(ops.len());
@@ -352,6 +395,31 @@ impl WriteAheadLog for HotTranslog {
         if matches!(self.durability, TranslogDurability::Request) {
             file.sync_data()?;
         }
+
+        Ok(())
+    }
+
+    fn write_bulk_with_start_seq(
+        &self,
+        start_seq_no: u64,
+        ops: &[(&str, serde_json::Value)],
+    ) -> Result<()> {
+        let mut buf = Vec::with_capacity(ops.len() * 200);
+
+        for (offset, (op, payload)) in ops.iter().enumerate() {
+            let seq_no = start_seq_no + offset as u64;
+            buf.extend_from_slice(&encode_entry_borrowed(seq_no, op, payload)?);
+        }
+
+        let mut file = self.file.lock().unwrap();
+        file.write_all(&buf)?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            file.sync_data()?;
+        }
+        drop(file);
+
+        let mut next_seq = self.seq_no.lock().unwrap();
+        *next_seq = (*next_seq).max(start_seq_no.saturating_add(ops.len() as u64));
 
         Ok(())
     }
@@ -477,6 +545,20 @@ mod tests {
         assert_eq!(entries[2].op, "delete");
     }
 
+    #[test]
+    fn append_with_explicit_seq_preserves_provided_seq_number() {
+        let (_dir, tl) = open_translog();
+        let entry = tl
+            .append_with_seq(7, "index", json!({"title": "replicated"}))
+            .unwrap();
+
+        assert_eq!(entry.seq_no, 7);
+        assert_eq!(tl.next_seq_no(), 8);
+
+        let next = tl.append("index", json!({"title": "local"})).unwrap();
+        assert_eq!(next.seq_no, 8);
+    }
+
     // ── append_bulk ─────────────────────────────────────────────────────
 
     #[test]
@@ -490,6 +572,25 @@ mod tests {
 
         let all = tl.read_all().unwrap();
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn write_bulk_with_explicit_start_seq_advances_allocator() {
+        let (_dir, tl) = open_translog();
+        let ops: Vec<(&str, serde_json::Value)> = vec![
+            ("index", json!({"doc": "a"})),
+            ("index", json!({"doc": "b"})),
+            ("index", json!({"doc": "c"})),
+        ];
+
+        tl.write_bulk_with_start_seq(10, &ops).unwrap();
+
+        let entries = tl.read_all().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].seq_no, 10);
+        assert_eq!(entries[1].seq_no, 11);
+        assert_eq!(entries[2].seq_no, 12);
+        assert_eq!(tl.next_seq_no(), 13);
     }
 
     #[test]

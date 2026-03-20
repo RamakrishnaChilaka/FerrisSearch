@@ -17,6 +17,7 @@ use ferrissearch::transport::proto::{
     ShardSearchRequest,
 };
 use ferrissearch::transport::server::create_transport_service;
+use ferrissearch::wal::{HotTranslog, WriteAheadLog};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -277,6 +278,11 @@ async fn replicate_doc_index_via_grpc() {
     assert!(resp.found);
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["color"], "blue");
+
+    let tl = HotTranslog::open(dir.path().join("replica-idx").join("shard_0")).unwrap();
+    let entries = tl.read_all().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].seq_no, 0);
 }
 
 #[tokio::test]
@@ -348,7 +354,7 @@ async fn replicate_bulk_via_grpc() {
             doc_id: format!("bulk-rep-{}", i),
             payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
             op: "index".into(),
-            seq_no: 0,
+            seq_no: i,
         })
         .collect();
 
@@ -380,6 +386,13 @@ async fn replicate_bulk_via_grpc() {
             .into_inner();
         assert!(resp.found, "bulk-rep-{} not found", i);
     }
+
+    let tl = HotTranslog::open(dir.path().join("bulk-rep-idx").join("shard_0")).unwrap();
+    let entries = tl.read_all().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].seq_no, 0);
+    assert_eq!(entries[1].seq_no, 1);
+    assert_eq!(entries[2].seq_no, 2);
 }
 
 #[tokio::test]
@@ -533,6 +546,11 @@ async fn primary_write_replicates_to_replica_node() {
     assert!(resp.found, "Document not replicated to replica node");
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["message"], "hello from primary");
+
+    let tl = HotTranslog::open(replica_dir.path().join("replicated-idx").join("shard_0")).unwrap();
+    let entries = tl.read_all().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].seq_no, 0);
 }
 
 #[tokio::test]
@@ -656,6 +674,12 @@ async fn primary_bulk_replicates_to_replica_node() {
             .into_inner();
         assert!(resp.found, "repl-bulk-{} not replicated to replica", i);
     }
+
+    let tl = HotTranslog::open(replica_dir.path().join("bulk-repl-idx").join("shard_0")).unwrap();
+    let entries = tl.read_all().unwrap();
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0].seq_no, 0);
+    assert_eq!(entries[4].seq_no, 4);
 }
 
 // ─── Search integration tests ───────────────────────────────────────────────

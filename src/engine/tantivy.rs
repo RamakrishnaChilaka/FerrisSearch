@@ -1201,6 +1201,35 @@ impl super::SearchEngine for HotEngine {
         Ok(doc_id.to_string())
     }
 
+    fn add_document_with_seq(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        seq_no: u64,
+    ) -> Result<String> {
+        {
+            let tl = self.translog.lock().unwrap();
+            let wal_entry = serde_json::json!({
+                "_doc_id": doc_id,
+                "_source": payload
+            });
+            tl.append_with_seq(seq_no, "index", wal_entry)?;
+        }
+
+        let id_field = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .id_field;
+        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+        writer.delete_term(Term::from_field_text(id_field, doc_id));
+
+        let doc = self.build_tantivy_doc(doc_id, &payload);
+        writer.add_document(doc)?;
+
+        Ok(doc_id.to_string())
+    }
+
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
         // 1. Write all ops to translog with a single fsync (write_bulk skips entry construction)
         let ops: Vec<(&str, serde_json::Value)> = docs
@@ -1214,6 +1243,37 @@ impl super::SearchEngine for HotEngine {
 
         // 2. Write all docs to Tantivy in-memory buffer under one lock
         // Acquire registry once for the entire batch (not per-doc)
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+        let mut doc_ids = Vec::with_capacity(docs.len());
+        for (doc_id, payload) in &docs {
+            writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
+            let doc =
+                Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload);
+            writer.add_document(doc)?;
+            doc_ids.push(doc_id.clone());
+        }
+
+        Ok(doc_ids)
+    }
+
+    fn bulk_add_documents_with_start_seq(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+        start_seq_no: u64,
+    ) -> Result<Vec<String>> {
+        let ops: Vec<(&str, serde_json::Value)> = docs
+            .iter()
+            .map(|(id, p)| ("index", serde_json::json!({ "_doc_id": id, "_source": p })))
+            .collect();
+        {
+            let tl = self.translog.lock().unwrap();
+            tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
+        }
+
         let registry = self
             .field_registry
             .read()
@@ -1247,6 +1307,23 @@ impl super::SearchEngine for HotEngine {
         let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
         let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
         // delete_term returns an OpStamp, not a count — we report 1 optimistically
+        let _ = opstamp;
+        Ok(1)
+    }
+
+    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
+        {
+            let tl = self.translog.lock().unwrap();
+            tl.append_with_seq(seq_no, "delete", serde_json::json!({ "_doc_id": doc_id }))?;
+        }
+
+        let id_field = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .id_field;
+        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+        let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
         let _ = opstamp;
         Ok(1)
     }

@@ -10,8 +10,11 @@ Each shard has a **CompositeEngine** that wraps two sub-engines:
 pub trait SearchEngine: Send + Sync {
     // Document operations
     fn add_document(&self, doc_id: &str, payload: Value) -> Result<String>;
+    fn add_document_with_seq(&self, doc_id: &str, payload: Value, seq_no: u64) -> Result<String>;
     fn bulk_add_documents(&self, docs: Vec<(String, Value)>) -> Result<Vec<String>>;
+    fn bulk_add_documents_with_start_seq(&self, docs: Vec<(String, Value)>, start_seq_no: u64) -> Result<Vec<String>>;
     fn delete_document(&self, doc_id: &str) -> Result<u64>;
+    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64>;
     fn get_document(&self, doc_id: &str) -> Result<Option<Value>>;
 
     // Engine lifecycle
@@ -34,6 +37,11 @@ pub trait SearchEngine: Send + Sync {
 }
 ```
 
+### Seq Ownership Rule
+- `add_document()` / `bulk_add_documents()` / `delete_document()` are for local primary-originated writes that allocate new WAL seq_nos
+- `*_with_seq` methods are for replica apply and recovery replay only
+- Replica/recovery code MUST preserve the primary-assigned seq_no when writing to WAL; do not route replicated operations through the local-allocation methods
+
 ## CompositeEngine (src/engine/composite.rs)
 ```rust
 pub struct CompositeEngine {
@@ -44,6 +52,7 @@ pub struct CompositeEngine {
     global_cp: AtomicU64,    // global checkpoint (primary only)
 }
 ```
+- `CompositeEngine` updates its local checkpoint from the explicit seq in replica/recovery paths and from `text.last_seq_no()` for local primary writes
 
 ### Constructors
 - `new(data_dir, refresh_interval)` — default refresh loop (static interval)
@@ -78,6 +87,7 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - **`body` field**: catch-all for unmapped textual content
 - `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
 - `replay_translog()` — crash recovery from WAL, replaying only entries at or above the persisted committed checkpoint
+- Replica/recovery writes use `append_with_seq()` / `write_bulk_with_start_seq()` under the hood so persisted WAL seq_nos match the primary's numbering
 
 ### Field Schema Flags
 Numeric fields use three Tantivy flags (mirrors OpenSearch default doc_values: true):

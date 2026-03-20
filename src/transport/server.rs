@@ -652,22 +652,22 @@ impl InternalTransport for TransportService {
             "index" => {
                 let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
                     .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
-                engine.add_document(&req.doc_id, payload).map(|_| ())
+                engine
+                    .add_document_with_seq(&req.doc_id, payload, req.seq_no)
+                    .map(|_| ())
             }
-            "delete" => engine.delete_document(&req.doc_id).map(|_| ()),
+            "delete" => engine
+                .delete_document_with_seq(&req.doc_id, req.seq_no)
+                .map(|_| ()),
             other => Err(anyhow::anyhow!("Unknown replication op: {}", other)),
         };
 
         match result {
-            Ok(()) => {
-                // Update replica's local checkpoint
-                engine.update_local_checkpoint(req.seq_no);
-                Ok(Response::new(ReplicateDocResponse {
-                    success: true,
-                    error: String::new(),
-                    local_checkpoint: engine.local_checkpoint(),
-                }))
-            }
+            Ok(()) => Ok(Response::new(ReplicateDocResponse {
+                success: true,
+                error: String::new(),
+                local_checkpoint: engine.local_checkpoint(),
+            })),
             Err(e) => Ok(Response::new(ReplicateDocResponse {
                 success: false,
                 error: e.to_string(),
@@ -699,18 +699,14 @@ impl InternalTransport for TransportService {
             docs.push((op.doc_id.clone(), payload));
         }
 
-        match engine.bulk_add_documents(docs) {
-            Ok(_) => {
-                // Update replica's checkpoint with the highest seq_no in the batch
-                if let Some(last_op) = req.ops.last() {
-                    engine.update_local_checkpoint(last_op.seq_no);
-                }
-                Ok(Response::new(ReplicateBulkResponse {
-                    success: true,
-                    error: String::new(),
-                    local_checkpoint: engine.local_checkpoint(),
-                }))
-            }
+        let start_seq_no = req.ops.first().map(|op| op.seq_no).unwrap_or(0);
+
+        match engine.bulk_add_documents_with_start_seq(docs, start_seq_no) {
+            Ok(_) => Ok(Response::new(ReplicateBulkResponse {
+                success: true,
+                error: String::new(),
+                local_checkpoint: engine.local_checkpoint(),
+            })),
             Err(e) => Ok(Response::new(ReplicateBulkResponse {
                 success: false,
                 error: e.to_string(),
