@@ -5,7 +5,7 @@
 # FerrisSearch
 
 <p align="center">
-  <strong>A distributed search engine written in Rust, powered by <a href="https://github.com/quickwit-oss/tantivy">Tantivy</a></strong>
+  <strong>A distributed search engine with Raft consensus, hybrid vector search, and OpenSearch-compatible APIs — written in Rust, powered by <a href="https://github.com/quickwit-oss/tantivy">Tantivy</a></strong>
 </p>
 
 <p align="center">
@@ -386,10 +386,10 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 511 tests
-cargo test --lib                                # Unit tests (444)
-cargo test --test consensus_integration          # Raft consensus tests (29)
-cargo test --test replication_integration        # Replication tests (38)
+cargo test                                      # All 515 tests
+cargo test --lib                                # Unit tests (446)
+cargo test --test consensus_integration          # Raft consensus tests (30)
+cargo test --test replication_integration        # Replication tests (39)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.

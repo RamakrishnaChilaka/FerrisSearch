@@ -223,6 +223,20 @@ impl SearchEngine for CompositeEngine {
         Ok(id)
     }
 
+    fn add_document_with_seq(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        seq_no: u64,
+    ) -> Result<String> {
+        let id = self
+            .text
+            .add_document_with_seq(doc_id, payload.clone(), seq_no)?;
+        self.index_vectors(&id, &payload);
+        self.update_local_checkpoint(seq_no);
+        Ok(id)
+    }
+
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
         // Extract vector fields before passing docs to text engine (avoids cloning)
         let mut vec_fields: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
@@ -272,6 +286,62 @@ impl SearchEngine for CompositeEngine {
         Ok(ids)
     }
 
+    fn bulk_add_documents_with_start_seq(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+        start_seq_no: u64,
+    ) -> Result<Vec<String>> {
+        let mut vec_fields: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
+        for (_, payload) in &docs {
+            let mut found = None;
+            if let Some(obj) = payload.as_object() {
+                for (_field, value) in obj {
+                    if let Some(arr) = value.as_array() {
+                        let floats: Option<Vec<f32>> =
+                            arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
+                        if let Some(ref vec) = floats
+                            && !vec.is_empty()
+                        {
+                            found = floats;
+                            break;
+                        }
+                    }
+                }
+            }
+            vec_fields.push(found);
+        }
+
+        let ids = self
+            .text
+            .bulk_add_documents_with_start_seq(docs, start_seq_no)?;
+
+        let mut vec_batch: Vec<(String, Vec<f32>)> = Vec::new();
+        for (i, vec_opt) in vec_fields.into_iter().enumerate() {
+            if let (Some(id), Some(vec)) = (ids.get(i), vec_opt)
+                && self.ensure_vector_index(vec.len()).is_ok()
+            {
+                vec_batch.push((id.clone(), vec));
+            }
+        }
+        if !vec_batch.is_empty() {
+            let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref vi) = *guard {
+                let refs: Vec<(&str, &[f32])> = vec_batch
+                    .iter()
+                    .map(|(id, v)| (id.as_str(), v.as_slice()))
+                    .collect();
+                if let Err(e) = vi.bulk_add_with_doc_ids(&refs) {
+                    tracing::warn!("Failed to bulk-add vectors: {}", e);
+                }
+            }
+        }
+
+        if !ids.is_empty() {
+            self.update_local_checkpoint(start_seq_no + ids.len() as u64 - 1);
+        }
+        Ok(ids)
+    }
+
     fn delete_document(&self, doc_id: &str) -> Result<u64> {
         // Remove from vector index if present
         let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
@@ -282,6 +352,19 @@ impl SearchEngine for CompositeEngine {
         drop(guard);
         let result = self.text.delete_document(doc_id)?;
         self.update_local_checkpoint(self.text.last_seq_no());
+        Ok(result)
+    }
+
+    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
+        let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref vi) = *guard {
+            let key = crate::engine::routing::hash_string(doc_id);
+            let _ = vi.remove(key);
+        }
+        drop(guard);
+
+        let result = self.text.delete_document_with_seq(doc_id, seq_no)?;
+        self.update_local_checkpoint(seq_no);
         Ok(result)
     }
 
@@ -1175,6 +1258,35 @@ mod tests {
         engine.add_document("d", json!({"v": 4})).unwrap();
         let cp4 = engine.local_checkpoint();
         assert!(cp4 > cp3, "add after delete should advance");
+    }
+
+    #[test]
+    fn explicit_seq_write_updates_local_checkpoint() {
+        let (_dir, engine) = create_engine();
+
+        engine
+            .add_document_with_seq("replica-doc", json!({"x": 1}), 7)
+            .unwrap();
+
+        assert_eq!(engine.local_checkpoint(), 7);
+    }
+
+    #[test]
+    fn explicit_seq_bulk_updates_local_checkpoint() {
+        let (_dir, engine) = create_engine();
+
+        engine
+            .bulk_add_documents_with_start_seq(
+                vec![
+                    ("b1".into(), json!({"x": 1})),
+                    ("b2".into(), json!({"x": 2})),
+                    ("b3".into(), json!({"x": 3})),
+                ],
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(engine.local_checkpoint(), 12);
     }
 
     #[test]

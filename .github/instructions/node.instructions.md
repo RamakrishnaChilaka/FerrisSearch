@@ -44,6 +44,11 @@ pub struct Node {
 1. Ping master node for liveness check
 2. Reopen any locally assigned shards that are still not open
 3. Request translog-based replica recovery for replica shards once opened
+4. Replay recovered operations using the seq_no carried by the primary so the replica WAL stays in the shared shard seq space
+
+## Recovery Invariant
+- `apply_recovery_ops()` must use the explicit-seq engine write methods for both index and delete operations
+- Recovery replay must not allocate fresh local WAL seq_nos on the recovering replica
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` → returns orphaned primary shard IDs

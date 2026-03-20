@@ -592,18 +592,14 @@ fn apply_recovery_ops(
         match op.op.as_str() {
             "index" => {
                 if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&op.payload_json) {
-                    if let Err(e) = engine.add_document(&op.doc_id, payload) {
+                    if let Err(e) = engine.add_document_with_seq(&op.doc_id, payload, op.seq_no) {
                         tracing::error!("Recovery: failed to index doc '{}': {}", op.doc_id, e);
-                    } else {
-                        engine.update_local_checkpoint(op.seq_no);
                     }
                 }
             }
             "delete" => {
-                if let Err(e) = engine.delete_document(&op.doc_id) {
+                if let Err(e) = engine.delete_document_with_seq(&op.doc_id, op.seq_no) {
                     tracing::error!("Recovery: failed to delete doc '{}': {}", op.doc_id, e);
-                } else {
-                    engine.update_local_checkpoint(op.seq_no);
                 }
             }
             other => {
