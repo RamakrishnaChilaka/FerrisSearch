@@ -137,6 +137,7 @@ pub fn create_router(state: AppState) -> Router {
         // Search
         .route("/{index}/_search", get(search::search_documents))
         .route("/{index}/_search", post(index::search_documents_dsl))
+        .route("/{index}/_sql", post(search::search_sql))
         // Maintenance
         .route("/{index}/_refresh", post(index::refresh_index))
         .route("/{index}/_refresh", get(index::refresh_index))

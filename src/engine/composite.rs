@@ -404,6 +404,14 @@ impl SearchEngine for CompositeEngine {
         self.text.search_query(req)
     }
 
+    fn sql_record_batch(
+        &self,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+    ) -> Result<Option<super::SqlBatchResult>> {
+        Ok(Some(self.text.sql_record_batch(req, columns)?))
+    }
+
     fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<serde_json::Value>> {
         self.search_knn_filtered(field, vector, k, None)
     }

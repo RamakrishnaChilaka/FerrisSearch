@@ -5,20 +5,22 @@
 # FerrisSearch
 
 <p align="center">
-  <strong>A distributed search engine with Raft consensus, hybrid vector search, and OpenSearch-compatible APIs — written in Rust, powered by <a href="https://github.com/quickwit-oss/tantivy">Tantivy</a></strong>
+  <strong>A Rust-native distributed search and search-aware analytics engine with Raft consensus, hybrid vector search, OpenSearch-compatible APIs, and SQL over matched docs — powered by <a href="https://github.com/quickwit-oss/tantivy">Tantivy</a></strong>
 </p>
 
 <p align="center">
   <a href="#getting-started">Getting Started</a> &middot;
   <a href="#api-reference">API Reference</a> &middot;
+  <a href="#how-hybrid-sql-works">Architecture</a> &middot;
   <a href="#benchmarks">Benchmarks</a> &middot;
   <a href="#replication">Replication</a> &middot;
-  <a href="#testing">Testing</a>
+  <a href="#testing">Testing</a> &middot;
+  <a href="#roadmap">Roadmap</a>
 </p>
 
 ---
 
-FerrisSearch is a high-performance, Rust-native distributed search engine with OpenSearch-compatible REST APIs. Built for teams that want the familiar OpenSearch interface with the performance and safety of Rust.
+FerrisSearch is a high-performance, Rust-native distributed search engine with OpenSearch-compatible REST APIs, hybrid vector retrieval, and a search-aware SQL layer for querying matched documents as a dataset. It is built for teams that want the familiar OpenSearch interface with the performance and safety of Rust, without giving up on structured analytics over search results.
 
 > **⚡ Performance:** 2M documents — ingestion at **9,376 docs/sec**, search at **134.2 queries/sec (p50 = 26.4ms)**, zero errors — [see benchmarks](#benchmarks)
 
@@ -27,11 +29,52 @@ FerrisSearch is a high-performance, Rust-native distributed search engine with O
 - **OpenSearch-compatible REST API** — drop-in `PUT /{index}`, `POST /_doc`, `GET /_search` endpoints
 - **Raft consensus** — cluster state managed by [openraft](https://github.com/datafuselabs/openraft); quorum-based leader election, linearizable writes, automatic failover, persistent log storage via [redb](https://github.com/cberner/redb)
 - **Vector search** — k-NN approximate nearest neighbor search via [USearch](https://github.com/unum-cloud/usearch) (HNSW algorithm); hybrid full-text + vector queries
+- **Search-aware SQL** — SQL over matched docs with pushdown-aware planning, local fast-field execution when possible, planner metadata, and grouped analytics over the matched result set
 - **Distributed clustering** — multi-node clusters with shard-based data distribution
 - **Synchronous replication** — primary-replica replication over gRPC; writes acknowledged only after all in-sync replicas confirm
 - **Scatter-gather search** — queries fan out across shards, results merged and returned
 - **Crash recovery** — binary write-ahead log (WAL) with configurable durability (`request` fsync-per-write or `async` timer-based); sequence number checkpointing and translog-based replica recovery
 - **Zero external dependencies** — no JVM, no Zookeeper, just a single binary
+
+## Why FerrisSearch Is Different
+
+FerrisSearch is not just exposing SQL on top of a search API. The current direction is a true hybrid execution model:
+
+- **Tantivy executes search-native work first**: full-text matching, scoring, and pushdown-friendly structured filters
+- **Fast fields stay in the hot path**: when the query is eligible and shards are local, structured columns are read directly from Tantivy fast fields instead of materializing `_source`
+- **SQL runs on matched docs, not the whole index**: Arrow and DataFusion operate on the narrowed result set or merged partial states
+- **Planner metadata is visible**: responses show `execution_mode` and a `planner` block so you can see what was pushed down vs. what stayed residual
+
+That makes FerrisSearch useful for workflows like:
+
+- relevance debugging with `score` and structured filters in one query
+- grouped analytics over matched docs
+- internal dashboards over live search results
+- interactive search + analysis without moving logic into client code
+
+## How Hybrid SQL Works
+
+```mermaid
+flowchart LR
+  A[SQL Query] --> B[Hybrid Planner]
+  B --> C[Tantivy Search-Native Work]
+  B --> D[Residual SQL Work]
+  C --> E[Matched docs plus score]
+  C --> F[Fast-field reads or shard-local partials]
+  E --> G[Arrow RecordBatch]
+  F --> G
+  D --> H[DataFusion]
+  G --> H
+  H --> I[Rows plus planner metadata]
+```
+
+The intended execution order is:
+
+1. Tantivy handles `text_match(...)`, scoring, and pushdown-friendly structured filters.
+2. Eligible structured columns are read directly from fast fields.
+3. Arrow batches represent matched docs or merged partial states.
+4. DataFusion executes only the remaining relational work.
+5. The API returns rows plus `execution_mode` and `planner` metadata.
 
 ## Getting Started
 
@@ -203,13 +246,106 @@ curl -X POST 'http://localhost:9200/my-index/_search' \
     "from": 0,
     "size": 5
   }'
-```
 
-```bash
 # Fuzzy query (typo-tolerant search)
 curl -X POST 'http://localhost:9200/my-index/_search' \
   -H 'Content-Type: application/json' \
   -d '{"query": {"fuzzy": {"title": {"value": "rsut", "fuzziness": 2}}}}'
+```
+
+### Search-Aware SQL
+
+`POST /{index}/_sql` runs a SQL query over the matched document set. Tantivy still handles text matching, relevance scoring, and pushed-down structured filters; Arrow and DataFusion handle the residual SQL-style projection, ordering, grouping, and aggregation after search-aware planning.
+
+Current behavior:
+
+- `text_match(field, 'query')` is pushed into Tantivy
+- simple `=`, `>`, `>=`, `<`, `<=` predicates on structured fields are pushed into Tantivy filters
+- `score` is exposed as a normal SQL column
+- projection, `ORDER BY score`, `avg(field)`, `count(*)`, and `GROUP BY` are supported
+- when all shards for the target index are local and the query does not use `SELECT *`, SQL reads Tantivy fast fields directly and returns `"execution_mode": "tantivy_fast_fields"`
+- cross-node or wildcard-projection queries fall back to the compatibility path and return `"execution_mode": "materialized_hits_fallback"`
+- responses include a `planner` section showing pushed-down filters, grouping columns, required columns, and whether residual SQL predicates remained
+
+> **Roadmap note:** `EXPLAIN` for SQL plans is not implemented yet. Today, the closest visibility surface is the response `planner` block plus `execution_mode`. `EXPLAIN` is on the roadmap so plan shape becomes queryable directly.
+
+> **Current limitations:** the SQL layer is already search-aware, but it is not yet a fully distributed partial SQL engine. Cross-node grouped partial execution, richer search-native SQL functions, and `EXPLAIN` are still roadmap items.
+
+```bash
+# Project fields plus relevance score
+curl -X POST 'http://localhost:9200/products/_sql' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "SELECT title, price, score FROM products WHERE text_match(description, '\''iphone'\'') AND price > 500 ORDER BY score DESC"
+  }'
+
+# Aggregate over the matched search result set
+curl -X POST 'http://localhost:9200/products/_sql' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "SELECT avg(price) AS avg_price, count(*) AS total FROM products WHERE text_match(description, '\''iphone'\'')"
+  }'
+
+# Search-aware grouped analytics over matched docs
+curl -X POST 'http://localhost:9200/products/_sql' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "SELECT brand, count(*) AS total, avg(price) AS avg_price FROM products WHERE text_match(description, '\''iphone'\'') AND price > 500 GROUP BY brand ORDER BY total DESC, brand ASC"
+  }'
+```
+
+Example response shape:
+
+```json
+{
+  "execution_mode": "tantivy_fast_fields",
+  "planner": {
+    "text_match": {
+      "field": "description",
+      "query": "iphone"
+    },
+    "pushed_down_filters": [
+      {
+        "range": {
+          "price": {
+            "gt": 500
+          }
+        }
+      }
+    ],
+    "group_by_columns": ["brand"],
+    "required_columns": ["brand", "price"],
+    "has_residual_predicates": false
+  },
+  "matched_hits": 3,
+  "columns": ["brand", "total", "avg_price"],
+  "rows": [
+    {
+      "brand": "Apple",
+      "total": 2,
+      "avg_price": 949.0
+    },
+    {
+      "brand": "Samsung",
+      "total": 1,
+      "avg_price": 799.0
+    }
+  ]
+}
+```
+
+This is the important visibility contract for the current SQL path:
+
+- `execution_mode = "tantivy_fast_fields"` means the query stayed on the local fast-field path
+- `execution_mode = "materialized_hits_fallback"` means the compatibility path was used
+- `planner` tells you what work was pushed into Tantivy before residual SQL execution
+
+If an index name contains a hyphen, quote it in SQL:
+
+```sql
+SELECT count(*) AS total
+FROM "my-index"
+WHERE text_match(description, 'iphone')
 ```
 
 ### Vector Search (k-NN)
@@ -386,8 +522,8 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 515 tests
-cargo test --lib                                # Unit tests (446)
+cargo test                                      # All 533 tests
+cargo test --lib                                # Unit tests (464)
 cargo test --test consensus_integration          # Raft consensus tests (30)
 cargo test --test replication_integration        # Replication tests (39)
 ```
@@ -465,7 +601,8 @@ src/
 ├── cluster/       Cluster state, membership, shard routing
 ├── config/        Configuration loading
 ├── consensus/     Raft consensus (openraft): types, store, state machine, network
-├── engine/        Tantivy search engine wrapper
+├── engine/        Tantivy + vector engine integration
+├── hybrid/        Search-aware SQL planner, Arrow bridge, DataFusion execution
 ├── replication/   Primary → replica replication
 ├── shard/         Shard lifecycle management
 ├── transport/     gRPC client & server (tonic) + Raft RPCs
@@ -478,6 +615,20 @@ config/            Default configuration
 ```
 
 ## Roadmap
+
+### Search-Aware SQL
+- [x] SQL endpoint over matched docs (`POST /{index}/_sql`)
+- [x] `text_match(field, 'query')` planning and pushdown
+- [x] Structured filter pushdown for simple `=`, `>`, `>=`, `<`, `<=`
+- [x] `score` as a first-class SQL column
+- [x] Projection, `ORDER BY score`, `avg(field)`, `count(*)`
+- [x] `GROUP BY` over matched docs
+- [x] Planner metadata in SQL responses (`planner`, `execution_mode`)
+- [x] Local fast-field SQL path (`tantivy_fast_fields`)
+- [x] Compatibility fallback path (`materialized_hits_fallback`)
+- [ ] `EXPLAIN` for SQL plans
+- [ ] Distributed partial aggregates over matched docs
+- [ ] Search-native SQL functions beyond `text_match` / `score`
 
 ### Search & Query
 - [x] Pagination support (`from` / `size` parameters)
@@ -555,4 +706,17 @@ config/            Default configuration
 - [ ] Role-based access control (RBAC)
 - [ ] TLS for HTTP API
 - [ ] Encryption at rest
+
+## Positioning
+
+FerrisSearch today is best described as:
+
+- a distributed search engine with Raft-managed cluster state
+- a hybrid vector + full-text retrieval system
+- a search-aware SQL engine over matched docs
+
+It is not yet a fully distributed partial SQL engine. The current SQL path already performs real pushdown and local fast-field execution where possible, but distributed grouped partial execution is still a roadmap item.
+
+## License
+
 Apache-2.0
