@@ -58,11 +58,8 @@ impl RestTestHarness {
             raft: None,
         };
 
-        let transport_service = create_transport_service(
-            cluster_manager,
-            shard_manager,
-            transport_client,
-        );
+        let transport_service =
+            create_transport_service(cluster_manager, shard_manager, transport_client);
         let transport_handle = tokio::spawn(async move {
             let incoming = TcpListenerStream::new(transport_listener);
             if let Err(error) = tonic::transport::Server::builder()
@@ -269,7 +266,10 @@ async fn rest_root_and_cluster_health_work() -> Result<()> {
         .post_json("/_cluster/transfer_master", json!({ "node_id": "node-1" }))
         .await?;
     assert_eq!(transfer_status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(transfer_body["error"]["type"], json!("raft_not_enabled_exception"));
+    assert_eq!(
+        transfer_body["error"]["type"],
+        json!("raft_not_enabled_exception")
+    );
 
     Ok(())
 }
@@ -305,14 +305,23 @@ async fn rest_cat_endpoints_work_on_single_node() -> Result<()> {
 async fn rest_can_create_update_settings_and_delete_index() -> Result<()> {
     let harness = RestTestHarness::start().await?;
 
-    assert_eq!(harness.head_status("/products").await?, StatusCode::NOT_FOUND);
+    assert_eq!(
+        harness.head_status("/products").await?,
+        StatusCode::NOT_FOUND
+    );
     create_products_index(&harness).await?;
     assert_eq!(harness.head_status("/products").await?, StatusCode::OK);
 
     let (settings_status, settings_body) = harness.get_json("/products/_settings").await?;
     assert_eq!(settings_status, StatusCode::OK);
-    assert_eq!(settings_body["products"]["settings"]["index"]["number_of_shards"], json!(1));
-    assert_eq!(settings_body["products"]["settings"]["index"]["number_of_replicas"], json!(0));
+    assert_eq!(
+        settings_body["products"]["settings"]["index"]["number_of_shards"],
+        json!(1)
+    );
+    assert_eq!(
+        settings_body["products"]["settings"]["index"]["number_of_replicas"],
+        json!(0)
+    );
 
     let (update_status, update_body) = harness
         .put_json(
@@ -323,15 +332,25 @@ async fn rest_can_create_update_settings_and_delete_index() -> Result<()> {
     assert_eq!(update_status, StatusCode::OK);
     assert_eq!(update_body["acknowledged"], json!(true));
 
-    let (settings_after_status, settings_after_body) = harness.get_json("/products/_settings").await?;
+    let (settings_after_status, settings_after_body) =
+        harness.get_json("/products/_settings").await?;
     assert_eq!(settings_after_status, StatusCode::OK);
-    assert_eq!(settings_after_body["products"]["settings"]["index"]["number_of_shards"], json!(1));
-    assert_eq!(settings_after_body["products"]["settings"]["index"]["number_of_replicas"], json!(0));
+    assert_eq!(
+        settings_after_body["products"]["settings"]["index"]["number_of_shards"],
+        json!(1)
+    );
+    assert_eq!(
+        settings_after_body["products"]["settings"]["index"]["number_of_replicas"],
+        json!(0)
+    );
 
     let (delete_status, delete_body) = harness.delete_json("/products").await?;
     assert_eq!(delete_status, StatusCode::OK);
     assert_eq!(delete_body["acknowledged"], json!(true));
-    assert_eq!(harness.head_status("/products").await?, StatusCode::NOT_FOUND);
+    assert_eq!(
+        harness.head_status("/products").await?,
+        StatusCode::NOT_FOUND
+    );
 
     Ok(())
 }
@@ -386,7 +405,8 @@ async fn rest_can_index_get_update_delete_and_refresh_flush_documents() -> Resul
     assert_eq!(refresh_get_status, StatusCode::OK);
     assert_eq!(refresh_get_body["_shards"]["successful"], json!(1));
 
-    let (refresh_post_status, refresh_post_body) = harness.post_json("/products/_refresh", json!({})).await?;
+    let (refresh_post_status, refresh_post_body) =
+        harness.post_json("/products/_refresh", json!({})).await?;
     assert_eq!(refresh_post_status, StatusCode::OK);
     assert_eq!(refresh_post_body["_shards"]["successful"], json!(1));
 
@@ -394,7 +414,8 @@ async fn rest_can_index_get_update_delete_and_refresh_flush_documents() -> Resul
     assert_eq!(flush_get_status, StatusCode::OK);
     assert_eq!(flush_get_body["_shards"]["successful"], json!(1));
 
-    let (flush_post_status, flush_post_body) = harness.post_json("/products/_flush", json!({})).await?;
+    let (flush_post_status, flush_post_body) =
+        harness.post_json("/products/_flush", json!({})).await?;
     assert_eq!(flush_post_status, StatusCode::OK);
     assert_eq!(flush_post_body["_shards"]["successful"], json!(1));
 
@@ -402,7 +423,8 @@ async fn rest_can_index_get_update_delete_and_refresh_flush_documents() -> Resul
     assert_eq!(delete_status, StatusCode::OK);
     assert_eq!(delete_body["result"], json!("deleted"));
 
-    let (refresh_after_delete_status, refresh_after_delete_body) = harness.get_json("/products/_refresh").await?;
+    let (refresh_after_delete_status, refresh_after_delete_body) =
+        harness.get_json("/products/_refresh").await?;
     assert_eq!(refresh_after_delete_status, StatusCode::OK);
     assert_eq!(refresh_after_delete_body["_shards"]["successful"], json!(1));
 
@@ -410,7 +432,9 @@ async fn rest_can_index_get_update_delete_and_refresh_flush_documents() -> Resul
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
     assert_eq!(missing_body["found"], json!(false));
 
-    let (auto_doc_status, auto_doc_body) = harness.get_json(&format!("/products/_doc/{}", auto_id)).await?;
+    let (auto_doc_status, auto_doc_body) = harness
+        .get_json(&format!("/products/_doc/{}", auto_id))
+        .await?;
     assert_eq!(auto_doc_status, StatusCode::OK);
     assert_eq!(auto_doc_body["_source"]["brand"], json!("Google"));
 
@@ -428,7 +452,9 @@ async fn rest_can_bulk_index_and_search_via_query_and_dsl() -> Result<()> {
         "{\"index\":{\"_index\":\"products\",\"_id\":\"2\"}}\n",
         "{\"title\":\"Galaxy\",\"description\":\"iphone competitor\",\"brand\":\"Samsung\",\"price\":799.0}\n"
     );
-    let (global_bulk_status, global_bulk_body) = harness.post_ndjson("/_bulk?refresh=true", global_bulk).await?;
+    let (global_bulk_status, global_bulk_body) = harness
+        .post_ndjson("/_bulk?refresh=true", global_bulk)
+        .await?;
     assert_eq!(global_bulk_status, StatusCode::OK);
     assert_eq!(global_bulk_body["errors"], json!(false));
     assert_eq!(global_bulk_body["items"].as_array().map(Vec::len), Some(2));
@@ -437,7 +463,9 @@ async fn rest_can_bulk_index_and_search_via_query_and_dsl() -> Result<()> {
         "{\"index\":{\"_id\":\"3\"}}\n",
         "{\"title\":\"iPhone\",\"description\":\"iphone standard\",\"brand\":\"Apple\",\"price\":899.0}\n"
     );
-    let (index_bulk_status, index_bulk_body) = harness.post_ndjson("/products/_bulk?refresh=true", index_bulk).await?;
+    let (index_bulk_status, index_bulk_body) = harness
+        .post_ndjson("/products/_bulk?refresh=true", index_bulk)
+        .await?;
     assert_eq!(index_bulk_status, StatusCode::OK);
     assert_eq!(index_bulk_body["errors"], json!(false));
     assert_eq!(index_bulk_body["items"].as_array().map(Vec::len), Some(1));
@@ -445,7 +473,10 @@ async fn rest_can_bulk_index_and_search_via_query_and_dsl() -> Result<()> {
     let (search_status, search_body) = harness.get_json("/products/_search?q=iphone").await?;
     assert_eq!(search_status, StatusCode::OK);
     assert_eq!(search_body["hits"]["total"]["value"], json!(3));
-    assert_eq!(search_body["hits"]["hits"].as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        search_body["hits"]["hits"].as_array().map(Vec::len),
+        Some(3)
+    );
 
     let (dsl_status, dsl_body) = harness
         .post_json(
@@ -477,7 +508,10 @@ async fn rest_can_create_index_index_get_and_search_documents() -> Result<()> {
     let (search_status, search_body) = harness.get_json("/products/_search?q=iphone").await?;
     assert_eq!(search_status, StatusCode::OK);
     assert_eq!(search_body["hits"]["total"]["value"], json!(3));
-    assert_eq!(search_body["hits"]["hits"].as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        search_body["hits"]["hits"].as_array().map(Vec::len),
+        Some(3)
+    );
 
     Ok(())
 }
