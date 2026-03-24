@@ -591,10 +591,10 @@ fn apply_recovery_ops(
     for op in operations {
         match op.op.as_str() {
             "index" => {
-                if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&op.payload_json) {
-                    if let Err(e) = engine.add_document_with_seq(&op.doc_id, payload, op.seq_no) {
-                        tracing::error!("Recovery: failed to index doc '{}': {}", op.doc_id, e);
-                    }
+                if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&op.payload_json)
+                    && let Err(e) = engine.add_document_with_seq(&op.doc_id, payload, op.seq_no)
+                {
+                    tracing::error!("Recovery: failed to index doc '{}': {}", op.doc_id, e);
                 }
             }
             "delete" => {
