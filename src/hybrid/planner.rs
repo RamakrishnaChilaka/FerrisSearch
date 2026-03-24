@@ -181,7 +181,11 @@ fn extract_pushdowns(
 
 fn split_conjunction(expr: Expr, out: &mut Vec<Expr>) {
     match expr {
-        Expr::BinaryOp { left, op, right } if op == BinaryOperator::And => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             split_conjunction(*left, out);
             split_conjunction(*right, out);
         }
