@@ -52,6 +52,19 @@ cargo test -- test_name                         # Single test by name
 8. **Update README** — examples, roadmap, test counts
 9. **Update copilot-instructions.md** — if architecture changed
 
+## Hybrid SQL Test Expectations
+- For hybrid SQL planner changes, add unit tests for:
+	- pushdown extraction
+	- quoted index names
+	- grouped analytics planning
+	- residual predicate detection
+- For direct fast-field execution changes, add tests that assert eligible queries use fast-field readers without requiring `_source` materialization.
+- For API-level SQL changes, validate both execution modes where practical:
+	- `tantivy_fast_fields` for local non-`SELECT *` queries with columnar access
+	- `materialized_hits_fallback` for wildcard projection or distributed compatibility paths
+- Live tests should inspect the `planner` and `execution_mode` fields, not just the returned rows.
+- Add regression tests when planner or execution changes accidentally widen the fallback path for queries that should stay search-aware.
+
 ## Dev Cluster
 ```bash
 ./dev_cluster.sh 1    # HTTP 9200, Transport 9300, Raft ID 1

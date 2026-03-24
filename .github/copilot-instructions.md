@@ -526,6 +526,113 @@ When implementing any feature or fix:
 8. **Update README** — examples, roadmap checkmarks, test counts
 9. **Update copilot-instructions.md** — if architecture or conventions changed
 
+## Hybrid Search + SQL Guidance
+
+If you add a hybrid execution path that mixes full-text search with SQL-style projection, sorting, or aggregation, keep responsibilities separated.
+
+## Fast-Field Access For Hybrid Execution
+
+- Do NOT change Tantivy's fast-field on-disk format to implement search-aware planning, distributed partial execution, or grouped analytics over matched docs.
+- Read fast fields directly from Rust through Tantivy's segment readers:
+    - numeric: `segment_reader.fast_fields().f64(name)` / `.i64(name)`
+    - string/keyword: `segment_reader.fast_fields().str(name)` plus `term_ords(doc)` and `ord_to_str(ord, buf)`
+- For shard-local partial execution, prefer segment-local collectors and column readers over `_source` materialization.
+- For grouped analytics, compute shard-local partials from fast fields, ship compact partial states, and merge at the coordinator. Do not ship full matched rows unless the query needs expressions that cannot run from fast fields.
+- Only introduce new storage or sidecar column formats if a required SQL feature cannot be served by Tantivy fast fields or stored fields. Planning and partial aggregation alone are not sufficient reasons.
+
+### Responsibility Split
+- Tantivy handles text matching, ranking, and returns `(doc_id, score)`
+- Arrow holds in-memory columnar batches for matched docs or merged partial states
+- Prefer reading Tantivy fast fields directly for structured SQL columns instead of materializing `_source` into temporary row objects when all needed fields are available columnarly
+- DataFusion handles residual relational work on already-filtered matched docs or merged partial states
+- DataFusion must not become the text-search engine
+
+### What Stays In Tantivy
+- Query planning pushdown for `text_match(...)`, exact filters, and range filters
+- Ranking and hit collection
+- Fast-field reads for numeric and keyword columns
+- Search-native shard-local partial aggregation over matched docs
+- Compact per-shard partial state production for distributed grouped analytics
+
+### What Stays In DataFusion
+- SQL projection semantics
+- Alias handling and expression evaluation after pushdown
+- Residual predicates that cannot be pushed into Tantivy safely
+- Final `GROUP BY`, `ORDER BY`, and aggregate execution when the query cannot be fully answered from shard-local partial states
+- Final tabular shaping of Arrow batches into SQL result rows
+
+### What This Must NOT Become
+- Do not describe or implement the feature as "SQL over hits".
+- Do not make row-materialized post-processing the normal execution model.
+- Do not treat DataFusion as the default engine for matched documents once a query has already been narrowed by search-aware planning.
+- The target architecture is a true hybrid planner: Tantivy executes search-native work first, shard-local partials are produced where possible, and DataFusion finishes only the remaining relational semantics.
+
+### What To Move Next
+- Push grouped partial aggregation into shard-local Tantivy collectors before coordinator merge
+- Keep DataFusion as the residual/final relational executor after Tantivy pushdown, fast-field reads, and shard-local partial execution
+- Reduce fallback to materialized hits to only the cases that require unsupported expressions, wildcard projection, or unavailable columnar data
+- Treat `materialized_hits_fallback` as a compatibility path, not the target architecture
+
+### Critical Invariants
+- `doc_id` must equal the row index in any columnar representation used for hybrid execution
+- Direct lookup should remain `column[doc_id as usize]`; avoid extra maps and indirection unless there is a proven need
+- `score` must be represented as a normal Arrow/DataFusion column so SQL can sort or aggregate over it
+- Simple structured predicates (`=`, `>`, `>=`, `<`, `<=`) should be pushed into Tantivy `Term`/`Range` queries before DataFusion sees the rows
+
+### Required Comments To Anchor Generation
+When creating new hybrid-search modules, add explicit comments like these near the core flow:
+
+```rust
+// CRITICAL DESIGN:
+// doc_id is the row index in all columnar arrays
+// Do not introduce mappings or indirection
+// Access pattern must be: column[doc_id]
+```
+
+```rust
+// IMPORTANT:
+// Treat 'score' as a normal column in Arrow
+// so that SQL can sort and filter using it.
+```
+
+```rust
+// Execution pipeline:
+// 1. Run Tantivy search -> Vec<(doc_id, score)>
+// 2. Fetch column values using doc_id
+// 3. Build Arrow arrays
+// 4. Run DataFusion for aggregation/sorting
+```
+
+```rust
+// IMPORTANT:
+// DataFusion is only used for aggregation and sorting
+// It should NOT handle text search
+```
+
+```rust
+// IMPORTANT:
+// Prefer shard-local partial states over shipping matched rows
+// to the coordinator for grouped analytics.
+```
+
+```rust
+// IMPORTANT:
+// The goal is not SQL over hits.
+// The goal is search-aware planning with residual SQL execution.
+```
+
+### Suggested Implementation Order
+1. Tantivy search executor returning `Vec<(u32, f32)>`
+2. Column store with direct `doc_id -> row index` semantics
+3. Arrow `RecordBatch` bridge that includes `score`
+4. DataFusion execution for projection, sort, `avg`, and `count`
+5. Query planner that splits `text_match(...)` from SQL-style operations
+6. Shard-local partial aggregation on fast fields for `GROUP BY` / `COUNT` / `SUM` / `MIN` / `MAX` / `AVG`
+7. Coordinator merge of compact partial states before any fallback to row materialization
+
+### Copilot Review Standard
+Generated code is acceptable only if it preserves the invariants above and avoids unnecessary copying. Prefer slices, iterators, builders, and cache-friendly access patterns over collecting intermediate vectors unless materialization is required by the API boundary.
+
 ## Vector Search Plan (0.1.0)
 Uses USearch (C++ with Rust bindings) for HNSW-based approximate nearest neighbor search.
 

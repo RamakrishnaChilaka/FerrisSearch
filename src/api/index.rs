@@ -10,6 +10,14 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub(crate) struct DistributedDslSearchResult {
+    pub all_hits: Vec<Value>,
+    pub total_hits: usize,
+    pub successful_shards: u32,
+    pub failed_shards: u32,
+    pub aggregations: HashMap<String, Value>,
+}
+
 pub(crate) fn ensure_local_index_shards_open(
     state: &AppState,
     index_name: &str,
@@ -1109,40 +1117,28 @@ pub async fn bulk_index(
     )
 }
 
-/// POST /{index}/_search — DSL search across all shards (local + remote) for this index.
-pub async fn search_documents_dsl(
-    State(state): State<AppState>,
-    Path(index_name): Path<String>,
-    Json(req): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
+pub(crate) async fn execute_distributed_dsl_search(
+    state: &AppState,
+    index_name: &str,
+    search_req: &crate::search::SearchRequest,
+) -> Result<DistributedDslSearchResult, (StatusCode, Json<Value>)> {
+    if let Err(msg) = crate::common::validate_index_name(index_name) {
+        return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_index_name_exception",
             msg,
-        );
+        ));
     }
 
-    let search_req: crate::search::SearchRequest = match serde_json::from_value(req) {
-        Ok(r) => r,
-        Err(e) => {
-            return crate::api::error_response(
-                StatusCode::BAD_REQUEST,
-                "parsing_exception",
-                format!("Invalid query DSL: {}", e),
-            );
-        }
-    };
-
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(&index_name) {
+    let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m.clone(),
         None => {
-            return crate::api::error_response(
+            return Err(crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
                 format!("no such index [{}]", index_name),
-            );
+            ));
         }
     };
 
@@ -1153,15 +1149,12 @@ pub async fn search_documents_dsl(
     let mut total_hits: usize = 0;
     let is_hybrid = search_req.knn.is_some();
 
-    let mut all_partial_aggs: Vec<
-        std::collections::HashMap<String, crate::search::PartialAggResult>,
-    > = Vec::new();
+    let mut all_partial_aggs: Vec<HashMap<String, crate::search::PartialAggResult>> = Vec::new();
 
-    let local_shards = ensure_local_index_shards_open(&state, &index_name, &metadata, "DSL search");
+    let local_shards = ensure_local_index_shards_open(state, index_name, &metadata, "DSL search");
 
-    // Query local shards directly (text search)
     for (shard_id, engine) in &local_shards {
-        match engine.search_query(&search_req) {
+        match engine.search_query(search_req) {
             Ok((hits, shard_total, partial_aggs)) => {
                 successful += 1;
                 total_hits += shard_total;
@@ -1184,7 +1177,6 @@ pub async fn search_documents_dsl(
         }
     }
 
-    // k-NN vector search on local shards (if knn clause present)
     if let Some(ref knn) = search_req.knn
         && let Some((field_name, params)) = knn.fields.iter().next()
     {
@@ -1221,19 +1213,18 @@ pub async fn search_documents_dsl(
         }
     }
 
-    // Scatter to remote shards (shards on other nodes)
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
 
     let mut remote_futures = Vec::new();
     for (shard_id, routing) in &metadata.shard_routing {
         if local_shard_ids.contains(shard_id) {
-            continue; // already queried locally
+            continue;
         }
         if let Some(node_info) = cluster_state.nodes.get(&routing.primary) {
             let client = state.transport_client.clone();
             let node_info = node_info.clone();
-            let index = index_name.clone();
+            let index = index_name.to_string();
             let sid = *shard_id;
             let req_clone = search_req.clone();
             remote_futures.push(tokio::spawn(async move {
@@ -1265,7 +1256,6 @@ pub async fn search_documents_dsl(
                         "_knn_field": hit.get("_knn_field"),
                         "_knn_distance": hit.get("_knn_distance"),
                     });
-                    // Classify remote hits by type
                     if hit.get("_knn_field").is_some() {
                         knn_hits.push(enriched);
                     } else {
@@ -1289,36 +1279,70 @@ pub async fn search_documents_dsl(
         }
     }
 
-    // Merge results: use RRF for hybrid, plain sort otherwise
     let mut all_hits = if is_hybrid {
         crate::search::merge_hybrid_hits(text_hits, knn_hits)
     } else {
         text_hits
     };
-
-    // Apply user-specified sort (or default _score desc)
     crate::search::sort_hits(&mut all_hits, &search_req.sort);
 
-    // Merge per-shard partial aggregations at coordinator level
     let merged_aggs = if !all_partial_aggs.is_empty() {
         crate::search::merge_aggregations(all_partial_aggs, &search_req.aggs)
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
     };
 
-    let total = total_hits;
-    let paginated: Vec<_> = all_hits
+    Ok(DistributedDslSearchResult {
+        all_hits,
+        total_hits,
+        successful_shards: successful,
+        failed_shards: failed,
+        aggregations: merged_aggs,
+    })
+}
+
+/// POST /{index}/_search — DSL search across all shards (local + remote) for this index.
+pub async fn search_documents_dsl(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let search_req: crate::search::SearchRequest = match serde_json::from_value(req) {
+        Ok(r) => r,
+        Err(e) => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("Invalid query DSL: {}", e),
+            );
+        }
+    };
+
+    let result = match execute_distributed_dsl_search(&state, &index_name, &search_req).await {
+        Ok(result) => result,
+        Err(err) => return err,
+    };
+
+    let paginated: Vec<_> = result
+        .all_hits
         .into_iter()
         .skip(search_req.from)
         .take(search_req.size)
         .collect();
 
     let mut response = serde_json::json!({
-        "_shards": { "total": successful + failed, "successful": successful, "failed": failed },
-        "hits": { "total": { "value": total, "relation": "eq" }, "hits": paginated }
+        "_shards": {
+            "total": result.successful_shards + result.failed_shards,
+            "successful": result.successful_shards,
+            "failed": result.failed_shards
+        },
+        "hits": {
+            "total": { "value": result.total_hits, "relation": "eq" },
+            "hits": paginated
+        }
     });
-    if !merged_aggs.is_empty() {
-        response["aggregations"] = serde_json::json!(merged_aggs);
+    if !result.aggregations.is_empty() {
+        response["aggregations"] = serde_json::json!(result.aggregations);
     }
 
     (StatusCode::OK, Json(response))

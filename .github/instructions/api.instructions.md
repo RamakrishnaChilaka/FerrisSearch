@@ -81,6 +81,16 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 |------|------|---------|
 | GET | `/{index}/_search` | `search_documents()` — query-string (q=, size, from) |
 | POST | `/{index}/_search` | `search_documents_dsl()` — DSL body (SearchRequest) |
+| POST | `/{index}/_sql` | `search_sql()` — SQL over matched docs with planner metadata and execution mode |
+
+### SQL Endpoint Expectations
+- `POST /{index}/_sql` must remain coordinator-safe like other search endpoints.
+- Responses include an `execution_mode` field:
+    - `tantivy_fast_fields` when the query runs from local shard fast fields without materializing full hits first
+    - `materialized_hits_fallback` when SQL runs over gathered hits for compatibility
+- Responses include a `planner` object showing pushed-down text match, structured filters, grouping columns, required columns, and whether residual predicates remained.
+- Future SQL work should preserve these fields so manual testing can confirm whether a query stayed on the intended search-aware path.
+- API docs and responses should make it clear that `materialized_hits_fallback` is a compatibility mode, while `tantivy_fast_fields` reflects the intended search-aware local fast-field path.
 
 ### Maintenance — src/api/index.rs
 | HTTP | Path | Handler |

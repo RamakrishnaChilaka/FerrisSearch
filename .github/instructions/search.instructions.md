@@ -87,6 +87,17 @@ pub struct KnnParams {
 5. Gather results: merge hits by score, merge aggregations, apply from/size
 6. Return `{ "_shards": {...}, "hits": { "total": {...}, "hits": [...] }, "aggregations": {...} }`
 
+## Hybrid SQL Planning Guidance
+- Search-aware SQL planning should push `text_match`, term filters, and range filters into Tantivy before any Arrow/DataFusion stage.
+- Distributed grouped analytics should prefer shard-local partial execution over shipping matched rows to the coordinator.
+- Tantivy fast fields are the first-choice column source for grouped analytics, partial aggregates, sort keys, and pushed-down structured filters.
+- Only fall back to coordinator-side row materialization when the query contains projections or expressions that cannot be executed from shard-local fast fields and partial states.
+- Plan SQL in two stages:
+    1. search-aware stage in Tantivy for match/filter/pushdown and shard-local partials
+    2. residual SQL stage in DataFusion for remaining tabular semantics
+- Treat `materialized_hits_fallback` as a compatibility path. New work should try to shrink that path, not expand it.
+- Avoid describing the SQL feature as "SQL over hits" except when explicitly documenting the fallback path.
+
 ## Hybrid Search (BM25 + k-NN)
 When both `query` and `knn` are present:
 1. Full-text search produces BM25-scored results

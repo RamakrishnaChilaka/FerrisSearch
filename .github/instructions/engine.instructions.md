@@ -106,6 +106,18 @@ Aggregations run in the same Tantivy search pass as hit collection via `AggColle
 `(TopDocs, Option<AggCollector>, Count)` for hit-returning requests, or `(Option<AggCollector>, Count)`
 for agg-only `size=0` requests. When no aggs are requested, `None` adds zero overhead.
 
+### Hybrid SQL And Distributed Partial Execution
+- Do not modify Tantivy fast-field storage format for hybrid SQL work. Use Tantivy's Rust APIs directly.
+- Direct access patterns already expected in this module:
+    - numeric columns: `segment_reader.fast_fields().f64(name)` / `.i64(name)`
+    - keyword columns: `segment_reader.fast_fields().str(name)` with `term_ords(doc)` and `ord_to_str()`
+- `sql_record_batch(...)` is the reference pattern for projecting matched docs from fast fields into Arrow without `_source` materialization.
+- For grouped analytics over matched docs, prefer shard-local partial aggregation from fast fields and merge compact partials at the coordinator.
+- Fall back to `_source` materialization only for fields or expressions that cannot be read from fast fields or stored fields.
+- Tantivy is the preferred execution engine for search-aware work: pushdown, ranking, field reads, and shard-local partial aggregation should stay here.
+- DataFusion is a downstream consumer of Arrow batches or merged partial states; do not move text-search behavior, broad scan-style execution, or default matched-doc execution into it.
+- If a new SQL feature can be implemented by extending fast-field collectors or compact partial-state merging, prefer that over coordinator-side row materialization.
+
 **Architecture (mirrors OpenSearch's aggregation design):**
 - `AggCollector` implements `Collector` -- `for_segment()` opens fast-field columns per segment
 - `AggSegmentCollector` implements `SegmentCollector` -- `collect(doc, score)` reads column values and accumulates

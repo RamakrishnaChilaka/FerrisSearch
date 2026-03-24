@@ -4,9 +4,15 @@ pub mod tantivy;
 pub mod vector;
 
 use anyhow::Result;
+use datafusion::arrow::record_batch::RecordBatch;
 
 pub use self::composite::CompositeEngine;
 pub use self::tantivy::HotEngine;
+
+pub struct SqlBatchResult {
+    pub batch: RecordBatch,
+    pub total_hits: usize,
+}
 
 /// Trait abstracting a search engine backend.
 /// Each shard/split is backed by one `SearchEngine` implementation.
@@ -84,6 +90,15 @@ pub trait SearchEngine: Send + Sync {
         usize,
         std::collections::HashMap<String, crate::search::PartialAggResult>,
     )>;
+
+    /// Build a RecordBatch directly from local Tantivy columns for SQL execution.
+    fn sql_record_batch(
+        &self,
+        _req: &crate::search::SearchRequest,
+        _columns: &[String],
+    ) -> Result<Option<SqlBatchResult>> {
+        Ok(None)
+    }
 
     /// k-NN vector search. Returns hits with _id, _score, _source, _knn_distance.
     /// Default implementation returns empty (no vector support).

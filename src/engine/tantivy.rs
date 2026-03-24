@@ -192,6 +192,111 @@ impl HotEngine {
         }
     }
 
+    pub fn sql_record_batch(
+        &self,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+    ) -> Result<super::SqlBatchResult> {
+        let searcher = self.reader.searcher();
+        let query = self.build_query(&req.query)?;
+        let limit = std::cmp::max(req.size, 1);
+        let (top_docs, total_hits) =
+            searcher.search(&*query, &(TopDocs::with_limit(limit), Count))?;
+
+        let schema = self.index.schema();
+        let segment_readers = searcher.segment_readers();
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut field_plans = Vec::with_capacity(segment_readers.len());
+        for segment_reader in segment_readers {
+            let fast_fields = segment_reader.fast_fields();
+            let mut segment_fields = Vec::with_capacity(columns.len());
+            for column in columns {
+                segment_fields.push(open_sql_field_reader(&schema, fast_fields, column));
+            }
+            field_plans.push(segment_fields);
+        }
+
+        let mut ids = Vec::with_capacity(top_docs.len());
+        let mut scores = Vec::with_capacity(top_docs.len());
+        let mut projected_columns = std::collections::BTreeMap::new();
+        for column in columns {
+            projected_columns.insert(column.clone(), Vec::with_capacity(top_docs.len()));
+        }
+
+        for (score, doc_address) in top_docs {
+            let seg_ord = doc_address.segment_ord as usize;
+            let doc_id = doc_address.doc_id;
+            let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
+
+            ids.push(
+                retrieved_doc
+                    .get_all(registry.id_field)
+                    .next()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            scores.push(score);
+
+            let mut source_json = None;
+            for (index, column) in columns.iter().enumerate() {
+                let value = match &field_plans[seg_ord][index] {
+                    SqlFieldReader::F64(reader) => reader
+                        .first(doc_id)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                    SqlFieldReader::I64(reader) => reader
+                        .first(doc_id)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                    SqlFieldReader::Str(reader) => {
+                        let mut ords = reader.term_ords(doc_id);
+                        if let Some(ord) = ords.next() {
+                            let mut text = String::new();
+                            if reader.ord_to_str(ord, &mut text).unwrap_or(false) {
+                                serde_json::Value::String(text)
+                            } else {
+                                serde_json::Value::Null
+                            }
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    }
+                    SqlFieldReader::SourceFallback => {
+                        let source = source_json.get_or_insert_with(|| {
+                            retrieved_doc
+                                .get_all(registry.source_field)
+                                .next()
+                                .and_then(|value| value.as_str())
+                                .and_then(|text| {
+                                    serde_json::from_str::<serde_json::Value>(text).ok()
+                                })
+                                .and_then(|value| value.as_object().cloned())
+                                .unwrap_or_default()
+                        });
+                        source
+                            .get(column)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                };
+                projected_columns
+                    .get_mut(column)
+                    .expect("projected SQL column should exist")
+                    .push(value);
+            }
+        }
+
+        let column_store =
+            crate::hybrid::column_store::ColumnStore::new(ids, scores, projected_columns);
+        let batch = crate::hybrid::arrow_bridge::build_record_batch(&column_store)?;
+        Ok(super::SqlBatchResult { batch, total_hits })
+    }
+
     /// Build a Tantivy document from a JSON object.
     /// When typed fields exist in the registry, values are indexed into their
     /// proper field types. All text values also go into the "body" catch-all
@@ -769,6 +874,40 @@ fn open_num_col(
         tantivy::schema::FieldType::I64(_) => fast_fields.i64(entry.name()).ok().map(NumCol::I64),
         tantivy::schema::FieldType::U64(_) => fast_fields.i64(entry.name()).ok().map(NumCol::I64),
         _ => None,
+    }
+}
+
+enum SqlFieldReader {
+    F64(tantivy::columnar::Column<f64>),
+    I64(tantivy::columnar::Column<i64>),
+    Str(tantivy::columnar::StrColumn),
+    SourceFallback,
+}
+
+fn open_sql_field_reader(
+    schema: &Schema,
+    fast_fields: &tantivy::fastfield::FastFieldReaders,
+    field_name: &str,
+) -> SqlFieldReader {
+    let Ok(field) = schema.get_field(field_name) else {
+        return SqlFieldReader::SourceFallback;
+    };
+    let entry = schema.get_field_entry(field);
+    match entry.field_type() {
+        tantivy::schema::FieldType::F64(_) => fast_fields
+            .f64(entry.name())
+            .map(SqlFieldReader::F64)
+            .unwrap_or(SqlFieldReader::SourceFallback),
+        tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::U64(_) => fast_fields
+            .i64(entry.name())
+            .map(SqlFieldReader::I64)
+            .unwrap_or(SqlFieldReader::SourceFallback),
+        _ => fast_fields
+            .str(entry.name())
+            .ok()
+            .flatten()
+            .map(SqlFieldReader::Str)
+            .unwrap_or(SqlFieldReader::SourceFallback),
     }
 }
 
@@ -1449,6 +1588,14 @@ impl super::SearchEngine for HotEngine {
         )?;
         let hits = self.collect_hits(&searcher, top_docs)?;
         Ok((hits, total, partial_aggs.unwrap_or_default()))
+    }
+
+    fn sql_record_batch(
+        &self,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+    ) -> Result<Option<super::SqlBatchResult>> {
+        Ok(Some(HotEngine::sql_record_batch(self, req, columns)?))
     }
 
     fn doc_count(&self) -> u64 {
@@ -2547,6 +2694,95 @@ mod tests {
             !ids.contains(&"d1"),
             "alice should be excluded (gt, not gte)"
         );
+    }
+
+    #[test]
+    fn sql_record_batch_reads_filtered_fast_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let engine = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            crate::wal::TranslogDurability::Request,
+        )
+        .unwrap();
+
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "iPhone Budget", "price": 499.0, "description": "iphone"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "iPhone Pro", "price": 999.0, "description": "iphone"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![crate::search::QueryClause::Match(HashMap::from([(
+                    "description".to_string(),
+                    json!("iphone"),
+                )]))],
+                should: Vec::new(),
+                must_not: Vec::new(),
+                filter: vec![crate::search::QueryClause::Range(HashMap::from([(
+                    "price".to_string(),
+                    crate::search::RangeCondition {
+                        gt: Some(json!(500)),
+                        ..Default::default()
+                    },
+                )]))],
+            }),
+            size: 100,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+
+        let batch = engine
+            .sql_record_batch(&req, &["title".to_string(), "price".to_string()])
+            .unwrap();
+        assert_eq!(batch.total_hits, 1);
+        assert_eq!(batch.batch.num_rows(), 1);
+
+        let title = batch
+            .batch
+            .column_by_name("title")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let price = batch
+            .batch
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+
+        assert_eq!(title.value(0), "iPhone Pro");
+        assert_eq!(price.value(0), 999.0);
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod common;
 pub mod config;
 pub mod consensus;
 pub mod engine;
+pub mod hybrid;
 pub mod indexing;
 pub mod node;
 pub mod replication;
