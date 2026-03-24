@@ -433,14 +433,13 @@ mod tests {
         };
 
         let metadata = cluster_state.indices.get(index_name).unwrap().clone();
-        assert!(crate::api::index::ensure_local_index_shards_open(
-            &state,
-            index_name,
-            &metadata,
-            "SQL test"
-        )
-        .len()
-            == 1);
+        assert!(
+            crate::api::index::ensure_local_index_shards_open(
+                &state, index_name, &metadata, "SQL test"
+            )
+            .len()
+                == 1
+        );
 
         let shard = state.shard_manager.get_shard(index_name, 0).unwrap();
         shard
@@ -494,8 +493,7 @@ mod tests {
             State(state),
             Path("products".to_string()),
             Json(SqlQueryRequest {
-                query: "SELECT * FROM products WHERE text_match(description, 'iphone')"
-                    .to_string(),
+                query: "SELECT * FROM products WHERE text_match(description, 'iphone')".to_string(),
             }),
         )
         .await;

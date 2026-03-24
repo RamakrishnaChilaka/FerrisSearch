@@ -108,8 +108,8 @@ mod tests {
 
     #[test]
     fn to_search_request_uses_match_all_when_no_pushdowns_exist() {
-        let plan = planner::plan_sql("products", "SELECT title FROM products ORDER BY title ASC")
-            .unwrap();
+        let plan =
+            planner::plan_sql("products", "SELECT title FROM products ORDER BY title ASC").unwrap();
 
         match plan.to_search_request().query {
             crate::search::QueryClause::MatchAll(_) => {}
