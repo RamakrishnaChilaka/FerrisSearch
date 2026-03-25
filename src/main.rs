@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use ferrissearch::config::AppConfig;
 use ferrissearch::node::Node;
 use tracing::Level;

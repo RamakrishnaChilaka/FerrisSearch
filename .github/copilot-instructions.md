@@ -11,6 +11,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Axum (HTTP API)
 - Tonic/gRPC (inter-node transport)
 - Protobuf (proto/transport.proto)
+- jemalloc (global allocator via tikv-jemallocator — reduces post-workload RSS retention vs glibc malloc)
 
 ## Architecture
 - **Raft consensus** manages cluster state (leader election, node membership, index metadata).
