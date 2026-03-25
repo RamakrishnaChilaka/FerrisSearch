@@ -29,6 +29,182 @@ pub async fn execute_planned_sql_batches(
     datafusion_exec::execute_sql_batches(plan, batches).await
 }
 
+pub fn execute_grouped_partial_sql(
+    plan: &QueryPlan,
+    partials: &[std::collections::HashMap<String, crate::search::PartialAggResult>],
+) -> Result<SqlQueryResult> {
+    let grouped_sql = plan
+        .grouped_sql
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("query plan is not eligible for grouped partial SQL"))?;
+
+    let params = crate::search::GroupedMetricsAggParams {
+        group_by: grouped_sql
+            .group_columns
+            .iter()
+            .map(|column| column.source_name.clone())
+            .collect(),
+        metrics: grouped_sql
+            .metrics
+            .iter()
+            .map(|metric| crate::search::GroupedMetricAgg {
+                output_name: metric.output_name.clone(),
+                function: metric.function.to_search_function(),
+                field: metric.field.clone(),
+            })
+            .collect(),
+    };
+
+    let merged = crate::search::merge_grouped_metrics_partials(
+        partials,
+        crate::hybrid::planner::INTERNAL_SQL_GROUPED_AGG,
+        &params,
+    );
+
+    let columns: Vec<String> = grouped_sql
+        .group_columns
+        .iter()
+        .map(|column| column.output_name.clone())
+        .chain(
+            grouped_sql
+                .metrics
+                .iter()
+                .map(|metric| metric.output_name.clone()),
+        )
+        .collect();
+
+    let mut rows = merged
+        .into_iter()
+        .map(|bucket| {
+            let mut row = serde_json::Map::new();
+            for (index, column) in grouped_sql.group_columns.iter().enumerate() {
+                row.insert(
+                    column.output_name.clone(),
+                    bucket
+                        .group_values
+                        .get(index)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+
+            for metric in &grouped_sql.metrics {
+                row.insert(
+                    metric.output_name.clone(),
+                    grouped_metric_value(bucket.metrics.get(&metric.output_name), metric),
+                );
+            }
+
+            serde_json::Value::Object(row)
+        })
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|left, right| compare_grouped_rows(left, right, &grouped_sql.order_by));
+
+    Ok(SqlQueryResult { columns, rows })
+}
+
+fn grouped_metric_value(
+    partial: Option<&crate::search::GroupedMetricPartial>,
+    metric: &planner::SqlGroupedMetric,
+) -> serde_json::Value {
+    match (partial, &metric.function) {
+        (
+            Some(crate::search::GroupedMetricPartial::Count { count }),
+            planner::SqlGroupedMetricFunction::Count,
+        ) => serde_json::json!(count),
+        (
+            Some(crate::search::GroupedMetricPartial::Stats {
+                count,
+                sum,
+                min: _,
+                max: _,
+            }),
+            planner::SqlGroupedMetricFunction::Sum,
+        ) => {
+            if *count > 0 {
+                serde_json::json!(sum)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        (
+            Some(crate::search::GroupedMetricPartial::Stats { count, sum, .. }),
+            planner::SqlGroupedMetricFunction::Avg,
+        ) => {
+            if *count > 0 {
+                serde_json::json!(sum / *count as f64)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        (
+            Some(crate::search::GroupedMetricPartial::Stats { count, min, .. }),
+            planner::SqlGroupedMetricFunction::Min,
+        ) => {
+            if *count > 0 {
+                serde_json::json!(min)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        (
+            Some(crate::search::GroupedMetricPartial::Stats { count, max, .. }),
+            planner::SqlGroupedMetricFunction::Max,
+        ) => {
+            if *count > 0 {
+                serde_json::json!(max)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn compare_grouped_rows(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    order_by: &[planner::SqlOrderBy],
+) -> std::cmp::Ordering {
+    for order in order_by {
+        let left_value = left
+            .get(&order.output_name)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let right_value = right
+            .get(&order.output_name)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let ordering = compare_json_values(&left_value, &right_value);
+        let ordering = if order.desc {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn compare_json_values(left: &serde_json::Value, right: &serde_json::Value) -> std::cmp::Ordering {
+    match (left, right) {
+        (serde_json::Value::Null, serde_json::Value::Null) => std::cmp::Ordering::Equal,
+        (serde_json::Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, serde_json::Value::Null) => std::cmp::Ordering::Less,
+        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => left
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&right.as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (serde_json::Value::String(left), serde_json::Value::String(right)) => left.cmp(right),
+        (serde_json::Value::Bool(left), serde_json::Value::Bool(right)) => left.cmp(right),
+        _ => left.to_string().cmp(&right.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +259,7 @@ mod tests {
         );
         assert_eq!(plan.pushed_filters.len(), 1);
         assert!(!plan.has_residual_predicates);
+        assert!(plan.uses_grouped_partials());
     }
 
     #[test]
@@ -158,6 +335,19 @@ mod tests {
             }
             other => panic!("expected Bool query, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn to_search_request_emits_internal_grouped_agg_for_group_by_query() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT brand, count(*) AS total, avg(price) AS avg_price FROM products WHERE text_match(description, 'iphone') GROUP BY brand ORDER BY total DESC",
+        )
+        .unwrap();
+
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 0);
+        assert!(req.aggs.contains_key(planner::INTERNAL_SQL_GROUPED_AGG));
     }
 
     #[test]
@@ -266,6 +456,94 @@ mod tests {
     }
 
     #[test]
+    fn execute_grouped_partial_sql_merges_and_orders_group_rows() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT brand, count(*) AS total, avg(price) AS avg_price FROM products WHERE text_match(description, 'iphone') GROUP BY brand ORDER BY total DESC, brand ASC",
+        )
+        .unwrap();
+
+        let partials = vec![
+            std::collections::HashMap::from([(
+                planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+                crate::search::PartialAggResult::GroupedMetrics {
+                    buckets: vec![
+                        crate::search::GroupedMetricsBucket {
+                            group_values: vec![json!("Apple")],
+                            metrics: std::collections::HashMap::from([
+                                (
+                                    "total".to_string(),
+                                    crate::search::GroupedMetricPartial::Count { count: 1 },
+                                ),
+                                (
+                                    "avg_price".to_string(),
+                                    crate::search::GroupedMetricPartial::Stats {
+                                        count: 1,
+                                        sum: 999.0,
+                                        min: 999.0,
+                                        max: 999.0,
+                                    },
+                                ),
+                            ]),
+                        },
+                        crate::search::GroupedMetricsBucket {
+                            group_values: vec![json!("Samsung")],
+                            metrics: std::collections::HashMap::from([
+                                (
+                                    "total".to_string(),
+                                    crate::search::GroupedMetricPartial::Count { count: 1 },
+                                ),
+                                (
+                                    "avg_price".to_string(),
+                                    crate::search::GroupedMetricPartial::Stats {
+                                        count: 1,
+                                        sum: 799.0,
+                                        min: 799.0,
+                                        max: 799.0,
+                                    },
+                                ),
+                            ]),
+                        },
+                    ],
+                },
+            )]),
+            std::collections::HashMap::from([(
+                planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+                crate::search::PartialAggResult::GroupedMetrics {
+                    buckets: vec![crate::search::GroupedMetricsBucket {
+                        group_values: vec![json!("Apple")],
+                        metrics: std::collections::HashMap::from([
+                            (
+                                "total".to_string(),
+                                crate::search::GroupedMetricPartial::Count { count: 1 },
+                            ),
+                            (
+                                "avg_price".to_string(),
+                                crate::search::GroupedMetricPartial::Stats {
+                                    count: 1,
+                                    sum: 899.0,
+                                    min: 899.0,
+                                    max: 899.0,
+                                },
+                            ),
+                        ]),
+                    }],
+                },
+            )]),
+        ];
+
+        let result = execute_grouped_partial_sql(&plan, &partials).unwrap();
+        assert_eq!(result.columns, vec!["brand", "total", "avg_price"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0]["brand"], "Apple");
+        assert_eq!(result.rows[0]["total"], 2);
+        assert_eq!(result.rows[0]["avg_price"], 949.0);
+        assert_eq!(result.rows[1]["brand"], "Samsung");
+        assert_eq!(result.rows[1]["total"], 1);
+        assert_eq!(result.rows[1]["avg_price"], 799.0);
+    }
+
+    #[test]
     fn explain_shows_fast_field_strategy_for_projected_query() {
         let plan = planner::plan_sql(
             "products",
@@ -275,7 +553,7 @@ mod tests {
 
         let explain = plan.to_explain_json();
         assert_eq!(explain["index"], "products");
-        assert_eq!(explain["execution_strategy"], "tantivy_fast_fields");
+        assert_eq!(explain["execution_strategy"], "tantivy_grouped_partials");
         assert_eq!(explain["pushdown_summary"]["pushed_filter_count"], 1);
         assert_eq!(
             explain["pushdown_summary"]["has_residual_predicates"],
@@ -288,14 +566,14 @@ mod tests {
         assert_eq!(explain["pushdown_summary"]["text_match"]["query"], "iphone");
         assert_eq!(explain["columns"]["group_by"], json!(["brand"]));
         assert!(!explain["columns"]["selects_all"].as_bool().unwrap());
+        assert_eq!(explain["columns"]["uses_grouped_partials"], true);
 
         let pipeline = explain["pipeline"].as_array().unwrap();
         assert_eq!(pipeline.len(), 4);
         assert_eq!(pipeline[0]["name"], "tantivy_search");
-        assert_eq!(pipeline[1]["name"], "fast_field_read");
-        assert_eq!(pipeline[2]["name"], "arrow_batch");
-        assert_eq!(pipeline[3]["name"], "datafusion_sql");
-        assert_eq!(pipeline[3]["group_by"], json!(["brand"]));
+        assert_eq!(pipeline[1]["name"], "grouped_partial_collect");
+        assert_eq!(pipeline[2]["name"], "grouped_partial_merge");
+        assert_eq!(pipeline[3]["name"], "final_grouped_sql_shape");
     }
 
     #[test]

@@ -180,6 +180,9 @@ pub enum AggregationRequest {
     /// Histogram: fixed-interval numeric buckets.
     /// `{ "histogram": { "field": "year", "interval": 10 } }`
     Histogram(HistogramAggParams),
+    /// Internal grouped metrics aggregation used by the SQL grouped-partials path.
+    /// Not part of the public REST DSL surface.
+    GroupedMetrics(GroupedMetricsAggParams),
 }
 
 /// Parameters for a terms aggregation.
@@ -207,6 +210,31 @@ pub struct HistogramAggParams {
     pub interval: f64,
 }
 
+/// Internal grouped metrics request for SQL `GROUP BY` execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupedMetricsAggParams {
+    pub group_by: Vec<String>,
+    pub metrics: Vec<GroupedMetricAgg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupedMetricAgg {
+    pub output_name: String,
+    pub function: GroupedMetricFunction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupedMetricFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
 /// A partial aggregation result from a single shard/split.
 /// Designed to be mergeable: the coordinator combines partials from all shards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +253,8 @@ pub enum PartialAggResult {
     Metric { value: Option<f64> },
     /// Histogram buckets: key → doc_count
     Histogram { buckets: Vec<HistogramBucket> },
+    /// Internal grouped metrics partial state for SQL grouped execution.
+    GroupedMetrics { buckets: Vec<GroupedMetricsBucket> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +273,42 @@ enum WirePartialAggResult {
     },
     Histogram {
         buckets: Vec<HistogramBucket>,
+    },
+    GroupedMetrics {
+        buckets: Vec<WireGroupedMetricsBucket>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum WireJsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireGroupedMetricsBucket {
+    group_values: Vec<WireJsonValue>,
+    metrics: HashMap<String, GroupedMetricPartial>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupedMetricsBucket {
+    pub group_values: Vec<serde_json::Value>,
+    pub metrics: HashMap<String, GroupedMetricPartial>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GroupedMetricPartial {
+    Count {
+        count: u64,
+    },
+    Stats {
+        count: u64,
+        sum: f64,
+        min: f64,
+        max: f64,
     },
 }
 
@@ -267,6 +333,9 @@ impl From<&PartialAggResult> for WirePartialAggResult {
             PartialAggResult::Histogram { buckets } => Self::Histogram {
                 buckets: buckets.clone(),
             },
+            PartialAggResult::GroupedMetrics { buckets } => Self::GroupedMetrics {
+                buckets: buckets.iter().map(WireGroupedMetricsBucket::from).collect(),
+            },
         }
     }
 }
@@ -288,6 +357,57 @@ impl From<WirePartialAggResult> for PartialAggResult {
             },
             WirePartialAggResult::Metric { value } => Self::Metric { value },
             WirePartialAggResult::Histogram { buckets } => Self::Histogram { buckets },
+            WirePartialAggResult::GroupedMetrics { buckets } => Self::GroupedMetrics {
+                buckets: buckets
+                    .into_iter()
+                    .map(GroupedMetricsBucket::from)
+                    .collect(),
+            },
+        }
+    }
+}
+
+impl From<&serde_json::Value> for WireJsonValue {
+    fn from(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(value) => Self::Bool(*value),
+            serde_json::Value::Number(value) => Self::Number(value.as_f64().unwrap_or(0.0)),
+            serde_json::Value::String(value) => Self::String(value.clone()),
+            other => Self::String(other.to_string()),
+        }
+    }
+}
+
+impl From<WireJsonValue> for serde_json::Value {
+    fn from(value: WireJsonValue) -> Self {
+        match value {
+            WireJsonValue::Null => serde_json::Value::Null,
+            WireJsonValue::Bool(value) => serde_json::Value::Bool(value),
+            WireJsonValue::Number(value) => serde_json::Value::from(value),
+            WireJsonValue::String(value) => serde_json::Value::String(value),
+        }
+    }
+}
+
+impl From<&GroupedMetricsBucket> for WireGroupedMetricsBucket {
+    fn from(value: &GroupedMetricsBucket) -> Self {
+        Self {
+            group_values: value.group_values.iter().map(WireJsonValue::from).collect(),
+            metrics: value.metrics.clone(),
+        }
+    }
+}
+
+impl From<WireGroupedMetricsBucket> for GroupedMetricsBucket {
+    fn from(value: WireGroupedMetricsBucket) -> Self {
+        Self {
+            group_values: value
+                .group_values
+                .into_iter()
+                .map(serde_json::Value::from)
+                .collect(),
+            metrics: value.metrics,
         }
     }
 }
@@ -390,6 +510,7 @@ pub fn compute_aggregations(
             AggregationRequest::Histogram(params) => {
                 compute_histogram(hits, &params.field, params.interval)
             }
+            AggregationRequest::GroupedMetrics(params) => compute_grouped_metrics(hits, params),
         };
         results.insert(name.clone(), result);
     }
@@ -499,6 +620,98 @@ fn compute_histogram(hits: &[serde_json::Value], field: &str, interval: f64) -> 
     PartialAggResult::Histogram { buckets }
 }
 
+fn compute_grouped_metrics(
+    hits: &[serde_json::Value],
+    params: &GroupedMetricsAggParams,
+) -> PartialAggResult {
+    let mut buckets: HashMap<String, GroupedMetricsBucket> = HashMap::new();
+
+    for hit in hits {
+        let source = hit.get("_source").unwrap_or(hit);
+        let group_values: Vec<serde_json::Value> = params
+            .group_by
+            .iter()
+            .map(|field| {
+                source
+                    .get(field)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .collect();
+        let key = serde_json::to_string(&group_values).unwrap_or_default();
+
+        let bucket = buckets.entry(key).or_insert_with(|| GroupedMetricsBucket {
+            group_values: group_values.clone(),
+            metrics: HashMap::new(),
+        });
+
+        for metric in &params.metrics {
+            match metric.function {
+                GroupedMetricFunction::Count => {
+                    let should_count = match &metric.field {
+                        Some(field) => source.get(field).is_some_and(|value| !value.is_null()),
+                        None => true,
+                    };
+                    if should_count {
+                        let entry = bucket
+                            .metrics
+                            .entry(metric.output_name.clone())
+                            .or_insert(GroupedMetricPartial::Count { count: 0 });
+                        if let GroupedMetricPartial::Count { count } = entry {
+                            *count += 1;
+                        }
+                    }
+                }
+                GroupedMetricFunction::Sum
+                | GroupedMetricFunction::Avg
+                | GroupedMetricFunction::Min
+                | GroupedMetricFunction::Max => {
+                    let Some(field) = &metric.field else {
+                        continue;
+                    };
+                    let Some(value) = source.get(field).and_then(|value| value.as_f64()) else {
+                        continue;
+                    };
+                    let entry = bucket.metrics.entry(metric.output_name.clone()).or_insert(
+                        GroupedMetricPartial::Stats {
+                            count: 0,
+                            sum: 0.0,
+                            min: f64::INFINITY,
+                            max: f64::NEG_INFINITY,
+                        },
+                    );
+                    if let GroupedMetricPartial::Stats {
+                        count,
+                        sum,
+                        min,
+                        max,
+                    } = entry
+                    {
+                        *count += 1;
+                        *sum += value;
+                        if value < *min {
+                            *min = value;
+                        }
+                        if value > *max {
+                            *max = value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut grouped_buckets: Vec<GroupedMetricsBucket> = buckets.into_values().collect();
+    grouped_buckets.sort_by(|left, right| {
+        serde_json::to_string(&left.group_values)
+            .unwrap_or_default()
+            .cmp(&serde_json::to_string(&right.group_values).unwrap_or_default())
+    });
+    PartialAggResult::GroupedMetrics {
+        buckets: grouped_buckets,
+    }
+}
+
 /// Merge partial aggregation results from multiple shards/splits.
 /// This is the coordinator-level merge that combines partial agg results.
 pub fn merge_aggregations(
@@ -519,6 +732,9 @@ pub fn merge_aggregations(
             AggregationRequest::Sum(_) => merge_sum(&parts),
             AggregationRequest::ValueCount(_) => merge_value_count(&parts),
             AggregationRequest::Histogram(_) => merge_histogram(&parts),
+            AggregationRequest::GroupedMetrics(params) => {
+                merge_grouped_metrics_json(&parts, params)
+            }
         };
 
         merged.insert(name.clone(), result);
@@ -687,6 +903,219 @@ fn merge_histogram(parts: &[&PartialAggResult]) -> serde_json::Value {
         ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
     });
     serde_json::json!({"buckets": buckets})
+}
+
+pub fn merge_grouped_metrics_partials(
+    partials: &[HashMap<String, PartialAggResult>],
+    agg_name: &str,
+    params: &GroupedMetricsAggParams,
+) -> Vec<GroupedMetricsBucket> {
+    let mut merged: HashMap<String, GroupedMetricsBucket> = HashMap::new();
+
+    for partial in partials {
+        let Some(PartialAggResult::GroupedMetrics { buckets }) = partial.get(agg_name) else {
+            continue;
+        };
+
+        for bucket in buckets {
+            let key = serde_json::to_string(&bucket.group_values).unwrap_or_default();
+            let merged_bucket = merged.entry(key).or_insert_with(|| GroupedMetricsBucket {
+                group_values: bucket.group_values.clone(),
+                metrics: HashMap::new(),
+            });
+
+            for metric in &params.metrics {
+                let Some(incoming) = bucket.metrics.get(&metric.output_name) else {
+                    continue;
+                };
+                match incoming {
+                    GroupedMetricPartial::Count { count } => {
+                        let entry = merged_bucket
+                            .metrics
+                            .entry(metric.output_name.clone())
+                            .or_insert(GroupedMetricPartial::Count { count: 0 });
+                        if let GroupedMetricPartial::Count {
+                            count: merged_count,
+                        } = entry
+                        {
+                            *merged_count += count;
+                        }
+                    }
+                    GroupedMetricPartial::Stats {
+                        count,
+                        sum,
+                        min,
+                        max,
+                    } => {
+                        let entry = merged_bucket
+                            .metrics
+                            .entry(metric.output_name.clone())
+                            .or_insert(GroupedMetricPartial::Stats {
+                                count: 0,
+                                sum: 0.0,
+                                min: f64::INFINITY,
+                                max: f64::NEG_INFINITY,
+                            });
+                        if let GroupedMetricPartial::Stats {
+                            count: merged_count,
+                            sum: merged_sum,
+                            min: merged_min,
+                            max: merged_max,
+                        } = entry
+                        {
+                            *merged_count += count;
+                            *merged_sum += sum;
+                            if *min < *merged_min {
+                                *merged_min = *min;
+                            }
+                            if *max > *merged_max {
+                                *merged_max = *max;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut buckets: Vec<GroupedMetricsBucket> = merged.into_values().collect();
+    buckets.sort_by(|left, right| {
+        serde_json::to_string(&left.group_values)
+            .unwrap_or_default()
+            .cmp(&serde_json::to_string(&right.group_values).unwrap_or_default())
+    });
+    buckets
+}
+
+fn merge_grouped_metrics_json(
+    parts: &[&PartialAggResult],
+    params: &GroupedMetricsAggParams,
+) -> serde_json::Value {
+    let mut merged: HashMap<String, GroupedMetricsBucket> = HashMap::new();
+
+    for part in parts {
+        let PartialAggResult::GroupedMetrics { buckets } = part else {
+            continue;
+        };
+        for bucket in buckets {
+            let key = serde_json::to_string(&bucket.group_values).unwrap_or_default();
+            let merged_bucket = merged.entry(key).or_insert_with(|| GroupedMetricsBucket {
+                group_values: bucket.group_values.clone(),
+                metrics: HashMap::new(),
+            });
+
+            for metric in &params.metrics {
+                let Some(incoming) = bucket.metrics.get(&metric.output_name) else {
+                    continue;
+                };
+                match incoming {
+                    GroupedMetricPartial::Count { count } => {
+                        let entry = merged_bucket
+                            .metrics
+                            .entry(metric.output_name.clone())
+                            .or_insert(GroupedMetricPartial::Count { count: 0 });
+                        if let GroupedMetricPartial::Count {
+                            count: merged_count,
+                        } = entry
+                        {
+                            *merged_count += count;
+                        }
+                    }
+                    GroupedMetricPartial::Stats {
+                        count,
+                        sum,
+                        min,
+                        max,
+                    } => {
+                        let entry = merged_bucket
+                            .metrics
+                            .entry(metric.output_name.clone())
+                            .or_insert(GroupedMetricPartial::Stats {
+                                count: 0,
+                                sum: 0.0,
+                                min: f64::INFINITY,
+                                max: f64::NEG_INFINITY,
+                            });
+                        if let GroupedMetricPartial::Stats {
+                            count: merged_count,
+                            sum: merged_sum,
+                            min: merged_min,
+                            max: merged_max,
+                        } = entry
+                        {
+                            *merged_count += count;
+                            *merged_sum += sum;
+                            if *min < *merged_min {
+                                *merged_min = *min;
+                            }
+                            if *max > *merged_max {
+                                *merged_max = *max;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut merged: Vec<GroupedMetricsBucket> = merged.into_values().collect();
+    merged.sort_by(|left, right| {
+        serde_json::to_string(&left.group_values)
+            .unwrap_or_default()
+            .cmp(&serde_json::to_string(&right.group_values).unwrap_or_default())
+    });
+    let buckets: Vec<serde_json::Value> = merged
+        .into_iter()
+        .map(|bucket| {
+            let metrics = params
+                .metrics
+                .iter()
+                .map(|metric| {
+                    let value = match bucket.metrics.get(&metric.output_name) {
+                        Some(GroupedMetricPartial::Count { count }) => serde_json::json!(count),
+                        Some(GroupedMetricPartial::Stats {
+                            count,
+                            sum,
+                            min,
+                            max,
+                        }) => match metric.function {
+                            GroupedMetricFunction::Sum => serde_json::json!(sum),
+                            GroupedMetricFunction::Avg => {
+                                if *count > 0 {
+                                    serde_json::json!(sum / *count as f64)
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            }
+                            GroupedMetricFunction::Min => {
+                                if *count > 0 {
+                                    serde_json::json!(min)
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            }
+                            GroupedMetricFunction::Max => {
+                                if *count > 0 {
+                                    serde_json::json!(max)
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            }
+                            GroupedMetricFunction::Count => serde_json::Value::Null,
+                        },
+                        None => serde_json::Value::Null,
+                    };
+                    (metric.output_name.clone(), value)
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>();
+
+            serde_json::json!({
+                "key": bucket.group_values,
+                "metrics": metrics,
+            })
+        })
+        .collect();
+    serde_json::json!({ "buckets": buckets })
 }
 
 /// Sort a list of search hits according to the given sort clauses.
@@ -2056,6 +2485,128 @@ mod tests {
         assert_eq!(sum, 60.0);
         assert_eq!(min, 10.0);
         assert_eq!(max, 30.0);
+    }
+
+    #[test]
+    fn grouped_partial_agg_bincode_roundtrip() {
+        let partials = HashMap::from([(
+            "sql_grouped".to_string(),
+            PartialAggResult::GroupedMetrics {
+                buckets: vec![GroupedMetricsBucket {
+                    group_values: vec![json!("Apple")],
+                    metrics: HashMap::from([
+                        (
+                            "total".to_string(),
+                            GroupedMetricPartial::Count { count: 2 },
+                        ),
+                        (
+                            "avg_price".to_string(),
+                            GroupedMetricPartial::Stats {
+                                count: 2,
+                                sum: 1898.0,
+                                min: 899.0,
+                                max: 999.0,
+                            },
+                        ),
+                    ]),
+                }],
+            },
+        )]);
+
+        let bytes = encode_partial_aggs(&partials).unwrap();
+        let decoded = decode_partial_aggs(&bytes).unwrap();
+
+        let PartialAggResult::GroupedMetrics { buckets } = &decoded["sql_grouped"] else {
+            panic!("expected grouped metrics partial");
+        };
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].group_values, vec![json!("Apple")]);
+        match buckets[0].metrics.get("total") {
+            Some(GroupedMetricPartial::Count { count }) => assert_eq!(*count, 2),
+            other => panic!("unexpected grouped count partial: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_grouped_metrics_partials_combines_matching_groups() {
+        let params = GroupedMetricsAggParams {
+            group_by: vec!["brand".into()],
+            metrics: vec![
+                GroupedMetricAgg {
+                    output_name: "total".into(),
+                    function: GroupedMetricFunction::Count,
+                    field: None,
+                },
+                GroupedMetricAgg {
+                    output_name: "avg_price".into(),
+                    function: GroupedMetricFunction::Avg,
+                    field: Some("price".into()),
+                },
+            ],
+        };
+
+        let partials = vec![
+            HashMap::from([(
+                "sql_grouped".to_string(),
+                PartialAggResult::GroupedMetrics {
+                    buckets: vec![GroupedMetricsBucket {
+                        group_values: vec![json!("Apple")],
+                        metrics: HashMap::from([
+                            (
+                                "total".to_string(),
+                                GroupedMetricPartial::Count { count: 1 },
+                            ),
+                            (
+                                "avg_price".to_string(),
+                                GroupedMetricPartial::Stats {
+                                    count: 1,
+                                    sum: 999.0,
+                                    min: 999.0,
+                                    max: 999.0,
+                                },
+                            ),
+                        ]),
+                    }],
+                },
+            )]),
+            HashMap::from([(
+                "sql_grouped".to_string(),
+                PartialAggResult::GroupedMetrics {
+                    buckets: vec![GroupedMetricsBucket {
+                        group_values: vec![json!("Apple")],
+                        metrics: HashMap::from([
+                            (
+                                "total".to_string(),
+                                GroupedMetricPartial::Count { count: 1 },
+                            ),
+                            (
+                                "avg_price".to_string(),
+                                GroupedMetricPartial::Stats {
+                                    count: 1,
+                                    sum: 899.0,
+                                    min: 899.0,
+                                    max: 899.0,
+                                },
+                            ),
+                        ]),
+                    }],
+                },
+            )]),
+        ];
+
+        let merged = merge_grouped_metrics_partials(&partials, "sql_grouped", &params);
+        assert_eq!(merged.len(), 1);
+        match merged[0].metrics.get("total") {
+            Some(GroupedMetricPartial::Count { count }) => assert_eq!(*count, 2),
+            other => panic!("unexpected grouped count partial: {other:?}"),
+        }
+        match merged[0].metrics.get("avg_price") {
+            Some(GroupedMetricPartial::Stats { count, sum, .. }) => {
+                assert_eq!(*count, 2);
+                assert_eq!(*sum, 1898.0);
+            }
+            other => panic!("unexpected grouped stats partial: {other:?}"),
+        }
     }
 
     #[test]

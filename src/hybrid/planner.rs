@@ -17,6 +17,55 @@ pub struct TextMatchPredicate {
     pub query: String,
 }
 
+pub(crate) const INTERNAL_SQL_GROUPED_AGG: &str = "__sql_grouped_metrics";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlGroupedMetricFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl SqlGroupedMetricFunction {
+    pub(crate) fn to_search_function(&self) -> crate::search::GroupedMetricFunction {
+        match self {
+            Self::Count => crate::search::GroupedMetricFunction::Count,
+            Self::Sum => crate::search::GroupedMetricFunction::Sum,
+            Self::Avg => crate::search::GroupedMetricFunction::Avg,
+            Self::Min => crate::search::GroupedMetricFunction::Min,
+            Self::Max => crate::search::GroupedMetricFunction::Max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlGroupColumn {
+    pub source_name: String,
+    pub output_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlGroupedMetric {
+    pub output_name: String,
+    pub function: SqlGroupedMetricFunction,
+    pub field: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlOrderBy {
+    pub output_name: String,
+    pub desc: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedSqlPlan {
+    pub group_columns: Vec<SqlGroupColumn>,
+    pub metrics: Vec<SqlGroupedMetric>,
+    pub order_by: Vec<SqlOrderBy>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub index_name: String,
@@ -28,9 +77,14 @@ pub struct QueryPlan {
     pub group_by_columns: Vec<String>,
     pub has_residual_predicates: bool,
     pub selects_all_columns: bool,
+    pub grouped_sql: Option<GroupedSqlPlan>,
 }
 
 impl QueryPlan {
+    pub fn uses_grouped_partials(&self) -> bool {
+        self.grouped_sql.is_some()
+    }
+
     pub fn to_search_request(&self) -> crate::search::SearchRequest {
         let query = if self.text_match.is_none() && self.pushed_filters.is_empty() {
             crate::search::QueryClause::MatchAll(serde_json::Value::Object(Default::default()))
@@ -50,13 +104,43 @@ impl QueryPlan {
             crate::search::QueryClause::Bool(bool_query)
         };
 
+        let (size, aggs) = if let Some(grouped_sql) = &self.grouped_sql {
+            let metrics = grouped_sql
+                .metrics
+                .iter()
+                .map(|metric| crate::search::GroupedMetricAgg {
+                    output_name: metric.output_name.clone(),
+                    function: metric.function.to_search_function(),
+                    field: metric.field.clone(),
+                })
+                .collect();
+            (
+                0,
+                HashMap::from([(
+                    INTERNAL_SQL_GROUPED_AGG.to_string(),
+                    crate::search::AggregationRequest::GroupedMetrics(
+                        crate::search::GroupedMetricsAggParams {
+                            group_by: grouped_sql
+                                .group_columns
+                                .iter()
+                                .map(|column| column.source_name.clone())
+                                .collect(),
+                            metrics,
+                        },
+                    ),
+                )]),
+            )
+        } else {
+            (SQL_MATCH_LIMIT, HashMap::new())
+        };
+
         crate::search::SearchRequest {
             query,
-            size: SQL_MATCH_LIMIT,
+            size,
             from: 0,
             knn: None,
             sort: vec![],
-            aggs: HashMap::new(),
+            aggs,
         }
     }
 
@@ -65,13 +149,17 @@ impl QueryPlan {
         let search_request = self.to_search_request();
 
         // Determine which execution strategy would be chosen
-        let execution_strategy = if self.selects_all_columns {
+        let execution_strategy = if self.grouped_sql.is_some() {
+            "tantivy_grouped_partials"
+        } else if self.selects_all_columns {
             "materialized_hits_fallback"
         } else {
             "tantivy_fast_fields"
         };
 
-        let strategy_reason = if self.selects_all_columns {
+        let strategy_reason = if self.grouped_sql.is_some() {
+            "Eligible GROUP BY query can execute as shard-local grouped partial aggregation"
+        } else if self.selects_all_columns {
             "SELECT * requires _source materialization; fast-field path unavailable"
         } else {
             "All projected columns can be read from Tantivy fast fields"
@@ -101,7 +189,37 @@ impl QueryPlan {
         stages.push(tantivy_stage);
 
         // Stage 2: Column extraction
-        if !self.selects_all_columns {
+        if let Some(grouped_sql) = &self.grouped_sql {
+            stages.push(serde_json::json!({
+                "stage": 2,
+                "name": "grouped_partial_collect",
+                "description": "Compute grouped partial metrics on each shard using Tantivy fast fields",
+                "group_by": grouped_sql
+                    .group_columns
+                    .iter()
+                    .map(|column| column.source_name.clone())
+                    .collect::<Vec<_>>(),
+                "metrics": grouped_sql
+                    .metrics
+                    .iter()
+                    .map(|metric| serde_json::json!({
+                        "output": metric.output_name,
+                        "function": format!("{:?}", metric.function).to_lowercase(),
+                        "field": metric.field,
+                    }))
+                    .collect::<Vec<_>>(),
+            }));
+            stages.push(serde_json::json!({
+                "stage": 3,
+                "name": "grouped_partial_merge",
+                "description": "Merge compact grouped partial states at the coordinator",
+            }));
+            stages.push(serde_json::json!({
+                "stage": 4,
+                "name": "final_grouped_sql_shape",
+                "description": "Apply final projection and ordering to merged grouped results",
+            }));
+        } else if !self.selects_all_columns {
             stages.push(serde_json::json!({
                 "stage": 2,
                 "name": "fast_field_read",
@@ -116,30 +234,32 @@ impl QueryPlan {
             }));
         }
 
-        // Stage 3: Arrow batch building
-        stages.push(serde_json::json!({
-            "stage": 3,
-            "name": "arrow_batch",
-            "description": "Build Arrow RecordBatch from extracted columns with score column",
-        }));
+        if self.grouped_sql.is_none() {
+            // Stage 3: Arrow batch building
+            stages.push(serde_json::json!({
+                "stage": 3,
+                "name": "arrow_batch",
+                "description": "Build Arrow RecordBatch from extracted columns with score column",
+            }));
 
-        // Stage 4: DataFusion SQL execution
-        let mut datafusion_stage = serde_json::json!({
-            "stage": 4,
-            "name": "datafusion_sql",
-            "description": "Execute rewritten SQL over Arrow batches for projection, sorting, and aggregation",
-            "rewritten_sql": self.rewritten_sql,
-        });
-        if self.has_residual_predicates {
-            datafusion_stage["residual_predicates"] = serde_json::json!(true);
-            datafusion_stage["residual_note"] = serde_json::json!(
-                "Some predicates could not be pushed into Tantivy and will be evaluated by DataFusion"
-            );
+            // Stage 4: DataFusion SQL execution
+            let mut datafusion_stage = serde_json::json!({
+                "stage": 4,
+                "name": "datafusion_sql",
+                "description": "Execute rewritten SQL over Arrow batches for projection, sorting, and aggregation",
+                "rewritten_sql": self.rewritten_sql,
+            });
+            if self.has_residual_predicates {
+                datafusion_stage["residual_predicates"] = serde_json::json!(true);
+                datafusion_stage["residual_note"] = serde_json::json!(
+                    "Some predicates could not be pushed into Tantivy and will be evaluated by DataFusion"
+                );
+            }
+            if !self.group_by_columns.is_empty() {
+                datafusion_stage["group_by"] = serde_json::json!(self.group_by_columns);
+            }
+            stages.push(datafusion_stage);
         }
-        if !self.group_by_columns.is_empty() {
-            datafusion_stage["group_by"] = serde_json::json!(self.group_by_columns);
-        }
-        stages.push(datafusion_stage);
 
         serde_json::json!({
             "original_sql": self.original_sql,
@@ -159,6 +279,7 @@ impl QueryPlan {
                 "required": self.required_columns,
                 "group_by": self.group_by_columns,
                 "selects_all": self.selects_all_columns,
+                "uses_grouped_partials": self.grouped_sql.is_some(),
             },
             "rewritten_sql": self.rewritten_sql,
             "pipeline": stages,
@@ -202,6 +323,14 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     rewrite_table_name(select);
     let required_columns = collect_required_columns(select, order_by.as_ref());
     let group_by_columns = collect_group_by_columns(select);
+    let grouped_sql = extract_grouped_sql_plan(
+        select,
+        order_by.as_ref(),
+        has_residual_predicates,
+        selects_all_columns,
+        sql,
+        &group_by_columns,
+    )?;
 
     Ok(QueryPlan {
         index_name: index_name.to_string(),
@@ -213,7 +342,192 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         group_by_columns,
         has_residual_predicates,
         selects_all_columns,
+        grouped_sql,
     })
+}
+
+fn extract_grouped_sql_plan(
+    select: &Select,
+    order_by: Option<&sqlparser::ast::OrderBy>,
+    has_residual_predicates: bool,
+    selects_all_columns: bool,
+    original_sql: &str,
+    group_by_columns: &[String],
+) -> Result<Option<GroupedSqlPlan>> {
+    if group_by_columns.is_empty()
+        || has_residual_predicates
+        || selects_all_columns
+        || select.having.is_some()
+        || contains_limit_or_offset(original_sql)
+    {
+        return Ok(None);
+    }
+
+    let mut group_columns = Vec::new();
+    let mut metrics = Vec::new();
+
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                if let Some(source_name) = expr_to_field_name(expr)
+                    && group_by_columns.iter().any(|column| column == &source_name)
+                {
+                    group_columns.push(SqlGroupColumn {
+                        source_name: source_name.clone(),
+                        output_name: source_name,
+                    });
+                    continue;
+                }
+
+                if let Some(metric) = parse_grouped_metric(expr, None)? {
+                    metrics.push(metric);
+                    continue;
+                }
+                return Ok(None);
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if let Some(source_name) = expr_to_field_name(expr)
+                    && group_by_columns.iter().any(|column| column == &source_name)
+                {
+                    group_columns.push(SqlGroupColumn {
+                        source_name,
+                        output_name: alias.value.clone(),
+                    });
+                    continue;
+                }
+
+                if let Some(metric) = parse_grouped_metric(expr, Some(alias.value.clone()))? {
+                    metrics.push(metric);
+                    continue;
+                }
+                return Ok(None);
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return Ok(None),
+        }
+    }
+
+    if metrics.is_empty() {
+        return Ok(None);
+    }
+
+    let mut valid_names: HashMap<String, String> = HashMap::new();
+    for column in &group_columns {
+        valid_names.insert(column.source_name.clone(), column.output_name.clone());
+        valid_names.insert(column.output_name.clone(), column.output_name.clone());
+    }
+    for metric in &metrics {
+        valid_names.insert(metric.output_name.clone(), metric.output_name.clone());
+    }
+
+    let mut order_items = Vec::new();
+    if let Some(order_by) = order_by {
+        match &order_by.kind {
+            OrderByKind::Expressions(exprs) => {
+                for expr in exprs {
+                    let Some(name) = expr_to_field_name(&expr.expr) else {
+                        return Ok(None);
+                    };
+                    let Some(output_name) = valid_names.get(&name).cloned() else {
+                        return Ok(None);
+                    };
+                    order_items.push(SqlOrderBy {
+                        output_name,
+                        desc: expr.options.asc == Some(false),
+                    });
+                }
+            }
+            OrderByKind::All(_) => return Ok(None),
+        }
+    }
+
+    Ok(Some(GroupedSqlPlan {
+        group_columns,
+        metrics,
+        order_by: order_items,
+    }))
+}
+
+fn parse_grouped_metric(expr: &Expr, alias: Option<String>) -> Result<Option<SqlGroupedMetric>> {
+    let Expr::Function(function) = expr else {
+        return Ok(None);
+    };
+
+    let args = match &function.args {
+        FunctionArguments::List(list) => &list.args,
+        _ => return Ok(None),
+    };
+    let function_name = function.name.to_string();
+    let normalized = function_name.to_ascii_lowercase();
+
+    let (function, field, default_name) = match normalized.as_str() {
+        "count" => {
+            if args.len() != 1 {
+                return Ok(None);
+            }
+            match &args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                    (SqlGroupedMetricFunction::Count, None, "count".to_string())
+                }
+                FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {
+                    return Ok(None);
+                }
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    let Some(field) = expr_to_field_name(expr) else {
+                        return Ok(None);
+                    };
+                    (
+                        SqlGroupedMetricFunction::Count,
+                        Some(field.clone()),
+                        format!("count_{field}"),
+                    )
+                }
+                _ => return Ok(None),
+            }
+        }
+        "sum" | "avg" | "min" | "max" => {
+            if args.len() != 1 {
+                return Ok(None);
+            }
+            let field = match &args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr_to_field_name(expr),
+                FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
+                    if let FunctionArgExpr::Expr(expr) = arg {
+                        expr_to_field_name(expr)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let Some(field) = field else {
+                return Ok(None);
+            };
+            let function = match normalized.as_str() {
+                "sum" => SqlGroupedMetricFunction::Sum,
+                "avg" => SqlGroupedMetricFunction::Avg,
+                "min" => SqlGroupedMetricFunction::Min,
+                "max" => SqlGroupedMetricFunction::Max,
+                _ => unreachable!(),
+            };
+            (
+                function,
+                Some(field.clone()),
+                format!("{}_{}", normalized, field),
+            )
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(SqlGroupedMetric {
+        output_name: alias.unwrap_or(default_name),
+        function,
+        field,
+    }))
+}
+
+fn contains_limit_or_offset(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    lower.contains(" limit ") || lower.contains(" offset ")
 }
 
 fn extract_single_table(select: &Select) -> Result<String> {

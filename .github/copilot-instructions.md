@@ -83,7 +83,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 475 unit tests + 30 consensus integration + 39 replication integration + 8 REST API integration = 552 total
+- 480 unit tests + 30 consensus integration + 39 replication integration + 8 REST API integration = 557 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -577,9 +577,9 @@ If you add a hybrid execution path that mixes full-text search with SQL-style pr
 - The target architecture is a true hybrid planner: Tantivy executes search-native work first, shard-local partials are produced where possible, and DataFusion finishes only the remaining relational semantics.
 
 ### What To Move Next
-- Push grouped partial aggregation into shard-local Tantivy collectors before coordinator merge
 - Keep DataFusion as the residual/final relational executor after Tantivy pushdown, fast-field reads, and shard-local partial execution
 - Reduce fallback to materialized hits to only the cases that require unsupported expressions, wildcard projection, or unavailable columnar data
+- Extend aggregate pushdown beyond the current grouped partial path (`count`, `min`, `max`, `sum`, `avg` for more eligible shapes)
 - Treat `materialized_hits_fallback` as a compatibility path, not the target architecture
 
 ### Critical Invariants

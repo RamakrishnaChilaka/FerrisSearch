@@ -16,6 +16,7 @@ pub(crate) struct DistributedDslSearchResult {
     pub successful_shards: u32,
     pub failed_shards: u32,
     pub aggregations: HashMap<String, Value>,
+    pub partial_aggs: Vec<HashMap<String, crate::search::PartialAggResult>>,
 }
 
 pub(crate) fn ensure_local_index_shards_open(
@@ -1287,7 +1288,7 @@ pub(crate) async fn execute_distributed_dsl_search(
     crate::search::sort_hits(&mut all_hits, &search_req.sort);
 
     let merged_aggs = if !all_partial_aggs.is_empty() {
-        crate::search::merge_aggregations(all_partial_aggs, &search_req.aggs)
+        crate::search::merge_aggregations(all_partial_aggs.clone(), &search_req.aggs)
     } else {
         HashMap::new()
     };
@@ -1298,6 +1299,7 @@ pub(crate) async fn execute_distributed_dsl_search(
         successful_shards: successful,
         failed_shards: failed,
         aggregations: merged_aggs,
+        partial_aggs: all_partial_aggs,
     })
 }
 

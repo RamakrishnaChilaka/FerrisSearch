@@ -238,6 +238,58 @@ pub async fn search_sql(
             );
         }
     };
+
+    if plan.uses_grouped_partials() {
+        let distributed = match crate::api::index::execute_distributed_dsl_search(
+            &state,
+            &index_name,
+            &search_req,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => return err,
+        };
+
+        let sql_result =
+            match crate::hybrid::execute_grouped_partial_sql(&plan, &distributed.partial_aggs) {
+                Ok(result) => result,
+                Err(error) => {
+                    return crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "sql_execution_exception",
+                        error,
+                    );
+                }
+            };
+
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "execution_mode": "tantivy_grouped_partials",
+                "planner": {
+                    "text_match": plan.text_match.as_ref().map(|text_match| serde_json::json!({
+                        "field": text_match.field,
+                        "query": text_match.query,
+                    })),
+                    "pushed_down_filters": plan.pushed_filters,
+                    "group_by_columns": plan.group_by_columns,
+                    "required_columns": plan.required_columns,
+                    "has_residual_predicates": plan.has_residual_predicates,
+                    "uses_grouped_partials": true,
+                },
+                "_shards": {
+                    "total": distributed.successful_shards + distributed.failed_shards,
+                    "successful": distributed.successful_shards,
+                    "failed": distributed.failed_shards
+                },
+                "matched_hits": distributed.total_hits,
+                "columns": sql_result.columns,
+                "rows": sql_result.rows
+            })),
+        );
+    }
+
     let local_shards = crate::api::index::ensure_local_index_shards_open(
         &state,
         &index_name,
@@ -512,9 +564,10 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["execution_mode"], "tantivy_fast_fields");
+        assert_eq!(body["execution_mode"], "tantivy_grouped_partials");
         assert_eq!(body["planner"]["group_by_columns"], json!(["brand"]));
         assert_eq!(body["planner"]["has_residual_predicates"], json!(false));
+        assert_eq!(body["planner"]["uses_grouped_partials"], json!(true));
         assert_eq!(body["matched_hits"], 3);
     }
 
@@ -552,7 +605,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["index"], "products");
-        assert_eq!(body["execution_strategy"], "tantivy_fast_fields");
+        assert_eq!(body["execution_strategy"], "tantivy_grouped_partials");
         assert_eq!(
             body["pushdown_summary"]["text_match"]["field"],
             "description"
@@ -563,7 +616,9 @@ mod tests {
         let pipeline = body["pipeline"].as_array().unwrap();
         assert_eq!(pipeline.len(), 4);
         assert_eq!(pipeline[0]["name"], "tantivy_search");
-        assert_eq!(pipeline[3]["name"], "datafusion_sql");
+        assert_eq!(pipeline[1]["name"], "grouped_partial_collect");
+        assert_eq!(pipeline[2]["name"], "grouped_partial_merge");
+        assert_eq!(pipeline[3]["name"], "final_grouped_sql_shape");
 
         // Should NOT have rows/matched_hits — explain doesn't execute
         assert!(body.get("rows").is_none());

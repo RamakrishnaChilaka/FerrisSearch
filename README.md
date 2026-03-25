@@ -263,11 +263,12 @@ Current behavior:
 - simple `=`, `>`, `>=`, `<`, `<=` predicates on structured fields are pushed into Tantivy filters
 - `score` is exposed as a normal SQL column
 - projection, `ORDER BY score`, `avg(field)`, `count(*)`, and `GROUP BY` are supported
-- when all shards for the target index are local and the query does not use `SELECT *`, SQL reads Tantivy fast fields directly and returns `"execution_mode": "tantivy_fast_fields"`
+- eligible `GROUP BY` queries with shard-local grouped partial execution return `"execution_mode": "tantivy_grouped_partials"`
+- when all shards for the target index are local and the query does not use `SELECT *`, non-grouped SQL reads Tantivy fast fields directly and returns `"execution_mode": "tantivy_fast_fields"`
 - cross-node or wildcard-projection queries fall back to the compatibility path and return `"execution_mode": "materialized_hits_fallback"`
 - responses include a `planner` section showing pushed-down filters, grouping columns, required columns, and whether residual SQL predicates remained
 
-> **Current limitations:** the SQL layer is already search-aware, but it is not yet a fully distributed partial SQL engine. Cross-node grouped partial execution and richer search-native SQL functions are still roadmap items.
+> **Current limitations:** the SQL layer now supports distributed grouped partial execution for eligible `GROUP BY` queries, but it is not yet a complete distributed partial SQL engine. The remaining roadmap is focused on deeper planner pushdown, stronger type/null fidelity, richer SQL semantics, and better execution diagnostics.
 
 ```bash
 # Explain a SQL plan without executing it
@@ -286,9 +287,9 @@ curl -X POST 'http://localhost:9200/products/_sql/explain' \
   "index": "products",
   "original_sql": "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') AND price > 500 GROUP BY brand ORDER BY total DESC",
   "rewritten_sql": "SELECT brand, count(*) AS total FROM matched_rows GROUP BY brand ORDER BY total DESC",
-  "execution_strategy": "tantivy_fast_fields",
-  "strategy_reason": "All projected columns can be read from Tantivy fast fields",
-  "columns": { "required": ["brand", "price"], "group_by": ["brand"], "selects_all": false },
+  "execution_strategy": "tantivy_grouped_partials",
+  "strategy_reason": "Eligible GROUP BY query can execute as shard-local grouped partial aggregation",
+  "columns": { "required": ["brand", "price"], "group_by": ["brand"], "selects_all": false, "uses_grouped_partials": true },
   "pushdown_summary": {
     "text_match": { "field": "description", "query": "iphone" },
     "pushed_filter_count": 1,
@@ -297,9 +298,9 @@ curl -X POST 'http://localhost:9200/products/_sql/explain' \
   },
   "pipeline": [
     { "stage": 1, "name": "tantivy_search", "description": "Execute search query in Tantivy to collect matching doc IDs and scores" },
-    { "stage": 2, "name": "fast_field_read", "columns": ["brand", "price"], "description": "Read required columns directly from Tantivy fast fields (columnar storage)" },
-    { "stage": 3, "name": "arrow_batch", "description": "Build Arrow RecordBatch from extracted columns with score column" },
-    { "stage": 4, "name": "datafusion_sql", "rewritten_sql": "SELECT brand, count(*) AS total FROM matched_rows GROUP BY brand ORDER BY total DESC", "description": "Execute rewritten SQL over Arrow batches for projection, sorting, and aggregation" }
+    { "stage": 2, "name": "grouped_partial_collect", "description": "Compute grouped partial metrics on each shard using Tantivy fast fields" },
+    { "stage": 3, "name": "grouped_partial_merge", "description": "Merge compact grouped partial states at the coordinator" },
+    { "stage": 4, "name": "final_grouped_sql_shape", "description": "Apply final projection and ordering to merged grouped results" }
   ]
 }
 ```
@@ -333,7 +334,7 @@ Example response shape:
 
 ```json
 {
-  "execution_mode": "tantivy_fast_fields",
+  "execution_mode": "tantivy_grouped_partials",
   "planner": {
     "text_match": {
       "field": "description",
@@ -371,6 +372,7 @@ Example response shape:
 
 This is the important visibility contract for the current SQL path:
 
+- `execution_mode = "tantivy_grouped_partials"` means the query executed as shard-local grouped partial aggregation with coordinator merge
 - `execution_mode = "tantivy_fast_fields"` means the query stayed on the local fast-field path
 - `execution_mode = "materialized_hits_fallback"` means the compatibility path was used
 - `planner` tells you what work was pushed into Tantivy before residual SQL execution
@@ -557,8 +559,8 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 552 tests
-cargo test --lib                                # Unit tests (475)
+cargo test                                      # All 557 tests
+cargo test --lib                                # Unit tests (480)
 cargo test --test consensus_integration          # Raft consensus tests (30)
 cargo test --test replication_integration        # Replication tests (39)
 cargo test --test rest_api_integration           # REST API tests (8)
@@ -661,10 +663,21 @@ config/            Default configuration
 - [x] `GROUP BY` over matched docs
 - [x] Planner metadata in SQL responses (`planner`, `execution_mode`)
 - [x] Local fast-field SQL path (`tantivy_fast_fields`)
+- [x] Distributed grouped partial SQL path (`tantivy_grouped_partials`)
 - [x] Compatibility fallback path (`materialized_hits_fallback`)
 - [x] `EXPLAIN` for SQL plans (`POST /{index}/_sql/explain`)
-- [ ] Distributed partial aggregates over matched docs
+- [x] Distributed shard-local partial aggregates over matched docs
+- [x] Coordinator merge of compact grouped partial states
+- [ ] Aggregate pushdown for fast-field-eligible `count(*)`, `min`, `max`, `sum`, `avg`
+- [ ] Search-aware `ORDER BY` / `LIMIT` pushdown on sortable fast fields
+- [ ] Broader predicate pushdown (`IN`, `BETWEEN`, more bool combinations)
+- [ ] Stronger Arrow type fidelity across fast-field and fallback SQL paths
+- [ ] Explicit SQL null semantics (`IS NULL`, `IS NOT NULL`) on matched docs
+- [ ] `HAVING` support after grouped execution
+- [ ] More robust alias handling in `ORDER BY`, `GROUP BY`, and `HAVING`
+- [ ] `EXPLAIN ANALYZE` with runtime timings and fallback reasons
 - [ ] Search-native SQL functions beyond `text_match` / `score`
+- [ ] Search-aware histogram and date-bucketing style SQL analytics
 
 ### Search & Query
 - [x] Pagination support (`from` / `size` parameters)
@@ -751,7 +764,7 @@ FerrisSearch today is best described as:
 - a hybrid vector + full-text retrieval system
 - a search-aware SQL engine over matched docs
 
-It is not yet a fully distributed partial SQL engine. The current SQL path already performs real pushdown and local fast-field execution where possible, but distributed grouped partial execution is still a roadmap item.
+It is not yet a fully distributed partial SQL engine. The current SQL path already performs real pushdown, distributed grouped partial execution for eligible `GROUP BY` queries, and local fast-field execution where possible.
 
 ## License
 

@@ -88,11 +88,12 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 - `POST /{index}/_sql` must remain coordinator-safe like other search endpoints.
 - `POST /{index}/_sql/explain` returns the query plan without executing it — validates SQL, shows pushdown decisions, execution strategy, rewritten SQL, and the full pipeline stages.
 - Responses include an `execution_mode` field:
+    - `tantivy_grouped_partials` when an eligible `GROUP BY` query executes as shard-local grouped partial aggregation with coordinator merge
     - `tantivy_fast_fields` when the query runs from local shard fast fields without materializing full hits first
     - `materialized_hits_fallback` when SQL runs over gathered hits for compatibility
 - Responses include a `planner` object showing pushed-down text match, structured filters, grouping columns, required columns, and whether residual predicates remained.
 - Future SQL work should preserve these fields so manual testing can confirm whether a query stayed on the intended search-aware path.
-- API docs and responses should make it clear that `materialized_hits_fallback` is a compatibility mode, while `tantivy_fast_fields` reflects the intended search-aware local fast-field path.
+- API docs and responses should make it clear that `materialized_hits_fallback` is a compatibility mode, while `tantivy_grouped_partials` and `tantivy_fast_fields` reflect the intended search-aware execution paths.
 
 ### Maintenance — src/api/index.rs
 | HTTP | Path | Handler |
