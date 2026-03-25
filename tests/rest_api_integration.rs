@@ -531,8 +531,9 @@ async fn rest_sql_uses_tantivy_fast_fields_for_supported_query() -> Result<()> {
         .await?;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(body["execution_mode"], json!("tantivy_grouped_partials"));
     assert_eq!(body["planner"]["group_by_columns"], json!(["brand"]));
+    assert_eq!(body["planner"]["uses_grouped_partials"], json!(true));
     assert_eq!(body["matched_hits"], json!(3));
     Ok(())
 }

@@ -61,6 +61,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 ## Testing Expectations
 - Add unit tests for pushdown extraction, quoted index handling, grouped analytics planning, and residual predicate detection.
 - Add execution tests for both:
+  - `tantivy_grouped_partials`
   - `tantivy_fast_fields`
   - `materialized_hits_fallback`
 - Add regression tests for zero-result or all-null columns: verify that schema-derived `type_hints` override `infer_column_kind` to produce correct Arrow DataTypes (e.g. Float64, not Utf8 for numeric columns).

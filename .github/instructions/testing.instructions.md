@@ -1,11 +1,11 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **475 unit tests** (`cargo test --lib`)
+- **480 unit tests** (`cargo test --lib`)
 - **30 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
 - **8 REST API integration tests** (`cargo test --test rest_api_integration`)
-- **552 total** (`cargo test`)
+- **557 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -62,6 +62,7 @@ cargo test -- test_name                         # Single test by name
 	- residual predicate detection
 - For direct fast-field execution changes, add tests that assert eligible queries use fast-field readers without requiring `_source` materialization.
 - For API-level SQL changes, validate both execution modes where practical:
+	- `tantivy_grouped_partials` for eligible grouped SQL queries over matched docs
 	- `tantivy_fast_fields` for local non-`SELECT *` queries with columnar access
 	- `materialized_hits_fallback` for wildcard projection or distributed compatibility paths
 - Live tests should inspect the `planner` and `execution_mode` fields, not just the returned rows.

@@ -920,6 +920,35 @@ enum SqlFieldReader {
     SourceFallback,
 }
 
+impl SqlFieldReader {
+    fn first_json(&self, doc: tantivy::DocId) -> serde_json::Value {
+        match self {
+            SqlFieldReader::F64(reader) => reader
+                .first(doc)
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+            SqlFieldReader::I64(reader) => reader
+                .first(doc)
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+            SqlFieldReader::Str(reader) => {
+                let mut ords = reader.term_ords(doc);
+                if let Some(ord) = ords.next() {
+                    let mut text = String::new();
+                    if reader.ord_to_str(ord, &mut text).unwrap_or(false) {
+                        serde_json::Value::String(text)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            SqlFieldReader::SourceFallback => serde_json::Value::Null,
+        }
+    }
+}
+
 fn open_sql_field_reader(
     schema: &Schema,
     fast_fields: &tantivy::fastfield::FastFieldReaders,
@@ -944,6 +973,371 @@ fn open_sql_field_reader(
             .flatten()
             .map(SqlFieldReader::Str)
             .unwrap_or(SqlFieldReader::SourceFallback),
+    }
+}
+
+struct ResolvedGroupedAggSpec {
+    name: String,
+    group_by: Vec<String>,
+    metrics: Vec<ResolvedGroupedMetricSpec>,
+}
+
+struct ResolvedGroupedMetricSpec {
+    output_name: String,
+    function: crate::search::GroupedMetricFunction,
+    field_name: Option<String>,
+}
+
+enum GroupedMetricSource {
+    CountAll,
+    CountField(SqlFieldReader),
+    Numeric(NumCol),
+}
+
+struct GroupedMetricEntry {
+    output_name: String,
+    function: crate::search::GroupedMetricFunction,
+    source: GroupedMetricSource,
+}
+
+struct GroupedAggSegmentEntry {
+    group_readers: Vec<SqlFieldReader>,
+    metric_entries: Vec<GroupedMetricEntry>,
+    buckets: std::collections::HashMap<String, crate::search::GroupedMetricsBucket>,
+}
+
+pub(crate) struct GroupedAggCollector {
+    specs: Vec<ResolvedGroupedAggSpec>,
+    schema: Schema,
+}
+
+pub(crate) struct GroupedAggSegmentCollector {
+    entries: Vec<(String, Option<GroupedAggSegmentEntry>)>,
+}
+
+impl GroupedAggCollector {
+    fn has_grouped_metrics(
+        aggs: &std::collections::HashMap<String, crate::search::AggregationRequest>,
+    ) -> bool {
+        aggs.values()
+            .any(|agg| matches!(agg, crate::search::AggregationRequest::GroupedMetrics(_)))
+    }
+
+    fn from_request(
+        aggs: &std::collections::HashMap<String, crate::search::AggregationRequest>,
+        schema: Schema,
+    ) -> Self {
+        let specs = aggs
+            .iter()
+            .filter_map(|(name, req)| match req {
+                crate::search::AggregationRequest::GroupedMetrics(params) => {
+                    Some(ResolvedGroupedAggSpec {
+                        name: name.clone(),
+                        group_by: params.group_by.clone(),
+                        metrics: params
+                            .metrics
+                            .iter()
+                            .map(|metric| ResolvedGroupedMetricSpec {
+                                output_name: metric.output_name.clone(),
+                                function: metric.function.clone(),
+                                field_name: metric.field.clone(),
+                            })
+                            .collect(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        Self { specs, schema }
+    }
+}
+
+impl tantivy::collector::Collector for GroupedAggCollector {
+    type Fruit = std::collections::HashMap<String, crate::search::PartialAggResult>;
+    type Child = GroupedAggSegmentCollector;
+
+    fn for_segment(
+        &self,
+        _seg_id: u32,
+        segment: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        let ff = segment.fast_fields();
+        let mut entries = Vec::with_capacity(self.specs.len());
+
+        for spec in &self.specs {
+            let group_readers: Vec<SqlFieldReader> = spec
+                .group_by
+                .iter()
+                .map(|field| open_sql_field_reader(&self.schema, ff, field))
+                .collect();
+
+            if group_readers
+                .iter()
+                .any(|reader| matches!(reader, SqlFieldReader::SourceFallback))
+            {
+                entries.push((spec.name.clone(), None));
+                continue;
+            }
+
+            let mut metric_entries = Vec::with_capacity(spec.metrics.len());
+            let mut unsupported = false;
+            for metric in &spec.metrics {
+                let source = match metric.function {
+                    crate::search::GroupedMetricFunction::Count => match &metric.field_name {
+                        None => GroupedMetricSource::CountAll,
+                        Some(field_name) => {
+                            let reader = open_sql_field_reader(&self.schema, ff, field_name);
+                            if matches!(reader, SqlFieldReader::SourceFallback) {
+                                unsupported = true;
+                                break;
+                            }
+                            GroupedMetricSource::CountField(reader)
+                        }
+                    },
+                    crate::search::GroupedMetricFunction::Sum
+                    | crate::search::GroupedMetricFunction::Avg
+                    | crate::search::GroupedMetricFunction::Min
+                    | crate::search::GroupedMetricFunction::Max => {
+                        let Some(field_name) = &metric.field_name else {
+                            unsupported = true;
+                            break;
+                        };
+                        let Some(column) = open_num_col(&self.schema, ff, field_name) else {
+                            unsupported = true;
+                            break;
+                        };
+                        GroupedMetricSource::Numeric(column)
+                    }
+                };
+                metric_entries.push(GroupedMetricEntry {
+                    output_name: metric.output_name.clone(),
+                    function: metric.function.clone(),
+                    source,
+                });
+            }
+
+            if unsupported {
+                entries.push((spec.name.clone(), None));
+                continue;
+            }
+
+            entries.push((
+                spec.name.clone(),
+                Some(GroupedAggSegmentEntry {
+                    group_readers,
+                    metric_entries,
+                    buckets: std::collections::HashMap::new(),
+                }),
+            ));
+        }
+
+        Ok(GroupedAggSegmentCollector { entries })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<Vec<(String, Vec<crate::search::GroupedMetricsBucket>)>>,
+    ) -> tantivy::Result<Self::Fruit> {
+        let mut merged: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, crate::search::GroupedMetricsBucket>,
+        > = std::collections::HashMap::new();
+
+        for fruit in segment_fruits {
+            for (name, buckets) in fruit {
+                let agg_buckets = merged.entry(name).or_default();
+                for bucket in buckets {
+                    let key = serde_json::to_string(&bucket.group_values).unwrap_or_default();
+                    let target = agg_buckets.entry(key).or_insert_with(|| {
+                        crate::search::GroupedMetricsBucket {
+                            group_values: bucket.group_values.clone(),
+                            metrics: std::collections::HashMap::new(),
+                        }
+                    });
+                    merge_grouped_bucket_metrics(target, &bucket);
+                }
+            }
+        }
+
+        let mut results = std::collections::HashMap::new();
+        for spec in &self.specs {
+            let mut buckets = merged
+                .remove(&spec.name)
+                .unwrap_or_default()
+                .into_values()
+                .collect::<Vec<_>>();
+            buckets.sort_by(|left, right| {
+                serde_json::to_string(&left.group_values)
+                    .unwrap_or_default()
+                    .cmp(&serde_json::to_string(&right.group_values).unwrap_or_default())
+            });
+            results.insert(
+                spec.name.clone(),
+                crate::search::PartialAggResult::GroupedMetrics { buckets },
+            );
+        }
+        Ok(results)
+    }
+}
+
+impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
+    type Fruit = Vec<(String, Vec<crate::search::GroupedMetricsBucket>)>;
+
+    fn collect(&mut self, doc: tantivy::DocId, _score: tantivy::Score) {
+        for (_, maybe_entry) in &mut self.entries {
+            let Some(entry) = maybe_entry else {
+                continue;
+            };
+
+            let group_values: Vec<serde_json::Value> = entry
+                .group_readers
+                .iter()
+                .map(|reader| reader.first_json(doc))
+                .collect();
+            let key = serde_json::to_string(&group_values).unwrap_or_default();
+
+            let bucket =
+                entry
+                    .buckets
+                    .entry(key)
+                    .or_insert_with(|| crate::search::GroupedMetricsBucket {
+                        group_values: group_values.clone(),
+                        metrics: std::collections::HashMap::new(),
+                    });
+
+            for metric in &entry.metric_entries {
+                match (&metric.function, &metric.source) {
+                    (
+                        crate::search::GroupedMetricFunction::Count,
+                        GroupedMetricSource::CountAll,
+                    ) => {
+                        let target = bucket
+                            .metrics
+                            .entry(metric.output_name.clone())
+                            .or_insert(crate::search::GroupedMetricPartial::Count { count: 0 });
+                        if let crate::search::GroupedMetricPartial::Count { count } = target {
+                            *count += 1;
+                        }
+                    }
+                    (
+                        crate::search::GroupedMetricFunction::Count,
+                        GroupedMetricSource::CountField(reader),
+                    ) => {
+                        if !reader.first_json(doc).is_null() {
+                            let target = bucket
+                                .metrics
+                                .entry(metric.output_name.clone())
+                                .or_insert(crate::search::GroupedMetricPartial::Count { count: 0 });
+                            if let crate::search::GroupedMetricPartial::Count { count } = target {
+                                *count += 1;
+                            }
+                        }
+                    }
+                    (
+                        crate::search::GroupedMetricFunction::Sum
+                        | crate::search::GroupedMetricFunction::Avg
+                        | crate::search::GroupedMetricFunction::Min
+                        | crate::search::GroupedMetricFunction::Max,
+                        GroupedMetricSource::Numeric(column),
+                    ) => {
+                        let Some(value) = column.first_f64(doc) else {
+                            continue;
+                        };
+                        let target = bucket.metrics.entry(metric.output_name.clone()).or_insert(
+                            crate::search::GroupedMetricPartial::Stats {
+                                count: 0,
+                                sum: 0.0,
+                                min: f64::INFINITY,
+                                max: f64::NEG_INFINITY,
+                            },
+                        );
+                        if let crate::search::GroupedMetricPartial::Stats {
+                            count,
+                            sum,
+                            min,
+                            max,
+                        } = target
+                        {
+                            *count += 1;
+                            *sum += value;
+                            if value < *min {
+                                *min = value;
+                            }
+                            if value > *max {
+                                *max = value;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        self.entries
+            .into_iter()
+            .filter_map(|(name, maybe_entry)| {
+                maybe_entry.map(|entry| (name, entry.buckets.into_values().collect()))
+            })
+            .collect()
+    }
+}
+
+fn merge_grouped_bucket_metrics(
+    target: &mut crate::search::GroupedMetricsBucket,
+    source: &crate::search::GroupedMetricsBucket,
+) {
+    for (metric_name, incoming) in &source.metrics {
+        match incoming {
+            crate::search::GroupedMetricPartial::Count { count } => {
+                let entry = target
+                    .metrics
+                    .entry(metric_name.clone())
+                    .or_insert(crate::search::GroupedMetricPartial::Count { count: 0 });
+                if let crate::search::GroupedMetricPartial::Count {
+                    count: merged_count,
+                } = entry
+                {
+                    *merged_count += count;
+                }
+            }
+            crate::search::GroupedMetricPartial::Stats {
+                count,
+                sum,
+                min,
+                max,
+            } => {
+                let entry = target.metrics.entry(metric_name.clone()).or_insert(
+                    crate::search::GroupedMetricPartial::Stats {
+                        count: 0,
+                        sum: 0.0,
+                        min: f64::INFINITY,
+                        max: f64::NEG_INFINITY,
+                    },
+                );
+                if let crate::search::GroupedMetricPartial::Stats {
+                    count: merged_count,
+                    sum: merged_sum,
+                    min: merged_min,
+                    max: merged_max,
+                } = entry
+                {
+                    *merged_count += count;
+                    *merged_sum += sum;
+                    if *min < *merged_min {
+                        *merged_min = *min;
+                    }
+                    if *max > *merged_max {
+                        *merged_max = *max;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1136,7 +1530,7 @@ impl AggCollector {
         use crate::search::AggregationRequest;
         let specs = aggs
             .iter()
-            .map(|(name, req)| {
+            .filter_map(|(name, req)| {
                 let (field_name, kind) = match req {
                     AggregationRequest::Stats(p) => (p.field.clone(), AggKind::Stats),
                     AggregationRequest::Min(p) => (p.field.clone(), AggKind::Min),
@@ -1151,12 +1545,13 @@ impl AggCollector {
                         },
                     ),
                     AggregationRequest::Terms(p) => (p.field.clone(), AggKind::Terms),
+                    AggregationRequest::GroupedMetrics(_) => return None,
                 };
-                ResolvedAggSpec {
+                Some(ResolvedAggSpec {
                     name: name.clone(),
                     field_name,
                     kind,
-                }
+                })
             })
             .collect();
         Self { specs, schema }
@@ -1571,6 +1966,28 @@ impl super::SearchEngine for HotEngine {
         let query = self.build_query(&req.query)?;
         let effective_limit = if limit == 0 { 1 } else { limit };
 
+        if GroupedAggCollector::has_grouped_metrics(&req.aggs) {
+            let grouped_collector =
+                GroupedAggCollector::from_request(&req.aggs, self.index.schema());
+
+            if req.size == 0 {
+                let (partial_aggs, total) =
+                    searcher.search(&*query, &(grouped_collector, Count))?;
+                return Ok((Vec::new(), total, partial_aggs));
+            }
+
+            let (top_docs, partial_aggs, total) = searcher.search(
+                &*query,
+                &(
+                    TopDocs::with_limit(effective_limit),
+                    grouped_collector,
+                    Count,
+                ),
+            )?;
+            let hits = self.collect_hits(&searcher, top_docs)?;
+            return Ok((hits, total, partial_aggs));
+        }
+
         // Build optional aggregation collector (None = zero overhead when no aggs)
         let agg_collector = if !req.aggs.is_empty() {
             Some(AggCollector::from_request(&req.aggs, self.index.schema()))
@@ -1884,6 +2301,88 @@ mod tests {
         assert_eq!(total, 3);
         assert!(partial_aggs.contains_key("top_categories"));
         assert!(partial_aggs.contains_key("price_stats"));
+    }
+
+    #[test]
+    fn size_zero_with_grouped_metrics_returns_grouped_partials() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::{
+            AggregationRequest, GroupedMetricAgg, GroupedMetricFunction, GroupedMetricsAggParams,
+        };
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "brand".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".into(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document(
+                "d1",
+                json!({"brand": "Apple", "price": 999.0, "body": "iphone"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"brand": "Apple", "price": 899.0, "body": "iphone"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d3",
+                json!({"brand": "Samsung", "price": 799.0, "body": "iphone"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Match(HashMap::from([("body".to_string(), json!("iphone"))])),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::from([(
+                "sql_grouped".into(),
+                AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
+                    group_by: vec!["brand".into()],
+                    metrics: vec![
+                        GroupedMetricAgg {
+                            output_name: "total".into(),
+                            function: GroupedMetricFunction::Count,
+                            field: None,
+                        },
+                        GroupedMetricAgg {
+                            output_name: "avg_price".into(),
+                            function: GroupedMetricFunction::Avg,
+                            field: Some("price".into()),
+                        },
+                    ],
+                }),
+            )]),
+        };
+
+        let (hits, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(total, 3);
+
+        let crate::search::PartialAggResult::GroupedMetrics { buckets } =
+            &partial_aggs["sql_grouped"]
+        else {
+            panic!("expected grouped metrics partial");
+        };
+        assert_eq!(buckets.len(), 2);
     }
 
     #[test]
