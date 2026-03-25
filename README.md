@@ -629,6 +629,8 @@ Reproduce with:
 pip install opensearch-py
 python3 scripts/ingest_1gb.py                              # populate 2M docs
 python3 scripts/search_1gb.py --queries 500 --concurrency 4 # run search benchmark
+python3 scripts/sql_1gb.py --suite throughput --queries 100 --explain-sample # bounded-result SQL benchmark
+python3 scripts/sql_1gb.py --suite stress --queries 25      # heavy result-shipping SQL benchmark
 ```
 
 ## Project Structure
