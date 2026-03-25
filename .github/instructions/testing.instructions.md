@@ -1,10 +1,11 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **444 unit tests** (`cargo test --lib`)
-- **29 consensus integration tests** (`cargo test --test consensus_integration`)
-- **38 replication integration tests** (`cargo test --test replication_integration`)
-- **511 total** (`cargo test`)
+- **475 unit tests** (`cargo test --lib`)
+- **30 consensus integration tests** (`cargo test --test consensus_integration`)
+- **39 replication integration tests** (`cargo test --test replication_integration`)
+- **8 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **552 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -12,6 +13,7 @@ cargo test                                      # All tests
 cargo test --lib                                # Unit tests only
 cargo test --test consensus_integration         # Raft consensus tests
 cargo test --test replication_integration       # Replication tests
+cargo test --test rest_api_integration          # REST API integration tests
 cargo test -- test_name                         # Single test by name
 ```
 

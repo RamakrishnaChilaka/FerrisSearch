@@ -63,6 +63,13 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `build_tantivy_doc_inner()` takes `&Schema` to check field types before adding numeric values — prevents indexing `i64` into `f64` fields
 - Tantivy does NOT error on type-mismatched terms — it silently returns 0 results. Always validate.
 
+## Arrow Bridge Type Safety
+- `build_record_batch_with_hints(column_store, type_hints)` uses schema-derived type hints to set correct Arrow column types
+- Without type hints, `infer_column_kind()` scans data values and defaults to `Utf8` for empty/all-null columns — this breaks aggregation functions like `avg()`, `sum()` on zero-result queries
+- The fast-field path (`sql_record_batch`) MUST populate `type_hints` from `SqlFieldReader` variants (F64/I64 → Float64, Str → Utf8) or the Tantivy schema when no segments exist
+- The `materialized_hits_fallback` path uses plain `build_record_batch()` (no hints, data-driven inference only)
+- SELECT aliases must be excluded from `required_columns` — aliases (e.g. `total` from `count(*) AS total`) are not real schema fields and cause `SourceFallback` → Null → Utf8 misclassification
+
 ## Cluster Commands (Raft log entries)
 - `ClusterCommand::AddNode { node: NodeInfo }` — register/update a node in cluster state
 - `ClusterCommand::RemoveNode { node_id: String }` — remove node from cluster + Raft membership
@@ -76,7 +83,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 444 unit tests + 29 consensus integration + 38 replication integration = 511 total
+- 475 unit tests + 30 consensus integration + 39 replication integration + 8 REST API integration = 552 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -260,6 +267,8 @@ if let Some(ref raft) = state.raft {
 |------|------|---------|--------|
 | GET | `/{index}/_search` | `search_documents()` | Query-string search (q=, size, from) |
 | POST | `/{index}/_search` | `search_documents_dsl()` | DSL search (SearchRequest body) |
+| POST | `/{index}/_sql` | `search_sql()` | SQL over matched docs (search-aware planning) |
+| POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan without executing |
 
 ### Maintenance
 | HTTP | Path | Handler | Purpose |

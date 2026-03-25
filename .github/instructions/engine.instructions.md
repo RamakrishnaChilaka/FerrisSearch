@@ -111,7 +111,7 @@ for agg-only `size=0` requests. When no aggs are requested, `None` adds zero ove
 - Direct access patterns already expected in this module:
     - numeric columns: `segment_reader.fast_fields().f64(name)` / `.i64(name)`
     - keyword columns: `segment_reader.fast_fields().str(name)` with `term_ords(doc)` and `ord_to_str()`
-- `sql_record_batch(...)` is the reference pattern for projecting matched docs from fast fields into Arrow without `_source` materialization.
+- `sql_record_batch(...)` is the reference pattern for projecting matched docs from fast fields into Arrow without `_source` materialization. It builds `type_hints` from `SqlFieldReader` variants (F64/I64 → `ColumnKind::Float64`, Str → `ColumnKind::Utf8`) and passes them to `build_record_batch_with_hints()` so that zero-result queries still produce correctly-typed Arrow columns instead of defaulting to Utf8.
 - For grouped analytics over matched docs, prefer shard-local partial aggregation from fast fields and merge compact partials at the coordinator.
 - Fall back to `_source` materialization only for fields or expressions that cannot be read from fast fields or stored fields.
 - Tantivy is the preferred execution engine for search-aware work: pushdown, ranking, field reads, and shard-local partial aggregation should stay here.

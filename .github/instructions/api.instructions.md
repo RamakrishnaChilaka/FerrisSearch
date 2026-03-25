@@ -82,9 +82,11 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | GET | `/{index}/_search` | `search_documents()` — query-string (q=, size, from) |
 | POST | `/{index}/_search` | `search_documents_dsl()` — DSL body (SearchRequest) |
 | POST | `/{index}/_sql` | `search_sql()` — SQL over matched docs with planner metadata and execution mode |
+| POST | `/{index}/_sql/explain` | `explain_sql()` — Explain SQL plan without executing |
 
 ### SQL Endpoint Expectations
 - `POST /{index}/_sql` must remain coordinator-safe like other search endpoints.
+- `POST /{index}/_sql/explain` returns the query plan without executing it — validates SQL, shows pushdown decisions, execution strategy, rewritten SQL, and the full pipeline stages.
 - Responses include an `execution_mode` field:
     - `tantivy_fast_fields` when the query runs from local shard fast fields without materializing full hits first
     - `materialized_hits_fallback` when SQL runs over gathered hits for compatibility

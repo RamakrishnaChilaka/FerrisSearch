@@ -52,9 +52,16 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Say: "search-aware planning", "residual SQL execution", and "grouped analytics over matched docs".
 - Avoid: "SQL over hits" unless you are explicitly describing the compatibility fallback path.
 
+## Arrow Bridge Type Hints
+- `build_record_batch_with_hints(column_store, type_hints)` accepts a `HashMap<String, ColumnKind>` to override data-driven type inference.
+- When building Arrow batches from the fast-field path (`sql_record_batch`), callers MUST populate `type_hints` from `SqlFieldReader` variants or the Tantivy schema so that zero-result queries still produce correctly-typed columns (e.g. Float64 for price) instead of defaulting to Utf8.
+- `infer_column_kind()` (data-driven inference) is only the fallback for columns without a type hint — it defaults to Utf8 when all values are null or the column is empty.
+- The plain `build_record_batch()` (no hints) is used only by the `materialized_hits_fallback` path where schema info is unavailable.
+
 ## Testing Expectations
 - Add unit tests for pushdown extraction, quoted index handling, grouped analytics planning, and residual predicate detection.
 - Add execution tests for both:
   - `tantivy_fast_fields`
   - `materialized_hits_fallback`
+- Add regression tests for zero-result or all-null columns: verify that schema-derived `type_hints` override `infer_column_kind` to produce correct Arrow DataTypes (e.g. Float64, not Utf8 for numeric columns).
 - Live tests should inspect both returned rows and planner metadata.

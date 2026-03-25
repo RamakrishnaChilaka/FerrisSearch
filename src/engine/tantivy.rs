@@ -293,7 +293,43 @@ impl HotEngine {
 
         let column_store =
             crate::hybrid::column_store::ColumnStore::new(ids, scores, projected_columns);
-        let batch = crate::hybrid::arrow_bridge::build_record_batch(&column_store)?;
+
+        // Build type hints from the SqlFieldReader variants so that zero-result
+        // queries still produce correctly-typed Arrow columns (e.g. Float64 for
+        // price) instead of defaulting to Utf8.
+        let mut type_hints = std::collections::HashMap::new();
+        if let Some(first_segment) = field_plans.first() {
+            for (i, column) in columns.iter().enumerate() {
+                let kind = match &first_segment[i] {
+                    SqlFieldReader::F64(_) | SqlFieldReader::I64(_) => {
+                        crate::hybrid::arrow_bridge::ColumnKind::Float64
+                    }
+                    SqlFieldReader::Str(_) => crate::hybrid::arrow_bridge::ColumnKind::Utf8,
+                    SqlFieldReader::SourceFallback => continue,
+                };
+                type_hints.insert(column.clone(), kind);
+            }
+        } else {
+            // No segments — derive types from the Tantivy schema directly
+            for column in columns {
+                if let Ok(field) = schema.get_field(column) {
+                    let kind = match schema.get_field_entry(field).field_type() {
+                        tantivy::schema::FieldType::F64(_)
+                        | tantivy::schema::FieldType::I64(_)
+                        | tantivy::schema::FieldType::U64(_) => {
+                            crate::hybrid::arrow_bridge::ColumnKind::Float64
+                        }
+                        tantivy::schema::FieldType::Bool(_) => {
+                            crate::hybrid::arrow_bridge::ColumnKind::Boolean
+                        }
+                        _ => crate::hybrid::arrow_bridge::ColumnKind::Utf8,
+                    };
+                    type_hints.insert(column.clone(), kind);
+                }
+            }
+        }
+        let batch =
+            crate::hybrid::arrow_bridge::build_record_batch_with_hints(&column_store, &type_hints)?;
         Ok(super::SqlBatchResult { batch, total_hits })
     }
 
