@@ -59,6 +59,111 @@ impl QueryPlan {
             aggs: HashMap::new(),
         }
     }
+
+    /// Build a structured explanation of the query plan for the EXPLAIN API.
+    pub fn to_explain_json(&self) -> serde_json::Value {
+        let search_request = self.to_search_request();
+
+        // Determine which execution strategy would be chosen
+        let execution_strategy = if self.selects_all_columns {
+            "materialized_hits_fallback"
+        } else {
+            "tantivy_fast_fields"
+        };
+
+        let strategy_reason = if self.selects_all_columns {
+            "SELECT * requires _source materialization; fast-field path unavailable"
+        } else {
+            "All projected columns can be read from Tantivy fast fields"
+        };
+
+        // Build pipeline stages
+        let mut stages = Vec::new();
+
+        // Stage 1: Tantivy search
+        let mut tantivy_stage = serde_json::json!({
+            "stage": 1,
+            "name": "tantivy_search",
+            "description": "Execute search query in Tantivy to collect matching doc IDs and scores",
+            "search_query": search_request.query,
+            "max_hits": SQL_MATCH_LIMIT,
+        });
+        if let Some(tm) = &self.text_match {
+            tantivy_stage["text_match"] = serde_json::json!({
+                "field": tm.field,
+                "query": tm.query,
+            });
+        }
+        if !self.pushed_filters.is_empty() {
+            tantivy_stage["pushed_filters"] = serde_json::json!(self.pushed_filters);
+            tantivy_stage["pushed_filter_count"] = serde_json::json!(self.pushed_filters.len());
+        }
+        stages.push(tantivy_stage);
+
+        // Stage 2: Column extraction
+        if !self.selects_all_columns {
+            stages.push(serde_json::json!({
+                "stage": 2,
+                "name": "fast_field_read",
+                "description": "Read required columns directly from Tantivy fast fields (columnar storage)",
+                "columns": self.required_columns,
+            }));
+        } else {
+            stages.push(serde_json::json!({
+                "stage": 2,
+                "name": "source_materialization",
+                "description": "Materialize full _source documents for SELECT * projection",
+            }));
+        }
+
+        // Stage 3: Arrow batch building
+        stages.push(serde_json::json!({
+            "stage": 3,
+            "name": "arrow_batch",
+            "description": "Build Arrow RecordBatch from extracted columns with score column",
+        }));
+
+        // Stage 4: DataFusion SQL execution
+        let mut datafusion_stage = serde_json::json!({
+            "stage": 4,
+            "name": "datafusion_sql",
+            "description": "Execute rewritten SQL over Arrow batches for projection, sorting, and aggregation",
+            "rewritten_sql": self.rewritten_sql,
+        });
+        if self.has_residual_predicates {
+            datafusion_stage["residual_predicates"] = serde_json::json!(true);
+            datafusion_stage["residual_note"] = serde_json::json!(
+                "Some predicates could not be pushed into Tantivy and will be evaluated by DataFusion"
+            );
+        }
+        if !self.group_by_columns.is_empty() {
+            datafusion_stage["group_by"] = serde_json::json!(self.group_by_columns);
+        }
+        stages.push(datafusion_stage);
+
+        serde_json::json!({
+            "original_sql": self.original_sql,
+            "index": self.index_name,
+            "execution_strategy": execution_strategy,
+            "strategy_reason": strategy_reason,
+            "pushdown_summary": {
+                "text_match": self.text_match.as_ref().map(|tm| serde_json::json!({
+                    "field": tm.field,
+                    "query": tm.query,
+                })),
+                "pushed_filters": self.pushed_filters,
+                "pushed_filter_count": self.pushed_filters.len(),
+                "has_residual_predicates": self.has_residual_predicates,
+            },
+            "columns": {
+                "required": self.required_columns,
+                "group_by": self.group_by_columns,
+                "selects_all": self.selects_all_columns,
+            },
+            "rewritten_sql": self.rewritten_sql,
+            "pipeline": stages,
+        })
+    }
 }
 
 pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
@@ -415,6 +520,15 @@ fn collect_required_columns(
         }
     }
 
+    // Remove computed aliases (e.g., `count(*) AS total`) — these are not
+    // data columns that can be read from storage. ORDER BY or HAVING may
+    // reference them as identifiers, but they are resolved by DataFusion,
+    // not by the fast-field reader.
+    let aliases = collect_select_aliases(select);
+    for alias in &aliases {
+        columns.remove(alias);
+    }
+
     columns.remove(INTERNAL_TABLE_NAME);
     columns.remove("score");
     columns.remove("_id");
@@ -447,6 +561,18 @@ fn collect_select_item_columns(item: &SelectItem, columns: &mut BTreeSet<String>
         }
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
     }
+}
+
+/// Collect all SELECT aliases (e.g., `count(*) AS total` yields `"total"`).
+/// These are computed columns that should not be sent to the fast-field reader.
+fn collect_select_aliases(select: &Select) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for item in &select.projection {
+        if let SelectItem::ExprWithAlias { alias, .. } = item {
+            aliases.insert(alias.value.clone());
+        }
+    }
+    aliases
 }
 
 fn collect_expr_columns(expr: &Expr, columns: &mut BTreeSet<String>) {

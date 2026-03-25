@@ -6,10 +6,11 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnKind {
+pub enum ColumnKind {
     Float64,
     Boolean,
     Utf8,
@@ -32,6 +33,13 @@ pub fn build_score_array(scores: &[f32]) -> Float32Array {
 }
 
 pub fn build_record_batch(column_store: &ColumnStore) -> Result<RecordBatch> {
+    build_record_batch_with_hints(column_store, &HashMap::new())
+}
+
+pub fn build_record_batch_with_hints(
+    column_store: &ColumnStore,
+    type_hints: &HashMap<String, ColumnKind>,
+) -> Result<RecordBatch> {
     let mut fields = vec![
         Field::new("_id", DataType::Utf8, false),
         Field::new("score", DataType::Float32, false),
@@ -42,7 +50,10 @@ pub fn build_record_batch(column_store: &ColumnStore) -> Result<RecordBatch> {
     ];
 
     for (name, values) in column_store.columns() {
-        let kind = infer_column_kind(values);
+        let kind = type_hints
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| infer_column_kind(values));
         fields.push(Field::new(name, data_type_for(kind), true));
         arrays.push(build_array(values, kind)?);
     }

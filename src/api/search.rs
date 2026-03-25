@@ -172,6 +172,39 @@ pub async fn search_documents(
     )
 }
 
+/// POST /{index}/_sql/explain — Explain the SQL query plan without executing it.
+pub async fn explain_sql(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+    Json(req): Json<SqlQueryRequest>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(msg) = crate::common::validate_index_name(&index_name) {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_index_name_exception",
+            msg,
+        );
+    }
+
+    let cluster_state = state.cluster_manager.get_state();
+    if !cluster_state.indices.contains_key(&index_name) {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name),
+        );
+    }
+
+    let plan = match crate::hybrid::planner::plan_sql(&index_name, &req.query) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return crate::api::error_response(StatusCode::BAD_REQUEST, "parsing_exception", e);
+        }
+    };
+
+    (StatusCode::OK, Json(plan.to_explain_json()))
+}
+
 /// POST /{index}/_sql — SQL projection/aggregation over distributed search hits.
 pub async fn search_sql(
     State(state): State<AppState>,
@@ -502,5 +535,93 @@ mod tests {
         assert_eq!(body["execution_mode"], "materialized_hits_fallback");
         assert!(body["rows"].as_array().is_some());
         assert_eq!(body["matched_hits"], 3);
+    }
+
+    #[tokio::test]
+    async fn explain_sql_returns_plan_without_executing() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = explain_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') AND price > 500 GROUP BY brand ORDER BY total DESC".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["index"], "products");
+        assert_eq!(body["execution_strategy"], "tantivy_fast_fields");
+        assert_eq!(
+            body["pushdown_summary"]["text_match"]["field"],
+            "description"
+        );
+        assert_eq!(body["pushdown_summary"]["pushed_filter_count"], 1);
+        assert_eq!(body["columns"]["group_by"], json!(["brand"]));
+
+        let pipeline = body["pipeline"].as_array().unwrap();
+        assert_eq!(pipeline.len(), 4);
+        assert_eq!(pipeline[0]["name"], "tantivy_search");
+        assert_eq!(pipeline[3]["name"], "datafusion_sql");
+
+        // Should NOT have rows/matched_hits — explain doesn't execute
+        assert!(body.get("rows").is_none());
+        assert!(body.get("matched_hits").is_none());
+    }
+
+    #[tokio::test]
+    async fn explain_sql_returns_error_for_invalid_sql() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = explain_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "NOT A VALID SQL".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "parsing_exception");
+    }
+
+    #[tokio::test]
+    async fn explain_sql_returns_error_for_nonexistent_index() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = explain_sql(
+            State(state),
+            Path("nonexistent".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT * FROM nonexistent".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["type"], "index_not_found_exception");
+    }
+
+    #[tokio::test]
+    async fn explain_sql_shows_materialized_fallback_for_select_star() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = explain_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT * FROM products WHERE text_match(description, 'iphone')".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["execution_strategy"], "materialized_hits_fallback");
+        assert!(body["columns"]["selects_all"].as_bool().unwrap());
+
+        let pipeline = body["pipeline"].as_array().unwrap();
+        assert_eq!(pipeline[1]["name"], "source_materialization");
     }
 }

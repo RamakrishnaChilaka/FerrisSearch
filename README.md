@@ -267,9 +267,44 @@ Current behavior:
 - cross-node or wildcard-projection queries fall back to the compatibility path and return `"execution_mode": "materialized_hits_fallback"`
 - responses include a `planner` section showing pushed-down filters, grouping columns, required columns, and whether residual SQL predicates remained
 
-> **Roadmap note:** `EXPLAIN` for SQL plans is not implemented yet. Today, the closest visibility surface is the response `planner` block plus `execution_mode`. `EXPLAIN` is on the roadmap so plan shape becomes queryable directly.
+> **Current limitations:** the SQL layer is already search-aware, but it is not yet a fully distributed partial SQL engine. Cross-node grouped partial execution and richer search-native SQL functions are still roadmap items.
 
-> **Current limitations:** the SQL layer is already search-aware, but it is not yet a fully distributed partial SQL engine. Cross-node grouped partial execution, richer search-native SQL functions, and `EXPLAIN` are still roadmap items.
+```bash
+# Explain a SQL plan without executing it
+curl -X POST 'http://localhost:9200/products/_sql/explain' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "SELECT brand, count(*) AS total FROM products WHERE text_match(description, '\''iphone'\'') AND price > 500 GROUP BY brand ORDER BY total DESC"
+  }'
+```
+
+<details>
+<summary>Example EXPLAIN response</summary>
+
+```json
+{
+  "index": "products",
+  "original_sql": "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') AND price > 500 GROUP BY brand ORDER BY total DESC",
+  "rewritten_sql": "SELECT brand, count(*) AS total FROM matched_rows GROUP BY brand ORDER BY total DESC",
+  "execution_strategy": "tantivy_fast_fields",
+  "strategy_reason": "All projected columns can be read from Tantivy fast fields",
+  "columns": { "required": ["brand", "price"], "group_by": ["brand"], "selects_all": false },
+  "pushdown_summary": {
+    "text_match": { "field": "description", "query": "iphone" },
+    "pushed_filter_count": 1,
+    "pushed_filters": [{ "range": { "price": { "gt": 500 } } }],
+    "has_residual_predicates": false
+  },
+  "pipeline": [
+    { "stage": 1, "name": "tantivy_search", "description": "Execute search query in Tantivy to collect matching doc IDs and scores" },
+    { "stage": 2, "name": "fast_field_read", "columns": ["brand", "price"], "description": "Read required columns directly from Tantivy fast fields (columnar storage)" },
+    { "stage": 3, "name": "arrow_batch", "description": "Build Arrow RecordBatch from extracted columns with score column" },
+    { "stage": 4, "name": "datafusion_sql", "rewritten_sql": "SELECT brand, count(*) AS total FROM matched_rows GROUP BY brand ORDER BY total DESC", "description": "Execute rewritten SQL over Arrow batches for projection, sorting, and aggregation" }
+  ]
+}
+```
+
+</details>
 
 ```bash
 # Project fields plus relevance score
@@ -522,10 +557,11 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 533 tests
-cargo test --lib                                # Unit tests (464)
+cargo test                                      # All 552 tests
+cargo test --lib                                # Unit tests (475)
 cargo test --test consensus_integration          # Raft consensus tests (30)
 cargo test --test replication_integration        # Replication tests (39)
+cargo test --test rest_api_integration           # REST API tests (8)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.
@@ -626,7 +662,7 @@ config/            Default configuration
 - [x] Planner metadata in SQL responses (`planner`, `execution_mode`)
 - [x] Local fast-field SQL path (`tantivy_fast_fields`)
 - [x] Compatibility fallback path (`materialized_hits_fallback`)
-- [ ] `EXPLAIN` for SQL plans
+- [x] `EXPLAIN` for SQL plans (`POST /{index}/_sql/explain`)
 - [ ] Distributed partial aggregates over matched docs
 - [ ] Search-native SQL functions beyond `text_match` / `score`
 
