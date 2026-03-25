@@ -22,7 +22,7 @@
 
 FerrisSearch is a high-performance, Rust-native distributed search engine with OpenSearch-compatible REST APIs, hybrid vector retrieval, and a search-aware SQL layer for querying matched documents as a dataset. It is built for teams that want the familiar OpenSearch interface with the performance and safety of Rust, without giving up on structured analytics over search results.
 
-> **⚡ Performance:** 2M documents — ingestion at **9,376 docs/sec**, search at **134.2 queries/sec (p50 = 26.4ms)**, zero errors — [see benchmarks](#benchmarks)
+> **⚡ Performance:** 2M documents — ingestion at **10,402 docs/sec**, search at **142.4 queries/sec (p50 = 24.8ms)**, zero errors — [see benchmarks](#benchmarks)
 
 ## Highlights
 
@@ -582,14 +582,14 @@ Integration tests run entirely in-process — they spin up real gRPC servers wit
 |--------|-------|
 | Documents | 2,000,000 |
 | Errors | 0 |
-| Total time | 213.3s |
-| Throughput | **9,376 docs/sec** |
+| Total time | 192.3s |
+| Throughput | **10,402 docs/sec** |
 
 **Bulk batch latency (400 batches × 5,000 docs):**
 
 | Min | Avg | p50 | p95 | p99 | Max |
 |-----|-----|-----|-----|-----|-----|
-| 314.2ms | 429.8ms | 380.0ms | 671.6ms | 813.9ms | 1658.7ms |
+| 277.9ms | 379.8ms | 340.0ms | 621.0ms | 764.6ms | 1777.6ms |
 
 ### Search
 
@@ -598,31 +598,31 @@ Integration tests run entirely in-process — they spin up real gRPC servers wit
 ```
 Query Type                 Count  Err      Min      Avg      p50      p95      p99      Max   Hits/q
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-agg_filtered                 500    0     5.4ms    15.4ms    11.0ms    37.6ms    55.4ms   101.1ms  250019
-agg_histogram_price          500    0    52.6ms    67.3ms    65.4ms    88.0ms    94.0ms   101.8ms 2000000
-agg_stats_price              500    0    16.3ms    29.1ms    26.0ms    50.1ms    78.2ms   148.8ms 2000000
-agg_terms_category           500    0    39.2ms    54.0ms    52.2ms    73.1ms    87.4ms   114.3ms 2000000
-bool_filter_range            500    0     9.3ms    22.7ms    19.1ms    45.8ms    60.1ms    78.2ms   25371
-bool_must                    500    0     9.1ms    20.4ms    16.1ms    42.4ms    56.3ms    70.2ms   77638
-bool_should                  500    0     7.9ms    20.5ms    15.7ms    43.2ms    65.8ms    76.9ms  328806
-complex_bool                 500    0    35.5ms    48.0ms    46.5ms    65.1ms    78.4ms    94.5ms  534321
-fuzzy_title                  500    0     6.0ms    17.9ms    13.1ms    39.3ms    53.2ms    73.8ms  137598
-match_all                    500    0    23.5ms    36.3ms    33.9ms    54.3ms    64.0ms    74.5ms 2000000
-match_description            500    0    20.8ms    34.4ms    31.8ms    53.2ms    66.4ms    71.1ms 1710882
-match_title                  500    0     6.4ms    16.7ms    12.4ms    38.9ms    55.5ms    80.7ms  120793
-paginated                    500    0    13.6ms    40.8ms    40.8ms    64.1ms    75.1ms    85.4ms 1245895
-prefix_title                 500    0     5.9ms    17.6ms    13.0ms    41.9ms    53.8ms    65.0ms  139038
-range_price                  500    0    11.2ms    25.7ms    22.8ms    47.6ms    56.6ms    76.5ms  506040
-range_rating                 500    0    21.2ms    38.5ms    36.8ms    57.2ms    68.1ms    81.9ms 1399221
-sort_price_asc               500    0    20.8ms    34.2ms    31.9ms    53.2ms    62.4ms    84.3ms 2000000
-sort_rating_desc             500    0     7.4ms    19.1ms    15.0ms    43.1ms    56.3ms    69.4ms  139983
-term_category                500    0     6.8ms    18.0ms    14.3ms    39.2ms    47.4ms    89.5ms  249995
-wildcard_title               500    0     6.3ms    17.4ms    12.6ms    40.8ms    49.8ms    57.5ms  142728
+agg_filtered                 500    0     4.9ms    14.8ms    11.7ms    33.0ms    50.9ms    77.2ms  249989
+agg_histogram_price          500    0    47.4ms    60.4ms    57.6ms    79.4ms    93.7ms   142.0ms 2000000
+agg_stats_price              500    0    16.1ms    27.9ms    25.4ms    45.3ms    53.8ms    92.9ms 2000000
+agg_terms_category           500    0    39.9ms    54.2ms    52.3ms    75.2ms    86.0ms    92.8ms 2000000
+bool_filter_range            500    0     8.9ms    20.8ms    17.3ms    38.7ms    53.4ms    82.5ms   19648
+bool_must                    500    0     7.8ms    18.7ms    13.8ms    45.2ms    66.8ms    95.1ms   84833
+bool_should                  500    0     7.1ms    18.2ms    13.9ms    41.5ms    55.1ms    91.8ms  345825
+complex_bool                 500    0    34.5ms    46.5ms    43.6ms    66.1ms    78.3ms   121.0ms  534730
+fuzzy_title                  500    0     5.5ms    16.4ms    11.8ms    38.1ms    57.3ms    69.7ms  114947
+match_all                    500    0    23.1ms    36.2ms    33.9ms    55.1ms    62.9ms    91.4ms 2000000
+match_description            500    0    20.0ms    32.8ms    29.9ms    52.9ms    66.8ms    81.3ms 1711887
+match_title                  500    0     5.2ms    15.1ms    11.1ms    34.2ms    49.2ms    62.7ms  120821
+paginated                    500    0    12.3ms    37.0ms    36.6ms    58.0ms    74.4ms   100.2ms 1246055
+prefix_title                 500    0     5.8ms    16.4ms    12.2ms    37.7ms    51.1ms    73.8ms  147570
+range_price                  500    0     9.6ms    24.5ms    22.0ms    43.4ms    57.2ms    63.8ms  492218
+range_rating                 500    0    20.7ms    38.4ms    36.2ms    58.7ms    71.8ms   124.8ms 1409617
+sort_price_asc               500    0    19.4ms    32.1ms    29.0ms    55.0ms    65.2ms    83.1ms 2000000
+sort_rating_desc             500    0     6.6ms    16.7ms    12.6ms    36.7ms    51.3ms    73.6ms  124650
+term_category                500    0     6.2ms    16.0ms    12.4ms    33.0ms    48.7ms    59.6ms  250008
+wildcard_title               500    0     5.8ms    16.6ms    12.2ms    40.1ms    48.1ms    61.9ms  106150
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-TOTAL                      10000    0     5.4ms    29.7ms    26.4ms    63.5ms    79.0ms   148.8ms
+TOTAL                      10000    0     4.9ms    28.0ms    24.8ms    60.0ms    75.5ms   142.0ms
 ```
 
-**10,000 queries | 0 errors | 134.2 queries/sec | p50 = 26.4ms | concurrency = 4**
+**10,000 queries | 0 errors | 142.4 queries/sec | p50 = 24.8ms | concurrency = 4**
 
 Reproduce with:
 ```bash
