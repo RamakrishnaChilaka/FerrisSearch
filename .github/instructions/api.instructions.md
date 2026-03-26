@@ -82,11 +82,16 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | GET | `/{index}/_search` | `search_documents()` — query-string (q=, size, from) |
 | POST | `/{index}/_search` | `search_documents_dsl()` — DSL body (SearchRequest) |
 | POST | `/{index}/_sql` | `search_sql()` — SQL over matched docs with planner metadata and execution mode |
-| POST | `/{index}/_sql/explain` | `explain_sql()` — Explain SQL plan without executing |
+| POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan; with `"analyze": true`, execute and return plan + per-stage timings + rows |
 
 ### SQL Endpoint Expectations
 - `POST /{index}/_sql` must remain coordinator-safe like other search endpoints.
 - `POST /{index}/_sql/explain` returns the query plan without executing it — validates SQL, shows pushdown decisions, execution strategy, rewritten SQL, and the full pipeline stages.
+- With `"analyze": true`, `explain_sql` executes the query fully and returns the plan JSON enriched with:
+    - `timings` object: `planning_ms`, `search_ms`, `collect_ms`, `merge_ms`, `datafusion_ms`, `total_ms` (fractional milliseconds)
+    - `rows` and `row_count`: the actual query results
+    - `matched_hits`, `execution_mode`, `truncated`, `_shards`
+- The `search_sql` handler internally delegates to `execute_sql_query()` — the same function used by EXPLAIN ANALYZE — so timing instrumentation is in one place.
 - Responses include an `execution_mode` field:
     - `tantivy_grouped_partials` when an eligible `GROUP BY` query executes as shard-local grouped partial aggregation with coordinator merge
     - `tantivy_fast_fields` when the query runs from local shard fast fields without materializing full hits first
