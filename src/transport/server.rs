@@ -636,6 +636,57 @@ impl InternalTransport for TransportService {
         }))
     }
 
+    async fn sql_record_batch(
+        &self,
+        request: Request<SqlRecordBatchRequest>,
+    ) -> Result<Response<SqlRecordBatchResponse>, Status> {
+        let req = request.into_inner();
+        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+            Ok(engine) => engine,
+            Err(status) => {
+                return Ok(Response::new(SqlRecordBatchResponse {
+                    success: false,
+                    arrow_ipc: vec![],
+                    total_hits: 0,
+                    error: status.message().to_string(),
+                }));
+            }
+        };
+
+        let search_req: crate::search::SearchRequest =
+            serde_json::from_slice(&req.search_request_json).map_err(|e| {
+                Status::invalid_argument(format!("invalid SearchRequest JSON: {}", e))
+            })?;
+
+        let columns: Vec<String> = req.columns;
+
+        match engine.sql_record_batch(&search_req, &columns, req.needs_id, req.needs_score) {
+            Ok(Some(batch_result)) => {
+                let ipc_bytes =
+                    crate::hybrid::arrow_bridge::record_batch_to_ipc(&batch_result.batch)
+                        .map_err(|e| Status::internal(format!("Arrow IPC encode error: {}", e)))?;
+                Ok(Response::new(SqlRecordBatchResponse {
+                    success: true,
+                    arrow_ipc: ipc_bytes,
+                    total_hits: batch_result.total_hits as u64,
+                    error: String::new(),
+                }))
+            }
+            Ok(None) => Ok(Response::new(SqlRecordBatchResponse {
+                success: false,
+                arrow_ipc: vec![],
+                total_hits: 0,
+                error: "shard does not support sql_record_batch".to_string(),
+            })),
+            Err(e) => Ok(Response::new(SqlRecordBatchResponse {
+                success: false,
+                arrow_ipc: vec![],
+                total_hits: 0,
+                error: e.to_string(),
+            })),
+        }
+    }
+
     async fn replicate_doc(
         &self,
         request: Request<ReplicateDocRequest>,

@@ -39,6 +39,14 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - `parse_limit_expr()` and `parse_offset_expr()` extract numeric values from `sqlparser::ast::LimitClause`.
 - When limit is pushed down, the Tantivy search collects only `limit + offset` docs instead of the default 100K.
 
+## Distributed Fast-Field SQL
+- The `tantivy_fast_fields` path now works across multi-node clusters.
+- For non-`SELECT *` queries, the coordinator scatters `SqlRecordBatch` gRPC RPCs to remote shards in parallel.
+- Remote shards run `sql_record_batch()` locally and return Arrow IPC-serialized `RecordBatch` bytes.
+- The coordinator deserializes Arrow IPC, concatenates batches from all shards (local + remote), and runs DataFusion for final SQL execution.
+- Arrow IPC helpers: `record_batch_to_ipc()` and `record_batch_from_ipc()` in `arrow_bridge.rs`.
+- Falls back to `materialized_hits_fallback` only for `SELECT *` or when a shard fails to produce a batch.
+
 ## Planning Rules
 - Split planning into two stages:
   1. search-aware planning in Tantivy

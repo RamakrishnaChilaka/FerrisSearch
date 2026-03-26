@@ -19,6 +19,9 @@ GetDoc(ShardGetRequest) → ShardGetResponse
 SearchShard(ShardSearchRequest) → ShardSearchResponse
 SearchShardDsl(ShardSearchDslRequest) → ShardSearchResponse
 
+// Distributed SQL (scatter Arrow IPC batches from remote shards)
+SqlRecordBatch(SqlRecordBatchRequest) → SqlRecordBatchResponse
+
 // Replication (primary → replica)
 ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse
 ReplicateBulk(ReplicateBulkRequest) → ReplicateBulkResponse
@@ -87,6 +90,7 @@ pub struct TransportClient {
 | `forward_bulk_to_shard()` | Route bulk write to shard primary — returns `Err` on shard failure |
 | `forward_search_to_shard()` | Scatter search to remote shard |
 | `forward_search_dsl_to_shard()` | Scatter DSL search to remote shard |
+| `forward_sql_batch_to_shard()` | Scatter SQL RecordBatch to remote shard (Arrow IPC) |
 | `get_shard_stats()` | Collect shard doc counts from remote node |
 | `replicate_to_shard()` | Primary → replica single write |
 | `replicate_bulk_to_shard()` | Primary → replica batch write |

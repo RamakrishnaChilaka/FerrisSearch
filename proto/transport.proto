@@ -252,6 +252,24 @@ message ShardStatsResponse {
     repeated ShardStat shards = 1;
 }
 
+// ─── Distributed SQL (Arrow IPC over gRPC) ──────────────────────────────────
+
+message SqlRecordBatchRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    bytes search_request_json = 3;  // SearchRequest serialized as JSON bytes
+    repeated string columns = 4;     // required SQL columns (fast-field names)
+    bool needs_id = 5;
+    bool needs_score = 6;
+}
+
+message SqlRecordBatchResponse {
+    bool success = 1;
+    bytes arrow_ipc = 2;     // Arrow IPC-serialized RecordBatch
+    uint64 total_hits = 3;
+    string error = 4;
+}
+
 // ─── Service Definition ─────────────────────────────────────────────────────
 
 service InternalTransport {
@@ -269,6 +287,9 @@ service InternalTransport {
     // Shard-level search
     rpc SearchShard(ShardSearchRequest) returns (ShardSearchResponse);
     rpc SearchShardDsl(ShardSearchDslRequest) returns (ShardSearchResponse);
+
+    // Shard-level SQL (returns Arrow IPC RecordBatch)
+    rpc SqlRecordBatch(SqlRecordBatchRequest) returns (SqlRecordBatchResponse);
 
     // Primary-to-replica replication
     rpc ReplicateDoc(ReplicateDocRequest) returns (ReplicateDocResponse);
