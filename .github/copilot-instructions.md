@@ -73,6 +73,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - The fast-field path (`sql_record_batch`) MUST populate `type_hints` from `SqlFieldReader` variants (F64/I64 → Float64, Str → Utf8) or the Tantivy schema when no segments exist
 - The fast-field path skips `searcher.doc()` entirely when all requested columns have fast-field readers — reads `_id` from its fast-field column instead of loading stored docs
 - When the SQL query does not reference `_id` or `score`, those columns are filled with empty/zero values and fast-field reads for `_id` are skipped entirely (`needs_id`/`needs_score` flags on `QueryPlan`)
+- When `required_columns` is empty and neither `_id` nor `score` is referenced (e.g., `SELECT 1 FROM ...`), `needs_score` is forced true so the batch has the correct row count — without this, DataFusion sees 0 rows and returns `count(*) = 0`\n- Ungrouped aggregates (`SELECT count(*), avg(price) FROM ...` without GROUP BY) use the grouped partial path with zero group-by columns — no row materialization needed
 - The `materialized_hits_fallback` path uses plain `build_record_batch()` (no hints, data-driven inference only)
 - SELECT aliases must be excluded from `required_columns` — aliases (e.g. `total` from `count(*) AS total`) are not real schema fields and cause `SourceFallback` → Null → Utf8 misclassification
 
@@ -89,7 +90,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 509 unit tests + 30 consensus integration + 39 replication integration + 9 REST API integration = 587 total
+- 531 unit tests + 30 consensus integration + 39 replication integration + 12 REST API integration = 612 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 

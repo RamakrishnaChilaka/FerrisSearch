@@ -32,6 +32,14 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - When `needs_score` is false, the engine skips collecting scores and the Arrow bridge emits a zero-filled `score` column.
 - The DataFusion table schema always includes `_id` and `score` columns for compatibility, but they contain dummy values when not referenced.
 - Typical SQL queries like `SELECT category, avg(price) FROM ... GROUP BY category` benefit from this: zero `_id` reads across all matched docs.
+- **Safety rule**: When `required_columns` is empty, `_id`/`score` are unreferenced, and the query is not grouped or `SELECT *`, `needs_score` is forced true as a fallback for edge cases like `SELECT 1 FROM ...`.
+
+## Ungrouped Aggregate Pushdown
+- SQL queries with only aggregate functions (no GROUP BY) now use the `tantivy_grouped_partials` execution path with zero group-by columns.
+- `SELECT count(*), avg(price), sum(price) FROM ...` produces a single global bucket via fast-field collectors — no row materialization needed.
+- The planner's `extract_grouped_sql_plan` no longer requires `group_by_columns` to be non-empty.
+- With zero group-by columns, the engine produces one bucket key (`"[]"`) per segment, merged correctly by `merge_grouped_metrics_partials`.
+- Queries with bare column references alongside aggregates (e.g., `SELECT price, count(*)`) correctly fall back — the bare column is not a valid aggregate.
 
 ## SQL LIMIT Pushdown
 - When a SQL query has LIMIT/OFFSET and ORDER BY is `_score`-only (or absent), the limit is pushed into Tantivy's `TopDocs` collector.
@@ -46,6 +54,15 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - The coordinator deserializes Arrow IPC, concatenates batches from all shards (local + remote), and runs DataFusion for final SQL execution.
 - Arrow IPC helpers: `record_batch_to_ipc()` and `record_batch_from_ipc()` in `arrow_bridge.rs`.
 - Falls back to `materialized_hits_fallback` only for `SELECT *` or when a shard fails to produce a batch.
+
+## DataFusion 53 LIMIT Workaround
+- DataFusion 53.0.0 has a bug where `LIMIT` fetch-pushdown into `MemTable`'s `TableScan` is silently ignored when the SQL `SELECT` projects columns in a different order than the table schema.
+- Example: schema `[base_passenger_fare, hvfhs_license_num]` + SQL `SELECT hvfhs_license_num, base_passenger_fare ... LIMIT 5` → returns all rows instead of 5.
+- The same query with columns in schema order (`SELECT base_passenger_fare, hvfhs_license_num`) correctly returns 5 rows.
+- **Workaround**: `project_batch_to_sql_columns()` in `datafusion_exec.rs` reorders the `RecordBatch` columns to match the SQL `SELECT` list order before creating the `MemTable`. This ensures DataFusion's projection is identity (no reorder), preventing the buggy optimizer path.
+- The workaround uses `sqlparser` to extract the SELECT column order and all referenced column names (including ORDER BY, WHERE) from the rewritten SQL, then physically reorders the Arrow batch accordingly.
+- DataFusion still handles LIMIT/OFFSET execution — we do NOT strip LIMIT from the SQL or apply it manually. The workaround only prevents the specific optimizer misfire.
+- When DataFusion fixes this upstream, the workaround can be removed — the reordering is a no-op when projection already matches schema order.
 
 ## Planning Rules
 - Split planning into two stages:

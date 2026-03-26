@@ -385,6 +385,14 @@ FROM "my-index"
 WHERE text_match(description, 'iphone')
 ```
 
+#### SQL Collection Limit
+
+SQL queries (except grouped aggregations) collect up to **100,000 matching documents** per shard. If a broad `text_match` returns more matches than this ceiling, the response includes `"truncated": true` to signal that some matching documents were not included in the SQL result set.
+
+- **Grouped aggregations** (`GROUP BY` with `count`, `avg`, etc.) are **not** subject to this limit — they scan all matched documents via shard-local fast-field collectors.
+- **Explicit `LIMIT`**: If you specify a SQL `LIMIT`, you get exactly the number of rows you asked for. The `truncated` flag is **not** set for explicit `LIMIT` queries — you got what you requested.
+- The `truncated` flag only appears when the internal ceiling silently caps the collected doc set.
+
 ### Vector Search (k-NN)
 
 ```bash
@@ -559,11 +567,11 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 587 tests
-cargo test --lib                                # Unit tests (509)
+cargo test                                      # All 612 tests
+cargo test --lib                                # Unit tests (531)
 cargo test --test consensus_integration          # Raft consensus tests (30)
 cargo test --test replication_integration        # Replication tests (39)
-cargo test --test rest_api_integration           # REST API tests (9)
+cargo test --test rest_api_integration           # REST API tests (12)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.
@@ -670,7 +678,7 @@ config/            Default configuration
 - [x] `EXPLAIN` for SQL plans (`POST /{index}/_sql/explain`)
 - [x] Distributed shard-local partial aggregates over matched docs
 - [x] Coordinator merge of compact grouped partial states
-- [ ] Aggregate pushdown for fast-field-eligible `count(*)`, `min`, `max`, `sum`, `avg`
+- [x] Aggregate pushdown for fast-field-eligible `count(*)`, `min`, `max`, `sum`, `avg`
 - [x] Distributed fast-field SQL (ship compact Arrow batches between nodes instead of `_source` JSON for cross-node fast-field queries)
 - [ ] Search-aware `ORDER BY` / `LIMIT` pushdown on sortable fast fields
 - [ ] Broader predicate pushdown (`IN`, `BETWEEN`, more bool combinations)

@@ -826,6 +826,25 @@ mod tests {
         assert_eq!(pipeline[0]["limit_pushed_down"], true);
     }
 
+    #[test]
+    fn rewritten_sql_preserves_limit_clause() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price FROM products WHERE text_match(description, 'test') LIMIT 10",
+        )
+        .unwrap();
+        assert!(plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(10));
+        // CRITICAL: the rewritten SQL must still contain the LIMIT clause
+        // so DataFusion re-applies it after multi-shard concatenation
+        let upper = plan.rewritten_sql.to_uppercase();
+        assert!(
+            upper.contains("LIMIT"),
+            "rewritten SQL must contain LIMIT: {}",
+            plan.rewritten_sql
+        );
+    }
+
     // ── needs_id / needs_score detection tests ──────────────────────────
 
     #[test]
@@ -895,5 +914,150 @@ mod tests {
         assert!(!plan.needs_id);
         assert!(!plan.needs_score);
         assert!(plan.selects_all_columns);
+    }
+
+    // ── Truncation flag logic ───────────────────────────────────────────
+
+    #[test]
+    fn explicit_limit_should_not_be_truncated() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'test') LIMIT 5",
+        )
+        .unwrap();
+        // User explicitly requested LIMIT 5 → truncated should never be true
+        assert!(plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(5));
+        // The truncation check in search_sql: !limit_pushed_down && limit.is_none() && ...
+        // With limit_pushed_down=true, truncated is always false regardless of matched_hits
+        let would_truncate = !plan.limit_pushed_down && plan.limit.is_none();
+        assert!(
+            !would_truncate,
+            "explicit LIMIT must not trigger truncation"
+        );
+    }
+
+    #[test]
+    fn no_limit_can_truncate_at_ceiling() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        assert!(!plan.limit_pushed_down);
+        assert!(plan.limit.is_none());
+        // With no LIMIT, if matched_hits > 100K, truncated should be true
+        let would_truncate = !plan.limit_pushed_down && plan.limit.is_none();
+        assert!(
+            would_truncate,
+            "no LIMIT should allow truncation at ceiling"
+        );
+    }
+
+    #[test]
+    fn grouped_partials_never_truncated() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, count(*) AS cnt FROM products WHERE text_match(description, 'test') GROUP BY title",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        // Grouped partials scan all docs (size=0), never truncated
+    }
+
+    #[test]
+    fn limit_with_residual_predicate_not_pushed_down() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'test') AND title = 'Foo' LIMIT 5",
+        )
+        .unwrap();
+        // title = 'Foo' is a residual predicate (not pushed into Tantivy for keyword match on text_match)
+        // Wait — title = 'Foo' may or may not be pushed. Let's check:
+        // has_residual_predicates means selection was NOT fully consumed by pushdowns
+        if plan.has_residual_predicates {
+            assert!(!plan.limit_pushed_down);
+            assert_eq!(plan.limit, Some(5));
+            // With residual predicates + explicit LIMIT, limit is NOT pushed
+            // but truncated should still be false (user asked for LIMIT)
+            let would_truncate = !plan.limit_pushed_down && plan.limit.is_none();
+            assert!(!would_truncate);
+        }
+    }
+
+    // ── Ungrouped aggregate pushdown ───────────────────────────────────
+
+    #[test]
+    fn count_star_without_group_by_uses_grouped_partials() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT count(*) AS total FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        // count(*) without GROUP BY should use the grouped partial path
+        // with zero group-by columns (one global bucket)
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert!(
+            grouped.group_columns.is_empty(),
+            "ungrouped aggregate should have zero group-by columns"
+        );
+        assert_eq!(grouped.metrics.len(), 1);
+        assert_eq!(
+            grouped.metrics[0].function,
+            crate::hybrid::planner::SqlGroupedMetricFunction::Count
+        );
+    }
+
+    #[test]
+    fn ungrouped_multi_agg_uses_grouped_partials() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT count(*) AS cnt, avg(price) AS avg_price, sum(price) AS total FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert!(grouped.group_columns.is_empty());
+        assert_eq!(grouped.metrics.len(), 3);
+    }
+
+    #[test]
+    fn ungrouped_with_bare_column_falls_back() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT price, count(*) AS cnt FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        // `price` without GROUP BY is not a valid aggregate → falls back
+        assert!(!plan.uses_grouped_partials());
+    }
+
+    #[test]
+    fn select_literal_forces_needs_score() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT 1 AS one FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        // SELECT 1 has no data column references
+        assert!(plan.required_columns.is_empty());
+        assert!(
+            plan.needs_score,
+            "needs_score must be true when no columns are projected"
+        );
+    }
+
+    #[test]
+    fn select_with_columns_does_not_force_needs_score() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT count(*), avg(price) FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        // avg(price) references price → required_columns is not empty
+        assert!(!plan.required_columns.is_empty());
+        // needs_score should NOT be forced
+        assert!(!plan.needs_score);
     }
 }

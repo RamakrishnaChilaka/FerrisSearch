@@ -1,11 +1,11 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **509 unit tests** (`cargo test --lib`)
+- **531 unit tests** (`cargo test --lib`)
 - **30 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **9 REST API integration tests** (`cargo test --test rest_api_integration`)
-- **587 total** (`cargo test`)
+- **12 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **612 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -59,13 +59,19 @@ cargo test -- test_name                         # Single test by name
 	- pushdown extraction
 	- quoted index names
 	- grouped analytics planning
+	- LIMIT pushdown detection and rewritten SQL preservation
 	- residual predicate detection
+	- `needs_id` / `needs_score` detection
+	- truncation flag logic (explicit LIMIT = not truncated, no LIMIT = may truncate at 100K ceiling)
 - For direct fast-field execution changes, add tests that assert eligible queries use fast-field readers without requiring `_source` materialization.
 - For API-level SQL changes, validate both execution modes where practical:
 	- `tantivy_grouped_partials` for eligible grouped SQL queries over matched docs
 	- `tantivy_fast_fields` for local non-`SELECT *` queries with columnar access
 	- `materialized_hits_fallback` for wildcard projection or distributed compatibility paths
-- Live tests should inspect the `planner` and `execution_mode` fields, not just the returned rows.
+- **LIMIT correctness**: Always assert exact row counts for LIMIT queries — `LIMIT N` must produce exactly N rows, not N × number_of_shards. This was a previous test gap.
+- **DataFusion 53 LIMIT regression**: Include pure DataFusion tests that reproduce the projection-reorder LIMIT bug (schema-order SELECT works, reverse-order SELECT without the workaround returns too many rows). These tests document the upstream bug and verify the `project_batch_to_sql_columns` workaround.
+- **Truncation flag**: Assert `truncated=false` for explicit LIMIT queries. Assert `truncated=true` only when matched_hits exceeds the internal 100K ceiling without an explicit LIMIT.
+- Live tests should inspect the `planner`, `execution_mode`, and `truncated` fields, not just the returned rows.
 - Add regression tests when planner or execution changes accidentally widen the fallback path for queries that should stay search-aware.
 
 ## Dev Cluster

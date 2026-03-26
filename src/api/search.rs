@@ -446,10 +446,19 @@ pub async fn search_sql(
             )
         };
 
+    // Determine if results were truncated by the internal collection ceiling.
+    // If the user specified an explicit LIMIT, they got what they asked for — that's not truncation.
+    // Truncation only occurs when the internal 100K ceiling silently drops results.
+    let truncated = !plan.limit_pushed_down
+        && plan.limit.is_none()
+        && matched_hits > search_req.size
+        && execution_mode != "tantivy_grouped_partials";
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "execution_mode": execution_mode,
+            "truncated": truncated,
             "planner": {
                 "text_match": plan.text_match.as_ref().map(|text_match| serde_json::json!({
                     "field": text_match.field,

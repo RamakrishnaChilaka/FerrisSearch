@@ -118,6 +118,7 @@ for agg-only `size=0` requests. When no aggs are requested, `None` adds zero ove
 - When `needs_id` is false, `_id` fast-field reads are skipped and the Arrow `_id` column is filled with empty strings.
 - When `needs_score` is false, score collection is skipped and the Arrow `score` column is filled with zeros.
 - The planner detects `needs_id`/`needs_score` by checking whether the SQL query references `_id` or `score`/`_score` in any projection, filter, GROUP BY, or ORDER BY.
+- **Safety rule**: When `required_columns` is empty and neither `_id` nor `score` is referenced (e.g., `SELECT count(*)`), the planner forces `needs_score = true` so the batch has the correct row count. Without this, the Arrow batch would have 0 rows and DataFusion would return `count(*) = 0`.
 - For grouped analytics over matched docs, prefer shard-local partial aggregation from fast fields and merge compact partials at the coordinator.
 - Fall back to `_source` materialization only for fields or expressions that cannot be read from fast fields or stored fields.
 - Tantivy is the preferred execution engine for search-aware work: pushdown, ranking, field reads, and shard-local partial aggregation should stay here.

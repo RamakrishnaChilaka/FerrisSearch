@@ -355,6 +355,15 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         && !selects_all_columns
         && is_order_by_score_only(order_by.as_ref());
 
+    // Safety: if no data columns, _id, or score are needed and we're not on the
+    // grouped partial or SELECT * paths, force needs_score so the Arrow batch has
+    // the correct row count.  Edge case: `SELECT 1 FROM ... WHERE text_match(...)`.
+    let needs_score = needs_score
+        || (required_columns.is_empty()
+            && !needs_id
+            && !selects_all_columns
+            && grouped_sql.is_none());
+
     Ok(QueryPlan {
         index_name: index_name.to_string(),
         original_sql: sql.to_string(),
@@ -383,8 +392,7 @@ fn extract_grouped_sql_plan(
     offset: Option<usize>,
     group_by_columns: &[String],
 ) -> Result<Option<GroupedSqlPlan>> {
-    if group_by_columns.is_empty()
-        || has_residual_predicates
+    if has_residual_predicates
         || selects_all_columns
         || select.having.is_some()
         || limit.is_some()
