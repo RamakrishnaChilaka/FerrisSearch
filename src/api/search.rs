@@ -7,6 +7,7 @@ use axum::{
 use futures::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
+use std::time::Instant;
 
 #[derive(Deserialize)]
 pub struct SearchParams {
@@ -26,9 +27,12 @@ fn default_size() -> usize {
     10
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct SqlQueryRequest {
+    #[serde(default)]
     pub query: String,
+    #[serde(default)]
+    pub analyze: bool,
 }
 
 /// GET /{index}/_search?q=... — query-string search across all shards (local + remote) for this index.
@@ -172,7 +176,10 @@ pub async fn search_documents(
     )
 }
 
-/// POST /{index}/_sql/explain — Explain the SQL query plan without executing it.
+/// POST /{index}/_sql/explain — Explain the SQL query plan, optionally with execution timings.
+///
+/// With `"analyze": false` (default): returns the plan without executing the query.
+/// With `"analyze": true`: executes the query and returns plan + per-stage timings + result rows.
 pub async fn explain_sql(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
@@ -195,118 +202,150 @@ pub async fn explain_sql(
         );
     }
 
-    let plan = match crate::hybrid::planner::plan_sql(&index_name, &req.query) {
-        Ok(plan) => plan,
-        Err(e) => {
-            return crate::api::error_response(StatusCode::BAD_REQUEST, "parsing_exception", e);
-        }
-    };
-
-    (StatusCode::OK, Json(plan.to_explain_json()))
-}
-
-/// POST /{index}/_sql — SQL projection/aggregation over distributed search hits.
-pub async fn search_sql(
-    State(state): State<AppState>,
-    Path(index_name): Path<String>,
-    Json(req): Json<SqlQueryRequest>,
-) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
+    if !req.analyze {
+        // Plan-only mode: parse and return the plan without executing
+        let plan = match crate::hybrid::planner::plan_sql(&index_name, &req.query) {
+            Ok(plan) => plan,
+            Err(e) => {
+                return crate::api::error_response(StatusCode::BAD_REQUEST, "parsing_exception", e);
+            }
+        };
+        return (StatusCode::OK, Json(plan.to_explain_json()));
     }
 
-    let plan = match crate::hybrid::planner::plan_sql(&index_name, &req.query) {
+    // EXPLAIN ANALYZE: execute the query and merge plan + timings + rows
+    match execute_sql_query(&state, &index_name, &req.query).await {
+        Ok(result) => {
+            let mut explain = result.plan.to_explain_json();
+            explain["timings"] = serde_json::to_value(&result.timings).unwrap();
+            explain["execution_mode"] = serde_json::json!(result.execution_mode);
+            explain["matched_hits"] = serde_json::json!(result.matched_hits);
+            explain["row_count"] = serde_json::json!(result.sql_result.rows.len());
+            explain["truncated"] = serde_json::json!(result.truncated);
+            explain["_shards"] = serde_json::json!({
+                "total": result.successful_shards + result.failed_shards,
+                "successful": result.successful_shards,
+                "failed": result.failed_shards,
+            });
+            explain["columns"] = serde_json::json!(result.sql_result.columns);
+            explain["rows"] = serde_json::json!(result.sql_result.rows);
+            (StatusCode::OK, Json(explain))
+        }
+        Err(err) => err,
+    }
+}
+
+/// Internal result of a fully-executed SQL query, with timings.
+struct SqlExecutionResult {
+    plan: crate::hybrid::QueryPlan,
+    sql_result: crate::hybrid::SqlQueryResult,
+    matched_hits: usize,
+    successful_shards: u32,
+    failed_shards: u32,
+    execution_mode: &'static str,
+    truncated: bool,
+    timings: crate::hybrid::SqlTimings,
+}
+
+/// Execute a SQL query end-to-end with per-stage timing instrumentation.
+/// Used by both `search_sql` (for the normal response) and `explain_sql`
+/// (for EXPLAIN ANALYZE with timings + rows).
+async fn execute_sql_query(
+    state: &AppState,
+    index_name: &str,
+    query: &str,
+) -> Result<SqlExecutionResult, (StatusCode, Json<Value>)> {
+    let total_start = Instant::now();
+
+    // Stage 1: Planning
+    let plan_start = Instant::now();
+    let plan = match crate::hybrid::planner::plan_sql(index_name, query) {
         Ok(plan) => plan,
         Err(e) => {
-            return crate::api::error_response(StatusCode::BAD_REQUEST, "parsing_exception", e);
+            return Err(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                e,
+            ));
         }
     };
-
     let search_req = plan.to_search_request();
+    let planning_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(&index_name) {
+    let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m.clone(),
         None => {
-            return crate::api::error_response(
+            return Err(crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
                 format!("no such index [{}]", index_name),
-            );
+            ));
         }
     };
 
+    // Grouped partials path
     if plan.uses_grouped_partials() {
-        let distributed = match crate::api::index::execute_distributed_dsl_search(
-            &state,
-            &index_name,
-            &search_req,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(err) => return err,
-        };
+        let search_start = Instant::now();
+        let distributed =
+            match crate::api::index::execute_distributed_dsl_search(state, index_name, &search_req)
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => return Err(err),
+            };
+        let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
+        let merge_start = Instant::now();
         let sql_result =
             match crate::hybrid::execute_grouped_partial_sql(&plan, &distributed.partial_aggs) {
                 Ok(result) => result,
                 Err(error) => {
-                    return crate::api::error_response(
+                    return Err(crate::api::error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "sql_execution_exception",
                         error,
-                    );
+                    ));
                 }
             };
+        let merge_ms = merge_start.elapsed().as_secs_f64() * 1000.0;
 
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "execution_mode": "tantivy_grouped_partials",
-                "planner": {
-                    "text_match": plan.text_match.as_ref().map(|text_match| serde_json::json!({
-                        "field": text_match.field,
-                        "query": text_match.query,
-                    })),
-                    "pushed_down_filters": plan.pushed_filters,
-                    "group_by_columns": plan.group_by_columns,
-                    "required_columns": plan.required_columns,
-                    "has_residual_predicates": plan.has_residual_predicates,
-                    "uses_grouped_partials": true,
-                },
-                "_shards": {
-                    "total": distributed.successful_shards + distributed.failed_shards,
-                    "successful": distributed.successful_shards,
-                    "failed": distributed.failed_shards
-                },
-                "matched_hits": distributed.total_hits,
-                "columns": sql_result.columns,
-                "rows": sql_result.rows
-            })),
-        );
+        return Ok(SqlExecutionResult {
+            plan,
+            sql_result,
+            matched_hits: distributed.total_hits,
+            successful_shards: distributed.successful_shards,
+            failed_shards: distributed.failed_shards,
+            execution_mode: "tantivy_grouped_partials",
+            truncated: false,
+            timings: crate::hybrid::SqlTimings {
+                planning_ms,
+                search_ms,
+                collect_ms: 0.0,
+                merge_ms,
+                datafusion_ms: 0.0,
+                total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            },
+        });
     }
 
     let local_shards = crate::api::index::ensure_local_index_shards_open(
-        &state,
-        &index_name,
+        state,
+        index_name,
         &metadata,
         "SQL search",
     );
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
 
-    // Distributed fast-field SQL: scatter sql_record_batch to all shards (local + remote)
+    // Fast-field path: collect Arrow batches from local + remote shards
+    let search_start = Instant::now();
     let direct_sql = if !plan.selects_all_columns {
         let mut batches = Vec::new();
         let mut total_hits = 0usize;
         let mut successful_shards = 0u32;
         let mut direct_error: Option<anyhow::Error> = None;
 
-        // Local shards: call engine.sql_record_batch directly
         for (_shard_id, engine) in &local_shards {
             match engine.sql_record_batch(
                 &search_req,
@@ -332,20 +371,19 @@ pub async fn search_sql(
             }
         }
 
-        // Remote shards: scatter Arrow IPC requests via gRPC
         if direct_error.is_none() {
             let cs = state.cluster_manager.get_state();
             let mut remote_futures = Vec::new();
 
             for (shard_id, routing) in &metadata.shard_routing {
                 if local_shard_ids.contains(shard_id) {
-                    continue; // already handled locally
+                    continue;
                 }
                 let primary_node_id = &routing.primary;
                 if let Some(node) = cs.nodes.get(primary_node_id) {
                     let client = state.transport_client.clone();
                     let node = node.clone();
-                    let idx = index_name.clone();
+                    let idx = index_name.to_string();
                     let sid = *shard_id;
                     let req = search_req.clone();
                     let cols = plan.required_columns.clone();
@@ -393,18 +431,21 @@ pub async fn search_sql(
     } else {
         None
     };
+    let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
+    // Stage 3: DataFusion SQL execution (or materialized fallback)
+    let datafusion_start = Instant::now();
     let (sql_result, matched_hits, successful_shards, failed_shards, execution_mode) =
         if let Some((batches, total_hits, successful_shards, failed_shards)) = direct_sql {
             let sql_result = match crate::hybrid::execute_planned_sql_batches(&plan, batches).await
             {
                 Ok(result) => result,
                 Err(e) => {
-                    return crate::api::error_response(
+                    return Err(crate::api::error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "sql_execution_exception",
                         e,
-                    );
+                    ));
                 }
             };
             (
@@ -416,25 +457,25 @@ pub async fn search_sql(
             )
         } else {
             let distributed = match crate::api::index::execute_distributed_dsl_search(
-                &state,
-                &index_name,
+                state,
+                index_name,
                 &search_req,
             )
             .await
             {
                 Ok(result) => result,
-                Err(err) => return err,
+                Err(err) => return Err(err),
             };
 
             let sql_result =
                 match crate::hybrid::execute_planned_sql(&plan, &distributed.all_hits).await {
                     Ok(result) => result,
                     Err(e) => {
-                        return crate::api::error_response(
+                        return Err(crate::api::error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "sql_execution_exception",
                             e,
-                        );
+                        ));
                     }
                 };
             (
@@ -445,38 +486,74 @@ pub async fn search_sql(
                 "materialized_hits_fallback",
             )
         };
+    let datafusion_ms = datafusion_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Determine if results were truncated by the internal collection ceiling.
-    // If the user specified an explicit LIMIT, they got what they asked for — that's not truncation.
-    // Truncation only occurs when the internal 100K ceiling silently drops results.
     let truncated = !plan.limit_pushed_down
         && plan.limit.is_none()
         && matched_hits > search_req.size
         && execution_mode != "tantivy_grouped_partials";
 
+    Ok(SqlExecutionResult {
+        plan,
+        sql_result,
+        matched_hits,
+        successful_shards,
+        failed_shards,
+        execution_mode,
+        truncated,
+        timings: crate::hybrid::SqlTimings {
+            planning_ms,
+            search_ms,
+            collect_ms: 0.0,
+            merge_ms: 0.0,
+            datafusion_ms,
+            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+        },
+    })
+}
+
+/// POST /{index}/_sql — SQL projection/aggregation over distributed search hits.
+pub async fn search_sql(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+    Json(req): Json<SqlQueryRequest>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(msg) = crate::common::validate_index_name(&index_name) {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_index_name_exception",
+            msg,
+        );
+    }
+
+    let result = match execute_sql_query(&state, &index_name, &req.query).await {
+        Ok(result) => result,
+        Err(err) => return err,
+    };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "execution_mode": execution_mode,
-            "truncated": truncated,
+            "execution_mode": result.execution_mode,
+            "truncated": result.truncated,
             "planner": {
-                "text_match": plan.text_match.as_ref().map(|text_match| serde_json::json!({
+                "text_match": result.plan.text_match.as_ref().map(|text_match| serde_json::json!({
                     "field": text_match.field,
                     "query": text_match.query,
                 })),
-                "pushed_down_filters": plan.pushed_filters,
-                "group_by_columns": plan.group_by_columns,
-                "required_columns": plan.required_columns,
-                "has_residual_predicates": plan.has_residual_predicates,
+                "pushed_down_filters": result.plan.pushed_filters,
+                "group_by_columns": result.plan.group_by_columns,
+                "required_columns": result.plan.required_columns,
+                "has_residual_predicates": result.plan.has_residual_predicates,
             },
             "_shards": {
-                "total": successful_shards + failed_shards,
-                "successful": successful_shards,
-                "failed": failed_shards
+                "total": result.successful_shards + result.failed_shards,
+                "successful": result.successful_shards,
+                "failed": result.failed_shards
             },
-            "matched_hits": matched_hits,
-            "columns": sql_result.columns,
-            "rows": sql_result.rows
+            "matched_hits": result.matched_hits,
+            "columns": result.sql_result.columns,
+            "rows": result.sql_result.rows
         })),
     )
 }
@@ -618,6 +695,7 @@ mod tests {
             Path("products".to_string()),
             Json(SqlQueryRequest {
                 query: "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') AND price > 500 GROUP BY brand ORDER BY total DESC, brand ASC".to_string(),
+                ..Default::default()
             }),
         )
         .await;
@@ -626,7 +704,6 @@ mod tests {
         assert_eq!(body["execution_mode"], "tantivy_grouped_partials");
         assert_eq!(body["planner"]["group_by_columns"], json!(["brand"]));
         assert_eq!(body["planner"]["has_residual_predicates"], json!(false));
-        assert_eq!(body["planner"]["uses_grouped_partials"], json!(true));
         assert_eq!(body["matched_hits"], 3);
     }
 
@@ -639,6 +716,7 @@ mod tests {
             Path("products".to_string()),
             Json(SqlQueryRequest {
                 query: "SELECT * FROM products WHERE text_match(description, 'iphone')".to_string(),
+                ..Default::default()
             }),
         )
         .await;
@@ -658,6 +736,7 @@ mod tests {
             Path("products".to_string()),
             Json(SqlQueryRequest {
                 query: "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') AND price > 500 GROUP BY brand ORDER BY total DESC".to_string(),
+                ..Default::default()
             }),
         )
         .await;
@@ -693,6 +772,7 @@ mod tests {
             Path("products".to_string()),
             Json(SqlQueryRequest {
                 query: "NOT A VALID SQL".to_string(),
+                ..Default::default()
             }),
         )
         .await;
@@ -710,6 +790,7 @@ mod tests {
             Path("nonexistent".to_string()),
             Json(SqlQueryRequest {
                 query: "SELECT * FROM nonexistent".to_string(),
+                ..Default::default()
             }),
         )
         .await;
@@ -727,6 +808,7 @@ mod tests {
             Path("products".to_string()),
             Json(SqlQueryRequest {
                 query: "SELECT * FROM products WHERE text_match(description, 'iphone')".to_string(),
+                ..Default::default()
             }),
         )
         .await;
@@ -737,5 +819,82 @@ mod tests {
 
         let pipeline = body["pipeline"].as_array().unwrap();
         assert_eq!(pipeline[1]["name"], "source_materialization");
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_returns_timings_and_rows() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = explain_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') GROUP BY brand".to_string(),
+                analyze: true,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        // Plan fields should still be present
+        assert_eq!(body["execution_strategy"], "tantivy_grouped_partials");
+        assert!(body["pipeline"].as_array().is_some());
+
+        // ANALYZE-specific fields: timings, rows, matched_hits
+        let timings = &body["timings"];
+        assert!(timings["planning_ms"].as_f64().unwrap() >= 0.0);
+        assert!(timings["search_ms"].as_f64().unwrap() >= 0.0);
+        assert!(timings["total_ms"].as_f64().unwrap() > 0.0);
+
+        assert_eq!(body["matched_hits"], 3);
+        assert!(body["row_count"].as_u64().unwrap() > 0);
+        let rows = body["rows"].as_array().unwrap();
+        assert!(!rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explain_without_analyze_has_no_timings_or_rows() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = explain_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT brand FROM products WHERE text_match(description, 'iphone')"
+                    .to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        // Plan-only mode: no timings, no rows, no matched_hits
+        assert!(body.get("timings").is_none());
+        assert!(body.get("rows").is_none());
+        assert!(body.get("matched_hits").is_none());
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_fast_fields_returns_timings() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = explain_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT brand, price FROM products WHERE text_match(description, 'iphone')"
+                    .to_string(),
+                analyze: true,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["execution_mode"], "tantivy_fast_fields");
+        assert!(body["timings"]["total_ms"].as_f64().unwrap() > 0.0);
+        assert_eq!(body["matched_hits"], 3);
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
     }
 }

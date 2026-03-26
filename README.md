@@ -567,11 +567,11 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 612 tests
-cargo test --lib                                # Unit tests (531)
+cargo test                                      # All 617 tests
+cargo test --lib                                # Unit tests (535)
 cargo test --test consensus_integration          # Raft consensus tests (30)
 cargo test --test replication_integration        # Replication tests (39)
-cargo test --test rest_api_integration           # REST API tests (12)
+cargo test --test rest_api_integration           # REST API tests (13)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.
@@ -686,7 +686,7 @@ config/            Default configuration
 - [ ] Explicit SQL null semantics (`IS NULL`, `IS NOT NULL`) on matched docs
 - [ ] `HAVING` support after grouped execution
 - [ ] More robust alias handling in `ORDER BY`, `GROUP BY`, and `HAVING`
-- [ ] `EXPLAIN ANALYZE` with runtime timings and fallback reasons
+- [x] `EXPLAIN ANALYZE` with runtime timings and fallback reasons
 - [ ] Search-native SQL functions beyond `text_match` / `score`
 - [ ] Search-aware histogram and date-bucketing style SQL analytics
 

@@ -10,6 +10,17 @@ use serde_json::Value;
 
 pub use planner::QueryPlan;
 
+/// Per-stage wall-clock timings for SQL execution, in fractional milliseconds.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SqlTimings {
+    pub planning_ms: f64,
+    pub search_ms: f64,
+    pub collect_ms: f64,
+    pub merge_ms: f64,
+    pub datafusion_ms: f64,
+    pub total_ms: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SqlQueryResult {
     pub columns: Vec<String>,

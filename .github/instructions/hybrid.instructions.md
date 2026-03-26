@@ -55,6 +55,13 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Arrow IPC helpers: `record_batch_to_ipc()` and `record_batch_from_ipc()` in `arrow_bridge.rs`.
 - Falls back to `materialized_hits_fallback` only for `SELECT *` or when a shard fails to produce a batch.
 
+## EXPLAIN ANALYZE
+- `POST /{index}/_sql/explain` with `"analyze": true` executes the query and returns plan + per-stage timings + result rows.
+- `SqlTimings` struct in `src/hybrid/mod.rs`: `planning_ms`, `search_ms`, `collect_ms`, `merge_ms`, `datafusion_ms`, `total_ms` (fractional milliseconds, `f64`).
+- `execute_sql_query()` in `src/api/search.rs` is the shared internal function used by both `search_sql` and `explain_sql(analyze=true)`. Timing instrumentation is in this one place.
+- The `search_sql` handler is a thin response formatter over `execute_sql_query()`.
+- Without `"analyze": true`, `explain_sql` returns plan-only (no execution, no timings, no rows) — unchanged from the original behavior.
+
 ## DataFusion 53 LIMIT Workaround
 - DataFusion 53.0.0 has a bug where `LIMIT` fetch-pushdown into `MemTable`'s `TableScan` is silently ignored when the SQL `SELECT` projects columns in a different order than the table schema.
 - Example: schema `[base_passenger_fare, hvfhs_license_num]` + SQL `SELECT hvfhs_license_num, base_passenger_fare ... LIMIT 5` → returns all rows instead of 5.

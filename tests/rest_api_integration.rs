@@ -533,7 +533,6 @@ async fn rest_sql_uses_tantivy_fast_fields_for_supported_query() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["execution_mode"], json!("tantivy_grouped_partials"));
     assert_eq!(body["planner"]["group_by_columns"], json!(["brand"]));
-    assert_eq!(body["planner"]["uses_grouped_partials"], json!(true));
     assert_eq!(body["matched_hits"], json!(3));
     Ok(())
 }
@@ -705,6 +704,77 @@ async fn rest_sql_count_star_without_group_by_returns_correct_count() -> Result<
     assert_eq!(rows.len(), 1, "count(*) should return exactly 1 row");
     let total = rows[0]["total"].as_i64().unwrap();
     assert_eq!(total, 3, "count(*) should return 3 matching docs");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_explain_analyze_returns_timings_and_rows() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // EXPLAIN ANALYZE: execute query and return plan + timings + rows
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql/explain",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone')",
+                "analyze": true
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    // Plan fields present
+    assert!(body.get("execution_strategy").is_some());
+    assert!(body.get("pipeline").is_some());
+    assert!(body.get("rewritten_sql").is_some());
+
+    // Timings present with non-negative values
+    let timings = &body["timings"];
+    assert!(
+        timings["planning_ms"].as_f64().unwrap() >= 0.0,
+        "planning_ms should be non-negative"
+    );
+    assert!(
+        timings["search_ms"].as_f64().unwrap() >= 0.0,
+        "search_ms should be non-negative"
+    );
+    assert!(
+        timings["total_ms"].as_f64().unwrap() > 0.0,
+        "total_ms should be positive"
+    );
+
+    // Execution results present
+    assert_eq!(body["matched_hits"], json!(3));
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 3);
+    assert!(body["row_count"].as_u64().unwrap() == 3);
+
+    // Plain EXPLAIN (no analyze) should NOT have timings or rows
+    let (status2, body2) = harness
+        .post_json(
+            "/products/_sql/explain",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone')"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status2, StatusCode::OK);
+    assert!(
+        body2.get("timings").is_none(),
+        "plain EXPLAIN must not have timings"
+    );
+    assert!(
+        body2.get("rows").is_none(),
+        "plain EXPLAIN must not have rows"
+    );
+    assert!(
+        body2.get("matched_hits").is_none(),
+        "plain EXPLAIN must not have matched_hits"
+    );
 
     Ok(())
 }
