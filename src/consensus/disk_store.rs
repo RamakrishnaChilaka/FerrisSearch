@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use openraft::storage::{IOFlushed, LogState, RaftLogStorage};
 use openraft::{OptionalSend, RaftLogReader};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::consensus::types::{self, TypeConfig};
 

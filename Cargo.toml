@@ -8,16 +8,16 @@ anyhow = "1.0.102"
 axum = "0.8.8"
 bincode-next = { version = "3.0.0-rc.5", features = ["serde"] }
 config = "0.15.21"
-datafusion = "49"
+datafusion = "53"
 futures = "0.3.32"
-murmur3 = "0.5"
+murmur3 = "0.5.2"
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "tokio-rt"] }
 prost = "0.13"
-redb = "2"
+redb = "3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
-sqlparser = "0.55"
+sqlparser = "0.61"
 tantivy = "0.25.0"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["full"] }
@@ -25,7 +25,7 @@ tonic = "0.13"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 usearch = "2.24.0"
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.6.1"
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 
 [build-dependencies]
