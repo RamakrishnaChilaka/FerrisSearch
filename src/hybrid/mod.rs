@@ -707,4 +707,122 @@ mod tests {
             "Unhinted column should still infer (Utf8 for empty)"
         );
     }
+
+    #[test]
+    fn limit_pushdown_with_order_by_score() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price, score FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC LIMIT 25",
+        ).unwrap();
+        assert_eq!(plan.limit, Some(25));
+        assert_eq!(plan.offset, None);
+        assert!(plan.limit_pushed_down);
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 25);
+    }
+
+    #[test]
+    fn limit_pushdown_with_offset() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price, score FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC LIMIT 10 OFFSET 20",
+        ).unwrap();
+        assert_eq!(plan.limit, Some(10));
+        assert_eq!(plan.offset, Some(20));
+        assert!(plan.limit_pushed_down);
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 30); // limit + offset
+    }
+
+    #[test]
+    fn limit_not_pushed_down_for_non_score_order_by() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price FROM products WHERE text_match(description, 'iphone') ORDER BY price DESC LIMIT 10",
+        ).unwrap();
+        assert_eq!(plan.limit, Some(10));
+        assert!(!plan.limit_pushed_down);
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 100_000); // falls back to SQL_MATCH_LIMIT
+    }
+
+    #[test]
+    fn limit_not_pushed_down_when_residual_predicates() {
+        // score > 1.0 is a residual predicate (not pushed into Tantivy)
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, score FROM products WHERE text_match(description, 'iphone') AND score > 1.0 ORDER BY score DESC LIMIT 5",
+        ).unwrap();
+        assert_eq!(plan.limit, Some(5));
+        assert!(plan.has_residual_predicates);
+        assert!(!plan.limit_pushed_down);
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 100_000);
+    }
+
+    #[test]
+    fn no_limit_uses_sql_match_limit() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC",
+        ).unwrap();
+        assert_eq!(plan.limit, None);
+        assert!(!plan.limit_pushed_down);
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 100_000);
+    }
+
+    #[test]
+    fn limit_pushdown_no_order_by() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price FROM products WHERE text_match(description, 'iphone') LIMIT 50",
+        )
+        .unwrap();
+        assert_eq!(plan.limit, Some(50));
+        assert!(plan.limit_pushed_down); // no ORDER BY = default score sort, safe
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 50);
+    }
+
+    #[test]
+    fn limit_not_pushed_down_for_select_star() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT * FROM products WHERE text_match(description, 'iphone') LIMIT 10",
+        )
+        .unwrap();
+        assert_eq!(plan.limit, Some(10));
+        assert!(plan.selects_all_columns);
+        assert!(!plan.limit_pushed_down);
+    }
+
+    #[test]
+    fn grouped_query_with_limit_falls_back_to_datafusion() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT category, count(*) AS total FROM products WHERE text_match(description, 'iphone') GROUP BY category LIMIT 5",
+        ).unwrap();
+        assert_eq!(plan.limit, Some(5));
+        assert!(plan.grouped_sql.is_none()); // LIMIT disables grouped partials
+        // Without grouped partials, this becomes a regular query with no ORDER BY.
+        // No ORDER BY means default score sort, so limit pushdown IS safe here.
+        assert!(plan.limit_pushed_down);
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 5);
+    }
+
+    #[test]
+    fn explain_shows_limit_pushdown_info() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price, score FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC LIMIT 25",
+        ).unwrap();
+        let explain = plan.to_explain_json();
+        assert_eq!(explain["columns"]["limit"], 25);
+        assert_eq!(explain["columns"]["limit_pushed_down"], true);
+        let pipeline = explain["pipeline"].as_array().unwrap();
+        assert_eq!(pipeline[0]["max_hits"], 25);
+        assert_eq!(pipeline[0]["limit_pushed_down"], true);
+    }
 }

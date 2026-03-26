@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# dev_cluster_release.sh — same as dev_cluster.sh but uses the pre-built release binary
+# dev_cluster_release.sh — builds with native CPU optimizations and runs a release node
 
 if [ -z "$1" ]; then
     echo "Usage: ./dev_cluster_release.sh <node_id>"
@@ -9,6 +9,12 @@ fi
 
 NODE_ID=$1
 OFFSET=$((NODE_ID - 1))
+
+# Build with native CPU optimizations if binary is stale or missing
+if [ "$NODE_ID" = "1" ] || [ ! -f ./target/release/ferrissearch ]; then
+    echo "Building release binary with target-cpu=native..."
+    RUSTFLAGS="-C target-cpu=native" cargo build --release
+fi
 
 export FERRISSEARCH_NODE_NAME="node-$NODE_ID"
 export FERRISSEARCH_HTTP_PORT=$((9200 + OFFSET))
