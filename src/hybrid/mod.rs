@@ -825,4 +825,75 @@ mod tests {
         assert_eq!(pipeline[0]["max_hits"], 25);
         assert_eq!(pipeline[0]["limit_pushed_down"], true);
     }
+
+    // ── needs_id / needs_score detection tests ──────────────────────────
+
+    #[test]
+    fn plan_detects_needs_id_when_projected() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT _id, price FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        assert!(plan.needs_id);
+        assert!(!plan.needs_score);
+    }
+
+    #[test]
+    fn plan_detects_needs_score_when_projected() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, score FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        assert!(!plan.needs_id);
+        assert!(plan.needs_score);
+    }
+
+    #[test]
+    fn plan_detects_needs_score_in_order_by() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'test') ORDER BY score DESC",
+        )
+        .unwrap();
+        assert!(!plan.needs_id);
+        assert!(plan.needs_score);
+    }
+
+    #[test]
+    fn plan_neither_id_nor_score_when_not_referenced() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        assert!(!plan.needs_id);
+        assert!(!plan.needs_score);
+    }
+
+    #[test]
+    fn plan_detects_both_id_and_score() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT _id, score, title FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        assert!(plan.needs_id);
+        assert!(plan.needs_score);
+    }
+
+    #[test]
+    fn plan_select_star_needs_both() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT * FROM products WHERE text_match(description, 'test')",
+        )
+        .unwrap();
+        // SELECT * doesn't go through required_columns since selects_all_columns=true
+        // but needs_id/needs_score should be false (they're only set from explicit references)
+        assert!(!plan.needs_id);
+        assert!(!plan.needs_score);
+        assert!(plan.selects_all_columns);
+    }
 }

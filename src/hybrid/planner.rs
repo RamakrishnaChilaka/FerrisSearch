@@ -81,6 +81,10 @@ pub struct QueryPlan {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub limit_pushed_down: bool,
+    /// Whether the SQL query references `_id` in any projection, filter, or ordering.
+    pub needs_id: bool,
+    /// Whether the SQL query references `score` in any projection, filter, or ordering.
+    pub needs_score: bool,
 }
 
 impl QueryPlan {
@@ -332,7 +336,8 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     let (text_match, pushed_filters) = extract_pushdowns(&mut select.selection)?;
     let has_residual_predicates = select.selection.is_some();
     rewrite_table_name(select);
-    let required_columns = collect_required_columns(select, order_by.as_ref());
+    let (required_columns, needs_id, needs_score) =
+        collect_required_columns(select, order_by.as_ref());
     let group_by_columns = collect_group_by_columns(select);
     let grouped_sql = extract_grouped_sql_plan(
         select,
@@ -364,6 +369,8 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         limit,
         offset,
         limit_pushed_down,
+        needs_id,
+        needs_score,
     })
 }
 
@@ -884,7 +891,7 @@ fn projection_has_wildcard(select: &Select) -> bool {
 fn collect_required_columns(
     select: &Select,
     order_by: Option<&sqlparser::ast::OrderBy>,
-) -> Vec<String> {
+) -> (Vec<String>, bool, bool) {
     let mut columns = BTreeSet::new();
 
     for item in &select.projection {
@@ -919,9 +926,15 @@ fn collect_required_columns(
     }
 
     columns.remove(INTERNAL_TABLE_NAME);
+
+    // Detect whether _id and score are actually referenced before removing them
+    let needs_id = columns.contains("_id");
+    let needs_score = columns.contains("score") || columns.contains("_score");
+
     columns.remove("score");
+    columns.remove("_score");
     columns.remove("_id");
-    columns.into_iter().collect()
+    (columns.into_iter().collect(), needs_id, needs_score)
 }
 
 fn collect_group_by_columns(select: &Select) -> Vec<String> {

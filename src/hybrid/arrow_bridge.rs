@@ -40,14 +40,29 @@ pub fn build_record_batch_with_hints(
     column_store: &ColumnStore,
     type_hints: &HashMap<String, ColumnKind>,
 ) -> Result<RecordBatch> {
+    let row_count = column_store.row_count();
     let mut fields = vec![
         Field::new("_id", DataType::Utf8, false),
         Field::new("score", DataType::Float32, false),
     ];
-    let mut arrays: Vec<ArrayRef> = vec![
-        build_id_array(column_store),
-        Arc::new(build_score_array(column_store.scores())),
-    ];
+
+    let mut arrays: Vec<ArrayRef> = if column_store.ids().is_empty() && row_count > 0 {
+        // _id not needed: emit a column of empty strings
+        let mut builder = StringBuilder::with_capacity(row_count, 0);
+        for _ in 0..row_count {
+            builder.append_value("");
+        }
+        vec![Arc::new(builder.finish())]
+    } else {
+        vec![build_id_array(column_store)]
+    };
+
+    if column_store.scores().is_empty() && row_count > 0 {
+        // score not needed: emit a column of zeros
+        arrays.push(Arc::new(Float32Array::from(vec![0.0f32; row_count])));
+    } else {
+        arrays.push(Arc::new(build_score_array(column_store.scores())));
+    };
 
     for (name, values) in column_store.columns() {
         let kind = type_hints
