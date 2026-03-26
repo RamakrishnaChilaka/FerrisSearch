@@ -319,6 +319,39 @@ impl TransportClient {
         }
     }
 
+    /// Forward a SQL RecordBatch request to a specific shard (returns Arrow IPC)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_sql_batch_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
+    ) -> Result<(datafusion::arrow::record_batch::RecordBatch, usize), anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(SqlRecordBatchRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            search_request_json: serde_json::to_vec(req)?,
+            columns: columns.to_vec(),
+            needs_id,
+            needs_score,
+        });
+        let response = client.sql_record_batch(request).await?.into_inner();
+        if response.success {
+            let batch = crate::hybrid::arrow_bridge::record_batch_from_ipc(&response.arrow_ipc)?;
+            Ok((batch, response.total_hits as usize))
+        } else {
+            Err(anyhow::anyhow!(
+                "Shard SQL batch failed: {}",
+                response.error
+            ))
+        }
+    }
+
     /// Sends a heartbeat ping to another node
     pub async fn send_ping(
         &self,

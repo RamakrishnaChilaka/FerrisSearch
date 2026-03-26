@@ -143,3 +143,127 @@ fn build_array(values: &[Value], kind: ColumnKind) -> Result<ArrayRef> {
         }
     }
 }
+
+/// Serialize a RecordBatch to Arrow IPC stream format bytes.
+pub fn record_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer =
+            datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())?;
+        writer.write(batch)?;
+        writer.finish()?;
+    }
+    Ok(buf)
+}
+
+/// Deserialize a RecordBatch from Arrow IPC stream format bytes.
+pub fn record_batch_from_ipc(bytes: &[u8]) -> Result<RecordBatch> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut reader = datafusion::arrow::ipc::reader::StreamReader::try_new(cursor, None)?;
+    reader
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Arrow IPC stream contained no batches"))?
+        .map_err(|e| anyhow::anyhow!("Arrow IPC deserialization error: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hybrid::column_store::ColumnStore;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn arrow_ipc_round_trip_preserves_data() {
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let scores = vec![1.5f32, 2.0];
+        let mut cols = BTreeMap::new();
+        cols.insert(
+            "price".to_string(),
+            vec![Value::from(10.5), Value::from(20.0)],
+        );
+        cols.insert(
+            "name".to_string(),
+            vec![
+                Value::String("widget".to_string()),
+                Value::String("gadget".to_string()),
+            ],
+        );
+        let store = ColumnStore::new(ids, scores, cols);
+        let batch = build_record_batch(&store).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let ipc_bytes = record_batch_to_ipc(&batch).unwrap();
+        assert!(!ipc_bytes.is_empty());
+
+        let restored = record_batch_from_ipc(&ipc_bytes).unwrap();
+        assert_eq!(restored.num_rows(), 2);
+        assert_eq!(restored.num_columns(), batch.num_columns());
+
+        // Verify column names match
+        let original_schema = batch.schema();
+        let restored_schema = restored.schema();
+        let original_names: Vec<&str> = original_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        let restored_names: Vec<&str> = restored_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(original_names, restored_names);
+    }
+
+    #[test]
+    fn arrow_ipc_round_trip_empty_batch() {
+        let store = ColumnStore::new(vec![], vec![], BTreeMap::new());
+        let batch = build_record_batch(&store).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+
+        let ipc_bytes = record_batch_to_ipc(&batch).unwrap();
+        let restored = record_batch_from_ipc(&ipc_bytes).unwrap();
+        assert_eq!(restored.num_rows(), 0);
+    }
+
+    #[test]
+    fn arrow_ipc_round_trip_with_type_hints() {
+        let ids = vec!["x".to_string()];
+        let scores = vec![0.0f32];
+        let mut cols = BTreeMap::new();
+        cols.insert("amount".to_string(), vec![Value::from(42.5)]);
+        let store = ColumnStore::new(ids, scores, cols);
+
+        let mut hints = HashMap::new();
+        hints.insert("amount".to_string(), ColumnKind::Float64);
+        let batch = build_record_batch_with_hints(&store, &hints).unwrap();
+
+        let ipc_bytes = record_batch_to_ipc(&batch).unwrap();
+        let restored = record_batch_from_ipc(&ipc_bytes).unwrap();
+
+        // Verify Float64 type is preserved
+        let restored_schema = restored.schema();
+        let field = restored_schema.field_with_name("amount").unwrap();
+        assert_eq!(*field.data_type(), DataType::Float64);
+    }
+
+    #[test]
+    fn arrow_ipc_round_trip_skip_id_score() {
+        // Empty ids/scores but data present — simulates needs_id=false, needs_score=false
+        let mut cols = BTreeMap::new();
+        cols.insert(
+            "category".to_string(),
+            vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ],
+        );
+        let store = ColumnStore::new(vec![], vec![], cols);
+        let batch = build_record_batch(&store).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let ipc_bytes = record_batch_to_ipc(&batch).unwrap();
+        let restored = record_batch_from_ipc(&ipc_bytes).unwrap();
+        assert_eq!(restored.num_rows(), 2);
+    }
+}

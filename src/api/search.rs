@@ -298,17 +298,15 @@ pub async fn search_sql(
     );
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
-    let all_shards_local = metadata
-        .shard_routing
-        .keys()
-        .all(|shard_id| local_shard_ids.contains(shard_id));
 
-    let direct_sql = if all_shards_local && !plan.selects_all_columns {
+    // Distributed fast-field SQL: scatter sql_record_batch to all shards (local + remote)
+    let direct_sql = if !plan.selects_all_columns {
         let mut batches = Vec::new();
         let mut total_hits = 0usize;
         let mut successful_shards = 0u32;
-        let mut direct_error = None;
+        let mut direct_error: Option<anyhow::Error> = None;
 
+        // Local shards: call engine.sql_record_batch directly
         for (_shard_id, engine) in &local_shards {
             match engine.sql_record_batch(
                 &search_req,
@@ -330,6 +328,53 @@ pub async fn search_sql(
                 Err(error) => {
                     direct_error = Some(error);
                     break;
+                }
+            }
+        }
+
+        // Remote shards: scatter Arrow IPC requests via gRPC
+        if direct_error.is_none() {
+            let cs = state.cluster_manager.get_state();
+            let mut remote_futures = Vec::new();
+
+            for (shard_id, routing) in &metadata.shard_routing {
+                if local_shard_ids.contains(shard_id) {
+                    continue; // already handled locally
+                }
+                let primary_node_id = &routing.primary;
+                if let Some(node) = cs.nodes.get(primary_node_id) {
+                    let client = state.transport_client.clone();
+                    let node = node.clone();
+                    let idx = index_name.clone();
+                    let sid = *shard_id;
+                    let req = search_req.clone();
+                    let cols = plan.required_columns.clone();
+                    let nid = plan.needs_id;
+                    let nsc = plan.needs_score;
+                    remote_futures.push(tokio::spawn(async move {
+                        client
+                            .forward_sql_batch_to_shard(&node, &idx, sid, &req, &cols, nid, nsc)
+                            .await
+                    }));
+                }
+            }
+
+            let remote_results = futures::future::join_all(remote_futures).await;
+            for result in remote_results {
+                match result {
+                    Ok(Ok((batch, hits))) => {
+                        successful_shards += 1;
+                        total_hits += hits;
+                        batches.push(batch);
+                    }
+                    Ok(Err(e)) => {
+                        direct_error = Some(e);
+                        break;
+                    }
+                    Err(e) => {
+                        direct_error = Some(anyhow::anyhow!("remote shard task failed: {}", e));
+                        break;
+                    }
                 }
             }
         }

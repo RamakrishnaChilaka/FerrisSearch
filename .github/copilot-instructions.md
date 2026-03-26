@@ -89,7 +89,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 505 unit tests + 30 consensus integration + 39 replication integration + 9 REST API integration = 583 total
+- 509 unit tests + 30 consensus integration + 39 replication integration + 9 REST API integration = 587 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -225,6 +225,7 @@ if let Some(ref raft) = state.raft {
 | `BulkIndex` | Route bulk write to shard primary | `forward_bulk_to_shard()` |
 | `SearchShard` | Scatter search to remote shards | `forward_search_to_shard()` |
 | `SearchShardDsl` | Scatter DSL search to remote shards | `forward_search_dsl_to_shard()` |
+| `SqlRecordBatch` | Scatter SQL fast-field batch to remote shards (Arrow IPC) | `forward_sql_batch_to_shard()` |
 
 ### Adding a new Raft-write API endpoint (checklist)
 1. Add proto messages (`<Op>Request` / `<Op>Response`) to `proto/transport.proto`
@@ -495,6 +496,9 @@ GetDoc(ShardGetRequest) → ShardGetResponse
 // Shard search
 SearchShard(ShardSearchRequest) → ShardSearchResponse
 SearchShardDsl(ShardSearchDslRequest) → ShardSearchResponse
+
+// Distributed SQL (Arrow IPC)
+SqlRecordBatch(SqlRecordBatchRequest) → SqlRecordBatchResponse
 
 // Replication
 ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse
