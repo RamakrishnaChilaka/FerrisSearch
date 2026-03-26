@@ -78,6 +78,9 @@ pub struct QueryPlan {
     pub has_residual_predicates: bool,
     pub selects_all_columns: bool,
     pub grouped_sql: Option<GroupedSqlPlan>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub limit_pushed_down: bool,
 }
 
 impl QueryPlan {
@@ -130,6 +133,9 @@ impl QueryPlan {
                     ),
                 )]),
             )
+        } else if self.limit_pushed_down {
+            let size = self.limit.unwrap_or(SQL_MATCH_LIMIT) + self.offset.unwrap_or(0);
+            (size, HashMap::new())
         } else {
             (SQL_MATCH_LIMIT, HashMap::new())
         };
@@ -174,7 +180,8 @@ impl QueryPlan {
             "name": "tantivy_search",
             "description": "Execute search query in Tantivy to collect matching doc IDs and scores",
             "search_query": search_request.query,
-            "max_hits": SQL_MATCH_LIMIT,
+            "max_hits": search_request.size,
+            "limit_pushed_down": self.limit_pushed_down,
         });
         if let Some(tm) = &self.text_match {
             tantivy_stage["text_match"] = serde_json::json!({
@@ -280,6 +287,9 @@ impl QueryPlan {
                 "group_by": self.group_by_columns,
                 "selects_all": self.selects_all_columns,
                 "uses_grouped_partials": self.grouped_sql.is_some(),
+                "limit": self.limit,
+                "offset": self.offset,
+                "limit_pushed_down": self.limit_pushed_down,
             },
             "rewritten_sql": self.rewritten_sql,
             "pipeline": stages,
@@ -302,6 +312,8 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         _ => bail!("Only SELECT statements are supported"),
     };
     let order_by = query.order_by.clone();
+    let limit = parse_limit_expr(&query.limit);
+    let offset = parse_offset_expr(&query.offset);
 
     let select = match query.body.as_mut() {
         SetExpr::Select(select) => select,
@@ -328,9 +340,16 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         order_by.as_ref(),
         has_residual_predicates,
         selects_all_columns,
-        sql,
+        limit,
+        offset,
         &group_by_columns,
     )?;
+
+    let limit_pushed_down = limit.is_some()
+        && !has_residual_predicates
+        && grouped_sql.is_none()
+        && !selects_all_columns
+        && is_order_by_score_only(order_by.as_ref());
 
     Ok(QueryPlan {
         index_name: index_name.to_string(),
@@ -343,6 +362,9 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         has_residual_predicates,
         selects_all_columns,
         grouped_sql,
+        limit,
+        offset,
+        limit_pushed_down,
     })
 }
 
@@ -351,14 +373,16 @@ fn extract_grouped_sql_plan(
     order_by: Option<&sqlparser::ast::OrderBy>,
     has_residual_predicates: bool,
     selects_all_columns: bool,
-    original_sql: &str,
+    limit: Option<usize>,
+    offset: Option<usize>,
     group_by_columns: &[String],
 ) -> Result<Option<GroupedSqlPlan>> {
     if group_by_columns.is_empty()
         || has_residual_predicates
         || selects_all_columns
         || select.having.is_some()
-        || contains_limit_or_offset(original_sql)
+        || limit.is_some()
+        || offset.is_some()
     {
         return Ok(None);
     }
@@ -525,9 +549,40 @@ fn parse_grouped_metric(expr: &Expr, alias: Option<String>) -> Result<Option<Sql
     }))
 }
 
-fn contains_limit_or_offset(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    lower.contains(" limit ") || lower.contains(" offset ")
+fn parse_limit_expr(limit_expr: &Option<Expr>) -> Option<usize> {
+    let expr = limit_expr.as_ref()?;
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlValue::Number(n, _) => n.parse::<usize>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_offset_expr(offset: &Option<sqlparser::ast::Offset>) -> Option<usize> {
+    let offset = offset.as_ref()?;
+    match &offset.value {
+        Expr::Value(value) => match &value.value {
+            SqlValue::Number(n, _) => n.parse::<usize>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_order_by_score_only(order_by: Option<&sqlparser::ast::OrderBy>) -> bool {
+    let Some(order_by) = order_by else {
+        return true;
+    };
+    match &order_by.kind {
+        OrderByKind::Expressions(exprs) => exprs.iter().all(|expr| {
+            expr_to_field_name(&expr.expr)
+                .map(|name| name == "score" || name == "_score")
+                .unwrap_or(false)
+        }),
+        OrderByKind::All(_) => false,
+    }
 }
 
 fn extract_single_table(select: &Select) -> Result<String> {
