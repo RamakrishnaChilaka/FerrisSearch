@@ -593,3 +593,118 @@ async fn rest_sql_fast_field_path_returns_correct_ids_and_values() -> Result<()>
 
     Ok(())
 }
+
+#[tokio::test]
+async fn rest_sql_truncated_flag_not_set_for_explicit_limit() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // LIMIT 1 but 3 docs match — user explicitly asked for 1, NOT truncated
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone') LIMIT 1"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["truncated"], json!(false));
+    assert_eq!(body["matched_hits"], json!(3));
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 1);
+
+    // No LIMIT — all 3 docs fit within default 100K limit → not truncated
+    let (status2, body2) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone')"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(body2["truncated"], json!(false));
+    assert_eq!(body2["matched_hits"], json!(3));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_limit_returns_exact_row_count() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // LIMIT 2: must return exactly 2 rows, not 2 × number_of_shards
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone') LIMIT 2"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "LIMIT 2 must return exactly 2 rows, got {}",
+        rows.len()
+    );
+
+    // LIMIT 1 with ORDER BY: must return exactly 1 row
+    let (status2, body2) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone') ORDER BY price DESC LIMIT 1"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status2, StatusCode::OK);
+    let rows2 = body2["rows"].as_array().expect("rows should be array");
+    assert_eq!(
+        rows2.len(),
+        1,
+        "LIMIT 1 must return exactly 1 row, got {}",
+        rows2.len()
+    );
+
+    // Verify it's the highest price (ORDER BY price DESC)
+    let price = rows2[0]["price"].as_f64().unwrap();
+    assert!(
+        price >= 999.0,
+        "ORDER BY DESC should return highest price first"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_count_star_without_group_by_returns_correct_count() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // SELECT count(*) without GROUP BY — must return the actual match count, not 0
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT count(*) AS total FROM products WHERE text_match(description, 'iphone')"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 1, "count(*) should return exactly 1 row");
+    let total = rows[0]["total"].as_i64().unwrap();
+    assert_eq!(total, 3, "count(*) should return 3 matching docs");
+
+    Ok(())
+}
