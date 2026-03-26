@@ -72,7 +72,13 @@ impl ColumnStore {
     }
 
     pub fn row_count(&self) -> usize {
-        self.ids.len()
+        if !self.ids.is_empty() {
+            self.ids.len()
+        } else if !self.scores.is_empty() {
+            self.scores.len()
+        } else {
+            self.columns.values().next().map_or(0, |v| v.len())
+        }
     }
 
     pub fn ids(&self) -> &[String] {

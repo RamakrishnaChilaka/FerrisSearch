@@ -26,6 +26,7 @@ pub trait SearchEngine: Send + Sync {
     // Search
     fn search(&self, query_str: &str) -> Result<Vec<Value>>;
     fn search_query(&self, req: &SearchRequest) -> Result<(Vec<Value>, usize, HashMap<String, PartialAggResult>)>;
+    fn sql_record_batch(&self, req: &SearchRequest, columns: &[String], needs_id: bool, needs_score: bool) -> Result<Option<SqlBatchResult>>;
     fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<Value>>;
     fn search_knn_filtered(&self, field: &str, vector: &[f32], k: usize, filter: Option<&QueryClause>) -> Result<Vec<Value>>;
 
@@ -95,6 +96,8 @@ Numeric fields use three Tantivy flags (mirrors OpenSearch default doc_values: t
 - STORED - preserves original value, retrievable in results
 - FAST - columnar storage, critical for range queries, sorting, and aggregations
 
+The `_id` field uses `(STRING | STORED).set_fast(None)` — enables fast-field columnar access so the SQL fast-field path can read `_id` without loading the full stored document.
+
 Integer and Float fields get all three: INDEXED | STORED | FAST.
 Keyword and Boolean fields get: STRING | STORED + FAST (set_fast(None) for dictionary-encoded columnar).
 Without FAST, range queries scan the inverted index (slow on high-cardinality fields).
@@ -111,7 +114,10 @@ for agg-only `size=0` requests. When no aggs are requested, `None` adds zero ove
 - Direct access patterns already expected in this module:
     - numeric columns: `segment_reader.fast_fields().f64(name)` / `.i64(name)`
     - keyword columns: `segment_reader.fast_fields().str(name)` with `term_ords(doc)` and `ord_to_str()`
-- `sql_record_batch(...)` is the reference pattern for projecting matched docs from fast fields into Arrow without `_source` materialization. It builds `type_hints` from `SqlFieldReader` variants (F64/I64 → `ColumnKind::Float64`, Str → `ColumnKind::Utf8`) and passes them to `build_record_batch_with_hints()` so that zero-result queries still produce correctly-typed Arrow columns instead of defaulting to Utf8.
+- `sql_record_batch(req, columns, needs_id, needs_score)` is the reference pattern for projecting matched docs from fast fields into Arrow without `_source` materialization. It builds `type_hints` from `SqlFieldReader` variants (F64/I64 → `ColumnKind::Float64`, Str → `ColumnKind::Utf8`) and passes them to `build_record_batch_with_hints()` so that zero-result queries still produce correctly-typed Arrow columns instead of defaulting to Utf8.
+- When `needs_id` is false, `_id` fast-field reads are skipped and the Arrow `_id` column is filled with empty strings.
+- When `needs_score` is false, score collection is skipped and the Arrow `score` column is filled with zeros.
+- The planner detects `needs_id`/`needs_score` by checking whether the SQL query references `_id` or `score`/`_score` in any projection, filter, GROUP BY, or ORDER BY.
 - For grouped analytics over matched docs, prefer shard-local partial aggregation from fast fields and merge compact partials at the coordinator.
 - Fall back to `_source` materialization only for fields or expressions that cannot be read from fast fields or stored fields.
 - Tantivy is the preferred execution engine for search-aware work: pushdown, ranking, field reads, and shard-local partial aggregation should stay here.

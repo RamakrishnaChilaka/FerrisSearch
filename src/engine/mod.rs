@@ -96,6 +96,8 @@ pub trait SearchEngine: Send + Sync {
         &self,
         _req: &crate::search::SearchRequest,
         _columns: &[String],
+        _needs_id: bool,
+        _needs_score: bool,
     ) -> Result<Option<SqlBatchResult>> {
         Ok(None)
     }

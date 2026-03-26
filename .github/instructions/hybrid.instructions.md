@@ -17,7 +17,27 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Read Tantivy fast fields directly from Rust:
   - numeric: `segment_reader.fast_fields().f64(name)` / `.i64(name)`
   - keyword/string: `segment_reader.fast_fields().str(name)` with `term_ords(doc)` and `ord_to_str()`
+  - `_id`: `segment_reader.fast_fields().str("_id")` — `_id` is `(STRING | STORED).set_fast(None)`, enabling fast-field columnar access
 - Prefer fast fields or stored fields over `_source` materialization whenever the needed SQL columns are available columnarly.
+
+## Stored Fields Optimization (sql_record_batch)
+- When all requested SQL columns have fast-field readers (no `SourceFallback`), `sql_record_batch` reads `_id` from its fast-field column and skips `searcher.doc()` entirely.
+- This avoids loading the full stored document (which includes the `_source` JSON blob) from disk for every hit in the SQL fast-field execution path.
+- When any column requires `SourceFallback` (unmapped or non-fast field), the stored doc is loaded as before and `_id` is read from it.
+- The `needs_stored_doc` flag is computed once per query by scanning all field plans for `SourceFallback`.
+
+## _id/score Skip Optimization
+- `QueryPlan` has `needs_id: bool` and `needs_score: bool` flags, detected by checking whether the SQL query references `_id` or `score`/`_score` in any projection, filter, GROUP BY, or ORDER BY.
+- When `needs_id` is false, the engine skips reading `_id` from fast-field columns entirely and the Arrow bridge emits an empty-string `_id` column.
+- When `needs_score` is false, the engine skips collecting scores and the Arrow bridge emits a zero-filled `score` column.
+- The DataFusion table schema always includes `_id` and `score` columns for compatibility, but they contain dummy values when not referenced.
+- Typical SQL queries like `SELECT category, avg(price) FROM ... GROUP BY category` benefit from this: zero `_id` reads across all matched docs.
+
+## SQL LIMIT Pushdown
+- When a SQL query has LIMIT/OFFSET and ORDER BY is `_score`-only (or absent), the limit is pushed into Tantivy's `TopDocs` collector.
+- `QueryPlan` has `limit: Option<usize>`, `offset: Option<usize>`, and `limit_pushed_down: bool` fields.
+- `parse_limit_expr()` and `parse_offset_expr()` extract numeric values from `sqlparser::ast::LimitClause`.
+- When limit is pushed down, the Tantivy search collects only `limit + offset` docs instead of the default 100K.
 
 ## Planning Rules
 - Split planning into two stages:
@@ -59,10 +79,12 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - The plain `build_record_batch()` (no hints) is used only by the `materialized_hits_fallback` path where schema info is unavailable.
 
 ## Testing Expectations
-- Add unit tests for pushdown extraction, quoted index handling, grouped analytics planning, and residual predicate detection.
+- Add unit tests for pushdown extraction, quoted index handling, grouped analytics planning, LIMIT pushdown, and residual predicate detection.
 - Add execution tests for both:
   - `tantivy_grouped_partials`
   - `tantivy_fast_fields`
   - `materialized_hits_fallback`
 - Add regression tests for zero-result or all-null columns: verify that schema-derived `type_hints` override `infer_column_kind` to produce correct Arrow DataTypes (e.g. Float64, not Utf8 for numeric columns).
+- Add tests verifying that the fast-field path reads `_id` from the fast-field column (not from stored docs) when all columns are fast-field-backed.
+- Add tests verifying that mixed fast+fallback column queries still return correct `_id` values.
 - Live tests should inspect both returned rows and planner metadata.

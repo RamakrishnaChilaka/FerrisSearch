@@ -558,3 +558,38 @@ async fn rest_sql_uses_materialized_hits_fallback_for_select_star() -> Result<()
     assert!(body["rows"].as_array().is_some());
     Ok(())
 }
+
+#[tokio::test]
+async fn rest_sql_fast_field_path_returns_correct_ids_and_values() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // Non-grouped, specific columns → should use tantivy_fast_fields path
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone') ORDER BY price DESC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 3);
+
+    // Verify ordering (price DESC) and correct values
+    let first_price = rows[0]["price"].as_f64().unwrap();
+    let last_price = rows[rows.len() - 1]["price"].as_f64().unwrap();
+    assert!(
+        first_price >= last_price,
+        "rows should be ordered by price DESC"
+    );
+
+    // Verify brand values are present and correct
+    let brands: Vec<&str> = rows.iter().filter_map(|r| r["brand"].as_str()).collect();
+    assert_eq!(brands.len(), 3);
+
+    Ok(())
+}

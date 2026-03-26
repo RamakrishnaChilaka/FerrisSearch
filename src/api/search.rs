@@ -310,7 +310,12 @@ pub async fn search_sql(
         let mut direct_error = None;
 
         for (_shard_id, engine) in &local_shards {
-            match engine.sql_record_batch(&search_req, &plan.required_columns) {
+            match engine.sql_record_batch(
+                &search_req,
+                &plan.required_columns,
+                plan.needs_id,
+                plan.needs_score,
+            ) {
                 Ok(Some(batch_result)) => {
                     successful_shards += 1;
                     total_hits += batch_result.total_hits;

@@ -7,10 +7,12 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 ## Tech Stack
 - Rust 1.94.0, edition 2024
 - openraft 0.10.0-alpha.17 (features: serde, tokio-rt)
-- Tantivy (search engine)
+- Tantivy 0.25.0 (search engine)
+- DataFusion 53 / sqlparser 0.61 (SQL layer)
 - Axum (HTTP API)
-- Tonic/gRPC (inter-node transport)
+- Tonic 0.13/gRPC (inter-node transport)
 - Protobuf (proto/transport.proto)
+- redb 3 (persistent Raft log storage — v3 file format, ~15% faster bulk writes, smaller files)
 - jemalloc (global allocator via tikv-jemallocator — reduces post-workload RSS retention vs glibc malloc)
 
 ## Architecture
@@ -45,6 +47,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `raft.add_learner(node_id, BasicNode { addr }, blocking)` then `raft.change_membership(voter_set, false)` to add nodes
 
 ## Tantivy Field Schema Flags
+- `_id` field uses `(STRING | STORED).set_fast(None)` — enables fast-field columnar access for SQL queries without loading stored docs
 - Numeric fields (Integer, Float) use INDEXED | STORED | FAST (mirrors OpenSearch default doc_values: true)
 - Keyword and Boolean fields use STRING | STORED + set_fast(None) for dictionary-encoded columnar
 - FAST enables columnar storage - critical for range queries, sorting, and aggregations
@@ -68,6 +71,8 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `build_record_batch_with_hints(column_store, type_hints)` uses schema-derived type hints to set correct Arrow column types
 - Without type hints, `infer_column_kind()` scans data values and defaults to `Utf8` for empty/all-null columns — this breaks aggregation functions like `avg()`, `sum()` on zero-result queries
 - The fast-field path (`sql_record_batch`) MUST populate `type_hints` from `SqlFieldReader` variants (F64/I64 → Float64, Str → Utf8) or the Tantivy schema when no segments exist
+- The fast-field path skips `searcher.doc()` entirely when all requested columns have fast-field readers — reads `_id` from its fast-field column instead of loading stored docs
+- When the SQL query does not reference `_id` or `score`, those columns are filled with empty/zero values and fast-field reads for `_id` are skipped entirely (`needs_id`/`needs_score` flags on `QueryPlan`)
 - The `materialized_hits_fallback` path uses plain `build_record_batch()` (no hints, data-driven inference only)
 - SELECT aliases must be excluded from `required_columns` — aliases (e.g. `total` from `count(*) AS total`) are not real schema fields and cause `SourceFallback` → Null → Utf8 misclassification
 
@@ -84,7 +89,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 480 unit tests + 30 consensus integration + 39 replication integration + 8 REST API integration = 557 total
+- 505 unit tests + 30 consensus integration + 39 replication integration + 9 REST API integration = 583 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -338,14 +343,18 @@ KnnParams { vector: Vec<f32>, k: usize, filter: Option<QueryClause> }  // option
 ```rust
 pub trait SearchEngine: Send + Sync {
     fn add_document(&self, doc_id: &str, payload: Value) -> Result<String>;
+    fn add_document_with_seq(&self, doc_id: &str, payload: Value, seq_no: u64) -> Result<String>;
     fn bulk_add_documents(&self, docs: Vec<(String, Value)>) -> Result<Vec<String>>;
+    fn bulk_add_documents_with_start_seq(&self, docs: Vec<(String, Value)>, start_seq_no: u64) -> Result<Vec<String>>;
     fn delete_document(&self, doc_id: &str) -> Result<u64>;
+    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64>;
     fn get_document(&self, doc_id: &str) -> Result<Option<Value>>;
     fn refresh(&self) -> Result<()>;
     fn flush(&self) -> Result<()>;
     fn flush_with_global_checkpoint(&self) -> Result<()>;
-    fn search(&self, query_str: &str) -> Result<Vec<Value>>;           // simple query
-    fn search_query(&self, req: &SearchRequest) -> Result<(Vec<Value>, usize)>; // DSL
+    fn search(&self, query_str: &str) -> Result<Vec<Value>>;
+    fn search_query(&self, req: &SearchRequest) -> Result<(Vec<Value>, usize, HashMap<String, PartialAggResult>)>;
+    fn sql_record_batch(&self, req: &SearchRequest, columns: &[String], needs_id: bool, needs_score: bool) -> Result<Option<SqlBatchResult>>;
     fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<Value>>;
     fn search_knn_filtered(&self, field: &str, vector: &[f32], k: usize, filter: Option<&QueryClause>) -> Result<Vec<Value>>;
     fn doc_count(&self) -> u64;

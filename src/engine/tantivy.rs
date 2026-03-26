@@ -61,7 +61,7 @@ impl HotEngine {
         std::fs::create_dir_all(&index_path)?;
 
         let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_text_field("_id", STRING | STORED);
+        let id_field = schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
         let source_field = schema_builder.add_text_field("_source", STORED);
         let body_field = schema_builder.add_text_field("body", TEXT | STORED);
 
@@ -196,6 +196,8 @@ impl HotEngine {
         &self,
         req: &crate::search::SearchRequest,
         columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
     ) -> Result<super::SqlBatchResult> {
         let searcher = self.reader.searcher();
         let query = self.build_query(&req.query)?;
@@ -210,18 +212,36 @@ impl HotEngine {
             .read()
             .unwrap_or_else(|e| e.into_inner());
 
+        // Build per-segment field readers for requested columns
         let mut field_plans = Vec::with_capacity(segment_readers.len());
+        // Also open fast-field reader for _id per segment (only if needed)
+        let mut id_readers: Vec<Option<tantivy::columnar::StrColumn>> =
+            Vec::with_capacity(segment_readers.len());
+        let mut needs_stored_doc = false;
+
         for segment_reader in segment_readers {
             let fast_fields = segment_reader.fast_fields();
             let mut segment_fields = Vec::with_capacity(columns.len());
             for column in columns {
-                segment_fields.push(open_sql_field_reader(&schema, fast_fields, column));
+                let reader = open_sql_field_reader(&schema, fast_fields, column);
+                if matches!(reader, SqlFieldReader::SourceFallback) {
+                    needs_stored_doc = true;
+                }
+                segment_fields.push(reader);
             }
             field_plans.push(segment_fields);
+
+            // Only open _id fast-field reader if we actually need _id
+            let id_reader = if needs_id {
+                fast_fields.str("_id").ok().flatten()
+            } else {
+                None
+            };
+            id_readers.push(id_reader);
         }
 
-        let mut ids = Vec::with_capacity(top_docs.len());
-        let mut scores = Vec::with_capacity(top_docs.len());
+        let mut ids = Vec::with_capacity(if needs_id { top_docs.len() } else { 0 });
+        let mut scores = Vec::with_capacity(if needs_score { top_docs.len() } else { 0 });
         let mut projected_columns = std::collections::BTreeMap::new();
         for column in columns {
             projected_columns.insert(column.clone(), Vec::with_capacity(top_docs.len()));
@@ -230,17 +250,47 @@ impl HotEngine {
         for (score, doc_address) in top_docs {
             let seg_ord = doc_address.segment_ord as usize;
             let doc_id = doc_address.doc_id;
-            let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
 
-            ids.push(
-                retrieved_doc
-                    .get_all(registry.id_field)
-                    .next()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            );
-            scores.push(score);
+            // Load stored doc only when needed for SourceFallback columns
+            let retrieved_doc = if needs_stored_doc {
+                Some(searcher.doc::<TantivyDocument>(doc_address)?)
+            } else {
+                None
+            };
+
+            // Read _id only if the SQL query references it
+            if needs_id {
+                let id_str = if needs_stored_doc {
+                    retrieved_doc
+                        .as_ref()
+                        .unwrap()
+                        .get_all(registry.id_field)
+                        .next()
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                } else if let Some(ref id_reader) = id_readers[seg_ord] {
+                    let mut ords = id_reader.term_ords(doc_id);
+                    if let Some(ord) = ords.next() {
+                        let mut text = String::new();
+                        if id_reader.ord_to_str(ord, &mut text).unwrap_or(false) {
+                            text
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                ids.push(id_str);
+            }
+
+            // Read score only if the SQL query references it
+            if needs_score {
+                scores.push(score);
+            }
 
             let mut source_json = None;
             for (index, column) in columns.iter().enumerate() {
@@ -269,6 +319,8 @@ impl HotEngine {
                     SqlFieldReader::SourceFallback => {
                         let source = source_json.get_or_insert_with(|| {
                             retrieved_doc
+                                .as_ref()
+                                .unwrap()
                                 .get_all(registry.source_field)
                                 .next()
                                 .and_then(|value| value.as_str())
@@ -2047,8 +2099,16 @@ impl super::SearchEngine for HotEngine {
         &self,
         req: &crate::search::SearchRequest,
         columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
     ) -> Result<Option<super::SqlBatchResult>> {
-        Ok(Some(HotEngine::sql_record_batch(self, req, columns)?))
+        Ok(Some(HotEngine::sql_record_batch(
+            self,
+            req,
+            columns,
+            needs_id,
+            needs_score,
+        )?))
     }
 
     fn doc_count(&self) -> u64 {
@@ -3296,7 +3356,12 @@ mod tests {
         };
 
         let batch = engine
-            .sql_record_batch(&req, &["title".to_string(), "price".to_string()])
+            .sql_record_batch(
+                &req,
+                &["title".to_string(), "price".to_string()],
+                true,
+                true,
+            )
             .unwrap();
         assert_eq!(batch.total_hits, 1);
         assert_eq!(batch.batch.num_rows(), 1);
@@ -4651,5 +4716,512 @@ mod tests {
         engine.refresh().unwrap();
         engine.refresh().unwrap();
         assert_eq!(engine.doc_count(), 1);
+    }
+
+    // ── Stored-fields optimization tests (fast-field _id path) ──────────
+
+    fn create_typed_engine() -> (tempfile::TempDir, HotEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Float,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "category".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        let engine = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            crate::wal::TranslogDurability::Request,
+        )
+        .unwrap();
+        (dir, engine)
+    }
+
+    #[test]
+    fn sql_batch_fast_path_reads_id_from_fast_field() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document(
+                "doc-alpha",
+                json!({"title": "Widget", "price": 19.99, "category": "gadgets"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "doc-beta",
+                json!({"title": "Sprocket", "price": 5.50, "category": "parts"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // All requested columns (title, price) have fast fields → fast path
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(
+                &req,
+                &["title".to_string(), "price".to_string()],
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 2);
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let mut ids: Vec<&str> = (0..result.batch.num_rows())
+            .map(|i| id_col.value(i))
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["doc-alpha", "doc-beta"]);
+    }
+
+    #[test]
+    fn sql_batch_source_fallback_still_works() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document(
+                "fb-1",
+                json!({"title": "Laptop", "price": 1200.0, "description": "A fine laptop"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // "description" is not a mapped fast field → SourceFallback path
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(
+                &req,
+                &["title".to_string(), "description".to_string()],
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 1);
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "fb-1");
+
+        let desc_col = result
+            .batch
+            .column_by_name("description")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(desc_col.value(0), "A fine laptop");
+    }
+
+    #[test]
+    fn sql_batch_fast_path_preserves_correct_ids_after_delete() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document("keep-me", json!({"title": "Keep", "price": 10.0}))
+            .unwrap();
+        engine
+            .add_document("delete-me", json!({"title": "Delete", "price": 20.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.delete_document("delete-me").unwrap();
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(
+                &req,
+                &["title".to_string(), "price".to_string()],
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 1);
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "keep-me");
+    }
+
+    #[test]
+    fn sql_batch_fast_path_empty_result() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document("d1", json!({"title": "Widget", "price": 5.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // Query that matches nothing
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::Term(HashMap::from([(
+                "title".to_string(),
+                json!("nonexistent"),
+            )])),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(
+                &req,
+                &["title".to_string(), "price".to_string()],
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 0);
+        assert_eq!(result.total_hits, 0);
+    }
+
+    #[test]
+    fn sql_batch_fast_path_many_docs_ids_correct() {
+        let (_dir, engine) = create_typed_engine();
+        for i in 0..50 {
+            engine
+                .add_document(
+                    &format!("doc-{:03}", i),
+                    json!({"title": format!("item-{}", i), "price": i as f64}),
+                )
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 100,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(&req, &["price".to_string()], true, true)
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 50);
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let mut ids: Vec<String> = (0..result.batch.num_rows())
+            .map(|i| id_col.value(i).to_string())
+            .collect();
+        ids.sort();
+        let mut expected: Vec<String> = (0..50).map(|i| format!("doc-{:03}", i)).collect();
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn sql_batch_mixed_fast_and_fallback_columns() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document(
+                "m1",
+                json!({"title": "Gizmo", "price": 42.0, "notes": "special order"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "m2",
+                json!({"title": "Doodad", "price": 7.5, "notes": "in stock"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // "price" is fast, "notes" is SourceFallback
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(
+                &req,
+                &["price".to_string(), "notes".to_string()],
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 2);
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let mut ids: Vec<&str> = (0..result.batch.num_rows())
+            .map(|i| id_col.value(i))
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["m1", "m2"]);
+
+        let notes_col = result
+            .batch
+            .column_by_name("notes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let mut notes: Vec<&str> = (0..result.batch.num_rows())
+            .map(|i| notes_col.value(i))
+            .collect();
+        notes.sort();
+        assert_eq!(notes, vec!["in stock", "special order"]);
+    }
+
+    // ── _id/score skip optimization tests ───────────────────────────────
+
+    #[test]
+    fn sql_batch_skip_id_and_score_when_not_needed() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document("d1", json!({"title": "Widget", "price": 19.99}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "Gadget", "price": 29.99}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // needs_id=false, needs_score=false
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(
+                &req,
+                &["title".to_string(), "price".to_string()],
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 2);
+
+        // _id column should exist but contain empty strings
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "");
+        assert_eq!(id_col.value(1), "");
+
+        // score column should exist but contain zeros
+        let score_col = result
+            .batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float32Array>()
+            .unwrap();
+        assert_eq!(score_col.value(0), 0.0);
+        assert_eq!(score_col.value(1), 0.0);
+
+        // Data columns should still have correct values
+        let price_col = result
+            .batch
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+        let mut prices: Vec<f64> = (0..result.batch.num_rows())
+            .map(|i| price_col.value(i))
+            .collect();
+        prices.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(prices, vec![19.99, 29.99]);
+    }
+
+    #[test]
+    fn sql_batch_skip_id_only() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document("x1", json!({"title": "A", "price": 1.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // needs_id=false, needs_score=true
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(&req, &["price".to_string()], false, true)
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 1);
+
+        // _id should be empty string
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "");
+
+        // score should have real value (> 0)
+        let score_col = result
+            .batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float32Array>()
+            .unwrap();
+        assert!(score_col.value(0) > 0.0);
+    }
+
+    #[test]
+    fn sql_batch_skip_score_only() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document("y1", json!({"title": "B", "price": 2.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // needs_id=true, needs_score=false
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(&req, &["price".to_string()], true, false)
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 1);
+
+        // _id should have real value
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "y1");
+
+        // score should be zero
+        let score_col = result
+            .batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float32Array>()
+            .unwrap();
+        assert_eq!(score_col.value(0), 0.0);
+    }
+
+    #[test]
+    fn sql_batch_skip_both_many_docs() {
+        let (_dir, engine) = create_typed_engine();
+        for i in 0..100 {
+            engine
+                .add_document(
+                    &format!("d-{}", i),
+                    json!({"title": format!("item-{}", i), "price": i as f64 * 1.5}),
+                )
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 200,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(&req, &["price".to_string()], false, false)
+            .unwrap();
+        assert_eq!(result.batch.num_rows(), 100);
+
+        // All _id values should be empty
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        for i in 0..100 {
+            assert_eq!(id_col.value(i), "");
+        }
     }
 }
