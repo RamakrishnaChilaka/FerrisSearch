@@ -312,8 +312,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         _ => bail!("Only SELECT statements are supported"),
     };
     let order_by = query.order_by.clone();
-    let limit = parse_limit_expr(&query.limit);
-    let offset = parse_offset_expr(&query.offset);
+    let (limit, offset) = extract_limit_offset(&query.limit_clause);
 
     let select = match query.body.as_mut() {
         SetExpr::Select(select) => select,
@@ -549,8 +548,29 @@ fn parse_grouped_metric(expr: &Expr, alias: Option<String>) -> Result<Option<Sql
     }))
 }
 
-fn parse_limit_expr(limit_expr: &Option<Expr>) -> Option<usize> {
-    let expr = limit_expr.as_ref()?;
+fn extract_limit_offset(
+    clause: &Option<sqlparser::ast::LimitClause>,
+) -> (Option<usize>, Option<usize>) {
+    let Some(clause) = clause else {
+        return (None, None);
+    };
+    match clause {
+        sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } => {
+            let l = limit.as_ref().and_then(parse_limit_expr);
+            let o = offset
+                .as_ref()
+                .and_then(|off| parse_offset_value(&off.value));
+            (l, o)
+        }
+        sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+            let l = parse_limit_expr(limit);
+            let o = parse_offset_value(offset);
+            (l, o)
+        }
+    }
+}
+
+fn parse_limit_expr(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::Value(value) => match &value.value {
             SqlValue::Number(n, _) => n.parse::<usize>().ok(),
@@ -560,9 +580,8 @@ fn parse_limit_expr(limit_expr: &Option<Expr>) -> Option<usize> {
     }
 }
 
-fn parse_offset_expr(offset: &Option<sqlparser::ast::Offset>) -> Option<usize> {
-    let offset = offset.as_ref()?;
-    match &offset.value {
+fn parse_offset_value(expr: &Expr) -> Option<usize> {
+    match expr {
         Expr::Value(value) => match &value.value {
             SqlValue::Number(n, _) => n.parse::<usize>().ok(),
             _ => None,
@@ -602,6 +621,7 @@ fn extract_single_table(select: &Select) -> Result<String> {
             }
             match &name.0[0] {
                 ObjectNamePart::Identifier(ident) => Ok(ident.value.clone()),
+                _ => bail!("Unsupported table name syntax"),
             }
         }
         _ => bail!("Unsupported FROM clause"),
