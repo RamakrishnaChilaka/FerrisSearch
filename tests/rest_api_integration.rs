@@ -823,3 +823,26 @@ async fn rest_sql_in_and_between_pushdown() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn rest_cat_shards_shows_started_state() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (_, _) = harness.post_json("/products/_refresh", json!({})).await?;
+
+    // cat/shards should show STARTED for the local shard after docs are indexed
+    let (status, text) = harness.get_text("/_cat/shards?v").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        text.contains("STARTED"),
+        "cat/shards must show STARTED for active shards, got: {text}"
+    );
+    // Should NOT show INITIALIZING after docs are loaded and refreshed
+    assert!(
+        !text.contains("INITIALIZING"),
+        "cat/shards must not show INITIALIZING after docs are loaded, got: {text}"
+    );
+
+    Ok(())
+}

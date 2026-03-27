@@ -50,6 +50,17 @@ pub fn error_response(
 | GET | `/_cat/shards` | `cat_shards()` | Shard allocation (prirep=p/r, state, docs, node) |
 | GET | `/_cat/indices` | `cat_indices()` | Index listing (health, shards, docs) |
 | GET | `/_cat/master` | `cat_master()` | Current master node |
+
+### Shard Display State
+The `_cat/shards` endpoint shows three possible shard states:
+- **`STARTED`**: The shard engine is open and serving docs.
+- **`INITIALIZING`**: The shard is assigned to a live node but the shard engine isn't open yet (e.g., the shard is still being reopened from disk during startup). Other shards on the same node may already be `STARTED`.
+- **`UNASSIGNED`**: The assigned node doesn't exist in the cluster (node left or shard not yet placed).
+
+State is determined by `shard_display_state()` — a single function used for both primaries and replicas. In distributed mode (default), the state is derived from whether the shard appears in the `collect_shard_doc_counts()` fan-out results. In `?local` mode, it checks whether `shard_manager.get_shard()` returns the engine.
+
+`INITIALIZING` is a runtime observation, NOT a cluster state change. The `ShardState` enum (`Started` / `Unassigned`) represents the Raft-managed allocation intent. The display state is the intersection of allocation intent + shard engine availability.
+
 ### Cat Endpoint Doc Count Collection
 By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `GetShardStats` to collect real doc counts (mirrors OpenSearch behavior). This ensures every shard row shows accurate doc counts regardless of which node is queried.
 
