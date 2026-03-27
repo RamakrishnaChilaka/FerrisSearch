@@ -11,21 +11,25 @@ use std::time::Instant;
 
 /// GET/POST /{index}/_count — Count documents matching a query.
 /// GET returns total doc count (match_all). POST accepts an optional query body.
+///
+/// Fast path: when the query is match_all, sums `doc_count()` from local shards
+/// and `GetShardStats` from remote nodes — no search execution at all.
 pub async fn count_documents(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
     body: Option<Json<Value>>,
 ) -> (StatusCode, Json<Value>) {
-    let search_req = match body {
-        Some(Json(req)) => match serde_json::from_value::<CountRequest>(req) {
-            Ok(cr) => crate::search::SearchRequest {
-                query: cr.query,
-                size: 0,
-                from: 0,
-                knn: None,
-                sort: vec![],
-                aggs: std::collections::HashMap::new(),
-            },
+    if let Err(msg) = crate::common::validate_index_name(&index_name) {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_index_name_exception",
+            msg,
+        );
+    }
+
+    let query = match &body {
+        Some(Json(req)) => match serde_json::from_value::<CountRequest>(req.clone()) {
+            Ok(cr) => cr.query,
             Err(e) => {
                 return crate::api::error_response(
                     StatusCode::BAD_REQUEST,
@@ -34,14 +38,22 @@ pub async fn count_documents(
                 );
             }
         },
-        None => crate::search::SearchRequest {
-            query: crate::search::QueryClause::MatchAll(serde_json::json!({})),
-            size: 0,
-            from: 0,
-            knn: None,
-            sort: vec![],
-            aggs: std::collections::HashMap::new(),
-        },
+        None => crate::search::QueryClause::MatchAll(serde_json::json!({})),
+    };
+
+    // Fast path: match_all counts use doc_count() metadata — no search needed
+    if query.is_match_all() {
+        return count_match_all_fast(&state, &index_name).await;
+    }
+
+    // Slow path: run distributed search with size=0 to count matching docs
+    let search_req = crate::search::SearchRequest {
+        query,
+        size: 0,
+        from: 0,
+        knn: None,
+        sort: vec![],
+        aggs: std::collections::HashMap::new(),
     };
 
     match crate::api::index::execute_distributed_dsl_search(&state, &index_name, &search_req).await
@@ -61,6 +73,35 @@ pub async fn count_documents(
     }
 }
 
+/// Fast path for match_all count: sum doc_count() from all shards without running a query.
+async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = match cluster_state.indices.get(index_name) {
+        Some(m) => m.clone(),
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name),
+            );
+        }
+    };
+
+    let (count, successful, failed) = count_docs_from_metadata(state, index_name, &metadata).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": count,
+            "_shards": {
+                "total": successful + failed,
+                "successful": successful,
+                "failed": failed
+            }
+        })),
+    )
+}
+
 #[derive(Deserialize)]
 struct CountRequest {
     #[serde(default = "default_match_all_query")]
@@ -69,6 +110,66 @@ struct CountRequest {
 
 fn default_match_all_query() -> crate::search::QueryClause {
     crate::search::QueryClause::MatchAll(serde_json::json!({}))
+}
+
+/// Shared helper: count docs from metadata (doc_count + GetShardStats) without executing a query.
+/// Returns (total_count, successful_shards, failed_shards).
+async fn count_docs_from_metadata(
+    state: &AppState,
+    index_name: &str,
+    metadata: &crate::cluster::state::IndexMetadata,
+) -> (u64, u32, u32) {
+    let cluster_state = state.cluster_manager.get_state();
+    let local_shards = crate::api::index::ensure_local_index_shards_open(
+        state,
+        index_name,
+        metadata,
+        "count_fast",
+    );
+    let local_shard_ids: std::collections::HashSet<u32> =
+        local_shards.iter().map(|(id, _)| *id).collect();
+
+    let mut count: u64 = 0;
+    let mut successful: u32 = 0;
+    let mut failed: u32 = 0;
+
+    for (_shard_id, engine) in &local_shards {
+        count += engine.doc_count();
+        successful += 1;
+    }
+
+    let mut remote_handles = Vec::new();
+    for (shard_id, routing) in &metadata.shard_routing {
+        if local_shard_ids.contains(shard_id) {
+            continue;
+        }
+        if let Some(node) = cluster_state.nodes.get(&routing.primary) {
+            let client = state.transport_client.clone();
+            let node = node.clone();
+            let idx = index_name.to_string();
+            let sid = *shard_id;
+            remote_handles.push(tokio::spawn(async move {
+                client
+                    .get_shard_stats(&node)
+                    .await
+                    .map(|stats| stats.get(&(idx, sid)).copied().unwrap_or(0))
+            }));
+        }
+    }
+
+    for handle in remote_handles {
+        match handle.await {
+            Ok(Ok(remote_count)) => {
+                count += remote_count;
+                successful += 1;
+            }
+            _ => {
+                failed += 1;
+            }
+        }
+    }
+
+    (count, successful, failed)
 }
 
 #[derive(Deserialize)]
@@ -345,6 +446,44 @@ async fn execute_sql_query(
             ));
         }
     };
+
+    // count(*) fast path: answer from doc_count() metadata without scanning docs
+    if plan.is_count_star_only() {
+        let search_start = Instant::now();
+        let (count, successful_shards, failed_shards) =
+            count_docs_from_metadata(state, index_name, &metadata).await;
+        let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
+
+        let grouped_sql = plan.grouped_sql.as_ref().unwrap();
+        let columns: Vec<String> = grouped_sql
+            .metrics
+            .iter()
+            .map(|m| m.output_name.clone())
+            .collect();
+        let mut row = serde_json::Map::new();
+        for m in &grouped_sql.metrics {
+            row.insert(m.output_name.clone(), serde_json::json!(count));
+        }
+        let rows = vec![serde_json::Value::Object(row)];
+
+        return Ok(SqlExecutionResult {
+            plan,
+            sql_result: crate::hybrid::SqlQueryResult { columns, rows },
+            matched_hits: count as usize,
+            successful_shards,
+            failed_shards,
+            execution_mode: "count_star_fast",
+            truncated: false,
+            timings: crate::hybrid::SqlTimings {
+                planning_ms,
+                search_ms,
+                collect_ms: 0.0,
+                merge_ms: 0.0,
+                datafusion_ms: 0.0,
+                total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            },
+        });
+    }
 
     // Grouped partials path
     if plan.uses_grouped_partials() {

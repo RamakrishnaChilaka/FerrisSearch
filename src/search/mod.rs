@@ -113,6 +113,13 @@ pub enum QueryClause {
     Fuzzy(HashMap<String, FuzzyParams>),
 }
 
+impl QueryClause {
+    /// Returns true if this query matches all documents.
+    pub fn is_match_all(&self) -> bool {
+        matches!(self, QueryClause::MatchAll(_))
+    }
+}
+
 /// Fuzzy query parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuzzyParams {
@@ -2734,5 +2741,17 @@ mod tests {
         assert!(merged.contains_key("genres"));
         assert!(merged.contains_key("rating_stats"));
         assert_eq!(merged["rating_stats"]["count"], 3);
+    }
+
+    #[test]
+    fn is_match_all_returns_true_for_match_all() {
+        let q = QueryClause::MatchAll(json!({}));
+        assert!(q.is_match_all());
+    }
+
+    #[test]
+    fn is_match_all_returns_false_for_term() {
+        let q = QueryClause::Term(HashMap::from([("field".into(), json!("value"))]));
+        assert!(!q.is_match_all());
     }
 }

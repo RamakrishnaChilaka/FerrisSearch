@@ -886,3 +886,37 @@ async fn rest_count_returns_correct_total() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn rest_sql_count_star_uses_fast_path() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // SQL count(*) without WHERE should use count_star_fast execution mode
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({"query": "SELECT count(*) AS total FROM \"products\""}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("count_star_fast"));
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["total"], json!(3));
+
+    // SQL count(*) WITH WHERE should NOT use count_star_fast
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({"query": "SELECT count(*) AS total FROM \"products\" WHERE brand = 'Apple'"}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_grouped_partials"));
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["total"], json!(2));
+
+    Ok(())
+}
