@@ -24,6 +24,9 @@ pub struct SearchRequest {
 | `Range(HashMap<String, RangeCondition>)` | Range: `{ gt, gte, lt, lte }` |
 | `Bool(BoolQuery)` | `{ must, should, must_not, filter }` |
 
+### QueryClause Helpers
+- `is_match_all()` — returns true if this is a `MatchAll` query. Used by `_count` fast path and SQL `count(*)` detection.
+
 ## FuzzyParams
 ```rust
 pub struct FuzzyParams {
