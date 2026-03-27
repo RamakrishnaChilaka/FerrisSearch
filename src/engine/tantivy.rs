@@ -2049,7 +2049,9 @@ impl super::SearchEngine for HotEngine {
         std::collections::HashMap<String, crate::search::PartialAggResult>,
     )> {
         let searcher = self.reader.searcher();
-        let limit = std::cmp::max(req.from + req.size, 100);
+        // Use the exact requested limit when from+size is explicit.
+        // The coordinator handles cross-shard merging at the API layer.
+        let limit = req.from + req.size;
         let query = self.build_query(&req.query)?;
         let effective_limit = if limit == 0 { 1 } else { limit };
 
@@ -2761,8 +2763,7 @@ mod tests {
         }
         engine.refresh().unwrap();
 
-        // Engine fetches max(from+size, 100) hits; coordinator does the slicing.
-        // With 20 docs and limit=max(5,100)=100, engine returns all 20.
+        // Engine returns exactly from+size hits; coordinator does further merging.
         let req = crate::search::SearchRequest {
             query: crate::search::QueryClause::MatchAll(json!({})),
             size: 5,
@@ -2771,12 +2772,9 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (results, _, _) = engine.search_query(&req).unwrap();
-        assert_eq!(
-            results.len(),
-            20,
-            "engine returns all matching docs for coordinator to slice"
-        );
+        let (results, total, _) = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 5, "engine returns exactly size hits");
+        assert_eq!(total, 20, "total reflects all matching docs");
     }
 
     #[test]
@@ -2789,7 +2787,7 @@ mod tests {
         }
         engine.refresh().unwrap();
 
-        // Engine always fetches max(from+size, 100) — returns all 10
+        // Engine always fetches from+size hits (10 here) — returns all 10
         let req_all = crate::search::SearchRequest {
             query: crate::search::QueryClause::MatchAll(json!({})),
             size: 10,
@@ -2801,7 +2799,7 @@ mod tests {
         let (all_results, _, _) = engine.search_query(&req_all).unwrap();
         assert_eq!(all_results.len(), 10);
 
-        // from=7, size=10 → engine fetches max(17,100)=100, returns all 10
+        // from=7, size=10 → engine fetches top 17, returns all 10 (< 17)
         let req_paged = crate::search::SearchRequest {
             query: crate::search::QueryClause::MatchAll(json!({})),
             size: 10,
@@ -2846,8 +2844,8 @@ mod tests {
 
     #[test]
     fn pagination_total_is_accurate_after_coordinator_slice() {
-        // Simulates what the API coordinator does: collect all engine hits,
-        // report total from full set, then slice with from/size.
+        // Simulates what the API coordinator does: collect engine hits,
+        // report total from Count collector, then return the hits.
         let (_dir, engine) = create_engine();
         for i in 0..15 {
             engine
@@ -2864,11 +2862,9 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let (all_hits, _, _) = engine.search_query(&req).unwrap();
-        let total = all_hits.len(); // This is what hits.total.value should be
-        let paginated: Vec<_> = all_hits.into_iter().skip(req.from).take(req.size).collect();
+        let (hits, total, _) = engine.search_query(&req).unwrap();
         assert_eq!(total, 15, "total should reflect all matching docs");
-        assert_eq!(paginated.len(), 5, "paginated should have size hits");
+        assert_eq!(hits.len(), 5, "engine returns exactly size hits");
     }
 
     // ── Bool query tests ────────────────────────────────────────────────
@@ -4718,7 +4714,7 @@ mod tests {
             total, 50,
             "all 50 bulk docs should be visible after refresh"
         );
-        assert_eq!(hits.len(), 50, "all 50 returned since under internal limit");
+        assert_eq!(hits.len(), 10, "engine returns exactly size=10 hits");
         assert_eq!(engine.doc_count(), 50);
     }
 

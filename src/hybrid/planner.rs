@@ -95,6 +95,24 @@ impl QueryPlan {
         self.grouped_sql.is_some()
     }
 
+    /// Returns true if this is a simple `SELECT count(*) FROM ...` with no WHERE,
+    /// no GROUP BY, and no non-count aggregates — meaning we can answer it from
+    /// `doc_count()` metadata without scanning any documents.
+    pub fn is_count_star_only(&self) -> bool {
+        if self.text_match.is_some() || !self.pushed_filters.is_empty() {
+            return false;
+        }
+        if let Some(grouped) = &self.grouped_sql {
+            grouped.group_columns.is_empty()
+                && !grouped.metrics.is_empty()
+                && grouped.metrics.iter().all(|m| {
+                    matches!(m.function, SqlGroupedMetricFunction::Count) && m.field.is_none()
+                })
+        } else {
+            false
+        }
+    }
+
     pub fn to_search_request(&self) -> crate::search::SearchRequest {
         let query = if self.text_match.is_none() && self.pushed_filters.is_empty() {
             crate::search::QueryClause::MatchAll(serde_json::Value::Object(Default::default()))
@@ -1144,5 +1162,55 @@ fn collect_expr_columns(expr: &Expr, columns: &mut BTreeSet<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_star_only_simple() {
+        let plan = plan_sql("idx", "SELECT count(*) AS total FROM \"idx\"").unwrap();
+        assert!(plan.is_count_star_only());
+        assert!(plan.uses_grouped_partials());
+    }
+
+    #[test]
+    fn count_star_only_multiple_counts() {
+        let plan = plan_sql("idx", "SELECT count(*) AS a, count(*) AS b FROM \"idx\"").unwrap();
+        assert!(plan.is_count_star_only());
+    }
+
+    #[test]
+    fn count_star_with_where_not_fast() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT count(*) AS total FROM \"idx\" WHERE price > 10",
+        )
+        .unwrap();
+        assert!(!plan.is_count_star_only());
+    }
+
+    #[test]
+    fn count_with_group_by_not_fast() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT brand, count(*) AS total FROM \"idx\" GROUP BY brand",
+        )
+        .unwrap();
+        assert!(!plan.is_count_star_only());
+    }
+
+    #[test]
+    fn avg_not_count_star() {
+        let plan = plan_sql("idx", "SELECT avg(price) AS avg_p FROM \"idx\"").unwrap();
+        assert!(!plan.is_count_star_only());
+    }
+
+    #[test]
+    fn count_field_not_count_star() {
+        let plan = plan_sql("idx", "SELECT count(price) AS c FROM \"idx\"").unwrap();
+        assert!(!plan.is_count_star_only());
     }
 }
