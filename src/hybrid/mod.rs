@@ -319,6 +319,128 @@ mod tests {
         assert!(plan.rewritten_sql.contains("score > 1"));
     }
 
+    // ── IN / BETWEEN pushdown ───────────────────────────────────────────
+
+    #[test]
+    fn between_pushes_down_as_range() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT title, price FROM products WHERE text_match(description, 'iphone') AND price BETWEEN 100 AND 500",
+        )
+        .unwrap();
+
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+        match &plan.pushed_filters[0] {
+            crate::search::QueryClause::Range(fields) => {
+                let range = fields.get("price").expect("price range");
+                assert_eq!(range.gte, Some(json!(100)));
+                assert_eq!(range.lte, Some(json!(500)));
+                assert!(range.gt.is_none());
+                assert!(range.lt.is_none());
+            }
+            other => panic!("expected Range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_list_pushes_down_as_bool_should() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'iphone') AND brand IN ('Apple', 'Samsung')",
+        )
+        .unwrap();
+
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+        match &plan.pushed_filters[0] {
+            crate::search::QueryClause::Bool(bool_query) => {
+                assert_eq!(bool_query.should.len(), 2);
+                assert!(bool_query.must.is_empty());
+                assert!(bool_query.must_not.is_empty());
+                // Each should clause is a Term for brand
+                for clause in &bool_query.should {
+                    match clause {
+                        crate::search::QueryClause::Term(fields) => {
+                            assert!(fields.contains_key("brand"));
+                        }
+                        other => panic!("expected Term in should, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_list_with_numbers_pushes_down() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'iphone') AND price IN (100, 200, 300)",
+        )
+        .unwrap();
+
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+        match &plan.pushed_filters[0] {
+            crate::search::QueryClause::Bool(bool_query) => {
+                assert_eq!(bool_query.should.len(), 3);
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_in_stays_as_residual() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'iphone') AND brand NOT IN ('Apple')",
+        )
+        .unwrap();
+
+        // NOT IN cannot be pushed — stays as residual for DataFusion
+        assert_eq!(plan.pushed_filters.len(), 0);
+        assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn not_between_stays_as_residual() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'iphone') AND price NOT BETWEEN 100 AND 500",
+        )
+        .unwrap();
+
+        assert_eq!(plan.pushed_filters.len(), 0);
+        assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn between_and_in_combine_with_existing_pushdown() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'iphone') AND price BETWEEN 100 AND 500 AND brand IN ('Apple', 'Samsung') AND rating >= 4.0",
+        )
+        .unwrap();
+
+        // 3 pushed filters: BETWEEN (Range), IN (Bool), >= (Range)
+        assert_eq!(plan.pushed_filters.len(), 3);
+        assert!(!plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn in_on_score_stays_as_residual() {
+        let plan = planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'iphone') AND score IN (1.0, 2.0)",
+        )
+        .unwrap();
+
+        // score is explicitly blocked from pushdown
+        assert_eq!(plan.pushed_filters.len(), 0);
+        assert!(plan.has_residual_predicates);
+    }
+
     #[test]
     fn to_search_request_uses_match_all_when_no_pushdowns_exist() {
         let plan =

@@ -762,6 +762,68 @@ fn parse_text_match(expr: &Expr) -> Result<Option<TextMatchPredicate>> {
 }
 
 fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryClause>> {
+    // BETWEEN field AND low AND high → Range { gte: low, lte: high }
+    if let Expr::Between {
+        expr: between_expr,
+        negated: false,
+        low,
+        high,
+    } = expr
+    {
+        let Some(field) = expr_to_field_name(between_expr) else {
+            return Ok(None);
+        };
+        if field == "score" || field == "_id" {
+            return Ok(None);
+        }
+        let (Some(low_val), Some(high_val)) = (expr_to_json_value(low)?, expr_to_json_value(high)?)
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(crate::search::QueryClause::Range(HashMap::from([(
+            field,
+            crate::search::RangeCondition {
+                gte: Some(low_val),
+                lte: Some(high_val),
+                ..Default::default()
+            },
+        )]))));
+    }
+
+    // IN (a, b, c) → Bool { should: [Term(a), Term(b), Term(c)] }
+    if let Expr::InList {
+        expr: in_expr,
+        list,
+        negated: false,
+    } = expr
+    {
+        let Some(field) = expr_to_field_name(in_expr) else {
+            return Ok(None);
+        };
+        if field == "score" || field == "_id" {
+            return Ok(None);
+        }
+        let mut terms = Vec::new();
+        for item in list {
+            let Some(value) = expr_to_json_value(item)? else {
+                return Ok(None);
+            };
+            terms.push(crate::search::QueryClause::Term(HashMap::from([(
+                field.clone(),
+                value,
+            )])));
+        }
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(crate::search::QueryClause::Bool(
+            crate::search::BoolQuery {
+                should: terms,
+                ..Default::default()
+            },
+        )));
+    }
+
     let Expr::BinaryOp { left, op, right } = expr else {
         return Ok(None);
     };
@@ -1003,6 +1065,26 @@ fn collect_expr_columns(expr: &Expr, columns: &mut BTreeSet<String>) {
         | Expr::Nested(expr)
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr) => collect_expr_columns(expr, columns),
+        Expr::Between {
+            expr: between_expr,
+            low,
+            high,
+            ..
+        } => {
+            collect_expr_columns(between_expr, columns);
+            collect_expr_columns(low, columns);
+            collect_expr_columns(high, columns);
+        }
+        Expr::InList {
+            expr: in_expr,
+            list,
+            ..
+        } => {
+            collect_expr_columns(in_expr, columns);
+            for item in list {
+                collect_expr_columns(item, columns);
+            }
+        }
         Expr::Function(function) => {
             if let FunctionArguments::List(list) = &function.args {
                 for arg in &list.args {

@@ -75,7 +75,11 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Split planning into two stages:
   1. search-aware planning in Tantivy
   2. residual SQL planning in DataFusion
-- Push `text_match(...)`, exact filters, and range filters into Tantivy before Arrow/DataFusion execution.
+- Push `text_match(...)`, exact filters (`=`), range filters (`>`, `>=`, `<`, `<=`), `BETWEEN`, and `IN` into Tantivy before Arrow/DataFusion execution.
+- `BETWEEN a AND b` is pushed as `Range { gte: a, lte: b }` — reuses existing Range query support.
+- `IN (a, b, c)` is pushed as `Bool { should: [Term(a), Term(b), Term(c)] }` — reuses existing Bool+Term support.
+- `NOT IN` and `NOT BETWEEN` are NOT pushed — they remain as residual predicates for DataFusion.
+- `score` and `_id` fields are never pushed (score is computed by Tantivy, _id is a doc identifier).
 - Prefer shard-local partial execution before coordinator-side row materialization.
 - Treat `materialized_hits_fallback` as a compatibility path, not the target architecture.
 
