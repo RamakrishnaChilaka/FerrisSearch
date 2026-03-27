@@ -28,8 +28,28 @@ pub struct SqlQueryResult {
 }
 
 pub async fn execute_planned_sql(plan: &QueryPlan, hits: &[Value]) -> Result<SqlQueryResult> {
+    execute_planned_sql_with_mappings(plan, hits, &std::collections::HashMap::new()).await
+}
+
+/// Execute SQL over materialized hits with schema-derived type hints.
+/// Ensures integer fields become Int64 and float fields become Float64
+/// regardless of the JSON number representation.
+pub async fn execute_planned_sql_with_mappings(
+    plan: &QueryPlan,
+    hits: &[Value],
+    mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<SqlQueryResult> {
     let column_store = column_store::ColumnStore::from_hits(hits, &plan.required_columns);
-    let batch = arrow_bridge::build_record_batch(&column_store)?;
+    let type_hints: std::collections::HashMap<String, arrow_bridge::ColumnKind> = mappings
+        .iter()
+        .map(|(name, fm)| {
+            (
+                name.clone(),
+                arrow_bridge::column_kind_from_field_type(&fm.field_type),
+            )
+        })
+        .collect();
+    let batch = arrow_bridge::build_record_batch_with_hints(&column_store, &type_hints)?;
     datafusion_exec::execute_sql(plan, batch).await
 }
 

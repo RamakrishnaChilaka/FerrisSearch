@@ -388,9 +388,8 @@ impl HotEngine {
         if let Some(first_segment) = field_plans.first() {
             for (i, column) in columns.iter().enumerate() {
                 let kind = match &first_segment[i] {
-                    SqlFieldReader::F64(_) | SqlFieldReader::I64(_) => {
-                        crate::hybrid::arrow_bridge::ColumnKind::Float64
-                    }
+                    SqlFieldReader::F64(_) => crate::hybrid::arrow_bridge::ColumnKind::Float64,
+                    SqlFieldReader::I64(_) => crate::hybrid::arrow_bridge::ColumnKind::Int64,
                     SqlFieldReader::Str(_) => crate::hybrid::arrow_bridge::ColumnKind::Utf8,
                     SqlFieldReader::SourceFallback => continue,
                 };
@@ -401,10 +400,11 @@ impl HotEngine {
             for column in columns {
                 if let Ok(field) = schema.get_field(column) {
                     let kind = match schema.get_field_entry(field).field_type() {
-                        tantivy::schema::FieldType::F64(_)
-                        | tantivy::schema::FieldType::I64(_)
-                        | tantivy::schema::FieldType::U64(_) => {
+                        tantivy::schema::FieldType::F64(_) => {
                             crate::hybrid::arrow_bridge::ColumnKind::Float64
+                        }
+                        tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::U64(_) => {
+                            crate::hybrid::arrow_bridge::ColumnKind::Int64
                         }
                         tantivy::schema::FieldType::Bool(_) => {
                             crate::hybrid::arrow_bridge::ColumnKind::Boolean

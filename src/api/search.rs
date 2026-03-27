@@ -668,17 +668,22 @@ async fn execute_sql_query(
                 Err(err) => return Err(err),
             };
 
-            let sql_result =
-                match crate::hybrid::execute_planned_sql(&plan, &distributed.all_hits).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        return Err(crate::api::error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "sql_execution_exception",
-                            e,
-                        ));
-                    }
-                };
+            let sql_result = match crate::hybrid::execute_planned_sql_with_mappings(
+                &plan,
+                &distributed.all_hits,
+                &metadata.mappings,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "sql_execution_exception",
+                        e,
+                    ));
+                }
+            };
             (
                 sql_result,
                 distributed.total_hits,

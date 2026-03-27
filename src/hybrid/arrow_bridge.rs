@@ -1,7 +1,8 @@
 use super::column_store::ColumnStore;
 use anyhow::{Result, bail};
 use datafusion::arrow::array::{
-    ArrayRef, BooleanBuilder, Float32Array, Float64Array, Float64Builder, StringBuilder,
+    ArrayRef, BooleanBuilder, Float32Array, Float64Array, Float64Builder, Int64Array, Int64Builder,
+    StringBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnKind {
     Float64,
+    Int64,
     Boolean,
     Utf8,
 }
@@ -26,6 +28,35 @@ pub fn build_float64_array(values: &[Value]) -> Result<Float64Array> {
         }
     }
     Ok(builder.finish())
+}
+
+pub fn build_int64_array(values: &[Value]) -> Result<Int64Array> {
+    let mut builder = Int64Builder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Value::Number(number) => {
+                if let Some(i) = number.as_i64() {
+                    builder.append_value(i);
+                } else {
+                    builder.append_value(number.as_f64().unwrap_or(0.0) as i64);
+                }
+            }
+            Value::Null => builder.append_null(),
+            _ => bail!("Non-numeric value found in integer column"),
+        }
+    }
+    Ok(builder.finish())
+}
+
+/// Derive Arrow column type from the index field mapping.
+/// This ensures both fast-field and fallback paths agree on column types.
+pub fn column_kind_from_field_type(ft: &crate::cluster::state::FieldType) -> ColumnKind {
+    match ft {
+        crate::cluster::state::FieldType::Float => ColumnKind::Float64,
+        crate::cluster::state::FieldType::Integer => ColumnKind::Int64,
+        crate::cluster::state::FieldType::Boolean => ColumnKind::Boolean,
+        _ => ColumnKind::Utf8,
+    }
 }
 
 pub fn build_score_array(scores: &[f32]) -> Float32Array {
@@ -95,8 +126,13 @@ fn infer_column_kind(values: &[Value]) -> ColumnKind {
                 kind = Some(ColumnKind::Boolean);
                 break;
             }
-            Value::Number(_) => {
-                kind = Some(ColumnKind::Float64);
+            Value::Number(n) => {
+                // Distinguish integers from floats based on the JSON number type
+                if n.is_f64() && n.as_i64().is_none() {
+                    kind = Some(ColumnKind::Float64);
+                } else {
+                    kind = Some(ColumnKind::Int64);
+                }
                 break;
             }
             _ => {
@@ -111,6 +147,7 @@ fn infer_column_kind(values: &[Value]) -> ColumnKind {
 fn data_type_for(kind: ColumnKind) -> DataType {
     match kind {
         ColumnKind::Float64 => DataType::Float64,
+        ColumnKind::Int64 => DataType::Int64,
         ColumnKind::Boolean => DataType::Boolean,
         ColumnKind::Utf8 => DataType::Utf8,
     }
@@ -119,6 +156,7 @@ fn data_type_for(kind: ColumnKind) -> DataType {
 fn build_array(values: &[Value], kind: ColumnKind) -> Result<ArrayRef> {
     match kind {
         ColumnKind::Float64 => Ok(Arc::new(build_float64_array(values)?)),
+        ColumnKind::Int64 => Ok(Arc::new(build_int64_array(values)?)),
         ColumnKind::Boolean => {
             let mut builder = BooleanBuilder::with_capacity(values.len());
             for value in values {
@@ -265,5 +303,121 @@ mod tests {
         let ipc_bytes = record_batch_to_ipc(&batch).unwrap();
         let restored = record_batch_from_ipc(&ipc_bytes).unwrap();
         assert_eq!(restored.num_rows(), 2);
+    }
+
+    #[test]
+    fn int64_hint_produces_int64_arrow_column() {
+        let ids = vec!["a".to_string()];
+        let scores = vec![0.0f32];
+        let mut cols = BTreeMap::new();
+        cols.insert("count".to_string(), vec![Value::from(42)]);
+        let store = ColumnStore::new(ids, scores, cols);
+
+        let mut hints = HashMap::new();
+        hints.insert("count".to_string(), ColumnKind::Int64);
+        let batch = build_record_batch_with_hints(&store, &hints).unwrap();
+
+        let schema = batch.schema();
+        let field = schema.field_with_name("count").unwrap();
+        assert_eq!(
+            *field.data_type(),
+            DataType::Int64,
+            "integer column should be Int64"
+        );
+
+        let array = batch
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(array.value(0), 42);
+    }
+
+    #[test]
+    fn float64_hint_produces_float64_arrow_column() {
+        let ids = vec!["a".to_string()];
+        let scores = vec![0.0f32];
+        let mut cols = BTreeMap::new();
+        cols.insert("price".to_string(), vec![Value::from(42.5)]);
+        let store = ColumnStore::new(ids, scores, cols);
+
+        let mut hints = HashMap::new();
+        hints.insert("price".to_string(), ColumnKind::Float64);
+        let batch = build_record_batch_with_hints(&store, &hints).unwrap();
+
+        let schema = batch.schema();
+        let field = schema.field_with_name("price").unwrap();
+        assert_eq!(*field.data_type(), DataType::Float64);
+    }
+
+    #[test]
+    fn infer_integer_json_as_int64() {
+        // JSON integer `42` should infer as Int64, not Float64
+        let values = vec![Value::from(42), Value::from(100)];
+        let kind = infer_column_kind(&values);
+        assert_eq!(kind, ColumnKind::Int64);
+    }
+
+    #[test]
+    fn infer_float_json_as_float64() {
+        // JSON float `42.5` should infer as Float64
+        let values = vec![Value::from(42.5), Value::from(1.0)];
+        let kind = infer_column_kind(&values);
+        assert_eq!(kind, ColumnKind::Float64);
+    }
+
+    #[test]
+    fn column_kind_from_field_type_maps_correctly() {
+        use crate::cluster::state::FieldType;
+        assert_eq!(
+            column_kind_from_field_type(&FieldType::Integer),
+            ColumnKind::Int64
+        );
+        assert_eq!(
+            column_kind_from_field_type(&FieldType::Float),
+            ColumnKind::Float64
+        );
+        assert_eq!(
+            column_kind_from_field_type(&FieldType::Boolean),
+            ColumnKind::Boolean
+        );
+        assert_eq!(
+            column_kind_from_field_type(&FieldType::Text),
+            ColumnKind::Utf8
+        );
+        assert_eq!(
+            column_kind_from_field_type(&FieldType::Keyword),
+            ColumnKind::Utf8
+        );
+    }
+
+    #[test]
+    fn int64_round_trip_preserves_values() {
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let scores = vec![0.0f32, 0.0];
+        let mut cols = BTreeMap::new();
+        cols.insert("age".to_string(), vec![Value::from(25), Value::from(30)]);
+        let store = ColumnStore::new(ids, scores, cols);
+
+        let mut hints = HashMap::new();
+        hints.insert("age".to_string(), ColumnKind::Int64);
+        let batch = build_record_batch_with_hints(&store, &hints).unwrap();
+
+        let ipc_bytes = record_batch_to_ipc(&batch).unwrap();
+        let restored = record_batch_from_ipc(&ipc_bytes).unwrap();
+
+        let schema = restored.schema();
+        let field = schema.field_with_name("age").unwrap();
+        assert_eq!(*field.data_type(), DataType::Int64);
+
+        let array = restored
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(array.value(0), 25);
+        assert_eq!(array.value(1), 30);
     }
 }

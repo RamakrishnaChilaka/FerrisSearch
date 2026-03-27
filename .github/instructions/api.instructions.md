@@ -92,6 +92,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 |------|------|---------|
 | GET | `/{index}/_search` | `search_documents()` — query-string (q=, size, from) |
 | POST | `/{index}/_search` | `search_documents_dsl()` — DSL body (SearchRequest) |
+| GET/POST | `/{index}/_count` | `count_documents()` — document count (match_all or query body) |
 | POST | `/{index}/_sql` | `search_sql()` — SQL over matched docs with planner metadata and execution mode |
 | POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan; with `"analyze": true`, execute and return plan + per-stage timings + rows |
 
@@ -104,6 +105,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
     - `matched_hits`, `execution_mode`, `truncated`, `_shards`
 - The `search_sql` handler internally delegates to `execute_sql_query()` — the same function used by EXPLAIN ANALYZE — so timing instrumentation is in one place.
 - Responses include an `execution_mode` field:
+    - `count_star_fast` when `SELECT count(*) FROM ...` (no WHERE/GROUP BY) is answered from `doc_count()` metadata without scanning documents
     - `tantivy_grouped_partials` when an eligible `GROUP BY` query executes as shard-local grouped partial aggregation with coordinator merge
     - `tantivy_fast_fields` when the query runs from local shard fast fields without materializing full hits first
     - `materialized_hits_fallback` when SQL runs over gathered hits for compatibility

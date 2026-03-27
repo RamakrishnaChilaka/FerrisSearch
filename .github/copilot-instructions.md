@@ -90,7 +90,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 553 unit tests + 30 consensus integration + 39 replication integration + 15 REST API integration = 637 total
+- 567 unit tests + 30 consensus integration + 39 replication integration + 17 REST API integration = 653 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -274,7 +274,7 @@ if let Some(ref raft) = state.raft {
 | HTTP | Path | Handler | Purpose |
 |------|------|---------|--------|
 | GET | `/{index}/_search` | `search_documents()` | Query-string search (q=, size, from) |
-| POST | `/{index}/_search` | `search_documents_dsl()` | DSL search (SearchRequest body) |
+| POST | `/{index}/_search` | `search_documents_dsl()` | DSL search (SearchRequest body) |\n| GET/POST | `/{index}/_count` | `count_documents()` | Document count (match_all fast path or query) |
 | POST | `/{index}/_sql` | `search_sql()` | SQL over matched docs (search-aware planning) |
 | POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan without executing |
 

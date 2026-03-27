@@ -214,6 +214,14 @@ curl 'http://localhost:9200/my-index/_search'
 # Query string with pagination
 curl 'http://localhost:9200/my-index/_search?q=rust&from=0&size=10'
 
+# Count all documents (fast — uses metadata, no search)
+curl 'http://localhost:9200/my-index/_count'
+
+# Count matching documents
+curl -X POST 'http://localhost:9200/my-index/_count' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": {"term": {"brand": "Apple"}}}'
+
 # DSL: match query
 curl -X POST 'http://localhost:9200/my-index/_search' \
   -H 'Content-Type: application/json' \
@@ -567,11 +575,11 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 629 tests
-cargo test --lib                                # Unit tests (545)
+cargo test                                      # All 647 tests
+cargo test --lib                                # Unit tests (561)
 cargo test --test consensus_integration          # Raft consensus tests (30)
 cargo test --test replication_integration        # Replication tests (39)
-cargo test --test rest_api_integration           # REST API tests (15)
+cargo test --test rest_api_integration           # REST API tests (17)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.
@@ -682,11 +690,12 @@ config/            Default configuration
 - [x] Distributed fast-field SQL (ship compact Arrow batches between nodes instead of `_source` JSON for cross-node fast-field queries)
 - [x] Search-aware `ORDER BY` / `LIMIT` pushdown on sortable fast fields
 - [x] Broader predicate pushdown (`IN`, `BETWEEN`, more bool combinations)
-- [ ] Stronger Arrow type fidelity across fast-field and fallback SQL paths
+- [x] Stronger Arrow type fidelity across fast-field and fallback SQL paths
 - [ ] Explicit SQL null semantics (`IS NULL`, `IS NOT NULL`) on matched docs
 - [ ] `HAVING` support after grouped execution
 - [ ] More robust alias handling in `ORDER BY`, `GROUP BY`, and `HAVING`
 - [x] `EXPLAIN ANALYZE` with runtime timings and fallback reasons
+- [x] `count(*)` metadata fast path (`count_star_fast` — answers from `doc_count()` without scanning docs)
 - [ ] `COUNT(DISTINCT field)` aggregate function
 - [ ] Cursor-based SQL pagination for large result sets
 - [ ] Lookup joins (small broadcast table joined to search results)
@@ -701,6 +710,10 @@ config/            Default configuration
 - [x] Wildcard and prefix queries
 - [x] Return `_score` in search results
 - [x] Aggregations (terms, histogram, stats)
+- [x] `_count` API (`GET/POST /{index}/_count`)
+- [ ] `_msearch` API (batch multiple searches in one request)
+- [ ] `search_after` cursor-based pagination
+- [ ] Scroll API for large result iteration
 
 ### Vector Search (k-NN)
 - [x] USearch integration for HNSW-based approximate nearest neighbor search
@@ -716,11 +729,15 @@ config/            Default configuration
 
 ### Index Management
 - [x] Field mappings in `PUT /{index}` (explicit schema definition)
-- [ ] Dynamic vs. strict mapping modes
+- [x] UUID-based data directories (delete + re-create never collides with stale data)
+- [x] Orphaned data cleanup on startup
+- [ ] Dynamic field mapping (auto-detect types on first document)
+- [ ] Strict mapping mode
 - [x] Update document API (`POST /{index}/_update/{id}`)
 - [ ] Index aliases
 - [ ] Index templates
 - [x] Dynamic settings updates (`number_of_replicas`, `refresh_interval`)
+- [x] Refresh/flush fan-out to all nodes
 - [ ] Document versioning and optimistic concurrency control
 
 ### Cluster Reliability
@@ -730,6 +747,7 @@ config/            Default configuration
 - [ ] Automatic shard rebalancing across nodes
 - [x] Shard reassignment on node failure
 - [x] Replica promotion on primary failure (ISR-aware: picks replica with highest checkpoint)
+- [ ] Search-time replica routing (load-balance reads across primary + in-sync replicas)
 - [ ] Shard awareness (co-location prevention)
 - [ ] Delayed allocation for rolling restarts
 - [x] Persistent Raft log (disk-backed storage)

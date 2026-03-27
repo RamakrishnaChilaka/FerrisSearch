@@ -26,6 +26,14 @@ pub trait SearchEngine: Send + Sync {
     // Search
     fn search(&self, query_str: &str) -> Result<Vec<Value>>;
     fn search_query(&self, req: &SearchRequest) -> Result<(Vec<Value>, usize, HashMap<String, PartialAggResult>)>;
+```
+
+### search_query Collector Selection
+- `size=0` with no aggs: uses `(None::<AggCollector>, Count)` — skip TopDocs entirely
+- `size=0` with aggs: uses `(AggCollector, Count)` — aggs without hit materialization
+- `size>0` with fast-field sort: uses `TopDocs::order_by_fast_field()` for Tantivy-native sorting
+- `size>0` default: uses `(TopDocs::with_limit(from + size), AggCollector?, Count)`
+- TopDocs limit is always `from + size` (not `max(from+size, 100)`) — each shard collects exactly the requested count; the coordinator handles cross-shard merging
     fn sql_record_batch(&self, req: &SearchRequest, columns: &[String], needs_id: bool, needs_score: bool) -> Result<Option<SqlBatchResult>>;
     fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<Value>>;
     fn search_knn_filtered(&self, field: &str, vector: &[f32], k: usize, filter: Option<&QueryClause>) -> Result<Vec<Value>>;
