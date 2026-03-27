@@ -101,6 +101,7 @@ mod tests {
         );
         let meta = IndexMetadata {
             name: "test-index".into(),
+            uuid: String::new(),
             number_of_shards: 2,
             number_of_replicas: 0,
             shard_routing,
@@ -118,6 +119,7 @@ mod tests {
     fn route_document_zero_shards_returns_none() {
         let meta = IndexMetadata {
             name: "empty".into(),
+            uuid: String::new(),
             number_of_shards: 0,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),

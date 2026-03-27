@@ -27,24 +27,15 @@ fn wants_local(params: &CatParams) -> bool {
 }
 
 /// Collect doc counts for all shards across the cluster.
-/// Fans out to remote nodes via gRPC `GetShardStats` concurrently.
-/// Local shards are read directly from the ShardManager.
+/// Fans out to ALL nodes (including self) via gRPC `GetShardStats` concurrently.
+/// This ensures consistent doc counts regardless of which node is queried.
 /// Returns a map of (index_name, shard_id) → doc_count.
 async fn collect_shard_doc_counts(state: &AppState) -> HashMap<(String, u32), u64> {
     let mut counts: HashMap<(String, u32), u64> = HashMap::new();
 
-    // Local shards
-    for (key, engine) in state.shard_manager.all_shards() {
-        counts.insert((key.index.clone(), key.shard_id), engine.doc_count());
-    }
-
-    // Remote nodes — fan out concurrently
     let cs = state.cluster_manager.get_state();
     let mut handles = Vec::new();
     for node in cs.nodes.values() {
-        if node.id == state.local_node_id {
-            continue;
-        }
         let client = state.transport_client.clone();
         let node = node.clone();
         handles.push(tokio::spawn(

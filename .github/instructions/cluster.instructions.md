@@ -14,9 +14,16 @@ FieldMapping { field_type, dimension }  // dimension for knn_vector only
 IndexSettings { refresh_interval_ms: Option<u64> }  // None = cluster default 5000ms
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary, replicas, unassigned_replicas }
-IndexMetadata { name, number_of_shards, number_of_replicas, shard_routing, mappings, settings }
+IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, settings }
 ClusterState { cluster_name, version, master_node, nodes, indices, last_seen }
 ```
+
+### Index UUID
+- Every `IndexMetadata` has a `uuid: String` field (UUID v4, auto-generated on creation)
+- `#[serde(default = "generate_index_uuid")]` ensures backwards compat with old snapshots
+- The UUID determines the on-disk data directory: `<data_dir>/<uuid>/shard_<id>`
+- Delete + re-create with the same index name gets a new UUID — stale data never collides
+- `build_shard_routing()` auto-generates a UUID; `auto_create_index()` generates one explicitly
 
 ### Key ClusterState Methods
 - `add_node(node)`, `remove_node(node_id) -> Option<NodeInfo>`

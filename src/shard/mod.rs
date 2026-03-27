@@ -156,6 +156,8 @@ pub struct ShardManager {
     shards: RwLock<HashMap<ShardKey, Arc<dyn SearchEngine>>>,
     /// Per-index reactive settings managers.
     settings_managers: RwLock<HashMap<String, Arc<SettingsManager>>>,
+    /// Maps index_name → index UUID (used for on-disk directory names).
+    index_uuids: RwLock<HashMap<String, String>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
     pub isr_tracker: IsrTracker,
     /// Translog durability mode for new shards.
@@ -176,6 +178,7 @@ impl ShardManager {
             data_dir: data_dir.into(),
             shards: RwLock::new(HashMap::new()),
             settings_managers: RwLock::new(HashMap::new()),
+            index_uuids: RwLock::new(HashMap::new()),
             isr_tracker: IsrTracker::new(1000),
             durability,
         }
@@ -188,6 +191,7 @@ impl ShardManager {
 
     /// Open or create the engine for a specific shard.
     /// Uses CompositeEngine which handles both text and vector indexing.
+    /// Generates a random UUID for the on-disk directory (suitable for tests).
     pub fn open_shard(&self, index: &str, shard_id: u32) -> Result<Arc<dyn SearchEngine>> {
         self.open_shard_with_mappings(index, shard_id, &HashMap::new())
     }
@@ -222,18 +226,22 @@ impl ShardManager {
         shard_id: u32,
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
     ) -> Result<Arc<dyn SearchEngine>> {
-        self.open_shard_with_settings(index, shard_id, mappings, &IndexSettings::default())
+        self.open_shard_with_settings(index, shard_id, mappings, &IndexSettings::default(), "")
     }
 
     /// Open or create the engine for a specific shard with explicit field mappings
     /// and per-index settings. The settings manager provides a watch channel so
     /// the refresh loop automatically adjusts when settings change.
+    ///
+    /// `index_uuid` determines the on-disk directory: `<data_dir>/<uuid>/shard_<id>`.
+    /// If empty, falls back to index-name-based directory for backwards compat.
     pub fn open_shard_with_settings(
         &self,
         index: &str,
         shard_id: u32,
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
         settings: &IndexSettings,
+        index_uuid: &str,
     ) -> Result<Arc<dyn SearchEngine>> {
         let key = ShardKey::new(index, shard_id);
         {
@@ -243,12 +251,23 @@ impl ShardManager {
             }
         }
 
+        // Register UUID mapping (or generate one if missing)
+        let uuid = if index_uuid.is_empty() {
+            self.get_or_generate_uuid(index)
+        } else {
+            self.register_index_uuid(index, index_uuid);
+            index_uuid.to_string()
+        };
+
         // Ensure a settings manager exists for this index
         let settings_mgr = self.ensure_settings_manager(index, settings);
         let refresh_interval = settings_mgr.refresh_interval();
         let refresh_rx = settings_mgr.watch_refresh_interval();
 
-        let shard_dir = self.data_dir.join(key.data_dir());
+        let shard_dir = self
+            .data_dir
+            .join(&uuid)
+            .join(format!("shard_{}", shard_id));
         std::fs::create_dir_all(&shard_dir)?;
 
         // Try to open the engine. If it fails with a schema mismatch (stale data
@@ -339,6 +358,7 @@ impl ShardManager {
     }
 
     /// Close and remove all shard engines for an index, then delete the data directory.
+    /// Uses the stored UUID mapping to find the correct on-disk directory.
     pub fn close_index_shards(&self, index: &str) -> Result<()> {
         let mut shards = self.shards.write().unwrap_or_else(|e| e.into_inner());
         let keys_to_remove: Vec<ShardKey> = shards
@@ -363,14 +383,23 @@ impl ShardManager {
             managers.remove(index);
         }
 
-        let index_dir = self.data_dir.join(index);
-        if index_dir.exists() {
-            Self::remove_dir_all_with_retry(&index_dir)?;
-            tracing::info!(
-                "Removed shard data for index '{}' at {:?}",
-                index,
-                index_dir
-            );
+        // Look up UUID for this index and delete the UUID-based directory
+        let uuid = {
+            let mut uuids = self.index_uuids.write().unwrap_or_else(|e| e.into_inner());
+            uuids.remove(index)
+        };
+
+        if let Some(uuid) = uuid {
+            let index_dir = self.data_dir.join(&uuid);
+            if index_dir.exists() {
+                Self::remove_dir_all_with_retry(&index_dir)?;
+                tracing::info!(
+                    "Removed shard data for index '{}' (uuid={}) at {:?}",
+                    index,
+                    uuid,
+                    index_dir
+                );
+            }
         }
         Ok(())
     }
@@ -410,6 +439,75 @@ impl ShardManager {
             .unwrap_or_else(|e| e.into_inner())
             .get(index)
             .cloned()
+    }
+
+    /// Register or update the UUID for an index.
+    pub fn register_index_uuid(&self, index: &str, uuid: &str) {
+        let mut uuids = self.index_uuids.write().unwrap_or_else(|e| e.into_inner());
+        uuids.insert(index.to_string(), uuid.to_string());
+    }
+
+    /// Get the registered UUID for an index, or generate and register a new one.
+    fn get_or_generate_uuid(&self, index: &str) -> String {
+        {
+            let uuids = self.index_uuids.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(u) = uuids.get(index) {
+                return u.clone();
+            }
+        }
+        let new_uuid = uuid::Uuid::new_v4().to_string();
+        let mut uuids = self.index_uuids.write().unwrap_or_else(|e| e.into_inner());
+        uuids.entry(index.to_string()).or_insert(new_uuid).clone()
+    }
+
+    /// Get the UUID for an index if one is registered.
+    pub fn index_uuid(&self, index: &str) -> Option<String> {
+        self.index_uuids
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index)
+            .cloned()
+    }
+
+    /// Return the on-disk path for a shard, using the registered UUID.
+    pub fn shard_data_dir(&self, index: &str, shard_id: u32) -> Option<PathBuf> {
+        self.index_uuid(index).map(|uuid| {
+            self.data_dir
+                .join(&uuid)
+                .join(format!("shard_{}", shard_id))
+        })
+    }
+
+    /// Delete any directories under `data_dir` that don't correspond to a known
+    /// index UUID. Called on startup to clean up stale data from deleted indices.
+    pub fn cleanup_orphaned_data(&self, known_uuids: &std::collections::HashSet<String>) {
+        let entries = match std::fs::read_dir(&self.data_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            // Skip known directories (raft data, etc.)
+            if dir_name == "raft" || dir_name == "raft-disk" {
+                continue;
+            }
+            if !known_uuids.contains(&dir_name) {
+                tracing::info!(
+                    "Removing orphaned data directory: {:?} (not in known UUIDs)",
+                    path
+                );
+                if let Err(e) = Self::remove_dir_all_with_retry(&path) {
+                    tracing::warn!("Failed to remove orphaned directory {:?}: {}", path, e);
+                }
+            }
+        }
     }
 }
 
@@ -633,7 +731,7 @@ mod tests {
         let settings = IndexSettings {
             refresh_interval_ms: Some(2000),
         };
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings)
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings, "")
             .unwrap();
 
         let sm = mgr.get_settings_manager("idx");
@@ -653,7 +751,7 @@ mod tests {
     #[tokio::test]
     async fn apply_settings_updates_refresh_interval() {
         let (_dir, mgr) = create_shard_manager();
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default())
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default(), "")
             .unwrap();
 
         let sm = mgr.get_settings_manager("idx").unwrap();
@@ -694,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn close_index_shards_removes_settings_manager() {
         let (_dir, mgr) = create_shard_manager();
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default())
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default(), "")
             .unwrap();
         assert!(mgr.get_settings_manager("idx").is_some());
 
@@ -705,7 +803,7 @@ mod tests {
     #[tokio::test]
     async fn open_shard_with_default_settings_uses_cluster_default() {
         let (_dir, mgr) = create_shard_manager();
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default())
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default(), "")
             .unwrap();
 
         let sm = mgr.get_settings_manager("idx").unwrap();
@@ -721,9 +819,9 @@ mod tests {
         let settings = IndexSettings {
             refresh_interval_ms: Some(4000),
         };
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings)
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings, "")
             .unwrap();
-        mgr.open_shard_with_settings("idx", 1, &HashMap::new(), &settings)
+        mgr.open_shard_with_settings("idx", 1, &HashMap::new(), &settings, "")
             .unwrap();
 
         let sm0 = mgr.get_settings_manager("idx").unwrap();

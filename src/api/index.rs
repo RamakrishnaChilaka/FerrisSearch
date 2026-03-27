@@ -45,6 +45,7 @@ pub(crate) fn ensure_local_index_shards_open(
             *shard_id,
             &metadata.mappings,
             &metadata.settings,
+            &metadata.uuid,
         ) {
             tracing::error!(
                 "{}: failed to open shard {}/{}: {}",
@@ -81,6 +82,7 @@ async fn auto_create_index(
     );
     let m = IndexMetadata {
         name: index_name.to_string(),
+        uuid: uuid::Uuid::new_v4().to_string(),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -308,6 +310,7 @@ pub async fn create_index(
     let shard_assignment = metadata.shard_routing.clone();
     let index_mappings = metadata.mappings.clone();
     let index_settings = metadata.settings.clone();
+    let index_uuid = metadata.uuid.clone();
 
     // Write through Raft if available, otherwise fallback
     if let Some(ref raft) = state.raft {
@@ -375,6 +378,7 @@ pub async fn create_index(
                 *shard_id,
                 &index_mappings,
                 &index_settings,
+                &index_uuid,
             )
         {
             tracing::error!(
@@ -565,8 +569,8 @@ pub async fn index_document_with_id(
     }
 }
 
-/// POST|GET /{index}/_refresh — Scatter refresh to all local shard engines for this index.
-/// If no local shards are open but the index exists in cluster state, opens them first.
+/// POST|GET /{index}/_refresh — Refresh all shards across the cluster for this index.
+/// Fans out to remote nodes via gRPC concurrently.
 pub async fn refresh_index(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
@@ -580,30 +584,16 @@ pub async fn refresh_index(
     }
 
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = cluster_state.indices.get(&index_name);
-
-    let shards = if let Some(meta) = metadata {
-        ensure_local_index_shards_open(&state, &index_name, meta, "Refresh")
-    } else {
+    if !cluster_state.indices.contains_key(&index_name) {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
             format!("no such index [{}]", index_name),
         );
-    };
-
-    let mut successful = 0;
-    let mut failed = 0;
-
-    for (_, engine) in shards {
-        match engine.refresh() {
-            Ok(_) => successful += 1,
-            Err(e) => {
-                tracing::error!("Refresh failed: {}", e);
-                failed += 1;
-            }
-        }
     }
+
+    let (successful, failed) =
+        fan_out_maintenance(&state, &index_name, MaintenanceOp::Refresh).await;
 
     (
         StatusCode::OK,
@@ -613,8 +603,8 @@ pub async fn refresh_index(
     )
 }
 
-/// POST|GET /{index}/_flush — Scatter flush to all local shard engines for this index.
-/// If no local shards are open but the index exists in cluster state, opens them first.
+/// POST|GET /{index}/_flush — Flush all shards across the cluster for this index.
+/// Fans out to remote nodes via gRPC concurrently.
 pub async fn flush_index(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
@@ -628,30 +618,15 @@ pub async fn flush_index(
     }
 
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = cluster_state.indices.get(&index_name);
-
-    let shards = if let Some(meta) = metadata {
-        ensure_local_index_shards_open(&state, &index_name, meta, "Flush")
-    } else {
+    if !cluster_state.indices.contains_key(&index_name) {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
             format!("no such index [{}]", index_name),
         );
-    };
-
-    let mut successful = 0;
-    let mut failed = 0;
-
-    for (_, engine) in shards {
-        match engine.flush_with_global_checkpoint() {
-            Ok(_) => successful += 1,
-            Err(e) => {
-                tracing::error!("Flush failed: {}", e);
-                failed += 1;
-            }
-        }
     }
+
+    let (successful, failed) = fan_out_maintenance(&state, &index_name, MaintenanceOp::Flush).await;
 
     (
         StatusCode::OK,
@@ -659,6 +634,83 @@ pub async fn flush_index(
             "_shards": { "total": successful + failed, "successful": successful, "failed": failed }
         })),
     )
+}
+
+enum MaintenanceOp {
+    Refresh,
+    Flush,
+}
+
+/// Fan out a refresh or flush operation to all nodes in the cluster.
+/// Local shards are handled directly; remote nodes are called via gRPC.
+async fn fan_out_maintenance(state: &AppState, index_name: &str, op: MaintenanceOp) -> (u32, u32) {
+    let mut successful = 0u32;
+    let mut failed = 0u32;
+
+    // Local shards
+    let cs = state.cluster_manager.get_state();
+    if let Some(meta) = cs.indices.get(index_name) {
+        let local_shards = ensure_local_index_shards_open(state, index_name, meta, "Maintenance");
+        for (_, engine) in local_shards {
+            let result = match op {
+                MaintenanceOp::Refresh => engine.refresh(),
+                MaintenanceOp::Flush => engine.flush_with_global_checkpoint(),
+            };
+            match result {
+                Ok(_) => successful += 1,
+                Err(e) => {
+                    tracing::error!(
+                        "Local {} failed: {}",
+                        match op {
+                            MaintenanceOp::Refresh => "refresh",
+                            MaintenanceOp::Flush => "flush",
+                        },
+                        e
+                    );
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    // Remote nodes — fan out concurrently
+    let cs = state.cluster_manager.get_state();
+    let mut handles = Vec::new();
+    for node in cs.nodes.values() {
+        if node.id == state.local_node_id {
+            continue;
+        }
+        let client = state.transport_client.clone();
+        let node = node.clone();
+        let idx = index_name.to_string();
+        let is_flush = matches!(op, MaintenanceOp::Flush);
+        handles.push(tokio::spawn(async move {
+            if is_flush {
+                client.forward_flush(&node, &idx).await
+            } else {
+                client.forward_refresh(&node, &idx).await
+            }
+        }));
+    }
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok((s, f))) => {
+                successful += s;
+                failed += f;
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Remote maintenance RPC failed: {}", e);
+                failed += 1;
+            }
+            Err(e) => {
+                tracing::error!("Remote maintenance task panicked: {}", e);
+                failed += 1;
+            }
+        }
+    }
+
+    (successful, failed)
 }
 
 /// Parsed bulk document with optional index from action metadata.
@@ -2069,6 +2121,7 @@ mod tests {
         }
         IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,

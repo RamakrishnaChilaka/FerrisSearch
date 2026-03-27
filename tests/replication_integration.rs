@@ -33,7 +33,12 @@ async fn start_grpc_server(
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
     let transport_client = TransportClient::new();
-    let service = create_transport_service(cluster_manager, shard_manager, transport_client);
+    let service = create_transport_service(
+        cluster_manager,
+        shard_manager,
+        transport_client,
+        "node-1".into(),
+    );
 
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -100,6 +105,7 @@ fn setup_two_node_cluster_state(cm: &ClusterManager, index_name: &str, replica_p
     );
     cs.add_index(IndexMetadata {
         name: index_name.into(),
+        uuid: String::new(),
         number_of_shards: 1,
         number_of_replicas: 1,
         shard_routing,
@@ -279,7 +285,7 @@ async fn replicate_doc_index_via_grpc() {
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["color"], "blue");
 
-    let tl = HotTranslog::open(dir.path().join("replica-idx").join("shard_0")).unwrap();
+    let tl = HotTranslog::open(sm.shard_data_dir("replica-idx", 0).unwrap()).unwrap();
     let entries = tl.read_all().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].seq_no, 0);
@@ -387,7 +393,7 @@ async fn replicate_bulk_via_grpc() {
         assert!(resp.found, "bulk-rep-{} not found", i);
     }
 
-    let tl = HotTranslog::open(dir.path().join("bulk-rep-idx").join("shard_0")).unwrap();
+    let tl = HotTranslog::open(sm.shard_data_dir("bulk-rep-idx", 0).unwrap()).unwrap();
     let entries = tl.read_all().unwrap();
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].seq_no, 0);
@@ -454,6 +460,7 @@ async fn publish_state_updates_cluster_and_closes_deleted_indices() {
         );
         initial_state.add_index(IndexMetadata {
             name: "old-index".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -547,7 +554,7 @@ async fn primary_write_replicates_to_replica_node() {
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["message"], "hello from primary");
 
-    let tl = HotTranslog::open(replica_dir.path().join("replicated-idx").join("shard_0")).unwrap();
+    let tl = HotTranslog::open(replica_sm.shard_data_dir("replicated-idx", 0).unwrap()).unwrap();
     let entries = tl.read_all().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].seq_no, 0);
@@ -675,7 +682,7 @@ async fn primary_bulk_replicates_to_replica_node() {
         assert!(resp.found, "repl-bulk-{} not replicated to replica", i);
     }
 
-    let tl = HotTranslog::open(replica_dir.path().join("bulk-repl-idx").join("shard_0")).unwrap();
+    let tl = HotTranslog::open(replica_sm.shard_data_dir("bulk-repl-idx", 0).unwrap()).unwrap();
     let entries = tl.read_all().unwrap();
     assert_eq!(entries.len(), 5);
     assert_eq!(entries[0].seq_no, 0);
@@ -741,9 +748,11 @@ async fn search_shard_simple_query_string_via_grpc() {
 #[tokio::test]
 async fn search_shard_reopens_persisted_shard_after_restart() {
     let dir = tempfile::tempdir().unwrap();
+    let test_uuid = "restart-search-uuid";
 
     {
         let sm = ShardManager::new(dir.path(), Duration::from_secs(60));
+        sm.register_index_uuid("restart-idx", test_uuid);
         let engine = sm.open_shard("restart-idx", 0).unwrap();
         engine
             .add_document("d1", serde_json::json!({"title": "rust restart"}))
@@ -752,6 +761,28 @@ async fn search_shard_reopens_persisted_shard_after_restart() {
     }
 
     let cm = Arc::new(ClusterManager::new("restart-search-test".into()));
+    {
+        let mut cs = cm.get_state();
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        cs.add_index(IndexMetadata {
+            name: "restart-idx".into(),
+            uuid: test_uuid.into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: ferrissearch::cluster::state::IndexSettings::default(),
+        });
+        cm.update_state(cs);
+    }
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -843,9 +874,11 @@ async fn search_shard_dsl_match_query_via_grpc() {
 #[tokio::test]
 async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
     let dir = tempfile::tempdir().unwrap();
+    let test_uuid = "restart-dsl-uuid";
 
     {
         let sm = ShardManager::new(dir.path(), Duration::from_secs(60));
+        sm.register_index_uuid("restart-dsl-idx", test_uuid);
         let engine = sm.open_shard("restart-dsl-idx", 0).unwrap();
         engine
             .add_document("d1", serde_json::json!({"title": "the restart matrix"}))
@@ -854,6 +887,28 @@ async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
     }
 
     let cm = Arc::new(ClusterManager::new("restart-dsl-test".into()));
+    {
+        let mut cs = cm.get_state();
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        cs.add_index(IndexMetadata {
+            name: "restart-dsl-idx".into(),
+            uuid: test_uuid.into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: ferrissearch::cluster::state::IndexSettings::default(),
+        });
+        cm.update_state(cs);
+    }
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -886,9 +941,11 @@ async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
 #[tokio::test]
 async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_restart() {
     let dir = tempfile::tempdir().unwrap();
+    let test_uuid = "restart-mapped-uuid";
 
     {
         let sm = ShardManager::new(dir.path(), Duration::from_secs(60));
+        sm.register_index_uuid("restart-mapped-idx", test_uuid);
         let mut mappings = HashMap::new();
         mappings.insert(
             "title".into(),
@@ -947,6 +1004,7 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
     let mut cs = cm.get_state();
     cs.add_index(IndexMetadata {
         name: "restart-mapped-idx".into(),
+        uuid: test_uuid.into(),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -991,9 +1049,10 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
 #[tokio::test]
 async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
+    let test_uuid = "restart-replay-uuid";
 
     {
-        let shard_dir = dir.path().join("restart-replay-idx").join("shard_0");
+        let shard_dir = dir.path().join(test_uuid).join("shard_0");
         std::fs::create_dir_all(&shard_dir).unwrap();
         let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
         engine
@@ -1009,6 +1068,28 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
     }
 
     let cm = Arc::new(ClusterManager::new("restart-replay-test".into()));
+    {
+        let mut cs = cm.get_state();
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        cs.add_index(IndexMetadata {
+            name: "restart-replay-idx".into(),
+            uuid: test_uuid.into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: ferrissearch::cluster::state::IndexSettings::default(),
+        });
+        cm.update_state(cs);
+    }
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -1120,6 +1201,7 @@ async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
     let mut cs = cm.get_state();
     cs.add_index(IndexMetadata {
         name: "agg-idx".into(),
+        uuid: String::new(),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,

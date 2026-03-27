@@ -196,7 +196,7 @@ impl CompositeEngine {
             return Ok(());
         }
 
-        let mut count = 0;
+        let mut vector_count = 0;
         for doc in &docs {
             let doc_id = doc.get("_id").and_then(|v| v.as_str()).unwrap_or("");
             if doc_id.is_empty() {
@@ -204,12 +204,16 @@ impl CompositeEngine {
             }
             if let Some(source) = doc.get("_source") {
                 self.index_vectors(doc_id, source);
-                count += 1;
             }
         }
 
-        if count > 0 {
-            tracing::info!("Rebuilt vector index from {} documents", count);
+        // Check if any vectors were actually indexed
+        if let Some(ref vi) = *self.vector.read().unwrap() {
+            vector_count = vi.len();
+        }
+
+        if vector_count > 0 {
+            tracing::info!("Rebuilt vector index: {} vectors recovered", vector_count);
         }
         Ok(())
     }

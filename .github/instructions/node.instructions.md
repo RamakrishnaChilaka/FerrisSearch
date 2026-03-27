@@ -31,6 +31,7 @@ pub struct Node {
 3. If no seed responds, bootstraps single-node Raft via `bootstrap_single_node()`
 4. Registers self via `raft.client_write(AddNode)` + `raft.client_write(SetMaster)`
 5. Opens shards for any indices assigned to this node
+6. Cleans up orphaned data directories via `cleanup_orphaned_data(known_uuids)`
 
 ### Joining Node (seed reachable)
 1. Tries `try_join_cluster()` with 5 retries and exponential backoff

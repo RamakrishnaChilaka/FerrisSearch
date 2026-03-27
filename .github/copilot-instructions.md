@@ -90,7 +90,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 545 unit tests + 30 consensus integration + 39 replication integration + 15 REST API integration = 629 total
+- 553 unit tests + 30 consensus integration + 39 replication integration + 15 REST API integration = 637 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 
@@ -146,7 +146,7 @@ FieldMapping { field_type: FieldType, dimension: Option<usize> }  // dimension f
 IndexSettings { refresh_interval_ms: Option<u64> }  // None = cluster default 5000ms
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary: NodeId, replicas: Vec<NodeId>, unassigned_replicas: u32 }
-IndexMetadata { name, number_of_shards, number_of_replicas, shard_routing: HashMap<u32, ShardRoutingEntry>, mappings: HashMap<String, FieldMapping>, settings: IndexSettings }
+IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing: HashMap<u32, ShardRoutingEntry>, mappings: HashMap<String, FieldMapping>, settings: IndexSettings }
 ClusterState { cluster_name, version: u64, master_node: Option<NodeId>, nodes: HashMap<NodeId, NodeInfo>, indices: HashMap<String, IndexMetadata>, last_seen: HashMap<NodeId, Instant> }
 ```
 
@@ -399,13 +399,22 @@ pub struct ShardManager {
     data_dir: PathBuf,
     shards: RwLock<HashMap<ShardKey, Arc<dyn SearchEngine>>>,
     settings_managers: RwLock<HashMap<String, Arc<SettingsManager>>>,  // per-index
+    index_uuids: RwLock<HashMap<String, String>>,  // index_name → UUID for on-disk dirs
     pub isr_tracker: IsrTracker,
     durability: TranslogDurability,
 }
 ```
 
+### UUID-Based Data Directories
+- On-disk path: `<data_dir>/<uuid>/shard_<id>` (NOT `<data_dir>/<index_name>/shard_<id>`)
+- `IndexMetadata.uuid` is a UUID v4 string, auto-generated on index creation
+- Passed to `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)`
+- `close_index_shards()` uses stored UUID mapping to find the directory to delete
+- `cleanup_orphaned_data(known_uuids)` deletes directories not matching any known index UUID (called on startup)
+- **NEVER** construct shard paths from index names — always use the UUID
+
 ### Key Methods
-- `open_shard_with_settings(index, shard_id, mappings, settings)` — creates CompositeEngine, starts reactive refresh, rebuilds vectors
+- `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)` — creates CompositeEngine, starts reactive refresh, rebuilds vectors
 - `get_shard(index, shard_id)`, `get_index_shards(index)`, `all_shards()`
 - `close_index_shards(index)` — remove engines, clean ISR, delete directory
 - `apply_settings(index, new_settings)` — notify consumers via watch channels

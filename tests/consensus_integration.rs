@@ -44,6 +44,7 @@ fn make_index(name: &str) -> IndexMetadata {
     );
     IndexMetadata {
         name: name.into(),
+        uuid: String::new(),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -878,7 +879,7 @@ async fn start_raft_grpc_server(
     let dir = tempfile::tempdir().unwrap();
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     let tc = TransportClient::new();
-    let service = create_transport_service_with_raft(cm, sm, tc, raft);
+    let service = create_transport_service_with_raft(cm, sm, tc, raft, "node-1".into());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
