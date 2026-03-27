@@ -868,15 +868,57 @@ mod tests {
     }
 
     #[test]
-    fn limit_not_pushed_down_for_non_score_order_by() {
+    fn limit_pushed_down_for_single_fast_field_order_by() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
             "SELECT title, price FROM products WHERE text_match(description, 'iphone') ORDER BY price DESC LIMIT 10",
         ).unwrap();
         assert_eq!(plan.limit, Some(10));
-        assert!(!plan.limit_pushed_down);
+        assert!(
+            plan.limit_pushed_down,
+            "single fast-field ORDER BY should push down LIMIT"
+        );
+        assert_eq!(plan.sort_pushdown, Some(("price".to_string(), true)));
         let req = plan.to_search_request();
-        assert_eq!(req.size, 100_000); // falls back to SQL_MATCH_LIMIT
+        assert_eq!(req.size, 10); // pushed down, not 100K
+        assert_eq!(req.sort.len(), 1); // sort clause populated
+    }
+
+    #[test]
+    fn sort_pushdown_not_applied_for_multi_column_order_by() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title FROM products WHERE text_match(description, 'iphone') ORDER BY price DESC, title ASC LIMIT 10",
+        ).unwrap();
+        assert!(
+            plan.sort_pushdown.is_none(),
+            "multi-column ORDER BY cannot push to Tantivy"
+        );
+        assert!(!plan.limit_pushed_down);
+    }
+
+    #[test]
+    fn sort_pushdown_asc_direction() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price FROM products ORDER BY price ASC LIMIT 5",
+        )
+        .unwrap();
+        assert_eq!(plan.sort_pushdown, Some(("price".to_string(), false)));
+        assert!(plan.limit_pushed_down);
+    }
+
+    #[test]
+    fn sort_pushdown_no_limit_still_captured() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT title, price FROM products ORDER BY price DESC",
+        )
+        .unwrap();
+        // sort_pushdown is captured even without LIMIT
+        assert_eq!(plan.sort_pushdown, Some(("price".to_string(), true)));
+        // but limit_pushed_down requires a LIMIT clause
+        assert!(!plan.limit_pushed_down);
     }
 
     #[test]

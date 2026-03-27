@@ -202,8 +202,43 @@ impl HotEngine {
         let searcher = self.reader.searcher();
         let query = self.build_query(&req.query)?;
         let limit = std::cmp::max(req.size, 1);
+
+        // Use fast-field sort when the SearchRequest includes a sortable field,
+        // otherwise fall back to score-based collection.
         let (top_docs, total_hits) =
-            searcher.search(&*query, &(TopDocs::with_limit(limit), Count))?;
+            if let Some((sort_field, order)) = self.extract_fast_field_sort(req) {
+                let schema = self.index.schema();
+                let field = self.resolve_field(&sort_field);
+                match schema.get_field_entry(field).field_type() {
+                    tantivy::schema::FieldType::F64(_) => {
+                        let td = TopDocs::with_limit(limit)
+                            .order_by_fast_field::<f64>(&sort_field, order);
+                        let (sorted, count) = searcher.search(&*query, &(td, Count))?;
+                        let docs: Vec<(f32, tantivy::DocAddress)> =
+                            sorted.into_iter().map(|(_, addr)| (0.0f32, addr)).collect();
+                        (docs, count)
+                    }
+                    tantivy::schema::FieldType::I64(_) => {
+                        let td = TopDocs::with_limit(limit)
+                            .order_by_fast_field::<i64>(&sort_field, order);
+                        let (sorted, count) = searcher.search(&*query, &(td, Count))?;
+                        let docs: Vec<(f32, tantivy::DocAddress)> =
+                            sorted.into_iter().map(|(_, addr)| (0.0f32, addr)).collect();
+                        (docs, count)
+                    }
+                    tantivy::schema::FieldType::U64(_) => {
+                        let td = TopDocs::with_limit(limit)
+                            .order_by_fast_field::<u64>(&sort_field, order);
+                        let (sorted, count) = searcher.search(&*query, &(td, Count))?;
+                        let docs: Vec<(f32, tantivy::DocAddress)> =
+                            sorted.into_iter().map(|(_, addr)| (0.0f32, addr)).collect();
+                        (docs, count)
+                    }
+                    _ => searcher.search(&*query, &(TopDocs::with_limit(limit), Count))?,
+                }
+            } else {
+                searcher.search(&*query, &(TopDocs::with_limit(limit), Count))?
+            };
 
         let schema = self.index.schema();
         let segment_readers = searcher.segment_readers();
