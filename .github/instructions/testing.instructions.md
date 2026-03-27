@@ -4,8 +4,8 @@
 - **545 unit tests** (`cargo test --lib`)
 - **30 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **14 REST API integration tests** (`cargo test --test rest_api_integration`)
-- **628 total** (`cargo test`)
+- **15 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **629 total** (`cargo test`)
 
 ## Running Tests
 ```bash

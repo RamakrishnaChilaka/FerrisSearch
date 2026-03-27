@@ -117,6 +117,44 @@ pub async fn cat_nodes(State(state): State<AppState>, params: Query<CatParams>) 
     text_response(out)
 }
 
+/// Determine the display state for a shard assigned to `node_id`.
+/// - `UNASSIGNED` — the assigned node doesn't exist in the cluster
+/// - `INITIALIZING` — the node exists but the engine isn't open yet (shard not in doc_counts)
+/// - `STARTED` — the node exists and the engine is serving docs
+fn shard_display_state(
+    node_id: &str,
+    index: &str,
+    shard_id: u32,
+    cs: &crate::cluster::state::ClusterState,
+    doc_counts: &Option<HashMap<(String, u32), u64>>,
+    state: &AppState,
+) -> &'static str {
+    if !cs.nodes.contains_key(node_id) {
+        return "UNASSIGNED";
+    }
+    match doc_counts {
+        Some(m) => {
+            if m.contains_key(&(index.to_string(), shard_id)) {
+                "STARTED"
+            } else {
+                "INITIALIZING"
+            }
+        }
+        None => {
+            // Local-only mode
+            if node_id == state.local_node_id {
+                if state.shard_manager.get_shard(index, shard_id).is_some() {
+                    "STARTED"
+                } else {
+                    "INITIALIZING"
+                }
+            } else {
+                "STARTED" // remote shard, can't determine from local-only view
+            }
+        }
+    }
+}
+
 /// GET /_cat/shards — tabular shard listing
 /// By default, fans out to all nodes to collect real doc counts.
 /// Pass `?local` to only show counts for shards on this node.
@@ -133,7 +171,7 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
     if wants_headers(&params) {
         writeln!(
             out,
-            "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+            "{:<25} {:<8} {:<10} {:<14} {:<10} {:<40}",
             "index", "shard", "prirep", "state", "docs", "node"
         )
         .unwrap();
@@ -154,11 +192,14 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
                 .get(&routing.primary)
                 .map(|n| n.name.as_str())
                 .unwrap_or("UNASSIGNED");
-            let primary_state = if cs.nodes.contains_key(&routing.primary) {
-                "STARTED"
-            } else {
-                "UNASSIGNED"
-            };
+            let primary_state = shard_display_state(
+                &routing.primary,
+                idx_name,
+                shard_id,
+                &cs,
+                &doc_counts,
+                &state,
+            );
 
             let docs = match &doc_counts {
                 Some(m) => m
@@ -170,7 +211,7 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
 
             writeln!(
                 out,
-                "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+                "{:<25} {:<8} {:<10} {:<14} {:<10} {:<40}",
                 idx_name, shard_id, "p", primary_state, docs, node_name
             )
             .unwrap();
@@ -182,11 +223,14 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
                     .get(replica_node_id)
                     .map(|n| n.name.as_str())
                     .unwrap_or("UNASSIGNED");
-                let replica_state = if cs.nodes.contains_key(replica_node_id) {
-                    "STARTED"
-                } else {
-                    "UNASSIGNED"
-                };
+                let replica_state = shard_display_state(
+                    replica_node_id,
+                    idx_name,
+                    shard_id,
+                    &cs,
+                    &doc_counts,
+                    &state,
+                );
                 let replica_docs = match &doc_counts {
                     Some(m) => m
                         .get(&(idx_name.clone(), shard_id))
@@ -196,7 +240,7 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
                 };
                 writeln!(
                     out,
-                    "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+                    "{:<25} {:<8} {:<10} {:<14} {:<10} {:<40}",
                     idx_name, shard_id, "r", replica_state, replica_docs, replica_name
                 )
                 .unwrap();
@@ -206,7 +250,7 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
             for _ in 0..routing.unassigned_replicas {
                 writeln!(
                     out,
-                    "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
+                    "{:<25} {:<8} {:<10} {:<14} {:<10} {:<40}",
                     idx_name, shard_id, "r", "UNASSIGNED", "-", ""
                 )
                 .unwrap();
