@@ -154,16 +154,16 @@ impl Node {
                         );
                     }
                 } else {
-                    // Try to join an existing cluster (leader handles Raft membership)
+                    // Try to join an existing cluster with retries.
+                    // Other nodes may not be ready yet — retry a few times
+                    // before falling back to single-node bootstrap.
                     let joined = if !remote_seeds.is_empty() {
-                        client
-                            .join_cluster(&remote_seeds, &local_node, raft_node_id)
-                            .await
+                        try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 5).await
                     } else {
-                        None
+                        false
                     };
 
-                    if joined.is_some() {
+                    if joined {
                         // Don't call update_state — Raft log replication will
                         // propagate the authoritative state to our state machine.
                         info!(
@@ -576,7 +576,9 @@ async fn try_join_cluster(
         }
 
         if attempt + 1 < attempts {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Exponential backoff: 500ms, 1s, 2s, 4s, capped at 5s
+            let delay = std::cmp::min(500 * (1 << attempt), 5000);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
     }
 
@@ -785,5 +787,49 @@ mod tests {
             remote,
             vec!["127.0.0.1:9300".to_string(), "127.0.0.1:9302".to_string()]
         );
+    }
+
+    #[test]
+    fn remote_seed_hosts_all_nodes_have_reachable_peers() {
+        // When seed_hosts includes all 3 transport ports, every node
+        // must have at least one remote seed after filtering itself out.
+        // This is the fix for the reverse-start-order bug: if seed_hosts
+        // only had ["127.0.0.1:9300"], node-1 filtered it out and got
+        // an empty list, causing premature single-node bootstrap.
+        let seeds = vec![
+            "127.0.0.1:9300".to_string(),
+            "127.0.0.1:9301".to_string(),
+            "127.0.0.1:9302".to_string(),
+        ];
+
+        for port in [9300, 9301, 9302] {
+            let remote = remote_seed_hosts(&seeds, port);
+            assert_eq!(
+                remote.len(),
+                2,
+                "node on port {port} must have 2 remote seeds, got {}",
+                remote.len()
+            );
+            assert!(
+                !remote.iter().any(|s| s.ends_with(&format!(":{port}"))),
+                "node on port {port} must not have itself in remote seeds"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_seed_hosts_single_seed_leaves_self_empty() {
+        // Documents the old bug: with only one seed matching the local port,
+        // the node has zero remote seeds and will bootstrap solo.
+        let seeds = vec!["127.0.0.1:9300".to_string()];
+        let remote = remote_seed_hosts(&seeds, 9300);
+        assert!(
+            remote.is_empty(),
+            "single seed matching local port must be empty (triggers bootstrap)"
+        );
+
+        // But node-2 still has a seed to try
+        let remote2 = remote_seed_hosts(&seeds, 9301);
+        assert_eq!(remote2.len(), 1);
     }
 }
