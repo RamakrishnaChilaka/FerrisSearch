@@ -592,6 +592,46 @@ impl TransportClient {
             .collect();
         Ok(map)
     }
+
+    /// Fan out a refresh request to a remote node for a specific index.
+    pub async fn forward_refresh(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+    ) -> Result<(u32, u32), anyhow::Error> {
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
+        let resp = client
+            .refresh_index(tonic::Request::new(IndexMaintenanceRequest {
+                index_name: index_name.to_string(),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("RefreshIndex RPC to {}: {}", node.id, e))?;
+        let inner = resp.into_inner();
+        Ok((inner.successful_shards, inner.failed_shards))
+    }
+
+    /// Fan out a flush request to a remote node for a specific index.
+    pub async fn forward_flush(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+    ) -> Result<(u32, u32), anyhow::Error> {
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
+        let resp = client
+            .flush_index(tonic::Request::new(IndexMaintenanceRequest {
+                index_name: index_name.to_string(),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("FlushIndex RPC to {}: {}", node.id, e))?;
+        let inner = resp.into_inner();
+        Ok((inner.successful_shards, inner.failed_shards))
+    }
 }
 
 /// Result of a recovery request from the primary.

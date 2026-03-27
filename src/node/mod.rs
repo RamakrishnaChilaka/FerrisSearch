@@ -89,12 +89,14 @@ impl Node {
                 self.shard_manager.clone(),
                 self.transport_client.clone(),
                 raft.clone(),
+                self.config.node_name.clone(),
             )
         } else {
             crate::transport::server::create_transport_service(
                 self.cluster_manager.clone(),
                 self.shard_manager.clone(),
                 self.transport_client.clone(),
+                self.config.node_name.clone(),
             )
         };
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));
@@ -218,6 +220,13 @@ impl Node {
 
             let state = manager.get_state();
             open_local_assigned_shards(&state, &local_id, manager_clone.as_ref());
+
+            // Clean up orphaned data directories from previously deleted indices
+            {
+                let known_uuids: std::collections::HashSet<String> =
+                    state.indices.values().map(|m| m.uuid.clone()).collect();
+                manager_clone.cleanup_orphaned_data(&known_uuids);
+            }
 
             // ── Lifecycle loop ─────────────────────────────────────────
             let mut leader_since: Option<Instant> = None;
@@ -415,11 +424,17 @@ impl Node {
                         leader_since = None;
 
                         // ── Follower duties ────────────────────────
-                        // Only try to rejoin if this node is not in the cluster state
-                        // AND not already a Raft voter (avoids flood during leadership transitions).
+                        // Only try to rejoin if this node is genuinely not part of
+                        // the cluster. Skip if:
+                        // - already in cluster state (state.nodes)
+                        // - already a Raft voter (recovered from disk)
+                        // - Raft is initialized (has persisted vote/log — means we
+                        //   were previously part of the cluster)
                         let is_voter = raft.voter_ids().any(|id| id == raft_node_id);
+                        let is_initialized = raft.is_initialized().await.unwrap_or(false);
                         if !state.nodes.contains_key(&local_id)
                             && !is_voter
+                            && !is_initialized
                             && try_join_cluster(
                                 &client,
                                 &remote_seeds,
@@ -533,6 +548,7 @@ fn open_local_assigned_shards(
                 *shard_id,
                 &metadata.mappings,
                 &metadata.settings,
+                &metadata.uuid,
             ) {
                 tracing::warn!(
                     "Failed to reopen local shard {}/{} during lifecycle reconciliation: {}",
@@ -765,6 +781,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing,

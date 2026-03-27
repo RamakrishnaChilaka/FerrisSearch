@@ -58,8 +58,12 @@ impl RestTestHarness {
             raft: None,
         };
 
-        let transport_service =
-            create_transport_service(cluster_manager, shard_manager, transport_client);
+        let transport_service = create_transport_service(
+            cluster_manager,
+            shard_manager,
+            transport_client,
+            "node-1".into(),
+        );
         let transport_handle = tokio::spawn(async move {
             let incoming = TcpListenerStream::new(transport_listener);
             if let Err(error) = tonic::transport::Server::builder()
@@ -843,6 +847,42 @@ async fn rest_cat_shards_shows_started_state() -> Result<()> {
         !text.contains("INITIALIZING"),
         "cat/shards must not show INITIALIZING after docs are loaded, got: {text}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_count_returns_correct_total() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // GET _count (match_all) — should return all 3 docs
+    let (status, body) = harness.get_json("/products/_count").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], json!(3));
+    assert_eq!(body["_shards"]["successful"], json!(1));
+    assert_eq!(body["_shards"]["failed"], json!(0));
+
+    // POST _count with a match query — should return matching docs only
+    let (status, body) = harness
+        .post_json(
+            "/products/_count",
+            json!({
+                "query": { "term": { "brand": "Apple" } }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], json!(2));
+
+    // POST _count with empty body — match_all
+    let (status, body) = harness.post_json("/products/_count", json!({})).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], json!(3));
+
+    // _count on non-existent index
+    let (status, _body) = harness.get_json("/nonexistent/_count").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     Ok(())
 }

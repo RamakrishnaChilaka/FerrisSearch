@@ -224,6 +224,7 @@ mod tests {
         );
         cs.add_index(IndexMetadata {
             name: name.into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing,

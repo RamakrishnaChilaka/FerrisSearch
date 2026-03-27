@@ -118,8 +118,15 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 ### Maintenance — src/api/index.rs
 | HTTP | Path | Handler |
 |------|------|---------|
-| POST/GET | `/{index}/_refresh` | `refresh_index()` |
-| POST/GET | `/{index}/_flush` | `flush_index()` |
+| POST/GET | `/{index}/_refresh` | `refresh_index()` — fans out to all nodes |
+| POST/GET | `/{index}/_flush` | `flush_index()` — fans out to all nodes |
+
+### Refresh/Flush Fan-Out
+Both `refresh_index()` and `flush_index()` fan out to ALL nodes via `fan_out_maintenance()`:
+- **Local shards**: iterated via `ensure_local_index_shards_open()` and executed directly
+- **Remote nodes**: concurrent `tokio::spawn` per node via gRPC `RefreshIndex`/`FlushIndex` RPCs
+- The gRPC handlers use `run_maintenance_on_assigned_shards()` which checks the routing table — only shards where this node is primary or replica are operated on (orphaned shards are skipped)
+- Response: `{"_shards": {"total": N, "successful": M, "failed": F}}`
 
 ## RefreshParam
 ```rust

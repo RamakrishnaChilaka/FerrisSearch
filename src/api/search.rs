@@ -9,6 +9,68 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::time::Instant;
 
+/// GET/POST /{index}/_count — Count documents matching a query.
+/// GET returns total doc count (match_all). POST accepts an optional query body.
+pub async fn count_documents(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let search_req = match body {
+        Some(Json(req)) => match serde_json::from_value::<CountRequest>(req) {
+            Ok(cr) => crate::search::SearchRequest {
+                query: cr.query,
+                size: 0,
+                from: 0,
+                knn: None,
+                sort: vec![],
+                aggs: std::collections::HashMap::new(),
+            },
+            Err(e) => {
+                return crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("Invalid count query: {}", e),
+                );
+            }
+        },
+        None => crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(serde_json::json!({})),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        },
+    };
+
+    match crate::api::index::execute_distributed_dsl_search(&state, &index_name, &search_req).await
+    {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "count": result.total_hits,
+                "_shards": {
+                    "total": result.successful_shards + result.failed_shards,
+                    "successful": result.successful_shards,
+                    "failed": result.failed_shards
+                }
+            })),
+        ),
+        Err(err) => err,
+    }
+}
+
+#[derive(Deserialize)]
+struct CountRequest {
+    #[serde(default = "default_match_all_query")]
+    query: crate::search::QueryClause,
+}
+
+fn default_match_all_query() -> crate::search::QueryClause {
+    crate::search::QueryClause::MatchAll(serde_json::json!({}))
+}
+
 #[derive(Deserialize)]
 pub struct SearchParams {
     #[serde(default = "default_query")]
@@ -626,6 +688,7 @@ mod tests {
 
         IndexMetadata {
             name: index.to_string(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,

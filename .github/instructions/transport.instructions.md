@@ -36,6 +36,10 @@ TransferMaster(TransferMasterRequest) → TransferMasterResponse
 // Shard stats (for _cat endpoints)
 GetShardStats(ShardStatsRequest) → ShardStatsResponse
 
+// Index maintenance (fan-out from coordinator)
+RefreshIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
+FlushIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
+
 // Raft consensus (opaque JSON payloads)
 RaftVote(RaftRequest) → RaftReply
 RaftAppendEntries(RaftRequest) → RaftReply
@@ -49,9 +53,15 @@ pub struct TransportService {
     pub shard_manager: Arc<ShardManager>,
     pub transport_client: TransportClient,
     pub raft: Option<Arc<RaftInstance>>,
+    pub local_node_id: String,  // filters locally-assigned shards
 }
 ```
 Implements `InternalTransport` trait. All RPC handlers check Raft leadership or route to the correct shard.
+
+### Shard Stats & Maintenance
+- `get_shard_stats` only reports on **already-open** shards via `all_shards()` — it does NOT reopen shards from disk
+- `refresh_index` / `flush_index` use `run_maintenance_on_assigned_shards()` which checks the routing table and only operates on shards where `primary == local_node_id` or the node is in `replicas` — orphaned shards are skipped
+- The `local_node_id` field is required by the constructors: `create_transport_service(cm, sm, tc, local_node_id)` and `create_transport_service_with_raft(cm, sm, tc, raft, local_node_id)`
 
 ### Key Handler Patterns
 - **join_cluster**: If leader → registers node via Raft (`AddNode` + `add_learner` + `change_membership`). If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
@@ -92,6 +102,8 @@ pub struct TransportClient {
 | `forward_search_dsl_to_shard()` | Scatter DSL search to remote shard |
 | `forward_sql_batch_to_shard()` | Scatter SQL RecordBatch to remote shard (Arrow IPC) |
 | `get_shard_stats()` | Collect shard doc counts from remote node |
+| `forward_refresh()` | Fan out refresh to remote node |
+| `forward_flush()` | Fan out flush to remote node |
 | `replicate_to_shard()` | Primary → replica single write |
 | `replicate_bulk_to_shard()` | Primary → replica batch write |
 | `recover_replica()` | Request missed ops from primary's WAL |

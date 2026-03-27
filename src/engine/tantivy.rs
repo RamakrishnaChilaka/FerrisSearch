@@ -110,7 +110,7 @@ impl HotEngine {
             }
         }
 
-        let writer = index.writer(50_000_000)?; // 50MB heap
+        let writer = index.writer(512_000_000)?; // 512MB heap — matches OpenSearch's recommended minimum
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)

@@ -117,6 +117,11 @@ pub struct IndexSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
     pub name: String,
+    /// Unique identifier for this index instance.
+    /// Used as the on-disk directory name so that delete + re-create with the same
+    /// index name never collides with stale data from the previous incarnation.
+    #[serde(default = "generate_index_uuid")]
+    pub uuid: String,
     pub number_of_shards: u32,
     pub number_of_replicas: u32,
     /// Maps Shard ID → routing entry (primary + replicas)
@@ -128,6 +133,11 @@ pub struct IndexMetadata {
     /// engine-specific configuration when shardless mode is added.
     #[serde(default)]
     pub settings: IndexSettings,
+}
+
+/// Generate a random UUID v4 for new indices.
+fn generate_index_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 impl IndexMetadata {
@@ -165,6 +175,7 @@ impl IndexMetadata {
         }
         Self {
             name: name.to_string(),
+            uuid: generate_index_uuid(),
             number_of_shards: num_shards,
             number_of_replicas: num_replicas,
             shard_routing,
@@ -447,6 +458,7 @@ mod tests {
         let mut state = ClusterState::new("c".into());
         let meta = IndexMetadata {
             name: "my-index".into(),
+            uuid: String::new(),
             number_of_shards: 3,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -463,6 +475,7 @@ mod tests {
     fn promote_replica_to_primary() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -487,6 +500,7 @@ mod tests {
     fn promote_with_no_replicas_fails() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
@@ -509,6 +523,7 @@ mod tests {
     fn remove_node_from_index_metadata() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -543,6 +558,7 @@ mod tests {
     fn primary_node_returns_correct_id() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -574,6 +590,7 @@ mod tests {
     fn replica_nodes_returns_correct_list() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
@@ -598,6 +615,7 @@ mod tests {
     fn replica_nodes_empty_for_unknown_shard() {
         let meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
@@ -611,6 +629,7 @@ mod tests {
     fn chained_promotions() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
@@ -644,6 +663,7 @@ mod tests {
     fn promote_nonexistent_shard_returns_false() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
@@ -657,6 +677,7 @@ mod tests {
     fn remove_node_from_multiple_roles() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 3,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -701,6 +722,7 @@ mod tests {
     fn remove_node_not_in_any_shard() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -755,6 +777,7 @@ mod tests {
     fn index_metadata_with_mappings_serde() {
         let mut meta = IndexMetadata {
             name: "test".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
@@ -992,6 +1015,7 @@ mod tests {
     fn promote_replica_to_specific_node() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
@@ -1017,6 +1041,7 @@ mod tests {
     fn promote_replica_to_nonexistent_node_fails() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -1043,6 +1068,7 @@ mod tests {
     fn promote_replica_to_unknown_shard_fails() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -1067,6 +1093,7 @@ mod tests {
     fn remove_primary_node_and_promote() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -1107,6 +1134,7 @@ mod tests {
     fn remove_node_returns_empty_for_replica_only() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -1184,6 +1212,7 @@ mod tests {
     fn update_replicas_increase_adds_unassigned() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 2,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
@@ -1218,6 +1247,7 @@ mod tests {
     fn update_replicas_decrease_removes_assigned() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
@@ -1245,6 +1275,7 @@ mod tests {
     fn update_replicas_decrease_reduces_unassigned_first() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 3,
             shard_routing: HashMap::new(),
@@ -1272,6 +1303,7 @@ mod tests {
     fn update_replicas_same_value_is_noop() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -1297,6 +1329,7 @@ mod tests {
     fn update_replicas_to_zero_removes_all() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
@@ -1322,6 +1355,7 @@ mod tests {
     fn update_replicas_multi_shard() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
+            uuid: String::new(),
             number_of_shards: 3,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
@@ -1350,6 +1384,7 @@ mod tests {
     fn index_metadata_with_custom_settings_serializes() {
         let meta = IndexMetadata {
             name: "test".into(),
+            uuid: String::new(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
