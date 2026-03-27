@@ -415,7 +415,11 @@ impl Node {
                         leader_since = None;
 
                         // ── Follower duties ────────────────────────
+                        // Only try to rejoin if this node is not in the cluster state
+                        // AND not already a Raft voter (avoids flood during leadership transitions).
+                        let is_voter = raft.voter_ids().any(|id| id == raft_node_id);
                         if !state.nodes.contains_key(&local_id)
+                            && !is_voter
                             && try_join_cluster(
                                 &client,
                                 &remote_seeds,
