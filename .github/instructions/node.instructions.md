@@ -18,18 +18,26 @@ pub struct Node {
    - **HTTP API Server** (port 9200) — REST endpoints via Axum
    - **Cluster Lifecycle Loop** — runs every 5 seconds
 
+## Seed Hosts Configuration
+- `seed_hosts` must include ALL node transport addresses (e.g., `["127.0.0.1:9300", "127.0.0.1:9301", "127.0.0.1:9302"]`).
+- `remote_seed_hosts()` filters out the current node's own transport port to prevent self-join.
+- **Critical**: If `seed_hosts` only contains the first node's address (e.g., `["127.0.0.1:9300"]`), starting nodes in any order other than 1→2→3 fails — each node bootstraps its own isolated Raft cluster.
+- The `dev_cluster.sh` / `dev_cluster_release.sh` scripts set `FERRISSEARCH_SEED_HOSTS` to all three local ports.
+
 ## Cluster Lifecycle Loop
 ### First Node (no reachable seeds)
 1. Filters `seed_hosts` to exclude self
-2. Bootstraps single-node Raft via `bootstrap_single_node()`
-3. Registers self via `raft.client_write(AddNode)` + `raft.client_write(SetMaster)`
-4. Opens shards for any indices assigned to this node
+2. Tries `try_join_cluster()` with 5 retries and exponential backoff (500ms → 1s → 2s → 4s → 5s cap)
+3. If no seed responds, bootstraps single-node Raft via `bootstrap_single_node()`
+4. Registers self via `raft.client_write(AddNode)` + `raft.client_write(SetMaster)`
+5. Opens shards for any indices assigned to this node
 
 ### Joining Node (seed reachable)
-1. Sends `JoinCluster` gRPC to seed hosts (includes `raft_node_id`)
-2. Leader handles: `AddNode` Raft command → `add_learner()` → `change_membership()`
-3. Raft log replication propagates state (joiner does NOT call `update_state`)
-4. After joining, opens shards assigned to this node
+1. Tries `try_join_cluster()` with 5 retries and exponential backoff
+2. Sends `JoinCluster` gRPC to seed hosts (includes `raft_node_id`)
+3. Leader handles: `AddNode` Raft command → `add_learner()` → `change_membership()`
+4. Raft log replication propagates state (joiner does NOT call `update_state`)
+5. After joining, opens shards assigned to this node
 
 ### Leader Duties (every 5s tick)
 1. `SetMaster` if not already set
