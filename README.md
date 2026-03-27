@@ -567,8 +567,8 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 625 tests
-cargo test --lib                                # Unit tests (542)
+cargo test                                      # All 628 tests
+cargo test --lib                                # Unit tests (545)
 cargo test --test consensus_integration          # Raft consensus tests (30)
 cargo test --test replication_integration        # Replication tests (39)
 cargo test --test rest_api_integration           # REST API tests (14)
@@ -680,13 +680,16 @@ config/            Default configuration
 - [x] Coordinator merge of compact grouped partial states
 - [x] Aggregate pushdown for fast-field-eligible `count(*)`, `min`, `max`, `sum`, `avg`
 - [x] Distributed fast-field SQL (ship compact Arrow batches between nodes instead of `_source` JSON for cross-node fast-field queries)
-- [ ] Search-aware `ORDER BY` / `LIMIT` pushdown on sortable fast fields
+- [x] Search-aware `ORDER BY` / `LIMIT` pushdown on sortable fast fields
 - [x] Broader predicate pushdown (`IN`, `BETWEEN`, more bool combinations)
 - [ ] Stronger Arrow type fidelity across fast-field and fallback SQL paths
 - [ ] Explicit SQL null semantics (`IS NULL`, `IS NOT NULL`) on matched docs
 - [ ] `HAVING` support after grouped execution
 - [ ] More robust alias handling in `ORDER BY`, `GROUP BY`, and `HAVING`
 - [x] `EXPLAIN ANALYZE` with runtime timings and fallback reasons
+- [ ] `COUNT(DISTINCT field)` aggregate function
+- [ ] Cursor-based SQL pagination for large result sets
+- [ ] Lookup joins (small broadcast table joined to search results)
 - [ ] Search-native SQL functions beyond `text_match` / `score`
 - [ ] Search-aware histogram and date-bucketing style SQL analytics
 

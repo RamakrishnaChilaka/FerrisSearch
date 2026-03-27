@@ -85,6 +85,9 @@ pub struct QueryPlan {
     pub needs_id: bool,
     /// Whether the SQL query references `score` in any projection, filter, or ordering.
     pub needs_score: bool,
+    /// When ORDER BY is a single non-score column, capture (field, descending) for
+    /// fast-field sort pushdown into Tantivy's TopDocs collector.
+    pub sort_pushdown: Option<(String, bool)>,
 }
 
 impl QueryPlan {
@@ -149,9 +152,24 @@ impl QueryPlan {
             size,
             from: 0,
             knn: None,
-            sort: vec![],
+            sort: self.build_sort_clauses(),
             aggs,
         }
+    }
+
+    fn build_sort_clauses(&self) -> Vec<crate::search::SortClause> {
+        let Some((ref field, desc)) = self.sort_pushdown else {
+            return vec![];
+        };
+        let direction = if desc {
+            crate::search::SortDirection::Desc
+        } else {
+            crate::search::SortDirection::Asc
+        };
+        vec![crate::search::SortClause::Field(HashMap::from([(
+            field.clone(),
+            crate::search::SortOrder::Direction(direction),
+        )]))]
     }
 
     /// Build a structured explanation of the query plan for the EXPLAIN API.
@@ -349,11 +367,13 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         &group_by_columns,
     )?;
 
+    let sort_pushdown = extract_sort_pushdown(order_by.as_ref());
+
     let limit_pushed_down = limit.is_some()
         && !has_residual_predicates
         && grouped_sql.is_none()
         && !selects_all_columns
-        && is_order_by_score_only(order_by.as_ref());
+        && (is_order_by_score_only(order_by.as_ref()) || sort_pushdown.is_some());
 
     // Safety: if no data columns, _id, or score are needed and we're not on the
     // grouped partial or SELECT * paths, force needs_score so the Arrow batch has
@@ -380,6 +400,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         limit_pushed_down,
         needs_id,
         needs_score,
+        sort_pushdown,
     })
 }
 
@@ -617,6 +638,26 @@ fn is_order_by_score_only(order_by: Option<&sqlparser::ast::OrderBy>) -> bool {
         }),
         OrderByKind::All(_) => false,
     }
+}
+
+/// Extract a single-column ORDER BY on a non-score field for fast-field sort pushdown.
+/// Returns `Some((field_name, is_desc))` when the ORDER BY is a single data column
+/// (not `score` or `_score`), enabling Tantivy's `TopDocs::order_by_fast_field()`.
+fn extract_sort_pushdown(order_by: Option<&sqlparser::ast::OrderBy>) -> Option<(String, bool)> {
+    let order_by = order_by?;
+    let OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return None;
+    };
+    if exprs.len() != 1 {
+        return None;
+    }
+    let expr = &exprs[0];
+    let name = expr_to_field_name(&expr.expr)?;
+    if name == "score" || name == "_score" {
+        return None;
+    }
+    let desc = expr.options.asc == Some(false);
+    Some((name, desc))
 }
 
 fn extract_single_table(select: &Select) -> Result<String> {
