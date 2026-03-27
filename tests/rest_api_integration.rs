@@ -778,3 +778,48 @@ async fn rest_sql_explain_analyze_returns_timings_and_rows() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn rest_sql_in_and_between_pushdown() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // BETWEEN: price BETWEEN 800 AND 1000 should match iPhone Pro (999) and iPhone (899)
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone') AND price BETWEEN 800 AND 1000"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "BETWEEN 800..1000 should match 2 docs, got {}",
+        rows.len()
+    );
+    // Verify pushed down (no residual predicates)
+    assert_eq!(body["planner"]["has_residual_predicates"], json!(false));
+
+    // IN: brand IN ('Samsung') should match 1 doc
+    let (status2, body2) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT brand, price FROM products WHERE text_match(description, 'iphone') AND brand IN ('Samsung')"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status2, StatusCode::OK);
+    let rows2 = body2["rows"].as_array().expect("rows");
+    assert_eq!(rows2.len(), 1, "IN ('Samsung') should match 1 doc");
+    assert_eq!(rows2[0]["brand"], json!("Samsung"));
+    assert_eq!(body2["planner"]["has_residual_predicates"], json!(false));
+
+    Ok(())
+}
