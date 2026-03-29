@@ -395,12 +395,12 @@ fn render_explain(body: &Value, client_ms: f64) {
             .unwrap_or(1.0);
 
         for (key, label, block) in &stages {
-            if let Some(ms) = timings.get(key).and_then(|v| v.as_f64()) {
-                if ms > 0.0 {
-                    let bar_width = ((ms / total_ms) * 40.0).max(1.0) as usize;
-                    let bar: String = block.repeat(bar_width);
-                    println!("   {:<12} {:>7.1}ms  {}", label, ms, bar.bright_cyan());
-                }
+            if let Some(ms) = timings.get(key).and_then(|v| v.as_f64())
+                && ms > 0.0
+            {
+                let bar_width = ((ms / total_ms) * 40.0).max(1.0) as usize;
+                let bar: String = block.repeat(bar_width);
+                println!("   {:<12} {:>7.1}ms  {}", label, ms, bar.bright_cyan());
             }
         }
 
@@ -458,11 +458,10 @@ fn render_explain(body: &Value, client_ms: f64) {
                 .collect::<Vec<_>>()
         }),
         body.get("rows").and_then(|v| v.as_array()),
-    ) {
-        if !rows.is_empty() {
-            println!();
-            render_table(&columns, rows);
-        }
+    ) && !rows.is_empty()
+    {
+        println!();
+        render_table(&columns, rows);
     }
 
     println!();
@@ -503,7 +502,7 @@ fn extract_table_for_explain(sql: &str) -> Option<String> {
     let after_from = sql[from_pos + 6..].trim();
     // Handle quoted and unquoted table names
     if after_from.starts_with('"') {
-        let end = after_from[1..].find('"')?;
+        let end = after_from.strip_prefix('"')?.find('"')?;
         Some(after_from[1..=end].to_string())
     } else {
         let end = after_from
