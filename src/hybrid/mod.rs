@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_not_pushed_down_for_select_star() {
+    fn limit_pushed_down_for_select_star() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
             "SELECT * FROM products WHERE text_match(description, 'iphone') LIMIT 10",
@@ -989,7 +989,10 @@ mod tests {
         .unwrap();
         assert_eq!(plan.limit, Some(10));
         assert!(plan.selects_all_columns);
-        assert!(!plan.limit_pushed_down);
+        assert!(plan.limit_pushed_down);
+        // Search request should collect only 10 docs, not 100K
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 10);
     }
 
     #[test]

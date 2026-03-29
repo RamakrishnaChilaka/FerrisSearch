@@ -133,6 +133,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_doc/{id}", delete(index::delete_document))
         .route("/{index}/_update/{id}", post(index::update_document))
         .route("/_bulk", post(index::bulk_index_global))
+        .route("/_sql", post(search::global_sql))
         .route("/{index}/_bulk", post(index::bulk_index))
         // Search
         .route("/{index}/_search", get(search::search_documents))

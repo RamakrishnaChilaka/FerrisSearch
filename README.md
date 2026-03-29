@@ -35,6 +35,7 @@ FerrisSearch is a high-performance, Rust-native distributed search engine with O
 - **Scatter-gather search** — queries fan out across shards, results merged and returned
 - **Crash recovery** — binary write-ahead log (WAL) with configurable durability (`request` fsync-per-write or `async` timer-based); sequence number checkpointing and translog-based replica recovery
 - **Zero external dependencies** — no JVM, no Zookeeper, just a single binary
+- **Interactive SQL console** — built-in CLI with colored output, table formatting, EXPLAIN ANALYZE visualization, and query history
 
 ## Why FerrisSearch Is Different
 
@@ -115,6 +116,25 @@ curl http://localhost:9200/
 # Terminal 3
 ./dev_cluster.sh 3    # HTTP 9202 · Transport 9302 · Raft ID 3
 ```
+
+### SQL Console (CLI)
+
+```bash
+# Build the CLI
+cargo build --release --bin ferris-cli
+
+# Interactive mode
+./target/release/ferris-cli
+
+# Connect to a specific host
+./target/release/ferris-cli --host 10.0.0.5 --port 9200
+
+# Run a single query
+./target/release/ferris-cli -c "SHOW TABLES"
+./target/release/ferris-cli -c 'SELECT author, count(*) FROM "hackernews" WHERE text_match(title, '\''rust'\'') GROUP BY author LIMIT 5'
+```
+
+The CLI supports `SHOW TABLES`, `DESCRIBE <index>`, `SHOW CREATE TABLE <index>`, `SELECT` queries, and `EXPLAIN` with timing bar charts. Type `\help` for all commands.
 ### Configuration
 
 Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variables:
@@ -263,7 +283,7 @@ curl -X POST 'http://localhost:9200/my-index/_search' \
 
 ### Search-Aware SQL
 
-`POST /{index}/_sql` runs a SQL query over the matched document set. Tantivy still handles text matching, relevance scoring, and pushed-down structured filters; Arrow and DataFusion handle the residual SQL-style projection, ordering, grouping, and aggregation after search-aware planning.
+`POST /{index}/_sql` or `POST /_sql` runs a SQL query over the matched document set. The global `/_sql` endpoint auto-extracts the index from the `FROM` clause and also supports `SHOW TABLES`, `DESCRIBE <index>`, and `SHOW CREATE TABLE <index>`. Tantivy still handles text matching, relevance scoring, and pushed-down structured filters; Arrow and DataFusion handle the residual SQL-style projection, ordering, grouping, and aggregation after search-aware planning.
 
 Current behavior:
 
@@ -391,6 +411,25 @@ If an index name contains a hyphen, quote it in SQL:
 SELECT count(*) AS total
 FROM "my-index"
 WHERE text_match(description, 'iphone')
+```
+
+#### Global SQL Commands
+
+```bash
+# List all indices
+curl -X POST 'http://localhost:9200/_sql' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SHOW TABLES"}'
+
+# Describe an index
+curl -X POST 'http://localhost:9200/_sql' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "DESCRIBE hackernews"}'
+
+# Query without index in path
+curl -X POST 'http://localhost:9200/_sql' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SELECT count(*) FROM \\"hackernews\\""}'
 ```
 
 #### SQL Collection Limit
@@ -575,8 +614,8 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 647 tests
-cargo test --lib                                # Unit tests (561)
+cargo test                                      # All 669 tests
+cargo test --lib                                # Unit tests (583)
 cargo test --test consensus_integration          # Raft consensus tests (30)
 cargo test --test replication_integration        # Replication tests (39)
 cargo test --test rest_api_integration           # REST API tests (17)
@@ -654,6 +693,7 @@ python3 scripts/sql_1gb.py --suite stress --queries 25      # heavy result-shipp
 ```
 src/
 ├── api/           REST API handlers (Axum)
+├── cli.rs         Interactive SQL console (ferris-cli binary)
 ├── cluster/       Cluster state, membership, shard routing
 ├── config/        Configuration loading
 ├── consensus/     Raft consensus (openraft): types, store, state machine, network
@@ -663,7 +703,7 @@ src/
 ├── shard/         Shard lifecycle management
 ├── transport/     gRPC client & server (tonic) + Raft RPCs
 ├── wal/           Write-ahead log
-└── main.rs
+└── main.rs        Server entry point (ferrissearch binary)
 
 proto/             gRPC service definitions (including Raft RPCs)
 tests/             Integration tests (consensus + replication)
@@ -697,6 +737,8 @@ config/            Default configuration
 - [x] `EXPLAIN ANALYZE` with runtime timings and fallback reasons
 - [x] `count(*)` metadata fast path (`count_star_fast` — answers from `doc_count()` without scanning docs)
 - [ ] `COUNT(DISTINCT field)` aggregate function
+- [x] Global `/_sql` endpoint with `SHOW TABLES`, `DESCRIBE`, `SHOW CREATE TABLE`
+- [x] Interactive SQL console (ferris-cli) with colored tables, EXPLAIN visualization, query history
 - [ ] Cursor-based SQL pagination for large result sets
 - [ ] Lookup joins (small broadcast table joined to search results)
 - [ ] Search-native SQL functions beyond `text_match` / `score`

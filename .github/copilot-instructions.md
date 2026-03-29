@@ -90,9 +90,10 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 567 unit tests + 30 consensus integration + 39 replication integration + 17 REST API integration = 653 total
+- 583 unit tests + 30 consensus integration + 39 replication integration + 17 REST API integration = 669 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
+- SQL console: `cargo run --bin ferris-cli` (interactive) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
 
 ## Node Lifecycle (Raft-driven)
 - First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
@@ -277,6 +278,7 @@ if let Some(ref raft) = state.raft {
 | POST | `/{index}/_search` | `search_documents_dsl()` | DSL search (SearchRequest body) |\n| GET/POST | `/{index}/_count` | `count_documents()` | Document count (match_all fast path or query) |
 | POST | `/{index}/_sql` | `search_sql()` | SQL over matched docs (search-aware planning) |
 | POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan without executing |
+| POST | `/_sql` | `global_sql()` | Global SQL: SHOW TABLES, DESCRIBE, SHOW CREATE TABLE, SELECT (auto-extracts index from FROM) |
 
 ### Maintenance
 | HTTP | Path | Handler | Purpose |

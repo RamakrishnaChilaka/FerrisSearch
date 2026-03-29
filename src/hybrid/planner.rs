@@ -390,7 +390,6 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     let limit_pushed_down = limit.is_some()
         && !has_residual_predicates
         && grouped_sql.is_none()
-        && !selects_all_columns
         && (is_order_by_score_only(order_by.as_ref()) || sort_pushdown.is_some());
 
     // Safety: if no data columns, _id, or score are needed and we're not on the
@@ -1212,5 +1211,47 @@ mod tests {
     fn count_field_not_count_star() {
         let plan = plan_sql("idx", "SELECT count(price) AS c FROM \"idx\"").unwrap();
         assert!(!plan.is_count_star_only());
+    }
+
+    #[test]
+    fn select_star_limit_pushes_down() {
+        let plan = plan_sql("idx", "SELECT * FROM \"idx\" LIMIT 10").unwrap();
+        assert!(plan.selects_all_columns);
+        assert!(plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(10));
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 10);
+    }
+
+    #[test]
+    fn select_star_limit_with_offset_pushes_down() {
+        let plan = plan_sql("idx", "SELECT * FROM \"idx\" LIMIT 5 OFFSET 20").unwrap();
+        assert!(plan.selects_all_columns);
+        assert!(plan.limit_pushed_down);
+        let req = plan.to_search_request();
+        assert_eq!(req.size, 25); // limit + offset
+    }
+
+    #[test]
+    fn select_star_limit_order_by_score_pushes_down() {
+        let plan = plan_sql("idx", "SELECT * FROM \"idx\" ORDER BY score DESC LIMIT 4").unwrap();
+        assert!(plan.selects_all_columns);
+        assert!(plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(4));
+    }
+
+    #[test]
+    fn select_star_limit_order_by_fast_field_pushes_down() {
+        let plan = plan_sql("idx", "SELECT * FROM \"idx\" ORDER BY price DESC LIMIT 4").unwrap();
+        assert!(plan.selects_all_columns);
+        assert!(plan.limit_pushed_down);
+        assert!(plan.sort_pushdown.is_some());
+    }
+
+    #[test]
+    fn select_star_without_limit_no_pushdown() {
+        let plan = plan_sql("idx", "SELECT * FROM \"idx\"").unwrap();
+        assert!(plan.selects_all_columns);
+        assert!(!plan.limit_pushed_down);
     }
 }
