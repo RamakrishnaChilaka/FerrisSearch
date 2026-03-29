@@ -44,12 +44,14 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 ## SQL LIMIT Pushdown
 - When a SQL query has LIMIT/OFFSET and ORDER BY is `_score`-only (or absent), the limit is pushed into Tantivy's `TopDocs` collector.
 - When ORDER BY is a single non-score fast-field column (e.g., `ORDER BY price DESC`), both the sort and limit are pushed into Tantivy via `TopDocs::order_by_fast_field()`. This avoids materializing 100K docs and sorting in DataFusion.
+- **LIMIT pushdown applies to all query shapes including `SELECT *`.** The `selects_all_columns` flag does NOT block limit pushdown — it only determines whether the fast-field or materialized-fallback execution path is used. For `SELECT * LIMIT 4`, the engine collects only 4 docs (not 100K) and materializes only those 4.
 - `QueryPlan` has `limit: Option<usize>`, `offset: Option<usize>`, `limit_pushed_down: bool`, and `sort_pushdown: Option<(String, bool)>` fields.
 - `sort_pushdown` captures the single ORDER BY column name and direction (true = DESC) when eligible for fast-field sort pushdown.
 - `to_search_request()` populates `SearchRequest.sort` from `sort_pushdown`, so the engine uses `order_by_fast_field()` in both `search_query()` and `sql_record_batch()`.
 - Multi-column ORDER BY cannot be pushed — falls back to DataFusion sorting.
 - `parse_limit_expr()` and `parse_offset_expr()` extract numeric values from `sqlparser::ast::LimitClause`.
 - When limit is pushed down, the Tantivy search collects only `limit + offset` docs instead of the default 100K.
+- The `limit_pushed_down` guard conditions are: `limit.is_some() && !has_residual_predicates && grouped_sql.is_none() && (is_order_by_score_only || sort_pushdown.is_some())`.
 
 ## Distributed Fast-Field SQL
 - The `tantivy_fast_fields` path now works across multi-node clusters.
@@ -57,7 +59,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Remote shards run `sql_record_batch()` locally and return Arrow IPC-serialized `RecordBatch` bytes.
 - The coordinator deserializes Arrow IPC, concatenates batches from all shards (local + remote), and runs DataFusion for final SQL execution.
 - Arrow IPC helpers: `record_batch_to_ipc()` and `record_batch_from_ipc()` in `arrow_bridge.rs`.
-- Falls back to `materialized_hits_fallback` only for `SELECT *` or when a shard fails to produce a batch.
+- `SELECT *` queries always use the materialized fallback path (`materialized_hits_fallback`) — the fast-field path requires explicit column projection.
 
 ## EXPLAIN ANALYZE
 - `POST /{index}/_sql/explain` with `"analyze": true` executes the query and returns plan + per-stage timings + result rows.

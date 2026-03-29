@@ -764,6 +764,294 @@ pub async fn search_sql(
     )
 }
 
+/// POST /_sql — Global SQL endpoint (no index in path).
+/// Handles SHOW TABLES, DESCRIBE {table}, SHOW CREATE TABLE {table},
+/// and regular SELECT queries (index extracted from FROM clause).
+pub async fn global_sql(
+    State(state): State<AppState>,
+    Json(req): Json<SqlQueryRequest>,
+) -> (StatusCode, Json<Value>) {
+    let trimmed = req.query.trim();
+
+    // SHOW TABLES / SHOW INDICES
+    if matches_command(trimmed, "SHOW TABLES") || matches_command(trimmed, "SHOW INDICES") {
+        return handle_show_tables(&state).await;
+    }
+
+    // DESCRIBE {table} / DESC {table}
+    if let Some(table) =
+        strip_command(trimmed, "DESCRIBE").or_else(|| strip_command(trimmed, "DESC"))
+    {
+        let table = unquote_identifier(table);
+        return handle_describe(&state, &table).await;
+    }
+
+    // SHOW CREATE TABLE {table}
+    if let Some(table) = strip_command(trimmed, "SHOW CREATE TABLE") {
+        let table = unquote_identifier(table);
+        return handle_show_create_table(&state, &table).await;
+    }
+
+    // Regular SELECT — extract index from FROM clause
+    let index_name = match extract_index_from_sql(trimmed) {
+        Some(name) => name,
+        None => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "Could not determine index from SQL. Use: SELECT ... FROM \"index_name\" ..., or use SHOW TABLES / DESCRIBE",
+            );
+        }
+    };
+
+    if let Err(msg) = crate::common::validate_index_name(&index_name) {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_index_name_exception",
+            msg,
+        );
+    }
+
+    let result = match execute_sql_query(&state, &index_name, &req.query).await {
+        Ok(result) => result,
+        Err(err) => return err,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "execution_mode": result.execution_mode,
+            "truncated": result.truncated,
+            "planner": {
+                "text_match": result.plan.text_match.as_ref().map(|text_match| serde_json::json!({
+                    "field": text_match.field,
+                    "query": text_match.query,
+                })),
+                "pushed_down_filters": result.plan.pushed_filters,
+                "group_by_columns": result.plan.group_by_columns,
+                "required_columns": result.plan.required_columns,
+                "has_residual_predicates": result.plan.has_residual_predicates,
+            },
+            "_shards": {
+                "total": result.successful_shards + result.failed_shards,
+                "successful": result.successful_shards,
+                "failed": result.failed_shards
+            },
+            "matched_hits": result.matched_hits,
+            "columns": result.sql_result.columns,
+            "rows": result.sql_result.rows
+        })),
+    )
+}
+
+/// Check if the input matches a command (case-insensitive), optionally followed by a semicolon.
+fn matches_command(input: &str, command: &str) -> bool {
+    let stripped = input.trim().trim_end_matches(';').trim();
+    stripped.eq_ignore_ascii_case(command)
+}
+
+/// Strip a command prefix (case-insensitive) and return the remaining argument, trimmed.
+fn strip_command<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    let stripped = input.trim_end_matches(';').trim();
+    if stripped.len() >= prefix.len() && stripped[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        let rest = stripped[prefix.len()..].trim();
+        if rest.is_empty() { None } else { Some(rest) }
+    } else {
+        None
+    }
+}
+
+/// Remove surrounding quotes from an identifier: "foo" -> foo, `foo` -> foo
+fn unquote_identifier(s: &str) -> String {
+    let s = s.trim().trim_end_matches(';').trim();
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('`') && s.ends_with('`')) {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Extract the index/table name from a SELECT ... FROM "index" ... query.
+fn extract_index_from_sql(sql: &str) -> Option<String> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql).ok()?;
+    if statements.len() != 1 {
+        return None;
+    }
+    match &statements[0] {
+        sqlparser::ast::Statement::Query(query) => {
+            if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+                if select.from.len() == 1 {
+                    if let sqlparser::ast::TableFactor::Table { name, .. } =
+                        &select.from[0].relation
+                    {
+                        return Some(
+                            name.0
+                                .iter()
+                                .filter_map(|p| match p {
+                                    sqlparser::ast::ObjectNamePart::Identifier(id) => {
+                                        Some(id.value.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("."),
+                        );
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// SHOW TABLES — list all indices with doc counts and shard info.
+async fn handle_show_tables(state: &AppState) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let mut rows = Vec::new();
+
+    for (name, metadata) in &cluster_state.indices {
+        let num_shards = metadata.number_of_shards;
+        let num_replicas = metadata.number_of_replicas;
+        let field_count = metadata.mappings.len();
+
+        // Count docs across all shards
+        let (doc_count, _, _) = count_docs_from_metadata(state, name, metadata).await;
+
+        rows.push(serde_json::json!({
+            "index": name,
+            "docs": doc_count,
+            "shards": num_shards,
+            "replicas": num_replicas,
+            "fields": field_count,
+        }));
+    }
+
+    // Sort by index name
+    rows.sort_by(|a, b| {
+        let na = a.get("index").and_then(|v| v.as_str()).unwrap_or("");
+        let nb = b.get("index").and_then(|v| v.as_str()).unwrap_or("");
+        na.cmp(nb)
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "columns": ["index", "docs", "shards", "replicas", "fields"],
+            "rows": rows,
+        })),
+    )
+}
+
+/// DESCRIBE {table} — show field names and types for an index.
+async fn handle_describe(state: &AppState, index_name: &str) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = match cluster_state.indices.get(index_name) {
+        Some(m) => m,
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name),
+            );
+        }
+    };
+
+    let mut rows: Vec<Value> = metadata
+        .mappings
+        .iter()
+        .map(|(field_name, mapping)| {
+            let type_str = match mapping.field_type {
+                crate::cluster::state::FieldType::Text => "text",
+                crate::cluster::state::FieldType::Keyword => "keyword",
+                crate::cluster::state::FieldType::Integer => "integer",
+                crate::cluster::state::FieldType::Float => "float",
+                crate::cluster::state::FieldType::Boolean => "boolean",
+                crate::cluster::state::FieldType::KnnVector => "knn_vector",
+            };
+            let mut row = serde_json::json!({
+                "field": field_name,
+                "type": type_str,
+            });
+            if let Some(dim) = mapping.dimension {
+                row["dimension"] = serde_json::json!(dim);
+            }
+            row
+        })
+        .collect();
+
+    // Sort by field name
+    rows.sort_by(|a, b| {
+        let fa = a.get("field").and_then(|v| v.as_str()).unwrap_or("");
+        let fb = b.get("field").and_then(|v| v.as_str()).unwrap_or("");
+        fa.cmp(fb)
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "index": index_name,
+            "columns": ["field", "type"],
+            "rows": rows,
+        })),
+    )
+}
+
+/// SHOW CREATE TABLE {table} — show the CREATE INDEX JSON for an index.
+async fn handle_show_create_table(state: &AppState, index_name: &str) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = match cluster_state.indices.get(index_name) {
+        Some(m) => m,
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name),
+            );
+        }
+    };
+
+    let mut properties = serde_json::Map::new();
+    for (field_name, mapping) in &metadata.mappings {
+        let type_str = match mapping.field_type {
+            crate::cluster::state::FieldType::Text => "text",
+            crate::cluster::state::FieldType::Keyword => "keyword",
+            crate::cluster::state::FieldType::Integer => "integer",
+            crate::cluster::state::FieldType::Float => "float",
+            crate::cluster::state::FieldType::Boolean => "boolean",
+            crate::cluster::state::FieldType::KnnVector => "knn_vector",
+        };
+        let mut field_def = serde_json::json!({"type": type_str});
+        if let Some(dim) = mapping.dimension {
+            field_def["dimension"] = serde_json::json!(dim);
+        }
+        properties.insert(field_name.clone(), field_def);
+    }
+
+    let create_body = serde_json::json!({
+        "settings": {
+            "number_of_shards": metadata.number_of_shards,
+            "number_of_replicas": metadata.number_of_replicas,
+            "refresh_interval_ms": metadata.settings.refresh_interval_ms,
+        },
+        "mappings": {
+            "properties": properties,
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "index": index_name,
+            "create_statement": create_body,
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,5 +1391,163 @@ mod tests {
         assert_eq!(body["matched_hits"], 3);
         let rows = body["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
+    }
+
+    // -------- Tests for global SQL helper functions --------
+
+    #[test]
+    fn matches_command_case_insensitive() {
+        assert!(super::matches_command("SHOW TABLES", "SHOW TABLES"));
+        assert!(super::matches_command("show tables", "SHOW TABLES"));
+        assert!(super::matches_command("Show Tables", "SHOW TABLES"));
+        assert!(super::matches_command("SHOW TABLES;", "SHOW TABLES"));
+        assert!(super::matches_command("  SHOW TABLES  ;  ", "SHOW TABLES"));
+        assert!(!super::matches_command("SHOW", "SHOW TABLES"));
+        assert!(!super::matches_command("SELECT * FROM foo", "SHOW TABLES"));
+    }
+
+    #[test]
+    fn strip_command_extracts_argument() {
+        assert_eq!(
+            super::strip_command("DESCRIBE hackernews", "DESCRIBE"),
+            Some("hackernews")
+        );
+        assert_eq!(
+            super::strip_command("describe hackernews;", "DESCRIBE"),
+            Some("hackernews")
+        );
+        assert_eq!(
+            super::strip_command("DESC \"hackernews\"", "DESC"),
+            Some("\"hackernews\"")
+        );
+        assert_eq!(super::strip_command("DESCRIBE", "DESCRIBE"), None);
+        assert_eq!(
+            super::strip_command("SHOW CREATE TABLE hackernews", "SHOW CREATE TABLE"),
+            Some("hackernews")
+        );
+    }
+
+    #[test]
+    fn unquote_identifier_handles_all_formats() {
+        assert_eq!(super::unquote_identifier("hackernews"), "hackernews");
+        assert_eq!(super::unquote_identifier("\"hackernews\""), "hackernews");
+        assert_eq!(super::unquote_identifier("`hackernews`"), "hackernews");
+        assert_eq!(super::unquote_identifier("  hackernews  "), "hackernews");
+        assert_eq!(super::unquote_identifier("\"hackernews\";"), "hackernews");
+    }
+
+    #[test]
+    fn extract_index_from_sql_finds_table_name() {
+        assert_eq!(
+            super::extract_index_from_sql(r#"SELECT * FROM "hackernews" WHERE x > 1"#),
+            Some("hackernews".to_string())
+        );
+        assert_eq!(
+            super::extract_index_from_sql("SELECT count(*) FROM hackernews"),
+            Some("hackernews".to_string())
+        );
+        assert_eq!(super::extract_index_from_sql("SHOW TABLES"), None);
+        assert_eq!(super::extract_index_from_sql("not valid sql at all"), None);
+    }
+
+    #[tokio::test]
+    async fn global_sql_show_tables_returns_index_list() {
+        let (_tmp, state) = make_test_app_state("products");
+        let req = SqlQueryRequest {
+            query: "SHOW TABLES".to_string(),
+            analyze: false,
+        };
+        let (status, Json(body)) = super::global_sql(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+        let columns = body["columns"].as_array().unwrap();
+        assert!(columns.contains(&json!("index")));
+        assert!(columns.contains(&json!("docs")));
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["index"], "products");
+    }
+
+    #[tokio::test]
+    async fn global_sql_show_tables_case_insensitive() {
+        let (_tmp, state) = make_test_app_state("products");
+        let req = SqlQueryRequest {
+            query: "show tables;".to_string(),
+            analyze: false,
+        };
+        let (status, _) = super::global_sql(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn global_sql_describe_returns_field_mappings() {
+        let (_tmp, state) = make_test_app_state("products");
+        let req = SqlQueryRequest {
+            query: "DESCRIBE products".to_string(),
+            analyze: false,
+        };
+        let (status, Json(body)) = super::global_sql(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["index"], "products");
+        let rows = body["rows"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        // Check that known fields are present
+        let field_names: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.get("field").and_then(|v| v.as_str()))
+            .collect();
+        assert!(field_names.contains(&"title"));
+        assert!(field_names.contains(&"price"));
+    }
+
+    #[tokio::test]
+    async fn global_sql_describe_nonexistent_index_returns_404() {
+        let (_tmp, state) = make_test_app_state("products");
+        let req = SqlQueryRequest {
+            query: "DESCRIBE nonexistent".to_string(),
+            analyze: false,
+        };
+        let (status, _) = super::global_sql(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn global_sql_show_create_table_returns_index_json() {
+        let (_tmp, state) = make_test_app_state("products");
+        let req = SqlQueryRequest {
+            query: "SHOW CREATE TABLE products".to_string(),
+            analyze: false,
+        };
+        let (status, Json(body)) = super::global_sql(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["index"], "products");
+        let create = &body["create_statement"];
+        assert!(create.get("settings").is_some());
+        assert!(create.get("mappings").is_some());
+        let props = &create["mappings"]["properties"];
+        assert!(props.get("title").is_some());
+    }
+
+    #[tokio::test]
+    async fn global_sql_select_routes_to_correct_index() {
+        let (_tmp, state) = make_test_app_state("products");
+        let req = SqlQueryRequest {
+            query: r#"SELECT count(*) AS total FROM "products""#.to_string(),
+            analyze: false,
+        };
+        let (status, Json(body)) = super::global_sql(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("columns").is_some());
+        assert!(body.get("rows").is_some());
+    }
+
+    #[tokio::test]
+    async fn global_sql_invalid_query_returns_error() {
+        let (_tmp, state) = make_test_app_state("products");
+        let req = SqlQueryRequest {
+            query: "THIS IS NOT SQL".to_string(),
+            analyze: false,
+        };
+        let (status, _) = super::global_sql(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

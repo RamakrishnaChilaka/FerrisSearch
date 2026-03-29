@@ -95,6 +95,17 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | GET/POST | `/{index}/_count` | `count_documents()` — document count (match_all or query body) |
 | POST | `/{index}/_sql` | `search_sql()` — SQL over matched docs with planner metadata and execution mode |
 | POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan; with `"analyze": true`, execute and return plan + per-stage timings + rows |
+| POST | `/_sql` | `global_sql()` — global SQL endpoint: SHOW TABLES, DESCRIBE, SHOW CREATE TABLE, and SELECT (index auto-extracted from FROM clause) |
+
+### Global SQL Endpoint
+- `POST /_sql` handles SQL commands that don't require an index in the URL path.
+- Supported commands:
+    - `SHOW TABLES` / `SHOW INDICES` — lists all indices with doc counts, shards, replicas, field count
+    - `DESCRIBE <index>` / `DESC <index>` — shows field names and types for an index
+    - `SHOW CREATE TABLE <index>` — returns settings + mappings JSON for recreating the index
+    - `SELECT ... FROM "index" ...` — auto-extracts index name from the FROM clause and routes to `execute_sql_query()`
+- Helper functions: `matches_command()`, `strip_command()`, `unquote_identifier()`, `extract_index_from_sql()`
+- All commands are case-insensitive and handle optional trailing semicolons and quoted identifiers
 
 ### SQL Endpoint Expectations
 - `POST /{index}/_sql` must remain coordinator-safe like other search endpoints.
