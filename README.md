@@ -22,7 +22,7 @@
 
 FerrisSearch is a high-performance, Rust-native distributed search engine with OpenSearch-compatible REST APIs, hybrid vector retrieval, and a search-aware SQL layer for querying matched documents as a dataset. It is built for teams that want the familiar OpenSearch interface with the performance and safety of Rust, without giving up on structured analytics over search results.
 
-> **⚡ Performance:** 2M documents — ingestion at **10,402 docs/sec**, search at **142.4 queries/sec (p50 = 24.8ms)**, zero errors — [see benchmarks](#benchmarks)
+> **⚡ Performance:** Full-text search in **0.6ms**, grouped SQL analytics on 4M docs in **92ms**, cross-topic intelligence in **3–8ms** — [see benchmarks](#benchmarks)
 
 ## Highlights
 
@@ -625,67 +625,79 @@ Integration tests run entirely in-process — they spin up real gRPC servers wit
 
 ## Benchmarks
 
-3-node cluster (single dev box), 2M documents (~1 GB), 3 shards, 0 replicas.
+3-node cluster on a single machine, 3 shards, 0 replicas. Two environments tested.
 
-**Environment:** AMD EPYC 7763 (8 cores / 16 threads), 32 GB RAM, Ubuntu 24.04 (WSL2)
+| Environment | CPU | RAM | Storage | OS |
+|-------------|-----|-----|---------|-----|
+| **Home Desktop** | Intel i5-13600K (14c/20t) | 32 GB | Crucial P3 Plus NVMe | Linux Mint 22.3 |
+| Dev Box | AMD EPYC 7763 (8c/16t) | 32 GB | Virtualized (WSL2) | Ubuntu 24.04 |
 
 ### Ingestion
 
-2,000,000 documents (~954 MB) via `opensearch-py` bulk API in batches of 5,000 docs.
+| Dataset | Dev Box | Home Desktop |
+|---------|---------|-------------|
+| Synthetic 1GB (2M docs) | 10,402 docs/sec | **26,734 docs/sec** |
+| Hacker News (4M stories) | 18,839 docs/sec | **48,700 docs/sec** |
 
-| Metric | Value |
-|--------|-------|
-| Documents | 2,000,000 |
-| Errors | 0 |
-| Total time | 192.3s |
-| Throughput | **10,402 docs/sec** |
-
-**Bulk batch latency (400 batches × 5,000 docs):**
-
-| Min | Avg | p50 | p95 | p99 | Max |
-|-----|-----|-----|-----|-----|-----|
-| 277.9ms | 379.8ms | 340.0ms | 621.0ms | 764.6ms | 1777.6ms |
-
-### Search
-
-10,000 queries across 20 query types, concurrency = 4.
+### Search (2M docs, 20 query types, Home Desktop)
 
 ```
 Query Type                 Count  Err      Min      Avg      p50      p95      p99      Max   Hits/q
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-agg_filtered                 500    0     4.9ms    14.8ms    11.7ms    33.0ms    50.9ms    77.2ms  249989
-agg_histogram_price          500    0    47.4ms    60.4ms    57.6ms    79.4ms    93.7ms   142.0ms 2000000
-agg_stats_price              500    0    16.1ms    27.9ms    25.4ms    45.3ms    53.8ms    92.9ms 2000000
-agg_terms_category           500    0    39.9ms    54.2ms    52.3ms    75.2ms    86.0ms    92.8ms 2000000
-bool_filter_range            500    0     8.9ms    20.8ms    17.3ms    38.7ms    53.4ms    82.5ms   19648
-bool_must                    500    0     7.8ms    18.7ms    13.8ms    45.2ms    66.8ms    95.1ms   84833
-bool_should                  500    0     7.1ms    18.2ms    13.9ms    41.5ms    55.1ms    91.8ms  345825
-complex_bool                 500    0    34.5ms    46.5ms    43.6ms    66.1ms    78.3ms   121.0ms  534730
-fuzzy_title                  500    0     5.5ms    16.4ms    11.8ms    38.1ms    57.3ms    69.7ms  114947
-match_all                    500    0    23.1ms    36.2ms    33.9ms    55.1ms    62.9ms    91.4ms 2000000
-match_description            500    0    20.0ms    32.8ms    29.9ms    52.9ms    66.8ms    81.3ms 1711887
-match_title                  500    0     5.2ms    15.1ms    11.1ms    34.2ms    49.2ms    62.7ms  120821
-paginated                    500    0    12.3ms    37.0ms    36.6ms    58.0ms    74.4ms   100.2ms 1246055
-prefix_title                 500    0     5.8ms    16.4ms    12.2ms    37.7ms    51.1ms    73.8ms  147570
-range_price                  500    0     9.6ms    24.5ms    22.0ms    43.4ms    57.2ms    63.8ms  492218
-range_rating                 500    0    20.7ms    38.4ms    36.2ms    58.7ms    71.8ms   124.8ms 1409617
-sort_price_asc               500    0    19.4ms    32.1ms    29.0ms    55.0ms    65.2ms    83.1ms 2000000
-sort_rating_desc             500    0     6.6ms    16.7ms    12.6ms    36.7ms    51.3ms    73.6ms  124650
-term_category                500    0     6.2ms    16.0ms    12.4ms    33.0ms    48.7ms    59.6ms  250008
-wildcard_title               500    0     5.8ms    16.6ms    12.2ms    40.1ms    48.1ms    61.9ms  106150
+match_title                  200    0     0.6ms     1.2ms     1.2ms     1.5ms     5.1ms     9.3ms  111218
+fuzzy_title                  200    0     1.1ms     1.7ms     1.3ms     2.5ms    11.8ms    17.2ms  127621
+term_category                200    0     1.5ms     1.9ms     1.7ms     2.9ms     3.1ms     3.1ms  249998
+bool_must                    200    0     1.7ms     2.3ms     1.9ms     3.2ms     9.9ms    10.6ms   75274
+agg_filtered                 200    0     2.3ms     2.9ms     2.6ms     4.3ms     4.6ms     5.1ms  249975
+range_price                  200    0     4.1ms     7.4ms     7.4ms    10.2ms    11.0ms    16.2ms  503701
+match_all                    200    0     8.7ms     9.1ms     9.0ms     9.2ms    15.3ms    17.8ms 2000000
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-TOTAL                      10000    0     4.9ms    28.0ms    24.8ms    60.0ms    75.5ms   142.0ms
+TOTAL                       4000    0     0.6ms     7.5ms     6.1ms    22.0ms    22.7ms    26.2ms
 ```
 
-**10,000 queries | 0 errors | 142.4 queries/sec | p50 = 24.8ms | concurrency = 4**
+**4,000 queries | 0 errors | 133 queries/sec | p50 = 6.1ms | min = 0.6ms**
+
+### Hybrid SQL (4M Hacker News stories, Home Desktop)
+
+| Query | Execution Mode | Time |
+|-------|---------------|------|
+| `SELECT count(*) FROM hackernews` | `count_star_fast` | **20ms** |
+| text_match + filter + ORDER BY LIMIT 10 | `tantivy_fast_fields` | **19ms** |
+| text_match + GROUP BY 4,715 authors | `tantivy_grouped_partials` | **92ms** |
+| Cross-topic analytics (per query) | `tantivy_grouped_partials` | **3–8ms** |
+
+**Showcase query** — search 4M stories, find every Rust post, group by author, compute engagement:
+
+```sql
+SELECT author, count(*) AS posts, avg(upvotes) AS avg_upvotes
+FROM "hackernews" WHERE text_match(title, 'rust')
+GROUP BY author ORDER BY avg_upvotes DESC
+```
+
+**92ms** — 12,473 Rust posts, 4,715 authors, planning=0.1ms → search=86ms → merge=6ms
+
+### Cross-Topic Content Intelligence (4M docs)
+
+Six SQL queries combining full-text search + grouped analytics:
+
+| Topic | Posts | Avg ↑ | Avg 💬 | Best ↑ | Top 💬 | Time |
+|-------|-------|-------|--------|--------|--------|------|
+| India | 17,860 | 11 | 5.5 | 1,483 | 795 | 5ms |
+| China | 37,765 | 13 | 6.5 | 2,493 | 1,087 | 6ms |
+| Silicon Valley | 21,261 | 15 | 10.4 | 3,172 | 2,780 | 4ms |
+| Rust | 12,473 | 35 | 14.9 | 1,582 | 991 | 3ms |
+| Python | 31,044 | 19 | 6.7 | 1,616 | 957 | 5ms |
+| Machine Learning | 55,430 | 15 | 4.8 | 2,029 | 1,148 | 8ms |
+
+**3–8ms per query.** Total wall clock for all six: ~35ms.
 
 Reproduce with:
 ```bash
-pip install opensearch-py
-python3 scripts/ingest_1gb.py                              # populate 2M docs
-python3 scripts/search_1gb.py --queries 500 --concurrency 4 # run search benchmark
-python3 scripts/sql_1gb.py --suite throughput --queries 100 --explain-sample # bounded-result SQL benchmark
-python3 scripts/sql_1gb.py --suite stress --queries 25      # heavy result-shipping SQL benchmark
+pip install pyarrow requests
+python3 scripts/ingest_hackernews.py                         # 4M HN stories
+bash scripts/hackernews_queries.sh                           # SQL benchmark
+python3 scripts/ingest_1gb.py                                # 2M synthetic docs
+python3 scripts/search_1gb.py --queries 200 --concurrency 1  # search benchmark
 ```
 
 ## Project Structure

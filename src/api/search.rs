@@ -883,25 +883,22 @@ fn extract_index_from_sql(sql: &str) -> Option<String> {
     }
     match &statements[0] {
         sqlparser::ast::Statement::Query(query) => {
-            if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
-                if select.from.len() == 1 {
-                    if let sqlparser::ast::TableFactor::Table { name, .. } =
-                        &select.from[0].relation
-                    {
-                        return Some(
-                            name.0
-                                .iter()
-                                .filter_map(|p| match p {
-                                    sqlparser::ast::ObjectNamePart::Identifier(id) => {
-                                        Some(id.value.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("."),
-                        );
-                    }
-                }
+            if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref()
+                && select.from.len() == 1
+                && let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation
+            {
+                return Some(
+                    name.0
+                        .iter()
+                        .filter_map(|p| match p {
+                            sqlparser::ast::ObjectNamePart::Identifier(id) => {
+                                Some(id.value.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
             }
             None
         }
