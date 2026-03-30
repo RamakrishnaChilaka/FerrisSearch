@@ -912,6 +912,25 @@ fn merge_histogram(parts: &[&PartialAggResult]) -> serde_json::Value {
     serde_json::json!({"buckets": buckets})
 }
 
+/// Compact merge key from group_values — avoids full serde_json::to_string().
+fn compact_group_key(values: &[serde_json::Value]) -> String {
+    use std::fmt::Write;
+    let mut key = String::new();
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            key.push('\x1F');
+        }
+        match v {
+            serde_json::Value::String(s) => key.push_str(s),
+            serde_json::Value::Number(n) => write!(key, "{n}").unwrap(),
+            serde_json::Value::Bool(b) => write!(key, "{b}").unwrap(),
+            serde_json::Value::Null => key.push_str("\x00"),
+            _ => write!(key, "{v}").unwrap(),
+        }
+    }
+    key
+}
+
 pub fn merge_grouped_metrics_partials(
     partials: &[HashMap<String, PartialAggResult>],
     agg_name: &str,
@@ -925,7 +944,7 @@ pub fn merge_grouped_metrics_partials(
         };
 
         for bucket in buckets {
-            let key = serde_json::to_string(&bucket.group_values).unwrap_or_default();
+            let key = compact_group_key(&bucket.group_values);
             let merged_bucket = merged.entry(key).or_insert_with(|| GroupedMetricsBucket {
                 group_values: bucket.group_values.clone(),
                 metrics: HashMap::new(),
@@ -985,13 +1004,8 @@ pub fn merge_grouped_metrics_partials(
         }
     }
 
-    let mut buckets: Vec<GroupedMetricsBucket> = merged.into_values().collect();
-    buckets.sort_by(|left, right| {
-        serde_json::to_string(&left.group_values)
-            .unwrap_or_default()
-            .cmp(&serde_json::to_string(&right.group_values).unwrap_or_default())
-    });
-    buckets
+    // No sort needed — the coordinator applies ORDER BY from the SQL plan.
+    merged.into_values().collect()
 }
 
 fn merge_grouped_metrics_json(
@@ -1005,7 +1019,7 @@ fn merge_grouped_metrics_json(
             continue;
         };
         for bucket in buckets {
-            let key = serde_json::to_string(&bucket.group_values).unwrap_or_default();
+            let key = compact_group_key(&bucket.group_values);
             let merged_bucket = merged.entry(key).or_insert_with(|| GroupedMetricsBucket {
                 group_values: bucket.group_values.clone(),
                 metrics: HashMap::new(),
@@ -1065,14 +1079,8 @@ fn merge_grouped_metrics_json(
         }
     }
 
-    let mut merged: Vec<GroupedMetricsBucket> = merged.into_values().collect();
-    merged.sort_by(|left, right| {
-        serde_json::to_string(&left.group_values)
-            .unwrap_or_default()
-            .cmp(&serde_json::to_string(&right.group_values).unwrap_or_default())
-    });
     let buckets: Vec<serde_json::Value> = merged
-        .into_iter()
+        .into_values()
         .map(|bucket| {
             let metrics = params
                 .metrics

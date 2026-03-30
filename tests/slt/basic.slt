@@ -1,0 +1,134 @@
+# SQL Correctness Tests for FerrisSearch
+#
+# Dataset: 10 HN-style posts
+#   doc-1: alice, "Show HN: Rust search engine", upvotes=250, comments=45, category=rust
+#   doc-2: alice, "Rust vs Go performance", upvotes=180, comments=92, category=rust
+#   doc-3: alice, "Why Rust is great for systems", upvotes=120, comments=30, category=rust
+#   doc-4: bob, "Python 4.0 released", upvotes=500, comments=200, category=python
+#   doc-5: bob, "Machine learning with Python", upvotes=300, comments=150, category=python
+#   doc-6: carol, "Deep learning frameworks compared", upvotes=400, comments=80, category=ml
+#   doc-7: carol, "GPT-5 announcement", upvotes=1000, comments=500, category=ml
+#   doc-8: dave, "Startup funding trends 2026", upvotes=50, comments=20, category=startup
+#   doc-9: dave, "Building a startup in Rust", upvotes=150, comments=35, category=rust
+#   doc-10: eve, "Remote work is dead", upvotes=800, comments=600, category=culture
+
+# ── Basic count ──────────────────────────────────────────────────────
+
+query I nosort
+SELECT count(*) AS total FROM stories
+----
+10
+
+# ── count with text_match filter ─────────────────────────────────────
+
+query I nosort
+SELECT count(*) AS total FROM stories WHERE text_match(title, 'rust')
+----
+4
+
+query I nosort
+SELECT count(*) AS total FROM stories WHERE text_match(title, 'python')
+----
+2
+
+# ── GROUP BY + count + ORDER BY + LIMIT ──────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS posts FROM stories GROUP BY author ORDER BY posts DESC, author ASC LIMIT 3
+----
+alice 3
+bob 2
+carol 2
+
+# ── GROUP BY + count (all authors) ───────────────────────────────────
+
+query TI rowsort
+SELECT author, count(*) AS posts FROM stories GROUP BY author
+----
+alice 3
+bob 2
+carol 2
+dave 2
+eve 1
+
+# ── GROUP BY with avg ────────────────────────────────────────────────
+
+query TIR nosort
+SELECT author, count(*) AS posts, avg(upvotes) AS avg_up FROM stories GROUP BY author ORDER BY avg_up DESC LIMIT 3
+----
+eve 1 800.0
+carol 2 700.0
+bob 2 400.0
+
+# ── text_match + GROUP BY + ORDER BY ────────────────────────────────
+
+query TIR nosort
+SELECT author, count(*) AS posts, avg(upvotes) AS avg_up FROM stories WHERE text_match(title, 'rust') GROUP BY author ORDER BY avg_up DESC
+----
+alice 3 183.3
+dave 1 150.0
+
+# ── HAVING filter ────────────────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS posts FROM stories GROUP BY author HAVING posts > 1 ORDER BY posts DESC, author ASC
+----
+alice 3
+bob 2
+carol 2
+dave 2
+
+# ── HAVING with LIMIT ────────────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS posts FROM stories GROUP BY author HAVING posts > 1 ORDER BY posts DESC, author ASC LIMIT 2
+----
+alice 3
+bob 2
+
+# ── WHERE on pushdown field (not alias) ──────────────────────────────
+
+query I nosort
+SELECT count(*) AS cnt FROM stories WHERE upvotes > 400
+----
+3
+
+# ── sum aggregate ────────────────────────────────────────────────────
+
+query TR nosort
+SELECT author, sum(upvotes) AS total_up FROM stories GROUP BY author ORDER BY total_up DESC, author ASC LIMIT 3
+----
+carol 1400.0
+bob 800.0
+eve 800.0
+
+# ── min/max aggregates ───────────────────────────────────────────────
+
+query TRR nosort
+SELECT author, min(upvotes) AS min_up, max(upvotes) AS max_up FROM stories GROUP BY author ORDER BY max_up DESC, author ASC LIMIT 3
+----
+carol 400.0 1000.0
+eve 800.0 800.0
+bob 300.0 500.0
+
+# ── text_match + HAVING + LIMIT (the showcase pattern) ───────────────
+
+query TIR nosort
+SELECT author, count(*) AS posts, avg(upvotes) AS avg_up FROM stories WHERE text_match(title, 'rust') GROUP BY author HAVING posts > 1 ORDER BY avg_up DESC LIMIT 5
+----
+alice 3 183.3
+
+# ── count with WHERE filter pushdown ────────────────────────────────
+
+query I nosort
+SELECT count(*) AS cnt FROM stories WHERE comments > 100
+----
+4
+
+# ── GROUP BY with OFFSET ─────────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS posts FROM stories GROUP BY author ORDER BY posts DESC, author ASC LIMIT 2 OFFSET 1
+----
+bob 2
+carol 2

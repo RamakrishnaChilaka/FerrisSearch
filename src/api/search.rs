@@ -238,8 +238,15 @@ pub async fn search_documents(
         local_shards.iter().map(|(id, _)| *id).collect();
 
     for (shard_id, engine) in &local_shards {
-        match engine.search(&params.q) {
-            Ok(hits) => {
+        let engine = engine.clone();
+        let query = params.q.clone();
+        let shard_id = *shard_id;
+        let search_result = state
+            .worker_pools
+            .spawn_search(move || engine.search(&query))
+            .await;
+        match search_result {
+            Ok(Ok(hits)) => {
                 successful_shards += 1;
                 for hit in hits {
                     all_hits.push(serde_json::json!({
@@ -251,7 +258,7 @@ pub async fn search_documents(
                     }));
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) | Err(e) => {
                 tracing::error!("Shard {}/{} search failed: {}", index_name, shard_id, e);
                 failed_shards += 1;
             }
@@ -410,6 +417,30 @@ struct SqlExecutionResult {
     timings: crate::hybrid::SqlTimings,
 }
 
+/// Execute a SQL query and return the result for integration testing.
+/// Exposes the same execution pipeline as the HTTP handler but returns
+/// the raw `SqlQueryResult` without HTTP response formatting.
+pub async fn execute_sql_for_testing(
+    state: &AppState,
+    index_name: &str,
+    sql: &str,
+) -> crate::common::Result<crate::hybrid::SqlQueryResult> {
+    let result = execute_sql_query(state, index_name, sql)
+        .await
+        .map_err(|(_, json_body)| {
+            anyhow::anyhow!(
+                "{}",
+                json_body
+                    .0
+                    .get("error")
+                    .and_then(|e| e.get("reason"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("SQL execution error")
+            )
+        })?;
+    Ok(result.sql_result)
+}
+
 /// Execute a SQL query end-to-end with per-stage timing instrumentation.
 /// Used by both `search_sql` (for the normal response) and `explain_sql`
 /// (for EXPLAIN ANALYZE with timings + rows).
@@ -548,24 +579,28 @@ async fn execute_sql_query(
         let mut direct_error: Option<anyhow::Error> = None;
 
         for (_shard_id, engine) in &local_shards {
-            match engine.sql_record_batch(
-                &search_req,
-                &plan.required_columns,
-                plan.needs_id,
-                plan.needs_score,
-            ) {
-                Ok(Some(batch_result)) => {
+            let engine = engine.clone();
+            let req = search_req.clone();
+            let cols = plan.required_columns.clone();
+            let nid = plan.needs_id;
+            let nsc = plan.needs_score;
+            let batch_result = state
+                .worker_pools
+                .spawn_search(move || engine.sql_record_batch(&req, &cols, nid, nsc))
+                .await;
+            match batch_result {
+                Ok(Ok(Some(batch_result))) => {
                     successful_shards += 1;
                     total_hits += batch_result.total_hits;
                     batches.push(batch_result.batch);
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     direct_error = Some(anyhow::anyhow!(
                         "local shard does not support direct SQL batches"
                     ));
                     break;
                 }
-                Err(error) => {
+                Ok(Err(error)) | Err(error) => {
                     direct_error = Some(error);
                     break;
                 }
@@ -1143,6 +1178,7 @@ mod tests {
             transport_client: crate::transport::TransportClient::new(),
             local_node_id: "node-1".into(),
             raft: None,
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
         };
 
         let metadata = cluster_state.indices.get(index_name).unwrap().clone();

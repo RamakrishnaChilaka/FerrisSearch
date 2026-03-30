@@ -28,7 +28,7 @@ impl Default for TransportClient {
 impl TransportClient {
     pub fn new() -> Self {
         Self {
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(30),
             channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -45,7 +45,9 @@ impl TransportClient {
         {
             let cache = self.channels.read().unwrap_or_else(|e| e.into_inner());
             if let Some(channel) = cache.get(&key) {
-                return Ok(InternalTransportClient::new(channel.clone()));
+                return Ok(InternalTransportClient::new(channel.clone())
+                    .max_decoding_message_size(64 * 1024 * 1024)
+                    .max_encoding_message_size(64 * 1024 * 1024));
             }
         }
 
@@ -53,7 +55,7 @@ impl TransportClient {
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}:{}", host, port))
             .expect("valid endpoint URI")
             .timeout(self.timeout)
-            .connect_timeout(self.timeout);
+            .connect_timeout(Duration::from_secs(5));
         let channel = endpoint.connect().await?;
 
         {
@@ -61,7 +63,9 @@ impl TransportClient {
             cache.insert(key, channel.clone());
         }
 
-        Ok(InternalTransportClient::new(channel))
+        Ok(InternalTransportClient::new(channel)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024))
     }
 
     /// Attempts to join the cluster by contacting the seed hosts.

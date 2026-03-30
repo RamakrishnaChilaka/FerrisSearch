@@ -138,6 +138,14 @@ for agg-only `size=0` requests. When no aggs are requested, `None` adds zero ove
 - `AggSegmentCollector` implements `SegmentCollector` -- `collect(doc, score)` reads column values and accumulates
 - String `terms` aggs count term ords per segment in `collect()`, then resolve ord→string once in `harvest()`
 - `harvest()` returns per-segment data, `merge_fruits()` merges across segments into `HashMap<String, PartialAggResult>`
+
+### Grouped Metrics Collector (Ordinal-Based)
+The `GroupedAggCollector` computes grouped analytics (GROUP BY + aggregate functions) in a single Tantivy pass using fast fields.
+- **Zero-allocation hot path**: `collect()` uses `GroupKeyReader::key(doc) → u64` to get fast-field ordinals. For string columns, this is the dictionary ordinal; for numerics, the bit-reinterpreted value. No String allocations, no JSON serialization per doc.
+- **Ordinal-keyed HashMap**: Buckets are stored in `HashMap<u64, OrdGroupedBucket>` with compact `CompactMetricAccum` (count or stats) indexed by metric position in a `Vec`, not `HashMap<String, _>`.
+- **Deferred string resolution**: `harvest()` calls `GroupKeyReader::resolve(ord) → serde_json::Value` once per unique group to produce the final `GroupedMetricsBucket`s.
+- **Multi-column GROUP BY**: Combines ordinals with FxHash-style mixing (`h = h.wrapping_mul(0x517cc1b727220a95).wrapping_add(k)`) for the HashMap key.
+- Previously the hot path did 5 heap allocations + 1 JSON serialization per doc. The ordinal-based approach does zero allocations per doc for the common single-column string GROUP BY case.
 - Per-shard partial results are serialized with `bincode-next` into the `partial_aggs_json` bytes field over gRPC, then merged at coordinator via `merge_aggregations()`
 - Agg-only `size=0` requests skip `TopDocs` and hit materialization entirely
 

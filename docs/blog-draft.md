@@ -59,6 +59,8 @@ I've spent years working on search infrastructure at major cloud providers. I've
 
 One thing always stood out: customers wanted analytics over search results, and the existing options were awkward. You either wrote deeply nested aggregation JSON, piped results to a separate analytics system, or pulled data into application code. The search engine and the analytics engine stayed separate even when the data was the same.
 
+Most companies bridge this gap with an ETL pipeline from their search engine to an analytics database. FerrisSearch collapses that into one system.
+
 I wanted to explore what happens when you design a search engine from scratch with analytics as a first-class capability, not bolted on but woven into the query planner. No legacy runtime constraints, no backward compatibility requirements, just the best ideas from modern systems research combined in one binary.
 
 FerrisSearch is that exploration.
@@ -69,7 +71,7 @@ FerrisSearch is that exploration.
 
 FerrisSearch is a distributed search engine written in Rust. It has OpenSearch-compatible REST APIs, Raft consensus for cluster state, and a hybrid SQL layer that runs analytics directly on search results.
 
-It's 28,000 lines of Rust. No JVM, no extra services, no separate analytics database. Single binary.
+It's ~30,000 lines of Rust. No JVM, no extra services, no separate analytics database. Single binary.
 
 **Tech stack:**
 - [Tantivy](https://github.com/quickwit-oss/tantivy) for full-text indexing and BM25 scoring
@@ -108,12 +110,14 @@ That is **0.6ms** for a full-text match query across 2 million documents.
 
 ### Hybrid SQL (4M Hacker News stories, i5-13600K)
 
-| Query | Time |
-|-------|------|
-| `count(*)` across 4M docs | **20ms** |
-| text_match + filter + ORDER BY LIMIT 10 | **19ms** |
-| text_match + GROUP BY 4,715 authors | **92ms** |
-| Cross-topic analytics (per query) | **3–8ms** |
+```
+Query                                          Time
+─────────────────────────────────────────────────────
+count(*) across 4M docs                         20ms
+text_match + filter + ORDER BY LIMIT 10         19ms
+text_match + GROUP BY 4,715 authors             92ms
+Cross-topic analytics (per query)             3–8ms
+```
 
 ---
 
@@ -156,12 +160,21 @@ planning: 0.1ms → search: 7ms → datafusion: 1ms → total: 8ms
 
 The planner automatically picks the fastest path:
 
-| Mode | When | Example |
-|------|------|---------|
-| `count_star_fast` | `SELECT count(*)` with no WHERE | Reads doc_count() metadata. **20ms on 4M docs.** |
-| `tantivy_fast_fields` | Projected columns + filter + ORDER BY LIMIT | Columnar reads from Tantivy fast fields. **19ms on 4M docs.** |
-| `tantivy_grouped_partials` | GROUP BY + aggregates | Shard-local partial agg, coordinator merge. **92ms on 4M docs.** |
-| `materialized_hits_fallback` | SELECT * or unsupported expressions | Falls back to full hit materialization. Compatibility mode. |
+```
+Mode                          When                              Example
+────────────────────────────────────────────────────────────────────────────────
+count_star_fast               SELECT count(*) with no WHERE     Reads doc_count() metadata.
+                                                                20ms on 4M docs.
+
+tantivy_fast_fields           Projected columns + filter +      Columnar reads from Tantivy
+                              ORDER BY LIMIT                    fast fields. 19ms on 4M docs.
+
+tantivy_grouped_partials      GROUP BY + aggregates             Shard-local partial agg,
+                                                                coordinator merge. 92ms on 4M.
+
+materialized_hits_fallback    SELECT * or unsupported           Falls back to full hit
+                              expressions                       materialization. Compatibility.
+```
 
 You can see which mode was used in every response:
 
@@ -250,7 +263,7 @@ Beyond the SQL layer, FerrisSearch is a real distributed system:
 - **Write-ahead log** — binary WAL with configurable durability (`fsync` per write or async timer)
 - **Shard routing** — Murmur3 hash-based document routing across shards
 - **gRPC transport** — inter-node communication via [tonic](https://github.com/hyperium/tonic) with connection pooling
-- **653 tests** — unit, consensus integration, replication integration, and REST API integration tests
+- **701 tests** — unit, consensus integration, replication integration, REST API integration, and SQL correctness (sqllogictest) tests
 
 ---
 
@@ -266,11 +279,9 @@ Beyond the SQL layer, FerrisSearch is a real distributed system:
 
 FerrisSearch is not production-ready yet. Gaps you should know about:
 
-- **No dynamic field mapping** — you must define schemas upfront (OpenSearch auto-detects types on first document)
 - **No TLS** — zero encryption, localhost-only deployments
 - **No `search_after` pagination** — deep pagination breaks at high offsets
 - **No `_msearch`** — can't batch search requests (Kibana/Grafana integration blocked)
-- **High-cardinality GROUP BY is slow** — 400K distinct groups = 5.5s (per-doc HashMap insertion)
 - **Not battle-tested at scale** — tested on 4M docs, not 400M
 
 The planner works and the numbers are real, but the missing features above are the difference between an impressive prototype and something you'd trust in production.
@@ -281,7 +292,6 @@ The planner works and the numbers are real, but the missing features above are t
 
 If you want to contribute, these are good starting points:
 
-- **Dynamic field mapping** — auto-detect JSON value types on first document and create the schema automatically (removes the biggest usability gap vs OpenSearch)
 - **`search_after` pagination** — cursor-based deep pagination using sort values from the last result
 - **`_msearch` API** — batch multiple search requests in one call (unlocks Kibana/Grafana integration)
 - **Prometheus metrics** — add a `/_metrics` endpoint exposing query latency histograms and shard health
@@ -292,16 +302,14 @@ If you want to contribute, these are good starting points:
 ## Try It
 
 ```bash
-git clone https://github.com/RamakrishnaChilaka/ROpenSearch.git
-cd ROpenSearch
+git clone https://github.com/RamakrishnaChilaka/FerrisSearch.git
+cd FerrisSearch
 
 # Build
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-# Start 3-node cluster
-./dev_cluster_release.sh 1 &
-./dev_cluster_release.sh 2 &
-./dev_cluster_release.sh 3 &
+# Build & Start 3-node cluster
+./dev_cluster_release.sh --nodes 3
 
 # Ingest 4M Hacker News stories
 python3 -m pip install pyarrow requests

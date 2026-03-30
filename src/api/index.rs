@@ -479,7 +479,10 @@ pub async fn index_document(
             if refresh_param.should_refresh()
                 && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
             {
-                let _ = engine.refresh();
+                let _ = state
+                    .worker_pools
+                    .spawn_write(move || engine.refresh())
+                    .await;
             }
             (StatusCode::CREATED, Json(res))
         }
@@ -557,7 +560,10 @@ pub async fn index_document_with_id(
             if refresh_param.should_refresh()
                 && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
             {
-                let _ = engine.refresh();
+                let _ = state
+                    .worker_pools
+                    .spawn_write(move || engine.refresh())
+                    .await;
             }
             (StatusCode::CREATED, Json(res))
         }
@@ -647,26 +653,26 @@ async fn fan_out_maintenance(state: &AppState, index_name: &str, op: Maintenance
     let mut successful = 0u32;
     let mut failed = 0u32;
 
-    // Local shards
+    // Local shards — dispatch to write pool
     let cs = state.cluster_manager.get_state();
     if let Some(meta) = cs.indices.get(index_name) {
         let local_shards = ensure_local_index_shards_open(state, index_name, meta, "Maintenance");
+        let is_flush = matches!(op, MaintenanceOp::Flush);
         for (_, engine) in local_shards {
-            let result = match op {
-                MaintenanceOp::Refresh => engine.refresh(),
-                MaintenanceOp::Flush => engine.flush_with_global_checkpoint(),
-            };
+            let result = state
+                .worker_pools
+                .spawn_write(move || {
+                    if is_flush {
+                        engine.flush_with_global_checkpoint()
+                    } else {
+                        engine.refresh()
+                    }
+                })
+                .await;
             match result {
-                Ok(_) => successful += 1,
-                Err(e) => {
-                    tracing::error!(
-                        "Local {} failed: {}",
-                        match op {
-                            MaintenanceOp::Refresh => "refresh",
-                            MaintenanceOp::Flush => "flush",
-                        },
-                        e
-                    );
+                Ok(Ok(_)) => successful += 1,
+                Ok(Err(e)) | Err(e) => {
+                    tracing::error!("Local maintenance failed: {}", e);
                     failed += 1;
                 }
             }
@@ -1057,7 +1063,10 @@ pub async fn bulk_index_global(
             .collect();
         for index_name in affected_indices {
             for (_, engine) in state.shard_manager.get_index_shards(&index_name) {
-                let _ = engine.refresh();
+                let _ = state
+                    .worker_pools
+                    .spawn_write(move || engine.refresh())
+                    .await;
             }
         }
     }
@@ -1154,7 +1163,10 @@ pub async fn bulk_index(
     // ?refresh=true: commit + reload all affected shards so docs are immediately searchable
     if refresh_param.should_refresh() {
         for (_, engine) in state.shard_manager.get_index_shards(&index_name) {
-            let _ = engine.refresh();
+            let _ = state
+                .worker_pools
+                .spawn_write(move || engine.refresh())
+                .await;
         }
     }
 
@@ -1207,8 +1219,15 @@ pub(crate) async fn execute_distributed_dsl_search(
     let local_shards = ensure_local_index_shards_open(state, index_name, &metadata, "DSL search");
 
     for (shard_id, engine) in &local_shards {
-        match engine.search_query(search_req) {
-            Ok((hits, shard_total, partial_aggs)) => {
+        let engine = engine.clone();
+        let search_req = search_req.clone();
+        let shard_id = *shard_id;
+        let search_result = state
+            .worker_pools
+            .spawn_search(move || engine.search_query(&search_req))
+            .await;
+        match search_result {
+            Ok(Ok((hits, shard_total, partial_aggs))) => {
                 successful += 1;
                 total_hits += shard_total;
                 if !partial_aggs.is_empty() {
@@ -1223,7 +1242,7 @@ pub(crate) async fn execute_distributed_dsl_search(
                     }));
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) | Err(e) => {
                 tracing::error!("Shard {}/{} search failed: {}", index_name, shard_id, e);
                 failed += 1;
             }
@@ -1234,13 +1253,20 @@ pub(crate) async fn execute_distributed_dsl_search(
         && let Some((field_name, params)) = knn.fields.iter().next()
     {
         for (shard_id, engine) in &local_shards {
-            match engine.search_knn_filtered(
-                field_name,
-                &params.vector,
-                params.k,
-                params.filter.as_ref(),
-            ) {
-                Ok(hits) => {
+            let engine = engine.clone();
+            let field_name = field_name.clone();
+            let vector = params.vector.clone();
+            let k = params.k;
+            let filter = params.filter.clone();
+            let shard_id = *shard_id;
+            let knn_result = state
+                .worker_pools
+                .spawn_search(move || {
+                    engine.search_knn_filtered(&field_name, &vector, k, filter.as_ref())
+                })
+                .await;
+            match knn_result {
+                Ok(Ok(hits)) => {
                     for hit in hits {
                         knn_hits.push(serde_json::json!({
                             "_index": index_name,
@@ -1253,7 +1279,7 @@ pub(crate) async fn execute_distributed_dsl_search(
                         }));
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) | Err(e) => {
                     tracing::error!(
                         "Vector search on {}/shard_{} failed: {}",
                         index_name,
@@ -2143,6 +2169,7 @@ mod tests {
             transport_client: crate::transport::TransportClient::new(),
             local_node_id: "node-1".into(),
             raft: None,
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
         };
         (temp_dir, state)
     }

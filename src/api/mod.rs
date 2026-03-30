@@ -10,6 +10,7 @@ use crate::cluster::ClusterManager;
 use crate::consensus::types::RaftInstance;
 use crate::shard::ShardManager;
 use crate::transport::TransportClient;
+use crate::worker::WorkerPools;
 use axum::{
     Json, Router,
     body::Body,
@@ -45,6 +46,8 @@ pub struct AppState {
     pub local_node_id: String,
     /// Raft consensus instance (if enabled)
     pub raft: Option<Arc<RaftInstance>>,
+    /// Dedicated thread pools for search and write workloads
+    pub worker_pools: WorkerPools,
 }
 
 /// Build a consistent OpenSearch-compatible error response.
