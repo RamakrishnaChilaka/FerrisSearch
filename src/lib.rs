@@ -13,3 +13,4 @@ pub mod shard;
 pub mod storage;
 pub mod transport;
 pub mod wal;
+pub mod worker;

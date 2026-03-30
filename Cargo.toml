@@ -17,6 +17,7 @@ futures = "0.3.32"
 murmur3 = "0.5.2"
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "tokio-rt"] }
 prost = "0.13"
+rayon = "1.10"
 redb = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rustyline = "15"
@@ -47,5 +48,6 @@ path = "src/cli.rs"
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+sqllogictest = "0.29"
 tempfile = "3"
 tokio-stream = "0.1"

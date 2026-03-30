@@ -14,6 +14,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Protobuf (proto/transport.proto)
 - redb 3 (persistent Raft log storage — v3 file format, ~15% faster bulk writes, smaller files)
 - jemalloc (global allocator via tikv-jemallocator — reduces post-workload RSS retention vs glibc malloc)
+- rayon (dedicated thread pools for search/write workload isolation)
 
 ## Architecture
 - **Raft consensus** manages cluster state (leader election, node membership, index metadata).
@@ -33,6 +34,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
 - `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
 - `src/wal/` — HotTranslog (binary length-prefixed WAL), TranslogDurability, WriteAheadLog trait
+- `src/worker.rs` — WorkerPools: dedicated rayon thread pools for search/write isolation
 - `src/replication/` — replicate_write, replicate_bulk (sync to ISR replicas)
 - `src/common/` — `Result<T>` type alias (anyhow), `validate_index_name()`
 - `src/config/` — AppConfig (YAML + env var loading)
@@ -90,7 +92,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 583 unit tests + 30 consensus integration + 39 replication integration + 17 REST API integration = 669 total
+- 600 unit tests + 30 consensus integration + 39 replication integration + 17 REST API integration + 15 SQL correctness (sqllogictest) = 701 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 - SQL console: `cargo run --bin ferris-cli` (interactive) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
@@ -130,6 +132,7 @@ pub struct AppState {
     pub transport_client: TransportClient,
     pub local_node_id: String,
     pub raft: Option<Arc<RaftInstance>>,
+    pub worker_pools: WorkerPools,
 }
 ```
 

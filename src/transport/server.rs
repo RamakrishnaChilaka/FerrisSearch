@@ -23,6 +23,8 @@ pub struct TransportService {
     pub raft: Option<Arc<RaftInstance>>,
     /// This node's identifier — used to filter locally-assigned shards.
     pub local_node_id: String,
+    /// Dedicated thread pools for search and write workloads.
+    pub worker_pools: crate::worker::WorkerPools,
 }
 
 // ─── Conversion helpers: domain types ↔ proto types ─────────────────────────
@@ -292,7 +294,18 @@ impl InternalTransport for TransportService {
             "gRPC: index doc '{}' into {}/shard_{}",
             doc_id, req.index_name, req.shard_id
         );
-        match engine.add_document(&doc_id, payload.clone()) {
+
+        let write_result = {
+            let engine = engine.clone();
+            let doc_id = doc_id.clone();
+            let payload = payload.clone();
+            self.worker_pools
+                .spawn_write(move || engine.add_document(&doc_id, payload))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        match write_result {
             Ok(id) => {
                 // Get the seq_no assigned by the WAL during add_document
                 let seq_no = engine.local_checkpoint();
@@ -374,7 +387,17 @@ impl InternalTransport for TransportService {
             req.index_name,
             req.shard_id
         );
-        match engine.bulk_add_documents(docs.clone()) {
+
+        let write_result = {
+            let engine = engine.clone();
+            let docs_for_write = docs.clone();
+            self.worker_pools
+                .spawn_write(move || engine.bulk_add_documents(docs_for_write))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        match write_result {
             Ok(ids) => {
                 let seq_no = engine.local_checkpoint();
                 // Replicate to replica shards
@@ -436,7 +459,17 @@ impl InternalTransport for TransportService {
             "gRPC: delete doc '{}' from {}/shard_{}",
             req.doc_id, req.index_name, req.shard_id
         );
-        match engine.delete_document(&req.doc_id) {
+
+        let delete_result = {
+            let engine = engine.clone();
+            let doc_id = req.doc_id.clone();
+            self.worker_pools
+                .spawn_write(move || engine.delete_document(&doc_id))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        match delete_result {
             Ok(deleted) => {
                 let seq_no = engine.local_checkpoint();
                 // Replicate delete to replica shards
@@ -504,7 +537,16 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
-        match engine.get_document(&req.doc_id) {
+        let doc_result = {
+            let engine = engine.clone();
+            let doc_id = req.doc_id.clone();
+            self.worker_pools
+                .spawn_search(move || engine.get_document(&doc_id))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        match doc_result {
             Ok(Some(source)) => Ok(Response::new(ShardGetResponse {
                 found: true,
                 source_json: serde_json::to_vec(&source).unwrap_or_default(),
@@ -541,7 +583,16 @@ impl InternalTransport for TransportService {
             }
         };
 
-        match engine.search(&req.query) {
+        let search_result = {
+            let engine = engine.clone();
+            let query = req.query.clone();
+            self.worker_pools
+                .spawn_search(move || engine.search(&query))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        match search_result {
             Ok(hits) => Ok(Response::new(ShardSearchResponse {
                 success: true,
                 hits: hits
@@ -590,58 +641,66 @@ impl InternalTransport for TransportService {
         let mut all_hits = Vec::new();
         let mut total_hits: usize = 0;
 
-        // Text / DSL search
-        let (hits, total, partial_aggs) = match engine.search_query(&search_req) {
-            Ok(result) => result,
-            Err(e) => {
-                return Ok(Response::new(ShardSearchResponse {
-                    success: false,
-                    hits: vec![],
-                    error: e.to_string(),
-                    total_hits: 0,
-                    partial_aggs_json: vec![],
-                }));
-            }
-        };
-        total_hits += total;
-        all_hits.extend(hits);
-
-        // k-NN vector search (if knn clause present)
-        if let Some(ref knn) = search_req.knn
-            && let Some((field_name, params)) = knn.fields.iter().next()
-        {
-            match engine.search_knn_filtered(
-                field_name,
-                &params.vector,
-                params.k,
-                params.filter.as_ref(),
-            ) {
-                Ok(hits) => all_hits.extend(hits),
-                Err(e) => {
-                    tracing::error!("Vector search on remote shard failed: {}", e);
-                    // Non-fatal: text results still returned
-                }
-            }
-        }
-
-        let aggs_json = if partial_aggs.is_empty() {
-            vec![]
-        } else {
-            crate::search::encode_partial_aggs(&partial_aggs).unwrap_or_default()
-        };
-
-        Ok(Response::new(ShardSearchResponse {
-            success: true,
-            hits: all_hits
-                .into_iter()
-                .map(|v| SearchHit {
-                    source_json: serde_json::to_vec(&v).unwrap_or_default(),
+        // Run all blocking engine work on the search pool
+        let search_result = {
+            let engine = engine.clone();
+            let search_req = search_req.clone();
+            self.worker_pools
+                .spawn_search(move || -> crate::common::Result<(Vec<serde_json::Value>, usize, std::collections::HashMap<String, crate::search::PartialAggResult>, Vec<serde_json::Value>)> {
+                    let (hits, total, partial_aggs) = engine.search_query(&search_req)?;
+                    let mut knn_hits = Vec::new();
+                    if let Some(ref knn) = search_req.knn {
+                        if let Some((field_name, params)) = knn.fields.iter().next() {
+                            match engine.search_knn_filtered(
+                                field_name,
+                                &params.vector,
+                                params.k,
+                                params.filter.as_ref(),
+                            ) {
+                                Ok(h) => knn_hits = h,
+                                Err(e) => tracing::error!("Vector search on remote shard failed: {}", e),
+                            }
+                        }
+                    }
+                    Ok((hits, total, partial_aggs, knn_hits))
                 })
-                .collect(),
-            error: String::new(),
-            total_hits: total_hits as u64,
-            partial_aggs_json: aggs_json,
-        }))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        match search_result {
+            Ok((hits, total, partial_aggs, knn_hits)) => {
+                total_hits += total;
+                all_hits.extend(hits);
+                all_hits.extend(knn_hits);
+
+                let aggs_json = if partial_aggs.is_empty() {
+                    vec![]
+                } else {
+                    crate::search::encode_partial_aggs(&partial_aggs).unwrap_or_default()
+                };
+
+                Ok(Response::new(ShardSearchResponse {
+                    success: true,
+                    hits: all_hits
+                        .into_iter()
+                        .map(|v| SearchHit {
+                            source_json: serde_json::to_vec(&v).unwrap_or_default(),
+                        })
+                        .collect(),
+                    error: String::new(),
+                    total_hits: total_hits as u64,
+                    partial_aggs_json: aggs_json,
+                }))
+            }
+            Err(e) => Ok(Response::new(ShardSearchResponse {
+                success: false,
+                hits: vec![],
+                error: e.to_string(),
+                total_hits: 0,
+                partial_aggs_json: vec![],
+            })),
+        }
     }
 
     async fn sql_record_batch(
@@ -668,7 +727,21 @@ impl InternalTransport for TransportService {
 
         let columns: Vec<String> = req.columns;
 
-        match engine.sql_record_batch(&search_req, &columns, req.needs_id, req.needs_score) {
+        let batch_result = {
+            let engine = engine.clone();
+            let search_req = search_req.clone();
+            let columns = columns.clone();
+            let needs_id = req.needs_id;
+            let needs_score = req.needs_score;
+            self.worker_pools
+                .spawn_search(move || {
+                    engine.sql_record_batch(&search_req, &columns, needs_id, needs_score)
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        match batch_result {
             Ok(Some(batch_result)) => {
                 let ipc_bytes =
                     crate::hybrid::arrow_bridge::record_batch_to_ipc(&batch_result.batch)
@@ -711,13 +784,29 @@ impl InternalTransport for TransportService {
             "index" => {
                 let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
                     .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
-                engine
-                    .add_document_with_seq(&req.doc_id, payload, req.seq_no)
-                    .map(|_| ())
+                let engine = engine.clone();
+                let doc_id = req.doc_id.clone();
+                let seq_no = req.seq_no;
+                self.worker_pools
+                    .spawn_write(move || {
+                        engine
+                            .add_document_with_seq(&doc_id, payload, seq_no)
+                            .map(|_| ())
+                    })
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
             }
-            "delete" => engine
-                .delete_document_with_seq(&req.doc_id, req.seq_no)
-                .map(|_| ()),
+            "delete" => {
+                let engine = engine.clone();
+                let doc_id = req.doc_id.clone();
+                let seq_no = req.seq_no;
+                self.worker_pools
+                    .spawn_write(move || {
+                        engine.delete_document_with_seq(&doc_id, seq_no).map(|_| ())
+                    })
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+            }
             other => Err(anyhow::anyhow!("Unknown replication op: {}", other)),
         };
 
@@ -760,7 +849,15 @@ impl InternalTransport for TransportService {
 
         let start_seq_no = req.ops.first().map(|op| op.seq_no).unwrap_or(0);
 
-        match engine.bulk_add_documents_with_start_seq(docs, start_seq_no) {
+        let write_result = {
+            let engine = engine.clone();
+            self.worker_pools
+                .spawn_write(move || engine.bulk_add_documents_with_start_seq(docs, start_seq_no))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        match write_result {
             Ok(_) => Ok(Response::new(ReplicateBulkResponse {
                 success: true,
                 error: String::new(),
@@ -810,30 +907,40 @@ impl InternalTransport for TransportService {
             }
         };
 
-        let entries: Vec<crate::wal::TranslogEntry> =
-            match crate::wal::HotTranslog::open(&shard_dir) {
-                Ok(tl) => match tl.read_from(req.local_checkpoint) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        return Ok(Response::new(RecoverReplicaResponse {
-                            success: false,
-                            error: format!("Failed to read translog: {}", e),
-                            ops_replayed: 0,
-                            primary_checkpoint: engine.local_checkpoint(),
-                            operations: vec![],
-                        }));
-                    }
-                },
-                Err(e) => {
+        let entries: Vec<crate::wal::TranslogEntry> = {
+            let shard_dir = shard_dir.clone();
+            let checkpoint = req.local_checkpoint;
+            match self
+                .worker_pools
+                .spawn_search(
+                    move || -> crate::common::Result<Vec<crate::wal::TranslogEntry>> {
+                        let tl = crate::wal::HotTranslog::open(&shard_dir)?;
+                        tl.read_from(checkpoint)
+                    },
+                )
+                .await
+            {
+                Ok(Ok(entries)) => entries,
+                Ok(Err(e)) => {
                     return Ok(Response::new(RecoverReplicaResponse {
                         success: false,
-                        error: format!("Failed to open translog: {}", e),
+                        error: format!("Failed to read translog: {}", e),
                         ops_replayed: 0,
                         primary_checkpoint: engine.local_checkpoint(),
                         operations: vec![],
                     }));
                 }
-            };
+                Err(e) => {
+                    return Ok(Response::new(RecoverReplicaResponse {
+                        success: false,
+                        error: format!("Translog read task failed: {}", e),
+                        ops_replayed: 0,
+                        primary_checkpoint: engine.local_checkpoint(),
+                        operations: vec![],
+                    }));
+                }
+            }
+        };
 
         let ops_count = entries.len() as u64;
 
@@ -1213,8 +1320,22 @@ impl InternalTransport for TransportService {
         request: Request<IndexMaintenanceRequest>,
     ) -> Result<Response<IndexMaintenanceResponse>, Status> {
         let index_name = request.into_inner().index_name;
-        let (successful, failed) =
-            self.run_maintenance_on_assigned_shards(&index_name, |engine| engine.refresh());
+        let shard_manager = self.shard_manager.clone();
+        let cluster_manager = self.cluster_manager.clone();
+        let local_node_id = self.local_node_id.clone();
+        let (successful, failed) = self
+            .worker_pools
+            .spawn_write(move || {
+                run_maintenance_sync(
+                    &cluster_manager,
+                    &shard_manager,
+                    &local_node_id,
+                    &index_name,
+                    |engine| engine.refresh(),
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(IndexMaintenanceResponse {
             successful_shards: successful,
             failed_shards: failed,
@@ -1226,9 +1347,22 @@ impl InternalTransport for TransportService {
         request: Request<IndexMaintenanceRequest>,
     ) -> Result<Response<IndexMaintenanceResponse>, Status> {
         let index_name = request.into_inner().index_name;
-        let (successful, failed) = self.run_maintenance_on_assigned_shards(&index_name, |engine| {
-            engine.flush_with_global_checkpoint()
-        });
+        let shard_manager = self.shard_manager.clone();
+        let cluster_manager = self.cluster_manager.clone();
+        let local_node_id = self.local_node_id.clone();
+        let (successful, failed) = self
+            .worker_pools
+            .spawn_write(move || {
+                run_maintenance_sync(
+                    &cluster_manager,
+                    &shard_manager,
+                    &local_node_id,
+                    &index_name,
+                    |engine| engine.flush_with_global_checkpoint(),
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(IndexMaintenanceResponse {
             successful_shards: successful,
             failed_shards: failed,
@@ -1320,6 +1454,42 @@ impl InternalTransport for TransportService {
     }
 }
 
+/// Run a maintenance operation on all locally-assigned shards (sync, for pool dispatch).
+fn run_maintenance_sync<F>(
+    cluster_manager: &ClusterManager,
+    shard_manager: &crate::shard::ShardManager,
+    local_node_id: &str,
+    index_name: &str,
+    op: F,
+) -> (u32, u32)
+where
+    F: Fn(&Arc<dyn crate::engine::SearchEngine>) -> crate::common::Result<()>,
+{
+    let mut successful = 0u32;
+    let mut failed = 0u32;
+    let cs = cluster_manager.get_state();
+    let Some(metadata) = cs.indices.get(index_name) else {
+        return (successful, failed);
+    };
+    for (shard_id, routing) in &metadata.shard_routing {
+        let assigned_here =
+            routing.primary == local_node_id || routing.replicas.iter().any(|n| n == local_node_id);
+        if !assigned_here {
+            continue;
+        }
+        if let Some(engine) = shard_manager.get_shard(index_name, *shard_id) {
+            match op(&engine) {
+                Ok(_) => successful += 1,
+                Err(e) => {
+                    tracing::error!("Maintenance on {}/{} failed: {}", index_name, shard_id, e);
+                    failed += 1;
+                }
+            }
+        }
+    }
+    (successful, failed)
+}
+
 impl TransportService {
     #[allow(clippy::result_large_err)]
     fn get_or_open_shard(
@@ -1401,6 +1571,7 @@ impl TransportService {
 
     /// Run a maintenance operation (refresh or flush) only on shards assigned
     /// to this node per the routing table, skipping orphaned shards.
+    #[cfg(test)]
     fn run_maintenance_on_assigned_shards<F>(&self, index_name: &str, op: F) -> (u32, u32)
     where
         F: Fn(&Arc<dyn crate::engine::SearchEngine>) -> crate::common::Result<()>,
@@ -1448,8 +1619,11 @@ pub fn create_transport_service(
         transport_client,
         raft: None,
         local_node_id,
+        worker_pools: crate::worker::WorkerPools::default_for_system(),
     };
     InternalTransportServer::new(service)
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024)
 }
 
 /// Create the gRPC transport server with Raft consensus enabled.
@@ -1466,8 +1640,11 @@ pub fn create_transport_service_with_raft(
         transport_client,
         raft: Some(raft),
         local_node_id,
+        worker_pools: crate::worker::WorkerPools::default_for_system(),
     };
     InternalTransportServer::new(service)
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024)
 }
 
 #[cfg(test)]
@@ -1772,6 +1949,7 @@ mod tests {
             transport_client: crate::transport::TransportClient::new(),
             raft: None,
             local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
         };
 
         let engine = service
@@ -1824,6 +2002,7 @@ mod tests {
             transport_client: crate::transport::TransportClient::new(),
             raft: None,
             local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
         };
 
         let response = service
@@ -1854,6 +2033,7 @@ mod tests {
             transport_client: crate::transport::TransportClient::new(),
             raft: None,
             local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
         };
 
         let response = service
@@ -1877,6 +2057,7 @@ mod tests {
             transport_client: crate::transport::TransportClient::new(),
             raft: None,
             local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
         };
 
         let err = match service.get_or_open_search_shard("missing-idx", 99) {
@@ -1941,6 +2122,7 @@ mod tests {
             transport_client: crate::transport::TransportClient::new(),
             raft: None,
             local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
         };
 
         let (successful, failed) =
@@ -1997,6 +2179,7 @@ mod tests {
             transport_client: crate::transport::TransportClient::new(),
             raft: None,
             local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
         };
 
         let (successful, failed) =

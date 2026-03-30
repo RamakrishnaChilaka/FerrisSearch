@@ -130,7 +130,37 @@ pub fn execute_grouped_partial_sql(
         })
         .collect::<Vec<_>>();
 
+    // Apply HAVING filters before sorting
+    if !grouped_sql.having.is_empty() {
+        rows.retain(|row| {
+            grouped_sql.having.iter().all(|filter| {
+                let val = row.get(&filter.output_name).and_then(json_to_f64);
+                match val {
+                    Some(v) => match filter.op {
+                        planner::HavingOp::Gt => v > filter.value,
+                        planner::HavingOp::GtEq => v >= filter.value,
+                        planner::HavingOp::Lt => v < filter.value,
+                        planner::HavingOp::LtEq => v <= filter.value,
+                        planner::HavingOp::Eq => (v - filter.value).abs() < f64::EPSILON,
+                    },
+                    None => false, // NULL doesn't pass any filter
+                }
+            })
+        });
+    }
+
     rows.sort_by(|left, right| compare_grouped_rows(left, right, &grouped_sql.order_by));
+
+    // Apply LIMIT and OFFSET after sorting
+    let offset = plan.offset.unwrap_or(0);
+    if offset > 0 || plan.limit.is_some() {
+        let start = offset.min(rows.len());
+        let end = plan
+            .limit
+            .map(|limit| (start + limit).min(rows.len()))
+            .unwrap_or(rows.len());
+        rows = rows[start..end].to_vec();
+    }
 
     Ok(SqlQueryResult { columns, rows })
 }
@@ -233,6 +263,13 @@ fn compare_json_values(left: &serde_json::Value, right: &serde_json::Value) -> s
         (serde_json::Value::String(left), serde_json::Value::String(right)) => left.cmp(right),
         (serde_json::Value::Bool(left), serde_json::Value::Bool(right)) => left.cmp(right),
         _ => left.to_string().cmp(&right.to_string()),
+    }
+}
+
+fn json_to_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
     }
 }
 
@@ -996,18 +1033,14 @@ mod tests {
     }
 
     #[test]
-    fn grouped_query_with_limit_falls_back_to_datafusion() {
+    fn grouped_query_with_limit_uses_grouped_partials() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
             "SELECT category, count(*) AS total FROM products WHERE text_match(description, 'iphone') GROUP BY category LIMIT 5",
         ).unwrap();
         assert_eq!(plan.limit, Some(5));
-        assert!(plan.grouped_sql.is_none()); // LIMIT disables grouped partials
-        // Without grouped partials, this becomes a regular query with no ORDER BY.
-        // No ORDER BY means default score sort, so limit pushdown IS safe here.
-        assert!(plan.limit_pushed_down);
-        let req = plan.to_search_request();
-        assert_eq!(req.size, 5);
+        assert!(plan.grouped_sql.is_some()); // LIMIT + GROUP BY uses grouped partials
+        assert!(!plan.limit_pushed_down); // LIMIT is applied after merge, not pushed to Tantivy
     }
 
     #[test]
@@ -1257,5 +1290,262 @@ mod tests {
         assert!(!plan.required_columns.is_empty());
         // needs_score should NOT be forced
         assert!(!plan.needs_score);
+    }
+
+    #[test]
+    fn grouped_partial_sql_applies_limit() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC LIMIT 2",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert_eq!(plan.limit, Some(2));
+
+        // Simulate 4 grouped buckets from a single shard
+        let mut partial_map = HashMap::new();
+        let buckets = vec![
+            GroupedMetricsBucket {
+                group_values: vec![json!("alice")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 100 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("bob")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 50 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("carol")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 30 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("dave")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 10 },
+                )]),
+            },
+        ];
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0]["author"], "alice");
+        assert_eq!(result.rows[0]["posts"], 100);
+        assert_eq!(result.rows[1]["author"], "bob");
+        assert_eq!(result.rows[1]["posts"], 50);
+    }
+
+    #[test]
+    fn grouped_partial_sql_applies_offset_and_limit() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC LIMIT 2 OFFSET 1",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert_eq!(plan.limit, Some(2));
+        assert_eq!(plan.offset, Some(1));
+
+        let mut partial_map = HashMap::new();
+        let buckets = vec![
+            GroupedMetricsBucket {
+                group_values: vec![json!("alice")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 100 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("bob")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 50 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("carol")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 30 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("dave")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 10 },
+                )]),
+            },
+        ];
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        // OFFSET 1 skips alice, LIMIT 2 takes bob and carol
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0]["author"], "bob");
+        assert_eq!(result.rows[0]["posts"], 50);
+        assert_eq!(result.rows[1]["author"], "carol");
+        assert_eq!(result.rows[1]["posts"], 30);
+    }
+
+    #[test]
+    fn grouped_partial_sql_no_limit_returns_all() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert_eq!(plan.limit, None);
+
+        let mut partial_map = HashMap::new();
+        let buckets = vec![
+            GroupedMetricsBucket {
+                group_values: vec![json!("alice")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 100 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("bob")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 50 },
+                )]),
+            },
+        ];
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn grouped_partial_sql_applies_having_filter() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author HAVING posts > 30 ORDER BY posts DESC",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 1);
+
+        let mut partial_map = HashMap::new();
+        let buckets = vec![
+            GroupedMetricsBucket {
+                group_values: vec![json!("alice")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 100 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("bob")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 20 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("carol")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 50 },
+                )]),
+            },
+        ];
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        // bob (20) filtered out by HAVING posts > 30
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0]["author"], "alice");
+        assert_eq!(result.rows[0]["posts"], 100);
+        assert_eq!(result.rows[1]["author"], "carol");
+        assert_eq!(result.rows[1]["posts"], 50);
+    }
+
+    #[test]
+    fn grouped_partial_sql_having_with_limit() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author HAVING posts > 20 ORDER BY posts DESC LIMIT 1",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert_eq!(plan.limit, Some(1));
+
+        let mut partial_map = HashMap::new();
+        let buckets = vec![
+            GroupedMetricsBucket {
+                group_values: vec![json!("alice")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 100 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("bob")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 50 },
+                )]),
+            },
+            GroupedMetricsBucket {
+                group_values: vec![json!("carol")],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count { count: 10 },
+                )]),
+            },
+        ];
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        // HAVING filters carol (10), LIMIT 1 takes only alice (100)
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0]["author"], "alice");
+        assert_eq!(result.rows[0]["posts"], 100);
     }
 }

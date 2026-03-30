@@ -59,11 +59,28 @@ pub struct SqlOrderBy {
     pub desc: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum HavingOp {
+    Gt,
+    GtEq,
+    Lt,
+    LtEq,
+    Eq,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HavingFilter {
+    pub output_name: String,
+    pub op: HavingOp,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupedSqlPlan {
     pub group_columns: Vec<SqlGroupColumn>,
     pub metrics: Vec<SqlGroupedMetric>,
     pub order_by: Vec<SqlOrderBy>,
+    pub having: Vec<HavingFilter>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,11 +278,27 @@ impl QueryPlan {
                 "name": "grouped_partial_merge",
                 "description": "Merge compact grouped partial states at the coordinator",
             }));
-            stages.push(serde_json::json!({
+            let mut final_stage = serde_json::json!({
                 "stage": 4,
                 "name": "final_grouped_sql_shape",
                 "description": "Apply final projection and ordering to merged grouped results",
-            }));
+            });
+            if let Some(limit) = self.limit {
+                final_stage["limit"] = serde_json::json!(limit);
+            }
+            if let Some(offset) = self.offset {
+                final_stage["offset"] = serde_json::json!(offset);
+            }
+            if !grouped_sql.having.is_empty() {
+                final_stage["having"] = serde_json::json!(
+                    grouped_sql
+                        .having
+                        .iter()
+                        .map(|h| format!("{} {:?} {}", h.output_name, h.op, h.value))
+                        .collect::<Vec<_>>()
+                );
+            }
+            stages.push(final_stage);
         } else if !self.selects_all_columns {
             stages.push(serde_json::json!({
                 "stage": 2,
@@ -369,7 +402,8 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     }
 
     let selects_all_columns = projection_has_wildcard(select);
-    let (text_match, pushed_filters) = extract_pushdowns(&mut select.selection)?;
+    let select_aliases = collect_select_aliases(select);
+    let (text_match, pushed_filters) = extract_pushdowns(&mut select.selection, &select_aliases)?;
     let has_residual_predicates = select.selection.is_some();
     rewrite_table_name(select);
     let (required_columns, needs_id, needs_score) =
@@ -426,16 +460,11 @@ fn extract_grouped_sql_plan(
     order_by: Option<&sqlparser::ast::OrderBy>,
     has_residual_predicates: bool,
     selects_all_columns: bool,
-    limit: Option<usize>,
-    offset: Option<usize>,
+    _limit: Option<usize>,
+    _offset: Option<usize>,
     group_by_columns: &[String],
 ) -> Result<Option<GroupedSqlPlan>> {
-    if has_residual_predicates
-        || selects_all_columns
-        || select.having.is_some()
-        || limit.is_some()
-        || offset.is_some()
-    {
+    if has_residual_predicates || selects_all_columns {
         return Ok(None);
     }
 
@@ -516,11 +545,95 @@ fn extract_grouped_sql_plan(
         }
     }
 
+    // Parse HAVING clause into post-merge filters
+    let mut having_filters = Vec::new();
+    if let Some(having_expr) = &select.having {
+        if !parse_having_filters(having_expr, &valid_names, &mut having_filters) {
+            return Ok(None);
+        }
+    }
+
     Ok(Some(GroupedSqlPlan {
         group_columns,
         metrics,
         order_by: order_items,
+        having: having_filters,
     }))
+}
+
+/// Parse a HAVING expression into simple comparison filters.
+/// Returns false if the HAVING clause cannot be fully handled (bail to fallback).
+fn parse_having_filters(
+    expr: &Expr,
+    valid_names: &HashMap<String, String>,
+    filters: &mut Vec<HavingFilter>,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            parse_having_filters(left, valid_names, filters)
+                && parse_having_filters(right, valid_names, filters)
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let having_op = match op {
+                BinaryOperator::Gt => HavingOp::Gt,
+                BinaryOperator::GtEq => HavingOp::GtEq,
+                BinaryOperator::Lt => HavingOp::Lt,
+                BinaryOperator::LtEq => HavingOp::LtEq,
+                BinaryOperator::Eq => HavingOp::Eq,
+                _ => return false,
+            };
+            // Try field op value
+            if let (Some(name), Some(val)) = (expr_to_field_name(left), expr_to_f64(right)) {
+                if let Some(output_name) = valid_names.get(&name) {
+                    filters.push(HavingFilter {
+                        output_name: output_name.clone(),
+                        op: having_op,
+                        value: val,
+                    });
+                    return true;
+                }
+            }
+            // Try value op field (flipped)
+            if let (Some(val), Some(name)) = (expr_to_f64(left), expr_to_field_name(right)) {
+                if let Some(output_name) = valid_names.get(&name) {
+                    let flipped_op = match having_op {
+                        HavingOp::Gt => HavingOp::Lt,
+                        HavingOp::GtEq => HavingOp::LtEq,
+                        HavingOp::Lt => HavingOp::Gt,
+                        HavingOp::LtEq => HavingOp::GtEq,
+                        HavingOp::Eq => HavingOp::Eq,
+                    };
+                    filters.push(HavingFilter {
+                        output_name: output_name.clone(),
+                        op: flipped_op,
+                        value: val,
+                    });
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Nested(inner) => parse_having_filters(inner, valid_names, filters),
+        _ => false,
+    }
+}
+
+fn expr_to_f64(expr: &Expr) -> Option<f64> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlValue::Number(n, _) => n.parse::<f64>().ok(),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => expr_to_f64(inner).map(|v| -v),
+        _ => None,
+    }
 }
 
 fn parse_grouped_metric(expr: &Expr, alias: Option<String>) -> Result<Option<SqlGroupedMetric>> {
@@ -713,6 +826,7 @@ fn rewrite_table_name(select: &mut Select) {
 
 fn extract_pushdowns(
     selection: &mut Option<Expr>,
+    select_aliases: &BTreeSet<String>,
 ) -> Result<(Option<TextMatchPredicate>, Vec<crate::search::QueryClause>)> {
     let Some(expr) = selection.take() else {
         return Ok((None, Vec::new()));
@@ -725,6 +839,13 @@ fn extract_pushdowns(
     let mut pushed_filters = Vec::new();
     let mut residual = Vec::new();
     for predicate in predicates {
+        // Never push down predicates that reference SELECT aliases (e.g.,
+        // `WHERE posts > 10` when `posts` is an alias for `count(*)`).
+        // These are aggregate-derived values, not physical fields.
+        if predicate_references_alias(&predicate, select_aliases) {
+            residual.push(predicate);
+            continue;
+        }
         match parse_text_match(&predicate)? {
             Some(found) => {
                 if text_match.is_some() {
@@ -744,6 +865,24 @@ fn extract_pushdowns(
 
     *selection = combine_conjunctions(residual);
     Ok((text_match, pushed_filters))
+}
+
+/// Returns true if the predicate references any SELECT alias.
+/// For example, `posts > 10` when `posts` is an alias for `count(*)`.
+fn predicate_references_alias(expr: &Expr, aliases: &BTreeSet<String>) -> bool {
+    match expr {
+        Expr::Identifier(ident) => aliases.contains(&ident.value),
+        Expr::BinaryOp { left, right, .. } => {
+            predicate_references_alias(left, aliases) || predicate_references_alias(right, aliases)
+        }
+        Expr::Between {
+            expr: between_expr, ..
+        } => predicate_references_alias(between_expr, aliases),
+        Expr::InList { expr: in_expr, .. } => predicate_references_alias(in_expr, aliases),
+        Expr::UnaryOp { expr, .. } => predicate_references_alias(expr, aliases),
+        Expr::Nested(inner) => predicate_references_alias(inner, aliases),
+        _ => false,
+    }
 }
 
 fn split_conjunction(expr: Expr, out: &mut Vec<Expr>) {
@@ -1253,5 +1392,123 @@ mod tests {
         let plan = plan_sql("idx", "SELECT * FROM \"idx\"").unwrap();
         assert!(plan.selects_all_columns);
         assert!(!plan.limit_pushed_down);
+    }
+
+    #[test]
+    fn group_by_with_limit_uses_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC LIMIT 20",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert!(!plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(20));
+        assert_eq!(plan.offset, None);
+    }
+
+    #[test]
+    fn group_by_with_limit_and_offset_uses_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC LIMIT 10 OFFSET 5",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert!(!plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(10));
+        assert_eq!(plan.offset, Some(5));
+    }
+
+    #[test]
+    fn group_by_with_limit_no_order_uses_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT category, count(*) AS cnt FROM idx GROUP BY category LIMIT 5",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert!(!plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(5));
+    }
+
+    // ── Alias pushdown guard tests ──────────────────────────────────────
+
+    #[test]
+    fn where_on_select_alias_not_pushed_down() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx WHERE posts > 10 GROUP BY author",
+        )
+        .unwrap();
+        // "posts" is a SELECT alias — must NOT be pushed to Tantivy
+        assert!(plan.pushed_filters.is_empty());
+        assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn where_on_real_field_still_pushed_with_alias_present() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx WHERE upvotes > 10 GROUP BY author",
+        )
+        .unwrap();
+        // "upvotes" is a real field, not an alias — should be pushed
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn where_on_alias_and_real_field_only_pushes_real_field() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx WHERE upvotes > 10 AND posts > 5 GROUP BY author",
+        )
+        .unwrap();
+        // "upvotes" pushed; "posts" stays as residual
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(plan.has_residual_predicates);
+    }
+
+    // ── HAVING support tests ────────────────────────────────────────────
+
+    #[test]
+    fn having_simple_comparison_uses_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author HAVING posts > 10 ORDER BY posts DESC",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 1);
+        assert_eq!(grouped.having[0].output_name, "posts");
+        assert_eq!(grouped.having[0].value, 10.0);
+        assert!(matches!(grouped.having[0].op, super::HavingOp::Gt));
+    }
+
+    #[test]
+    fn having_multiple_conditions() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts, avg(upvotes) AS avg_up FROM idx GROUP BY author HAVING posts > 10 AND avg_up > 5.0",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 2);
+    }
+
+    #[test]
+    fn having_with_limit_uses_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author HAVING posts > 10 ORDER BY posts DESC LIMIT 20",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert_eq!(plan.limit, Some(20));
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 1);
     }
 }

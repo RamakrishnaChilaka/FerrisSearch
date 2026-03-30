@@ -110,3 +110,15 @@ pub struct TransportClient {
 
 ### Critical Invariant: Shard Forwarding Must Propagate Errors
 `forward_index_to_shard()` and `forward_bulk_to_shard()` MUST return `Err(...)` when the shard RPC returns `success: false`. Never wrap a shard failure in `Ok(json!({"error": ...}))` — this hides failures from API handlers, causing them to return HTTP 201 for failed writes.
+
+### gRPC Limits
+- **Max message size**: 64MB (`max_decoding_message_size` / `max_encoding_message_size`) on both client and server. Default tonic limit is 4MB, insufficient for high-cardinality GROUP BY partial results (~7MB for 200K groups).
+- **Request timeout**: 30s (set on the tonic `Endpoint`). Full-table GROUP BY on large shards can take 10s+.
+- **Connect timeout**: 5s (separate from request timeout).
+- Both limits are set in `TransportClient::connect()` (client-side) and `create_transport_service*()` (server-side).
+
+### Worker Pool Integration
+All blocking engine calls in `TransportService` handlers are dispatched to dedicated rayon thread pools via `self.worker_pools.spawn_search()` / `self.worker_pools.spawn_write()`:
+- **Search pool** (`search-N` threads): `get_doc`, `search_shard`, `search_shard_dsl`, `sql_record_batch`, `recover_replica` (WAL I/O)
+- **Write pool** (`write-N` threads): `index_doc`, `bulk_index`, `delete_doc`, `replicate_doc`, `replicate_bulk`, `refresh_index`, `flush_index`
+- The `TransportService` struct holds `worker_pools: WorkerPools` initialized in `create_transport_service*()` constructors.

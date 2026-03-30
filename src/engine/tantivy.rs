@@ -1063,6 +1063,29 @@ fn open_sql_field_reader(
     }
 }
 
+fn open_group_key_reader(
+    schema: &Schema,
+    fast_fields: &tantivy::fastfield::FastFieldReaders,
+    field_name: &str,
+) -> Option<GroupKeyReader> {
+    let field = schema.get_field(field_name).ok()?;
+    let entry = schema.get_field_entry(field);
+    match entry.field_type() {
+        tantivy::schema::FieldType::F64(_) => {
+            fast_fields.f64(entry.name()).ok().map(GroupKeyReader::F64)
+        }
+        tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::U64(_) => {
+            fast_fields.i64(entry.name()).ok().map(GroupKeyReader::I64)
+        }
+        tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::Bytes(_) => fast_fields
+            .str(entry.name())
+            .ok()
+            .flatten()
+            .map(GroupKeyReader::Str),
+        _ => None,
+    }
+}
+
 struct ResolvedGroupedAggSpec {
     name: String,
     group_by: Vec<String>,
@@ -1087,10 +1110,78 @@ struct GroupedMetricEntry {
     source: GroupedMetricSource,
 }
 
+/// Compact per-doc key reader. Extracts a u64 ordinal per group-by column
+/// without allocating Strings or serde_json::Values in the hot path.
+enum GroupKeyReader {
+    Str(tantivy::columnar::StrColumn),
+    I64(tantivy::columnar::Column<i64>),
+    F64(tantivy::columnar::Column<f64>),
+}
+
+impl GroupKeyReader {
+    /// Extract a compact ordinal key for the given doc. Returns u64::MAX for NULL.
+    fn key(&self, doc: tantivy::DocId) -> u64 {
+        match self {
+            GroupKeyReader::Str(reader) => {
+                let mut ords = reader.term_ords(doc);
+                ords.next().unwrap_or(u64::MAX)
+            }
+            GroupKeyReader::I64(reader) => reader.first(doc).map(|v| v as u64).unwrap_or(u64::MAX),
+            GroupKeyReader::F64(reader) => {
+                reader.first(doc).map(|v| v.to_bits()).unwrap_or(u64::MAX)
+            }
+        }
+    }
+
+    /// Resolve an ordinal key back to a serde_json::Value (called once per unique group).
+    fn resolve(&self, key: u64) -> serde_json::Value {
+        if key == u64::MAX {
+            return serde_json::Value::Null;
+        }
+        match self {
+            GroupKeyReader::Str(reader) => {
+                let mut text = String::new();
+                if reader.ord_to_str(key, &mut text).unwrap_or(false) {
+                    serde_json::Value::String(text)
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            GroupKeyReader::I64(_) => serde_json::Value::from(key as i64),
+            GroupKeyReader::F64(_) => serde_json::Value::from(f64::from_bits(key)),
+        }
+    }
+}
+
+/// Compact per-bucket metric accumulator using Vec (indexed by metric position)
+/// instead of HashMap<String, _>.
+#[derive(Clone)]
+enum CompactMetricAccum {
+    Count(u64),
+    Stats {
+        count: u64,
+        sum: f64,
+        min: f64,
+        max: f64,
+    },
+}
+
+struct OrdGroupedBucket {
+    /// Ordinal keys for each group-by column.
+    ord_keys: Vec<u64>,
+    /// One accumulator per metric, indexed by position.
+    accums: Vec<CompactMetricAccum>,
+}
+
 struct GroupedAggSegmentEntry {
-    group_readers: Vec<SqlFieldReader>,
+    key_readers: Vec<GroupKeyReader>,
     metric_entries: Vec<GroupedMetricEntry>,
-    buckets: std::collections::HashMap<String, crate::search::GroupedMetricsBucket>,
+    /// Maps compact ordinal key (single u64 for 1 group col, or hashed for multi-col) to bucket.
+    buckets: std::collections::HashMap<u64, OrdGroupedBucket>,
+    /// For multi-column GROUP BY, maps hash to full key for collision detection.
+    multi_col: bool,
+    /// Template of initial accumulators (one per metric).
+    accum_template: Vec<CompactMetricAccum>,
 }
 
 pub(crate) struct GroupedAggCollector {
@@ -1152,21 +1243,25 @@ impl tantivy::collector::Collector for GroupedAggCollector {
         let mut entries = Vec::with_capacity(self.specs.len());
 
         for spec in &self.specs {
-            let group_readers: Vec<SqlFieldReader> = spec
-                .group_by
-                .iter()
-                .map(|field| open_sql_field_reader(&self.schema, ff, field))
-                .collect();
-
-            if group_readers
-                .iter()
-                .any(|reader| matches!(reader, SqlFieldReader::SourceFallback))
-            {
+            // Build compact key readers for GROUP BY columns
+            let mut key_readers = Vec::with_capacity(spec.group_by.len());
+            let mut unsupported_group = false;
+            for field_name in &spec.group_by {
+                match open_group_key_reader(&self.schema, ff, field_name) {
+                    Some(reader) => key_readers.push(reader),
+                    None => {
+                        unsupported_group = true;
+                        break;
+                    }
+                }
+            }
+            if unsupported_group {
                 entries.push((spec.name.clone(), None));
                 continue;
             }
 
             let mut metric_entries = Vec::with_capacity(spec.metrics.len());
+            let mut accum_template = Vec::with_capacity(spec.metrics.len());
             let mut unsupported = false;
             for metric in &spec.metrics {
                 let source = match metric.function {
@@ -1196,6 +1291,18 @@ impl tantivy::collector::Collector for GroupedAggCollector {
                         GroupedMetricSource::Numeric(column)
                     }
                 };
+                let template = match &source {
+                    GroupedMetricSource::CountAll | GroupedMetricSource::CountField(_) => {
+                        CompactMetricAccum::Count(0)
+                    }
+                    GroupedMetricSource::Numeric(_) => CompactMetricAccum::Stats {
+                        count: 0,
+                        sum: 0.0,
+                        min: f64::INFINITY,
+                        max: f64::NEG_INFINITY,
+                    },
+                };
+                accum_template.push(template);
                 metric_entries.push(GroupedMetricEntry {
                     output_name: metric.output_name.clone(),
                     function: metric.function.clone(),
@@ -1208,12 +1315,15 @@ impl tantivy::collector::Collector for GroupedAggCollector {
                 continue;
             }
 
+            let multi_col = key_readers.len() > 1;
             entries.push((
                 spec.name.clone(),
                 Some(GroupedAggSegmentEntry {
-                    group_readers,
+                    key_readers,
                     metric_entries,
                     buckets: std::collections::HashMap::new(),
+                    multi_col,
+                    accum_template,
                 }),
             ));
         }
@@ -1238,7 +1348,10 @@ impl tantivy::collector::Collector for GroupedAggCollector {
             for (name, buckets) in fruit {
                 let agg_buckets = merged.entry(name).or_default();
                 for bucket in buckets {
-                    let key = serde_json::to_string(&bucket.group_values).unwrap_or_default();
+                    // Use a compact merge key — the group_values are already resolved
+                    // serde_json::Value strings at this point (from harvest), but only
+                    // runs #unique_groups × #segments times, not per-doc.
+                    let key = compact_group_key(&bucket.group_values);
                     let target = agg_buckets.entry(key).or_insert_with(|| {
                         crate::search::GroupedMetricsBucket {
                             group_values: bucket.group_values.clone(),
@@ -1252,16 +1365,11 @@ impl tantivy::collector::Collector for GroupedAggCollector {
 
         let mut results = std::collections::HashMap::new();
         for spec in &self.specs {
-            let mut buckets = merged
+            let buckets = merged
                 .remove(&spec.name)
                 .unwrap_or_default()
                 .into_values()
                 .collect::<Vec<_>>();
-            buckets.sort_by(|left, right| {
-                serde_json::to_string(&left.group_values)
-                    .unwrap_or_default()
-                    .cmp(&serde_json::to_string(&right.group_values).unwrap_or_default())
-            });
             results.insert(
                 spec.name.clone(),
                 crate::search::PartialAggResult::GroupedMetrics { buckets },
@@ -1280,34 +1388,39 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
                 continue;
             };
 
-            let group_values: Vec<serde_json::Value> = entry
-                .group_readers
-                .iter()
-                .map(|reader| reader.first_json(doc))
-                .collect();
-            let key = serde_json::to_string(&group_values).unwrap_or_default();
+            // Compute compact ordinal key — zero allocations.
+            let hash_key = if entry.multi_col {
+                // Multi-column: combine ordinals with FxHash-style mixing
+                let mut h: u64 = 0;
+                for reader in &entry.key_readers {
+                    let k = reader.key(doc);
+                    h = h.wrapping_mul(0x517cc1b727220a95).wrapping_add(k);
+                }
+                h
+            } else if let Some(reader) = entry.key_readers.first() {
+                reader.key(doc)
+            } else {
+                // No group-by columns — ungrouped aggregate, single global bucket
+                0
+            };
 
-            let bucket =
-                entry
-                    .buckets
-                    .entry(key)
-                    .or_insert_with(|| crate::search::GroupedMetricsBucket {
-                        group_values: group_values.clone(),
-                        metrics: std::collections::HashMap::new(),
-                    });
+            let bucket = entry.buckets.entry(hash_key).or_insert_with(|| {
+                let ord_keys: Vec<u64> = entry.key_readers.iter().map(|r| r.key(doc)).collect();
+                OrdGroupedBucket {
+                    ord_keys,
+                    accums: entry.accum_template.clone(),
+                }
+            });
 
-            for metric in &entry.metric_entries {
+            // Update accumulators by index — no String clones, no HashMap lookups.
+            for (idx, metric) in entry.metric_entries.iter().enumerate() {
                 match (&metric.function, &metric.source) {
                     (
                         crate::search::GroupedMetricFunction::Count,
                         GroupedMetricSource::CountAll,
                     ) => {
-                        let target = bucket
-                            .metrics
-                            .entry(metric.output_name.clone())
-                            .or_insert(crate::search::GroupedMetricPartial::Count { count: 0 });
-                        if let crate::search::GroupedMetricPartial::Count { count } = target {
-                            *count += 1;
+                        if let CompactMetricAccum::Count(c) = &mut bucket.accums[idx] {
+                            *c += 1;
                         }
                     }
                     (
@@ -1315,12 +1428,8 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
                         GroupedMetricSource::CountField(reader),
                     ) => {
                         if !reader.first_json(doc).is_null() {
-                            let target = bucket
-                                .metrics
-                                .entry(metric.output_name.clone())
-                                .or_insert(crate::search::GroupedMetricPartial::Count { count: 0 });
-                            if let crate::search::GroupedMetricPartial::Count { count } = target {
-                                *count += 1;
+                            if let CompactMetricAccum::Count(c) = &mut bucket.accums[idx] {
+                                *c += 1;
                             }
                         }
                     }
@@ -1334,20 +1443,12 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
                         let Some(value) = column.first_f64(doc) else {
                             continue;
                         };
-                        let target = bucket.metrics.entry(metric.output_name.clone()).or_insert(
-                            crate::search::GroupedMetricPartial::Stats {
-                                count: 0,
-                                sum: 0.0,
-                                min: f64::INFINITY,
-                                max: f64::NEG_INFINITY,
-                            },
-                        );
-                        if let crate::search::GroupedMetricPartial::Stats {
+                        if let CompactMetricAccum::Stats {
                             count,
                             sum,
                             min,
                             max,
-                        } = target
+                        } = &mut bucket.accums[idx]
                         {
                             *count += 1;
                             *sum += value;
@@ -1369,10 +1470,72 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
         self.entries
             .into_iter()
             .filter_map(|(name, maybe_entry)| {
-                maybe_entry.map(|entry| (name, entry.buckets.into_values().collect()))
+                let entry = maybe_entry?;
+                // Resolve ordinals to values and convert to GroupedMetricsBucket.
+                // This runs once per unique group (not per doc).
+                let buckets: Vec<crate::search::GroupedMetricsBucket> = entry
+                    .buckets
+                    .into_values()
+                    .map(|bucket| {
+                        let group_values: Vec<serde_json::Value> = bucket
+                            .ord_keys
+                            .iter()
+                            .zip(entry.key_readers.iter())
+                            .map(|(&ord, reader)| reader.resolve(ord))
+                            .collect();
+
+                        let mut metrics = std::collections::HashMap::new();
+                        for (idx, metric) in entry.metric_entries.iter().enumerate() {
+                            let partial = match &bucket.accums[idx] {
+                                CompactMetricAccum::Count(c) => {
+                                    crate::search::GroupedMetricPartial::Count { count: *c }
+                                }
+                                CompactMetricAccum::Stats {
+                                    count,
+                                    sum,
+                                    min,
+                                    max,
+                                } => crate::search::GroupedMetricPartial::Stats {
+                                    count: *count,
+                                    sum: *sum,
+                                    min: *min,
+                                    max: *max,
+                                },
+                            };
+                            metrics.insert(metric.output_name.clone(), partial);
+                        }
+
+                        crate::search::GroupedMetricsBucket {
+                            group_values,
+                            metrics,
+                        }
+                    })
+                    .collect();
+                Some((name, buckets))
             })
             .collect()
     }
+}
+
+/// Build a compact string key from group_values for segment merge.
+/// Much cheaper than serde_json::to_string — concatenates string representations
+/// with a separator. Only called #unique_groups × #segments times.
+fn compact_group_key(values: &[serde_json::Value]) -> String {
+    use std::fmt::Write;
+    let mut key = String::new();
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            key.push('\x1F'); // unit separator
+        }
+        match v {
+            serde_json::Value::String(s) => key.push_str(s),
+            serde_json::Value::Number(n) => write!(key, "{n}").unwrap(),
+            serde_json::Value::Bool(b) => write!(key, "{b}").unwrap(),
+            serde_json::Value::Null => key.push_str("\x00"),
+            _ => write!(key, "{v}").unwrap(),
+        }
+    }
+    key
 }
 
 fn merge_grouped_bucket_metrics(

@@ -80,6 +80,7 @@ impl Node {
             transport_client: self.transport_client.clone(),
             local_node_id: self.config.node_name.clone(),
             raft: self.raft.clone(),
+            worker_pools: crate::worker::WorkerPools::default_for_system(),
         };
 
         // 1. Start internal gRPC Transport Server (Port 9300)

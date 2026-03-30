@@ -1,11 +1,12 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **583 unit tests** (`cargo test --lib`)
+- **600 unit tests** (`cargo test --lib`)
 - **30 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
 - **17 REST API integration tests** (`cargo test --test rest_api_integration`)
-- **669 total** (`cargo test`)
+- **15 SQL correctness tests** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format
+- **701 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -73,6 +74,33 @@ cargo test -- test_name                         # Single test by name
 - **Truncation flag**: Assert `truncated=false` for explicit LIMIT queries. Assert `truncated=true` only when matched_hits exceeds the internal 100K ceiling without an explicit LIMIT.
 - Live tests should inspect the `planner`, `execution_mode`, and `truncated` fields, not just the returned rows.
 - Add regression tests when planner or execution changes accidentally widen the fallback path for queries that should stay search-aware.
+
+## SQL Correctness Testing Strategy
+
+### Industry Standard: sqllogictest
+The industry standard for SQL engine correctness testing is [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki), originally from SQLite. It's used by **DataFusion, CockroachDB, DuckDB, RisingWave, Databend, CnosDB**, and many others.
+
+- **Format**: `.slt` files containing `statement ok`, `statement error`, and `query <type> <sort_mode>` records with expected output after `----`.
+- **Rust crate**: [`sqllogictest`](https://crates.io/crates/sqllogictest) (v0.29.1) from risinglightdb — parser + runner, 12M+ downloads.
+- **DataFusion's approach**: 200+ `.slt` files covering GROUP BY, HAVING, LIMIT, ORDER BY, aggregations, joins, subqueries, window functions. Also runs SQLite's 5M+ test queries and Postgres compatibility tests.
+- **Key principle**: Tests assert **result correctness** (actual values), not just plan properties (mode, strategy). This is what caught the GROUP BY + LIMIT bug — our tests only checked `plan.limit_pushed_down` and `plan.grouped_sql.is_some()`, never the actual row values.
+
+### Testing Rules for SQL Changes
+1. **Always test result values, not just plan metadata.** A test that asserts `plan.limit_pushed_down == true` but never checks if the returned rows are correct is incomplete.
+2. **Always test WHERE/HAVING on aliases.** SELECT aliases like `count(*) AS posts` must NEVER be pushed down to Tantivy — they are computed values, not physical fields. Test that alias-referencing predicates stay as residual.
+3. **Test multi-shard correctness.** GROUP BY results must be identical regardless of how data is distributed across shards. Compare single-shard vs multi-shard results.
+4. **Test boundary conditions for LIMIT.** `LIMIT N` on grouped partials must return exactly N rows after merge+sort, not N rows per shard.
+5. **Test HAVING with LIMIT and OFFSET together.** The execution order must be: merge → HAVING → sort → LIMIT/OFFSET.
+6. **Every new SQL feature MUST have sqllogictest coverage.** When adding a new SQL capability (new aggregate function, new clause, new pushdown, new execution path), add `.slt` tests in `tests/slt/` that assert the correct output values. This is a BLOCKING requirement — do not merge SQL changes without corresponding `.slt` tests.
+
+### sqllogictest Infrastructure (Implemented)
+- **Crate**: `sqllogictest = "0.29"` as a dev dependency
+- **Runner**: `tests/sql_correctness.rs` — implements sync `DB` trait via `FerrisDB` adapter that calls `execute_sql_for_testing()` with `block_in_place` + `Handle::current()` bridge
+- **Test files**: `tests/slt/*.slt` — automatically discovered and run
+- **Dataset**: 10 HN-style docs with known values (5 authors, 5 categories, deterministic upvotes/comments)
+- **Coverage**: 15 assertions covering `count(*)`, `GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, `text_match`, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY
+- **Adding tests**: Create new `.slt` files in `tests/slt/` — the runner picks them up automatically
+- **Tie-breaking**: Always use secondary sort (e.g., `ORDER BY posts DESC, author ASC`) in `.slt` tests to avoid non-deterministic ordering
 
 ## Dev Cluster
 ```bash

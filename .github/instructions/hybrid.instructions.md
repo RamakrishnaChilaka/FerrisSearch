@@ -45,6 +45,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - When a SQL query has LIMIT/OFFSET and ORDER BY is `_score`-only (or absent), the limit is pushed into Tantivy's `TopDocs` collector.
 - When ORDER BY is a single non-score fast-field column (e.g., `ORDER BY price DESC`), both the sort and limit are pushed into Tantivy via `TopDocs::order_by_fast_field()`. This avoids materializing 100K docs and sorting in DataFusion.
 - **LIMIT pushdown applies to all query shapes including `SELECT *`.** The `selects_all_columns` flag does NOT block limit pushdown — it only determines whether the fast-field or materialized-fallback execution path is used. For `SELECT * LIMIT 4`, the engine collects only 4 docs (not 100K) and materializes only those 4.
+- **LIMIT with GROUP BY does NOT push to Tantivy.** When `grouped_sql.is_some()`, limit is applied after merge+sort in `execute_grouped_partial_sql`. LIMIT and OFFSET are applied post-sort, post-HAVING, to the final merged grouped results.
 - `QueryPlan` has `limit: Option<usize>`, `offset: Option<usize>`, `limit_pushed_down: bool`, and `sort_pushdown: Option<(String, bool)>` fields.
 - `sort_pushdown` captures the single ORDER BY column name and direction (true = DESC) when eligible for fast-field sort pushdown.
 - `to_search_request()` populates `SearchRequest.sort` from `sort_pushdown`, so the engine uses `order_by_fast_field()` in both `search_query()` and `sql_record_batch()`.
@@ -86,8 +87,17 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - `IN (a, b, c)` is pushed as `Bool { should: [Term(a), Term(b), Term(c)] }` — reuses existing Bool+Term support.
 - `NOT IN` and `NOT BETWEEN` are NOT pushed — they remain as residual predicates for DataFusion.
 - `score` and `_id` fields are never pushed (score is computed by Tantivy, _id is a doc identifier).
+- **SELECT aliases are never pushed down.** If a WHERE predicate references a SELECT alias (e.g., `WHERE posts > 10` when `posts` is `count(*) AS posts`), it stays as a residual predicate for DataFusion. This prevents pushing filters on nonexistent Tantivy fields, which silently fall back to the `body` catch-all field and match nearly everything.
 - Prefer shard-local partial execution before coordinator-side row materialization.
 - Treat `materialized_hits_fallback` as a compatibility path, not the target architecture.
+
+## HAVING Support
+- `HAVING` clauses are supported in the `tantivy_grouped_partials` path as post-merge filters.
+- Simple comparisons (`>`, `>=`, `<`, `<=`, `=`) on output columns (group columns or metric aliases) are converted to `HavingFilter` structs.
+- HAVING filters are applied after shard-partial merge but before sorting and LIMIT/OFFSET.
+- Multiple HAVING conditions (ANDed) are supported.
+- Complex HAVING expressions (OR, subqueries, expressions) cause fallback to the DataFusion path.
+- The pipeline order in grouped partials is: merge → HAVING → sort → LIMIT/OFFSET.
 
 ## Anti-Pattern To Avoid
 - Do not advertise or implement the feature as "SQL over hits".
