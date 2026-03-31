@@ -132,3 +132,35 @@ SELECT author, count(*) AS posts FROM stories GROUP BY author ORDER BY posts DES
 ----
 bob 2
 carol 2
+
+# ── Multi-column GROUP BY ────────────────────────────────────────────
+
+# GROUP BY (author, category) produces more groups than GROUP BY author alone
+query TT rowsort
+SELECT author, category FROM stories GROUP BY author, category
+----
+alice rust
+bob python
+carol ml
+dave rust
+dave startup
+eve culture
+
+# Multi-column GROUP BY with count
+query TTI nosort
+SELECT author, category, count(*) AS cnt FROM stories GROUP BY author, category ORDER BY cnt DESC, author ASC, category ASC
+----
+alice rust 3
+bob python 2
+carol ml 2
+dave rust 1
+dave startup 1
+eve culture 1
+
+# Multi-column GROUP BY with aggregate
+query TTR nosort
+SELECT author, category, avg(upvotes) AS avg_up FROM stories GROUP BY author, category ORDER BY avg_up DESC, author ASC LIMIT 3
+----
+eve culture 800.0
+carol ml 700.0
+bob python 400.0

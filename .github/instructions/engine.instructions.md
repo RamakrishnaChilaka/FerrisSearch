@@ -142,10 +142,13 @@ for agg-only `size=0` requests. When no aggs are requested, `None` adds zero ove
 ### Grouped Metrics Collector (Ordinal-Based)
 The `GroupedAggCollector` computes grouped analytics (GROUP BY + aggregate functions) in a single Tantivy pass using fast fields.
 - **Zero-allocation hot path**: `collect()` uses `GroupKeyReader::key(doc) → u64` to get fast-field ordinals. For string columns, this is the dictionary ordinal; for numerics, the bit-reinterpreted value. No String allocations, no JSON serialization per doc.
-- **Ordinal-keyed HashMap**: Buckets are stored in `HashMap<u64, OrdGroupedBucket>` with compact `CompactMetricAccum` (count or stats) indexed by metric position in a `Vec`, not `HashMap<String, _>`.
+- **Collision-free composite keys**: Single-column GROUP BY uses `OrdHashMap<u64>` (identity hasher). Multi-column uses `HashMap<Vec<u64>>` (exact ordinal match). No hash collisions possible.
+- **Batch ordinal reads**: Single-column GROUP BY buffers doc IDs and reads ordinals in batches of 1024 via `Column::first_vals()` — faster than per-doc `term_ords()`.
+- **Batch path handles numeric metrics**: The batch path now processes queries with `sum`, `avg`, `min`, `max` — not just `count(*)`. Ordinals are read in batch, numeric columns read per-doc from the batch.
 - **Deferred string resolution**: `harvest()` calls `GroupKeyReader::resolve(ord) → serde_json::Value` once per unique group to produce the final `GroupedMetricsBucket`s.
-- **Multi-column GROUP BY**: Combines ordinals with FxHash-style mixing (`h = h.wrapping_mul(0x517cc1b727220a95).wrapping_add(k)`) for the HashMap key.
-- Previously the hot path did 5 heap allocations + 1 JSON serialization per doc. The ordinal-based approach does zero allocations per doc for the common single-column string GROUP BY case.
+- **Identity hasher**: `OrdHasher` treats u64 ordinals as their own hash — zero hash computation in the per-doc path.
+- **Pre-sized HashMap**: `num_terms()` from the dictionary provides approximate group count for `HashMap::with_capacity()`.
+- **Top-K selection**: When ORDER BY + LIMIT are present, uses `select_nth_unstable_by` (O(N) average) instead of full sort (O(N log N)). Only the top-K subset is fully sorted.
 - Per-shard partial results are serialized with `bincode-next` into the `partial_aggs_json` bytes field over gRPC, then merged at coordinator via `merge_aggregations()`
 - Agg-only `size=0` requests skip `TopDocs` and hit materialization entirely
 

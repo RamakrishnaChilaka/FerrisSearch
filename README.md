@@ -543,7 +543,7 @@ scripts/           Ingestion and benchmark scripts
 - **No authentication** — zero access control
 - **No `_msearch`** — can't batch search requests (blocks Kibana/Grafana)
 - **Not battle-tested at scale** — tested on 4M docs, not 400M
-- **Full-table GROUP BY is slow** — ~18s on 4M docs without a `text_match` filter (inherent to search-engine storage; filtered path is fast)
+- **Full-table GROUP BY is slow** — ~6.5s on 4M docs without a `text_match` filter (inherent to search-engine storage; filtered path is fast)
 
 ## License
 

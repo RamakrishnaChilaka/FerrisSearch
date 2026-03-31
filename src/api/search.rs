@@ -527,6 +527,25 @@ async fn execute_sql_query(
 
     // Grouped partials path
     if plan.uses_grouped_partials() {
+        // Validate that GROUP BY columns are fast-field eligible (keyword, integer, float).
+        // Text fields are analyzed/tokenized and don't have fast-field columnar storage.
+        if let Some(grouped) = &plan.grouped_sql {
+            for col in &grouped.group_columns {
+                if let Some(mapping) = metadata.mappings.get(&col.source_name) {
+                    if matches!(mapping.field_type, crate::cluster::state::FieldType::Text) {
+                        return Err(crate::api::error_response(
+                            StatusCode::BAD_REQUEST,
+                            "group_by_text_field_exception",
+                            format!(
+                                "Cannot GROUP BY field '{}': text fields are tokenized and don't support grouping. Use a 'keyword' type field instead.",
+                                col.source_name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
         let search_start = Instant::now();
         let distributed =
             match crate::api::index::execute_distributed_dsl_search(state, index_name, &search_req)
@@ -1604,5 +1623,95 @@ mod tests {
         };
         let (status, _) = super::global_sql(State(state), Json(req)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn group_by_text_field_returns_error() {
+        // Create metadata with a Text field (not Keyword)
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".to_string(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "description".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "category".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+
+        cluster_state.add_index(IndexMetadata {
+            name: "texttest".to_string(),
+            uuid: String::new(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings,
+            settings: IndexSettings::default(),
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = crate::cluster::ClusterManager::new(cluster_state.cluster_name.clone());
+        manager.update_state(cluster_state.clone());
+        let state = AppState {
+            cluster_manager: Arc::new(manager),
+            shard_manager: Arc::new(crate::shard::ShardManager::new(
+                temp_dir.path(),
+                Duration::from_secs(60),
+            )),
+            transport_client: crate::transport::TransportClient::new(),
+            local_node_id: "node-1".into(),
+            raft: None,
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+        };
+
+        // GROUP BY on text field should return error
+        let (status, Json(body)) = search_sql(
+            State(state.clone()),
+            Path("texttest".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT description, count(*) AS cnt FROM texttest GROUP BY description"
+                    .to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"]["type"], "group_by_text_field_exception",
+            "should reject GROUP BY on text fields"
+        );
+
+        // GROUP BY on keyword field should succeed (not error)
+        let (status2, _) = search_sql(
+            State(state),
+            Path("texttest".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT category, count(*) AS cnt FROM texttest GROUP BY category"
+                    .to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status2, StatusCode::OK, "keyword fields should work");
     }
 }

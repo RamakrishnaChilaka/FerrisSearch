@@ -83,6 +83,14 @@ pub struct GroupedSqlPlan {
     pub having: Vec<HavingFilter>,
 }
 
+impl GroupedSqlPlan {
+    /// Returns true when this grouped query is eligible for top-K selection
+    /// (ORDER BY + LIMIT present, partial sort faster than full sort).
+    pub fn uses_top_k(&self, limit: Option<usize>) -> bool {
+        !self.order_by.is_empty() && limit.is_some()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub index_name: String,
@@ -297,6 +305,9 @@ impl QueryPlan {
                         .map(|h| format!("{} {:?} {}", h.output_name, h.op, h.value))
                         .collect::<Vec<_>>()
                 );
+            }
+            if grouped_sql.uses_top_k(self.limit) {
+                final_stage["top_k_selection"] = serde_json::json!(true);
             }
             stages.push(final_stage);
         } else if !self.selects_all_columns {
