@@ -72,9 +72,86 @@ fn refresh_all(sm: &ShardManager) {
     }
 }
 
-/// Build cluster state for two-node replication tests.
-fn setup_two_node_cluster_state(cm: &ClusterManager, index_name: &str, replica_port: u16) {
+fn setup_single_node_cluster_state(cm: &ClusterManager, index_name: &str) {
     let mut cs = cm.get_state();
+    if !cs.nodes.contains_key("node-1") {
+        cs.add_node(DomainNodeInfo {
+            id: "node-1".into(),
+            name: "node-1".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 0,
+        });
+    }
+
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    cs.add_index(IndexMetadata {
+        name: index_name.into(),
+        uuid: String::new(),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings: HashMap::new(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    cm.update_state(cs);
+}
+
+fn setup_multi_shard_single_node_cluster_state(cm: &ClusterManager, index_name: &str, shards: u32) {
+    let mut cs = cm.get_state();
+    if !cs.nodes.contains_key("node-1") {
+        cs.add_node(DomainNodeInfo {
+            id: "node-1".into(),
+            name: "node-1".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 0,
+        });
+    }
+
+    let mut shard_routing = HashMap::new();
+    for shard_id in 0..shards {
+        shard_routing.insert(
+            shard_id,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+    }
+    cs.add_index(IndexMetadata {
+        name: index_name.into(),
+        uuid: String::new(),
+        number_of_shards: shards,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings: HashMap::new(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    cm.update_state(cs);
+}
+
+/// Build cluster state for two-node replication tests.
+fn setup_two_node_cluster_state(
+    primary_cm: &ClusterManager,
+    replica_cm: &ClusterManager,
+    index_name: &str,
+    replica_port: u16,
+) {
+    let mut cs = primary_cm.get_state();
     cs.add_node(DomainNodeInfo {
         id: "primary-node".into(),
         name: "primary".into(),
@@ -112,7 +189,8 @@ fn setup_two_node_cluster_state(cm: &ClusterManager, index_name: &str, replica_p
         mappings: std::collections::HashMap::new(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
-    cm.update_state(cs);
+    primary_cm.update_state(cs.clone());
+    replica_cm.update_state(cs);
 }
 
 // ─── Single-node integration tests ─────────────────────────────────────────
@@ -122,6 +200,7 @@ async fn index_and_get_document_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "test-index");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -167,6 +246,7 @@ async fn bulk_index_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "bulk-idx");
 
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -200,6 +280,7 @@ async fn delete_document_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "del-idx");
 
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -246,6 +327,7 @@ async fn replicate_doc_index_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "replica-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -296,6 +378,7 @@ async fn replicate_doc_delete_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "rep-del-idx");
 
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -348,6 +431,7 @@ async fn replicate_bulk_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "bulk-rep-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -506,7 +590,7 @@ async fn primary_write_replicates_to_replica_node() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm, replica_sm.clone()).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
@@ -515,7 +599,12 @@ async fn primary_write_replicates_to_replica_node() {
         Duration::from_secs(60),
     ));
 
-    setup_two_node_cluster_state(&primary_cm, "replicated-idx", replica_addr.port());
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &replica_cm,
+        "replicated-idx",
+        replica_addr.port(),
+    );
 
     let primary_addr = start_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -568,7 +657,7 @@ async fn primary_delete_replicates_to_replica_node() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm, replica_sm.clone()).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
@@ -577,7 +666,12 @@ async fn primary_delete_replicates_to_replica_node() {
         Duration::from_secs(60),
     ));
 
-    setup_two_node_cluster_state(&primary_cm, "del-repl-idx", replica_addr.port());
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &replica_cm,
+        "del-repl-idx",
+        replica_addr.port(),
+    );
 
     let primary_addr = start_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -628,7 +722,7 @@ async fn primary_bulk_replicates_to_replica_node() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm, replica_sm.clone()).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
@@ -637,7 +731,12 @@ async fn primary_bulk_replicates_to_replica_node() {
         Duration::from_secs(60),
     ));
 
-    setup_two_node_cluster_state(&primary_cm, "bulk-repl-idx", replica_addr.port());
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &replica_cm,
+        "bulk-repl-idx",
+        replica_addr.port(),
+    );
 
     let primary_addr = start_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -717,6 +816,7 @@ async fn search_shard_simple_query_string_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("search-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "search-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -812,6 +912,7 @@ async fn search_shard_dsl_match_query_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("dsl-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "dsl-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1139,6 +1240,7 @@ async fn search_shard_dsl_match_all_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("matchall-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "all-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1296,6 +1398,7 @@ async fn search_shard_dsl_knn_only_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("knn-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "knn-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1377,6 +1480,7 @@ async fn search_shard_dsl_hybrid_text_and_knn_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("hybrid-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "hybrid-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1487,6 +1591,7 @@ async fn search_shard_dsl_knn_returns_empty_when_no_vectors() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("no-vec-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "novecs-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1570,6 +1675,7 @@ async fn search_shard_dsl_knn_with_filter_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("filter-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "filter-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1648,6 +1754,7 @@ async fn search_shard_dsl_knn_filter_no_matches_returns_empty_knn() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("nofilter-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "nofilter-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1705,6 +1812,7 @@ async fn update_document_merges_fields_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("update-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "update-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1784,6 +1892,7 @@ async fn update_nonexistent_document_returns_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("update-404-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "update-404-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -1821,6 +1930,7 @@ async fn replicate_doc_returns_local_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "cp-idx");
 
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -1873,6 +1983,7 @@ async fn replicate_bulk_returns_local_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "bulk-cp-idx");
 
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -1913,7 +2024,7 @@ async fn primary_write_advances_global_checkpoint() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm, replica_sm.clone()).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("gc-cluster".into()));
@@ -1922,7 +2033,7 @@ async fn primary_write_advances_global_checkpoint() {
         Duration::from_secs(60),
     ));
 
-    setup_two_node_cluster_state(&primary_cm, "gc-idx", replica_addr.port());
+    setup_two_node_cluster_state(&primary_cm, &replica_cm, "gc-idx", replica_addr.port());
 
     let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -1965,6 +2076,7 @@ async fn recover_replica_returns_translog_entries() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("recovery-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "recover-idx");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -2014,6 +2126,7 @@ async fn recover_replica_returns_empty_when_caught_up() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("recovery-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "caught-up-idx");
 
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -2058,7 +2171,7 @@ async fn bulk_replication_advances_global_checkpoint() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm, replica_sm).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("bulk-gc".into()));
@@ -2066,7 +2179,7 @@ async fn bulk_replication_advances_global_checkpoint() {
         primary_dir.path(),
         Duration::from_secs(60),
     ));
-    setup_two_node_cluster_state(&primary_cm, "bgc-idx", replica_addr.port());
+    setup_two_node_cluster_state(&primary_cm, &replica_cm, "bgc-idx", replica_addr.port());
 
     let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -2111,7 +2224,7 @@ async fn delete_replication_advances_global_checkpoint() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm, replica_sm).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("del-gc".into()));
@@ -2119,7 +2232,7 @@ async fn delete_replication_advances_global_checkpoint() {
         primary_dir.path(),
         Duration::from_secs(60),
     ));
-    setup_two_node_cluster_state(&primary_cm, "dgc-idx", replica_addr.port());
+    setup_two_node_cluster_state(&primary_cm, &replica_cm, "dgc-idx", replica_addr.port());
 
     let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -2173,7 +2286,7 @@ async fn isr_tracker_updated_after_replication() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm, replica_sm).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("isr-it".into()));
@@ -2181,7 +2294,7 @@ async fn isr_tracker_updated_after_replication() {
         primary_dir.path(),
         Duration::from_secs(60),
     ));
-    setup_two_node_cluster_state(&primary_cm, "isr-idx", replica_addr.port());
+    setup_two_node_cluster_state(&primary_cm, &replica_cm, "isr-idx", replica_addr.port());
 
     let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -2220,6 +2333,7 @@ async fn recover_replica_ops_have_correct_fields() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("op-fields".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "opf-idx");
 
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
@@ -2296,6 +2410,7 @@ async fn get_shard_stats_returns_doc_counts_for_open_shards() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "stats-test");
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
@@ -2335,6 +2450,7 @@ async fn get_shard_stats_returns_multiple_shards() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_multi_shard_single_node_cluster_state(&cm, "multi-shard", 2);
 
     let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;

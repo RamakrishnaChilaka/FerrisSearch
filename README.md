@@ -465,12 +465,13 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 708 tests
-cargo test --lib                                # Unit tests (607)
+cargo test                                      # All 733 tests
+cargo test --lib                                # Unit tests (613)
+cargo test --bin ferris-cli                      # CLI tests (33)
 cargo test --test consensus_integration          # Raft consensus (30)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test rest_api_integration           # REST API (17)
-cargo test --test sql_correctness                # SQL correctness (15 sqllogictest assertions)
+cargo test --test sql_correctness                # SQL correctness (1 test, 52 sqllogictest assertions)
 ```
 
 Integration tests run in-process with isolated temp directories. No external services needed.

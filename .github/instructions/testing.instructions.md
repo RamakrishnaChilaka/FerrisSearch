@@ -1,12 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **607 unit tests** (`cargo test --lib`)
+- **613 unit tests** (`cargo test --lib`)
+- **33 CLI tests** (`cargo test --bin ferris-cli`)
 - **30 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
 - **17 REST API integration tests** (`cargo test --test rest_api_integration`)
-- **15 SQL correctness tests** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 46 assertions across 2 files
-- **708 total** (`cargo test`)
+- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 52 assertions across 2 files
+- **733 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -37,6 +38,7 @@ cargo test -- test_name                         # Single test by name
 - Test primary-to-replica replication, bulk replication, recovery
 - Test checkpoint tracking, ISR behavior
 - Uses actual `TransportClient` + `TransportService` over localhost
+- Seed `ClusterManager` with node/index/shard metadata before gRPC write, replication, or search calls; transport now rejects unknown shards instead of implicitly creating them from empty metadata
 
 ## Test Helper Patterns
 - `tokio::time::timeout()` to prevent hung tests
@@ -99,6 +101,7 @@ The industry standard for SQL engine correctness testing is [sqllogictest](https
 - **Test files**: `tests/slt/*.slt` — automatically discovered and run
 - **Dataset**: 10 HN-style docs with known values (5 authors, 5 categories, deterministic upvotes/comments)
 - **Coverage**: 15 assertions covering `count(*)`, `GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, `text_match`, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY
+- **HAVING coverage rule**: Always test HAVING with **both** alias-based (`HAVING cnt > 1`) and aggregate-expression (`HAVING COUNT(*) > 1`) forms. These take different code paths in the planner — alias goes through `expr_to_field_name`, aggregate expression goes through `resolve_having_name` → `parse_grouped_metric`. Missing one form caused a regression where HAVING with aggregate expressions silently fell to the wrong execution path.
 - **Adding tests**: Create new `.slt` files in `tests/slt/` — the runner picks them up automatically
 - **Tie-breaking**: Always use secondary sort (e.g., `ORDER BY posts DESC, author ASC`) in `.slt` tests to avoid non-deterministic ordering
 
