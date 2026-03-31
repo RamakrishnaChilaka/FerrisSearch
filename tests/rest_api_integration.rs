@@ -56,6 +56,7 @@ impl RestTestHarness {
             transport_client: transport_client.clone(),
             local_node_id: "node-1".into(),
             raft: None,
+            worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
         };
 
         let transport_service = create_transport_service(

@@ -11,7 +11,7 @@ use crate::wal::WriteAheadLog;
 use openraft::type_config::async_runtime::WatchReceiver;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 /// Shared state for the gRPC transport service.
 #[derive(Clone)]
@@ -151,7 +151,7 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| Status::invalid_argument("missing node_info"))?;
         let mut ni = proto_to_node_info(&node_info);
         let joining_raft_id = req.raft_node_id;
-        info!(
+        debug!(
             "gRPC: join request from node {} (raft_id={})",
             ni.id, joining_raft_id
         );
@@ -649,17 +649,17 @@ impl InternalTransport for TransportService {
                 .spawn_search(move || -> crate::common::Result<(Vec<serde_json::Value>, usize, std::collections::HashMap<String, crate::search::PartialAggResult>, Vec<serde_json::Value>)> {
                     let (hits, total, partial_aggs) = engine.search_query(&search_req)?;
                     let mut knn_hits = Vec::new();
-                    if let Some(ref knn) = search_req.knn {
-                        if let Some((field_name, params)) = knn.fields.iter().next() {
-                            match engine.search_knn_filtered(
-                                field_name,
-                                &params.vector,
-                                params.k,
-                                params.filter.as_ref(),
-                            ) {
-                                Ok(h) => knn_hits = h,
-                                Err(e) => tracing::error!("Vector search on remote shard failed: {}", e),
-                            }
+                    if let Some(ref knn) = search_req.knn
+                        && let Some((field_name, params)) = knn.fields.iter().next()
+                    {
+                        match engine.search_knn_filtered(
+                            field_name,
+                            &params.vector,
+                            params.k,
+                            params.filter.as_ref(),
+                        ) {
+                            Ok(h) => knn_hits = h,
+                            Err(e) => tracing::error!("Vector search on remote shard failed: {}", e),
                         }
                     }
                     Ok((hits, total, partial_aggs, knn_hits))

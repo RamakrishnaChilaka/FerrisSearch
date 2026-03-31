@@ -1218,14 +1218,25 @@ pub(crate) async fn execute_distributed_dsl_search(
 
     let local_shards = ensure_local_index_shards_open(state, index_name, &metadata, "DSL search");
 
-    for (shard_id, engine) in &local_shards {
-        let engine = engine.clone();
-        let search_req = search_req.clone();
-        let shard_id = *shard_id;
-        let search_result = state
-            .worker_pools
-            .spawn_search(move || engine.search_query(&search_req))
-            .await;
+    // Dispatch all local shard searches in parallel
+    let search_futures: Vec<_> = local_shards
+        .iter()
+        .map(|(shard_id, engine)| {
+            let engine = engine.clone();
+            let search_req = search_req.clone();
+            let shard_id = *shard_id;
+            let pools = state.worker_pools.clone();
+            async move {
+                let result = pools
+                    .spawn_search(move || engine.search_query(&search_req))
+                    .await;
+                (shard_id, result)
+            }
+        })
+        .collect();
+    let search_results = futures::future::join_all(search_futures).await;
+
+    for (shard_id, search_result) in search_results {
         match search_result {
             Ok(Ok((hits, shard_total, partial_aggs))) => {
                 successful += 1;
