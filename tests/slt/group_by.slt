@@ -240,3 +240,52 @@ SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt > 10 ORDE
 query I nosort
 SELECT count(*) FROM stories WHERE text_match(title, 'zzzznonexistent')
 ----
+
+# ── HAVING with aggregate expression (not alias) ────────────────────
+# These tests verify that HAVING COUNT(*) > N (using the raw aggregate
+# expression instead of an alias) routes to tantivy_grouped_partials,
+# not tantivy_fast_fields. This was a regression where the planner
+# only recognized alias-based HAVING (e.g. HAVING cnt > 1) but not
+# aggregate-expression HAVING (e.g. HAVING COUNT(*) > 1).
+
+# Basic: HAVING COUNT(*) > 1 (aggregate expression, no alias reference)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING COUNT(*) > 1 ORDER BY cnt DESC, author ASC
+----
+alice 3
+bob 2
+carol 2
+dave 2
+
+# HAVING AVG(upvotes) > threshold
+query TR nosort
+SELECT author, avg(upvotes) AS avg_up FROM stories GROUP BY author HAVING AVG(upvotes) > 400 ORDER BY avg_up DESC
+----
+eve 800.0
+carol 700.0
+
+# HAVING with aggregate expr + LIMIT
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING COUNT(*) > 1 ORDER BY cnt DESC, author ASC LIMIT 2
+----
+alice 3
+bob 2
+
+# Mixed: alias + aggregate expression in same HAVING
+query TIR nosort
+SELECT author, count(*) AS cnt, avg(upvotes) AS avg_up FROM stories GROUP BY author HAVING cnt > 1 AND AVG(upvotes) > 300 ORDER BY avg_up DESC
+----
+carol 2 700.0
+bob 2 400.0
+
+# HAVING with pushdown WHERE + aggregate expression
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes > 200 GROUP BY author HAVING COUNT(*) > 1 ORDER BY cnt DESC, author ASC
+----
+bob 2
+carol 2
+
+# HAVING COUNT(*) filtering everything (empty result)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING COUNT(*) > 10 ORDER BY cnt DESC
+----

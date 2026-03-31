@@ -95,9 +95,13 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 ## HAVING Support
 - `HAVING` clauses are supported in the `tantivy_grouped_partials` path as post-merge filters.
 - Simple comparisons (`>`, `>=`, `<`, `<=`, `=`) on output columns (group columns or metric aliases) are converted to `HavingFilter` structs.
+- **Both alias-based and aggregate-expression HAVING are supported**: `HAVING posts > 10` (alias) and `HAVING COUNT(*) > 10` (aggregate expression) both route correctly to `tantivy_grouped_partials`.
+- Mixed HAVING conditions (e.g., `HAVING posts > 10 AND AVG(upvotes) > 5`) are supported — each condition can independently use an alias or an aggregate expression.
+- Flipped comparisons (e.g., `HAVING 20 < COUNT(*)`) are also supported with correct operator inversion.
+- `resolve_having_name()` resolves HAVING operands: tries identifier lookup first (alias path), then matches aggregate functions against the parsed metrics list (aggregate expression path).
 - HAVING filters are applied after shard-partial merge but before sorting and LIMIT/OFFSET.
 - Multiple HAVING conditions (ANDed) are supported.
-- Complex HAVING expressions (OR, subqueries, expressions) cause fallback to the DataFusion path.
+- Complex HAVING expressions (OR, subqueries, expressions not matching a known metric) cause fallback to the DataFusion path.
 - The pipeline order in grouped partials is: merge → HAVING → top-K selection → LIMIT/OFFSET.
 
 ## GROUP BY Field Type Validation

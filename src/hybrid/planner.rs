@@ -559,7 +559,7 @@ fn extract_grouped_sql_plan(
     // Parse HAVING clause into post-merge filters
     let mut having_filters = Vec::new();
     if let Some(having_expr) = &select.having
-        && !parse_having_filters(having_expr, &valid_names, &mut having_filters)
+        && !parse_having_filters(having_expr, &valid_names, &metrics, &mut having_filters)
     {
         return Ok(None);
     }
@@ -577,6 +577,7 @@ fn extract_grouped_sql_plan(
 fn parse_having_filters(
     expr: &Expr,
     valid_names: &HashMap<String, String>,
+    metrics: &[SqlGroupedMetric],
     filters: &mut Vec<HavingFilter>,
 ) -> bool {
     match expr {
@@ -585,8 +586,8 @@ fn parse_having_filters(
             op: BinaryOperator::And,
             right,
         } => {
-            parse_having_filters(left, valid_names, filters)
-                && parse_having_filters(right, valid_names, filters)
+            parse_having_filters(left, valid_names, metrics, filters)
+                && parse_having_filters(right, valid_names, metrics, filters)
         }
         Expr::BinaryOp { left, op, right } => {
             let having_op = match op {
@@ -597,21 +598,23 @@ fn parse_having_filters(
                 BinaryOperator::Eq => HavingOp::Eq,
                 _ => return false,
             };
-            // Try field op value
-            if let (Some(name), Some(val)) = (expr_to_field_name(left), expr_to_f64(right))
-                && let Some(output_name) = valid_names.get(&name)
-            {
+            // Try field/aggregate op value
+            if let (Some(name), Some(val)) = (
+                resolve_having_name(left, valid_names, metrics),
+                expr_to_f64(right),
+            ) {
                 filters.push(HavingFilter {
-                    output_name: output_name.clone(),
+                    output_name: name,
                     op: having_op,
                     value: val,
                 });
                 return true;
             }
-            // Try value op field (flipped)
-            if let (Some(val), Some(name)) = (expr_to_f64(left), expr_to_field_name(right))
-                && let Some(output_name) = valid_names.get(&name)
-            {
+            // Try value op field/aggregate (flipped)
+            if let (Some(val), Some(name)) = (
+                expr_to_f64(left),
+                resolve_having_name(right, valid_names, metrics),
+            ) {
                 let flipped_op = match having_op {
                     HavingOp::Gt => HavingOp::Lt,
                     HavingOp::GtEq => HavingOp::LtEq,
@@ -620,7 +623,7 @@ fn parse_having_filters(
                     HavingOp::Eq => HavingOp::Eq,
                 };
                 filters.push(HavingFilter {
-                    output_name: output_name.clone(),
+                    output_name: name,
                     op: flipped_op,
                     value: val,
                 });
@@ -628,9 +631,34 @@ fn parse_having_filters(
             }
             false
         }
-        Expr::Nested(inner) => parse_having_filters(inner, valid_names, filters),
+        Expr::Nested(inner) => parse_having_filters(inner, valid_names, metrics, filters),
         _ => false,
     }
+}
+
+/// Resolve a HAVING expression to its output name.
+/// Tries identifier lookup first (e.g. `HAVING posts > 10`),
+/// then aggregate function matching (e.g. `HAVING COUNT(*) > 10`).
+fn resolve_having_name(
+    expr: &Expr,
+    valid_names: &HashMap<String, String>,
+    metrics: &[SqlGroupedMetric],
+) -> Option<String> {
+    // 1. Try simple identifier: HAVING posts > 10
+    if let Some(name) = expr_to_field_name(expr)
+        && let Some(output_name) = valid_names.get(&name)
+    {
+        return Some(output_name.clone());
+    }
+    // 2. Try aggregate function: HAVING COUNT(*) > 10
+    if let Ok(Some(parsed)) = parse_grouped_metric(expr, None) {
+        for metric in metrics {
+            if metric.function == parsed.function && metric.field == parsed.field {
+                return Some(metric.output_name.clone());
+            }
+        }
+    }
+    None
 }
 
 fn expr_to_f64(expr: &Expr) -> Option<f64> {
@@ -1521,5 +1549,100 @@ mod tests {
         assert_eq!(plan.limit, Some(20));
         let grouped = plan.grouped_sql.as_ref().unwrap();
         assert_eq!(grouped.having.len(), 1);
+    }
+
+    #[test]
+    fn having_aggregate_expr_count_star() {
+        // HAVING COUNT(*) > 20 — uses aggregate expression, not alias
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, COUNT(*) AS posts FROM idx GROUP BY author HAVING COUNT(*) > 20",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 1);
+        assert_eq!(grouped.having[0].output_name, "posts");
+        assert_eq!(grouped.having[0].value, 20.0);
+        assert!(matches!(grouped.having[0].op, super::HavingOp::Gt));
+    }
+
+    #[test]
+    fn having_aggregate_expr_avg() {
+        // HAVING AVG(upvotes) > 50 — aggregate expression, not alias
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, AVG(upvotes) AS avg_up FROM idx GROUP BY author HAVING AVG(upvotes) > 50",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 1);
+        assert_eq!(grouped.having[0].output_name, "avg_up");
+        assert_eq!(grouped.having[0].value, 50.0);
+    }
+
+    #[test]
+    fn having_aggregate_expr_with_where_and_order() {
+        // Full query from the bug report
+        let plan = plan_sql(
+            "hackernews",
+            "SELECT author, COUNT(*) AS posts, AVG(comments) AS avg_comments, AVG(upvotes) AS avg_upvotes FROM hackernews WHERE upvotes > 50 GROUP BY author HAVING COUNT(*) > 20 ORDER BY avg_comments DESC LIMIT 10",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 1);
+        assert_eq!(grouped.having[0].output_name, "posts");
+        assert_eq!(grouped.having[0].value, 20.0);
+        assert_eq!(grouped.order_by.len(), 1);
+        assert_eq!(grouped.order_by[0].output_name, "avg_comments");
+        assert!(grouped.order_by[0].desc);
+        assert_eq!(plan.limit, Some(10));
+        assert!(!plan.pushed_filters.is_empty()); // upvotes > 50 pushed to tantivy
+    }
+
+    #[test]
+    fn having_mixed_alias_and_aggregate_expr() {
+        // Mix: one condition uses alias, another uses aggregate expression
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, COUNT(*) AS posts, AVG(upvotes) AS avg_up FROM idx GROUP BY author HAVING posts > 10 AND AVG(upvotes) > 5.0",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 2);
+    }
+
+    #[test]
+    fn having_aggregate_expr_flipped() {
+        // 20 < COUNT(*) — value on the left
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, COUNT(*) AS posts FROM idx GROUP BY author HAVING 20 < COUNT(*)",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.having.len(), 1);
+        assert_eq!(grouped.having[0].output_name, "posts");
+        assert_eq!(grouped.having[0].value, 20.0);
+        // 20 < COUNT(*) flips to COUNT(*) > 20
+        assert!(matches!(grouped.having[0].op, super::HavingOp::Gt));
+    }
+
+    #[test]
+    fn computed_expression_falls_to_fast_fields() {
+        // SUM(upvotes) * 1.0 / COUNT(*) is a computed expression, not a simple aggregate.
+        // The grouped partials path cannot handle it — falls to tantivy_fast_fields + DataFusion.
+        let plan = plan_sql(
+            "hackernews",
+            "SELECT author, COUNT(*) AS posts, SUM(upvotes) * 1.0 / COUNT(*) AS upvotes_per_post FROM hackernews GROUP BY author HAVING posts >= 100 ORDER BY upvotes_per_post DESC LIMIT 20",
+        ).unwrap();
+        assert!(!plan.uses_grouped_partials());
+        assert!(!plan.selects_all_columns);
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        assert!(plan.required_columns.contains(&"upvotes".to_string()));
     }
 }
