@@ -483,28 +483,33 @@ fn format_number(n: u64) -> String {
 /// Check if a query string is an EXPLAIN query and extract the inner SQL.
 fn parse_explain(input: &str) -> Option<String> {
     let trimmed = input.trim().trim_end_matches(';').trim();
-    if trimmed.len() > 8
-        && trimmed[..7].eq_ignore_ascii_case("EXPLAIN")
-        && trimmed.as_bytes()[7].is_ascii_whitespace()
-    {
-        let inner = trimmed[7..].trim();
-        let upper = inner.to_ascii_uppercase();
-        if upper.starts_with("SELECT") {
-            return Some(inner.to_string());
-        }
-        // Handle EXPLAIN ANALYZE SELECT ...
-        if upper.starts_with("ANALYZE")
-            && inner.len() > 8
-            && inner.as_bytes()[7].is_ascii_whitespace()
-        {
-            let after_analyze = inner[7..].trim();
-            if after_analyze.to_ascii_uppercase().starts_with("SELECT") {
-                // Return just the SELECT part — the CLI always sends analyze: true
-                return Some(after_analyze.to_string());
-            }
-        }
+    // Strip leading EXPLAIN (case-insensitive) followed by whitespace
+    let after_explain = strip_keyword_ci(trimmed, "EXPLAIN")?;
+    // Could be "SELECT ..." or "ANALYZE SELECT ..."
+    if after_explain.to_ascii_uppercase().starts_with("SELECT") {
+        return Some(after_explain.to_string());
+    }
+    // Handle EXPLAIN ANALYZE SELECT ...
+    let after_analyze = strip_keyword_ci(after_explain, "ANALYZE")?;
+    if after_analyze.to_ascii_uppercase().starts_with("SELECT") {
+        // Return just the SELECT part — the CLI always sends analyze: true
+        return Some(after_analyze.to_string());
     }
     None
+}
+
+/// Strip a case-insensitive keyword prefix followed by at least one whitespace char.
+/// Returns the trimmed remainder, or None if the input doesn't start with the keyword.
+fn strip_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let len = keyword.len();
+    if input.len() > len
+        && input[..len].eq_ignore_ascii_case(keyword)
+        && input.as_bytes()[len].is_ascii_whitespace()
+    {
+        Some(input[len..].trim_start())
+    } else {
+        None
+    }
 }
 
 /// Try to extract the table name from a SELECT query for the EXPLAIN endpoint.
@@ -516,10 +521,10 @@ fn extract_table_for_explain(sql: &str) -> Option<String> {
     if after_from.starts_with('"') {
         let end = after_from.strip_prefix('"')?.find('"')?;
         Some(after_from[1..=end].to_string())
-    } else if after_from.starts_with('\'') {
+    } else if let Some(stripped) = after_from.strip_prefix('\'') {
         // Single-quoted table names (non-standard but common user mistake)
-        let end = after_from[1..].find('\'')?;
-        Some(after_from[1..=end].to_string())
+        let end = stripped.find('\'')?;
+        Some(stripped[..end].to_string())
     } else {
         let end = after_from
             .find(|c: char| c.is_whitespace() || c == ';')
@@ -732,9 +737,9 @@ fn auto_quote_table_names(sql: &str) -> String {
         }
 
         // Handle single-quoted table names: FROM 'benchmark-1gb' → FROM "benchmark-1gb"
-        if trimmed.starts_with('\'') {
-            if let Some(end_quote) = trimmed[1..].find('\'') {
-                let ident = &trimmed[1..=end_quote];
+        if let Some(after_quote) = trimmed.strip_prefix('\'') {
+            if let Some(end_quote) = after_quote.find('\'') {
+                let ident = &after_quote[..end_quote];
                 let quoted = format!("\"{}\"", ident);
                 let total_len = end_quote + 2; // includes both single quotes
                 result = format!(
@@ -1021,9 +1026,7 @@ mod tests {
     fn auto_quote_single_quoted_with_string_literal() {
         // FROM 'my-index' should be quoted; 'electronics' in WHERE should NOT be touched
         assert_eq!(
-            auto_quote_table_names(
-                "SELECT * FROM 'my-index' WHERE category = 'electronics'"
-            ),
+            auto_quote_table_names("SELECT * FROM 'my-index' WHERE category = 'electronics'"),
             "SELECT * FROM \"my-index\" WHERE category = 'electronics'"
         );
     }
@@ -1091,9 +1094,15 @@ mod tests {
         // Simulates the exact multiline query the user typed, after CLI joins lines with spaces
         let input = "EXPLAIN SELECT category, in_stock, COUNT(*) AS products, AVG(price) AS avg_price FROM 'benchmark-1gb' WHERE price > 200 GROUP BY category, in_stock ORDER BY category, in_stock";
         let quoted = auto_quote_table_names(input);
-        assert!(quoted.contains("FROM \"benchmark-1gb\""), "single quotes should become double quotes: {}", quoted);
-        let inner_sql = parse_explain(&quoted).expect("parse_explain should succeed for EXPLAIN SELECT");
-        let table = extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");
+        assert!(
+            quoted.contains("FROM \"benchmark-1gb\""),
+            "single quotes should become double quotes: {}",
+            quoted
+        );
+        let inner_sql =
+            parse_explain(&quoted).expect("parse_explain should succeed for EXPLAIN SELECT");
+        let table =
+            extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");
         assert_eq!(table, "benchmark-1gb");
     }
 
@@ -1101,9 +1110,15 @@ mod tests {
     fn e2e_exact_user_query_explain_analyze() {
         let input = "EXPLAIN ANALYZE SELECT category, in_stock, COUNT(*) AS products, AVG(price) AS avg_price FROM 'benchmark-1gb' WHERE price > 200 GROUP BY category, in_stock ORDER BY category, in_stock";
         let quoted = auto_quote_table_names(input);
-        let inner_sql = parse_explain(&quoted).expect("parse_explain should succeed for EXPLAIN ANALYZE SELECT");
-        assert!(inner_sql.starts_with("SELECT"), "should return the SELECT part, not ANALYZE: {}", inner_sql);
-        let table = extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");
+        let inner_sql = parse_explain(&quoted)
+            .expect("parse_explain should succeed for EXPLAIN ANALYZE SELECT");
+        assert!(
+            inner_sql.starts_with("SELECT"),
+            "should return the SELECT part, not ANALYZE: {}",
+            inner_sql
+        );
+        let table =
+            extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");
         assert_eq!(table, "benchmark-1gb");
     }
 }
