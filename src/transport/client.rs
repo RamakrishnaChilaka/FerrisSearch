@@ -52,10 +52,10 @@ impl TransportClient {
         }
 
         // Slow path: create new channel, then write lock to cache it
-        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}:{}", host, port))
-            .expect("valid endpoint URI")
-            .timeout(self.timeout)
-            .connect_timeout(Duration::from_secs(5));
+        let endpoint =
+            tonic::transport::Endpoint::from_shared(format!("http://{}:{}", host, port))?
+                .timeout(self.timeout)
+                .connect_timeout(Duration::from_secs(5));
         let channel = endpoint.connect().await?;
 
         {
@@ -183,13 +183,13 @@ impl TransportClient {
                 // Write directly to buffer — avoids creating intermediate serde_json::Value
                 let mut buf = Vec::with_capacity(128 + id.len());
                 buf.extend_from_slice(b"{\"_doc_id\":");
-                serde_json::to_writer(&mut buf, id).unwrap_or_default();
+                serde_json::to_writer(&mut buf, id)?;
                 buf.extend_from_slice(b",\"_source\":");
-                serde_json::to_writer(&mut buf, payload).unwrap_or_default();
+                serde_json::to_writer(&mut buf, payload)?;
                 buf.push(b'}');
-                buf
+                Ok::<Vec<u8>, serde_json::Error>(buf)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         let request = tonic::Request::new(ShardBulkRequest {
             index_name: index_name.to_string(),
             shard_id,
@@ -278,11 +278,7 @@ impl TransportClient {
         });
         let response = client.search_shard(request).await?.into_inner();
         if response.success {
-            Ok(response
-                .hits
-                .iter()
-                .filter_map(|h| serde_json::from_slice(&h.source_json).ok())
-                .collect())
+            decode_search_hits(&response.hits)
         } else {
             Err(anyhow::anyhow!("Shard search failed: {}", response.error))
         }
@@ -311,15 +307,11 @@ impl TransportClient {
         });
         let response = client.search_shard_dsl(request).await?.into_inner();
         if response.success {
-            let hits: Vec<serde_json::Value> = response
-                .hits
-                .iter()
-                .filter_map(|h| serde_json::from_slice(&h.source_json).ok())
-                .collect();
+            let hits = decode_search_hits(&response.hits)?;
             let partial_aggs = if response.partial_aggs_json.is_empty() {
                 std::collections::HashMap::new()
             } else {
-                crate::search::decode_partial_aggs(&response.partial_aggs_json).unwrap_or_default()
+                crate::search::decode_partial_aggs(&response.partial_aggs_json)?
             };
             Ok((hits, response.total_hits as usize, partial_aggs))
         } else {
@@ -421,15 +413,17 @@ impl TransportClient {
         let ops: Vec<ReplicateDocRequest> = docs
             .iter()
             .enumerate()
-            .map(|(i, (id, payload))| ReplicateDocRequest {
-                index_name: index_name.to_string(),
-                shard_id,
-                doc_id: id.clone(),
-                payload_json: serde_json::to_vec(payload).unwrap_or_default(),
-                op: "index".to_string(),
-                seq_no: start_seq_no + i as u64,
+            .map(|(i, (id, payload))| {
+                Ok::<ReplicateDocRequest, serde_json::Error>(ReplicateDocRequest {
+                    index_name: index_name.to_string(),
+                    shard_id,
+                    doc_id: id.clone(),
+                    payload_json: serde_json::to_vec(payload)?,
+                    op: "index".to_string(),
+                    seq_no: start_seq_no + i as u64,
+                })
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         let request = tonic::Request::new(ReplicateBulkRequest {
             index_name: index_name.to_string(),
             shard_id,
@@ -645,6 +639,12 @@ impl TransportClient {
     }
 }
 
+fn decode_search_hits(hits: &[SearchHit]) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+    hits.iter()
+        .map(|hit| serde_json::from_slice(&hit.source_json).map_err(anyhow::Error::from))
+        .collect()
+}
+
 /// Result of a recovery request from the primary.
 pub struct RecoveryResult {
     pub ops_replayed: u64,
@@ -756,6 +756,17 @@ mod tests {
         };
         let result = client.forward_delete_index(&master, "test-idx").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_search_hits_returns_error_on_malformed_payload() {
+        let err = decode_search_hits(&[SearchHit {
+            source_json: b"not-json".to_vec(),
+        }])
+        .expect_err("malformed payload should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("expected") || message.contains("EOF"));
     }
 
     #[tokio::test]

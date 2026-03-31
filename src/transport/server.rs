@@ -547,11 +547,15 @@ impl InternalTransport for TransportService {
         };
 
         match doc_result {
-            Ok(Some(source)) => Ok(Response::new(ShardGetResponse {
-                found: true,
-                source_json: serde_json::to_vec(&source).unwrap_or_default(),
-                error: String::new(),
-            })),
+            Ok(Some(source)) => {
+                let source_json = serde_json::to_vec(&source)
+                    .map_err(|e| Status::internal(format!("serialize get_doc response: {}", e)))?;
+                Ok(Response::new(ShardGetResponse {
+                    found: true,
+                    source_json,
+                    error: String::new(),
+                }))
+            }
             Ok(None) => Ok(Response::new(ShardGetResponse {
                 found: false,
                 source_json: vec![],
@@ -593,18 +597,24 @@ impl InternalTransport for TransportService {
         };
 
         match search_result {
-            Ok(hits) => Ok(Response::new(ShardSearchResponse {
-                success: true,
-                hits: hits
+            Ok(hits) => {
+                let hits = hits
                     .into_iter()
-                    .map(|v| SearchHit {
-                        source_json: serde_json::to_vec(&v).unwrap_or_default(),
+                    .map(|v| {
+                        Ok::<SearchHit, serde_json::Error>(SearchHit {
+                            source_json: serde_json::to_vec(&v)?,
+                        })
                     })
-                    .collect(),
-                error: String::new(),
-                total_hits: 0,
-                partial_aggs_json: vec![],
-            })),
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Status::internal(format!("serialize search hit: {}", e)))?;
+                Ok(Response::new(ShardSearchResponse {
+                    success: true,
+                    hits,
+                    error: String::new(),
+                    total_hits: 0,
+                    partial_aggs_json: vec![],
+                }))
+            }
             Err(e) => Ok(Response::new(ShardSearchResponse {
                 success: false,
                 hits: vec![],
@@ -677,17 +687,23 @@ impl InternalTransport for TransportService {
                 let aggs_json = if partial_aggs.is_empty() {
                     vec![]
                 } else {
-                    crate::search::encode_partial_aggs(&partial_aggs).unwrap_or_default()
+                    crate::search::encode_partial_aggs(&partial_aggs)
+                        .map_err(|e| Status::internal(format!("encode partial aggs: {}", e)))?
                 };
+
+                let hits = all_hits
+                    .into_iter()
+                    .map(|v| {
+                        Ok::<SearchHit, serde_json::Error>(SearchHit {
+                            source_json: serde_json::to_vec(&v)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Status::internal(format!("serialize search hit: {}", e)))?;
 
                 Ok(Response::new(ShardSearchResponse {
                     success: true,
-                    hits: all_hits
-                        .into_iter()
-                        .map(|v| SearchHit {
-                            source_json: serde_json::to_vec(&v).unwrap_or_default(),
-                        })
-                        .collect(),
+                    hits,
                     error: String::new(),
                     total_hits: total_hits as u64,
                     partial_aggs_json: aggs_json,
@@ -956,14 +972,15 @@ impl InternalTransport for TransportService {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                RecoverReplicaOp {
+                Ok::<RecoverReplicaOp, serde_json::Error>(RecoverReplicaOp {
                     seq_no: e.seq_no,
                     op: e.op.clone(),
                     doc_id,
-                    payload_json: serde_json::to_vec(&e.payload).unwrap_or_default(),
-                }
+                    payload_json: serde_json::to_vec(&e.payload)?,
+                })
             })
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|e| Status::internal(format!("serialize recovery op: {}", e)))?;
 
         Ok(Response::new(RecoverReplicaResponse {
             success: true,
@@ -1182,7 +1199,7 @@ impl InternalTransport for TransportService {
             "shards_acknowledged": true,
             "index": index_name
         }))
-        .unwrap_or_default();
+        .map_err(|e| Status::internal(format!("serialize create index response: {}", e)))?;
 
         tracing::info!(
             "gRPC: created index '{}' with {} shards, {} replicas",
@@ -1428,15 +1445,24 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
         let payload: serde_json::Value = serde_json::from_slice(&request.into_inner().data)
             .map_err(|e| Status::invalid_argument(format!("bad snapshot request: {}", e)))?;
-        let vote: crate::consensus::types::Vote =
-            serde_json::from_value(payload.get("vote").cloned().unwrap_or_default())
-                .map_err(|e| Status::invalid_argument(format!("bad vote in snapshot: {}", e)))?;
-        let meta: crate::consensus::types::SnapshotMeta =
-            serde_json::from_value(payload.get("meta").cloned().unwrap_or_default())
-                .map_err(|e| Status::invalid_argument(format!("bad meta in snapshot: {}", e)))?;
-        let data: Vec<u8> =
-            serde_json::from_value(payload.get("data").cloned().unwrap_or_default())
-                .map_err(|e| Status::invalid_argument(format!("bad data in snapshot: {}", e)))?;
+        let vote_value = payload
+            .get("vote")
+            .cloned()
+            .ok_or_else(|| Status::invalid_argument("bad snapshot request: missing vote"))?;
+        let meta_value = payload
+            .get("meta")
+            .cloned()
+            .ok_or_else(|| Status::invalid_argument("bad snapshot request: missing meta"))?;
+        let data_value = payload
+            .get("data")
+            .cloned()
+            .ok_or_else(|| Status::invalid_argument("bad snapshot request: missing data"))?;
+        let vote: crate::consensus::types::Vote = serde_json::from_value(vote_value)
+            .map_err(|e| Status::invalid_argument(format!("bad vote in snapshot: {}", e)))?;
+        let meta: crate::consensus::types::SnapshotMeta = serde_json::from_value(meta_value)
+            .map_err(|e| Status::invalid_argument(format!("bad meta in snapshot: {}", e)))?;
+        let data: Vec<u8> = serde_json::from_value(data_value)
+            .map_err(|e| Status::invalid_argument(format!("bad data in snapshot: {}", e)))?;
         let snapshot = crate::consensus::types::Snapshot {
             meta,
             snapshot: std::io::Cursor::new(data),
@@ -1501,12 +1527,24 @@ impl TransportService {
             return Ok(e);
         }
         let cs = self.cluster_manager.get_state();
-        let metadata = cs.indices.get(index_name);
-        let mappings = metadata.map(|m| m.mappings.clone()).unwrap_or_default();
-        let settings = metadata.map(|m| m.settings.clone()).unwrap_or_default();
-        let uuid = metadata.map(|m| m.uuid.as_str()).unwrap_or("");
+        let Some(metadata) = cs.indices.get(index_name) else {
+            return Err(Status::not_found(format!(
+                "Shard [{index_name}][{shard_id}] not found on this node"
+            )));
+        };
+        if !metadata.shard_routing.contains_key(&shard_id) {
+            return Err(Status::not_found(format!(
+                "Shard [{index_name}][{shard_id}] not found on this node"
+            )));
+        }
         self.shard_manager
-            .open_shard_with_settings(index_name, shard_id, &mappings, &settings, uuid)
+            .open_shard_with_settings(
+                index_name,
+                shard_id,
+                &metadata.mappings,
+                &metadata.settings,
+                &metadata.uuid,
+            )
             .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
     }
 
@@ -2062,6 +2100,26 @@ mod tests {
 
         let err = match service.get_or_open_search_shard("missing-idx", 99) {
             Ok(_) => panic!("unknown shard should not be opened"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(err.message().contains("not found"));
+    }
+
+    #[test]
+    fn get_or_open_shard_returns_not_found_for_unknown_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = TransportService {
+            cluster_manager: Arc::new(ClusterManager::new("missing-unit".into())),
+            shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+            transport_client: crate::transport::TransportClient::new(),
+            raft: None,
+            local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+        };
+
+        let err = match service.get_or_open_shard("missing-idx", 99) {
+            Ok(_) => panic!("unknown write shard should not be opened"),
             Err(err) => err,
         };
         assert_eq!(err.code(), tonic::Code::NotFound);
