@@ -77,6 +77,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **join_cluster MUST forward on followers**: A follower receiving a JoinCluster RPC must forward it to the Raft leader. It must NEVER fall through to `cluster_manager.add_node()` when Raft is active, as this would add the node to local state without Raft membership.
 - **Shard writes MUST fail on replication failure**: The `index_doc`, `bulk_index`, and `delete_doc` handlers must return `success: false` when `replicate_write()` / `replicate_bulk()` returns `Err`. Logging the error and returning `success: true` violates the synchronous replication contract.
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc`, `replicate_bulk`, and recovery replay must call the explicit-seq engine methods. Do not route replicated writes through local seq allocation APIs.
+- **Write-side shard reopen MUST validate metadata**: `get_or_open_shard()` must return `NOT_FOUND` when the index or shard is absent from cluster state. It must NEVER create a shard with empty mappings/default settings on write or replication paths.
+- **Transport serialization must fail loudly**: gRPC handlers and clients must not use `unwrap_or_default()` for protocol payloads (`source_json`, `payload_json`, `partial_aggs_json`, Raft snapshot fields). Serialization or decode failures must surface as RPC errors, not empty payloads or silently dropped hits.
+- **Raft snapshot RPCs must require all fields**: missing `vote`, `meta`, or `data` in `RaftSnapshot` is `INVALID_ARGUMENT`, not a defaulted empty snapshot.
 
 ## TransportClient (src/transport/client.rs)
 ```rust
@@ -110,6 +113,11 @@ pub struct TransportClient {
 
 ### Critical Invariant: Shard Forwarding Must Propagate Errors
 `forward_index_to_shard()` and `forward_bulk_to_shard()` MUST return `Err(...)` when the shard RPC returns `success: false`. Never wrap a shard failure in `Ok(json!({"error": ...}))` — this hides failures from API handlers, causing them to return HTTP 201 for failed writes.
+
+### Critical Invariant: Remote Search Decode Must Not Drop Data
+- `forward_search_to_shard()` and `forward_search_dsl_to_shard()` must fail if a remote hit payload cannot be decoded.
+- Do not use `filter_map(...ok())` on transport hits — returning partial results as success hides wire-format and compatibility bugs.
+- Partial aggregation decode failures must also return `Err(...)`, not an empty aggregation map.
 
 ### gRPC Limits
 - **Max message size**: 64MB (`max_decoding_message_size` / `max_encoding_message_size`) on both client and server. Default tonic limit is 4MB, insufficient for high-cardinality GROUP BY partial results (~7MB for 200K groups).

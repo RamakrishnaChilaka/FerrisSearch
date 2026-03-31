@@ -7,6 +7,7 @@ use axum::{
 use futures::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 /// GET/POST /{index}/_count — Count documents matching a query.
@@ -126,8 +127,7 @@ async fn count_docs_from_metadata(
         metadata,
         "count_fast",
     );
-    let local_shard_ids: std::collections::HashSet<u32> =
-        local_shards.iter().map(|(id, _)| *id).collect();
+    let local_shard_ids: HashSet<u32> = local_shards.iter().map(|(id, _)| *id).collect();
 
     let mut count: u64 = 0;
     let mut successful: u32 = 0;
@@ -139,37 +139,59 @@ async fn count_docs_from_metadata(
     }
 
     let mut remote_handles = Vec::new();
-    for (shard_id, routing) in &metadata.shard_routing {
-        if local_shard_ids.contains(shard_id) {
-            continue;
-        }
-        if let Some(node) = cluster_state.nodes.get(&routing.primary) {
-            let client = state.transport_client.clone();
-            let node = node.clone();
-            let idx = index_name.to_string();
-            let sid = *shard_id;
-            remote_handles.push(tokio::spawn(async move {
-                client
-                    .get_shard_stats(&node)
-                    .await
-                    .map(|stats| stats.get(&(idx, sid)).copied().unwrap_or(0))
-            }));
-        }
+    for (node, shard_ids) in remote_count_targets(&cluster_state, metadata, &local_shard_ids) {
+        let client = state.transport_client.clone();
+        let idx = index_name.to_string();
+        let num_shards = shard_ids.len() as u32;
+        remote_handles.push(tokio::spawn(async move {
+            let result = client.get_shard_stats(&node).await.map(|stats| {
+                shard_ids
+                    .into_iter()
+                    .map(|shard_id| stats.get(&(idx.clone(), shard_id)).copied().unwrap_or(0))
+                    .sum::<u64>()
+            });
+            (result, num_shards)
+        }));
     }
 
     for handle in remote_handles {
         match handle.await {
-            Ok(Ok(remote_count)) => {
+            Ok((Ok(remote_count), num_shards)) => {
                 count += remote_count;
-                successful += 1;
+                successful += num_shards;
             }
-            _ => {
+            Ok((Err(_), num_shards)) => {
+                failed += num_shards;
+            }
+            Err(_) => {
                 failed += 1;
             }
         }
     }
 
     (count, successful, failed)
+}
+
+fn remote_count_targets(
+    cluster_state: &crate::cluster::state::ClusterState,
+    metadata: &crate::cluster::state::IndexMetadata,
+    local_shard_ids: &HashSet<u32>,
+) -> Vec<(crate::cluster::state::NodeInfo, Vec<u32>)> {
+    let mut per_node: HashMap<String, (crate::cluster::state::NodeInfo, Vec<u32>)> = HashMap::new();
+
+    for (shard_id, routing) in &metadata.shard_routing {
+        if local_shard_ids.contains(shard_id) {
+            continue;
+        }
+        if let Some(node) = cluster_state.nodes.get(&routing.primary) {
+            let entry = per_node
+                .entry(node.id.clone())
+                .or_insert_with(|| (node.clone(), Vec::new()));
+            entry.1.push(*shard_id);
+        }
+    }
+
+    per_node.into_values().collect()
 }
 
 #[derive(Deserialize)]
@@ -396,7 +418,17 @@ pub async fn explain_sql(
     match execute_sql_query(&state, &index_name, &req.query).await {
         Ok(result) => {
             let mut explain = result.plan.to_explain_json();
-            explain["timings"] = serde_json::to_value(&result.timings).unwrap();
+            let timings = match serde_json::to_value(&result.timings) {
+                Ok(timings) => timings,
+                Err(err) => {
+                    return crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "serialization_exception",
+                        format!("Failed to serialize timings: {}", err),
+                    );
+                }
+            };
+            explain["timings"] = timings;
             explain["execution_mode"] = serde_json::json!(result.execution_mode);
             explain["matched_hits"] = serde_json::json!(result.matched_hits);
             explain["row_count"] = serde_json::json!(result.sql_result.rows.len());
@@ -494,7 +526,13 @@ async fn execute_sql_query(
             count_docs_from_metadata(state, index_name, &metadata).await;
         let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
-        let grouped_sql = plan.grouped_sql.as_ref().unwrap();
+        let Some(grouped_sql) = plan.grouped_sql.as_ref() else {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "planning_exception",
+                "count_star_fast selected without grouped SQL metadata",
+            ));
+        };
         let columns: Vec<String> = grouped_sql
             .metrics
             .iter()
@@ -1134,9 +1172,26 @@ mod tests {
     };
     use axum::extract::{Path, State};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
+
+    fn sorted_remote_targets(
+        cluster_state: &ClusterState,
+        metadata: &IndexMetadata,
+        local_shard_ids: &HashSet<u32>,
+    ) -> Vec<(String, Vec<u32>)> {
+        let mut targets: Vec<_> =
+            super::remote_count_targets(cluster_state, metadata, local_shard_ids)
+                .into_iter()
+                .map(|(node, mut shard_ids)| {
+                    shard_ids.sort_unstable();
+                    (node.id, shard_ids)
+                })
+                .collect();
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
+        targets
+    }
 
     fn make_test_node(id: &str) -> NodeInfo {
         NodeInfo {
@@ -1713,5 +1768,50 @@ mod tests {
         .await;
 
         assert_eq!(status2, StatusCode::OK, "keyword fields should work");
+    }
+
+    #[test]
+    fn remote_count_targets_groups_shards_per_node() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        cluster_state.add_node(make_test_node("node-2"));
+        cluster_state.add_node(make_test_node("node-3"));
+
+        let mut metadata = make_sql_metadata("products");
+        metadata.shard_routing.insert(
+            1,
+            ShardRoutingEntry {
+                primary: "node-2".to_string(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        metadata.shard_routing.insert(
+            2,
+            ShardRoutingEntry {
+                primary: "node-2".to_string(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        metadata.shard_routing.insert(
+            3,
+            ShardRoutingEntry {
+                primary: "node-3".to_string(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+
+        let local_shard_ids = HashSet::from([0u32]);
+        let targets = sorted_remote_targets(&cluster_state, &metadata, &local_shard_ids);
+
+        assert_eq!(
+            targets,
+            vec![
+                ("node-2".to_string(), vec![1, 2]),
+                ("node-3".to_string(), vec![3]),
+            ]
+        );
     }
 }

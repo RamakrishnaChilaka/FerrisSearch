@@ -488,8 +488,20 @@ fn parse_explain(input: &str) -> Option<String> {
         && trimmed.as_bytes()[7].is_ascii_whitespace()
     {
         let inner = trimmed[7..].trim();
-        if inner.to_ascii_uppercase().starts_with("SELECT") {
+        let upper = inner.to_ascii_uppercase();
+        if upper.starts_with("SELECT") {
             return Some(inner.to_string());
+        }
+        // Handle EXPLAIN ANALYZE SELECT ...
+        if upper.starts_with("ANALYZE")
+            && inner.len() > 8
+            && inner.as_bytes()[7].is_ascii_whitespace()
+        {
+            let after_analyze = inner[7..].trim();
+            if after_analyze.to_ascii_uppercase().starts_with("SELECT") {
+                // Return just the SELECT part — the CLI always sends analyze: true
+                return Some(after_analyze.to_string());
+            }
         }
     }
     None
@@ -503,6 +515,10 @@ fn extract_table_for_explain(sql: &str) -> Option<String> {
     // Handle quoted and unquoted table names
     if after_from.starts_with('"') {
         let end = after_from.strip_prefix('"')?.find('"')?;
+        Some(after_from[1..=end].to_string())
+    } else if after_from.starts_with('\'') {
+        // Single-quoted table names (non-standard but common user mistake)
+        let end = after_from[1..].find('\'')?;
         Some(after_from[1..=end].to_string())
     } else {
         let end = after_from
@@ -694,21 +710,43 @@ fn is_instant_command(input: &str) -> bool {
 /// doesn't interpret them as subtraction (e.g. `FROM nyc-taxis` → `FROM "nyc-taxis"`).
 fn auto_quote_table_names(sql: &str) -> String {
     // Regex-free approach: find FROM followed by an unquoted identifier with a hyphen
-    let upper = sql.to_ascii_uppercase();
     let mut result = sql.to_string();
 
     // Find all FROM occurrences
     let mut search_from = 0;
-    while let Some(from_pos) = upper[search_from..].find("FROM ") {
+    loop {
+        let upper = result.to_ascii_uppercase();
+        let Some(from_pos) = upper[search_from..].find("FROM ") else {
+            break;
+        };
         let abs_pos = search_from + from_pos + 5; // skip "FROM "
-        let rest = &sql[abs_pos..];
+        let rest = &result[abs_pos..];
         let trimmed = rest.trim_start();
         let skip = rest.len() - trimmed.len();
         let start = abs_pos + skip;
 
-        // If already quoted, skip
+        // If already double-quoted, skip
         if trimmed.starts_with('"') || trimmed.starts_with('`') {
             search_from = start + 1;
+            continue;
+        }
+
+        // Handle single-quoted table names: FROM 'benchmark-1gb' → FROM "benchmark-1gb"
+        if trimmed.starts_with('\'') {
+            if let Some(end_quote) = trimmed[1..].find('\'') {
+                let ident = &trimmed[1..=end_quote];
+                let quoted = format!("\"{}\"", ident);
+                let total_len = end_quote + 2; // includes both single quotes
+                result = format!(
+                    "{}{}{}",
+                    &result[..start],
+                    quoted,
+                    &result[start + total_len..]
+                );
+                search_from = start + quoted.len();
+            } else {
+                search_from = start + 1;
+            }
             continue;
         }
 
@@ -794,5 +832,278 @@ async fn main() -> Result<()> {
         run_single_command(&client, &command).await
     } else {
         run_interactive(&client).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_explain ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_explain_select() {
+        let result = parse_explain("EXPLAIN SELECT * FROM test");
+        assert_eq!(result, Some("SELECT * FROM test".to_string()));
+    }
+
+    #[test]
+    fn parse_explain_analyze_select() {
+        let result = parse_explain("EXPLAIN ANALYZE SELECT author FROM hackernews");
+        assert_eq!(result, Some("SELECT author FROM hackernews".to_string()));
+    }
+
+    #[test]
+    fn parse_explain_analyze_case_insensitive() {
+        let result = parse_explain("explain analyze SELECT count(*) FROM idx");
+        assert_eq!(result, Some("SELECT count(*) FROM idx".to_string()));
+    }
+
+    #[test]
+    fn parse_explain_analyze_with_trailing_semicolon() {
+        let result = parse_explain("EXPLAIN ANALYZE SELECT 1 FROM t;");
+        assert_eq!(result, Some("SELECT 1 FROM t".to_string()));
+    }
+
+    #[test]
+    fn parse_explain_analyze_multiline_joined() {
+        // The CLI joins multiline input with spaces — simulate the exact user query
+        let query = "EXPLAIN SELECT category, in_stock, COUNT(*) AS products, AVG(price) AS avg_price FROM \"benchmark-1gb\" WHERE price > 200 GROUP BY category, in_stock ORDER BY category, in_stock";
+        let result = parse_explain(query);
+        assert!(result.is_some());
+        let inner = result.unwrap();
+        assert!(inner.starts_with("SELECT category"));
+        assert!(inner.contains("FROM \"benchmark-1gb\""));
+    }
+
+    #[test]
+    fn parse_explain_analyze_multiline_joined_with_analyze() {
+        let query = "EXPLAIN ANALYZE SELECT category, in_stock, COUNT(*) AS products FROM \"benchmark-1gb\" WHERE price > 200 GROUP BY category, in_stock";
+        let result = parse_explain(query);
+        assert!(result.is_some());
+        let inner = result.unwrap();
+        assert!(inner.starts_with("SELECT category"));
+        assert!(!inner.contains("ANALYZE"));
+    }
+
+    #[test]
+    fn parse_explain_rejects_non_select() {
+        assert!(parse_explain("EXPLAIN DROP TABLE foo").is_none());
+    }
+
+    #[test]
+    fn parse_explain_analyze_rejects_non_select() {
+        assert!(parse_explain("EXPLAIN ANALYZE DROP TABLE foo").is_none());
+    }
+
+    #[test]
+    fn parse_explain_plain_select_not_matched() {
+        assert!(parse_explain("SELECT * FROM test").is_none());
+    }
+
+    #[test]
+    fn parse_explain_analyze_alone() {
+        // "EXPLAIN ANALYZE" with nothing after it
+        assert!(parse_explain("EXPLAIN ANALYZE").is_none());
+    }
+
+    #[test]
+    fn parse_explain_extra_whitespace() {
+        let result = parse_explain("  EXPLAIN   ANALYZE   SELECT 1 FROM t  ;  ");
+        assert_eq!(result, Some("SELECT 1 FROM t".to_string()));
+    }
+
+    // ── extract_table_for_explain ──────────────────────────────────
+
+    #[test]
+    fn extract_table_unquoted() {
+        assert_eq!(
+            extract_table_for_explain("SELECT * FROM movies WHERE x > 1"),
+            Some("movies".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_double_quoted() {
+        assert_eq!(
+            extract_table_for_explain("SELECT * FROM \"benchmark-1gb\" WHERE x > 1"),
+            Some("benchmark-1gb".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_single_quoted() {
+        assert_eq!(
+            extract_table_for_explain("SELECT * FROM 'benchmark-1gb' WHERE x > 1"),
+            Some("benchmark-1gb".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_no_from() {
+        assert!(extract_table_for_explain("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn extract_table_trailing_no_where() {
+        assert_eq!(
+            extract_table_for_explain("SELECT count(*) FROM hackernews"),
+            Some("hackernews".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_single_quoted_no_hyphen() {
+        assert_eq!(
+            extract_table_for_explain("SELECT * FROM 'movies'"),
+            Some("movies".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_ignores_string_literal_from() {
+        // Should find the real FROM, not "from" inside a string literal
+        assert_eq!(
+            extract_table_for_explain("SELECT title FROM hackernews WHERE title = 'from 2024'"),
+            Some("hackernews".to_string())
+        );
+    }
+
+    // ── auto_quote_table_names ─────────────────────────────────────
+
+    #[test]
+    fn auto_quote_hyphenated_unquoted() {
+        assert_eq!(
+            auto_quote_table_names("SELECT * FROM benchmark-1gb"),
+            "SELECT * FROM \"benchmark-1gb\""
+        );
+    }
+
+    #[test]
+    fn auto_quote_single_quoted_hyphen() {
+        assert_eq!(
+            auto_quote_table_names("SELECT * FROM 'benchmark-1gb' WHERE x > 1"),
+            "SELECT * FROM \"benchmark-1gb\" WHERE x > 1"
+        );
+    }
+
+    #[test]
+    fn auto_quote_single_quoted_no_hyphen() {
+        assert_eq!(
+            auto_quote_table_names("SELECT * FROM 'movies' WHERE x > 1"),
+            "SELECT * FROM \"movies\" WHERE x > 1"
+        );
+    }
+
+    #[test]
+    fn auto_quote_already_double_quoted() {
+        let input = "SELECT * FROM \"benchmark-1gb\" WHERE x > 1";
+        assert_eq!(auto_quote_table_names(input), input);
+    }
+
+    #[test]
+    fn auto_quote_no_hyphen_unquoted() {
+        let input = "SELECT * FROM movies WHERE x > 1";
+        assert_eq!(auto_quote_table_names(input), input);
+    }
+
+    #[test]
+    fn auto_quote_explain_analyze_single_quoted() {
+        assert_eq!(
+            auto_quote_table_names(
+                "EXPLAIN ANALYZE SELECT * FROM 'benchmark-1gb' WHERE price > 200"
+            ),
+            "EXPLAIN ANALYZE SELECT * FROM \"benchmark-1gb\" WHERE price > 200"
+        );
+    }
+
+    #[test]
+    fn auto_quote_single_quoted_with_string_literal() {
+        // FROM 'my-index' should be quoted; 'electronics' in WHERE should NOT be touched
+        assert_eq!(
+            auto_quote_table_names(
+                "SELECT * FROM 'my-index' WHERE category = 'electronics'"
+            ),
+            "SELECT * FROM \"my-index\" WHERE category = 'electronics'"
+        );
+    }
+
+    #[test]
+    fn auto_quote_double_space_after_from() {
+        assert_eq!(
+            auto_quote_table_names("SELECT * FROM  'my-index' WHERE x = 1"),
+            "SELECT * FROM  \"my-index\" WHERE x = 1"
+        );
+    }
+
+    // ── End-to-end: auto_quote → parse_explain → extract_table ────
+
+    #[test]
+    fn e2e_explain_single_quoted_hyphen() {
+        let input = "EXPLAIN SELECT category, COUNT(*) FROM 'benchmark-1gb' WHERE price > 200 GROUP BY category";
+        let quoted = auto_quote_table_names(input);
+        let inner_sql = parse_explain(&quoted).expect("parse_explain should succeed");
+        let table = extract_table_for_explain(&inner_sql).expect("extract_table should succeed");
+        assert_eq!(table, "benchmark-1gb");
+    }
+
+    #[test]
+    fn e2e_explain_analyze_single_quoted_hyphen() {
+        let input = "EXPLAIN ANALYZE SELECT category, COUNT(*) FROM 'benchmark-1gb' WHERE price > 200 GROUP BY category";
+        let quoted = auto_quote_table_names(input);
+        let inner_sql = parse_explain(&quoted).expect("parse_explain should succeed");
+        let table = extract_table_for_explain(&inner_sql).expect("extract_table should succeed");
+        assert_eq!(table, "benchmark-1gb");
+        assert!(inner_sql.starts_with("SELECT"));
+    }
+
+    #[test]
+    fn e2e_explain_double_quoted_hyphen() {
+        let input = "EXPLAIN SELECT * FROM \"benchmark-1gb\" WHERE price > 200";
+        let quoted = auto_quote_table_names(input);
+        assert_eq!(quoted, input); // already quoted, no change
+        let inner_sql = parse_explain(&quoted).expect("parse_explain should succeed");
+        let table = extract_table_for_explain(&inner_sql).expect("extract_table should succeed");
+        assert_eq!(table, "benchmark-1gb");
+    }
+
+    #[test]
+    fn e2e_explain_analyze_double_quoted() {
+        let input = "EXPLAIN ANALYZE SELECT * FROM \"benchmark-1gb\"";
+        let quoted = auto_quote_table_names(input);
+        let inner_sql = parse_explain(&quoted).expect("parse_explain should succeed");
+        let table = extract_table_for_explain(&inner_sql).expect("extract_table should succeed");
+        assert_eq!(table, "benchmark-1gb");
+    }
+
+    #[test]
+    fn e2e_explain_unquoted_no_hyphen() {
+        let input = "EXPLAIN SELECT * FROM hackernews WHERE title = 'rust'";
+        let quoted = auto_quote_table_names(input);
+        assert_eq!(quoted, input); // no hyphen, no change
+        let inner_sql = parse_explain(&quoted).unwrap();
+        let table = extract_table_for_explain(&inner_sql).unwrap();
+        assert_eq!(table, "hackernews");
+    }
+
+    #[test]
+    fn e2e_exact_user_query() {
+        // Simulates the exact multiline query the user typed, after CLI joins lines with spaces
+        let input = "EXPLAIN SELECT category, in_stock, COUNT(*) AS products, AVG(price) AS avg_price FROM 'benchmark-1gb' WHERE price > 200 GROUP BY category, in_stock ORDER BY category, in_stock";
+        let quoted = auto_quote_table_names(input);
+        assert!(quoted.contains("FROM \"benchmark-1gb\""), "single quotes should become double quotes: {}", quoted);
+        let inner_sql = parse_explain(&quoted).expect("parse_explain should succeed for EXPLAIN SELECT");
+        let table = extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");
+        assert_eq!(table, "benchmark-1gb");
+    }
+
+    #[test]
+    fn e2e_exact_user_query_explain_analyze() {
+        let input = "EXPLAIN ANALYZE SELECT category, in_stock, COUNT(*) AS products, AVG(price) AS avg_price FROM 'benchmark-1gb' WHERE price > 200 GROUP BY category, in_stock ORDER BY category, in_stock";
+        let quoted = auto_quote_table_names(input);
+        let inner_sql = parse_explain(&quoted).expect("parse_explain should succeed for EXPLAIN ANALYZE SELECT");
+        assert!(inner_sql.starts_with("SELECT"), "should return the SELECT part, not ANALYZE: {}", inner_sql);
+        let table = extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");
+        assert_eq!(table, "benchmark-1gb");
     }
 }

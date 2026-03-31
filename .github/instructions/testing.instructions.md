@@ -1,12 +1,12 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **604 unit tests** (`cargo test --lib`)
+- **607 unit tests** (`cargo test --lib`)
 - **30 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
 - **17 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **15 SQL correctness tests** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 46 assertions across 2 files
-- **705 total** (`cargo test`)
+- **708 total** (`cargo test`)
 
 ## Running Tests
 ```bash
