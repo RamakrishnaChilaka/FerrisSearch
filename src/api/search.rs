@@ -569,17 +569,17 @@ async fn execute_sql_query(
         // Text fields are analyzed/tokenized and don't have fast-field columnar storage.
         if let Some(grouped) = &plan.grouped_sql {
             for col in &grouped.group_columns {
-                if let Some(mapping) = metadata.mappings.get(&col.source_name) {
-                    if matches!(mapping.field_type, crate::cluster::state::FieldType::Text) {
-                        return Err(crate::api::error_response(
-                            StatusCode::BAD_REQUEST,
-                            "group_by_text_field_exception",
-                            format!(
-                                "Cannot GROUP BY field '{}': text fields are tokenized and don't support grouping. Use a 'keyword' type field instead.",
-                                col.source_name
-                            ),
-                        ));
-                    }
+                if let Some(mapping) = metadata.mappings.get(&col.source_name)
+                    && matches!(mapping.field_type, crate::cluster::state::FieldType::Text)
+                {
+                    return Err(crate::api::error_response(
+                        StatusCode::BAD_REQUEST,
+                        "group_by_text_field_exception",
+                        format!(
+                            "Cannot GROUP BY field '{}': text fields are tokenized and don't support grouping. Use a 'keyword' type field instead.",
+                            col.source_name
+                        ),
+                    ));
                 }
             }
         }
