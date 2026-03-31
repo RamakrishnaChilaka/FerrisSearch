@@ -1000,6 +1000,25 @@ fn open_num_col(
     }
 }
 
+/// Identity hasher for u64 ordinal keys — ordinals are already well-distributed
+/// dictionary indices, so hashing them is wasted work. This eliminates hash
+/// computation overhead in the per-doc GROUP BY hot path.
+#[derive(Default)]
+struct OrdHasher(u64);
+
+impl std::hash::Hasher for OrdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _bytes: &[u8]) {}
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+}
+
+type OrdBuildHasher = std::hash::BuildHasherDefault<OrdHasher>;
+type OrdHashMap<V> = std::collections::HashMap<u64, V, OrdBuildHasher>;
+
 enum SqlFieldReader {
     F64(tantivy::columnar::Column<f64>),
     I64(tantivy::columnar::Column<i64>),
@@ -1077,11 +1096,11 @@ fn open_group_key_reader(
         tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::U64(_) => {
             fast_fields.i64(entry.name()).ok().map(GroupKeyReader::I64)
         }
-        tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::Bytes(_) => fast_fields
-            .str(entry.name())
-            .ok()
-            .flatten()
-            .map(GroupKeyReader::Str),
+        tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::Bytes(_) => {
+            let str_col = fast_fields.str(entry.name()).ok().flatten()?;
+            let ord_col = str_col.ords().clone();
+            Some(GroupKeyReader::Str { str_col, ord_col })
+        }
         _ => None,
     }
 }
@@ -1113,23 +1132,60 @@ struct GroupedMetricEntry {
 /// Compact per-doc key reader. Extracts a u64 ordinal per group-by column
 /// without allocating Strings or serde_json::Values in the hot path.
 enum GroupKeyReader {
-    Str(tantivy::columnar::StrColumn),
+    /// String column — reads ordinals from the underlying Column<u64> directly,
+    /// bypassing the iterator-based `term_ords()` path.
+    Str {
+        str_col: tantivy::columnar::StrColumn,
+        ord_col: tantivy::columnar::Column<u64>,
+    },
     I64(tantivy::columnar::Column<i64>),
     F64(tantivy::columnar::Column<f64>),
 }
 
 impl GroupKeyReader {
     /// Extract a compact ordinal key for the given doc. Returns u64::MAX for NULL.
+    #[inline]
     fn key(&self, doc: tantivy::DocId) -> u64 {
         match self {
-            GroupKeyReader::Str(reader) => {
-                let mut ords = reader.term_ords(doc);
-                ords.next().unwrap_or(u64::MAX)
-            }
+            GroupKeyReader::Str { ord_col, .. } => ord_col.first(doc).unwrap_or(u64::MAX),
             GroupKeyReader::I64(reader) => reader.first(doc).map(|v| v as u64).unwrap_or(u64::MAX),
             GroupKeyReader::F64(reader) => {
                 reader.first(doc).map(|v| v.to_bits()).unwrap_or(u64::MAX)
             }
+        }
+    }
+
+    /// Batch-read ordinal keys for a slice of doc IDs into the output buffer.
+    /// Much faster than per-doc `key()` calls due to sequential memory access.
+    #[inline]
+    fn keys_batch(&self, docs: &[tantivy::DocId], output: &mut [Option<u64>]) {
+        match self {
+            GroupKeyReader::Str { ord_col, .. } => {
+                ord_col.first_vals(docs, output);
+            }
+            GroupKeyReader::I64(reader) => {
+                // Reinterpret: read i64s into a temp buffer, convert to u64
+                let mut i64_buf: Vec<Option<i64>> = vec![None; docs.len()];
+                reader.first_vals(docs, &mut i64_buf);
+                for (i, val) in i64_buf.iter().enumerate() {
+                    output[i] = val.map(|v| v as u64);
+                }
+            }
+            GroupKeyReader::F64(reader) => {
+                let mut f64_buf: Vec<Option<f64>> = vec![None; docs.len()];
+                reader.first_vals(docs, &mut f64_buf);
+                for (i, val) in f64_buf.iter().enumerate() {
+                    output[i] = val.map(|v| v.to_bits());
+                }
+            }
+        }
+    }
+
+    /// Number of unique terms (for string columns), used for HashMap pre-sizing.
+    fn num_terms(&self) -> usize {
+        match self {
+            GroupKeyReader::Str { str_col, .. } => str_col.num_terms(),
+            _ => 256,
         }
     }
 
@@ -1139,9 +1195,9 @@ impl GroupKeyReader {
             return serde_json::Value::Null;
         }
         match self {
-            GroupKeyReader::Str(reader) => {
+            GroupKeyReader::Str { str_col, .. } => {
                 let mut text = String::new();
-                if reader.ord_to_str(key, &mut text).unwrap_or(false) {
+                if str_col.ord_to_str(key, &mut text).unwrap_or(false) {
                     serde_json::Value::String(text)
                 } else {
                     serde_json::Value::Null
@@ -1176,13 +1232,20 @@ struct OrdGroupedBucket {
 struct GroupedAggSegmentEntry {
     key_readers: Vec<GroupKeyReader>,
     metric_entries: Vec<GroupedMetricEntry>,
-    /// Maps compact ordinal key (single u64 for 1 group col, or hashed for multi-col) to bucket.
-    buckets: std::collections::HashMap<u64, OrdGroupedBucket>,
+    /// Maps compact ordinal key to bucket. Uses identity hasher since ordinals
+    /// are already well-distributed dictionary indices.
+    buckets: OrdHashMap<OrdGroupedBucket>,
     /// For multi-column GROUP BY, maps hash to full key for collision detection.
     multi_col: bool,
     /// Template of initial accumulators (one per metric).
     accum_template: Vec<CompactMetricAccum>,
+    /// Buffered doc IDs for batch ordinal reads.
+    doc_buffer: Vec<tantivy::DocId>,
+    /// Reusable ordinal output buffer (avoids allocation per flush).
+    ord_buffer: Vec<Option<u64>>,
 }
+
+const BATCH_SIZE: usize = 1024;
 
 pub(crate) struct GroupedAggCollector {
     specs: Vec<ResolvedGroupedAggSpec>,
@@ -1316,14 +1379,23 @@ impl tantivy::collector::Collector for GroupedAggCollector {
             }
 
             let multi_col = key_readers.len() > 1;
+
+            // Pre-size the HashMap from dictionary cardinality to avoid rehashing.
+            let approx_groups = key_readers.first().map(|r| r.num_terms()).unwrap_or(256);
+
             entries.push((
                 spec.name.clone(),
                 Some(GroupedAggSegmentEntry {
                     key_readers,
                     metric_entries,
-                    buckets: std::collections::HashMap::new(),
+                    buckets: OrdHashMap::with_capacity_and_hasher(
+                        approx_groups,
+                        OrdBuildHasher::default(),
+                    ),
                     multi_col,
                     accum_template,
+                    doc_buffer: Vec::with_capacity(BATCH_SIZE),
+                    ord_buffer: vec![None; BATCH_SIZE],
                 }),
             ));
         }
@@ -1388,9 +1460,24 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
                 continue;
             };
 
-            // Compute compact ordinal key — zero allocations.
+            // For single-column string GROUP BY with count-only metrics,
+            // buffer docs for batch ordinal reads. Otherwise, use per-doc path.
+            if !entry.multi_col
+                && entry.key_readers.len() == 1
+                && entry
+                    .metric_entries
+                    .iter()
+                    .all(|m| matches!(m.source, GroupedMetricSource::CountAll))
+            {
+                entry.doc_buffer.push(doc);
+                if entry.doc_buffer.len() >= BATCH_SIZE {
+                    flush_batch(entry);
+                }
+                continue;
+            }
+
+            // Per-doc path for multi-column or numeric metrics
             let hash_key = if entry.multi_col {
-                // Multi-column: combine ordinals with FxHash-style mixing
                 let mut h: u64 = 0;
                 for reader in &entry.key_readers {
                     let k = reader.key(doc);
@@ -1400,7 +1487,6 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
             } else if let Some(reader) = entry.key_readers.first() {
                 reader.key(doc)
             } else {
-                // No group-by columns — ungrouped aggregate, single global bucket
                 0
             };
 
@@ -1412,7 +1498,6 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
                 }
             });
 
-            // Update accumulators by index — no String clones, no HashMap lookups.
             for (idx, metric) in entry.metric_entries.iter().enumerate() {
                 match (&metric.function, &metric.source) {
                     (
@@ -1427,10 +1512,10 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
                         crate::search::GroupedMetricFunction::Count,
                         GroupedMetricSource::CountField(reader),
                     ) => {
-                        if !reader.first_json(doc).is_null() {
-                            if let CompactMetricAccum::Count(c) = &mut bucket.accums[idx] {
-                                *c += 1;
-                            }
+                        if !reader.first_json(doc).is_null()
+                            && let CompactMetricAccum::Count(c) = &mut bucket.accums[idx]
+                        {
+                            *c += 1;
                         }
                     }
                     (
@@ -1469,8 +1554,12 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
     fn harvest(self) -> Self::Fruit {
         self.entries
             .into_iter()
-            .filter_map(|(name, maybe_entry)| {
-                let entry = maybe_entry?;
+            .filter_map(|(name, entry)| {
+                let mut entry = entry?;
+                // Flush any remaining buffered docs
+                if !entry.doc_buffer.is_empty() {
+                    flush_batch(&mut entry);
+                }
                 // Resolve ordinals to values and convert to GroupedMetricsBucket.
                 // This runs once per unique group (not per doc).
                 let buckets: Vec<crate::search::GroupedMetricsBucket> = entry
@@ -1517,6 +1606,52 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
     }
 }
 
+/// Flush a batch of buffered doc IDs: batch-read ordinals, then update accumulators.
+/// Only used for single-column string GROUP BY with count-only metrics.
+fn flush_batch(entry: &mut GroupedAggSegmentEntry) {
+    let batch_len = entry.doc_buffer.len();
+    if batch_len == 0 {
+        return;
+    }
+
+    // Ensure ord_buffer is large enough
+    if entry.ord_buffer.len() < batch_len {
+        entry.ord_buffer.resize(batch_len, None);
+    }
+
+    // Reset buffer values
+    for slot in &mut entry.ord_buffer[..batch_len] {
+        *slot = None;
+    }
+
+    // Batch-read ordinals for all buffered docs at once
+    if let Some(reader) = entry.key_readers.first() {
+        reader.keys_batch(&entry.doc_buffer, &mut entry.ord_buffer[..batch_len]);
+    }
+
+    // Process the batch: update accumulators
+    for i in 0..batch_len {
+        let ord = entry.ord_buffer[i].unwrap_or(u64::MAX);
+
+        let bucket = entry
+            .buckets
+            .entry(ord)
+            .or_insert_with(|| OrdGroupedBucket {
+                ord_keys: vec![ord],
+                accums: entry.accum_template.clone(),
+            });
+
+        // All metrics are CountAll in the batch path
+        for accum in &mut bucket.accums {
+            if let CompactMetricAccum::Count(c) = accum {
+                *c += 1;
+            }
+        }
+    }
+
+    entry.doc_buffer.clear();
+}
+
 /// Build a compact string key from group_values for segment merge.
 /// Much cheaper than serde_json::to_string — concatenates string representations
 /// with a separator. Only called #unique_groups × #segments times.
@@ -1531,7 +1666,7 @@ fn compact_group_key(values: &[serde_json::Value]) -> String {
             serde_json::Value::String(s) => key.push_str(s),
             serde_json::Value::Number(n) => write!(key, "{n}").unwrap(),
             serde_json::Value::Bool(b) => write!(key, "{b}").unwrap(),
-            serde_json::Value::Null => key.push_str("\x00"),
+            serde_json::Value::Null => key.push('\0'),
             _ => write!(key, "{v}").unwrap(),
         }
     }

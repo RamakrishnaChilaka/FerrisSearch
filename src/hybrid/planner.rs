@@ -547,10 +547,10 @@ fn extract_grouped_sql_plan(
 
     // Parse HAVING clause into post-merge filters
     let mut having_filters = Vec::new();
-    if let Some(having_expr) = &select.having {
-        if !parse_having_filters(having_expr, &valid_names, &mut having_filters) {
-            return Ok(None);
-        }
+    if let Some(having_expr) = &select.having
+        && !parse_having_filters(having_expr, &valid_names, &mut having_filters)
+    {
+        return Ok(None);
     }
 
     Ok(Some(GroupedSqlPlan {
@@ -587,33 +587,33 @@ fn parse_having_filters(
                 _ => return false,
             };
             // Try field op value
-            if let (Some(name), Some(val)) = (expr_to_field_name(left), expr_to_f64(right)) {
-                if let Some(output_name) = valid_names.get(&name) {
-                    filters.push(HavingFilter {
-                        output_name: output_name.clone(),
-                        op: having_op,
-                        value: val,
-                    });
-                    return true;
-                }
+            if let (Some(name), Some(val)) = (expr_to_field_name(left), expr_to_f64(right))
+                && let Some(output_name) = valid_names.get(&name)
+            {
+                filters.push(HavingFilter {
+                    output_name: output_name.clone(),
+                    op: having_op,
+                    value: val,
+                });
+                return true;
             }
             // Try value op field (flipped)
-            if let (Some(val), Some(name)) = (expr_to_f64(left), expr_to_field_name(right)) {
-                if let Some(output_name) = valid_names.get(&name) {
-                    let flipped_op = match having_op {
-                        HavingOp::Gt => HavingOp::Lt,
-                        HavingOp::GtEq => HavingOp::LtEq,
-                        HavingOp::Lt => HavingOp::Gt,
-                        HavingOp::LtEq => HavingOp::GtEq,
-                        HavingOp::Eq => HavingOp::Eq,
-                    };
-                    filters.push(HavingFilter {
-                        output_name: output_name.clone(),
-                        op: flipped_op,
-                        value: val,
-                    });
-                    return true;
-                }
+            if let (Some(val), Some(name)) = (expr_to_f64(left), expr_to_field_name(right))
+                && let Some(output_name) = valid_names.get(&name)
+            {
+                let flipped_op = match having_op {
+                    HavingOp::Gt => HavingOp::Lt,
+                    HavingOp::GtEq => HavingOp::LtEq,
+                    HavingOp::Lt => HavingOp::Gt,
+                    HavingOp::LtEq => HavingOp::GtEq,
+                    HavingOp::Eq => HavingOp::Eq,
+                };
+                filters.push(HavingFilter {
+                    output_name: output_name.clone(),
+                    op: flipped_op,
+                    value: val,
+                });
+                return true;
             }
             false
         }

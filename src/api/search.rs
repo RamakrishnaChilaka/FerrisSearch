@@ -237,14 +237,23 @@ pub async fn search_documents(
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
 
-    for (shard_id, engine) in &local_shards {
-        let engine = engine.clone();
-        let query = params.q.clone();
-        let shard_id = *shard_id;
-        let search_result = state
-            .worker_pools
-            .spawn_search(move || engine.search(&query))
-            .await;
+    // Dispatch all local shard searches in parallel
+    let search_futures: Vec<_> = local_shards
+        .iter()
+        .map(|(shard_id, engine)| {
+            let engine = engine.clone();
+            let query = params.q.clone();
+            let shard_id = *shard_id;
+            let pools = state.worker_pools.clone();
+            async move {
+                let result = pools.spawn_search(move || engine.search(&query)).await;
+                (shard_id, result)
+            }
+        })
+        .collect();
+    let search_results = futures::future::join_all(search_futures).await;
+
+    for (shard_id, search_result) in search_results {
         match search_result {
             Ok(Ok(hits)) => {
                 successful_shards += 1;
@@ -578,16 +587,29 @@ async fn execute_sql_query(
         let mut successful_shards = 0u32;
         let mut direct_error: Option<anyhow::Error> = None;
 
-        for (_shard_id, engine) in &local_shards {
-            let engine = engine.clone();
-            let req = search_req.clone();
-            let cols = plan.required_columns.clone();
-            let nid = plan.needs_id;
-            let nsc = plan.needs_score;
-            let batch_result = state
-                .worker_pools
-                .spawn_search(move || engine.sql_record_batch(&req, &cols, nid, nsc))
-                .await;
+        // Dispatch all local shard SQL reads in parallel
+        let sql_futures: Vec<_> = local_shards
+            .iter()
+            .map(|(_shard_id, engine)| {
+                let engine = engine.clone();
+                let req = search_req.clone();
+                let cols = plan.required_columns.clone();
+                let nid = plan.needs_id;
+                let nsc = plan.needs_score;
+                let pools = state.worker_pools.clone();
+                async move {
+                    pools
+                        .spawn_search(move || engine.sql_record_batch(&req, &cols, nid, nsc))
+                        .await
+                }
+            })
+            .collect();
+        let sql_results = futures::future::join_all(sql_futures).await;
+
+        for batch_result in sql_results {
+            if direct_error.is_some() {
+                break;
+            }
             match batch_result {
                 Ok(Ok(Some(batch_result))) => {
                     successful_shards += 1;

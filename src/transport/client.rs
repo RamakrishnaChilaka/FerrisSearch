@@ -76,7 +76,14 @@ impl TransportClient {
         local_node: &NodeInfo,
         raft_node_id: u64,
     ) -> Option<ClusterState> {
+        // Build self address to skip sending join requests to ourselves
+        let self_addr = format!("{}:{}", local_node.host, local_node.transport_port);
+
         for host in seed_hosts {
+            // Skip self — sending a join request to ourselves is pointless
+            if host == &self_addr {
+                continue;
+            }
             debug!("Attempting to join cluster via seed host: {}", host);
 
             // Parse "host:port" format

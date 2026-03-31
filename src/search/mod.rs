@@ -924,7 +924,7 @@ fn compact_group_key(values: &[serde_json::Value]) -> String {
             serde_json::Value::String(s) => key.push_str(s),
             serde_json::Value::Number(n) => write!(key, "{n}").unwrap(),
             serde_json::Value::Bool(b) => write!(key, "{b}").unwrap(),
-            serde_json::Value::Null => key.push_str("\x00"),
+            serde_json::Value::Null => key.push('\0'),
             _ => write!(key, "{v}").unwrap(),
         }
     }
