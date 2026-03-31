@@ -149,7 +149,25 @@ pub fn execute_grouped_partial_sql(
         });
     }
 
-    rows.sort_by(|left, right| compare_grouped_rows(left, right, &grouped_sql.order_by));
+    // Top-K selection: when LIMIT is small relative to total rows and ORDER BY
+    // is present, use partial sort (select_nth_unstable_by) instead of full sort.
+    // This is O(N) average vs O(N log N) for full sort.
+    let needed = plan.offset.unwrap_or(0) + plan.limit.unwrap_or(usize::MAX);
+    let has_order = !grouped_sql.order_by.is_empty();
+
+    if has_order && needed < rows.len() {
+        // select_nth_unstable_by partitions: elements [0..n] are <= nth, [n+1..] are >=
+        // This gives us the top-K without fully sorting.
+        let n = needed.min(rows.len()) - 1;
+        rows.select_nth_unstable_by(n, |left, right| {
+            compare_grouped_rows(left, right, &grouped_sql.order_by)
+        });
+        rows.truncate(needed);
+        // Now sort only the top-K subset (much smaller)
+        rows.sort_by(|left, right| compare_grouped_rows(left, right, &grouped_sql.order_by));
+    } else if has_order {
+        rows.sort_by(|left, right| compare_grouped_rows(left, right, &grouped_sql.order_by));
+    }
 
     // Apply LIMIT and OFFSET after sorting
     let offset = plan.offset.unwrap_or(0);
@@ -1547,5 +1565,115 @@ mod tests {
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0]["author"], "alice");
         assert_eq!(result.rows[0]["posts"], 100);
+    }
+
+    #[test]
+    fn top_k_selection_produces_correct_results() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        // 100 authors with sequential post counts — top-K should find the highest
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC LIMIT 3",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert_eq!(plan.limit, Some(3));
+
+        let mut partial_map = HashMap::new();
+        let mut buckets = Vec::new();
+        for i in 0..100 {
+            buckets.push(GroupedMetricsBucket {
+                group_values: vec![json!(format!("author_{}", i))],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count {
+                        count: i as u64 + 1,
+                    },
+                )]),
+            });
+        }
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        // Top 3 by posts DESC should be author_99 (100), author_98 (99), author_97 (98)
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0]["author"], "author_99");
+        assert_eq!(result.rows[0]["posts"], 100);
+        assert_eq!(result.rows[1]["author"], "author_98");
+        assert_eq!(result.rows[1]["posts"], 99);
+        assert_eq!(result.rows[2]["author"], "author_97");
+        assert_eq!(result.rows[2]["posts"], 98);
+    }
+
+    #[test]
+    fn top_k_with_offset_produces_correct_results() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC LIMIT 2 OFFSET 2",
+        )
+        .unwrap();
+
+        let mut partial_map = HashMap::new();
+        let mut buckets = Vec::new();
+        for i in 0..50 {
+            buckets.push(GroupedMetricsBucket {
+                group_values: vec![json!(format!("author_{}", i))],
+                metrics: HashMap::from([(
+                    "posts".to_string(),
+                    GroupedMetricPartial::Count {
+                        count: i as u64 + 1,
+                    },
+                )]),
+            });
+        }
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        // OFFSET 2 skips author_49 and author_48, gives author_47 and author_46
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0]["author"], "author_47");
+        assert_eq!(result.rows[0]["posts"], 48);
+        assert_eq!(result.rows[1]["author"], "author_46");
+        assert_eq!(result.rows[1]["posts"], 47);
+    }
+
+    #[test]
+    fn planner_detects_top_k_eligibility() {
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC LIMIT 10",
+        )
+        .unwrap();
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert!(grouped.uses_top_k(plan.limit));
+
+        // No LIMIT = no top-K
+        let plan2 = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC",
+        )
+        .unwrap();
+        let grouped2 = plan2.grouped_sql.as_ref().unwrap();
+        assert!(!grouped2.uses_top_k(plan2.limit));
+
+        // No ORDER BY = no top-K
+        let plan3 = planner::plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author LIMIT 10",
+        )
+        .unwrap();
+        let grouped3 = plan3.grouped_sql.as_ref().unwrap();
+        assert!(!grouped3.uses_top_k(plan3.limit));
     }
 }

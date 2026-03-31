@@ -1,0 +1,242 @@
+# GROUP BY Comprehensive SQL Correctness Tests
+#
+# Adapted from DataFusion's group_by.slt patterns but tailored for
+# FerrisSearch's supported SQL features. Uses the same 10-doc HN dataset.
+#
+# Dataset (10 docs):
+#   alice:  3 posts, category=rust, upvotes=[250,180,120], comments=[45,92,30]
+#   bob:    2 posts, category=python, upvotes=[500,300], comments=[200,150]
+#   carol:  2 posts, category=ml, upvotes=[400,1000], comments=[80,500]
+#   dave:   2 posts, category=[rust,startup], upvotes=[150,50], comments=[35,20]
+#   eve:    1 post,  category=culture, upvotes=[800], comments=[600]
+
+# ── Single column GROUP BY ───────────────────────────────────────────
+
+query TI rowsort
+SELECT author, count(*) FROM stories GROUP BY author
+----
+alice 3
+bob 2
+carol 2
+dave 2
+eve 1
+
+query TI rowsort
+SELECT category, count(*) FROM stories GROUP BY category
+----
+culture 1
+ml 2
+python 2
+rust 4
+startup 1
+
+# ── Multi-column GROUP BY ────────────────────────────────────────────
+
+query TTI rowsort
+SELECT author, category, count(*) FROM stories GROUP BY author, category
+----
+alice rust 3
+bob python 2
+carol ml 2
+dave rust 1
+dave startup 1
+eve culture 1
+
+# Multi-column with aggregate
+query TTR rowsort
+SELECT author, category, avg(upvotes) FROM stories GROUP BY author, category
+----
+alice rust 183.3
+bob python 400.0
+carol ml 700.0
+dave rust 150.0
+dave startup 50.0
+eve culture 800.0
+
+# ── GROUP BY with ORDER BY ───────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author ORDER BY cnt DESC, author ASC
+----
+alice 3
+bob 2
+carol 2
+dave 2
+eve 1
+
+query TI nosort
+SELECT category, count(*) AS cnt FROM stories GROUP BY category ORDER BY cnt DESC, category ASC
+----
+rust 4
+ml 2
+python 2
+culture 1
+startup 1
+
+# ── GROUP BY with LIMIT ──────────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author ORDER BY cnt DESC, author ASC LIMIT 3
+----
+alice 3
+bob 2
+carol 2
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author ORDER BY cnt DESC, author ASC LIMIT 1
+----
+alice 3
+
+# ── GROUP BY with OFFSET ────────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author ORDER BY cnt DESC, author ASC LIMIT 2 OFFSET 1
+----
+bob 2
+carol 2
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author ORDER BY cnt DESC, author ASC LIMIT 2 OFFSET 3
+----
+dave 2
+eve 1
+
+# ── GROUP BY with HAVING ─────────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt > 1 ORDER BY cnt DESC, author ASC
+----
+alice 3
+bob 2
+carol 2
+dave 2
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt > 2 ORDER BY cnt DESC
+----
+alice 3
+
+# ── Multiple aggregates ──────────────────────────────────────────────
+
+query TIR nosort
+SELECT author, count(*) AS cnt, avg(upvotes) AS avg_up FROM stories GROUP BY author ORDER BY avg_up DESC, author ASC LIMIT 3
+----
+eve 1 800.0
+carol 2 700.0
+bob 2 400.0
+
+query TIRR nosort
+SELECT author, count(*) AS cnt, sum(upvotes) AS total_up, avg(comments) AS avg_disc FROM stories GROUP BY author ORDER BY total_up DESC, author ASC LIMIT 3
+----
+carol 2 1400.0 290.0
+bob 2 800.0 175.0
+eve 1 800.0 600.0
+
+# ── min/max aggregates ───────────────────────────────────────────────
+
+query TRR rowsort
+SELECT author, min(upvotes) AS min_up, max(upvotes) AS max_up FROM stories GROUP BY author
+----
+alice 120.0 250.0
+bob 300.0 500.0
+carol 400.0 1000.0
+dave 50.0 150.0
+eve 800.0 800.0
+
+# ── sum aggregate ────────────────────────────────────────────────────
+
+query TR rowsort
+SELECT author, sum(comments) AS total_comments FROM stories GROUP BY author
+----
+alice 167.0
+bob 350.0
+carol 580.0
+dave 55.0
+eve 600.0
+
+# ── Ungrouped aggregates (no GROUP BY) ───────────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories
+----
+10
+
+query R nosort
+SELECT avg(upvotes) FROM stories
+----
+375.0
+
+query RR nosort
+SELECT min(upvotes) AS mn, max(upvotes) AS mx FROM stories
+----
+50.0 1000.0
+
+# ── text_match + GROUP BY ────────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE text_match(title, 'rust') GROUP BY author ORDER BY cnt DESC, author ASC
+----
+alice 3
+dave 1
+
+query TIR nosort
+SELECT author, count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE text_match(title, 'rust') GROUP BY author ORDER BY avg_up DESC
+----
+alice 3 183.3
+dave 1 150.0
+
+# ── text_match + GROUP BY + HAVING ───────────────────────────────────
+
+query TIR nosort
+SELECT author, count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE text_match(title, 'rust') GROUP BY author HAVING cnt > 1 ORDER BY avg_up DESC
+----
+alice 3 183.3
+
+# ── Pushdown filter + GROUP BY ───────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes > 200 GROUP BY author ORDER BY cnt DESC, author ASC
+----
+bob 2
+carol 2
+alice 1
+eve 1
+
+query TIR nosort
+SELECT author, count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE upvotes > 400 GROUP BY author ORDER BY avg_up DESC
+----
+carol 1 1000.0
+eve 1 800.0
+bob 1 500.0
+
+# ── Multi-column GROUP BY with ORDER BY + LIMIT ─────────────────────
+
+query TTI nosort
+SELECT author, category, count(*) AS cnt FROM stories GROUP BY author, category ORDER BY cnt DESC, author ASC, category ASC LIMIT 3
+----
+alice rust 3
+bob python 2
+carol ml 2
+
+# ── GROUP BY with HAVING + LIMIT + OFFSET ────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt > 1 ORDER BY cnt DESC, author ASC LIMIT 2 OFFSET 1
+----
+bob 2
+carol 2
+
+# ── Empty result (HAVING filters everything) ─────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt > 10 ORDER BY cnt DESC
+----
+
+# ── text_match returning no results ──────────────────────────────────
+
+# count(*) with text_match returning zero matches gives empty result
+# (no rows, not a row with 0) because the grouped partials path
+# produces zero partial states when nothing matches.
+query I nosort
+SELECT count(*) FROM stories WHERE text_match(title, 'zzzznonexistent')
+----

@@ -45,7 +45,8 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - When a SQL query has LIMIT/OFFSET and ORDER BY is `_score`-only (or absent), the limit is pushed into Tantivy's `TopDocs` collector.
 - When ORDER BY is a single non-score fast-field column (e.g., `ORDER BY price DESC`), both the sort and limit are pushed into Tantivy via `TopDocs::order_by_fast_field()`. This avoids materializing 100K docs and sorting in DataFusion.
 - **LIMIT pushdown applies to all query shapes including `SELECT *`.** The `selects_all_columns` flag does NOT block limit pushdown — it only determines whether the fast-field or materialized-fallback execution path is used. For `SELECT * LIMIT 4`, the engine collects only 4 docs (not 100K) and materializes only those 4.
-- **LIMIT with GROUP BY does NOT push to Tantivy.** When `grouped_sql.is_some()`, limit is applied after merge+sort in `execute_grouped_partial_sql`. LIMIT and OFFSET are applied post-sort, post-HAVING, to the final merged grouped results.
+- **LIMIT with GROUP BY does NOT push to Tantivy.** When `grouped_sql.is_some()`, limit is applied after merge in `execute_grouped_partial_sql`. The pipeline order is: merge → HAVING → top-K selection → LIMIT/OFFSET.
+- **Top-K selection**: When ORDER BY + LIMIT are both present on grouped partials, uses `select_nth_unstable_by` (O(N) average) instead of full sort (O(N log N)). Only the top-K subset is fully sorted. `GroupedSqlPlan::uses_top_k()` detects eligibility. The EXPLAIN pipeline shows `"top_k_selection": true`.
 - `QueryPlan` has `limit: Option<usize>`, `offset: Option<usize>`, `limit_pushed_down: bool`, and `sort_pushdown: Option<(String, bool)>` fields.
 - `sort_pushdown` captures the single ORDER BY column name and direction (true = DESC) when eligible for fast-field sort pushdown.
 - `to_search_request()` populates `SearchRequest.sort` from `sort_pushdown`, so the engine uses `order_by_fast_field()` in both `search_query()` and `sql_record_batch()`.
@@ -97,7 +98,13 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - HAVING filters are applied after shard-partial merge but before sorting and LIMIT/OFFSET.
 - Multiple HAVING conditions (ANDed) are supported.
 - Complex HAVING expressions (OR, subqueries, expressions) cause fallback to the DataFusion path.
-- The pipeline order in grouped partials is: merge → HAVING → sort → LIMIT/OFFSET.
+- The pipeline order in grouped partials is: merge → HAVING → top-K selection → LIMIT/OFFSET.
+
+## GROUP BY Field Type Validation
+- `GROUP BY` on `Text` fields returns a `group_by_text_field_exception` error (HTTP 400).
+- Text fields are tokenized (split into words) and don't have fast-field columnar storage — grouping by individual tokens is not meaningful.
+- Only `Keyword`, `Integer`, `Float`, `Boolean` fields support GROUP BY.
+- Validation runs in `execute_sql_query()` by checking field mappings from cluster state before executing the grouped partials path.
 
 ## Anti-Pattern To Avoid
 - Do not advertise or implement the feature as "SQL over hits".
