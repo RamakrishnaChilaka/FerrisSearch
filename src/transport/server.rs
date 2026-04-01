@@ -346,6 +346,7 @@ impl InternalTransport for TransportService {
                         }));
                     }
                 }
+                crate::metrics::DOCS_INDEXED_TOTAL.inc();
                 Ok(Response::new(ShardDocResponse {
                     success: true,
                     doc_id: id,
@@ -435,6 +436,8 @@ impl InternalTransport for TransportService {
                         }));
                     }
                 }
+                let doc_count = ids.len() as u64;
+                crate::metrics::BULK_DOCS_TOTAL.inc_by(doc_count);
                 Ok(Response::new(ShardBulkResponse {
                     success: true,
                     doc_ids: ids,

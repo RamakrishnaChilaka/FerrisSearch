@@ -65,7 +65,7 @@ pub struct CompositeEngine {
 
 ### Constructors
 - `new(data_dir, refresh_interval)` — default refresh loop (static interval)
-- `new_with_mappings(data_dir, refresh_interval, mappings, durability)` — with schema + WAL
+- `new_with_mappings(data_dir, refresh_interval, mappings, durability, column_cache)` — with schema + WAL + shared column cache
 
 ### Refresh Loop (reactive)
 ```rust
@@ -144,7 +144,8 @@ The `GroupedAggCollector` computes grouped analytics (GROUP BY + aggregate funct
 - **Zero-allocation hot path**: `collect()` uses `GroupKeyReader::key(doc) → u64` to get fast-field ordinals. For string columns, this is the dictionary ordinal; for numerics, the bit-reinterpreted value. No String allocations, no JSON serialization per doc.
 - **Collision-free composite keys**: Single-column GROUP BY uses `OrdHashMap<u64>` (identity hasher). Multi-column uses `HashMap<Vec<u64>>` (exact ordinal match). No hash collisions possible.
 - **Batch ordinal reads**: Single-column GROUP BY buffers doc IDs and reads ordinals in batches of 1024 via `Column::first_vals()` — faster than per-doc `term_ords()`.
-- **Batch path handles numeric metrics**: The batch path now processes queries with `sum`, `avg`, `min`, `max` — not just `count(*)`. Ordinals are read in batch, numeric columns read per-doc from the batch.
+- **Batch numeric reads**: All numeric metric columns (sum/avg/min/max) are batch-read via `NumCol::first_vals_f64()` in the same 1024-doc batch as ordinals. This eliminates per-doc `first_f64()` calls — for 1.8M docs × 2 numeric columns, that's ~3.6M per-doc reads replaced by ~3,500 batch calls. The batch values are stored in pre-allocated `numeric_buffers` on `GroupedAggSegmentEntry` and consumed during accumulator updates.
+- **Batch path handles all single-column metrics**: The batch path now processes count-only AND numeric ( `sum`, `avg`, `min`, `max`) queries — not just `count(*)`. Ordinals and numerics are read in batch, accumulators updated from pre-fetched buffers.
 - **Deferred string resolution**: `harvest()` calls `GroupKeyReader::resolve(ord) → serde_json::Value` once per unique group to produce the final `GroupedMetricsBucket`s.
 - **Identity hasher**: `OrdHasher` treats u64 ordinals as their own hash — zero hash computation in the per-doc path.
 - **Pre-sized HashMap**: `num_terms()` from the dictionary provides approximate group count for `HashMap::with_capacity()`.
@@ -158,7 +159,7 @@ The `GroupedAggCollector` computes grouped analytics (GROUP BY + aggregate funct
 - **Terms**: reads `StrColumn` (dictionary-encoded keyword fields) or numeric column for numeric fields
 
 **Key types in `src/engine/tantivy.rs`:**
-- `NumCol` -- wraps i64/f64 fast-field columns with `first_f64()` coercion
+- `NumCol` -- wraps i64/f64 fast-field columns with `first_f64()` (per-doc) and `first_vals_f64()` (batch) coercion
 - `SegmentAggEntry` -- per-segment column + accumulator (NumericStats, Histogram, TermsStr, TermsNum, Skip)
 - `SegmentAggData` -- harvested per-segment result (Stats, Histogram, Terms)
 - `AggKind` / `ResolvedAggSpec` -- resolved from `AggregationRequest` before search
@@ -203,6 +204,36 @@ unsearchable by float range queries).
 - `add_with_doc_id(doc_id, vector)`, `search(query, k) -> (keys, distances)`
 - Binary persistence: `save(path)` / `open(path, dimensions, metric)`
 - Doc ID ↔ numeric key mapping via `HashMap` + bincode serialization
+
+## Column Cache (src/engine/column_cache.rs)
+
+### Architecture
+Segment-aware, lazy-loaded Arrow array cache backed by `moka`. Shared across all shards on a node via `Arc<ColumnCache>`.
+- **Key**: `(SegmentId, column_name)` — Tantivy segments are immutable once committed, so cached data never goes stale.
+- **Value**: Arrow `ArrayRef` covering all docs in a segment for one column. Queries extract matching rows via `arrow::compute::take()`.
+- **Eviction**: Size-bounded (weighted by `ArrayRef::get_array_memory_size()`), LRU eviction by moka.
+
+### Construction Chain
+`Node::new()` → `ShardManager::new_full(data_dir, durability, column_cache)` → `CompositeEngine::new_with_mappings(..., column_cache)` → `HotEngine::new_with_mappings(..., column_cache)`.
+- Cache capacity is derived from `AppConfig::column_cache_size_percent` (default 10, capped at 90% of system RAM).
+- `compute_cache_bytes(percent)` reads `/proc/meminfo`, falls back to 1 GB.
+- Set `column_cache_size_percent: 0` to disable caching entirely.
+
+### Cache Guard — Oversized Segment Protection
+Before building a full-segment array, `should_cache_full_segment_array(reader, max_doc, cache_max)` estimates the Arrow array size:
+- **Numeric (F64/I64)**: `max_doc * 8 + null_bitmap`
+- **String**: `offsets + null_bitmap + (max_doc * estimated_avg_term_len)` — avg term len is sampled from up to 32 dictionary terms via `estimate_string_array_value_bytes()`, then multiplied by 2× as a safety margin.
+- If the estimate exceeds `cache_max / 4`, the segment is too large to cache and `build_selective_array()` reads only matching doc IDs directly into Arrow — no full-segment allocation.
+- The `ColumnCache::insert()` method has a secondary guard: arrays larger than 25% of capacity are silently dropped.
+- `build_full_segment_array()` for strings uses `StringBuilder::with_capacity(max_doc, 0)` — deferred string buffer allocation to avoid large upfront memory spikes.
+
+### Integration with sql_record_batch
+When the fast path is eligible (`!needs_stored_doc && !columns.is_empty()`):
+1. Group matched docs by segment ordinal
+2. For each column × segment: check cache hit → miss builds full array → `take()` matching rows
+3. Concatenate per-segment arrays, reorder to match original `top_docs` order
+4. Build `RecordBatch` with `_id`/`score` columns + data columns
+Falls back to per-doc stored-doc reading when any column requires `SourceFallback`.
 
 ## Routing (src/engine/routing.rs)
 - `calculate_shard(doc_id, num_shards) -> u32` — Murmur3 hash modulo

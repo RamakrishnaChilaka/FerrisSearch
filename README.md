@@ -65,6 +65,7 @@ Every response tells you how the query ran:
 - **Write-ahead log** — binary WAL with configurable durability (`request` fsync-per-write or `async` timer-based)
 - **Workload isolation** — dedicated [rayon](https://github.com/rayon-rs/rayon) thread pools for search and write traffic; bulk indexing cannot starve search latency or Raft heartbeats
 - **Dynamic field mapping** — fields are auto-detected and created on first document encounter
+- **Prometheus metrics** — `/_metrics` endpoint with request latencies, search/index counters, SQL mode tracking, cluster gauges, and process stats (CPU, RSS, threads, FDs)
 - **Interactive SQL console** — `ferris-cli` with colored tables, EXPLAIN ANALYZE visualization, query history
 - **SQL correctness tests** — [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki) `.slt` files (same framework as DataFusion, CockroachDB, DuckDB)
 
@@ -351,6 +352,9 @@ curl 'http://localhost:9200/_cat/nodes'
 curl 'http://localhost:9200/_cat/shards'
 curl 'http://localhost:9200/_cat/indices'
 curl 'http://localhost:9200/_cat/master'
+
+# Prometheus metrics (text exposition format)
+curl 'http://localhost:9200/_metrics'
 ```
 
 Append `?pretty` to any endpoint for formatted JSON.
@@ -465,8 +469,8 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 733 tests
-cargo test --lib                                # Unit tests (613)
+cargo test                                      # All 760 tests
+cargo test --lib                                # Unit tests (640)
 cargo test --bin ferris-cli                      # CLI tests (33)
 cargo test --test consensus_integration          # Raft consensus (30)
 cargo test --test replication_integration        # Replication (39)
@@ -526,6 +530,7 @@ scripts/           Ingestion and benchmark scripts
 - [x] Interactive SQL console with EXPLAIN visualization
 - [x] Global `/_sql` with `SHOW TABLES`, `DESCRIBE`, `SHOW CREATE TABLE`
 - [x] sqllogictest correctness suite
+- [x] Prometheus metrics (`/_metrics`) — request latencies, search/index throughput, SQL mode counters, cluster gauges, process stats
 
 ### Planned
 
@@ -533,7 +538,6 @@ scripts/           Ingestion and benchmark scripts
 - [ ] `_msearch` API (batch searches)
 - [ ] `search_after` cursor-based pagination
 - [ ] TLS encryption
-- [ ] Prometheus metrics (`/_metrics`)
 - [ ] Snapshot and restore
 - [ ] Index aliases and templates
 - [ ] Column cache (in-memory flat arrays for analytics-hot columns)

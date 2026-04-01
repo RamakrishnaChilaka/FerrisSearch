@@ -6,6 +6,7 @@ pub mod consensus;
 pub mod engine;
 pub mod hybrid;
 pub mod indexing;
+pub mod metrics;
 pub mod node;
 pub mod replication;
 pub mod search;

@@ -1,3 +1,4 @@
+pub mod column_cache;
 pub mod composite;
 pub mod routing;
 pub mod tantivy;

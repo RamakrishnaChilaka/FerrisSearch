@@ -414,6 +414,8 @@ pub async fn index_document(
     Query(refresh_param): Query<RefreshParam>,
     Json(mut payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
+
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
         return crate::api::error_response(
             StatusCode::BAD_REQUEST,
@@ -501,6 +503,8 @@ pub async fn index_document_with_id(
     Query(refresh_param): Query<RefreshParam>,
     Json(mut payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
+
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
         return crate::api::error_response(
             StatusCode::BAD_REQUEST,
@@ -966,6 +970,9 @@ pub async fn bulk_index_global(
     Query(refresh_param): Query<RefreshParam>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
+    let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
+    crate::metrics::BULK_REQUESTS_TOTAL.inc();
+
     let text = match std::str::from_utf8(&body) {
         Ok(t) => t,
         Err(_) => {
@@ -1090,6 +1097,9 @@ pub async fn bulk_index(
     Query(refresh_param): Query<RefreshParam>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
+    let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
+    crate::metrics::BULK_REQUESTS_TOTAL.inc();
+
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
         return crate::api::error_response(
             StatusCode::BAD_REQUEST,
@@ -1398,6 +1408,8 @@ pub async fn search_documents_dsl(
     Path(index_name): Path<String>,
     Json(req): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let _timer = crate::metrics::SEARCH_LATENCY_SECONDS.start_timer();
+
     let search_req: crate::search::SearchRequest = match serde_json::from_value(req) {
         Ok(r) => r,
         Err(e) => {
@@ -1413,6 +1425,8 @@ pub async fn search_documents_dsl(
         Ok(result) => result,
         Err(err) => return err,
     };
+
+    crate::metrics::SEARCH_QUERIES_TOTAL.inc();
 
     let paginated: Vec<_> = result
         .all_hits

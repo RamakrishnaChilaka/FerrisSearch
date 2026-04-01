@@ -3,3 +3,4 @@ data/ropensearch-dev-1/index/.managed.json
 data/ropensearch-dev-1/index/meta.json
 data/
 test_workload_data/
+.venv/
