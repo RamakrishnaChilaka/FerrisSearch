@@ -35,6 +35,8 @@ pub struct HotEngine {
     translog: Arc<Mutex<dyn WriteAheadLog>>,
     /// Highest committed translog seq_no, stored as the next seq_no after commit.
     committed_seq_no_path: PathBuf,
+    /// Shared column cache for fast-field Arrow arrays.
+    column_cache: Arc<super::column_cache::ColumnCache>,
 }
 
 impl HotEngine {
@@ -44,6 +46,7 @@ impl HotEngine {
             refresh_interval,
             &HashMap::new(),
             TranslogDurability::Request,
+            Arc::new(super::column_cache::ColumnCache::new(0)),
         )
     }
 
@@ -55,6 +58,7 @@ impl HotEngine {
         refresh_interval: Duration,
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
         durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         let index_path = data_dir.join("index");
@@ -138,6 +142,7 @@ impl HotEngine {
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
             committed_seq_no_path,
+            column_cache,
         };
 
         // Replay any uncommitted translog entries from before a crash
@@ -277,6 +282,179 @@ impl HotEngine {
 
         let mut ids = Vec::with_capacity(if needs_id { top_docs.len() } else { 0 });
         let mut scores = Vec::with_capacity(if needs_score { top_docs.len() } else { 0 });
+
+        // Fast path: use column cache when no SourceFallback columns are needed.
+        // This avoids per-doc serde_json::Value allocation by working directly with Arrow arrays.
+        let use_cache = !needs_stored_doc && !columns.is_empty();
+
+        if use_cache {
+            // Group matching doc IDs by segment ordinal
+            let mut seg_docs: Vec<Vec<(u32, f32)>> = vec![Vec::new(); segment_readers.len()];
+            for (score, doc_address) in &top_docs {
+                let seg_ord = doc_address.segment_ord as usize;
+                seg_docs[seg_ord].push((doc_address.doc_id, *score));
+            }
+
+            // Collect IDs and scores in doc order
+            for (score, doc_address) in &top_docs {
+                if needs_id {
+                    let seg_ord = doc_address.segment_ord as usize;
+                    let doc_id = doc_address.doc_id;
+                    let id_str = if let Some(ref id_reader) = id_readers[seg_ord] {
+                        let mut ords = id_reader.term_ords(doc_id);
+                        if let Some(ord) = ords.next() {
+                            let mut text = String::new();
+                            if id_reader.ord_to_str(ord, &mut text).unwrap_or(false) {
+                                text
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    ids.push(id_str);
+                }
+                if needs_score {
+                    scores.push(*score);
+                }
+            }
+
+            // For each column, build per-segment Arrow arrays via cache, then take() matching rows
+            use datafusion::arrow::array::UInt32Array;
+
+            let mut result_columns: Vec<(String, datafusion::arrow::array::ArrayRef)> = Vec::new();
+
+            for (col_idx, column) in columns.iter().enumerate() {
+                let mut segment_arrays: Vec<datafusion::arrow::array::ArrayRef> = Vec::new();
+
+                for (seg_ord, docs) in seg_docs.iter().enumerate() {
+                    if docs.is_empty() {
+                        continue;
+                    }
+                    let seg_id = segment_readers[seg_ord].segment_id();
+                    let max_doc = segment_readers[seg_ord].max_doc();
+                    let reader = &field_plans[seg_ord][col_idx];
+
+                    let cache_max = self.column_cache.max_capacity();
+                    let use_segment_cache =
+                        should_cache_full_segment_array(reader, max_doc, cache_max);
+
+                    if use_segment_cache {
+                        // Check cache, build full-segment array on miss
+                        let full_array = if let Some(cached) = self.column_cache.get(seg_id, column)
+                        {
+                            cached
+                        } else {
+                            let array = build_full_segment_array(reader, max_doc);
+                            self.column_cache.insert(seg_id, column, array.clone());
+                            array
+                        };
+
+                        // take() only matching doc IDs from the full array
+                        let indices =
+                            UInt32Array::from(docs.iter().map(|(d, _)| *d).collect::<Vec<u32>>());
+                        let taken = datafusion::arrow::compute::take(&full_array, &indices, None)?;
+                        segment_arrays.push(taken);
+                    } else {
+                        // Segment too large for cache — read only matching docs directly
+                        let taken = build_selective_array(reader, docs);
+                        segment_arrays.push(taken);
+                    }
+                }
+
+                // Concatenate across segments (preserving top_docs order within each segment)
+                let refs: Vec<&dyn datafusion::arrow::array::Array> =
+                    segment_arrays.iter().map(|a| a.as_ref()).collect();
+                let concatenated = if refs.is_empty() {
+                    // Empty result — build typed empty array from schema
+                    let kind = type_hint_from_schema(&schema, column);
+                    empty_typed_array(kind)
+                } else {
+                    datafusion::arrow::compute::concat(&refs)?
+                };
+                result_columns.push((column.clone(), concatenated));
+            }
+
+            // Build the RecordBatch from the cached/taken columns + ids + scores
+            // We need to reorder rows to match the original top_docs order since we grouped by segment.
+            // Build a mapping: for each (seg_ord, position_in_seg_docs) → position in top_docs
+            let mut seg_positions: Vec<usize> = vec![0; segment_readers.len()];
+            let mut reorder_indices: Vec<u32> = Vec::with_capacity(top_docs.len());
+
+            // First pass: compute output offset per segment
+            let mut seg_offsets: Vec<usize> = Vec::with_capacity(segment_readers.len());
+            let mut offset = 0;
+            for docs in &seg_docs {
+                seg_offsets.push(offset);
+                offset += docs.len();
+            }
+
+            // For each doc in original top_docs order, find its position in the concatenated output
+            for (_, doc_address) in &top_docs {
+                let seg_ord = doc_address.segment_ord as usize;
+                let pos = seg_offsets[seg_ord] + seg_positions[seg_ord];
+                reorder_indices.push(pos as u32);
+                seg_positions[seg_ord] += 1;
+            }
+            let reorder_array = UInt32Array::from(reorder_indices);
+
+            // Reorder all columns to match original top_docs order
+            let mut schema_fields = Vec::new();
+            let mut ordered_arrays: Vec<datafusion::arrow::array::ArrayRef> = Vec::new();
+            let num_rows = top_docs.len();
+
+            // _id column — empty strings if not needed
+            schema_fields.push(datafusion::arrow::datatypes::Field::new(
+                "_id",
+                datafusion::arrow::datatypes::DataType::Utf8,
+                false,
+            ));
+            if needs_id {
+                ordered_arrays.push(std::sync::Arc::new(
+                    datafusion::arrow::array::StringArray::from(ids),
+                ));
+            } else {
+                ordered_arrays.push(std::sync::Arc::new(
+                    datafusion::arrow::array::StringArray::from(vec![""; num_rows]),
+                ));
+            }
+
+            // score column — zeros if not needed
+            schema_fields.push(datafusion::arrow::datatypes::Field::new(
+                "score",
+                datafusion::arrow::datatypes::DataType::Float32,
+                false,
+            ));
+            if needs_score {
+                ordered_arrays.push(std::sync::Arc::new(
+                    datafusion::arrow::array::Float32Array::from(scores),
+                ));
+            } else {
+                ordered_arrays.push(std::sync::Arc::new(
+                    datafusion::arrow::array::Float32Array::from(vec![0.0f32; num_rows]),
+                ));
+            }
+
+            // Data columns — reorder each to match top_docs order
+            for (name, arr) in &result_columns {
+                let reordered =
+                    datafusion::arrow::compute::take(arr.as_ref(), &reorder_array, None)?;
+                let dt = reordered.data_type().clone();
+                schema_fields.push(datafusion::arrow::datatypes::Field::new(name, dt, true));
+                ordered_arrays.push(reordered);
+            }
+
+            let schema =
+                std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(schema_fields));
+            let batch =
+                datafusion::arrow::record_batch::RecordBatch::try_new(schema, ordered_arrays)?;
+            return Ok(super::SqlBatchResult { batch, total_hits });
+        }
+
+        // Fallback: per-doc reading (used when SourceFallback columns are needed)
         let mut projected_columns = std::collections::BTreeMap::new();
         for column in columns {
             projected_columns.insert(column.clone(), Vec::with_capacity(top_docs.len()));
@@ -983,6 +1161,24 @@ impl NumCol {
             NumCol::I64(c) => c.first(doc).map(|v| v as f64),
         }
     }
+
+    /// Batch-read f64 values for a slice of doc IDs.
+    /// Much faster than per-doc `first_f64()` due to sequential memory access patterns.
+    #[inline]
+    fn first_vals_f64(&self, docs: &[tantivy::DocId], output: &mut [Option<f64>]) {
+        match self {
+            NumCol::F64(col) => {
+                col.first_vals(docs, output);
+            }
+            NumCol::I64(col) => {
+                let mut i64_buf: Vec<Option<i64>> = vec![None; docs.len()];
+                col.first_vals(docs, &mut i64_buf);
+                for (i, val) in i64_buf.iter().enumerate() {
+                    output[i] = val.map(|v| v as f64);
+                }
+            }
+        }
+    }
 }
 
 fn open_num_col(
@@ -1079,6 +1275,209 @@ fn open_sql_field_reader(
             .flatten()
             .map(SqlFieldReader::Str)
             .unwrap_or(SqlFieldReader::SourceFallback),
+    }
+}
+
+/// Build a full-segment Arrow array from a fast-field reader.
+/// Reads every doc in the segment (0..max_doc) to produce a complete column.
+fn build_full_segment_array(
+    reader: &SqlFieldReader,
+    max_doc: u32,
+) -> datafusion::arrow::array::ArrayRef {
+    use datafusion::arrow::array::{Float64Builder, Int64Builder, StringBuilder};
+    use std::sync::Arc;
+
+    match reader {
+        SqlFieldReader::F64(col) => {
+            let mut builder = Float64Builder::with_capacity(max_doc as usize);
+            for doc in 0..max_doc {
+                match col.first(doc) {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        SqlFieldReader::I64(col) => {
+            let mut builder = Int64Builder::with_capacity(max_doc as usize);
+            for doc in 0..max_doc {
+                match col.first(doc) {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        SqlFieldReader::Str(col) => {
+            let mut builder = StringBuilder::with_capacity(max_doc as usize, 0);
+            let mut buf = String::new();
+            for doc in 0..max_doc {
+                let mut ords = col.term_ords(doc);
+                if let Some(ord) = ords.next() {
+                    buf.clear();
+                    if col.ord_to_str(ord, &mut buf).unwrap_or(false) {
+                        builder.append_value(&buf);
+                    } else {
+                        builder.append_null();
+                    }
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        SqlFieldReader::SourceFallback => {
+            // Should never be called for SourceFallback — pre-checked by caller
+            Arc::new(datafusion::arrow::array::StringBuilder::new().finish())
+        }
+    }
+}
+
+fn should_cache_full_segment_array(reader: &SqlFieldReader, max_doc: u32, cache_max: u64) -> bool {
+    cache_max > 0 && estimate_full_segment_array_bytes(reader, max_doc) <= cache_max / 4
+}
+
+fn estimate_full_segment_array_bytes(reader: &SqlFieldReader, max_doc: u32) -> u64 {
+    let doc_count = u64::from(max_doc);
+    let null_bitmap_bytes = doc_count.saturating_add(7) / 8;
+
+    match reader {
+        SqlFieldReader::F64(_) | SqlFieldReader::I64(_) => doc_count
+            .saturating_mul(std::mem::size_of::<f64>() as u64)
+            .saturating_add(null_bitmap_bytes),
+        SqlFieldReader::Str(col) => {
+            let offset_bytes = doc_count
+                .saturating_add(1)
+                .saturating_mul(std::mem::size_of::<i32>() as u64);
+            let avg_term_len = estimate_string_array_value_bytes(col);
+            offset_bytes
+                .saturating_add(null_bitmap_bytes)
+                .saturating_add(doc_count.saturating_mul(avg_term_len))
+        }
+        SqlFieldReader::SourceFallback => 0,
+    }
+}
+
+fn estimate_string_array_value_bytes(col: &tantivy::columnar::StrColumn) -> u64 {
+    const MAX_SAMPLES: usize = 32;
+
+    let num_terms = col.num_terms();
+    if num_terms == 0 {
+        return 16;
+    }
+
+    let sample_count = num_terms.min(MAX_SAMPLES);
+    let step = (num_terms.saturating_add(sample_count - 1) / sample_count).max(1);
+    let mut total_len = 0u64;
+    let mut sampled = 0u64;
+    let mut buf = String::new();
+    let mut ord = 0usize;
+
+    while ord < num_terms && sampled < sample_count as u64 {
+        buf.clear();
+        if col.ord_to_str(ord as u64, &mut buf).unwrap_or(false) {
+            total_len = total_len.saturating_add(buf.len() as u64);
+            sampled += 1;
+        }
+        ord = ord.saturating_add(step);
+    }
+
+    if sampled == 0 {
+        return 16;
+    }
+
+    // 2× safety margin: dictionary term lengths don't account for multi-valued docs,
+    // null bitmap overhead, or Arrow offset array padding. Over-estimating is safe
+    // (it just falls back to build_selective_array), under-estimating causes a large
+    // allocation that gets rejected by the cache insert guard.
+    total_len.saturating_mul(2).saturating_div(sampled).max(16)
+}
+
+/// Build an Arrow array containing only the values at specific doc IDs.
+/// Used when the segment is too large to cache the full column.
+fn build_selective_array(
+    reader: &SqlFieldReader,
+    docs: &[(u32, f32)],
+) -> datafusion::arrow::array::ArrayRef {
+    use datafusion::arrow::array::{Float64Builder, Int64Builder, StringBuilder};
+    use std::sync::Arc;
+
+    match reader {
+        SqlFieldReader::F64(col) => {
+            let mut builder = Float64Builder::with_capacity(docs.len());
+            for (doc_id, _) in docs {
+                match col.first(*doc_id) {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        SqlFieldReader::I64(col) => {
+            let mut builder = Int64Builder::with_capacity(docs.len());
+            for (doc_id, _) in docs {
+                match col.first(*doc_id) {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        SqlFieldReader::Str(col) => {
+            let mut builder = StringBuilder::with_capacity(docs.len(), docs.len() * 16);
+            let mut buf = String::new();
+            for (doc_id, _) in docs {
+                let mut ords = col.term_ords(*doc_id);
+                if let Some(ord) = ords.next() {
+                    buf.clear();
+                    if col.ord_to_str(ord, &mut buf).unwrap_or(false) {
+                        builder.append_value(&buf);
+                    } else {
+                        builder.append_null();
+                    }
+                } else {
+                    builder.append_null();
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        SqlFieldReader::SourceFallback => Arc::new(StringBuilder::new().finish()),
+    }
+}
+
+/// Determine column type from Tantivy schema (for building typed empty arrays).
+fn type_hint_from_schema(schema: &Schema, column: &str) -> crate::hybrid::arrow_bridge::ColumnKind {
+    if let Ok(field) = schema.get_field(column) {
+        match schema.get_field_entry(field).field_type() {
+            tantivy::schema::FieldType::F64(_) => crate::hybrid::arrow_bridge::ColumnKind::Float64,
+            tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::U64(_) => {
+                crate::hybrid::arrow_bridge::ColumnKind::Int64
+            }
+            _ => crate::hybrid::arrow_bridge::ColumnKind::Utf8,
+        }
+    } else {
+        crate::hybrid::arrow_bridge::ColumnKind::Utf8
+    }
+}
+
+/// Create an empty Arrow array with the correct type.
+fn empty_typed_array(
+    kind: crate::hybrid::arrow_bridge::ColumnKind,
+) -> datafusion::arrow::array::ArrayRef {
+    use std::sync::Arc;
+    match kind {
+        crate::hybrid::arrow_bridge::ColumnKind::Float64 => Arc::new(
+            datafusion::arrow::array::Float64Array::from(Vec::<f64>::new()),
+        ),
+        crate::hybrid::arrow_bridge::ColumnKind::Int64 => {
+            Arc::new(datafusion::arrow::array::Int64Array::from(Vec::<i64>::new()))
+        }
+        crate::hybrid::arrow_bridge::ColumnKind::Boolean => Arc::new(
+            datafusion::arrow::array::BooleanArray::from(Vec::<bool>::new()),
+        ),
+        crate::hybrid::arrow_bridge::ColumnKind::Utf8 => Arc::new(
+            datafusion::arrow::array::StringArray::from(Vec::<&str>::new()),
+        ),
     }
 }
 
@@ -1250,6 +1649,11 @@ struct GroupedAggSegmentEntry {
     doc_buffer: Vec<tantivy::DocId>,
     /// Reusable ordinal output buffer (avoids allocation per flush).
     ord_buffer: Vec<Option<u64>>,
+    /// Reusable numeric value buffers — one per numeric metric (avoids per-doc reads).
+    /// Indices correspond to positions in `metric_entries` that are `Numeric`.
+    numeric_buffers: Vec<Vec<Option<f64>>>,
+    /// Maps metric_entries index → numeric_buffers index (None if not numeric).
+    numeric_buf_map: Vec<Option<usize>>,
 }
 
 const BATCH_SIZE: usize = 1024;
@@ -1401,6 +1805,21 @@ impl tantivy::collector::Collector for GroupedAggCollector {
                 ))
             };
 
+            // Build numeric buffer mapping: for each metric entry, assign a
+            // numeric_buffers index if it's a Numeric source.
+            let mut numeric_buf_map: Vec<Option<usize>> = Vec::with_capacity(metric_entries.len());
+            let mut num_numeric = 0usize;
+            for me in &metric_entries {
+                if matches!(me.source, GroupedMetricSource::Numeric(_)) {
+                    numeric_buf_map.push(Some(num_numeric));
+                    num_numeric += 1;
+                } else {
+                    numeric_buf_map.push(None);
+                }
+            }
+            let numeric_buffers: Vec<Vec<Option<f64>>> =
+                (0..num_numeric).map(|_| vec![None; BATCH_SIZE]).collect();
+
             entries.push((
                 spec.name.clone(),
                 Some(GroupedAggSegmentEntry {
@@ -1410,6 +1829,8 @@ impl tantivy::collector::Collector for GroupedAggCollector {
                     accum_template,
                     doc_buffer: Vec::with_capacity(BATCH_SIZE),
                     ord_buffer: vec![None; BATCH_SIZE],
+                    numeric_buffers,
+                    numeric_buf_map,
                 }),
             ));
         }
@@ -1541,8 +1962,8 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
     }
 }
 
-/// Flush a batch of buffered doc IDs: batch-read ordinals, then update accumulators.
-/// Only used for single-column string GROUP BY with count-only metrics.
+/// Flush a batch of buffered doc IDs: batch-read ordinals AND numeric values,
+/// then update accumulators. Avoids per-doc fast-field reads for numeric metrics.
 fn flush_batch(entry: &mut GroupedAggSegmentEntry) {
     let batch_len = entry.doc_buffer.len();
     if batch_len == 0 {
@@ -1561,15 +1982,28 @@ fn flush_batch(entry: &mut GroupedAggSegmentEntry) {
         reader.keys_batch(&entry.doc_buffer, &mut entry.ord_buffer[..batch_len]);
     }
 
+    // Batch-read all numeric columns upfront (sequential memory access).
+    for (metric_idx, metric) in entry.metric_entries.iter().enumerate() {
+        if let Some(buf_idx) = entry.numeric_buf_map[metric_idx]
+            && let GroupedMetricSource::Numeric(col) = &metric.source
+        {
+            let buf = &mut entry.numeric_buffers[buf_idx];
+            if buf.len() < batch_len {
+                buf.resize(batch_len, None);
+            }
+            for slot in &mut buf[..batch_len] {
+                *slot = None;
+            }
+            col.first_vals_f64(&entry.doc_buffer, &mut buf[..batch_len]);
+        }
+    }
+
     let GroupedBuckets::Single(map) = &mut entry.buckets else {
         entry.doc_buffer.clear();
         return;
     };
 
-    let has_numeric = entry
-        .metric_entries
-        .iter()
-        .any(|m| matches!(m.source, GroupedMetricSource::Numeric(_)));
+    let has_numeric = !entry.numeric_buffers.is_empty();
 
     for i in 0..batch_len {
         let ord = entry.ord_buffer[i].unwrap_or(u64::MAX);
@@ -1580,8 +2014,44 @@ fn flush_batch(entry: &mut GroupedAggSegmentEntry) {
         });
 
         if has_numeric {
-            // Per-doc accumulator update for numeric metrics
-            update_accumulators(bucket, &entry.metric_entries, entry.doc_buffer[i]);
+            // Use pre-fetched batch values instead of per-doc reads.
+            for (metric_idx, metric) in entry.metric_entries.iter().enumerate() {
+                match (&metric.function, &entry.numeric_buf_map[metric_idx]) {
+                    (crate::search::GroupedMetricFunction::Count, _) => {
+                        if let CompactMetricAccum::Count(c) = &mut bucket.accums[metric_idx] {
+                            *c += 1;
+                        }
+                    }
+                    (
+                        crate::search::GroupedMetricFunction::Sum
+                        | crate::search::GroupedMetricFunction::Avg
+                        | crate::search::GroupedMetricFunction::Min
+                        | crate::search::GroupedMetricFunction::Max,
+                        Some(buf_idx),
+                    ) => {
+                        let Some(value) = entry.numeric_buffers[*buf_idx][i] else {
+                            continue;
+                        };
+                        if let CompactMetricAccum::Stats {
+                            count,
+                            sum,
+                            min,
+                            max,
+                        } = &mut bucket.accums[metric_idx]
+                        {
+                            *count += 1;
+                            *sum += value;
+                            if value < *min {
+                                *min = value;
+                            }
+                            if value > *max {
+                                *max = value;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         } else {
             // Count-only fast path
             for accum in &mut bucket.accums {
@@ -3030,6 +3500,7 @@ mod tests {
                 Duration::from_secs(60),
                 &mappings,
                 TranslogDurability::Request,
+                std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(0)),
             )
             .unwrap();
             engine
@@ -3059,6 +3530,7 @@ mod tests {
             Duration::from_secs(60),
             &reopened_mappings,
             TranslogDurability::Request,
+            std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(0)),
         )
         .unwrap();
 
@@ -3682,6 +4154,7 @@ mod tests {
             Duration::from_secs(60),
             &mappings,
             crate::wal::TranslogDurability::Request,
+            std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(0)),
         )
         .unwrap();
 
@@ -4051,6 +4524,7 @@ mod tests {
             Duration::from_secs(60),
             &mappings,
             TranslogDurability::Request,
+            std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(0)),
         )
         .unwrap();
         (dir, engine)
@@ -5116,6 +5590,7 @@ mod tests {
             Duration::from_secs(60),
             &mappings,
             crate::wal::TranslogDurability::Request,
+            std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(0)),
         )
         .unwrap();
         (dir, engine)
@@ -5590,5 +6065,341 @@ mod tests {
         for i in 0..100 {
             assert_eq!(id_col.value(i), "");
         }
+    }
+
+    // ── Batch numeric reads in GroupedAggCollector ───────────────────────
+
+    /// Helper: extract count from a GroupedMetricPartial
+    fn metric_count(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> u64 {
+        match &bucket.metrics[name] {
+            crate::search::GroupedMetricPartial::Count { count } => *count,
+            crate::search::GroupedMetricPartial::Stats { count, .. } => *count,
+        }
+    }
+
+    /// Helper: extract sum from a GroupedMetricPartial::Stats
+    fn metric_sum(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
+        match &bucket.metrics[name] {
+            crate::search::GroupedMetricPartial::Stats { sum, .. } => *sum,
+            _ => panic!("expected Stats for {}", name),
+        }
+    }
+
+    /// Helper: extract min from a GroupedMetricPartial::Stats
+    fn metric_min(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
+        match &bucket.metrics[name] {
+            crate::search::GroupedMetricPartial::Stats { min, .. } => *min,
+            _ => panic!("expected Stats for {}", name),
+        }
+    }
+
+    /// Helper: extract max from a GroupedMetricPartial::Stats
+    fn metric_max(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
+        match &bucket.metrics[name] {
+            crate::search::GroupedMetricPartial::Stats { max, .. } => *max,
+            _ => panic!("expected Stats for {}", name),
+        }
+    }
+
+    /// Helper: create an engine with brand (keyword), price (float), quantity (integer)
+    /// mappings and insert `n` documents spread across two brands.
+    fn create_grouped_numeric_engine(n: usize) -> (tempfile::TempDir, HotEngine) {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "brand".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".into(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "quantity".into(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        for i in 0..n {
+            let brand = if i % 2 == 0 { "Apple" } else { "Samsung" };
+            let price = 100.0 + i as f64;
+            let quantity = (i + 1) as i64;
+            engine
+                .add_document(
+                    &format!("d{}", i),
+                    json!({"brand": brand, "price": price, "quantity": quantity, "body": "phone"}),
+                )
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+        (_dir, engine)
+    }
+
+    fn grouped_numeric_request(
+        _n_docs: usize,
+        metrics: Vec<crate::search::GroupedMetricAgg>,
+    ) -> SearchRequest {
+        use crate::search::*;
+        SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::from([(
+                "sql_grouped".into(),
+                AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
+                    group_by: vec!["brand".into()],
+                    metrics,
+                }),
+            )]),
+        }
+    }
+
+    #[test]
+    fn grouped_batch_numeric_sum_correctness() {
+        use crate::search::*;
+        // Use > BATCH_SIZE (1024) docs to ensure multiple flushes exercise the batch path.
+        let n = 2050;
+        let (_dir, engine) = create_grouped_numeric_engine(n);
+        let req = grouped_numeric_request(
+            n,
+            vec![
+                GroupedMetricAgg {
+                    output_name: "total".into(),
+                    function: GroupedMetricFunction::Count,
+                    field: None,
+                },
+                GroupedMetricAgg {
+                    output_name: "sum_price".into(),
+                    function: GroupedMetricFunction::Sum,
+                    field: Some("price".into()),
+                },
+            ],
+        );
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, n);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+        assert_eq!(buckets.len(), 2);
+
+        // Apple = even indices: 0,2,4,...,2048 → 1025 docs, prices: 100,102,104,...,2148
+        // Samsung = odd indices: 1,3,5,...,2049 → 1025 docs, prices: 101,103,105,...,2149
+        let apple = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Apple")
+            .unwrap();
+        let samsung = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Samsung")
+            .unwrap();
+
+        assert_eq!(metric_count(apple, "total"), 1025);
+        assert_eq!(metric_count(samsung, "total"), 1025);
+
+        // sum(price) for Apple = sum of (100 + 2k) for k in 0..1025 = 1025*100 + 2*(0+1+...+1024) = 102500 + 2*524800 = 1152100
+        let apple_sum = metric_sum(apple, "sum_price");
+        let expected_apple_sum: f64 = (0..n)
+            .filter(|i| i % 2 == 0)
+            .map(|i| 100.0 + i as f64)
+            .sum();
+        assert!(
+            (apple_sum - expected_apple_sum).abs() < 0.01,
+            "apple sum: {} != {}",
+            apple_sum,
+            expected_apple_sum
+        );
+
+        let samsung_sum = metric_sum(samsung, "sum_price");
+        let expected_samsung_sum: f64 = (0..n)
+            .filter(|i| i % 2 == 1)
+            .map(|i| 100.0 + i as f64)
+            .sum();
+        assert!(
+            (samsung_sum - expected_samsung_sum).abs() < 0.01,
+            "samsung sum: {} != {}",
+            samsung_sum,
+            expected_samsung_sum
+        );
+    }
+
+    #[test]
+    fn grouped_batch_numeric_min_max_correctness() {
+        use crate::search::*;
+        let n = 2050;
+        let (_dir, engine) = create_grouped_numeric_engine(n);
+        let req = grouped_numeric_request(
+            n,
+            vec![
+                GroupedMetricAgg {
+                    output_name: "min_price".into(),
+                    function: GroupedMetricFunction::Min,
+                    field: Some("price".into()),
+                },
+                GroupedMetricAgg {
+                    output_name: "max_price".into(),
+                    function: GroupedMetricFunction::Max,
+                    field: Some("price".into()),
+                },
+            ],
+        );
+
+        let (_, _, partial_aggs) = engine.search_query(&req).unwrap();
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+
+        let apple = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Apple")
+            .unwrap();
+        let samsung = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Samsung")
+            .unwrap();
+
+        // Apple: even indices 0..2048, prices 100.0..2148.0
+        assert!((metric_min(apple, "min_price") - 100.0).abs() < 0.01);
+        assert!((metric_max(apple, "max_price") - (100.0 + (n - 2) as f64)).abs() < 0.01);
+        // Samsung: odd indices 1..2049, prices 101.0..2149.0
+        assert!((metric_min(samsung, "min_price") - 101.0).abs() < 0.01);
+        assert!((metric_max(samsung, "max_price") - (100.0 + (n - 1) as f64)).abs() < 0.01);
+    }
+
+    #[test]
+    fn grouped_batch_numeric_avg_correctness() {
+        use crate::search::*;
+        let n = 2050;
+        let (_dir, engine) = create_grouped_numeric_engine(n);
+        let req = grouped_numeric_request(
+            n,
+            vec![GroupedMetricAgg {
+                output_name: "avg_price".into(),
+                function: GroupedMetricFunction::Avg,
+                field: Some("price".into()),
+            }],
+        );
+
+        let (_, _, partial_aggs) = engine.search_query(&req).unwrap();
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+
+        let apple = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Apple")
+            .unwrap();
+        let expected_avg: f64 = (0..n)
+            .filter(|i| i % 2 == 0)
+            .map(|i| 100.0 + i as f64)
+            .sum::<f64>()
+            / 1025.0;
+        let actual_avg = metric_sum(apple, "avg_price") / metric_count(apple, "avg_price") as f64;
+        assert!(
+            (actual_avg - expected_avg).abs() < 0.01,
+            "avg: {} != {}",
+            actual_avg,
+            expected_avg
+        );
+    }
+
+    #[test]
+    fn grouped_batch_numeric_multiple_columns() {
+        use crate::search::*;
+        // Verify batch reads work with multiple numeric columns (price + quantity).
+        let n = 1500;
+        let (_dir, engine) = create_grouped_numeric_engine(n);
+        let req = grouped_numeric_request(
+            n,
+            vec![
+                GroupedMetricAgg {
+                    output_name: "total".into(),
+                    function: GroupedMetricFunction::Count,
+                    field: None,
+                },
+                GroupedMetricAgg {
+                    output_name: "sum_price".into(),
+                    function: GroupedMetricFunction::Sum,
+                    field: Some("price".into()),
+                },
+                GroupedMetricAgg {
+                    output_name: "sum_qty".into(),
+                    function: GroupedMetricFunction::Sum,
+                    field: Some("quantity".into()),
+                },
+                GroupedMetricAgg {
+                    output_name: "max_qty".into(),
+                    function: GroupedMetricFunction::Max,
+                    field: Some("quantity".into()),
+                },
+            ],
+        );
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, n);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+
+        let apple = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Apple")
+            .unwrap();
+        assert_eq!(metric_count(apple, "total"), 750);
+
+        // quantity for Apple (even i): i+1 for i in [0,2,4,...,1498] → [1,3,5,...,1499]
+        let expected_qty_sum: f64 = (0..n).filter(|i| i % 2 == 0).map(|i| (i + 1) as f64).sum();
+        let actual_qty_sum = metric_sum(apple, "sum_qty");
+        assert!((actual_qty_sum - expected_qty_sum).abs() < 0.01);
+
+        let expected_max_qty = (n - 1) as f64; // last even index (1498) → quantity = 1499
+        assert!((metric_max(apple, "max_qty") - expected_max_qty).abs() < 0.01);
+    }
+
+    #[test]
+    fn grouped_batch_count_only_still_works() {
+        use crate::search::*;
+        // Verify count-only (no numeric metrics) still uses the optimized batch path correctly.
+        let n = 2050;
+        let (_dir, engine) = create_grouped_numeric_engine(n);
+        let req = grouped_numeric_request(
+            n,
+            vec![GroupedMetricAgg {
+                output_name: "cnt".into(),
+                function: GroupedMetricFunction::Count,
+                field: None,
+            }],
+        );
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, n);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+        assert_eq!(buckets.len(), 2);
+
+        let apple = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Apple")
+            .unwrap();
+        let samsung = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Samsung")
+            .unwrap();
+        assert_eq!(metric_count(apple, "cnt"), 1025);
+        assert_eq!(metric_count(samsung, "cnt"), 1025);
     }
 }

@@ -41,10 +41,12 @@ impl Node {
             },
             _ => TranslogDurability::Request,
         };
-        let shard_manager = Arc::new(ShardManager::new_with_durability(
+        let shard_manager = Arc::new(ShardManager::new_full(
             &config.data_dir,
-            Duration::from_secs(5),
             durability,
+            Arc::new(crate::engine::column_cache::ColumnCache::new(
+                crate::engine::column_cache::compute_cache_bytes(config.column_cache_size_percent),
+            )),
         ));
 
         Ok(Self {

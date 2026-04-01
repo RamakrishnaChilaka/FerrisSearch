@@ -14,6 +14,7 @@ use crate::worker::WorkerPools;
 use axum::{
     Json, Router,
     body::Body,
+    extract::State,
     http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -112,12 +113,76 @@ async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
     Response::from_parts(parts, Body::from(bytes))
 }
 
+/// Middleware that records HTTP request count and latency as Prometheus metrics.
+async fn metrics_middleware(req: Request<Body>, next: Next) -> Response {
+    let method = req.method().to_string();
+    let path = normalize_metrics_path(req.uri().path());
+    let start = std::time::Instant::now();
+
+    let response = next.run(req).await;
+
+    let status = response.status().as_u16().to_string();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    crate::metrics::HTTP_REQUESTS_TOTAL
+        .with_label_values(&[&method, &path, &status])
+        .inc();
+    crate::metrics::HTTP_REQUEST_DURATION_SECONDS
+        .with_label_values(&[&method, &path])
+        .observe(elapsed);
+
+    response
+}
+
+/// Normalize request paths for metric labels to avoid high cardinality.
+/// Replaces index names and doc IDs with placeholders.
+fn normalize_metrics_path(path: &str) -> String {
+    let segments: Vec<&str> = path.split('/').collect();
+    match segments.as_slice() {
+        // Root and system endpoints — keep as-is
+        ["", ""] => "/".to_string(),
+        ["", p] if p.starts_with('_') => format!("/{p}"),
+        ["", p, s] if p.starts_with('_') => format!("/{p}/{s}"),
+        // /{index}/_doc/{id}
+        ["", _, "_doc", _] => "/{index}/_doc/{id}".to_string(),
+        // /{index}/_update/{id}
+        ["", _, "_update", _] => "/{index}/_update/{id}".to_string(),
+        // /{index}/{action}/{sub} — _sql/explain
+        ["", _, action, sub] if action.starts_with('_') => {
+            format!("/{{index}}/{action}/{sub}")
+        }
+        // /{index}/{action} — _search, _bulk, _sql, _refresh, etc.
+        ["", _, action] if action.starts_with('_') => {
+            format!("/{{index}}/{action}")
+        }
+        // /{index} — PUT/DELETE/HEAD
+        ["", _] => "/{index}".to_string(),
+        _ => "/{unknown}".to_string(),
+    }
+}
+
+/// Prometheus metrics endpoint. Returns metrics in text exposition format.
+async fn handle_metrics(State(state): State<AppState>) -> Response {
+    crate::metrics::update_cluster_metrics(&state);
+    let body = crate::metrics::gather();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(handle_root))
         .route("/_cluster/health", get(cluster::get_health))
         .route("/_cluster/state", get(cluster::get_state))
         .route("/_cluster/transfer_master", post(cluster::transfer_master))
+        // Metrics
+        .route("/_metrics", get(handle_metrics))
         // _cat APIs
         .route("/_cat/nodes", get(cat::cat_nodes))
         .route("/_cat/shards", get(cat::cat_shards))
@@ -151,5 +216,77 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_flush", post(index::flush_index))
         .route("/{index}/_flush", get(index::flush_index))
         .layer(middleware::from_fn(pretty_json_middleware))
+        .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_root() {
+        assert_eq!(normalize_metrics_path("/"), "/");
+    }
+
+    #[test]
+    fn normalize_system_endpoints() {
+        assert_eq!(
+            normalize_metrics_path("/_cluster/health"),
+            "/_cluster/health"
+        );
+        assert_eq!(normalize_metrics_path("/_cat/nodes"), "/_cat/nodes");
+        assert_eq!(normalize_metrics_path("/_metrics"), "/_metrics");
+        assert_eq!(normalize_metrics_path("/_bulk"), "/_bulk");
+        assert_eq!(normalize_metrics_path("/_sql"), "/_sql");
+    }
+
+    #[test]
+    fn normalize_index_operations() {
+        assert_eq!(normalize_metrics_path("/movies"), "/{index}");
+        assert_eq!(normalize_metrics_path("/benchmark-1gb"), "/{index}");
+    }
+
+    #[test]
+    fn normalize_doc_operations() {
+        assert_eq!(
+            normalize_metrics_path("/movies/_doc/abc123"),
+            "/{index}/_doc/{id}"
+        );
+        assert_eq!(
+            normalize_metrics_path("/movies/_update/abc123"),
+            "/{index}/_update/{id}"
+        );
+    }
+
+    #[test]
+    fn normalize_search_operations() {
+        assert_eq!(
+            normalize_metrics_path("/movies/_search"),
+            "/{index}/_search"
+        );
+        assert_eq!(normalize_metrics_path("/movies/_bulk"), "/{index}/_bulk");
+        assert_eq!(normalize_metrics_path("/movies/_sql"), "/{index}/_sql");
+        assert_eq!(
+            normalize_metrics_path("/movies/_refresh"),
+            "/{index}/_refresh"
+        );
+        assert_eq!(normalize_metrics_path("/movies/_count"), "/{index}/_count");
+    }
+
+    #[test]
+    fn normalize_sql_explain() {
+        assert_eq!(
+            normalize_metrics_path("/movies/_sql/explain"),
+            "/{index}/_sql/explain"
+        );
+    }
+
+    #[test]
+    fn normalize_unknown_paths() {
+        assert_eq!(
+            normalize_metrics_path("/totally-unknown/path"),
+            "/{unknown}"
+        );
+    }
 }

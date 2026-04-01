@@ -1,7 +1,7 @@
 # API Module — src/api/
 
 ## Router (src/api/mod.rs)
-Axum router with middleware for `?pretty` JSON formatting.
+Axum router with two middleware layers and a Prometheus metrics endpoint.
 
 ### Middleware
 ```rust
@@ -10,6 +10,25 @@ async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response
 - When `?pretty` query param present, reformats JSON response with indentation
 - Only applies to `application/json` responses
 - Silently skips if parsing fails
+
+```rust
+async fn metrics_middleware(req: Request<Body>, next: Next) -> Response
+```
+- Records `ferrissearch_http_requests_total` (counter, labels: method/path/status) and `ferrissearch_http_request_duration_seconds` (histogram, labels: method/path) for every HTTP request.
+- Path labels are normalized via `normalize_metrics_path()` to prevent high cardinality — index names become `{index}`, doc IDs become `{id}`, unknown paths become `{unknown}`.
+
+### Metrics Endpoint
+`GET /_metrics` returns all Prometheus metrics in text exposition format.
+- Calls `update_cluster_metrics(state)` on each scrape to refresh cluster/shard/index gauges.
+- Calls `initialize_metrics()` to force-register all `LazyLock` statics even before first traffic, so metrics appear in output from the first scrape.
+- `INDEX_DOCS` gauge is reset before rebuilding to remove stale series from deleted indices.
+
+### Metrics Placement Rules
+- **HTTP-level latency**: `INDEX_LATENCY_SECONDS` and `SEARCH_LATENCY_SECONDS` use RAII `start_timer()` at the top of API handlers. These measure full request wall-clock time including routing, forwarding, and replication — NOT engine-level latency.
+- **Engine-level counters**: `DOCS_INDEXED_TOTAL` and `BULK_DOCS_TOTAL` are incremented in the gRPC transport handler (`src/transport/server.rs`) after the engine write succeeds. This counts actual documents written, not API requests.
+- **SQL counters**: `SQL_QUERIES_TOTAL` (with `mode` label) must be incremented on ALL exit paths from `execute_sql_query()` — including `count_star_fast` and `tantivy_grouped_partials` early returns. The `_sql_timer` histogram uses RAII drop so it auto-observes on all paths.
+- **Bulk requests**: `BULK_REQUESTS_TOTAL` is incremented once per bulk API call in the HTTP handler. `BULK_DOCS_TOTAL` is incremented per-document in the gRPC handler.
+- **Search queries**: `SEARCH_QUERIES_TOTAL` is incremented after successful distributed search in both `search_documents()` and `search_documents_dsl()`.
 
 ### Error Response Helper
 ```rust

@@ -26,6 +26,9 @@ pub struct CompositeEngine {
     checkpoint: std::sync::atomic::AtomicU64,
     /// Global checkpoint: min of all in-sync replica checkpoints (primary only).
     global_cp: std::sync::atomic::AtomicU64,
+    /// Shared column cache for fast-field Arrow arrays.
+    #[allow(dead_code)]
+    column_cache: Arc<super::column_cache::ColumnCache>,
 }
 
 impl CompositeEngine {
@@ -36,6 +39,7 @@ impl CompositeEngine {
             refresh_interval,
             &std::collections::HashMap::new(),
             TranslogDurability::Request,
+            Arc::new(super::column_cache::ColumnCache::new(0)),
         )
     }
 
@@ -45,9 +49,16 @@ impl CompositeEngine {
         refresh_interval: Duration,
         mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
         durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        let text = HotEngine::new_with_mappings(&data_dir, refresh_interval, mappings, durability)?;
+        let text = HotEngine::new_with_mappings(
+            &data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache.clone(),
+        )?;
 
         // Load existing vector index if present
         let vector_path = data_dir.join("vectors.usearch");
@@ -65,6 +76,7 @@ impl CompositeEngine {
             data_dir,
             checkpoint: std::sync::atomic::AtomicU64::new(0),
             global_cp: std::sync::atomic::AtomicU64::new(0),
+            column_cache,
         })
     }
 

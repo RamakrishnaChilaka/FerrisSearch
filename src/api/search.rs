@@ -226,6 +226,8 @@ pub async fn search_documents(
     Path(index_name): Path<String>,
     Query(params): Query<SearchParams>,
 ) -> (StatusCode, Json<Value>) {
+    let _timer = crate::metrics::SEARCH_LATENCY_SECONDS.start_timer();
+
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
         return crate::api::error_response(
             StatusCode::BAD_REQUEST,
@@ -361,6 +363,8 @@ pub async fn search_documents(
     let size = params.size;
     let paginated: Vec<_> = all_hits.into_iter().skip(from).take(size).collect();
 
+    crate::metrics::SEARCH_QUERIES_TOTAL.inc();
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -491,6 +495,7 @@ async fn execute_sql_query(
     query: &str,
 ) -> Result<SqlExecutionResult, (StatusCode, Json<Value>)> {
     let total_start = Instant::now();
+    let _sql_timer = crate::metrics::SQL_LATENCY_SECONDS.start_timer();
 
     // Stage 1: Planning
     let plan_start = Instant::now();
@@ -543,6 +548,10 @@ async fn execute_sql_query(
             row.insert(m.output_name.clone(), serde_json::json!(count));
         }
         let rows = vec![serde_json::Value::Object(row)];
+
+        crate::metrics::SQL_QUERIES_TOTAL
+            .with_label_values(&["count_star_fast"])
+            .inc();
 
         return Ok(SqlExecutionResult {
             plan,
@@ -607,6 +616,10 @@ async fn execute_sql_query(
                 }
             };
         let merge_ms = merge_start.elapsed().as_secs_f64() * 1000.0;
+
+        crate::metrics::SQL_QUERIES_TOTAL
+            .with_label_values(&["tantivy_grouped_partials"])
+            .inc();
 
         return Ok(SqlExecutionResult {
             plan,
@@ -812,6 +825,11 @@ async fn execute_sql_query(
         && plan.limit.is_none()
         && matched_hits > search_req.size
         && execution_mode != "tantivy_grouped_partials";
+
+    // Record SQL metrics
+    crate::metrics::SQL_QUERIES_TOTAL
+        .with_label_values(&[execution_mode])
+        .inc();
 
     Ok(SqlExecutionResult {
         plan,

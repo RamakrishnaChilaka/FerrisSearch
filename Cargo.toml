@@ -14,8 +14,10 @@ comfy-table = "7"
 config = "0.15.21"
 datafusion = "53"
 futures = "0.3.32"
+moka = { version = "0.12", features = ["sync"] }
 murmur3 = "0.5.2"
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "tokio-rt"] }
+prometheus = "0.14"
 prost = "0.13"
 rayon = "1.10"
 redb = "3"

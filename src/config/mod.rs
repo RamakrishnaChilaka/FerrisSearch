@@ -59,6 +59,11 @@ pub struct AppConfig {
     /// Defaults to 5000ms if unset.
     #[serde(default)]
     pub translog_sync_interval_ms: Option<u64>,
+    /// Percentage of system memory to use for the column cache (0-100).
+    /// Caches Arrow arrays built from Tantivy fast-field columns for SQL analytics.
+    /// Default: 10. Set to 0 to disable.
+    #[serde(default = "default_column_cache_size_percent")]
+    pub column_cache_size_percent: u8,
 }
 
 fn default_raft_node_id() -> u64 {
@@ -67,6 +72,10 @@ fn default_raft_node_id() -> u64 {
 
 fn default_translog_durability() -> String {
     "request".to_string()
+}
+
+fn default_column_cache_size_percent() -> u8 {
+    10
 }
 
 impl Default for AppConfig {
@@ -81,6 +90,7 @@ impl Default for AppConfig {
             raft_node_id: 1,
             translog_durability: "request".to_string(),
             translog_sync_interval_ms: None,
+            column_cache_size_percent: 10,
         }
     }
 }

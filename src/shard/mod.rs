@@ -162,6 +162,8 @@ pub struct ShardManager {
     pub isr_tracker: IsrTracker,
     /// Translog durability mode for new shards.
     durability: TranslogDurability,
+    /// Shared column cache for SQL fast-field Arrow arrays.
+    column_cache: Arc<crate::engine::column_cache::ColumnCache>,
 }
 
 impl ShardManager {
@@ -174,6 +176,18 @@ impl ShardManager {
         _refresh_interval: Duration,
         durability: TranslogDurability,
     ) -> Self {
+        Self::new_full(
+            data_dir,
+            durability,
+            Arc::new(crate::engine::column_cache::ColumnCache::new(0)),
+        )
+    }
+
+    pub fn new_full(
+        data_dir: impl Into<PathBuf>,
+        durability: TranslogDurability,
+        column_cache: Arc<crate::engine::column_cache::ColumnCache>,
+    ) -> Self {
         Self {
             data_dir: data_dir.into(),
             shards: RwLock::new(HashMap::new()),
@@ -181,6 +195,7 @@ impl ShardManager {
             index_uuids: RwLock::new(HashMap::new()),
             isr_tracker: IsrTracker::new(1000),
             durability,
+            column_cache,
         }
     }
 
@@ -278,6 +293,7 @@ impl ShardManager {
             refresh_interval,
             mappings,
             self.durability,
+            self.column_cache.clone(),
         ) {
             Ok(e) => Arc::new(e),
             Err(first_err) => {
@@ -295,6 +311,7 @@ impl ShardManager {
                         refresh_interval,
                         mappings,
                         self.durability,
+                        self.column_cache.clone(),
                     )?)
                 } else {
                     return Err(first_err);
