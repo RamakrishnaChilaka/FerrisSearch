@@ -1,0 +1,281 @@
+# SELECT and Projection SQL Correctness Tests
+#
+# Covers SELECT variations, LIMIT/OFFSET, ORDER BY, and execution strategy paths.
+# Inspired by DataFusion's select.slt, limit.slt, and order.slt.
+#
+# Dataset (10 docs — same as basic.slt)
+
+# ── SELECT specific columns (fast-field path) ───────────────────────
+
+query T rowsort
+SELECT author FROM stories
+----
+alice
+alice
+alice
+bob
+bob
+carol
+carol
+dave
+dave
+eve
+
+query T rowsort
+SELECT DISTINCT author FROM stories
+----
+alice
+bob
+carol
+dave
+eve
+
+query T rowsort
+SELECT DISTINCT category FROM stories
+----
+culture
+ml
+python
+rust
+startup
+
+# ── SELECT with alias ────────────────────────────────────────────────
+
+query TI nosort
+SELECT author AS writer, count(*) AS articles FROM stories GROUP BY author ORDER BY articles DESC, writer ASC LIMIT 3
+----
+alice 3
+bob 2
+carol 2
+
+# ── SELECT * (materialized hits fallback) ────────────────────────────
+
+# SELECT * returns all columns; just check count and structure
+query I nosort
+SELECT count(*) FROM stories
+----
+10
+
+# ── LIMIT without ORDER BY ──────────────────────────────────────────
+
+# With ORDER BY on fast field + LIMIT, exactly N rows returned
+query TI nosort
+SELECT author, upvotes FROM stories ORDER BY upvotes DESC LIMIT 5
+----
+carol 1000
+eve 800
+bob 500
+carol 400
+bob 300
+
+# ── LIMIT with ORDER BY on fast field ────────────────────────────────
+
+query TI nosort
+SELECT author, upvotes FROM stories ORDER BY upvotes DESC LIMIT 3
+----
+carol 1000
+eve 800
+bob 500
+
+query TI nosort
+SELECT author, upvotes FROM stories ORDER BY upvotes ASC LIMIT 3
+----
+dave 50
+alice 120
+dave 150
+
+# ── LIMIT with OFFSET ────────────────────────────────────────────────
+
+query TI nosort
+SELECT author, upvotes FROM stories ORDER BY upvotes DESC LIMIT 3 OFFSET 2
+----
+bob 500
+carol 400
+bob 300
+
+query TI nosort
+SELECT author, upvotes FROM stories ORDER BY upvotes DESC LIMIT 2 OFFSET 8
+----
+alice 120
+dave 50
+
+# OFFSET past all rows returns empty
+query TI nosort
+SELECT author, upvotes FROM stories ORDER BY upvotes DESC LIMIT 5 OFFSET 100
+----
+
+# ── ORDER BY multiple columns ────────────────────────────────────────
+
+query TI nosort
+SELECT author, upvotes FROM stories ORDER BY author ASC, upvotes DESC
+----
+alice 250
+alice 180
+alice 120
+bob 500
+bob 300
+carol 1000
+carol 400
+dave 150
+dave 50
+eve 800
+
+# ── ORDER BY with GROUP BY ───────────────────────────────────────────
+
+query TR nosort
+SELECT author, avg(upvotes) AS avg_up FROM stories GROUP BY author ORDER BY avg_up ASC
+----
+dave 100.0
+alice 183.3
+bob 400.0
+carol 700.0
+eve 800.0
+
+# ── HAVING with different comparison operators ───────────────────────
+
+# HAVING >= (greater-than-or-equal)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt >= 2 ORDER BY cnt DESC, author ASC
+----
+alice 3
+bob 2
+carol 2
+dave 2
+
+# HAVING < (less-than)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt < 2 ORDER BY author
+----
+eve 1
+
+# HAVING <= (less-than-or-equal)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt <= 1 ORDER BY author
+----
+eve 1
+
+# HAVING = (exact match)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt = 3 ORDER BY author
+----
+alice 3
+
+# HAVING with flipped comparison (literal on left)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING 2 < cnt ORDER BY author
+----
+alice 3
+
+# ── Aggregate without GROUP BY (ungrouped aggregate) ─────────────────
+
+query I nosort
+SELECT count(*) FROM stories
+----
+10
+
+query R nosort
+SELECT avg(upvotes) FROM stories
+----
+375.0
+
+query R nosort
+SELECT sum(upvotes) FROM stories
+----
+3750.0
+
+query R nosort
+SELECT min(upvotes) FROM stories
+----
+50.0
+
+query R nosort
+SELECT max(upvotes) FROM stories
+----
+1000.0
+
+# Multiple ungrouped aggregates
+query RRRRR nosort
+SELECT count(*) AS cnt, sum(upvotes) AS s, avg(upvotes) AS a, min(upvotes) AS mn, max(upvotes) AS mx FROM stories
+----
+10 3750.0 375.0 50.0 1000.0
+
+# Ungrouped aggregate with WHERE
+query IR nosort
+SELECT count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE upvotes > 400
+----
+3 766.7
+
+# ── SELECT with WHERE on pushdown field (no GROUP BY) ────────────────
+
+query TI nosort
+SELECT author, upvotes FROM stories WHERE upvotes > 400 ORDER BY upvotes DESC
+----
+carol 1000
+eve 800
+bob 500
+
+query TI nosort
+SELECT author, comments FROM stories WHERE author = 'alice' ORDER BY comments DESC
+----
+alice 92
+alice 45
+alice 30
+
+# ── Multi-column projection + filter ─────────────────────────────────
+
+query TTI nosort
+SELECT author, category, upvotes FROM stories WHERE category = 'rust' ORDER BY upvotes DESC
+----
+alice rust 250
+alice rust 180
+dave rust 150
+alice rust 120
+
+# Actually for nosort, columns are tab-separated on each row.
+# The result must match column order in the SELECT.
+
+query TTI nosort
+SELECT author, category, upvotes FROM stories WHERE category = 'python' ORDER BY upvotes DESC
+----
+bob python 500
+bob python 300
+
+# ── COUNT with field (not *) ─────────────────────────────────────────
+# count(field) counts non-null values — all our fields are non-null
+query I nosort
+SELECT count(upvotes) FROM stories
+----
+10
+
+# ── Computed aggregate expressions (DataFusion fallback) ─────────────
+# These are NOT simple aggregates — they contain arithmetic over aggregates.
+# The grouped partials path can't handle them, so they fall to
+# tantivy_fast_fields + DataFusion, which evaluates the expressions.
+
+# Simple arithmetic on aggregates (ungrouped)
+query R nosort
+SELECT sum(upvotes) * 1.0 / count(*) FROM stories
+----
+375.0
+
+# count(*) * constant / avg()
+query R nosort
+SELECT count(*) * 10.0 / avg(upvotes) FROM stories
+----
+0.3
+
+# Grouped computed expression
+query TR nosort
+SELECT author, sum(upvotes) * 1.0 / count(*) AS avg_manual FROM stories GROUP BY author ORDER BY avg_manual DESC LIMIT 3
+----
+eve 800.0
+carol 700.0
+bob 400.0
+
+# Difference of aggregates
+query TI nosort
+SELECT author, max(upvotes) - min(upvotes) AS spread FROM stories GROUP BY author ORDER BY spread DESC LIMIT 3
+----
+carol 600
+bob 200
+alice 130

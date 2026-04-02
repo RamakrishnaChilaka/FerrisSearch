@@ -285,10 +285,11 @@ fn format_value(val: &Value) -> String {
 }
 
 fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}…", &s[..max_len - 1])
+        let truncated: String = s.chars().take(max_len - 1).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -1120,5 +1121,52 @@ mod tests {
         let table =
             extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");
         assert_eq!(table, "benchmark-1gb");
+    }
+
+    // ── truncate_string (UTF-8 safety) ─────────────────────────────
+
+    #[test]
+    fn truncate_ascii_within_limit() {
+        assert_eq!(truncate_string("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_at_limit() {
+        assert_eq!(truncate_string("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_over_limit() {
+        assert_eq!(truncate_string("hello world", 6), "hello…");
+    }
+
+    #[test]
+    fn truncate_multibyte_endash_no_panic() {
+        // The exact crash case: en-dash '–' is 3 bytes in UTF-8
+        let s = "Drupal Core – Highly Critical – Remote Code Execution – SA-CORE-2018-002";
+        let result = truncate_string(s, 60);
+        assert!(result.ends_with('…'));
+        assert!(result.chars().count() <= 60);
+    }
+
+    #[test]
+    fn truncate_emoji_no_panic() {
+        let s = "Hello 🌍 World 🎉 Rust 🦀 is great";
+        let result = truncate_string(s, 15);
+        assert!(result.ends_with('…'));
+        assert!(result.chars().count() <= 15);
+    }
+
+    #[test]
+    fn truncate_cjk_no_panic() {
+        let s = "これは日本語のテストです";
+        let result = truncate_string(s, 6);
+        assert!(result.ends_with('…'));
+        assert_eq!(result.chars().count(), 6);
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_string("", 10), "");
     }
 }

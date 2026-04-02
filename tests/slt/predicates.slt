@@ -1,0 +1,391 @@
+# Predicate Pushdown and WHERE Clause SQL Correctness Tests
+#
+# Inspired by DataFusion's predicates.slt — covers all WHERE clause patterns
+# that FerrisSearch's planner handles: equality, comparison operators, BETWEEN,
+# IN, OR, NOT variants, and combinations with text_match.
+#
+# Dataset (10 docs — same as basic.slt):
+#   doc-1: alice, "Show HN: Rust search engine",   upvotes=250,  comments=45,  category=rust
+#   doc-2: alice, "Rust vs Go performance",         upvotes=180,  comments=92,  category=rust
+#   doc-3: alice, "Why Rust is great for systems",  upvotes=120,  comments=30,  category=rust
+#   doc-4: bob,   "Python 4.0 released",            upvotes=500,  comments=200, category=python
+#   doc-5: bob,   "Machine learning with Python",   upvotes=300,  comments=150, category=python
+#   doc-6: carol, "Deep learning frameworks compared", upvotes=400, comments=80, category=ml
+#   doc-7: carol, "GPT-5 announcement",             upvotes=1000, comments=500, category=ml
+#   doc-8: dave,  "Startup funding trends 2026",    upvotes=50,   comments=20,  category=startup
+#   doc-9: dave,  "Building a startup in Rust",     upvotes=150,  comments=35,  category=rust
+#   doc-10: eve,  "Remote work is dead",             upvotes=800,  comments=600, category=culture
+
+# ── Equality pushdown (=) ────────────────────────────────────────────
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE author = 'alice' GROUP BY author
+----
+alice 3
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE author = 'eve' GROUP BY author
+----
+eve 1
+
+query TI nosort
+SELECT category, count(*) AS cnt FROM stories WHERE category = 'rust' GROUP BY category
+----
+rust 4
+
+# ── Greater-than (>) ─────────────────────────────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes > 400
+----
+3
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes > 999
+----
+1
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes > 1000
+----
+
+# ── Greater-than-or-equal (>=) ───────────────────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes >= 400
+----
+4
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes >= 1000
+----
+1
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes >= 1001
+----
+
+# ── Less-than (<) ────────────────────────────────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes < 100
+----
+1
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes < 50
+----
+
+# ── Less-than-or-equal (<=) ──────────────────────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes <= 50
+----
+1
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes <= 120
+----
+2
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes <= 49
+----
+
+# ── BETWEEN pushdown ─────────────────────────────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes BETWEEN 100 AND 300
+----
+5
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes BETWEEN 500 AND 1000
+----
+3
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes BETWEEN 1001 AND 2000
+----
+
+# BETWEEN with GROUP BY
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes BETWEEN 100 AND 500 GROUP BY author
+----
+alice 3
+bob 2
+carol 1
+dave 1
+
+# ── IN pushdown ──────────────────────────────────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE author IN ('alice', 'bob')
+----
+5
+
+query I nosort
+SELECT count(*) FROM stories WHERE author IN ('alice')
+----
+3
+
+query I nosort
+SELECT count(*) FROM stories WHERE author IN ('alice', 'bob', 'carol', 'dave', 'eve')
+----
+10
+
+query I nosort
+SELECT count(*) FROM stories WHERE author IN ('nobody')
+----
+
+# IN with GROUP BY
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE author IN ('alice', 'carol') GROUP BY author
+----
+alice 3
+carol 2
+
+# IN with numeric values
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes IN (250, 500, 1000) GROUP BY author
+----
+alice 1
+bob 1
+carol 1
+
+# ── OR disjunction pushdown ─────────────────────────────────────────
+
+# Two-way OR on keyword
+query I nosort
+SELECT count(*) FROM stories WHERE author = 'alice' OR author = 'bob'
+----
+5
+
+# Three-way OR
+query I nosort
+SELECT count(*) FROM stories WHERE author = 'alice' OR author = 'bob' OR author = 'eve'
+----
+6
+
+# OR with GROUP BY (the original bug case)
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE author = 'alice' OR author = 'bob' GROUP BY author
+----
+alice 3
+bob 2
+
+# OR with aggregates
+query TIR nosort
+SELECT author, count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE author = 'carol' OR author = 'eve' GROUP BY author ORDER BY avg_up DESC
+----
+eve 1 800.0
+carol 2 700.0
+
+# OR with range predicates
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes < 100 OR upvotes > 900 GROUP BY author
+----
+carol 1
+dave 1
+
+# OR on mixed operators
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes = 250 OR upvotes = 500 OR upvotes = 1000
+----
+3
+
+# OR combined with AND
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes > 200 AND (author = 'bob' OR author = 'carol') GROUP BY author
+----
+bob 2
+carol 2
+
+# OR combined with text_match (separate AND branches)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE text_match(title, 'rust') AND (author = 'alice' OR author = 'dave') GROUP BY author ORDER BY cnt DESC
+----
+alice 3
+dave 1
+
+# OR + HAVING
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE author = 'alice' OR author = 'bob' OR author = 'carol' OR author = 'dave' GROUP BY author HAVING cnt > 1 ORDER BY cnt DESC, author ASC
+----
+alice 3
+bob 2
+carol 2
+dave 2
+
+# OR on category field
+query TI rowsort
+SELECT category, count(*) AS cnt FROM stories WHERE category = 'rust' OR category = 'ml' GROUP BY category
+----
+ml 2
+rust 4
+
+# ── Flipped comparisons (literal on left) ────────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE 200 < upvotes
+----
+6
+
+query I nosort
+SELECT count(*) FROM stories WHERE 400 <= upvotes
+----
+4
+
+query I nosort
+SELECT count(*) FROM stories WHERE 100 > upvotes
+----
+1
+
+query I nosort
+SELECT count(*) FROM stories WHERE 120 >= upvotes
+----
+2
+
+# ── Negative numbers in predicates ───────────────────────────────────
+# All upvotes are positive, so this should return all rows
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes > -1
+----
+10
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes >= -100
+----
+10
+
+# ── Compound predicates (AND combinations) ───────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes > 100 AND upvotes < 500
+----
+6
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes >= 100 AND upvotes <= 500 AND author = 'alice'
+----
+3
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes > 200 AND comments > 100
+----
+4
+
+# AND + GROUP BY
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes > 200 AND comments > 100 GROUP BY author
+----
+bob 2
+carol 1
+eve 1
+
+# ── text_match combined with pushdown filters ────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE text_match(title, 'rust') AND upvotes > 200
+----
+1
+
+query I nosort
+SELECT count(*) FROM stories WHERE text_match(title, 'python') AND upvotes >= 300
+----
+2
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE text_match(title, 'learning') AND upvotes > 200 GROUP BY author ORDER BY cnt DESC, author ASC
+----
+bob 1
+carol 1
+
+# text_match + BETWEEN
+query I nosort
+SELECT count(*) FROM stories WHERE text_match(title, 'rust') AND upvotes BETWEEN 100 AND 200
+----
+3
+
+# text_match + IN
+query I nosort
+SELECT count(*) FROM stories WHERE text_match(title, 'rust') AND author IN ('alice', 'dave')
+----
+4
+
+# text_match + OR (OR on separate AND branch)
+query I nosort
+SELECT count(*) FROM stories WHERE text_match(title, 'rust') AND (upvotes > 200 OR comments > 50)
+----
+2
+
+# ── NOT BETWEEN (residual, handled by DataFusion) ───────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes NOT BETWEEN 100 AND 800
+----
+2
+
+# ── NOT IN (residual, handled by DataFusion) ─────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE author NOT IN ('alice', 'bob')
+----
+5
+
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE author NOT IN ('alice', 'bob') GROUP BY author
+----
+carol 2
+dave 2
+eve 1
+
+# ── != / <> (residual, handled by DataFusion) ────────────────────────
+
+query I nosort
+SELECT count(*) FROM stories WHERE author != 'alice'
+----
+7
+
+query I nosort
+SELECT count(*) FROM stories WHERE author <> 'alice'
+----
+7
+
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE author != 'alice' GROUP BY author
+----
+bob 2
+carol 2
+dave 2
+eve 1
+
+# ── Multiple predicates that mix pushed and residual ─────────────────
+
+# upvotes > 200 is pushed, author != 'bob' is residual
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes > 200 AND author != 'bob' GROUP BY author
+----
+alice 1
+carol 2
+eve 1
+
+# ── Empty results (predicate filters everything) ─────────────────────
+
+# NOTE: Standard SQL says ungrouped count(*) with zero matches should return
+# one row containing 0.  FerrisSearch currently returns zero rows because
+# the grouped partials path produces zero partial states.  This is a known
+# deviation tracked for future fix.  The GROUP BY case (zero groups → zero
+# output rows) IS correct per the SQL standard.
+
+query I nosort
+SELECT count(*) FROM stories WHERE author = 'nobody'
+----
+
+query I nosort
+SELECT count(*) FROM stories WHERE upvotes > 10000
+----
+
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE author = 'nobody' GROUP BY author
+----
