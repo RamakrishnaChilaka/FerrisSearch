@@ -45,7 +45,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - When a SQL query has LIMIT/OFFSET and ORDER BY is `_score`-only (or absent), the limit is pushed into Tantivy's `TopDocs` collector.
 - When ORDER BY is a single non-score fast-field column (e.g., `ORDER BY price DESC`), both the sort and limit are pushed into Tantivy via `TopDocs::order_by_fast_field()`. This avoids materializing 100K docs and sorting in DataFusion.
 - **LIMIT pushdown applies to all query shapes including `SELECT *`.** The `selects_all_columns` flag does NOT block limit pushdown — it only determines whether the fast-field or materialized-fallback execution path is used. For `SELECT * LIMIT 4`, the engine collects only 4 docs (not 100K) and materializes only those 4.
-- **LIMIT with GROUP BY does NOT push to Tantivy.** When `grouped_sql.is_some()`, limit is applied after merge in `execute_grouped_partial_sql`. The pipeline order is: merge → HAVING → top-K selection → LIMIT/OFFSET.
+- **LIMIT with GROUP BY does NOT push to Tantivy.** When `grouped_sql.is_some()`, limit is applied after merge in `execute_grouped_partial_sql`. When `grouped_sql.is_none()` but `group_by_columns` is non-empty (computed aggregate expressions that fell through the grouped partials planner), LIMIT is also NOT pushed — DataFusion needs all matching docs to produce correct GROUP BY results. The pipeline order for grouped partials is: merge → HAVING → top-K selection → LIMIT/OFFSET.
 - **Top-K selection**: When ORDER BY + LIMIT are both present on grouped partials, uses `select_nth_unstable_by` (O(N) average) instead of full sort (O(N log N)). Only the top-K subset is fully sorted. `GroupedSqlPlan::uses_top_k()` detects eligibility. The EXPLAIN pipeline shows `"top_k_selection": true`.
 - `QueryPlan` has `limit: Option<usize>`, `offset: Option<usize>`, `limit_pushed_down: bool`, and `sort_pushdown: Option<(String, bool)>` fields.
 - `sort_pushdown` captures the single ORDER BY column name and direction (true = DESC) when eligible for fast-field sort pushdown.
@@ -53,7 +53,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Multi-column ORDER BY cannot be pushed — falls back to DataFusion sorting.
 - `parse_limit_expr()` and `parse_offset_expr()` extract numeric values from `sqlparser::ast::LimitClause`.
 - When limit is pushed down, the Tantivy search collects only `limit + offset` docs instead of the default 100K.
-- The `limit_pushed_down` guard conditions are: `limit.is_some() && !has_residual_predicates && grouped_sql.is_none() && (is_order_by_score_only || sort_pushdown.is_some())`.
+- The `limit_pushed_down` guard conditions are: `limit.is_some() && !has_residual_predicates && grouped_sql.is_none() && group_by_columns.is_empty() && (is_order_by_score_only || sort_pushdown.is_some())`.
 
 ## Distributed Fast-Field SQL
 - The `tantivy_fast_fields` path now works across multi-node clusters.
@@ -83,11 +83,16 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Split planning into two stages:
   1. search-aware planning in Tantivy
   2. residual SQL planning in DataFusion
-- Push `text_match(...)`, exact filters (`=`), range filters (`>`, `>=`, `<`, `<=`), `BETWEEN`, and `IN` into Tantivy before Arrow/DataFusion execution.
+- Push `text_match(...)`, exact filters (`=`), range filters (`>`, `>=`, `<`, `<=`), `BETWEEN`, `IN`, and `OR` disjunctions into Tantivy before Arrow/DataFusion execution.
 - `BETWEEN a AND b` is pushed as `Range { gte: a, lte: b }` — reuses existing Range query support.
 - `IN (a, b, c)` is pushed as `Bool { should: [Term(a), Term(b), Term(c)] }` — reuses existing Bool+Term support.
+- `OR` disjunctions (e.g., `author = 'pg' OR author = 'sama'`) are pushed as `Bool { should: [...] }` when ALL branches are individually pushable. Nested ORs are flattened. Parenthesized expressions are unwrapped.
+- If any OR branch is not pushable (e.g., contains `text_match`), the planner returns an error. `text_match()` must appear as a top-level AND predicate, not inside OR or complex expressions.
+- The `expr_contains_text_match` guard walks all expression shapes that can survive as residual predicates: `BinaryOp`, `Nested`, `UnaryOp`, `IsNull`, `IsNotNull`, `Cast`, `Case` (with `CaseWhen` arms), `Between`, `InList`, and `Function` arguments (for `COALESCE(text_match(...), false)` etc.).
 - `NOT IN` and `NOT BETWEEN` are NOT pushed — they remain as residual predicates for DataFusion.
-- `score` and `_id` fields are never pushed (score is computed by Tantivy, _id is a doc identifier).
+- `score`, `_score`, and `_id` fields are never pushed (score is computed by Tantivy, _id is a doc identifier).
+- **GROUP BY expressions** (e.g., `GROUP BY LOWER(author)`, `GROUP BY year / 10`) are NOT eligible for the grouped partials path. Only plain column references in GROUP BY enable `tantivy_grouped_partials`. Expression-based GROUP BY falls through to `tantivy_fast_fields` + DataFusion. Mixed GROUP BY (plain columns + expressions, e.g., `GROUP BY author, LOWER(category)`) also bails — `collect_group_by_columns` returns `has_expression_group_by = true` which gates `extract_grouped_sql_plan`.
+- `collect_expr_columns` handles `Cast`, `Case` (with `CaseWhen` arms), and `Like`/`ILike` expressions to ensure all referenced columns are read from fast fields.
 - **SELECT aliases are never pushed down.** If a WHERE predicate references a SELECT alias (e.g., `WHERE posts > 10` when `posts` is `count(*) AS posts`), it stays as a residual predicate for DataFusion. This prevents pushing filters on nonexistent Tantivy fields, which silently fall back to the `body` catch-all field and match nearly everything.
 - Prefer shard-local partial execution before coordinator-side row materialization.
 - Treat `materialized_hits_fallback` as a compatibility path, not the target architecture.

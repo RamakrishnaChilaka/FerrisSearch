@@ -351,3 +351,66 @@ query IR
 SELECT count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE upvotes > 200
 ----
 6 541.7
+
+# ── OR predicate pushdown ───────────────────────────────────────────
+# OR on equality predicates must be pushed as Bool { should: [...] }
+# so the grouped_partials path is used (not a full scan).
+
+# Two-way OR on keyword field
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE author = 'alice' OR author = 'bob' GROUP BY author
+----
+alice 3
+bob 2
+
+# Three-way OR
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE author = 'alice' OR author = 'bob' OR author = 'eve' GROUP BY author
+----
+alice 3
+bob 2
+eve 1
+
+# OR with aggregates
+query TIR nosort
+SELECT author, count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE author = 'carol' OR author = 'eve' GROUP BY author ORDER BY avg_up DESC
+----
+eve 1 800.0
+carol 2 700.0
+
+# OR combined with AND: pushdown filter + OR equality
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes > 200 AND (author = 'bob' OR author = 'carol') GROUP BY author
+----
+bob 2
+carol 2
+
+# OR with range predicates
+query TI rowsort
+SELECT author, count(*) AS cnt FROM stories WHERE upvotes < 100 OR upvotes > 900 GROUP BY author
+----
+carol 1
+dave 1
+
+# OR + text_match (OR doesn't block text_match pushdown when on separate AND branch)
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE text_match(title, 'rust') AND (author = 'alice' OR author = 'dave') GROUP BY author ORDER BY cnt DESC
+----
+alice 3
+dave 1
+
+# OR + HAVING
+query TI nosort
+SELECT author, count(*) AS cnt FROM stories WHERE author = 'alice' OR author = 'bob' OR author = 'carol' OR author = 'dave' GROUP BY author HAVING cnt > 1 ORDER BY cnt DESC, author ASC
+----
+alice 3
+bob 2
+carol 2
+dave 2
+
+# OR on category field
+query TI rowsort
+SELECT category, count(*) AS cnt FROM stories WHERE category = 'rust' OR category = 'ml' GROUP BY category
+----
+ml 2
+rust 4

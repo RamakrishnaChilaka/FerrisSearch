@@ -419,12 +419,13 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     rewrite_table_name(select);
     let (required_columns, needs_id, needs_score) =
         collect_required_columns(select, order_by.as_ref());
-    let group_by_columns = collect_group_by_columns(select);
+    let (group_by_columns, has_expression_group_by) = collect_group_by_columns(select);
     let grouped_sql = extract_grouped_sql_plan(
         select,
         order_by.as_ref(),
         has_residual_predicates,
         selects_all_columns,
+        has_expression_group_by,
         limit,
         offset,
         &group_by_columns,
@@ -435,6 +436,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     let limit_pushed_down = limit.is_some()
         && !has_residual_predicates
         && grouped_sql.is_none()
+        && group_by_columns.is_empty()
         && (is_order_by_score_only(order_by.as_ref()) || sort_pushdown.is_some());
 
     // Safety: if no data columns, _id, or score are needed and we're not on the
@@ -466,16 +468,21 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_grouped_sql_plan(
     select: &Select,
     order_by: Option<&sqlparser::ast::OrderBy>,
     has_residual_predicates: bool,
     selects_all_columns: bool,
+    has_expression_group_by: bool,
     _limit: Option<usize>,
     _offset: Option<usize>,
     group_by_columns: &[String],
 ) -> Result<Option<GroupedSqlPlan>> {
-    if has_residual_predicates || selects_all_columns {
+    // Expression-based GROUP BY (e.g., LOWER(author), year / 10) cannot use
+    // the grouped partials path — it would group by the raw column instead of
+    // the expression result. Fall through to DataFusion.
+    if has_residual_predicates || selects_all_columns || has_expression_group_by {
         return Ok(None);
     }
 
@@ -903,7 +910,102 @@ fn extract_pushdowns(
     }
 
     *selection = combine_conjunctions(residual);
+
+    // Safety check: if text_match() survived in residual predicates (e.g.,
+    // `text_match(title, 'rust') OR author = 'pg'`), DataFusion will crash
+    // because text_match is not a registered UDF. Bail with a clear error.
+    if let Some(sel) = selection.as_ref()
+        && expr_contains_text_match(sel)
+    {
+        bail!(
+            "text_match() cannot be used inside OR or complex expressions; \
+             it must appear as a top-level AND predicate"
+        );
+    }
+
     Ok((text_match, pushed_filters))
+}
+
+/// Returns true if the expression tree contains a `text_match(...)` function call.
+/// Walks all expression shapes that could survive as residual predicates.
+fn expr_contains_text_match(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(f) => {
+            if f.name.to_string().eq_ignore_ascii_case("text_match") {
+                return true;
+            }
+            // Recurse into function arguments (e.g., COALESCE(text_match(...), false))
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            if expr_contains_text_match(e) {
+                                return true;
+                            }
+                        }
+                        FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        }
+                        | FunctionArg::ExprNamed {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
+                            if expr_contains_text_match(e) {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            false
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_text_match(left) || expr_contains_text_match(right)
+        }
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => expr_contains_text_match(inner),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand
+                && expr_contains_text_match(op)
+            {
+                return true;
+            }
+            for case_when in conditions {
+                if expr_contains_text_match(&case_when.condition)
+                    || expr_contains_text_match(&case_when.result)
+                {
+                    return true;
+                }
+            }
+            if let Some(el) = else_result
+                && expr_contains_text_match(el)
+            {
+                return true;
+            }
+            false
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_contains_text_match(e)
+                || expr_contains_text_match(low)
+                || expr_contains_text_match(high)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            expr_contains_text_match(e) || list.iter().any(expr_contains_text_match)
+        }
+        _ => false,
+    }
 }
 
 /// Returns true if the predicate references any SELECT alias.
@@ -997,7 +1099,57 @@ fn parse_text_match(expr: &Expr) -> Result<Option<TextMatchPredicate>> {
     Ok(Some(TextMatchPredicate { field, query }))
 }
 
+fn collect_or_branches<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            collect_or_branches(left, out);
+            collect_or_branches(right, out);
+        }
+        Expr::Nested(inner) => collect_or_branches(inner, out),
+        other => out.push(other),
+    }
+}
+
 fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryClause>> {
+    // Unwrap parenthesized expressions
+    if let Expr::Nested(inner) = expr {
+        return parse_pushdown_predicate(inner);
+    }
+
+    // OR disjunction: push down if ALL branches are individually pushable.
+    // `author = 'pg' OR author = 'sama'` → Bool { should: [Term(pg), Term(sama)] }
+    if matches!(
+        expr,
+        Expr::BinaryOp {
+            op: BinaryOperator::Or,
+            ..
+        }
+    ) {
+        let mut branches = Vec::new();
+        collect_or_branches(expr, &mut branches);
+        let mut clauses = Vec::new();
+        for branch in branches {
+            if let Some(clause) = parse_pushdown_predicate(branch)? {
+                clauses.push(clause);
+            } else {
+                return Ok(None);
+            }
+        }
+        if clauses.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(crate::search::QueryClause::Bool(
+            crate::search::BoolQuery {
+                should: clauses,
+                ..Default::default()
+            },
+        )));
+    }
+
     // BETWEEN field AND low AND high → Range { gte: low, lte: high }
     if let Expr::Between {
         expr: between_expr,
@@ -1009,7 +1161,7 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
         let Some(field) = expr_to_field_name(between_expr) else {
             return Ok(None);
         };
-        if field == "score" || field == "_id" {
+        if field == "score" || field == "_score" || field == "_id" {
             return Ok(None);
         }
         let (Some(low_val), Some(high_val)) = (expr_to_json_value(low)?, expr_to_json_value(high)?)
@@ -1036,7 +1188,7 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
         let Some(field) = expr_to_field_name(in_expr) else {
             return Ok(None);
         };
-        if field == "score" || field == "_id" {
+        if field == "score" || field == "_score" || field == "_id" {
             return Ok(None);
         }
         let mut terms = Vec::new();
@@ -1068,7 +1220,7 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
         return Ok(None);
     };
 
-    if field == "score" || field == "_id" {
+    if field == "score" || field == "_score" || field == "_id" {
         return Ok(None);
     }
 
@@ -1243,12 +1395,32 @@ fn collect_required_columns(
     (columns.into_iter().collect(), needs_id, needs_score)
 }
 
-fn collect_group_by_columns(select: &Select) -> Vec<String> {
+/// Returns (plain_column_names, has_expression_group_by).
+/// `has_expression_group_by` is true when any GROUP BY item is NOT a plain column
+/// reference (e.g., `GROUP BY LOWER(author)` or `GROUP BY year / 10`).
+fn collect_group_by_columns(select: &Select) -> (Vec<String>, bool) {
     let mut columns = BTreeSet::new();
-    collect_group_by_exprs(select, &mut columns);
-    columns.remove("score");
-    columns.remove("_id");
-    columns.into_iter().collect()
+    let mut has_expression = false;
+    match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
+            for expr in exprs {
+                // Only accept plain column references for the grouped partials path.
+                // Expression-based GROUP BY (e.g., LOWER(author), year / 10) must
+                // fall through to DataFusion, which can evaluate them correctly.
+                if let Some(name) = expr_to_field_name(expr) {
+                    if name != "score" && name != "_id" {
+                        columns.insert(name);
+                    } else {
+                        has_expression = true;
+                    }
+                } else {
+                    has_expression = true;
+                }
+            }
+        }
+        sqlparser::ast::GroupByExpr::All(_) => {}
+    }
+    (columns.into_iter().collect(), has_expression)
 }
 
 fn collect_group_by_exprs(select: &Select, columns: &mut BTreeSet<String>) {
@@ -1337,6 +1509,30 @@ fn collect_expr_columns(expr: &Expr, columns: &mut BTreeSet<String>) {
                     }
                 }
             }
+        }
+        Expr::Cast { expr, .. } => {
+            collect_expr_columns(expr, columns);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_expr_columns(op, columns);
+            }
+            for case_when in conditions {
+                collect_expr_columns(&case_when.condition, columns);
+                collect_expr_columns(&case_when.result, columns);
+            }
+            if let Some(el) = else_result {
+                collect_expr_columns(el, columns);
+            }
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            collect_expr_columns(expr, columns);
+            collect_expr_columns(pattern, columns);
         }
         _ => {}
     }
@@ -1632,6 +1828,100 @@ mod tests {
         assert!(matches!(grouped.having[0].op, super::HavingOp::Gt));
     }
 
+    // ── OR disjunction pushdown tests ──────────────────────────────────
+
+    #[test]
+    fn or_equality_pushed_as_bool_should() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx WHERE author = 'pg' OR author = 'sama' GROUP BY author",
+        )
+        .unwrap();
+        // OR of two equality predicates → pushed as Bool { should: [Term, Term] }
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+        assert!(plan.uses_grouped_partials());
+        match &plan.pushed_filters[0] {
+            crate::search::QueryClause::Bool(bq) => {
+                assert_eq!(bq.should.len(), 2);
+                assert!(bq.must.is_empty());
+            }
+            other => panic!("Expected Bool query, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn or_three_way_pushed_flat() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT category FROM idx WHERE category = 'rust' OR category = 'python' OR category = 'ml'",
+        )
+        .unwrap();
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+        match &plan.pushed_filters[0] {
+            crate::search::QueryClause::Bool(bq) => {
+                assert_eq!(bq.should.len(), 3);
+            }
+            other => panic!("Expected Bool query, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn or_mixed_with_and_pushdown() {
+        // upvotes > 100 AND (author = 'pg' OR author = 'sama')
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx WHERE upvotes > 100 AND (author = 'pg' OR author = 'sama') GROUP BY author",
+        )
+        .unwrap();
+        // Both predicates pushed: Range + Bool { should }
+        assert_eq!(plan.pushed_filters.len(), 2);
+        assert!(!plan.has_residual_predicates);
+        assert!(plan.uses_grouped_partials());
+    }
+
+    #[test]
+    fn or_with_range_pushed() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT price FROM idx WHERE price < 10 OR price > 1000",
+        )
+        .unwrap();
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+        match &plan.pushed_filters[0] {
+            crate::search::QueryClause::Bool(bq) => {
+                assert_eq!(bq.should.len(), 2);
+            }
+            other => panic!("Expected Bool query, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn or_with_unpushable_branch_stays_residual() {
+        // text_match inside OR now gives a clear error instead of crashing DataFusion
+        let result = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE text_match(title, 'rust') OR author = 'pg'",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("text_match()"));
+    }
+
+    #[test]
+    fn or_on_score_not_pushed() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author FROM idx WHERE score > 0.5 OR author = 'pg'",
+        )
+        .unwrap();
+        // score branch can't be pushed → whole OR stays residual
+        assert!(plan.pushed_filters.is_empty());
+        assert!(plan.has_residual_predicates);
+    }
+
     #[test]
     fn computed_expression_falls_to_fast_fields() {
         // SUM(upvotes) * 1.0 / COUNT(*) is a computed expression, not a simple aggregate.
@@ -1644,5 +1934,216 @@ mod tests {
         assert!(!plan.selects_all_columns);
         assert!(plan.required_columns.contains(&"author".to_string()));
         assert!(plan.required_columns.contains(&"upvotes".to_string()));
+    }
+
+    #[test]
+    fn computed_expression_with_group_by_no_limit_pushdown() {
+        // GROUP BY + computed aggregate + LIMIT must NOT push LIMIT to Tantivy.
+        // DataFusion needs all matching docs to compute correct GROUP BY results.
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, SUM(price) * 1.0 / COUNT(*) AS avg_p FROM idx GROUP BY author ORDER BY avg_p DESC LIMIT 5",
+        ).unwrap();
+        assert!(!plan.uses_grouped_partials());
+        assert!(!plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(5));
+        assert!(!plan.group_by_columns.is_empty());
+    }
+
+    #[test]
+    fn no_group_by_computed_agg_limit_still_pushes() {
+        // Ungrouped computed expression WITHOUT GROUP BY — LIMIT can push
+        // because there's no grouping that requires all rows.
+        let plan = plan_sql("idx", "SELECT price FROM idx ORDER BY price DESC LIMIT 5").unwrap();
+        assert!(plan.limit_pushed_down);
+    }
+
+    #[test]
+    fn max_minus_min_group_by_no_limit_pushdown() {
+        // max(x) - min(x) is a computed expression with GROUP BY.
+        // Must NOT push LIMIT down.
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, MAX(price) - MIN(price) AS spread FROM idx GROUP BY author ORDER BY spread DESC LIMIT 3",
+        ).unwrap();
+        assert!(!plan.uses_grouped_partials());
+        assert!(!plan.limit_pushed_down);
+        assert_eq!(plan.limit, Some(3));
+    }
+
+    // ── Bug fix: _score not excluded from pushdown ──────────────────
+
+    #[test]
+    fn underscore_score_not_pushed_equality() {
+        let plan = plan_sql("idx", "SELECT title FROM idx WHERE _score > 0.5").unwrap();
+        assert!(plan.pushed_filters.is_empty());
+        assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn underscore_score_not_pushed_in_or() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE _score > 0.5 OR author = 'pg'",
+        )
+        .unwrap();
+        // _score branch can't be pushed → whole OR stays residual
+        assert!(plan.pushed_filters.is_empty());
+        assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn underscore_score_between_not_pushed() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE _score BETWEEN 0.1 AND 0.9",
+        )
+        .unwrap();
+        assert!(plan.pushed_filters.is_empty());
+        assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn underscore_score_in_not_pushed() {
+        let plan = plan_sql("idx", "SELECT title FROM idx WHERE _score IN (0.5, 0.6)").unwrap();
+        assert!(plan.pushed_filters.is_empty());
+        assert!(plan.has_residual_predicates);
+    }
+
+    // ── Bug fix: GROUP BY expression falls to DataFusion ────────────
+
+    #[test]
+    fn group_by_expression_falls_to_fast_fields() {
+        // GROUP BY LOWER(author) is an expression, not a plain column.
+        // Must NOT use grouped partials (would group by raw author instead).
+        let plan = plan_sql(
+            "idx",
+            "SELECT LOWER(author), count(*) AS cnt FROM idx GROUP BY LOWER(author)",
+        )
+        .unwrap();
+        // group_by_columns should be empty since LOWER(author) is not a plain column
+        assert!(plan.group_by_columns.is_empty());
+        // Should NOT use grouped partials
+        assert!(!plan.uses_grouped_partials());
+    }
+
+    #[test]
+    fn group_by_arithmetic_falls_to_fast_fields() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT upvotes / 100, count(*) AS cnt FROM idx GROUP BY upvotes / 100",
+        )
+        .unwrap();
+        assert!(plan.group_by_columns.is_empty());
+        assert!(!plan.uses_grouped_partials());
+    }
+
+    #[test]
+    fn group_by_plain_column_still_works() {
+        // Verify plain GROUP BY still routes to grouped partials
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS cnt FROM idx GROUP BY author",
+        )
+        .unwrap();
+        assert_eq!(plan.group_by_columns, vec!["author"]);
+        assert!(plan.uses_grouped_partials());
+    }
+
+    // ── Bug fix: text_match in OR gives clear error ─────────────────
+
+    #[test]
+    fn text_match_in_or_gives_error() {
+        let result = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE text_match(title, 'rust') OR author = 'pg'",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("text_match()"),
+            "Error should mention text_match: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn text_match_in_and_still_works() {
+        // text_match at top-level AND is fine
+        let plan = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE text_match(title, 'rust') AND author = 'pg'",
+        )
+        .unwrap();
+        assert!(plan.text_match.is_some());
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+    }
+
+    // ── Bug fix: collect_expr_columns handles Cast/Case/Like ────────
+
+    #[test]
+    fn cast_column_collected() {
+        let plan = plan_sql("idx", "SELECT CAST(price AS BIGINT) FROM idx").unwrap();
+        assert!(plan.required_columns.contains(&"price".to_string()));
+    }
+
+    #[test]
+    fn case_column_collected() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT CASE WHEN status = 'active' THEN upvotes ELSE 0 END FROM idx",
+        )
+        .unwrap();
+        assert!(plan.required_columns.contains(&"status".to_string()));
+        assert!(plan.required_columns.contains(&"upvotes".to_string()));
+    }
+
+    // ── Bug fix: mixed GROUP BY (plain + expression) bails out ──────
+
+    #[test]
+    fn group_by_mixed_plain_and_expression_bails() {
+        // GROUP BY author, LOWER(category) — mixed plain + expression.
+        // Must NOT use grouped partials (would silently drop LOWER(category)).
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, LOWER(category), count(*) AS cnt FROM idx GROUP BY author, LOWER(category)",
+        )
+        .unwrap();
+        assert!(!plan.uses_grouped_partials());
+    }
+
+    #[test]
+    fn group_by_expression_only_count_star_not_fast() {
+        // GROUP BY LOWER(author) with count(*) must NOT use count_star_fast
+        // path because there's a GROUP BY (even though it's expression-based).
+        let plan = plan_sql("idx", "SELECT count(*) FROM idx GROUP BY LOWER(author)").unwrap();
+        assert!(!plan.is_count_star_only());
+        assert!(!plan.uses_grouped_partials());
+    }
+
+    // ── Bug fix: text_match guard covers complex expressions ────────
+
+    #[test]
+    fn text_match_in_is_not_null_gives_error() {
+        let result = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE text_match(title, 'rust') IS NOT NULL",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("text_match()"), "Error: {}", err);
+    }
+
+    #[test]
+    fn text_match_in_case_where_gives_error() {
+        // text_match inside a CASE in the WHERE clause stays as residual
+        let result = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE CASE WHEN text_match(title, 'rust') THEN true ELSE false END",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("text_match()"), "Error: {}", err);
     }
 }
