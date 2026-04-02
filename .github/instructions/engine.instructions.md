@@ -152,6 +152,9 @@ The `GroupedAggCollector` computes grouped analytics (GROUP BY + aggregate funct
 - **Top-K selection**: When ORDER BY + LIMIT are present, uses `select_nth_unstable_by` (O(N) average) instead of full sort (O(N log N)). Only the top-K subset is fully sorted.
 - Per-shard partial results are serialized with `bincode-next` into the `partial_aggs_json` bytes field over gRPC, then merged at coordinator via `merge_aggregations()`
 - Agg-only `size=0` requests skip `TopDocs` and hit materialization entirely
+- **Direct scan for match_all**: When `query.is_match_all() && size == 0 && has_grouped_metrics`, `grouped_partials_direct_scan()` bypasses Tantivy's scorer/collector entirely — iterates segment fast-field columns directly in batches of 1024. Handles single-column (batch flush) and multi-column (per-doc) GROUP BY.
+- **Flat array accumulation**: For single-column keyword GROUP BY with <2M unique groups on match_all queries, replaces HashMap with pre-allocated `Vec<u64>/Vec<f64>` arrays indexed directly by ordinal — zero hash computation, zero collision handling, cache-friendly sequential access. `FlatMetric::Count` and `FlatMetric::Stats` provide parallel arrays for each metric. `flat_scan_segment()` and `flat_flush_batch()` implement the scan + accumulate loop.
+- **Parallel segment scanning**: The direct scan path uses `std::thread::scope` (not rayon, to avoid nested-pool deadlocks) to scan all segments concurrently. Each segment gets its own OS thread with independent flat arrays and fast-field readers. Results are merged after all threads complete. Achieved ~43% speedup on full-scan GROUP BY (13.9s → 8.0s search time on 1.8M docs).
 
 **Supported aggregation types:**
 - **Numeric** (Stats, Min, Max, Avg, Sum, ValueCount): reads `NumCol` (wraps `Column<f64>` or `Column<i64>`)
@@ -216,8 +219,12 @@ Segment-aware, lazy-loaded Arrow array cache backed by `moka`. Shared across all
 ### Construction Chain
 `Node::new()` → `ShardManager::new_full(data_dir, durability, column_cache)` → `CompositeEngine::new_with_mappings(..., column_cache)` → `HotEngine::new_with_mappings(..., column_cache)`.
 - Cache capacity is derived from `AppConfig::column_cache_size_percent` (default 10, capped at 90% of system RAM).
+- Selectivity threshold is derived from `AppConfig::column_cache_populate_threshold` (default 5, percentage 0–100).
+- `ColumnCache::new(max_bytes, populate_threshold_percent)` stores both capacity and threshold.
 - `compute_cache_bytes(percent)` reads `/proc/meminfo`, falls back to 1 GB.
 - Set `column_cache_size_percent: 0` to disable caching entirely.
+- Set `column_cache_populate_threshold: 0` to always eagerly populate on miss (old behavior).
+- Set `column_cache_populate_threshold: 100` to never eagerly populate (only use cache if already populated by a prior broad query).
 
 ### Cache Guard — Oversized Segment Protection
 Before building a full-segment array, `should_cache_full_segment_array(reader, max_doc, cache_max)` estimates the Arrow array size:
@@ -230,7 +237,7 @@ Before building a full-segment array, `should_cache_full_segment_array(reader, m
 ### Integration with sql_record_batch
 When the fast path is eligible (`!needs_stored_doc && !columns.is_empty()`):
 1. Group matched docs by segment ordinal
-2. For each column × segment: check cache hit → miss builds full array → `take()` matching rows
+2. For each column × segment: check cache hit → on miss, check selectivity threshold → if above threshold, build full array + cache + `take()` → if below threshold, `build_selective_array` (no cache population)
 3. Concatenate per-segment arrays, reorder to match original `top_docs` order
 4. Build `RecordBatch` with `_id`/`score` columns + data columns
 Falls back to per-doc stored-doc reading when any column requires `SourceFallback`.

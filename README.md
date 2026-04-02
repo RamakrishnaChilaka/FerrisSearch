@@ -66,6 +66,7 @@ Every response tells you how the query ran:
 - **Workload isolation** — dedicated [rayon](https://github.com/rayon-rs/rayon) thread pools for search and write traffic; bulk indexing cannot starve search latency or Raft heartbeats
 - **Dynamic field mapping** — fields are auto-detected and created on first document encounter
 - **Prometheus metrics** — `/_metrics` endpoint with request latencies, search/index counters, SQL mode tracking, cluster gauges, and process stats (CPU, RSS, threads, FDs)
+- **Column cache** — segment-aware Arrow array cache for SQL analytics; configurable memory limit (`column_cache_size_percent`) and selectivity threshold (`column_cache_populate_threshold`); ~1000× speedup on repeated fast-field queries
 - **Interactive SQL console** — `ferris-cli` with colored tables, EXPLAIN ANALYZE visualization, query history
 - **SQL correctness tests** — [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki) `.slt` files (same framework as DataFusion, CockroachDB, DuckDB)
 
@@ -469,13 +470,13 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 760 tests
-cargo test --lib                                # Unit tests (640)
+cargo test                                      # All 768 tests
+cargo test --lib                                # Unit tests (648)
 cargo test --bin ferris-cli                      # CLI tests (33)
 cargo test --test consensus_integration          # Raft consensus (30)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test rest_api_integration           # REST API (17)
-cargo test --test sql_correctness                # SQL correctness (1 test, 52 sqllogictest assertions)
+cargo test --test sql_correctness                # SQL correctness (1 test, 59 sqllogictest assertions)
 ```
 
 Integration tests run in-process with isolated temp directories. No external services needed.
@@ -531,6 +532,7 @@ scripts/           Ingestion and benchmark scripts
 - [x] Global `/_sql` with `SHOW TABLES`, `DESCRIBE`, `SHOW CREATE TABLE`
 - [x] sqllogictest correctness suite
 - [x] Prometheus metrics (`/_metrics`) — request latencies, search/index throughput, SQL mode counters, cluster gauges, process stats
+- [x] Column cache — segment-aware Arrow array cache with selectivity-based population, configurable memory limit and populate threshold
 
 ### Planned
 
@@ -540,7 +542,6 @@ scripts/           Ingestion and benchmark scripts
 - [ ] TLS encryption
 - [ ] Snapshot and restore
 - [ ] Index aliases and templates
-- [ ] Column cache (in-memory flat arrays for analytics-hot columns)
 
 ## What's Honestly Missing
 

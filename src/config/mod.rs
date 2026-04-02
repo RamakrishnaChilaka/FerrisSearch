@@ -64,6 +64,13 @@ pub struct AppConfig {
     /// Default: 10. Set to 0 to disable.
     #[serde(default = "default_column_cache_size_percent")]
     pub column_cache_size_percent: u8,
+    /// Selectivity threshold (0-100) for eager column cache population.
+    /// On a cache miss, the full-segment array is only built when matched docs
+    /// exceed this percentage of the segment's total docs. Below this threshold,
+    /// only matching docs are read directly (no cache population).
+    /// Default: 5. Set to 0 to always populate. Set to 100 to never eagerly populate.
+    #[serde(default = "default_column_cache_populate_threshold")]
+    pub column_cache_populate_threshold: u8,
 }
 
 fn default_raft_node_id() -> u64 {
@@ -76,6 +83,10 @@ fn default_translog_durability() -> String {
 
 fn default_column_cache_size_percent() -> u8 {
     10
+}
+
+fn default_column_cache_populate_threshold() -> u8 {
+    5
 }
 
 impl Default for AppConfig {
@@ -91,6 +102,7 @@ impl Default for AppConfig {
             translog_durability: "request".to_string(),
             translog_sync_interval_ms: None,
             column_cache_size_percent: 10,
+            column_cache_populate_threshold: 5,
         }
     }
 }
@@ -232,5 +244,38 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.seed_hosts.len(), 3);
         assert_eq!(config.seed_hosts[1], "127.0.0.1:9301");
+    }
+
+    #[test]
+    fn default_column_cache_settings() {
+        let config = AppConfig::default();
+        assert_eq!(config.column_cache_size_percent, 10);
+        assert_eq!(config.column_cache_populate_threshold, 5);
+    }
+
+    #[test]
+    fn column_cache_settings_deserialize_from_json() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "column_cache_size_percent": 25,
+            "column_cache_populate_threshold": 10
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.column_cache_size_percent, 25);
+        assert_eq!(config.column_cache_populate_threshold, 10);
+    }
+
+    #[test]
+    fn column_cache_settings_default_when_omitted() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"]
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.column_cache_size_percent, 10);
+        assert_eq!(config.column_cache_populate_threshold, 5);
     }
 }
