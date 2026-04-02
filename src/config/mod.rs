@@ -71,6 +71,23 @@ pub struct AppConfig {
     /// Default: 5. Set to 0 to always populate. Set to 100 to never eagerly populate.
     #[serde(default = "default_column_cache_populate_threshold")]
     pub column_cache_populate_threshold: u8,
+    /// Enable TLS for gRPC inter-node transport. Requires `transport-tls` feature.
+    /// Default: false.
+    #[serde(default)]
+    pub transport_tls_enabled: bool,
+    /// Path to PEM-encoded TLS certificate for the gRPC server.
+    /// Required when `transport_tls_enabled` is true.
+    #[serde(default)]
+    pub transport_tls_cert_file: Option<String>,
+    /// Path to PEM-encoded TLS private key for the gRPC server.
+    /// Required when `transport_tls_enabled` is true.
+    #[serde(default)]
+    pub transport_tls_key_file: Option<String>,
+    /// Path to PEM-encoded CA certificate for verifying peer nodes.
+    /// When set, the client verifies the server's certificate chain.
+    /// Required when `transport_tls_enabled` is true.
+    #[serde(default)]
+    pub transport_tls_ca_file: Option<String>,
 }
 
 fn default_raft_node_id() -> u64 {
@@ -103,6 +120,10 @@ impl Default for AppConfig {
             translog_sync_interval_ms: None,
             column_cache_size_percent: 10,
             column_cache_populate_threshold: 5,
+            transport_tls_enabled: false,
+            transport_tls_cert_file: None,
+            transport_tls_key_file: None,
+            transport_tls_ca_file: None,
         }
     }
 }
@@ -277,5 +298,53 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.column_cache_size_percent, 10);
         assert_eq!(config.column_cache_populate_threshold, 5);
+    }
+
+    #[test]
+    fn transport_tls_disabled_by_default() {
+        let config = AppConfig::default();
+        assert!(!config.transport_tls_enabled);
+        assert!(config.transport_tls_cert_file.is_none());
+        assert!(config.transport_tls_key_file.is_none());
+        assert!(config.transport_tls_ca_file.is_none());
+    }
+
+    #[test]
+    fn transport_tls_deserializes_when_set() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "transport_tls_enabled": true,
+            "transport_tls_cert_file": "/path/to/cert.pem",
+            "transport_tls_key_file": "/path/to/key.pem",
+            "transport_tls_ca_file": "/path/to/ca.pem"
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.transport_tls_enabled);
+        assert_eq!(
+            config.transport_tls_cert_file.as_deref(),
+            Some("/path/to/cert.pem")
+        );
+        assert_eq!(
+            config.transport_tls_key_file.as_deref(),
+            Some("/path/to/key.pem")
+        );
+        assert_eq!(
+            config.transport_tls_ca_file.as_deref(),
+            Some("/path/to/ca.pem")
+        );
+    }
+
+    #[test]
+    fn transport_tls_omitted_defaults_to_disabled() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"]
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.transport_tls_enabled);
+        assert!(config.transport_tls_cert_file.is_none());
     }
 }

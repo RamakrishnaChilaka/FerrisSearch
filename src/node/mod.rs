@@ -33,6 +33,20 @@ impl Node {
         .await?;
 
         let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle));
+
+        // Create transport client — with TLS when feature is enabled and configured
+        #[cfg(feature = "transport-tls")]
+        let transport_client = if config.transport_tls_enabled {
+            let ca_path = config
+                .transport_tls_ca_file
+                .as_deref()
+                .expect("transport_tls_ca_file is required when transport_tls_enabled=true");
+            let connector = crate::transport::TonicTlsConnector::from_ca_file(ca_path)?;
+            TransportClient::with_tls_connector(std::sync::Arc::new(connector))
+        } else {
+            TransportClient::new()
+        };
+        #[cfg(not(feature = "transport-tls"))]
         let transport_client = TransportClient::new();
 
         let durability = match config.translog_durability.as_str() {
@@ -106,8 +120,31 @@ impl Node {
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));
         info!("gRPC Transport listening on {}", transport_addr);
 
+        #[cfg(feature = "transport-tls")]
+        let tls_config =
+            if self.config.transport_tls_enabled {
+                Some(crate::transport::load_server_tls_config(
+                    self.config.transport_tls_cert_file.as_deref().expect(
+                        "transport_tls_cert_file is required when transport_tls_enabled=true",
+                    ),
+                    self.config.transport_tls_key_file.as_deref().expect(
+                        "transport_tls_key_file is required when transport_tls_enabled=true",
+                    ),
+                )?)
+            } else {
+                None
+            };
+
         let transport_handle = tokio::spawn(async move {
-            if let Err(e) = tonic::transport::Server::builder()
+            let mut builder = tonic::transport::Server::builder();
+
+            #[cfg(feature = "transport-tls")]
+            if let Some(tls) = tls_config {
+                builder = builder.tls_config(tls).expect("invalid TLS config");
+                info!("gRPC transport TLS enabled");
+            }
+
+            if let Err(e) = builder
                 .add_service(transport_service)
                 .serve(transport_addr)
                 .await

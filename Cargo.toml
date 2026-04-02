@@ -31,11 +31,18 @@ tantivy = "0.25.0"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["full"] }
 tonic = "0.13"
+tonic-types = { version = "0.13", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 usearch = "2.24.0"
 tikv-jemallocator = "0.6.1"
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
+
+[features]
+default = []
+transport-tls = ["dep:tonic-types", "dep:tokio-rustls", "dep:rustls-pemfile", "tonic/tls-ring"]
 
 [build-dependencies]
 tonic-build = "0.13"

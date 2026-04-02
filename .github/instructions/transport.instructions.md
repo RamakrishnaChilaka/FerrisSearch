@@ -130,3 +130,25 @@ All blocking engine calls in `TransportService` handlers are dispatched to dedic
 - **Search pool** (`search-N` threads): `get_doc`, `search_shard`, `search_shard_dsl`, `sql_record_batch`, `recover_replica` (WAL I/O)
 - **Write pool** (`write-N` threads): `index_doc`, `bulk_index`, `delete_doc`, `replicate_doc`, `replicate_bulk`, `refresh_index`, `flush_index`
 - The `TransportService` struct holds `worker_pools: WorkerPools` initialized in `create_transport_service*()` constructors.
+
+### Transport TLS (optional, feature-gated)
+Inter-node gRPC can be encrypted via the `transport-tls` Cargo feature flag. Disabled by default.
+```bash
+cargo build --features transport-tls
+```
+
+**Config** (`config/ferrissearch.yml` or `FERRISSEARCH_*` env vars):
+```yaml
+transport_tls_enabled: true
+transport_tls_cert_file: /path/to/node.pem
+transport_tls_key_file: /path/to/node-key.pem
+transport_tls_ca_file: /path/to/ca.pem
+```
+
+**Architecture:**
+- `TlsConnector` trait in `client.rs` — abstracts TLS endpoint configuration, no `#[cfg]` on the struct or `connect()` method.
+- `TonicTlsConnector` in `transport/mod.rs` — concrete implementation behind `#[cfg(feature = "transport-tls")]`, applies `ClientTlsConfig` with CA verification.
+- `load_server_tls_config()` in `transport/mod.rs` — loads PEM cert+key into `tonic::transport::ServerTlsConfig`.
+- `TransportClient::with_tls_connector(Arc<dyn TlsConnector>)` — factory that sets up https:// scheme and TLS for all connections.
+- Server-side TLS (`node/mod.rs`): `Server::builder().tls_config(config)` when feature + config are both active.
+- When `transport_tls_enabled: false` (default) or the feature is not compiled, all behavior is identical to pre-TLS code — zero overhead.

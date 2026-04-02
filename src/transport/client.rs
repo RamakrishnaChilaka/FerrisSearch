@@ -17,6 +17,18 @@ pub struct TransportClient {
     /// Uses RwLock for concurrent reads (cache hits) — only blocks on writes (cache misses).
     /// Tonic channels handle HTTP/2 multiplexing and reconnection internally.
     channels: Arc<RwLock<HashMap<String, Channel>>>,
+    /// Optional TLS endpoint configurator. When set, `connect()` uses https and
+    /// applies TLS settings. Populated by `with_tls()` (transport-tls feature only).
+    tls_connector: Option<Arc<dyn TlsConnector>>,
+}
+
+/// Trait to abstract TLS configuration behind the feature flag.
+/// The concrete implementation lives in transport/mod.rs behind #[cfg(feature = "transport-tls")].
+pub trait TlsConnector: Send + Sync {
+    fn configure_endpoint(
+        &self,
+        endpoint: tonic::transport::Endpoint,
+    ) -> Result<tonic::transport::Endpoint, tonic::transport::Error>;
 }
 
 impl Default for TransportClient {
@@ -30,6 +42,16 @@ impl TransportClient {
         Self {
             timeout: Duration::from_secs(30),
             channels: Arc::new(RwLock::new(HashMap::new())),
+            tls_connector: None,
+        }
+    }
+
+    /// Create a transport client with a TLS connector for encrypted inter-node communication.
+    pub fn with_tls_connector(connector: Arc<dyn TlsConnector>) -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            tls_connector: Some(connector),
         }
     }
 
@@ -52,10 +74,20 @@ impl TransportClient {
         }
 
         // Slow path: create new channel, then write lock to cache it
-        let endpoint =
-            tonic::transport::Endpoint::from_shared(format!("http://{}:{}", host, port))?
+        let scheme = if self.tls_connector.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let mut endpoint =
+            tonic::transport::Endpoint::from_shared(format!("{}://{}:{}", scheme, host, port))?
                 .timeout(self.timeout)
                 .connect_timeout(Duration::from_secs(5));
+
+        if let Some(ref connector) = self.tls_connector {
+            endpoint = connector.configure_endpoint(endpoint)?;
+        }
+
         let channel = endpoint.connect().await?;
 
         {

@@ -92,7 +92,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 672 unit tests + 40 CLI tests + 30 consensus integration + 39 replication integration + 17 REST API integration + 1 SQL correctness harness (sqllogictest, 161 assertions) = 799 total
+- 675 unit tests + 40 CLI tests + 30 consensus integration + 39 replication integration + 17 REST API integration + 1 SQL correctness harness (sqllogictest, 161 assertions) = 802 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 - SQL console: `cargo run --bin ferris-cli` (interactive) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
@@ -182,6 +182,10 @@ pub struct AppConfig {
     pub raft_node_id: u64,              // default: 1
     pub translog_durability: String,    // "request" (default) or "async"
     pub translog_sync_interval_ms: Option<u64>,  // default: None (5000 if async)
+    pub transport_tls_enabled: bool,             // default: false (requires transport-tls feature)
+    pub transport_tls_cert_file: Option<String>, // PEM cert for gRPC server
+    pub transport_tls_key_file: Option<String>,  // PEM key for gRPC server
+    pub transport_tls_ca_file: Option<String>,   // PEM CA for client verification
 }
 ```
 - Load order: defaults → `config/ferrissearch.yml` → `FERRISSEARCH_*` env vars
