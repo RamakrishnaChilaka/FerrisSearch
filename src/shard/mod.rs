@@ -179,7 +179,7 @@ impl ShardManager {
         Self::new_full(
             data_dir,
             durability,
-            Arc::new(crate::engine::column_cache::ColumnCache::new(0)),
+            Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0)),
         )
     }
 

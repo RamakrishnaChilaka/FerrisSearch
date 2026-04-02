@@ -39,7 +39,7 @@ impl CompositeEngine {
             refresh_interval,
             &std::collections::HashMap::new(),
             TranslogDurability::Request,
-            Arc::new(super::column_cache::ColumnCache::new(0)),
+            Arc::new(super::column_cache::ColumnCache::new(0, 0)),
         )
     }
 

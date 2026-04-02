@@ -20,12 +20,18 @@ struct CacheKey {
 /// Queries extract matching rows via `arrow::compute::take()`.
 pub struct ColumnCache {
     inner: moka::sync::Cache<CacheKey, ArrayRef>,
+    /// Selectivity threshold (0.0–1.0). On a cache miss, the full-segment array
+    /// is only built when `matched_docs / max_doc >= threshold`. Below this,
+    /// only matching docs are read directly without populating the cache.
+    populate_threshold: f64,
 }
 
 impl ColumnCache {
-    /// Create a new column cache with the given maximum size in bytes.
-    /// Pass 0 to create a no-op cache that never stores anything.
-    pub fn new(max_bytes: u64) -> Self {
+    /// Create a new column cache with the given maximum size in bytes
+    /// and a populate threshold percentage (0–100).
+    /// Pass 0 for max_bytes to create a no-op cache that never stores anything.
+    /// Pass 0 for threshold_percent to always eagerly populate on miss.
+    pub fn new(max_bytes: u64, populate_threshold_percent: u8) -> Self {
         let inner = moka::sync::Cache::builder()
             .weigher(|_key: &CacheKey, value: &ArrayRef| {
                 // Weight = Arrow array memory size. Capped at u32::MAX per moka API.
@@ -34,7 +40,22 @@ impl ColumnCache {
             })
             .max_capacity(max_bytes)
             .build();
-        Self { inner }
+        let threshold = (populate_threshold_percent.min(100) as f64) / 100.0;
+        Self {
+            inner,
+            populate_threshold: threshold,
+        }
+    }
+
+    /// Returns true if the matched doc ratio justifies building the full-segment
+    /// array on a cache miss. When `matched / total < threshold`, the caller
+    /// should use selective reads instead of populating the cache.
+    pub fn should_populate(&self, matched_docs: usize, segment_max_doc: u32) -> bool {
+        if segment_max_doc == 0 {
+            return false;
+        }
+        let ratio = matched_docs as f64 / segment_max_doc as f64;
+        ratio >= self.populate_threshold
     }
 
     /// Try to get a cached column array for the given segment + column.
@@ -121,13 +142,13 @@ mod tests {
 
     #[test]
     fn cache_miss_returns_none() {
-        let cache = ColumnCache::new(1024 * 1024);
+        let cache = ColumnCache::new(1024 * 1024, 0);
         assert!(cache.get(make_segment_id(), "price").is_none());
     }
 
     #[test]
     fn cache_hit_after_insert() {
-        let cache = ColumnCache::new(1024 * 1024);
+        let cache = ColumnCache::new(1024 * 1024, 0);
         let array: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
         let seg_id = make_segment_id();
 
@@ -138,7 +159,7 @@ mod tests {
 
     #[test]
     fn different_segments_are_independent() {
-        let cache = ColumnCache::new(1024 * 1024);
+        let cache = ColumnCache::new(1024 * 1024, 0);
         let seg1 = make_segment_id();
         let seg2 = make_segment_id_2();
 
@@ -154,7 +175,7 @@ mod tests {
 
     #[test]
     fn different_columns_same_segment() {
-        let cache = ColumnCache::new(1024 * 1024);
+        let cache = ColumnCache::new(1024 * 1024, 0);
         let seg = make_segment_id();
 
         let prices: ArrayRef = Arc::new(Float64Array::from(vec![9.99, 19.99]));
@@ -171,7 +192,7 @@ mod tests {
 
     #[test]
     fn zero_size_cache_stores_nothing() {
-        let cache = ColumnCache::new(0);
+        let cache = ColumnCache::new(0, 0);
         let array: ArrayRef = Arc::new(Float64Array::from(vec![1.0]));
         cache.insert(make_segment_id(), "x", array);
         // moka with max_capacity=0 may still briefly hold entries before eviction
@@ -206,5 +227,50 @@ mod tests {
     #[test]
     fn system_memory_is_positive() {
         assert!(system_memory_bytes() > 0);
+    }
+
+    // ── Selectivity threshold tests ─────────────────────────────────────
+
+    #[test]
+    fn should_populate_zero_threshold_always_true() {
+        let cache = ColumnCache::new(1024 * 1024, 0);
+        // threshold=0 → always populate (even for 1 match in 1M docs)
+        assert!(cache.should_populate(1, 1_000_000));
+        assert!(cache.should_populate(0, 1_000_000)); // 0 matches → ratio 0.0 >= 0.0 → true
+    }
+
+    #[test]
+    fn should_populate_100_threshold_never_populates() {
+        let cache = ColumnCache::new(1024 * 1024, 100);
+        // threshold=100% → only populate when ALL docs match
+        assert!(!cache.should_populate(999, 1000));
+        assert!(cache.should_populate(1000, 1000)); // exactly 100%
+    }
+
+    #[test]
+    fn should_populate_5_percent_threshold() {
+        let cache = ColumnCache::new(1024 * 1024, 5);
+        // 5% of 100,000 = 5,000
+        assert!(!cache.should_populate(4999, 100_000)); // below threshold
+        assert!(cache.should_populate(5000, 100_000)); // at threshold
+        assert!(cache.should_populate(10000, 100_000)); // above threshold
+    }
+
+    #[test]
+    fn should_populate_zero_max_doc_returns_false() {
+        let cache = ColumnCache::new(1024 * 1024, 5);
+        assert!(!cache.should_populate(0, 0));
+    }
+
+    #[test]
+    fn should_populate_default_threshold() {
+        // Default threshold is 5%
+        let cache = ColumnCache::new(1024 * 1024, 5);
+        // 560K docs, 20 matches → 0.003% → below 5%
+        assert!(!cache.should_populate(20, 560_000));
+        // 560K docs, 28K matches → 5% → at threshold
+        assert!(cache.should_populate(28_000, 560_000));
+        // 560K docs, 560K matches → 100% → above threshold
+        assert!(cache.should_populate(560_000, 560_000));
     }
 }

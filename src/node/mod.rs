@@ -46,6 +46,7 @@ impl Node {
             durability,
             Arc::new(crate::engine::column_cache::ColumnCache::new(
                 crate::engine::column_cache::compute_cache_bytes(config.column_cache_size_percent),
+                config.column_cache_populate_threshold,
             )),
         ));
 

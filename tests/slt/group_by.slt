@@ -331,3 +331,23 @@ bob 2 800.0 175.0
 eve 1 800.0 600.0
 alice 3 550.0 55.7
 dave 2 200.0 27.5
+
+# ── Ungrouped aggregates (direct scan path for match_all) ────────────
+
+# Global count — exercises count_star_fast path
+query I
+SELECT count(*) FROM stories
+----
+10
+
+# Global sum + avg + min + max — exercises ungrouped grouped_partials
+query RRRR
+SELECT sum(upvotes) AS s, avg(upvotes) AS a, min(upvotes) AS mn, max(upvotes) AS mx FROM stories
+----
+3750.0 375.0 50.0 1000.0
+
+# Ungrouped with WHERE — exercises collector path (not direct scan)
+query IR
+SELECT count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE upvotes > 200
+----
+6 541.7
