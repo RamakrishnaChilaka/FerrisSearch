@@ -106,6 +106,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - `IN (a, b, c)` is pushed as `Bool { should: [Term(a), Term(b), Term(c)] }` — reuses existing Bool+Term support.
 - `OR` disjunctions (e.g., `author = 'pg' OR author = 'sama'`) are pushed as `Bool { should: [...] }` when ALL branches are individually pushable. Nested ORs are flattened. Parenthesized expressions are unwrapped.
 - If any OR branch is not pushable (e.g., contains `text_match`), the planner returns an error. `text_match()` must appear as a top-level AND predicate, not inside OR or complex expressions.
+- Roadmap for this limitation: support `text_match()` inside `OR` / more complex boolean trees only with branch-aware boolean lowering when the entire subtree is fully pushable into Tantivy. Never leave residual `text_match()` evaluation to DataFusion.
 - The `expr_contains_text_match` guard walks all expression shapes that can survive as residual predicates: `BinaryOp`, `Nested`, `UnaryOp`, `IsNull`, `IsNotNull`, `Cast`, `Case` (with `CaseWhen` arms), `Between`, `InList`, and `Function` arguments (for `COALESCE(text_match(...), false)` etc.).
 - `NOT IN` and `NOT BETWEEN` are NOT pushed — they remain as residual predicates for DataFusion.
 - `_score` and `_id` fields are never pushed (`_score` is computed by Tantivy, `_id` is a doc identifier).
@@ -182,23 +183,27 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
   - GROUP BY eligibility: only `BoundColumn::Source` counts as a plain grouped-partials key; `Synthetic` or expression-derived outputs must bail to residual SQL execution
   - HAVING and ORDER BY on grouped queries: resolve output-space names first (`BoundColumn::Output`), then aggregate-expression matching, then source fields only when semantically valid
   - `_id` / `_score` must always bind through `SyntheticColumn`, never through ad-hoc string checks
-- First consumers of the small IR:
-  - `required_columns`
-  - `needs_id` / `needs_score`
-  - pushdown exclusion guards
-  - GROUP BY plain-column eligibility
-  - HAVING / ORDER BY name resolution in grouped planning
-- Suggested migration order:
-  1. Add a small binder helper that resolves identifiers into `BoundColumn` for a given clause context
-  2. Convert `collect_required_columns()` and synthetic-column detection to consume bound refs instead of raw names
-  3. Convert pushdown capability checks to reject `Output` and non-source refs explicitly
-  4. Convert grouped HAVING / ORDER BY resolution to use output-space binding instead of mixed raw-name maps
-  5. Only after that decide whether a fuller `BoundExpr` / bound-query IR is still needed
-- Non-goals for the small IR:
-  - no DataFusion-side semantic model
-  - no full SQL type inference
-  - no replacement of the `sqlparser` AST in this phase
-  - no broad planner rewrite before the current pushdown and grouped-partials behavior is re-expressed through the binder
+## Semantic Binder (Implemented)
+- `bind_select()` resolves SELECT projection + GROUP BY items into a `BindContext` **before** pushdown extraction and capability analysis.
+- `BoundSelectItem` enum classifies each SELECT item as `Column(BoundIdentifier)`, `Aggregate`, `Wildcard`, or `Unresolved` (escape hatch for expressions the binder can't fully resolve — passed through to DataFusion).
+- `BoundIdentifier` distinguishes `Source(field)` from `Synthetic(_id/_score)`.
+- `BoundGroupByItem` classifies GROUP BY items as `Source(column)` or `Expression` (synthetic, alias, or complex expression).
+- `BindContext::derive_columns()` replaces the old `collect_required_columns()` — walks bound items + WHERE/HAVING/ORDER BY with alias awareness, produces `(required_columns, needs_id, needs_score)`.
+- `BindContext::derive_group_by()` replaces the old `collect_group_by_columns()` — derives `(group_by_columns, has_expression_group_by)` from bound items.
+- `collect_expr_columns_alias_aware_into()` is the unified column walker that handles alias filtering + synthetic detection in a single pass (replaces the old separate `collect_expr_columns_alias_aware` + post-hoc `_id`/`_score` string matching).
+- `collect_expr_source_columns_with_flags()` walks any expression tree and extracts source columns + synthetic flags (used for `BoundSelectItem::Unresolved` source column extraction).
+- Identity aliases such as `SELECT author AS author` are treated as the same underlying source column for WHERE/GROUP BY/required-column extraction; non-identity aliases still block pushdown and grouped-partials eligibility.
+- The binder's `alias_set` directly feeds `extract_pushdowns()` — no separate `collect_select_aliases()` call needed.
+- The old functions (`projection_has_wildcard`, `collect_required_columns`, `collect_expr_columns_alias_aware`, `collect_group_by_columns`, `collect_group_by_exprs`, `collect_select_item_columns`, `collect_select_aliases`, `collect_expr_columns`) have been removed.
+- WHERE clause binding is intentionally deferred — pushdown extraction still uses raw AST walkers. The binder covers SELECT, GROUP BY, ORDER BY, and HAVING.
+- The binder does NOT replace capability analysis (pushdown eligibility, grouped partials eligibility). It provides resolved identifiers that the analysis consumes.
+
+## Query Shape Validation (Implemented)
+- `validate_query_shape()` runs early in `plan_sql()` before any planning work.
+- Rejects unsupported shapes with clear, actionable error messages instead of letting them leak to DataFusion as opaque table-resolution failures.
+- Validated shapes: CTEs (`WITH`), UNION/EXCEPT/INTERSECT, subqueries in SELECT/WHERE/HAVING/ORDER BY, subqueries in FROM (derived tables), subqueries as function arguments, JOINs, multi-table FROM.
+- `validate_where_clause()` recursively walks the WHERE expression tree to detect subquery nodes at any depth.
+- `expr_contains_subquery()` must recurse through nested CASE, LIKE/ILIKE, BETWEEN, IN-list, unary/binary, and function-argument expression trees so SELECT/HAVING/ORDER BY do not leak unsupported subqueries downstream.
 
 ## Preferred Language In Reviews And Docs
 - Say: "search-aware planning", "residual SQL execution", and "grouped analytics over matched docs".

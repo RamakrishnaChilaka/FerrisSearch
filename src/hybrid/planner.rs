@@ -38,6 +38,651 @@ impl SyntheticColumn {
     }
 }
 
+// ── Semantic Binder ────────────────────────────────────────────────────
+// Resolves SQL identifiers into classified categories BEFORE capability
+// analysis. This centralises _id/_score detection, alias tracking,
+// required-column extraction, and GROUP BY eligibility into one pass
+// instead of scattering it across 25+ raw AST walkers.
+
+/// How a SQL identifier was resolved during binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoundIdentifier {
+    /// A real index field (e.g. `author`, `price`).
+    Source(String),
+    /// A synthetic field (`_id` or `_score`).
+    Synthetic(SyntheticColumn),
+}
+
+/// A bound SELECT projection item — what the planner knows about each
+/// item in the SELECT list after binding.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // alias fields reserved for future semijoin/binder work
+enum BoundSelectItem {
+    /// A plain column reference (possibly aliased).
+    Column {
+        id: BoundIdentifier,
+        alias: Option<String>,
+    },
+    /// An aggregate function like COUNT(*), AVG(price), etc.
+    Aggregate { metric: SqlGroupedMetric },
+    /// A wildcard (`SELECT *`).
+    Wildcard,
+    /// An expression the binder cannot fully resolve — passed through
+    /// to DataFusion as-is (e.g. `LOWER(author)`, `price * 2`).
+    Unresolved {
+        /// Source columns referenced inside this expression.
+        source_columns: Vec<String>,
+        /// Whether `_id` is referenced.
+        needs_id: bool,
+        /// Whether `_score` is referenced.
+        needs_score: bool,
+        alias: Option<String>,
+    },
+}
+
+/// A bound GROUP BY item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoundGroupByItem {
+    /// A plain source column (eligible for grouped partials).
+    Source(String),
+    /// An expression or synthetic column (forces expression GROUP BY fallback).
+    Expression,
+}
+
+/// The result of binding a SELECT statement.
+struct BindContext {
+    /// Bound SELECT projection items.
+    select_items: Vec<BoundSelectItem>,
+    /// All SELECT output aliases.
+    alias_set: BTreeSet<String>,
+    /// Aliases like `author AS author` that are semantically identical to
+    /// the underlying source column and must not block source-column
+    /// interpretation in WHERE/GROUP BY/required-column extraction.
+    identity_source_aliases: BTreeSet<String>,
+    /// Bound GROUP BY items.
+    group_by_items: Vec<BoundGroupByItem>,
+    /// Whether SELECT * is present.
+    selects_all_columns: bool,
+}
+
+impl BindContext {
+    /// Derive `required_columns`, `needs_id`, `needs_score` from bound items
+    /// plus ORDER BY and WHERE/HAVING expressions.
+    fn derive_columns(
+        &self,
+        select: &Select,
+        order_by: Option<&sqlparser::ast::OrderBy>,
+    ) -> (Vec<String>, bool, bool) {
+        let mut columns = BTreeSet::new();
+        let mut needs_id = false;
+        let mut needs_score = false;
+
+        // From SELECT items
+        for item in &self.select_items {
+            match item {
+                BoundSelectItem::Column { id, .. } => match id {
+                    BoundIdentifier::Source(field) => {
+                        columns.insert(field.clone());
+                    }
+                    BoundIdentifier::Synthetic(SyntheticColumn::Id) => needs_id = true,
+                    BoundIdentifier::Synthetic(SyntheticColumn::Score) => needs_score = true,
+                },
+                BoundSelectItem::Aggregate { metric } => {
+                    if let Some(ref field) = metric.field {
+                        columns.insert(field.clone());
+                    }
+                }
+                BoundSelectItem::Wildcard => {
+                    // SELECT * — columns come from _source; no explicit columns needed
+                }
+                BoundSelectItem::Unresolved {
+                    source_columns,
+                    needs_id: uid,
+                    needs_score: usc,
+                    ..
+                } => {
+                    columns.extend(source_columns.iter().cloned());
+                    needs_id |= uid;
+                    needs_score |= usc;
+                }
+            }
+        }
+
+        // From WHERE clause (residual after pushdowns — walk with alias awareness)
+        if let Some(ref selection) = select.selection {
+            collect_expr_columns_alias_aware_into(
+                selection,
+                &self.alias_set,
+                &self.identity_source_aliases,
+                &mut columns,
+                &mut needs_id,
+                &mut needs_score,
+            );
+        }
+
+        // From HAVING clause
+        if let Some(ref having) = select.having {
+            collect_expr_columns_alias_aware_into(
+                having,
+                &self.alias_set,
+                &self.identity_source_aliases,
+                &mut columns,
+                &mut needs_id,
+                &mut needs_score,
+            );
+        }
+
+        // From ORDER BY
+        if let Some(order_by) = order_by
+            && let OrderByKind::Expressions(exprs) = &order_by.kind
+        {
+            for expr in exprs {
+                collect_expr_columns_alias_aware_into(
+                    &expr.expr,
+                    &self.alias_set,
+                    &self.identity_source_aliases,
+                    &mut columns,
+                    &mut needs_id,
+                    &mut needs_score,
+                );
+            }
+        }
+
+        // From GROUP BY expressions (for required_columns — need the fields
+        // even if GROUP BY is an expression like LOWER(author))
+        if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+            for expr in exprs {
+                collect_expr_source_columns(expr, &mut columns);
+            }
+        }
+
+        // Remove the internal table name if it leaked through
+        columns.remove(INTERNAL_TABLE_NAME);
+
+        (columns.into_iter().collect(), needs_id, needs_score)
+    }
+
+    /// Derive plain GROUP BY column names and whether expression GROUP BY is present.
+    fn derive_group_by(&self) -> (Vec<String>, bool) {
+        let mut columns = Vec::new();
+        let mut has_expression = false;
+        for item in &self.group_by_items {
+            match item {
+                BoundGroupByItem::Source(name) => columns.push(name.clone()),
+                BoundGroupByItem::Expression => has_expression = true,
+            }
+        }
+        (columns, has_expression)
+    }
+}
+
+/// Bind a parsed SELECT + ORDER BY into a `BindContext`.
+fn bind_select(select: &Select) -> BindContext {
+    let mut select_items = Vec::with_capacity(select.projection.len());
+    let mut alias_set = BTreeSet::new();
+    let mut identity_source_aliases = BTreeSet::new();
+    let mut selects_all_columns = false;
+
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                select_items.push(bind_expr_as_select_item(expr, None, &alias_set));
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let alias_name = alias.value.clone();
+                let bound = bind_expr_as_select_item(expr, Some(alias_name.clone()), &alias_set);
+                if let BoundSelectItem::Column {
+                    id: BoundIdentifier::Source(source_name),
+                    ..
+                } = &bound
+                    && source_name == &alias_name
+                {
+                    identity_source_aliases.insert(alias_name.clone());
+                }
+                alias_set.insert(alias_name);
+                select_items.push(bound);
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                selects_all_columns = true;
+                select_items.push(BoundSelectItem::Wildcard);
+            }
+        }
+    }
+
+    // Bind GROUP BY (alias-aware — aliases must not be classified as source columns)
+    let group_by_items = bind_group_by(&select.group_by, &alias_set, &identity_source_aliases);
+
+    BindContext {
+        select_items,
+        alias_set,
+        identity_source_aliases,
+        group_by_items,
+        selects_all_columns,
+    }
+}
+
+/// Bind a single expression as a SELECT item.
+fn bind_expr_as_select_item(
+    expr: &Expr,
+    alias: Option<String>,
+    _aliases: &BTreeSet<String>,
+) -> BoundSelectItem {
+    // Try as aggregate first
+    if let Ok(Some(metric)) = parse_grouped_metric(expr, alias.clone()) {
+        return BoundSelectItem::Aggregate { metric };
+    }
+
+    // Try as plain column
+    if let Some(name) = expr_to_field_name(expr) {
+        let id = if let Some(syn) = SyntheticColumn::parse(&name) {
+            BoundIdentifier::Synthetic(syn)
+        } else {
+            BoundIdentifier::Source(name)
+        };
+        return BoundSelectItem::Column { id, alias };
+    }
+
+    // Unresolved expression — walk to extract source columns and synthetic flags
+    let mut source_columns = BTreeSet::new();
+    let mut uid = false;
+    let mut usc = false;
+    collect_expr_source_columns_with_flags(expr, &mut source_columns, &mut uid, &mut usc);
+    BoundSelectItem::Unresolved {
+        source_columns: source_columns.into_iter().collect(),
+        needs_id: uid,
+        needs_score: usc,
+        alias,
+    }
+}
+
+/// Bind GROUP BY items. Plain source columns become `Source`, everything
+/// else (expressions, synthetics, aliases) becomes `Expression`.
+fn bind_group_by(
+    group_by: &sqlparser::ast::GroupByExpr,
+    aliases: &BTreeSet<String>,
+    identity_source_aliases: &BTreeSet<String>,
+) -> Vec<BoundGroupByItem> {
+    let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = group_by else {
+        return Vec::new();
+    };
+    exprs
+        .iter()
+        .map(|expr| {
+            if let Some(name) = expr_to_field_name(expr) {
+                if SyntheticColumn::parse(&name).is_some()
+                    || alias_blocks_source_name(&name, aliases, identity_source_aliases)
+                {
+                    BoundGroupByItem::Expression
+                } else {
+                    BoundGroupByItem::Source(name)
+                }
+            } else {
+                BoundGroupByItem::Expression
+            }
+        })
+        .collect()
+}
+
+fn alias_blocks_source_name(
+    name: &str,
+    aliases: &BTreeSet<String>,
+    identity_source_aliases: &BTreeSet<String>,
+) -> bool {
+    aliases.contains(name) && !identity_source_aliases.contains(name)
+}
+
+/// Walk an expression and collect all source field names (non-synthetic).
+fn collect_expr_source_columns(expr: &Expr, columns: &mut BTreeSet<String>) {
+    let mut uid = false;
+    let mut usc = false;
+    collect_expr_source_columns_with_flags(expr, columns, &mut uid, &mut usc);
+}
+
+/// Walk an expression and collect source columns plus synthetic flags.
+fn collect_expr_source_columns_with_flags(
+    expr: &Expr,
+    columns: &mut BTreeSet<String>,
+    needs_id: &mut bool,
+    needs_score: &mut bool,
+) {
+    match expr {
+        Expr::Identifier(ident) => {
+            let name = &ident.value;
+            match SyntheticColumn::parse(name) {
+                Some(SyntheticColumn::Id) => *needs_id = true,
+                Some(SyntheticColumn::Score) => *needs_score = true,
+                None => {
+                    columns.insert(name.clone());
+                }
+            }
+        }
+        Expr::CompoundIdentifier(idents) => {
+            if let Some(ident) = idents.last() {
+                let name = &ident.value;
+                match SyntheticColumn::parse(name) {
+                    Some(SyntheticColumn::Id) => *needs_id = true,
+                    Some(SyntheticColumn::Score) => *needs_score = true,
+                    None => {
+                        columns.insert(name.clone());
+                    }
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_source_columns_with_flags(left, columns, needs_id, needs_score);
+            collect_expr_source_columns_with_flags(right, columns, needs_id, needs_score);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => {
+            collect_expr_source_columns_with_flags(inner, columns, needs_id, needs_score);
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            collect_expr_source_columns_with_flags(e, columns, needs_id, needs_score);
+            collect_expr_source_columns_with_flags(low, columns, needs_id, needs_score);
+            collect_expr_source_columns_with_flags(high, columns, needs_id, needs_score);
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_expr_source_columns_with_flags(e, columns, needs_id, needs_score);
+            for item in list {
+                collect_expr_source_columns_with_flags(item, columns, needs_id, needs_score);
+            }
+        }
+        Expr::Function(func) => {
+            // For aggregates, extract the field name directly
+            if let Ok(Some(metric)) = parse_grouped_metric(expr, None) {
+                if let Some(field) = &metric.field {
+                    columns.insert(field.clone());
+                }
+                return;
+            }
+            if let FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        }
+                        | FunctionArg::ExprNamed {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
+                            collect_expr_source_columns_with_flags(
+                                e,
+                                columns,
+                                needs_id,
+                                needs_score,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_expr_source_columns_with_flags(op, columns, needs_id, needs_score);
+            }
+            for cond in conditions {
+                let sqlparser::ast::CaseWhen { condition, result } = cond;
+                collect_expr_source_columns_with_flags(condition, columns, needs_id, needs_score);
+                collect_expr_source_columns_with_flags(result, columns, needs_id, needs_score);
+            }
+            if let Some(else_res) = else_result {
+                collect_expr_source_columns_with_flags(else_res, columns, needs_id, needs_score);
+            }
+        }
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        } => {
+            collect_expr_source_columns_with_flags(e, columns, needs_id, needs_score);
+            collect_expr_source_columns_with_flags(pattern, columns, needs_id, needs_score);
+        }
+        _ => {}
+    }
+}
+
+/// Walk an expression collecting source columns with alias awareness, plus
+/// synthetic flags. Unified replacement for separate `collect_expr_columns_alias_aware`
+/// + synthetic detection.
+fn collect_expr_columns_alias_aware_into(
+    expr: &Expr,
+    aliases: &BTreeSet<String>,
+    identity_source_aliases: &BTreeSet<String>,
+    columns: &mut BTreeSet<String>,
+    needs_id: &mut bool,
+    needs_score: &mut bool,
+) {
+    // Aggregates: extract field, skip function name
+    if let Ok(Some(metric)) = parse_grouped_metric(expr, None) {
+        if let Some(field) = metric.field {
+            columns.insert(field);
+        }
+        return;
+    }
+
+    match expr {
+        Expr::Identifier(ident) => {
+            let name = &ident.value;
+            if alias_blocks_source_name(name, aliases, identity_source_aliases) {
+                return;
+            }
+            match SyntheticColumn::parse(name) {
+                Some(SyntheticColumn::Id) => *needs_id = true,
+                Some(SyntheticColumn::Score) => *needs_score = true,
+                None => {
+                    columns.insert(name.clone());
+                }
+            }
+        }
+        Expr::CompoundIdentifier(idents) => {
+            if let Some(ident) = idents.last() {
+                let name = &ident.value;
+                if alias_blocks_source_name(name, aliases, identity_source_aliases) {
+                    return;
+                }
+                match SyntheticColumn::parse(name) {
+                    Some(SyntheticColumn::Id) => *needs_id = true,
+                    Some(SyntheticColumn::Score) => *needs_score = true,
+                    None => {
+                        columns.insert(name.clone());
+                    }
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_columns_alias_aware_into(
+                left,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+            collect_expr_columns_alias_aware_into(
+                right,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => {
+            collect_expr_columns_alias_aware_into(
+                inner,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            collect_expr_columns_alias_aware_into(
+                e,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+            collect_expr_columns_alias_aware_into(
+                low,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+            collect_expr_columns_alias_aware_into(
+                high,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_expr_columns_alias_aware_into(
+                e,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+            for item in list {
+                collect_expr_columns_alias_aware_into(
+                    item,
+                    aliases,
+                    identity_source_aliases,
+                    columns,
+                    needs_id,
+                    needs_score,
+                );
+            }
+        }
+        Expr::Function(func) => {
+            if let FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        }
+                        | FunctionArg::ExprNamed {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
+                            collect_expr_columns_alias_aware_into(
+                                e,
+                                aliases,
+                                identity_source_aliases,
+                                columns,
+                                needs_id,
+                                needs_score,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_expr_columns_alias_aware_into(
+                    op,
+                    aliases,
+                    identity_source_aliases,
+                    columns,
+                    needs_id,
+                    needs_score,
+                );
+            }
+            for cond in conditions {
+                let sqlparser::ast::CaseWhen { condition, result } = cond;
+                collect_expr_columns_alias_aware_into(
+                    condition,
+                    aliases,
+                    identity_source_aliases,
+                    columns,
+                    needs_id,
+                    needs_score,
+                );
+                collect_expr_columns_alias_aware_into(
+                    result,
+                    aliases,
+                    identity_source_aliases,
+                    columns,
+                    needs_id,
+                    needs_score,
+                );
+            }
+            if let Some(else_res) = else_result {
+                collect_expr_columns_alias_aware_into(
+                    else_res,
+                    aliases,
+                    identity_source_aliases,
+                    columns,
+                    needs_id,
+                    needs_score,
+                );
+            }
+        }
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        } => {
+            collect_expr_columns_alias_aware_into(
+                e,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+            collect_expr_columns_alias_aware_into(
+                pattern,
+                aliases,
+                identity_source_aliases,
+                columns,
+                needs_id,
+                needs_score,
+            );
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMatchPredicate {
     pub field: String,
@@ -446,6 +1091,13 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         Statement::Query(query) => query,
         _ => bail!("Only SELECT statements are supported"),
     };
+
+    // ── Early shape validation ─────────────────────────────────────────
+    // Reject unsupported query shapes with clear errors before any
+    // planning work begins. This prevents opaque DataFusion table-
+    // resolution failures from leaking to the user.
+    validate_query_shape(query)?;
+
     let order_by = query.order_by.clone();
     let (limit, offset) = extract_limit_offset(&query.limit_clause);
 
@@ -463,14 +1115,25 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         );
     }
 
-    let selects_all_columns = projection_has_wildcard(select);
-    let select_aliases = collect_select_aliases(select);
-    let (text_matches, pushed_filters) = extract_pushdowns(&mut select.selection, &select_aliases)?;
+    // ── Binding ──────────────────────────────────────────────────────
+    // Bind the SELECT before pushdown extraction so we can collect
+    // aliases, then use the binder's alias set for pushdown guards,
+    // and finally derive required_columns / GROUP BY from bound items.
+    let bind_ctx = bind_select(select);
+    let selects_all_columns = bind_ctx.selects_all_columns;
+
+    let (text_matches, pushed_filters) = extract_pushdowns(
+        &mut select.selection,
+        &bind_ctx.alias_set,
+        &bind_ctx.identity_source_aliases,
+    )?;
     let has_residual_predicates = select.selection.is_some();
     rewrite_table_name(select);
+
+    // Derive columns and GROUP BY from the binder context
     let (required_columns, needs_id, needs_score) =
-        collect_required_columns(select, order_by.as_ref());
-    let (group_by_columns, has_expression_group_by) = collect_group_by_columns(select);
+        bind_ctx.derive_columns(select, order_by.as_ref());
+    let (group_by_columns, has_expression_group_by) = bind_ctx.derive_group_by();
     let grouped_sql = extract_grouped_sql_plan(
         select,
         order_by.as_ref(),
@@ -880,6 +1543,281 @@ fn extract_sort_pushdown(order_by: Option<&sqlparser::ast::OrderBy>) -> Option<(
     Some((name, desc))
 }
 
+// ── Query-shape validation ─────────────────────────────────────────────
+// These functions run early in `plan_sql()` to reject unsupported SQL
+// shapes with clear, actionable error messages instead of letting them
+// leak through to DataFusion as opaque table-resolution failures.
+
+/// Top-level shape validation. Called immediately after parsing the Query
+/// AST and before any planning work begins.
+fn validate_query_shape(query: &sqlparser::ast::Query) -> Result<()> {
+    // CTEs (WITH ... AS ...)
+    if query.with.is_some() {
+        bail!("CTEs (WITH ... AS ...) are not supported. Rewrite as separate queries.");
+    }
+
+    // UNION / EXCEPT / INTERSECT
+    match query.body.as_ref() {
+        SetExpr::Select(select) => {
+            // Check FROM clause for subqueries and JOINs
+            validate_from_clause(select)?;
+            // Check WHERE clause for subqueries
+            if let Some(ref selection) = select.selection {
+                validate_where_clause(selection)?;
+            }
+            // Check HAVING for subqueries
+            if let Some(ref having) = select.having
+                && expr_contains_subquery(having)
+            {
+                bail!(
+                    "Subqueries in HAVING are not supported. \
+                     Rewrite as separate queries."
+                );
+            }
+            // Check SELECT projection for subqueries
+            validate_projection(select)?;
+        }
+        SetExpr::SetOperation { op, .. } => {
+            bail!("{op} is not supported. Only simple SELECT queries are supported.");
+        }
+        _ => {
+            bail!("Only simple SELECT queries are supported");
+        }
+    }
+
+    // Check ORDER BY for subqueries
+    if let Some(ref order_by) = query.order_by
+        && let OrderByKind::Expressions(exprs) = &order_by.kind
+    {
+        for expr in exprs {
+            if expr_contains_subquery(&expr.expr) {
+                bail!(
+                    "Subqueries in ORDER BY are not supported. \
+                         Rewrite as separate queries."
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate FROM clause: reject subqueries and JOINs.
+fn validate_from_clause(select: &Select) -> Result<()> {
+    for table_with_joins in &select.from {
+        match &table_with_joins.relation {
+            TableFactor::Derived { .. } => {
+                bail!(
+                    "Subqueries in FROM (derived tables) are not supported. \
+                     Rewrite as separate queries."
+                );
+            }
+            TableFactor::NestedJoin { .. } => {
+                bail!("JOINs are not supported. Rewrite as separate queries.");
+            }
+            _ => {}
+        }
+        if !table_with_joins.joins.is_empty() {
+            bail!("JOINs are not supported. Rewrite as separate queries.");
+        }
+    }
+    if select.from.len() > 1 {
+        bail!(
+            "Multi-table FROM (implicit join) is not supported. \
+             Use a single table per query."
+        );
+    }
+    Ok(())
+}
+
+/// Validate SELECT projection: reject subqueries in any projection expression.
+fn validate_projection(select: &Select) -> Result<()> {
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => continue,
+        };
+        if expr_contains_subquery(expr) {
+            bail!(
+                "Subqueries in SELECT expressions are not supported. \
+                 Rewrite as separate queries."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate WHERE clause: reject subquery expressions.
+fn validate_where_clause(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::InSubquery { .. } => {
+            bail!(
+                "Subqueries (IN (SELECT ...)) are not yet supported. \
+                 Rewrite as separate queries."
+            );
+        }
+        Expr::Exists { .. } => {
+            bail!(
+                "EXISTS subqueries are not supported. \
+                 Rewrite as separate queries."
+            );
+        }
+        Expr::Subquery(_) => {
+            bail!(
+                "Scalar subqueries are not supported. \
+                 Rewrite as separate queries."
+            );
+        }
+        // Recurse into compound expressions
+        Expr::BinaryOp { left, right, .. } => {
+            validate_where_clause(left)?;
+            validate_where_clause(right)?;
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Nested(inner) => {
+            validate_where_clause(inner)?;
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            validate_where_clause(e)?;
+            validate_where_clause(low)?;
+            validate_where_clause(high)?;
+        }
+        Expr::InList { expr: e, list, .. } => {
+            validate_where_clause(e)?;
+            for item in list {
+                validate_where_clause(item)?;
+            }
+        }
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        } => {
+            validate_where_clause(e)?;
+            validate_where_clause(pattern)?;
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            validate_where_clause(inner)?;
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                validate_where_clause(op)?;
+            }
+            for cond in conditions {
+                let sqlparser::ast::CaseWhen { condition, result } = cond;
+                validate_where_clause(condition)?;
+                validate_where_clause(result)?;
+            }
+            if let Some(else_res) = else_result {
+                validate_where_clause(else_res)?;
+            }
+        }
+        Expr::Function(func) => {
+            if let FunctionArguments::Subquery(_) = &func.args {
+                bail!(
+                    "Subqueries as function arguments are not supported. \
+                     Rewrite as separate queries."
+                );
+            }
+            if let FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        }
+                        | FunctionArg::ExprNamed {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
+                            validate_where_clause(e)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Expr::Cast { expr: inner, .. } => {
+            validate_where_clause(inner)?;
+        }
+        // Leaf expressions (literals, identifiers, etc.) — no subqueries possible
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Returns true if the expression contains any subquery node.
+/// Used for HAVING clause checking where we want to detect but not produce
+/// a specific error message for each variant.
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => expr_contains_subquery(inner),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_contains_subquery(e) || expr_contains_subquery(low) || expr_contains_subquery(high)
+        }
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        } => expr_contains_subquery(e) || expr_contains_subquery(pattern),
+        Expr::InList { expr: e, list, .. } => {
+            expr_contains_subquery(e) || list.iter().any(expr_contains_subquery)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_contains_subquery)
+                || conditions.iter().any(|case_when| {
+                    expr_contains_subquery(&case_when.condition)
+                        || expr_contains_subquery(&case_when.result)
+                })
+                || else_result.as_deref().is_some_and(expr_contains_subquery)
+        }
+        Expr::Function(func) => {
+            matches!(&func.args, FunctionArguments::Subquery(_))
+                || if let FunctionArguments::List(list) = &func.args {
+                    list.args.iter().any(|arg| match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        }
+                        | FunctionArg::ExprNamed {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => expr_contains_subquery(e),
+                        _ => false,
+                    })
+                } else {
+                    false
+                }
+        }
+        _ => false,
+    }
+}
+
 fn extract_single_table(select: &Select) -> Result<String> {
     if select.from.len() != 1 {
         bail!("Exactly one FROM table is supported");
@@ -917,6 +1855,7 @@ fn rewrite_table_name(select: &mut Select) {
 fn extract_pushdowns(
     selection: &mut Option<Expr>,
     select_aliases: &BTreeSet<String>,
+    identity_source_aliases: &BTreeSet<String>,
 ) -> Result<(Vec<TextMatchPredicate>, Vec<crate::search::QueryClause>)> {
     let Some(expr) = selection.take() else {
         return Ok((Vec::new(), Vec::new()));
@@ -932,7 +1871,7 @@ fn extract_pushdowns(
         // Never push down predicates that reference SELECT aliases (e.g.,
         // `WHERE posts > 10` when `posts` is an alias for `count(*)`).
         // These are aggregate-derived values, not physical fields.
-        if predicate_references_alias(&predicate, select_aliases) {
+        if predicate_references_alias(&predicate, select_aliases, identity_source_aliases) {
             residual.push(predicate);
             continue;
         }
@@ -1058,18 +1997,77 @@ fn expr_contains_text_match(expr: &Expr) -> bool {
 
 /// Returns true if the predicate references any SELECT alias.
 /// For example, `posts > 10` when `posts` is an alias for `count(*)`.
-fn predicate_references_alias(expr: &Expr, aliases: &BTreeSet<String>) -> bool {
+fn predicate_references_alias(
+    expr: &Expr,
+    aliases: &BTreeSet<String>,
+    identity_source_aliases: &BTreeSet<String>,
+) -> bool {
     match expr {
-        Expr::Identifier(ident) => aliases.contains(&ident.value),
+        Expr::Identifier(ident) => {
+            alias_blocks_source_name(&ident.value, aliases, identity_source_aliases)
+        }
+        Expr::CompoundIdentifier(idents) => idents.last().is_some_and(|ident| {
+            alias_blocks_source_name(&ident.value, aliases, identity_source_aliases)
+        }),
         Expr::BinaryOp { left, right, .. } => {
-            predicate_references_alias(left, aliases) || predicate_references_alias(right, aliases)
+            predicate_references_alias(left, aliases, identity_source_aliases)
+                || predicate_references_alias(right, aliases, identity_source_aliases)
         }
         Expr::Between {
-            expr: between_expr, ..
-        } => predicate_references_alias(between_expr, aliases),
-        Expr::InList { expr: in_expr, .. } => predicate_references_alias(in_expr, aliases),
-        Expr::UnaryOp { expr, .. } => predicate_references_alias(expr, aliases),
-        Expr::Nested(inner) => predicate_references_alias(inner, aliases),
+            expr: between_expr,
+            low,
+            high,
+            ..
+        } => {
+            predicate_references_alias(between_expr, aliases, identity_source_aliases)
+                || predicate_references_alias(low, aliases, identity_source_aliases)
+                || predicate_references_alias(high, aliases, identity_source_aliases)
+        }
+        Expr::InList {
+            expr: in_expr,
+            list,
+            ..
+        } => {
+            predicate_references_alias(in_expr, aliases, identity_source_aliases)
+                || list
+                    .iter()
+                    .any(|item| predicate_references_alias(item, aliases, identity_source_aliases))
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => {
+            predicate_references_alias(expr, aliases, identity_source_aliases)
+        }
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        } => {
+            predicate_references_alias(e, aliases, identity_source_aliases)
+                || predicate_references_alias(pattern, aliases, identity_source_aliases)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(|expr| {
+                predicate_references_alias(expr, aliases, identity_source_aliases)
+            }) || conditions.iter().any(|case_when| {
+                predicate_references_alias(&case_when.condition, aliases, identity_source_aliases)
+                    || predicate_references_alias(
+                        &case_when.result,
+                        aliases,
+                        identity_source_aliases,
+                    )
+            }) || else_result.as_deref().is_some_and(|expr| {
+                predicate_references_alias(expr, aliases, identity_source_aliases)
+            })
+        }
         _ => false,
     }
 }
@@ -1382,297 +2380,6 @@ fn flip_binary_operator(op: &BinaryOperator) -> BinaryOperator {
         BinaryOperator::Lt => BinaryOperator::Gt,
         BinaryOperator::LtEq => BinaryOperator::GtEq,
         other => other.clone(),
-    }
-}
-
-fn projection_has_wildcard(select: &Select) -> bool {
-    select.projection.iter().any(|item| {
-        matches!(
-            item,
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
-        )
-    })
-}
-
-fn collect_required_columns(
-    select: &Select,
-    order_by: Option<&sqlparser::ast::OrderBy>,
-) -> (Vec<String>, bool, bool) {
-    let aliases = collect_select_aliases(select);
-    let mut columns = BTreeSet::new();
-
-    for item in &select.projection {
-        collect_select_item_columns(item, &mut columns);
-    }
-    if let Some(selection) = &select.selection {
-        collect_expr_columns_alias_aware(selection, &aliases, &mut columns);
-    }
-    collect_group_by_exprs(select, &mut columns);
-
-    if let Some(having) = &select.having {
-        collect_expr_columns_alias_aware(having, &aliases, &mut columns);
-    }
-
-    if let Some(order_by) = order_by {
-        match &order_by.kind {
-            OrderByKind::Expressions(exprs) => {
-                for expr in exprs {
-                    collect_expr_columns_alias_aware(&expr.expr, &aliases, &mut columns);
-                }
-            }
-            OrderByKind::All(_) => {}
-        }
-    }
-
-    columns.remove(INTERNAL_TABLE_NAME);
-
-    // Detect whether `_id` and synthetic `_score` are actually referenced before
-    // removing synthetic columns from required_columns.
-    let needs_id = columns.contains(SyntheticColumn::Id.name());
-    let needs_score = columns.contains(SyntheticColumn::Score.name());
-
-    for synthetic in [SyntheticColumn::Score, SyntheticColumn::Id] {
-        columns.remove(synthetic.name());
-    }
-    (columns.into_iter().collect(), needs_id, needs_score)
-}
-
-fn collect_expr_columns_alias_aware(
-    expr: &Expr,
-    aliases: &BTreeSet<String>,
-    columns: &mut BTreeSet<String>,
-) {
-    if let Ok(Some(metric)) = parse_grouped_metric(expr, None)
-        && let Some(field) = metric.field
-    {
-        columns.insert(field);
-        return;
-    }
-
-    match expr {
-        Expr::Identifier(ident) => {
-            if !aliases.contains(ident.value.as_str()) {
-                columns.insert(ident.value.clone());
-            }
-        }
-        Expr::CompoundIdentifier(idents) => {
-            if let Some(ident) = idents.last()
-                && !aliases.contains(ident.value.as_str())
-            {
-                columns.insert(ident.value.clone());
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_expr_columns_alias_aware(left, aliases, columns);
-            collect_expr_columns_alias_aware(right, aliases, columns);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr) => collect_expr_columns_alias_aware(expr, aliases, columns),
-        Expr::Between {
-            expr: between_expr,
-            low,
-            high,
-            ..
-        } => {
-            collect_expr_columns_alias_aware(between_expr, aliases, columns);
-            collect_expr_columns_alias_aware(low, aliases, columns);
-            collect_expr_columns_alias_aware(high, aliases, columns);
-        }
-        Expr::InList {
-            expr: in_expr,
-            list,
-            ..
-        } => {
-            collect_expr_columns_alias_aware(in_expr, aliases, columns);
-            for item in list {
-                collect_expr_columns_alias_aware(item, aliases, columns);
-            }
-        }
-        Expr::Function(function) => {
-            if let FunctionArguments::List(list) = &function.args {
-                for arg in &list.args {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                            collect_expr_columns_alias_aware(expr, aliases, columns)
-                        }
-                        FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-                            if let FunctionArgExpr::Expr(expr) = arg {
-                                collect_expr_columns_alias_aware(expr, aliases, columns)
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Expr::Cast { expr, .. } => collect_expr_columns_alias_aware(expr, aliases, columns),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(op) = operand {
-                collect_expr_columns_alias_aware(op, aliases, columns);
-            }
-            for case_when in conditions {
-                collect_expr_columns_alias_aware(&case_when.condition, aliases, columns);
-                collect_expr_columns_alias_aware(&case_when.result, aliases, columns);
-            }
-            if let Some(el) = else_result {
-                collect_expr_columns_alias_aware(el, aliases, columns);
-            }
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            collect_expr_columns_alias_aware(expr, aliases, columns);
-            collect_expr_columns_alias_aware(pattern, aliases, columns);
-        }
-        _ => {}
-    }
-}
-
-/// Returns (plain_column_names, has_expression_group_by).
-/// `has_expression_group_by` is true when any GROUP BY item is NOT a plain column
-/// reference (e.g., `GROUP BY LOWER(author)` or `GROUP BY year / 10`).
-fn collect_group_by_columns(select: &Select) -> (Vec<String>, bool) {
-    let mut columns = BTreeSet::new();
-    let mut has_expression = false;
-    match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
-            for expr in exprs {
-                // Only accept plain column references for the grouped partials path.
-                // Expression-based GROUP BY (e.g., LOWER(author), year / 10) must
-                // fall through to DataFusion, which can evaluate them correctly.
-                if let Some(name) = expr_to_field_name(expr) {
-                    if SyntheticColumn::parse(&name).is_none() {
-                        columns.insert(name);
-                    } else {
-                        has_expression = true;
-                    }
-                } else {
-                    has_expression = true;
-                }
-            }
-        }
-        sqlparser::ast::GroupByExpr::All(_) => {}
-    }
-    (columns.into_iter().collect(), has_expression)
-}
-
-fn collect_group_by_exprs(select: &Select, columns: &mut BTreeSet<String>) {
-    match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
-            for expr in exprs {
-                collect_expr_columns(expr, columns);
-            }
-        }
-        sqlparser::ast::GroupByExpr::All(_) => {}
-    }
-}
-
-fn collect_select_item_columns(item: &SelectItem, columns: &mut BTreeSet<String>) {
-    match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            collect_expr_columns(expr, columns)
-        }
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
-    }
-}
-
-/// Collect all SELECT aliases (e.g., `count(*) AS total` yields `"total"`).
-/// These are computed columns that should not be sent to the fast-field reader.
-fn collect_select_aliases(select: &Select) -> BTreeSet<String> {
-    let mut aliases = BTreeSet::new();
-    for item in &select.projection {
-        if let SelectItem::ExprWithAlias { alias, .. } = item {
-            aliases.insert(alias.value.clone());
-        }
-    }
-    aliases
-}
-
-fn collect_expr_columns(expr: &Expr, columns: &mut BTreeSet<String>) {
-    match expr {
-        Expr::Identifier(ident) => {
-            columns.insert(ident.value.clone());
-        }
-        Expr::CompoundIdentifier(idents) => {
-            if let Some(ident) = idents.last() {
-                columns.insert(ident.value.clone());
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_expr_columns(left, columns);
-            collect_expr_columns(right, columns);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr) => collect_expr_columns(expr, columns),
-        Expr::Between {
-            expr: between_expr,
-            low,
-            high,
-            ..
-        } => {
-            collect_expr_columns(between_expr, columns);
-            collect_expr_columns(low, columns);
-            collect_expr_columns(high, columns);
-        }
-        Expr::InList {
-            expr: in_expr,
-            list,
-            ..
-        } => {
-            collect_expr_columns(in_expr, columns);
-            for item in list {
-                collect_expr_columns(item, columns);
-            }
-        }
-        Expr::Function(function) => {
-            if let FunctionArguments::List(list) = &function.args {
-                for arg in &list.args {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                            collect_expr_columns(expr, columns)
-                        }
-                        FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-                            if let FunctionArgExpr::Expr(expr) = arg {
-                                collect_expr_columns(expr, columns)
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Expr::Cast { expr, .. } => {
-            collect_expr_columns(expr, columns);
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(op) = operand {
-                collect_expr_columns(op, columns);
-            }
-            for case_when in conditions {
-                collect_expr_columns(&case_when.condition, columns);
-                collect_expr_columns(&case_when.result, columns);
-            }
-            if let Some(el) = else_result {
-                collect_expr_columns(el, columns);
-            }
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            collect_expr_columns(expr, columns);
-            collect_expr_columns(pattern, columns);
-        }
-        _ => {}
     }
 }
 
@@ -2513,5 +3220,486 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("text_match()"), "Error: {}", err);
+    }
+
+    // ── Unsupported query shape validation tests ───────────────────────
+
+    #[test]
+    fn rejects_in_subquery() {
+        let result = plan_sql("idx", "SELECT * FROM idx WHERE id IN (SELECT id FROM idx)");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries") && err.contains("not"),
+            "Expected subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_exists_subquery() {
+        let result = plan_sql(
+            "idx",
+            "SELECT * FROM idx WHERE EXISTS (SELECT 1 FROM idx WHERE idx.id = idx.id)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("EXISTS") && err.contains("not supported"),
+            "Expected EXISTS error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_scalar_subquery_in_where() {
+        let result = plan_sql(
+            "idx",
+            "SELECT * FROM idx WHERE price > (SELECT MAX(price) FROM idx)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("subqueries") || err.contains("Subqueries"),
+            "Expected subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_cte() {
+        let result = plan_sql(
+            "idx",
+            "WITH top_authors AS (SELECT author FROM idx) SELECT * FROM idx",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("CTEs") || err.contains("WITH"),
+            "Expected CTE error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_union() {
+        let result = plan_sql("idx", "SELECT title FROM idx UNION SELECT title FROM idx");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UNION"), "Expected UNION error, got: {err}");
+    }
+
+    #[test]
+    fn rejects_except() {
+        let result = plan_sql("idx", "SELECT title FROM idx EXCEPT SELECT title FROM idx");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("EXCEPT"), "Expected EXCEPT error, got: {err}");
+    }
+
+    #[test]
+    fn rejects_intersect() {
+        let result = plan_sql(
+            "idx",
+            "SELECT title FROM idx INTERSECT SELECT title FROM idx",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("INTERSECT"),
+            "Expected INTERSECT error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_join() {
+        let result = plan_sql("idx", "SELECT * FROM idx JOIN idx AS b ON idx.id = b.id");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("JOIN") || err.contains("join"),
+            "Expected JOIN error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_derived_table_in_from() {
+        let result = plan_sql("idx", "SELECT * FROM (SELECT * FROM idx) AS sub");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("derived table") || err.contains("Subqueries in FROM"),
+            "Expected derived table error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_multi_table_from() {
+        let result = plan_sql("idx", "SELECT * FROM idx, other");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Multi-table") || err.contains("implicit join"),
+            "Expected multi-table error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_subquery_nested_in_and() {
+        let result = plan_sql(
+            "idx",
+            "SELECT * FROM idx WHERE price > 10 AND id IN (SELECT id FROM idx)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries") || err.contains("not"),
+            "Expected subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_subquery_in_having() {
+        let result = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS cnt FROM idx GROUP BY author HAVING count(*) > (SELECT 1 FROM idx)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("HAVING") || err.contains("subquer"),
+            "Expected HAVING subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn simple_select_still_works_after_validation() {
+        // Sanity: normal queries must still pass through validation
+        let plan = plan_sql("idx", "SELECT title, author FROM idx WHERE price > 10").unwrap();
+        assert_eq!(plan.index_name, "idx");
+        assert!(!plan.pushed_filters.is_empty());
+    }
+
+    #[test]
+    fn grouped_query_still_works_after_validation() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS cnt FROM idx GROUP BY author",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+    }
+
+    // ── Binder unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn binder_detects_source_columns() {
+        let plan = plan_sql("idx", "SELECT author, price FROM idx").unwrap();
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        assert!(plan.required_columns.contains(&"price".to_string()));
+        assert!(!plan.needs_id);
+        assert!(!plan.needs_score);
+    }
+
+    #[test]
+    fn binder_detects_synthetic_id() {
+        let plan = plan_sql("idx", "SELECT _id, author FROM idx").unwrap();
+        assert!(plan.needs_id);
+        assert!(!plan.needs_score);
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        // _id should NOT be in required_columns (it's synthetic)
+        assert!(!plan.required_columns.contains(&"_id".to_string()));
+    }
+
+    #[test]
+    fn binder_detects_synthetic_score() {
+        let plan = plan_sql("idx", "SELECT _score, author FROM idx ORDER BY _score DESC").unwrap();
+        assert!(plan.needs_score);
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        assert!(!plan.required_columns.contains(&"_score".to_string()));
+    }
+
+    #[test]
+    fn binder_extracts_aggregate_field() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, avg(price) AS avg_price FROM idx GROUP BY author",
+        )
+        .unwrap();
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        assert!(plan.required_columns.contains(&"price".to_string()));
+        assert!(!plan.required_columns.contains(&"avg_price".to_string()));
+    }
+
+    #[test]
+    fn binder_alias_not_in_required_columns() {
+        let plan = plan_sql("idx", "SELECT count(*) AS total FROM idx").unwrap();
+        assert!(!plan.required_columns.contains(&"total".to_string()));
+    }
+
+    #[test]
+    fn binder_expression_group_by_detected() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT LOWER(author) AS a, count(*) AS cnt FROM idx GROUP BY LOWER(author)",
+        )
+        .unwrap();
+        // Expression GROUP BY should not be eligible for grouped partials
+        assert!(!plan.uses_grouped_partials());
+        assert!(plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn binder_synthetic_in_group_by_flags_expression() {
+        let plan = plan_sql("idx", "SELECT _id, count(*) AS cnt FROM idx GROUP BY _id").unwrap();
+        // GROUP BY _id is treated as expression GROUP BY (synthetic)
+        assert!(!plan.uses_grouped_partials());
+        assert!(plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn binder_plain_group_by_eligible() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT category, count(*) AS cnt FROM idx GROUP BY category",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert!(!plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn binder_where_column_from_residual() {
+        // A column used only in WHERE (that can't be pushed down) should
+        // still be in required_columns
+        let plan = plan_sql("idx", "SELECT title FROM idx WHERE LOWER(author) = 'alice'").unwrap();
+        assert!(plan.required_columns.contains(&"title".to_string()));
+        assert!(plan.required_columns.contains(&"author".to_string()));
+    }
+
+    #[test]
+    fn binder_having_column_extraction() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author HAVING count(*) > 5",
+        )
+        .unwrap();
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        assert!(!plan.required_columns.contains(&"posts".to_string()));
+    }
+
+    #[test]
+    fn binder_order_by_alias_not_in_required() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS posts FROM idx GROUP BY author ORDER BY posts DESC",
+        )
+        .unwrap();
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        // 'posts' is an alias — should not be in required_columns
+        assert!(!plan.required_columns.contains(&"posts".to_string()));
+    }
+
+    #[test]
+    fn binder_score_in_order_by_sets_needs_score() {
+        let plan = plan_sql("idx", "SELECT title FROM idx ORDER BY _score DESC").unwrap();
+        assert!(plan.needs_score);
+        assert!(!plan.required_columns.contains(&"_score".to_string()));
+    }
+
+    #[test]
+    fn binder_select_star_sets_flag() {
+        let plan = plan_sql("idx", "SELECT * FROM idx").unwrap();
+        assert!(plan.selects_all_columns);
+    }
+
+    #[test]
+    fn binder_unresolved_expression_extracts_source_columns() {
+        let plan = plan_sql("idx", "SELECT price * 2 AS double_price, author FROM idx").unwrap();
+        assert!(plan.required_columns.contains(&"price".to_string()));
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        assert!(!plan.required_columns.contains(&"double_price".to_string()));
+    }
+
+    // ── Subquery validation: SELECT projection ─────────────────────────
+
+    #[test]
+    fn rejects_scalar_subquery_in_select() {
+        let result = plan_sql("idx", "SELECT (SELECT 1 FROM idx) AS x FROM idx");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries in SELECT"),
+            "Expected SELECT subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_subquery_in_select_expression() {
+        let result = plan_sql(
+            "idx",
+            "SELECT price + (SELECT MAX(price) FROM idx) AS x FROM idx",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries in SELECT"),
+            "Expected SELECT subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_in_subquery_in_select() {
+        let result = plan_sql(
+            "idx",
+            "SELECT price IN (SELECT price FROM idx) AS flag FROM idx",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries in SELECT") || err.contains("subquer"),
+            "Expected SELECT subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_subquery_in_select_case_expression() {
+        let result = plan_sql(
+            "idx",
+            "SELECT CASE WHEN true THEN (SELECT 1 FROM idx) ELSE 0 END AS x FROM idx",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries in SELECT"),
+            "Expected SELECT CASE subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_subquery_in_where_like_pattern() {
+        let result = plan_sql("idx", "SELECT * FROM idx WHERE title LIKE (SELECT 'r%')");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries") || err.contains("subqueries"),
+            "Expected WHERE LIKE subquery error, got: {err}"
+        );
+    }
+
+    // ── Subquery validation: ORDER BY ──────────────────────────────────
+
+    #[test]
+    fn rejects_scalar_subquery_in_order_by() {
+        let result = plan_sql(
+            "idx",
+            "SELECT * FROM idx ORDER BY (SELECT MAX(price) FROM idx)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries in ORDER BY"),
+            "Expected ORDER BY subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_subquery_in_order_by_expression() {
+        let result = plan_sql(
+            "idx",
+            "SELECT title FROM idx ORDER BY price + (SELECT 1 FROM idx)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries in ORDER BY"),
+            "Expected ORDER BY subquery error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_subquery_in_order_by_like_expression() {
+        let result = plan_sql(
+            "idx",
+            "SELECT title FROM idx ORDER BY title LIKE (SELECT 'r%') DESC",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Subqueries in ORDER BY"),
+            "Expected ORDER BY LIKE subquery error, got: {err}"
+        );
+    }
+
+    // ── GROUP BY alias classification ──────────────────────────────────
+
+    #[test]
+    fn group_by_alias_falls_back_to_expression() {
+        // SELECT LOWER(author) AS author, count(*) FROM idx GROUP BY author
+        // "author" in GROUP BY is an alias for LOWER(author), not a source column.
+        // The binder must classify it as Expression, triggering fallback.
+        let plan = plan_sql(
+            "idx",
+            "SELECT LOWER(author) AS author, count(*) AS cnt FROM idx GROUP BY author",
+        )
+        .unwrap();
+        assert!(
+            !plan.uses_grouped_partials(),
+            "GROUP BY alias should not use grouped partials"
+        );
+        assert!(
+            plan.has_group_by_fallback,
+            "GROUP BY alias should trigger fallback"
+        );
+    }
+
+    #[test]
+    fn group_by_same_name_source_alias_still_uses_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author AS author, count(*) AS cnt FROM idx GROUP BY author",
+        )
+        .unwrap();
+        assert_eq!(plan.group_by_columns, vec!["author"]);
+        assert!(plan.uses_grouped_partials());
+        assert!(!plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn where_on_same_name_source_alias_still_pushes_down() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author AS author FROM idx WHERE author = 'alice'",
+        )
+        .unwrap();
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn group_by_non_alias_column_still_eligible() {
+        // "category" is NOT an alias — it's a real source column. Grouped partials OK.
+        let plan = plan_sql(
+            "idx",
+            "SELECT category, count(*) AS cnt FROM idx GROUP BY category",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert!(!plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn group_by_alias_with_different_name_falls_back() {
+        // SELECT category, count(*) AS total FROM idx GROUP BY total
+        // "total" is an alias for count(*), not a source column.
+        let plan = plan_sql(
+            "idx",
+            "SELECT category, count(*) AS total FROM idx GROUP BY total",
+        )
+        .unwrap();
+        assert!(
+            !plan.uses_grouped_partials(),
+            "GROUP BY on aggregate alias should not use grouped partials"
+        );
+        assert!(
+            plan.has_group_by_fallback,
+            "GROUP BY aggregate alias should trigger fallback"
+        );
     }
 }

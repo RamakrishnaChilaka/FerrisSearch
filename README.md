@@ -471,8 +471,8 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 873 tests
-cargo test --lib                                # Unit tests (726)
+cargo test                                      # All 914 tests
+cargo test --lib                                # Unit tests (767)
 cargo test --bin ferris-cli                      # CLI tests (55)
 cargo test --test consensus_integration          # Raft consensus (30)
 cargo test --test replication_integration        # Replication (39)
@@ -542,7 +542,9 @@ scripts/           Ingestion and benchmark scripts
 
 ### Planned
 
-- [ ] Semantic binder for SQL planning — introduce a clause-aware bound query IR before capability analysis so aliases, aggregate references, `_id`, and `_score` are resolved semantically; derive `required_columns`, `needs_id`, and `needs_score` from the bound plan instead of raw SQL AST walkers
+- [x] Semantic binder for SQL planning — clause-aware `BindContext` resolves identifiers as `Source`/`Synthetic`/`Aggregate`/`Unresolved` before capability analysis; `derive_columns()` and `derive_group_by()` replace raw AST walkers for `required_columns`, `needs_id`, `needs_score`, and GROUP BY eligibility
+- [x] Query shape validation — `validate_query_shape()` rejects CTEs, UNION/EXCEPT/INTERSECT, subqueries (IN/EXISTS/scalar), derived tables, JOINs, and multi-table FROM with clear error messages instead of leaking DataFusion internals
+- [ ] Branch-aware boolean lowering for `text_match()` inside `OR` / complex expressions — today `text_match()` must remain a top-level `AND` predicate because residual SQL/DataFusion cannot evaluate it; future support must lower the full boolean subtree into Tantivy instead of leaving residual `text_match()` work behind
 - [ ] Streaming fast-field TableProvider — custom DataFusion `TableProvider` reading Tantivy fast fields as streaming Arrow batches (8K rows/batch), eliminating the GROUP BY scan limit entirely
 - [ ] Streaming export / wildcard scan path — support large `SELECT *` and other unbounded result-set queries as block-streamed export-style execution instead of materializing full shard batches on remote nodes and the coordinator
 - [ ] `COUNT(DISTINCT field)`
@@ -593,11 +595,11 @@ Execution shape for the MVP:
 
 Task tracker (target: about 1 hour per task):
 
-- [ ] 1. Add planner-side query-shape validation for subqueries and return clear `unsupported_query_shape` errors instead of leaking DataFusion table-resolution failures.
-- [ ] 2. Add regression tests for unsupported shapes: correlated subquery, join, CTE, `EXISTS`, and multi-index subquery.
-- [ ] 3. Introduce a small clause-aware binder layer for identifier resolution in the planner (`Source`, `Synthetic`, `Output`).
-- [ ] 4. Convert `_id` / `_score` detection and `required_columns` extraction to consume bound identifiers instead of raw string walkers.
-- [ ] 5. Convert GROUP BY plain-column eligibility checks to use the binder so expression keys and output aliases bail out cleanly.
+- [x] 1. Add planner-side query-shape validation for subqueries and return clear `unsupported_query_shape` errors instead of leaking DataFusion table-resolution failures.
+- [x] 2. Add regression tests for unsupported shapes: correlated subquery, join, CTE, `EXISTS`, and multi-index subquery.
+- [x] 3. Introduce a small clause-aware binder layer for identifier resolution in the planner (`Source`, `Synthetic`, `Output`).
+- [x] 4. Convert `_id` / `_score` detection and `required_columns` extraction to consume bound identifiers instead of raw string walkers.
+- [x] 5. Convert GROUP BY plain-column eligibility checks to use the binder so expression keys and output aliases bail out cleanly.
 - [ ] 6. Add a bound representation for supported semijoin subqueries: outer key expression + inner query plan + same-index validation.
 - [ ] 7. Implement planner detection for `expr IN (SELECT key FROM same_index ...)` with exactly one projected inner key column.
 - [ ] 8. Validate MVP constraints during planning: same index, uncorrelated inner query, no joins, no `SELECT *`, no unsupported set operations.
