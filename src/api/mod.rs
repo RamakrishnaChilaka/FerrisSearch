@@ -49,6 +49,9 @@ pub struct AppState {
     pub raft: Option<Arc<RaftInstance>>,
     /// Dedicated thread pools for search and write workloads
     pub worker_pools: WorkerPools,
+    /// Max docs to scan for GROUP BY queries on the fast-fields fallback path.
+    /// 0 = unlimited.
+    pub sql_group_by_scan_limit: usize,
 }
 
 /// Build a consistent OpenSearch-compatible error response.

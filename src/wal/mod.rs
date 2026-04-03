@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Controls when the translog is fsynced to disk.
@@ -188,6 +188,19 @@ fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
     Ok(entries)
 }
 
+fn recover_lock<'a, T>(mutex: &'a Mutex<T>, lock_name: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!(
+                lock = lock_name,
+                "translog lock poisoned; continuing with inner state"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// Hot translog — binary length-prefixed, fsync-on-every-write WAL for maximum durability.
 ///
 /// Stored at `<data_dir>/translog.bin`. Each entry is a bincode-encoded frame
@@ -269,7 +282,7 @@ impl HotTranslog {
 
     /// Get the current (next) sequence number without incrementing.
     pub fn current_seq_no(&self) -> u64 {
-        *self.seq_no.lock().unwrap()
+        *recover_lock(&self.seq_no, "seq_no")
     }
 
     /// Start a background task that periodically fsyncs the translog file.
@@ -285,7 +298,7 @@ impl HotTranslog {
         Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let f = file.lock().unwrap_or_else(|e| e.into_inner());
+                let f = recover_lock(file.as_ref(), "file");
                 if let Err(e) = f.sync_data() {
                     tracing::error!("Background translog fsync failed: {}", e);
                 }
@@ -295,7 +308,7 @@ impl HotTranslog {
 
     /// Manually trigger an fsync (useful for testing or explicit flush).
     pub fn sync(&self) -> Result<()> {
-        let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let f = recover_lock(self.file.as_ref(), "file");
         f.sync_data()?;
         Ok(())
     }
@@ -310,7 +323,7 @@ impl HotTranslog {
 
 impl WriteAheadLog for HotTranslog {
     fn append(&self, op: &str, payload: serde_json::Value) -> Result<TranslogEntry> {
-        let mut seq = self.seq_no.lock().unwrap();
+        let mut seq = recover_lock(&self.seq_no, "seq_no");
         let entry = TranslogEntry {
             seq_no: *seq,
             op: op.to_string(),
@@ -320,7 +333,7 @@ impl WriteAheadLog for HotTranslog {
 
         let frame = encode_entry(&entry)?;
 
-        let mut file = self.file.lock().unwrap();
+        let mut file = recover_lock(self.file.as_ref(), "file");
         file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
             file.sync_data()?;
@@ -343,21 +356,21 @@ impl WriteAheadLog for HotTranslog {
 
         let frame = encode_entry(&entry)?;
 
-        let mut file = self.file.lock().unwrap();
+        let mut file = recover_lock(self.file.as_ref(), "file");
         file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
             file.sync_data()?;
         }
         drop(file);
 
-        let mut next_seq = self.seq_no.lock().unwrap();
+        let mut next_seq = recover_lock(&self.seq_no, "seq_no");
         *next_seq = (*next_seq).max(seq_no.saturating_add(1));
 
         Ok(entry)
     }
 
     fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
-        let mut seq = self.seq_no.lock().unwrap();
+        let mut seq = recover_lock(&self.seq_no, "seq_no");
         let mut entries = Vec::with_capacity(ops.len());
         // Pre-estimate buffer size: ~200 bytes per entry is a reasonable guess
         let mut buf = Vec::with_capacity(ops.len() * 200);
@@ -372,7 +385,7 @@ impl WriteAheadLog for HotTranslog {
             *seq += 1;
         }
 
-        let mut file = self.file.lock().unwrap();
+        let mut file = recover_lock(self.file.as_ref(), "file");
         file.write_all(&buf)?;
         if matches!(self.durability, TranslogDurability::Request) {
             file.sync_data()?;
@@ -382,7 +395,7 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn write_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<()> {
-        let mut seq = self.seq_no.lock().unwrap();
+        let mut seq = recover_lock(&self.seq_no, "seq_no");
         let mut buf = Vec::with_capacity(ops.len() * 200);
 
         for (op, payload) in ops {
@@ -390,7 +403,7 @@ impl WriteAheadLog for HotTranslog {
             *seq += 1;
         }
 
-        let mut file = self.file.lock().unwrap();
+        let mut file = recover_lock(self.file.as_ref(), "file");
         file.write_all(&buf)?;
         if matches!(self.durability, TranslogDurability::Request) {
             file.sync_data()?;
@@ -411,21 +424,21 @@ impl WriteAheadLog for HotTranslog {
             buf.extend_from_slice(&encode_entry_borrowed(seq_no, op, payload)?);
         }
 
-        let mut file = self.file.lock().unwrap();
+        let mut file = recover_lock(self.file.as_ref(), "file");
         file.write_all(&buf)?;
         if matches!(self.durability, TranslogDurability::Request) {
             file.sync_data()?;
         }
         drop(file);
 
-        let mut next_seq = self.seq_no.lock().unwrap();
+        let mut next_seq = recover_lock(&self.seq_no, "seq_no");
         *next_seq = (*next_seq).max(start_seq_no.saturating_add(ops.len() as u64));
 
         Ok(())
     }
 
     fn read_all(&self) -> Result<Vec<TranslogEntry>> {
-        let mut file = self.file.lock().unwrap();
+        let mut file = recover_lock(self.file.as_ref(), "file");
         file.seek(SeekFrom::Start(0))?;
         let mut reader = BufReader::new(&*file);
         decode_entries(&mut reader)
@@ -440,7 +453,7 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn truncate(&self) -> Result<()> {
-        let mut file = self.file.lock().unwrap();
+        let mut file = recover_lock(self.file.as_ref(), "file");
         file.seek(SeekFrom::Start(0))?;
         file.set_len(0)?;
         file.sync_data()?;
@@ -448,7 +461,7 @@ impl WriteAheadLog for HotTranslog {
 
         // Persist the current seq_no so it survives truncation.
         // This ensures seq_no never goes backward after flush.
-        let seq = self.seq_no.lock().unwrap();
+        let seq = recover_lock(&self.seq_no, "seq_no");
         std::fs::write(&self.seq_no_path, seq.to_string())?;
 
         tracing::info!(
@@ -469,7 +482,7 @@ impl WriteAheadLog for HotTranslog {
         let retained_count = retained.len();
 
         // Rewrite the file with only retained entries
-        let mut file = self.file.lock().unwrap();
+        let mut file = recover_lock(self.file.as_ref(), "file");
         file.seek(SeekFrom::Start(0))?;
         file.set_len(0)?;
 
@@ -484,7 +497,7 @@ impl WriteAheadLog for HotTranslog {
         drop(file);
 
         // Persist seq_no high-water mark
-        let seq = self.seq_no.lock().unwrap();
+        let seq = recover_lock(&self.seq_no, "seq_no");
         std::fs::write(&self.seq_no_path, seq.to_string())?;
 
         tracing::info!(
@@ -497,12 +510,12 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn last_seq_no(&self) -> u64 {
-        let seq = self.seq_no.lock().unwrap();
+        let seq = recover_lock(&self.seq_no, "seq_no");
         if *seq == 0 { 0 } else { *seq - 1 }
     }
 
     fn next_seq_no(&self) -> u64 {
-        *self.seq_no.lock().unwrap()
+        *recover_lock(&self.seq_no, "seq_no")
     }
 }
 
@@ -510,6 +523,7 @@ impl WriteAheadLog for HotTranslog {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     /// Helper: create a translog in a fresh temp directory.
     fn open_translog() -> (tempfile::TempDir, HotTranslog) {
@@ -1026,5 +1040,36 @@ mod tests {
         tl.append("index", json!({"a": 1})).unwrap();
         // sync() should succeed even in request mode (already fsynced)
         tl.sync().unwrap();
+    }
+
+    #[test]
+    fn poisoned_seq_lock_is_recovered_for_reads_and_appends() {
+        let (_dir, tl) = open_translog();
+
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = tl.seq_no.lock().unwrap();
+            panic!("poison seq lock");
+        }));
+
+        assert_eq!(tl.current_seq_no(), 0);
+
+        let entry = tl.append("index", json!({"recovered": true})).unwrap();
+        assert_eq!(entry.seq_no, 0);
+        assert_eq!(tl.next_seq_no(), 1);
+    }
+
+    #[test]
+    fn poisoned_file_lock_is_recovered_for_subsequent_io() {
+        let (_dir, tl) = open_translog();
+
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = tl.file.lock().unwrap();
+            panic!("poison file lock");
+        }));
+
+        tl.append("index", json!({"doc": 1})).unwrap();
+        let entries = tl.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].payload["doc"], 1);
     }
 }

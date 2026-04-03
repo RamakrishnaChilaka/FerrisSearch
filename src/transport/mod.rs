@@ -11,7 +11,32 @@ pub mod proto {
 
 pub use client::TransportClient;
 
+pub const GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 // ─── TLS support (behind feature flag) ──────────────────────────────────────
+
+#[cfg(feature = "transport-tls")]
+fn ensure_rustls_crypto_provider() -> anyhow::Result<()> {
+    static TLS_CRYPTO_PROVIDER_INIT: std::sync::OnceLock<Option<String>> =
+        std::sync::OnceLock::new();
+
+    let init_error = TLS_CRYPTO_PROVIDER_INIT.get_or_init(|| {
+        if tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_some() {
+            return None;
+        }
+
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default()
+            .err()
+            .map(|_| "failed to install rustls ring crypto provider".to_string())
+    });
+
+    if let Some(message) = init_error {
+        anyhow::bail!(message.clone());
+    }
+
+    Ok(())
+}
 
 /// Load TLS server configuration from PEM-encoded cert and key files.
 /// Only available when the `transport-tls` feature is enabled.
@@ -20,6 +45,8 @@ pub fn load_server_tls_config(
     cert_path: &str,
     key_path: &str,
 ) -> anyhow::Result<tonic::transport::ServerTlsConfig> {
+    ensure_rustls_crypto_provider()?;
+
     let cert = std::fs::read_to_string(cert_path)
         .map_err(|e| anyhow::anyhow!("failed to read TLS cert {}: {}", cert_path, e))?;
     let key = std::fs::read_to_string(key_path)
@@ -39,6 +66,8 @@ pub struct TonicTlsConnector {
 #[cfg(feature = "transport-tls")]
 impl TonicTlsConnector {
     pub fn from_ca_file(ca_path: &str) -> anyhow::Result<Self> {
+        ensure_rustls_crypto_provider()?;
+
         let ca_cert = std::fs::read_to_string(ca_path)
             .map_err(|e| anyhow::anyhow!("failed to read TLS CA cert {}: {}", ca_path, e))?;
         let ca = tonic::transport::Certificate::from_pem(ca_cert);

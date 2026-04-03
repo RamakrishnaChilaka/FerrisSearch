@@ -71,6 +71,11 @@ pub struct AppConfig {
     /// Default: 5. Set to 0 to always populate. Set to 100 to never eagerly populate.
     #[serde(default = "default_column_cache_populate_threshold")]
     pub column_cache_populate_threshold: u8,
+    /// Maximum docs to scan for GROUP BY queries that fall back to the
+    /// tantivy_fast_fields path (expression GROUP BY, STDDEV_POP, etc.).
+    /// Default: 1,000,000. Set to 0 for unlimited.
+    #[serde(default = "default_sql_group_by_scan_limit")]
+    pub sql_group_by_scan_limit: usize,
     /// Enable TLS for gRPC inter-node transport. Requires `transport-tls` feature.
     /// Default: false.
     #[serde(default)]
@@ -106,6 +111,10 @@ fn default_column_cache_populate_threshold() -> u8 {
     5
 }
 
+fn default_sql_group_by_scan_limit() -> usize {
+    1_000_000
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -120,6 +129,7 @@ impl Default for AppConfig {
             translog_sync_interval_ms: None,
             column_cache_size_percent: 10,
             column_cache_populate_threshold: 5,
+            sql_group_by_scan_limit: 1_000_000,
             transport_tls_enabled: false,
             transport_tls_cert_file: None,
             transport_tls_key_file: None,
@@ -346,5 +356,35 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert!(!config.transport_tls_enabled);
         assert!(config.transport_tls_cert_file.is_none());
+    }
+
+    #[test]
+    fn sql_group_by_scan_limit_defaults_to_1m() {
+        let config = AppConfig::default();
+        assert_eq!(config.sql_group_by_scan_limit, 1_000_000);
+    }
+
+    #[test]
+    fn sql_group_by_scan_limit_deserializes() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "sql_group_by_scan_limit": 5000000
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sql_group_by_scan_limit, 5_000_000);
+    }
+
+    #[test]
+    fn sql_group_by_scan_limit_zero_means_unlimited() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "sql_group_by_scan_limit": 0
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sql_group_by_scan_limit, 0);
     }
 }

@@ -36,6 +36,14 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 
 ## Ungrouped Aggregate Pushdown
 - SQL queries with only aggregate functions (no GROUP BY) now use the `tantivy_grouped_partials` execution path with zero group-by columns.
+
+## Scan Limits and GROUP BY Correctness
+- **Flat queries** (no GROUP BY): `SQL_MATCH_LIMIT = 100_000` caps `TopDocs` collection. Truncation only affects completeness — individual rows are correct. The response includes `truncated: true`. The CLI renders a `⚠ TRUNCATED` warning.
+- **GROUP BY on grouped_partials path**: No scan limit. Aggregation collectors process ALL matched docs per shard.
+- **GROUP BY on fast-fields fallback**: The planner sets `has_group_by_fallback = true` when GROUP BY exists but `grouped_sql` is `None` (expression GROUP BY, unsupported aggregates, residual predicates). The API layer overrides `SearchRequest.size` from 100K to `sql_group_by_scan_limit` (default: 1M, configurable via `ferrissearch.yml`, 0 = unlimited).
+- **Error on overflow**: If matched docs exceed the scan limit on a GROUP BY fallback query, the API returns HTTP 400 `group_by_scan_limit_exceeded` with an actionable error message instead of silently wrong aggregates. This is fundamentally different from flat-query truncation: GROUP BY over incomplete data produces wrong counts, missing groups, and biased averages.
+- **Why not raise the flat-query limit too?** Flat query truncation makes individual rows correct but incomplete. GROUP BY truncation makes aggregates mathematically wrong. These are different severity levels requiring different treatment.
+- **ClickHouse comparison**: ClickHouse has no scan limit — it processes all matching rows for GROUP BY. It uses `max_rows_to_group_by` to limit output cardinality and `max_bytes_before_external_group_by` to spill to disk when memory is tight. Our approach is the right trade-off for a search engine that isn't designed for full-table OLAP scans.
 - `SELECT count(*), avg(price), sum(price) FROM ...` produces a single global bucket via fast-field collectors — no row materialization needed.
 - The planner's `extract_grouped_sql_plan` no longer requires `group_by_columns` to be non-empty.
 - With zero group-by columns, the engine produces one bucket key (`"[]"`) per segment, merged correctly by `merge_grouped_metrics_partials`.
@@ -75,7 +83,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Example: schema `[base_passenger_fare, hvfhs_license_num]` + SQL `SELECT hvfhs_license_num, base_passenger_fare ... LIMIT 5` → returns all rows instead of 5.
 - The same query with columns in schema order (`SELECT base_passenger_fare, hvfhs_license_num`) correctly returns 5 rows.
 - **Workaround**: `project_batch_to_sql_columns()` in `datafusion_exec.rs` reorders the `RecordBatch` columns to match the SQL `SELECT` list order before creating the `MemTable`. This ensures DataFusion's projection is identity (no reorder), preventing the buggy optimizer path.
-- The workaround uses `sqlparser` to extract the SELECT column order and all referenced column names (including ORDER BY, WHERE) from the rewritten SQL, then physically reorders the Arrow batch accordingly.
+- The workaround uses `sqlparser` only for SELECT-list order. The set of required columns must come from the planner (`required_columns`, `needs_id`, `needs_score`), not from a second SQL AST walker, so CASE/HAVING/GROUP BY dependencies are preserved.
 - DataFusion still handles LIMIT/OFFSET execution — we do NOT strip LIMIT from the SQL or apply it manually. The workaround only prevents the specific optimizer misfire.
 - When DataFusion fixes this upstream, the workaround can be removed — the reordering is a no-op when projection already matches schema order.
 
@@ -84,6 +92,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
   1. search-aware planning in Tantivy
   2. residual SQL planning in DataFusion
 - Push `text_match(...)`, exact filters (`=`), range filters (`>`, `>=`, `<`, `<=`), `BETWEEN`, `IN`, and `OR` disjunctions into Tantivy before Arrow/DataFusion execution.
+- Multiple top-level `AND`ed `text_match(...)` predicates are supported. Keep them as explicit planner state and lower them into separate `BoolQuery.must` clauses instead of hiding extras as structured filters.
 - `BETWEEN a AND b` is pushed as `Range { gte: a, lte: b }` — reuses existing Range query support.
 - `IN (a, b, c)` is pushed as `Bool { should: [Term(a), Term(b), Term(c)] }` — reuses existing Bool+Term support.
 - `OR` disjunctions (e.g., `author = 'pg' OR author = 'sama'`) are pushed as `Bool { should: [...] }` when ALL branches are individually pushable. Nested ORs are flattened. Parenthesized expressions are unwrapped.
@@ -92,6 +101,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - `NOT IN` and `NOT BETWEEN` are NOT pushed — they remain as residual predicates for DataFusion.
 - `score`, `_score`, and `_id` fields are never pushed (score is computed by Tantivy, _id is a doc identifier).
 - **GROUP BY expressions** (e.g., `GROUP BY LOWER(author)`, `GROUP BY year / 10`) are NOT eligible for the grouped partials path. Only plain column references in GROUP BY enable `tantivy_grouped_partials`. Expression-based GROUP BY falls through to `tantivy_fast_fields` + DataFusion. Mixed GROUP BY (plain columns + expressions, e.g., `GROUP BY author, LOWER(category)`) also bails — `collect_group_by_columns` returns `has_expression_group_by = true` which gates `extract_grouped_sql_plan`.
+- **GROUP BY fallback scan limit**: When a GROUP BY query falls to `tantivy_fast_fields` (expression GROUP BY, unsupported aggregates like `STDDEV_POP`, residual predicates), the planner sets `has_group_by_fallback = true`. The API layer overrides `SearchRequest.size` from the default 100K to `sql_group_by_scan_limit` (default: 1M, configurable, 0 = unlimited). If matched docs still exceed this limit, the query returns a `group_by_scan_limit_exceeded` error instead of silently wrong aggregates. The default 100K `SQL_MATCH_LIMIT` remains for flat (non-GROUP BY) queries where truncation only affects completeness, not correctness.
 - `collect_expr_columns` handles `Cast`, `Case` (with `CaseWhen` arms), and `Like`/`ILike` expressions to ensure all referenced columns are read from fast fields.
 - **SELECT aliases are never pushed down.** If a WHERE predicate references a SELECT alias (e.g., `WHERE posts > 10` when `posts` is `count(*) AS posts`), it stays as a residual predicate for DataFusion. This prevents pushing filters on nonexistent Tantivy fields, which silently fall back to the `body` catch-all field and match nearly everything.
 - Prefer shard-local partial execution before coordinator-side row materialization.

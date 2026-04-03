@@ -509,7 +509,18 @@ async fn execute_sql_query(
             ));
         }
     };
-    let search_req = plan.to_search_request();
+    let mut search_req = plan.to_search_request();
+
+    // GROUP BY fallback: override the default 100K cap so DataFusion sees all
+    // matching docs.  Uses the configurable sql_group_by_scan_limit (0 = unlimited).
+    if plan.has_group_by_fallback {
+        search_req.size = if state.sql_group_by_scan_limit == 0 {
+            usize::MAX
+        } else {
+            state.sql_group_by_scan_limit
+        };
+    }
+
     let planning_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
     let cluster_state = state.cluster_manager.get_state();
@@ -826,6 +837,23 @@ async fn execute_sql_query(
         && matched_hits > search_req.size
         && execution_mode != "tantivy_grouped_partials";
 
+    // GROUP BY over incomplete data produces wrong aggregates — error instead
+    // of returning silently incorrect results.
+    if truncated && plan.has_group_by_fallback {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "group_by_scan_limit_exceeded",
+            format!(
+                "GROUP BY query matched {} docs but the scan limit is {}. \
+                 Results would be incorrect. Narrow the query with filters, \
+                 rewrite to use simple GROUP BY columns with count/sum/avg/min/max \
+                 for the grouped_partials path, or increase sql_group_by_scan_limit \
+                 in ferrissearch.yml.",
+                matched_hits, search_req.size
+            ),
+        ));
+    }
+
     // Record SQL metrics
     crate::metrics::SQL_QUERIES_TOTAL
         .with_label_values(&[execution_mode])
@@ -847,6 +875,20 @@ async fn execute_sql_query(
             datafusion_ms,
             total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
         },
+    })
+}
+
+fn planner_metadata_json(plan: &crate::hybrid::planner::QueryPlan) -> Value {
+    serde_json::json!({
+        "text_match": plan.primary_text_match().map(|tm| serde_json::json!({
+            "field": tm.field,
+            "query": tm.query,
+        })),
+        "text_matches": plan.text_matches_json(),
+        "pushed_down_filters": &plan.pushed_filters,
+        "group_by_columns": &plan.group_by_columns,
+        "required_columns": &plan.required_columns,
+        "has_residual_predicates": plan.has_residual_predicates,
     })
 }
 
@@ -874,16 +916,7 @@ pub async fn search_sql(
         Json(serde_json::json!({
             "execution_mode": result.execution_mode,
             "truncated": result.truncated,
-            "planner": {
-                "text_match": result.plan.text_match.as_ref().map(|text_match| serde_json::json!({
-                    "field": text_match.field,
-                    "query": text_match.query,
-                })),
-                "pushed_down_filters": result.plan.pushed_filters,
-                "group_by_columns": result.plan.group_by_columns,
-                "required_columns": result.plan.required_columns,
-                "has_residual_predicates": result.plan.has_residual_predicates,
-            },
+            "planner": planner_metadata_json(&result.plan),
             "_shards": {
                 "total": result.successful_shards + result.failed_shards,
                 "successful": result.successful_shards,
@@ -954,16 +987,7 @@ pub async fn global_sql(
         Json(serde_json::json!({
             "execution_mode": result.execution_mode,
             "truncated": result.truncated,
-            "planner": {
-                "text_match": result.plan.text_match.as_ref().map(|text_match| serde_json::json!({
-                    "field": text_match.field,
-                    "query": text_match.query,
-                })),
-                "pushed_down_filters": result.plan.pushed_filters,
-                "group_by_columns": result.plan.group_by_columns,
-                "required_columns": result.plan.required_columns,
-                "has_residual_predicates": result.plan.has_residual_predicates,
-            },
+            "planner": planner_metadata_json(&result.plan),
             "_shards": {
                 "total": result.successful_shards + result.failed_shards,
                 "successful": result.successful_shards,
@@ -1293,6 +1317,7 @@ mod tests {
             local_node_id: "node-1".into(),
             raft: None,
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            sql_group_by_scan_limit: 1_000_000,
         };
 
         let metadata = cluster_state.indices.get(index_name).unwrap().clone();
@@ -1753,6 +1778,7 @@ mod tests {
             local_node_id: "node-1".into(),
             raft: None,
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            sql_group_by_scan_limit: 1_000_000,
         };
 
         // GROUP BY on text field should return error
@@ -1786,6 +1812,36 @@ mod tests {
         .await;
 
         assert_eq!(status2, StatusCode::OK, "keyword fields should work");
+    }
+
+    #[tokio::test]
+    async fn expression_group_by_with_tiny_scan_limit_returns_error() {
+        // Set sql_group_by_scan_limit to 1 so even 3 docs triggers the error.
+        let (_tmp, mut state) = make_test_app_state("products");
+        state.sql_group_by_scan_limit = 1;
+
+        let (status, Json(body)) = search_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query:
+                    "SELECT LOWER(brand) AS b, count(*) AS cnt FROM products GROUP BY LOWER(brand)"
+                        .to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"]["type"], "group_by_scan_limit_exceeded",
+            "should error when GROUP BY fallback hits scan limit"
+        );
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("scan limit"),
+            "error should mention scan limit: {reason}"
+        );
     }
 
     #[test]

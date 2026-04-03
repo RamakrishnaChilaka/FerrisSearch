@@ -1663,8 +1663,8 @@ pub fn create_transport_service(
         worker_pools: crate::worker::WorkerPools::default_for_system(),
     };
     InternalTransportServer::new(service)
-        .max_decoding_message_size(64 * 1024 * 1024)
-        .max_encoding_message_size(64 * 1024 * 1024)
+        .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
 }
 
 /// Create the gRPC transport server with Raft consensus enabled.
@@ -1684,8 +1684,8 @@ pub fn create_transport_service_with_raft(
         worker_pools: crate::worker::WorkerPools::default_for_system(),
     };
     InternalTransportServer::new(service)
-        .max_decoding_message_size(64 * 1024 * 1024)
-        .max_encoding_message_size(64 * 1024 * 1024)
+        .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
 }
 
 #[cfg(test)]

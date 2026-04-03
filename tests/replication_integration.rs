@@ -9,6 +9,8 @@ use ferrissearch::cluster::state::{
 };
 use ferrissearch::engine::{CompositeEngine, SearchEngine};
 use ferrissearch::shard::ShardManager;
+#[cfg(feature = "transport-tls")]
+use ferrissearch::transport::TonicTlsConnector;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
 use ferrissearch::transport::proto::{
@@ -20,8 +22,91 @@ use ferrissearch::transport::server::create_transport_service;
 use ferrissearch::wal::{HotTranslog, WriteAheadLog};
 
 use std::collections::HashMap;
+#[cfg(feature = "transport-tls")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "transport-tls")]
+const TEST_TRANSPORT_TLS_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIC7TCCAdWgAwIBAgIUDrtYB6ruoGKUSdC6xKA7NJiIIPwwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDQwMjIxMDE0OVoXDTI3MDQw
+MjIxMDE0OVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAuNpib/06YwZ/Gb2E1kTcvUJAxkzvwS+Wqn1As+Tn7fm5
+J6hRtMelw2031/B4lx/HUFxw5Cm4UEnKn2l1JXnO8QSgZnWbYSgeuNYSsbIeQWRq
+g0iSaLxJZ2i2RIBhARzkC5x5eF1tZMjITkk1Zo1GInxWUteWqhTPkhSSdNbME8G3
+wEvUl6TC5pzXvI6uTsJsCjvZU63CHuc6z9JfI+aF7yBDhVQF8PwEf63ubw6bMdtC
+iyYxZTwIoFCxBjb2O11l/FU+H1in+0v8pDFCg6ocd3J+aHwaUaA+BMtqKsdY9Ve+
+4Dk0VIfwqYWCd26GXcwWgh7l0ctxX96Yx1JIRIZ7nwIDAQABozcwNTAUBgNVHREE
+DTALgglsb2NhbGhvc3QwHQYDVR0OBBYEFJfkq34nKZH+oPYwNx8v5bD2sULtMA0G
+CSqGSIb3DQEBCwUAA4IBAQBamnKtY+jqfwGyYjIPXFWnf0Gh+HT54jslTDDQ9qyT
+xYHzACqH5KjwuPnbmhPONlPmbRTHeLA492VsYnSDTN1ypTLpC/u/ZXb3GVvU2Hza
+YMtSW+slBalR5QffTgb60fDgrgqrBYKBsIBZiqNQOw/0asa+2c72Bxwb5dfLxNAX
+zAGCoY+urr4sRbesol+p7R+TwDAn2v5vvd5Vrq2eposipdNMfkJUElKa5uVIvfTs
+9OhDLJtK7rMDIivFm4T8jcKaxmjkwUADBq9++p7j8BHhfP1ILMV6BamkTeOeAYwZ
+GlYQoYK+y3RWFrJFp2cPJsN4sqkMJqY9RiPyM/E9IhLT
+-----END CERTIFICATE-----
+"#;
+
+#[cfg(feature = "transport-tls")]
+const TEST_TRANSPORT_TLS_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC42mJv/TpjBn8Z
+vYTWRNy9QkDGTO/BL5aqfUCz5Oft+bknqFG0x6XDbTfX8HiXH8dQXHDkKbhQScqf
+aXUlec7xBKBmdZthKB641hKxsh5BZGqDSJJovElnaLZEgGEBHOQLnHl4XW1kyMhO
+STVmjUYifFZS15aqFM+SFJJ01swTwbfAS9SXpMLmnNe8jq5OwmwKO9lTrcIe5zrP
+0l8j5oXvIEOFVAXw/AR/re5vDpsx20KLJjFlPAigULEGNvY7XWX8VT4fWKf7S/yk
+MUKDqhx3cn5ofBpRoD4Ey2oqx1j1V77gOTRUh/CphYJ3boZdzBaCHuXRy3Ff3pjH
+UkhEhnufAgMBAAECggEAA+GR74gBkdKxGHlCML2BZPffJEq5PfUh1LKMiTplJDn6
+CTsffAw1DsVcRsxlu8aPCMDoHeJCXG0wM+ii7QaBsc3HEF+nw4J0Iq1b9x8mQ3k4
+Q0liyZAqemFYcle/saZJo3TFmCFeCp+slPg0htKwhkjWByc/opKNSSPlb06TOlbt
+wjBs5cwfoVlP+FfxEbtmKEs6VVXXw5FDwRu+zScR/j6hpTcTaNqH1pcln2vHyN6i
+uNLiXlJ3wKJoeVAeBDN85UfSSMIMcC6gRimr5BnDPMC7cBFjfr3dundAWtg6md7I
+oliTeV9gKXUGsbRX2Tau7e8s0WElwvZzpp2rw/DVAQKBgQDadUWo436dP6Hci0Ex
+MD9Jcm5Mo6PiQuUHcKP+k6AqP83UTDWRDhnIxmthdbhjEUiDCb0GycQkWyub4ivn
+/OxELIQkULBdHhg7fibENdQENX/kcawsSnKZpytmwBT0sIX38/D+hzx0ufXiWQ0a
+MYNUCcDapeCN1seFt3v5Gr6YrQKBgQDYnrX38Pt2fp507lek/mzUgrU/MAF74EhH
+xHvKEii/58OSOnkhjPD9AOP/2FTg78A4KgrOGpGNXguS9csuL0dA7LTnGEUX2Cq9
+R+ld+W+FL1lDfVssg/LDj02gy1UZda2XFbs4aog4zdoEE2WZR1ka6dYW+bEAicts
+6OS/+sky+wKBgGrhdXNr2kaVG1wLxZmLQWtt0QkuBsBseiFputKS54nELa/wmUSe
+4X6ZlW/ZaJ0Pl6qE2Ta5AH3JHUznGxQlanLwVLZvw9nLH4/76HuW2mQ0yJ27/8Cr
+q+YBI/rhf183/lORxhbBk5KIaQSVDRQDpX04SGKxRWwf6P5DBySZMScBAoGBALAx
+V51WW5LkJorBmnRPpcGslzPQHkTeBqypOm8AGjkNkFuOSBxsAVAou0rMcS2MlPKZ
+77P4lE9CIXPljOACAJjkb7hQW1KrtwfCSCTx0C2qd5aXjeNFZ9583w1cldlhiFKN
+kHyw2iAp/5y1Ejx8dhOYA1UovznK2rW5MOaeW6ylAoGABgGob6T47AS0nRCFIUGh
+AcPZhTf/aOTCpHONuxC4etnpM5bAZkn4E7KNe+EHbFn51QOegIbip7VDrteSzkFJ
+vvobgeFZ8Fq1YNC3d80wtt5mKrQF8ce0A7q0yM1DOQ3mgqO1424znll4IoDcZUos
+G0Zd6Hw16rGcTrwdHUeJOA0=
+-----END PRIVATE KEY-----
+"#;
+
+#[cfg(feature = "transport-tls")]
+struct TransportTlsTestFiles {
+    _dir: tempfile::TempDir,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    ca_path: PathBuf,
+}
+
+#[cfg(feature = "transport-tls")]
+impl TransportTlsTestFiles {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("transport-cert.pem");
+        let key_path = dir.path().join("transport-key.pem");
+        let ca_path = dir.path().join("transport-ca.pem");
+
+        std::fs::write(&cert_path, TEST_TRANSPORT_TLS_CERT_PEM).unwrap();
+        std::fs::write(&key_path, TEST_TRANSPORT_TLS_KEY_PEM).unwrap();
+        std::fs::write(&ca_path, TEST_TRANSPORT_TLS_CERT_PEM).unwrap();
+
+        Self {
+            _dir: dir,
+            cert_path,
+            key_path,
+            ca_path,
+        }
+    }
+}
 
 /// Start a gRPC transport server on a random port and return the address.
 async fn start_grpc_server(
@@ -53,6 +138,43 @@ async fn start_grpc_server(
     addr
 }
 
+#[cfg(feature = "transport-tls")]
+async fn start_grpc_server_with_tls(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    tls_files: &TransportTlsTestFiles,
+) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let transport_client = TransportClient::new();
+    let service = create_transport_service(
+        cluster_manager,
+        shard_manager,
+        transport_client,
+        "node-1".into(),
+    );
+    let tls_config = ferrissearch::transport::load_server_tls_config(
+        tls_files.cert_path.to_str().unwrap(),
+        tls_files.key_path.to_str().unwrap(),
+    )
+    .unwrap();
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .tls_config(tls_config)
+            .unwrap()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
 /// Connect a gRPC client to the given address.
 async fn connect_client(
     addr: std::net::SocketAddr,
@@ -63,6 +185,19 @@ async fn connect_client(
         .await
         .unwrap();
     InternalTransportClient::new(channel)
+}
+
+#[cfg(feature = "transport-tls")]
+async fn connect_tls_client(
+    addr: std::net::SocketAddr,
+    tls_files: &TransportTlsTestFiles,
+) -> InternalTransportClient<tonic::transport::Channel> {
+    let connector = TonicTlsConnector::from_ca_file(tls_files.ca_path.to_str().unwrap()).unwrap();
+    let transport_client = TransportClient::with_tls_connector(Arc::new(connector));
+    transport_client
+        .connect("localhost", addr.port())
+        .await
+        .unwrap()
 }
 
 /// Refresh all shard engines so recently indexed documents become visible.
@@ -239,6 +374,49 @@ async fn index_and_get_document_via_grpc() {
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["title"], "Integration Test");
     assert_eq!(source["score"], 42);
+}
+
+#[cfg(feature = "transport-tls")]
+#[tokio::test]
+async fn index_and_get_document_via_grpc_with_tls() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("integ-test-tls".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "tls-index");
+
+    let tls_files = TransportTlsTestFiles::new();
+    let addr = start_grpc_server_with_tls(cm, sm.clone(), &tls_files).await;
+    let mut client = connect_tls_client(addr, &tls_files).await;
+
+    let payload = serde_json::json!({"title": "TLS Integration Test", "score": 7});
+    let resp = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "tls-index".into(),
+            shard_id: 0,
+            doc_id: "tls-doc-1".into(),
+            payload_json: serde_json::to_vec(&payload).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success, "TLS index_doc failed: {}", resp.error);
+    refresh_all(&sm);
+
+    let resp = client
+        .get_doc(tonic::Request::new(ShardGetRequest {
+            index_name: "tls-index".into(),
+            shard_id: 0,
+            doc_id: "tls-doc-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.found, "TLS document not found: {}", resp.error);
+    let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
+    assert_eq!(source["title"], "TLS Integration Test");
+    assert_eq!(source["score"], 7);
 }
 
 #[tokio::test]

@@ -132,6 +132,28 @@ carol 2 1400.0 290.0
 bob 2 800.0 175.0
 eve 1 800.0 600.0
 
+# CASE expressions inside grouped aggregates must preserve the underlying
+# fast-field dependencies when building the DataFusion input batch.
+query TIIIR nosort
+SELECT author,
+			 count(*) AS posts,
+			 sum(CASE WHEN upvotes < 400 THEN upvotes ELSE 0 END) AS nonviral_upvotes,
+			 sum(CASE WHEN upvotes < 400 THEN 1 ELSE 0 END) AS nonviral_posts,
+			 round(
+				 sum(CASE WHEN upvotes < 400 THEN upvotes ELSE 0 END) * 1.0 /
+				 NULLIF(sum(CASE WHEN upvotes < 400 THEN 1 ELSE 0 END), 0),
+				 1
+			 ) AS avg_nonviral
+FROM stories
+GROUP BY author
+HAVING count(*) >= 2 AND sum(CASE WHEN upvotes < 400 THEN 1 ELSE 0 END) > 0
+ORDER BY avg_nonviral DESC, author ASC
+LIMIT 3
+----
+bob 2 300 1 300.0
+alice 3 550 3 183.3
+dave 2 200 2 100.0
+
 # ── min/max aggregates ───────────────────────────────────────────────
 
 query TRR rowsort

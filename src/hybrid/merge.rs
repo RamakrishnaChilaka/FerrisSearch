@@ -28,7 +28,7 @@ pub fn record_batches_to_json_rows(batches: &[RecordBatch]) -> Result<(Vec<Strin
                     batch.column(column_idx).as_ref(),
                     field.data_type(),
                     row_idx,
-                );
+                )?;
                 row.insert(field.name().to_string(), value);
             }
             rows.push(Value::Object(row));
@@ -38,75 +38,106 @@ pub fn record_batches_to_json_rows(batches: &[RecordBatch]) -> Result<(Vec<Strin
     Ok((columns, rows))
 }
 
-fn array_value_to_json(array: &dyn Array, data_type: &DataType, row_idx: usize) -> Value {
+fn downcast_array<'a, T: 'static>(
+    array: &'a dyn Array,
+    data_type: &DataType,
+    expected: &'static str,
+) -> Result<&'a T> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to downcast Arrow array for {:?}: expected {} backing array, got {:?}",
+            data_type,
+            expected,
+            array.data_type()
+        )
+    })
+}
+
+fn array_value_to_json(array: &dyn Array, data_type: &DataType, row_idx: usize) -> Result<Value> {
     if array.is_null(row_idx) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
 
-    match data_type {
+    let value = match data_type {
         DataType::Utf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("utf8 array");
+            let array = downcast_array::<StringArray>(array, data_type, "StringArray")?;
             Value::String(array.value(row_idx).to_string())
         }
         DataType::LargeUtf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("large utf8 array");
+            let array = downcast_array::<LargeStringArray>(array, data_type, "LargeStringArray")?;
             Value::String(array.value(row_idx).to_string())
         }
         DataType::Float64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("float64 array");
+            let array = downcast_array::<Float64Array>(array, data_type, "Float64Array")?;
             serde_json::json!(array.value(row_idx))
         }
         DataType::Float32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .expect("float32 array");
+            let array = downcast_array::<Float32Array>(array, data_type, "Float32Array")?;
             serde_json::json!(array.value(row_idx))
         }
         DataType::Int64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("int64 array");
+            let array = downcast_array::<Int64Array>(array, data_type, "Int64Array")?;
             serde_json::json!(array.value(row_idx))
         }
         DataType::Int32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("int32 array");
+            let array = downcast_array::<Int32Array>(array, data_type, "Int32Array")?;
             serde_json::json!(array.value(row_idx))
         }
         DataType::UInt64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("uint64 array");
+            let array = downcast_array::<UInt64Array>(array, data_type, "UInt64Array")?;
             serde_json::json!(array.value(row_idx))
         }
         DataType::UInt32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .expect("uint32 array");
+            let array = downcast_array::<UInt32Array>(array, data_type, "UInt32Array")?;
             serde_json::json!(array.value(row_idx))
         }
         DataType::Boolean => {
-            let array = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("bool array");
+            let array = downcast_array::<BooleanArray>(array, data_type, "BooleanArray")?;
             serde_json::json!(array.value(row_idx))
         }
         _ => Value::String(format!("{:?}", data_type)),
+    };
+
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    #[test]
+    fn record_batches_to_json_rows_serializes_supported_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["alice", "bob"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![42, 7])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let (columns, rows) = record_batches_to_json_rows(&[batch]).unwrap();
+
+        assert_eq!(columns, vec!["name", "age"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], Value::String("alice".into()));
+        assert_eq!(rows[1]["age"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn array_value_to_json_returns_error_for_mismatched_backing_array() {
+        let array = Int64Array::from(vec![1]);
+        let err = array_value_to_json(&array, &DataType::Utf8, 0).unwrap_err();
+
+        assert!(err.to_string().contains("failed to downcast Arrow array"));
+        assert!(err.to_string().contains("Utf8"));
     }
 }

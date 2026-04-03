@@ -208,6 +208,17 @@ SELECT author, count(*) AS cnt FROM stories WHERE text_match(title, 'rust') AND 
 alice 3
 dave 1
 
+# Multiple top-level text_match predicates joined by AND should push down
+# as multiple full-text Match clauses.
+query TI nosort
+SELECT author, count(*) AS cnt
+FROM stories
+WHERE text_match(title, 'rust') AND text_match(title, 'performance')
+GROUP BY author
+ORDER BY cnt DESC, author ASC
+----
+alice 1
+
 # OR + HAVING
 query TI nosort
 SELECT author, count(*) AS cnt FROM stories WHERE author = 'alice' OR author = 'bob' OR author = 'carol' OR author = 'dave' GROUP BY author HAVING cnt > 1 ORDER BY cnt DESC, author ASC
