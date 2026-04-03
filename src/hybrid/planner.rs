@@ -96,7 +96,7 @@ pub struct QueryPlan {
     pub index_name: String,
     pub original_sql: String,
     pub rewritten_sql: String,
-    pub text_match: Option<TextMatchPredicate>,
+    pub text_matches: Vec<TextMatchPredicate>,
     pub pushed_filters: Vec<crate::search::QueryClause>,
     pub required_columns: Vec<String>,
     pub group_by_columns: Vec<String>,
@@ -113,18 +113,39 @@ pub struct QueryPlan {
     /// When ORDER BY is a single non-score column, capture (field, descending) for
     /// fast-field sort pushdown into Tantivy's TopDocs collector.
     pub sort_pushdown: Option<(String, bool)>,
+    /// True when the SQL has GROUP BY but it's not handled by the
+    /// `tantivy_grouped_partials` path (expression GROUP BY, unsupported
+    /// aggregates, residual predicates). These queries MUST see all matching
+    /// docs for correct results — the default 100K TopDocs cap is wrong here.
+    pub has_group_by_fallback: bool,
 }
 
 impl QueryPlan {
+    pub fn primary_text_match(&self) -> Option<&TextMatchPredicate> {
+        self.text_matches.first()
+    }
+
     pub fn uses_grouped_partials(&self) -> bool {
         self.grouped_sql.is_some()
+    }
+
+    pub(crate) fn text_matches_json(&self) -> Vec<serde_json::Value> {
+        self.text_matches
+            .iter()
+            .map(|text_match| {
+                serde_json::json!({
+                    "field": text_match.field,
+                    "query": text_match.query,
+                })
+            })
+            .collect()
     }
 
     /// Returns true if this is a simple `SELECT count(*) FROM ...` with no WHERE,
     /// no GROUP BY, and no non-count aggregates — meaning we can answer it from
     /// `doc_count()` metadata without scanning any documents.
     pub fn is_count_star_only(&self) -> bool {
-        if self.text_match.is_some() || !self.pushed_filters.is_empty() {
+        if !self.text_matches.is_empty() || !self.pushed_filters.is_empty() {
             return false;
         }
         if let Some(grouped) = &self.grouped_sql {
@@ -139,19 +160,14 @@ impl QueryPlan {
     }
 
     pub fn to_search_request(&self) -> crate::search::SearchRequest {
-        let query = if self.text_match.is_none() && self.pushed_filters.is_empty() {
+        let query = if self.text_matches.is_empty() && self.pushed_filters.is_empty() {
             crate::search::QueryClause::MatchAll(serde_json::Value::Object(Default::default()))
         } else {
             let mut bool_query = crate::search::BoolQuery::default();
 
-            if let Some(text_match) = &self.text_match {
-                bool_query
-                    .must
-                    .push(crate::search::QueryClause::Match(HashMap::from([(
-                        text_match.field.clone(),
-                        serde_json::Value::String(text_match.query.clone()),
-                    )])));
-            }
+            bool_query
+                .must
+                .extend(self.text_matches.iter().map(text_match_to_query_clause));
 
             bool_query.filter.extend(self.pushed_filters.clone());
             crate::search::QueryClause::Bool(bool_query)
@@ -248,11 +264,15 @@ impl QueryPlan {
             "max_hits": search_request.size,
             "limit_pushed_down": self.limit_pushed_down,
         });
-        if let Some(tm) = &self.text_match {
+        let text_matches_json = self.text_matches_json();
+        if let Some(tm) = self.primary_text_match() {
             tantivy_stage["text_match"] = serde_json::json!({
                 "field": tm.field,
                 "query": tm.query,
             });
+        }
+        if !text_matches_json.is_empty() {
+            tantivy_stage["text_matches"] = serde_json::json!(text_matches_json);
         }
         if !self.pushed_filters.is_empty() {
             tantivy_stage["pushed_filters"] = serde_json::json!(self.pushed_filters);
@@ -358,10 +378,11 @@ impl QueryPlan {
             "execution_strategy": execution_strategy,
             "strategy_reason": strategy_reason,
             "pushdown_summary": {
-                "text_match": self.text_match.as_ref().map(|tm| serde_json::json!({
+                "text_match": self.primary_text_match().map(|tm| serde_json::json!({
                     "field": tm.field,
                     "query": tm.query,
                 })),
+                "text_matches": text_matches_json,
                 "pushed_filters": self.pushed_filters,
                 "pushed_filter_count": self.pushed_filters.len(),
                 "has_residual_predicates": self.has_residual_predicates,
@@ -414,7 +435,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
 
     let selects_all_columns = projection_has_wildcard(select);
     let select_aliases = collect_select_aliases(select);
-    let (text_match, pushed_filters) = extract_pushdowns(&mut select.selection, &select_aliases)?;
+    let (text_matches, pushed_filters) = extract_pushdowns(&mut select.selection, &select_aliases)?;
     let has_residual_predicates = select.selection.is_some();
     rewrite_table_name(select);
     let (required_columns, needs_id, needs_score) =
@@ -448,11 +469,14 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
             && !selects_all_columns
             && grouped_sql.is_none());
 
+    let has_group_by_fallback =
+        (!group_by_columns.is_empty() || has_expression_group_by) && grouped_sql.is_none();
+
     Ok(QueryPlan {
         index_name: index_name.to_string(),
         original_sql: sql.to_string(),
         rewritten_sql: statement.to_string(),
-        text_match,
+        text_matches,
         pushed_filters,
         required_columns,
         group_by_columns,
@@ -465,6 +489,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         needs_id,
         needs_score,
         sort_pushdown,
+        has_group_by_fallback,
     })
 }
 
@@ -873,15 +898,15 @@ fn rewrite_table_name(select: &mut Select) {
 fn extract_pushdowns(
     selection: &mut Option<Expr>,
     select_aliases: &BTreeSet<String>,
-) -> Result<(Option<TextMatchPredicate>, Vec<crate::search::QueryClause>)> {
+) -> Result<(Vec<TextMatchPredicate>, Vec<crate::search::QueryClause>)> {
     let Some(expr) = selection.take() else {
-        return Ok((None, Vec::new()));
+        return Ok((Vec::new(), Vec::new()));
     };
 
     let mut predicates = Vec::new();
     split_conjunction(expr, &mut predicates);
 
-    let mut text_match = None;
+    let mut text_matches = Vec::new();
     let mut pushed_filters = Vec::new();
     let mut residual = Vec::new();
     for predicate in predicates {
@@ -894,10 +919,7 @@ fn extract_pushdowns(
         }
         match parse_text_match(&predicate)? {
             Some(found) => {
-                if text_match.is_some() {
-                    bail!("Only one text_match(field, query) predicate is supported");
-                }
-                text_match = Some(found);
+                text_matches.push(found);
             }
             None => {
                 if let Some(filter) = parse_pushdown_predicate(&predicate)? {
@@ -923,7 +945,14 @@ fn extract_pushdowns(
         );
     }
 
-    Ok((text_match, pushed_filters))
+    Ok((text_matches, pushed_filters))
+}
+
+fn text_match_to_query_clause(predicate: &TextMatchPredicate) -> crate::search::QueryClause {
+    crate::search::QueryClause::Match(HashMap::from([(
+        predicate.field.clone(),
+        serde_json::Value::String(predicate.query.clone()),
+    )]))
 }
 
 /// Returns true if the expression tree contains a `text_match(...)` function call.
@@ -2025,6 +2054,8 @@ mod tests {
         assert!(plan.group_by_columns.is_empty());
         // Should NOT use grouped partials
         assert!(!plan.uses_grouped_partials());
+        // Must flag as GROUP BY fallback so the scan limit is raised
+        assert!(plan.has_group_by_fallback);
     }
 
     #[test]
@@ -2036,6 +2067,7 @@ mod tests {
         .unwrap();
         assert!(plan.group_by_columns.is_empty());
         assert!(!plan.uses_grouped_partials());
+        assert!(plan.has_group_by_fallback);
     }
 
     #[test]
@@ -2048,6 +2080,30 @@ mod tests {
         .unwrap();
         assert_eq!(plan.group_by_columns, vec!["author"]);
         assert!(plan.uses_grouped_partials());
+        assert!(!plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn unsupported_aggregate_flags_group_by_fallback() {
+        // STDDEV_POP is not a supported grouped partial metric —
+        // the query has GROUP BY but falls to fast-fields.
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, STDDEV_POP(upvotes) FROM idx GROUP BY author",
+        )
+        .unwrap();
+        assert!(!plan.uses_grouped_partials());
+        assert!(plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn flat_query_has_no_group_by_fallback() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT title, upvotes FROM idx WHERE text_match(title, 'rust') ORDER BY upvotes DESC",
+        )
+        .unwrap();
+        assert!(!plan.has_group_by_fallback);
     }
 
     // ── Bug fix: text_match in OR gives clear error ─────────────────
@@ -2075,9 +2131,75 @@ mod tests {
             "SELECT title FROM idx WHERE text_match(title, 'rust') AND author = 'pg'",
         )
         .unwrap();
-        assert!(plan.text_match.is_some());
+        assert_eq!(plan.text_matches.len(), 1);
+        assert!(plan.primary_text_match().is_some());
         assert_eq!(plan.pushed_filters.len(), 1);
         assert!(!plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn multiple_top_level_text_match_predicates_work() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE text_match(title, 'rust') AND text_match(title, 'performance') AND author = 'pg'",
+        )
+        .unwrap();
+
+        assert_eq!(plan.text_matches.len(), 2);
+        assert_eq!(plan.primary_text_match().unwrap().field, "title");
+        assert_eq!(plan.primary_text_match().unwrap().query, "rust");
+        assert!(
+            plan.text_matches.iter().any(|predicate| {
+                predicate.field == "title" && predicate.query == "performance"
+            })
+        );
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(plan.pushed_filters.iter().any(|clause| matches!(
+            clause,
+            crate::search::QueryClause::Term(fields)
+            if fields.get("author") == Some(&serde_json::Value::String("pg".to_string()))
+        )));
+        assert!(!plan.has_residual_predicates);
+
+        let request = plan.to_search_request();
+        match request.query {
+            crate::search::QueryClause::Bool(bool_query) => {
+                assert_eq!(bool_query.must.len(), 2);
+                assert_eq!(bool_query.filter.len(), 1);
+            }
+            other => panic!("expected Bool query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_text_match_across_different_fields() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE text_match(title, 'rust') AND text_match(body, 'performance')",
+        )
+        .unwrap();
+
+        assert_eq!(plan.text_matches.len(), 2);
+        assert!(
+            plan.text_matches
+                .iter()
+                .any(|p| p.field == "title" && p.query == "rust")
+        );
+        assert!(
+            plan.text_matches
+                .iter()
+                .any(|p| p.field == "body" && p.query == "performance")
+        );
+        assert!(plan.pushed_filters.is_empty());
+
+        let request = plan.to_search_request();
+        match request.query {
+            crate::search::QueryClause::Bool(bool_query) => {
+                assert_eq!(bool_query.must.len(), 2);
+                assert!(bool_query.filter.is_empty());
+            }
+            other => panic!("expected Bool query, got {other:?}"),
+        }
     }
 
     // ── Bug fix: collect_expr_columns handles Cast/Case/Like ────────

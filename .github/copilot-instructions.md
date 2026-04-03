@@ -92,8 +92,9 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 675 unit tests + 40 CLI tests + 30 consensus integration + 39 replication integration + 17 REST API integration + 1 SQL correctness harness (sqllogictest, 161 assertions) = 802 total
+- 692 unit tests + 40 CLI tests + 30 consensus integration + 39 replication integration + 18 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 820 total
 - Run with: `cargo test`
+- Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 - SQL console: `cargo run --bin ferris-cli` (interactive) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
 
@@ -133,6 +134,7 @@ pub struct AppState {
     pub local_node_id: String,
     pub raft: Option<Arc<RaftInstance>>,
     pub worker_pools: WorkerPools,
+    pub sql_group_by_scan_limit: usize,
 }
 ```
 
@@ -182,6 +184,7 @@ pub struct AppConfig {
     pub raft_node_id: u64,              // default: 1
     pub translog_durability: String,    // "request" (default) or "async"
     pub translog_sync_interval_ms: Option<u64>,  // default: None (5000 if async)
+    pub sql_group_by_scan_limit: usize,          // default: 1_000_000 (0 = unlimited)
     pub transport_tls_enabled: bool,             // default: false (requires transport-tls feature)
     pub transport_tls_cert_file: Option<String>, // PEM cert for gRPC server
     pub transport_tls_key_file: Option<String>,  // PEM key for gRPC server
@@ -190,6 +193,8 @@ pub struct AppConfig {
 ```
 - Load order: defaults → `config/ferrissearch.yml` → `FERRISSEARCH_*` env vars
 - `translog_durability: "request"` = fsync per write (no data loss); `"async"` = background fsync timer
+- `transport_tls_enabled: true` requires building with `--features transport-tls`; startup must fail on missing CA/cert/key paths or missing feature instead of silently downgrading to plaintext
+- The transport TLS helpers must install the rustls ring crypto provider before building server/client TLS config; otherwise feature builds can panic at runtime.
 
 ## Coordinator Pattern (CRITICAL — read before writing any API handler)
 
@@ -591,7 +596,7 @@ If you add a hybrid execution path that mixes full-text search with SQL-style pr
 - DataFusion must not become the text-search engine
 
 ### What Stays In Tantivy
-- Query planning pushdown for `text_match(...)`, exact filters, and range filters
+- Query planning pushdown for `text_match(...)` predicates (including multiple top-level `AND`ed matches), exact filters, and range filters
 - Ranking and hit collection
 - Fast-field reads for numeric and keyword columns
 - Search-native shard-local partial aggregation over matched docs

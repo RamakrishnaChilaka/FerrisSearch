@@ -77,5 +77,7 @@ pub struct AppState {
     pub transport_client: TransportClient,
     pub local_node_id: String,
     pub raft: Option<Arc<RaftInstance>>,
+    pub worker_pools: WorkerPools,
+    pub sql_group_by_scan_limit: usize,
 }
 ```

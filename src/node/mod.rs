@@ -8,6 +8,8 @@ use crate::consensus::types::{ClusterCommand, RaftInstance};
 use crate::shard::ShardManager;
 use crate::transport::client::TransportClient;
 use crate::wal::TranslogDurability;
+#[cfg(feature = "transport-tls")]
+use anyhow::Context;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +21,52 @@ pub struct Node {
     pub transport_client: TransportClient,
     pub shard_manager: Arc<ShardManager>,
     pub raft: Option<Arc<RaftInstance>>,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(feature = "transport-tls"), allow(dead_code))]
+struct TransportTlsPaths<'a> {
+    ca: &'a str,
+    cert: &'a str,
+    key: &'a str,
+}
+
+fn required_transport_tls_path<'a>(
+    field_name: &'static str,
+    value: Option<&'a str>,
+) -> anyhow::Result<&'a str> {
+    value.filter(|path| !path.trim().is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("{} is required when transport_tls_enabled=true", field_name)
+    })
+}
+
+fn resolve_transport_tls_paths(
+    config: &AppConfig,
+) -> anyhow::Result<Option<TransportTlsPaths<'_>>> {
+    if !config.transport_tls_enabled {
+        return Ok(None);
+    }
+
+    let paths = TransportTlsPaths {
+        ca: required_transport_tls_path(
+            "transport_tls_ca_file",
+            config.transport_tls_ca_file.as_deref(),
+        )?,
+        cert: required_transport_tls_path(
+            "transport_tls_cert_file",
+            config.transport_tls_cert_file.as_deref(),
+        )?,
+        key: required_transport_tls_path(
+            "transport_tls_key_file",
+            config.transport_tls_key_file.as_deref(),
+        )?,
+    };
+
+    if !cfg!(feature = "transport-tls") {
+        anyhow::bail!("transport_tls_enabled=true requires building with --features transport-tls");
+    }
+
+    Ok(Some(paths))
 }
 
 impl Node {
@@ -33,21 +81,21 @@ impl Node {
         .await?;
 
         let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle));
+        let transport_tls = resolve_transport_tls_paths(&config)?;
 
         // Create transport client — with TLS when feature is enabled and configured
         #[cfg(feature = "transport-tls")]
-        let transport_client = if config.transport_tls_enabled {
-            let ca_path = config
-                .transport_tls_ca_file
-                .as_deref()
-                .expect("transport_tls_ca_file is required when transport_tls_enabled=true");
-            let connector = crate::transport::TonicTlsConnector::from_ca_file(ca_path)?;
+        let transport_client = if let Some(tls) = transport_tls.as_ref() {
+            let connector = crate::transport::TonicTlsConnector::from_ca_file(tls.ca)?;
             TransportClient::with_tls_connector(std::sync::Arc::new(connector))
         } else {
             TransportClient::new()
         };
         #[cfg(not(feature = "transport-tls"))]
-        let transport_client = TransportClient::new();
+        let transport_client = {
+            let _ = &transport_tls;
+            TransportClient::new()
+        };
 
         let durability = match config.translog_durability.as_str() {
             "async" => TranslogDurability::Async {
@@ -98,6 +146,7 @@ impl Node {
             local_node_id: self.config.node_name.clone(),
             raft: self.raft.clone(),
             worker_pools: crate::worker::WorkerPools::default_for_system(),
+            sql_group_by_scan_limit: self.config.sql_group_by_scan_limit,
         };
 
         // 1. Start internal gRPC Transport Server (Port 9300)
@@ -119,32 +168,23 @@ impl Node {
         };
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));
         info!("gRPC Transport listening on {}", transport_addr);
+        let transport_tls = resolve_transport_tls_paths(&self.config)?;
+        let mut transport_builder = tonic::transport::Server::builder();
 
         #[cfg(feature = "transport-tls")]
-        let tls_config =
-            if self.config.transport_tls_enabled {
-                Some(crate::transport::load_server_tls_config(
-                    self.config.transport_tls_cert_file.as_deref().expect(
-                        "transport_tls_cert_file is required when transport_tls_enabled=true",
-                    ),
-                    self.config.transport_tls_key_file.as_deref().expect(
-                        "transport_tls_key_file is required when transport_tls_enabled=true",
-                    ),
-                )?)
-            } else {
-                None
-            };
+        if let Some(tls) = transport_tls.as_ref() {
+            let tls_config = crate::transport::load_server_tls_config(tls.cert, tls.key)?;
+            transport_builder = transport_builder
+                .tls_config(tls_config)
+                .context("failed to configure gRPC transport TLS")?;
+            info!("gRPC transport TLS enabled");
+        }
+
+        #[cfg(not(feature = "transport-tls"))]
+        let _ = &transport_tls;
 
         let transport_handle = tokio::spawn(async move {
-            let mut builder = tonic::transport::Server::builder();
-
-            #[cfg(feature = "transport-tls")]
-            if let Some(tls) = tls_config {
-                builder = builder.tls_config(tls).expect("invalid TLS config");
-                info!("gRPC transport TLS enabled");
-            }
-
-            if let Err(e) = builder
+            if let Err(e) = transport_builder
                 .add_service(transport_service)
                 .serve(transport_addr)
                 .await
@@ -893,5 +933,65 @@ mod tests {
         // But node-2 still has a seed to try
         let remote2 = remote_seed_hosts(&seeds, 9301);
         assert_eq!(remote2.len(), 1);
+    }
+
+    #[test]
+    fn resolve_transport_tls_paths_returns_none_when_disabled() {
+        let config = AppConfig::default();
+        assert!(resolve_transport_tls_paths(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_transport_tls_paths_requires_all_files_when_enabled() {
+        let mut config = AppConfig {
+            transport_tls_enabled: true,
+            ..AppConfig::default()
+        };
+
+        let err = resolve_transport_tls_paths(&config).unwrap_err();
+        assert!(err.to_string().contains("transport_tls_ca_file"));
+
+        config.transport_tls_ca_file = Some("/tmp/ca.pem".into());
+        let err = resolve_transport_tls_paths(&config).unwrap_err();
+        assert!(err.to_string().contains("transport_tls_cert_file"));
+
+        config.transport_tls_cert_file = Some("/tmp/node.pem".into());
+        let err = resolve_transport_tls_paths(&config).unwrap_err();
+        assert!(err.to_string().contains("transport_tls_key_file"));
+    }
+
+    #[cfg(not(feature = "transport-tls"))]
+    #[test]
+    fn resolve_transport_tls_paths_requires_transport_tls_feature() {
+        let config = AppConfig {
+            transport_tls_enabled: true,
+            transport_tls_ca_file: Some("/tmp/ca.pem".into()),
+            transport_tls_cert_file: Some("/tmp/node.pem".into()),
+            transport_tls_key_file: Some("/tmp/node-key.pem".into()),
+            ..AppConfig::default()
+        };
+
+        let err = resolve_transport_tls_paths(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires building with --features transport-tls")
+        );
+    }
+
+    #[cfg(feature = "transport-tls")]
+    #[test]
+    fn resolve_transport_tls_paths_returns_paths_when_feature_enabled() {
+        let config = AppConfig {
+            transport_tls_enabled: true,
+            transport_tls_ca_file: Some("/tmp/ca.pem".into()),
+            transport_tls_cert_file: Some("/tmp/node.pem".into()),
+            transport_tls_key_file: Some("/tmp/node-key.pem".into()),
+            ..AppConfig::default()
+        };
+
+        let tls = resolve_transport_tls_paths(&config).unwrap().unwrap();
+        assert_eq!(tls.ca, "/tmp/ca.pem");
+        assert_eq!(tls.cert, "/tmp/node.pem");
+        assert_eq!(tls.key, "/tmp/node-key.pem");
     }
 }

@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **675 unit tests** (`cargo test --lib`)
+- **692 unit tests** (`cargo test --lib`)
 - **40 CLI tests** (`cargo test --bin ferris-cli`)
 - **30 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **17 REST API integration tests** (`cargo test --test rest_api_integration`)
-- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 161 assertions across 4 files
-- **802 total** (`cargo test`)
+- **18 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 163 assertions across 4 files
+- **820 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -15,6 +15,7 @@ cargo test                                      # All tests
 cargo test --lib                                # Unit tests only
 cargo test --test consensus_integration         # Raft consensus tests
 cargo test --test replication_integration       # Replication tests
+cargo test --test replication_integration --features transport-tls  # Replication tests with encrypted gRPC transport
 cargo test --test rest_api_integration          # REST API integration tests
 cargo test -- test_name                         # Single test by name
 ```
@@ -24,6 +25,8 @@ cargo test -- test_name                         # Single test by name
 - Use `#[tokio::test]` for async tests
 - Use `tempfile::TempDir` for isolated data directories
 - Test every code path: happy path, edge cases, error conditions, empty inputs
+- For feature-gated transport TLS changes, run both `cargo test --lib` and `cargo test --lib --features transport-tls`; enabling TLS without the feature must error instead of silently downgrading to plaintext.
+- For transport TLS end-to-end coverage, also run `cargo test --test replication_integration --features transport-tls`.
 
 ## Integration Test Infrastructure
 ### Consensus Tests (tests/consensus_integration.rs)
@@ -73,7 +76,9 @@ cargo test -- test_name                         # Single test by name
 	- `materialized_hits_fallback` for wildcard projection or distributed compatibility paths
 - **LIMIT correctness**: Always assert exact row counts for LIMIT queries — `LIMIT N` must produce exactly N rows, not N × number_of_shards. This was a previous test gap.
 - **DataFusion 53 LIMIT regression**: Include pure DataFusion tests that reproduce the projection-reorder LIMIT bug (schema-order SELECT works, reverse-order SELECT without the workaround returns too many rows). These tests document the upstream bug and verify the `project_batch_to_sql_columns` workaround.
+- **Projection helper invariant**: `project_batch_to_sql_columns` must use planner-derived dependencies (`required_columns`, `needs_id`, `needs_score`) instead of a second ad-hoc SQL walker. Complex expressions such as `CASE`, `HAVING`, and grouped residual SQL can otherwise register an incomplete MemTable schema and fail at execution time.
 - **Truncation flag**: Assert `truncated=false` for explicit LIMIT queries. Assert `truncated=true` only when matched_hits exceeds the internal 100K ceiling without an explicit LIMIT.
+- **GROUP BY scan limit**: Expression GROUP BY and unsupported-aggregate GROUP BY fall to `tantivy_fast_fields` with a raised scan limit (`sql_group_by_scan_limit`, default 1M). Test that: (1) `has_group_by_fallback` is true for expression GROUP BY / unsupported aggs, false for plain GROUP BY and flat queries, (2) the `group_by_scan_limit_exceeded` error fires when matched docs exceed the limit (unit test with `sql_group_by_scan_limit: 1`), (3) expression GROUP BY under the limit succeeds on `tantivy_fast_fields` (REST API test).
 - Live tests should inspect the `planner`, `execution_mode`, and `truncated` fields, not just the returned rows.
 - Add regression tests when planner or execution changes accidentally widen the fallback path for queries that should stay search-aware.
 
@@ -100,7 +105,7 @@ The industry standard for SQL engine correctness testing is [sqllogictest](https
 - **Runner**: `tests/sql_correctness.rs` — implements sync `DB` trait via `FerrisDB` adapter that calls `execute_sql_for_testing()` with `block_in_place` + `Handle::current()` bridge
 - **Test files**: `tests/slt/*.slt` — automatically discovered and run
 - **Dataset**: 10 HN-style docs with known values (5 authors, 5 categories, deterministic upvotes/comments)
-- **Coverage**: 15 assertions covering `count(*)`, `GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, `text_match`, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY
+- **Coverage**: 163 assertions across 4 `.slt` files covering `count(*)`, `GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, single and multiple top-level `text_match` predicates, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY, and CASE-based grouped aggregates
 - **HAVING coverage rule**: Always test HAVING with **both** alias-based (`HAVING cnt > 1`) and aggregate-expression (`HAVING COUNT(*) > 1`) forms. These take different code paths in the planner — alias goes through `expr_to_field_name`, aggregate expression goes through `resolve_having_name` → `parse_grouped_metric`. Missing one form caused a regression where HAVING with aggregate expressions silently fell to the wrong execution path.
 - **Adding tests**: Create new `.slt` files in `tests/slt/` — the runner picks them up automatically
 - **Tie-breaking**: Always use secondary sort (e.g., `ORDER BY posts DESC, author ASC`) in `.slt` tests to avoid non-deterministic ordering

@@ -149,6 +149,13 @@ Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variable
 | `raft_node_id` | `1` | Unique Raft consensus node ID |
 | `translog_durability` | `request` | WAL fsync mode: `request` (per-write) or `async` (timer) |
 | `translog_sync_interval_ms` | (unset) | Background fsync interval when durability is `async` |
+| `sql_group_by_scan_limit` | `1000000` | Max docs scanned for GROUP BY queries on the fast-fields fallback path (0 = unlimited) |
+| `transport_tls_enabled` | `false` | Enable inter-node gRPC TLS (requires building with `--features transport-tls`) |
+| `transport_tls_cert_file` | (unset) | PEM certificate for the gRPC transport server when TLS is enabled |
+| `transport_tls_key_file` | (unset) | PEM private key for the gRPC transport server when TLS is enabled |
+| `transport_tls_ca_file` | (unset) | PEM CA certificate used by transport clients to verify peers |
+
+If `transport_tls_enabled: true` is set without compiling `--features transport-tls`, node startup fails instead of silently falling back to plaintext transport.
 
 ## SQL Over Search Results
 
@@ -156,7 +163,7 @@ Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variable
 
 ```
 SQL Query → Hybrid Planner
-  ├── text_match(), =, >, <, BETWEEN, IN → pushed into Tantivy
+  ├── top-level ANDed text_match(), =, >, <, BETWEEN, IN → pushed into Tantivy
   ├── GROUP BY + aggregates → per-shard grouped partial collectors (fast fields)
   ├── HAVING, ORDER BY, LIMIT → applied post-merge at coordinator
   └── residual predicates → DataFusion on Arrow batches
@@ -164,18 +171,9 @@ SQL Query → Hybrid Planner
 
 The planner splits work between Tantivy and DataFusion. For eligible queries, each shard (local and remote) computes partial aggregates on fast-field columns. The coordinator merges the compact partials — no rows are shipped between nodes.
 
-### Execution Modes
-
-| Mode | When | What happens |
-|------|------|-------------|
-| `count_star_fast` | `SELECT count(*)` with no WHERE | Reads doc count metadata, no scan |
-| `tantivy_grouped_partials` | `GROUP BY` + aggregates | Each shard computes partials on fast fields, coordinator merges |
-| `tantivy_fast_fields` | Projected columns without `SELECT *` | Each shard reads fast-field columns, coordinator runs DataFusion |
-| `materialized_hits_fallback` | `SELECT *` or unsupported expressions | Full `_source` materialization |
-
 ### SQL Features
 
-- `text_match(field, 'query')` — full-text search pushed into Tantivy
+- `text_match(field, 'query')` — full-text search pushed into Tantivy; multiple top-level `AND`ed `text_match(...)` predicates become multiple search `must` clauses
 - `=`, `>`, `>=`, `<`, `<=`, `BETWEEN`, `IN` — structured filter pushdown
 - `GROUP BY` with `count(*)`, `sum()`, `avg()`, `min()`, `max()`
 - `HAVING` — post-merge filtering on grouped results
@@ -470,13 +468,14 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 802 tests
-cargo test --lib                                # Unit tests (675)
+cargo test                                      # All 820 tests
+cargo test --lib                                # Unit tests (692)
 cargo test --bin ferris-cli                      # CLI tests (40)
 cargo test --test consensus_integration          # Raft consensus (30)
 cargo test --test replication_integration        # Replication (39)
-cargo test --test rest_api_integration           # REST API (17)
-cargo test --test sql_correctness                # SQL correctness (1 test, 161 sqllogictest assertions)
+cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
+cargo test --test rest_api_integration           # REST API (18)
+cargo test --test sql_correctness                # SQL correctness (1 test, 163 sqllogictest assertions)
 ```
 
 Integration tests run in-process with isolated temp directories. No external services needed.
@@ -533,19 +532,25 @@ scripts/           Ingestion and benchmark scripts
 - [x] sqllogictest correctness suite
 - [x] Prometheus metrics (`/_metrics`) — request latencies, search/index throughput, SQL mode counters, cluster gauges, process stats
 - [x] Column cache — segment-aware Arrow array cache with selectivity-based population, configurable memory limit and populate threshold
+- [x] Multiple `text_match()` predicates — top-level ANDed full-text searches lowered as separate Bool `must` clauses
+- [x] GROUP BY scan limit safety — configurable `sql_group_by_scan_limit` (default 1M) for expression GROUP BY / unsupported aggregates on fast-fields fallback; errors instead of silently wrong results
+- [x] Inter-node gRPC TLS (`--features transport-tls`)
+- [x] CLI truncation warning for capped fast-field queries
 
 ### Planned
 
+- [ ] Streaming fast-field TableProvider — custom DataFusion `TableProvider` reading Tantivy fast fields as streaming Arrow batches (8K rows/batch), eliminating the GROUP BY scan limit entirely
 - [ ] `COUNT(DISTINCT field)`
 - [ ] `_msearch` API (batch searches)
 - [ ] `search_after` cursor-based pagination
-- [ ] TLS encryption
+- [ ] HTTP TLS
 - [ ] Snapshot and restore
 - [ ] Index aliases and templates
+- [ ] Parquet sidecar — write Parquet alongside Tantivy segments for 100M+ scale, cross-index joins, external tool integration
 
 ## What's Honestly Missing
 
-- **No TLS** — localhost-only deployments
+- **No HTTP TLS** — client-facing HTTP is plaintext (gRPC inter-node TLS available via `transport-tls` feature flag)
 - **No authentication** — zero access control
 - **No `_msearch`** — can't batch search requests (blocks Kibana/Grafana)
 - **Not battle-tested at scale** — tested on 4M docs, not 400M

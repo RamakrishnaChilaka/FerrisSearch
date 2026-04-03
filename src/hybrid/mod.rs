@@ -305,8 +305,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.index_name, "products");
-        assert_eq!(plan.text_match.as_ref().unwrap().field, "description");
-        assert_eq!(plan.text_match.as_ref().unwrap().query, "iphone");
+        assert_eq!(plan.primary_text_match().unwrap().field, "description");
+        assert_eq!(plan.primary_text_match().unwrap().query, "iphone");
         assert_eq!(plan.pushed_filters.len(), 1);
         assert!(plan.required_columns.contains(&"title".to_string()));
         assert!(plan.required_columns.contains(&"price".to_string()));
@@ -324,7 +324,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.index_name, "my-index");
-        assert_eq!(plan.text_match.as_ref().unwrap().field, "description");
+        assert_eq!(plan.primary_text_match().unwrap().field, "description");
         assert!(plan.rewritten_sql.contains("FROM matched_rows"));
     }
 
@@ -559,17 +559,22 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_multiple_text_match_predicates() {
-        let err = planner::plan_sql(
+    fn planner_supports_multiple_text_match_predicates() {
+        let plan = planner::plan_sql(
             "products",
             "SELECT title FROM products WHERE text_match(description, 'iphone') AND text_match(title, 'pro')",
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.to_string()
-                .contains("Only one text_match(field, query) predicate is supported")
-        );
+        assert_eq!(plan.text_matches.len(), 2);
+        let req = plan.to_search_request();
+        match req.query {
+            crate::search::QueryClause::Bool(bool_query) => {
+                assert_eq!(bool_query.must.len(), 2);
+                assert!(bool_query.filter.is_empty());
+            }
+            other => panic!("expected Bool query, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -772,6 +777,13 @@ mod tests {
             "description"
         );
         assert_eq!(explain["pushdown_summary"]["text_match"]["query"], "iphone");
+        assert_eq!(
+            explain["pushdown_summary"]["text_matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(explain["columns"]["group_by"], json!(["brand"]));
         assert!(!explain["columns"]["selects_all"].as_bool().unwrap());
         assert_eq!(explain["columns"]["uses_grouped_partials"], true);
@@ -838,6 +850,12 @@ mod tests {
 
         let explain = plan.to_explain_json();
         assert!(explain["pushdown_summary"]["text_match"].is_null());
+        assert!(
+            explain["pushdown_summary"]["text_matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(explain["pushdown_summary"]["pushed_filter_count"], 0);
 
         let pipeline = explain["pipeline"].as_array().unwrap();

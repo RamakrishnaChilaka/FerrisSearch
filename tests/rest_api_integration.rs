@@ -57,6 +57,7 @@ impl RestTestHarness {
             local_node_id: "node-1".into(),
             raft: None,
             worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
+            sql_group_by_scan_limit: 1_000_000,
         };
 
         let transport_service = create_transport_service(
@@ -918,6 +919,36 @@ async fn rest_sql_count_star_uses_fast_path() -> Result<()> {
     let rows = body["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["total"], json!(2));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_expression_group_by_uses_fast_fields_fallback() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // Expression GROUP BY (LOWER) can't use grouped_partials — falls to tantivy_fast_fields.
+    // With only 3 docs this is well under the 1M scan limit, so it should succeed.
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT LOWER(brand) AS brand_lower, count(*) AS cnt FROM products GROUP BY LOWER(brand) ORDER BY cnt DESC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["execution_mode"],
+        json!("tantivy_fast_fields"),
+        "expression GROUP BY should fall to tantivy_fast_fields, not grouped_partials"
+    );
+    assert_eq!(body["truncated"], json!(false));
+
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "should have 2 groups: apple and samsung");
 
     Ok(())
 }

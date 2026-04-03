@@ -92,8 +92,7 @@ pub async fn execute_sql_batches(
     // project the RecordBatch down to only the columns referenced in the SQL
     // (in schema order) so that DataFusion's projection is either identity
     // or a simple prefix — preventing the reorder that triggers the bug.
-    let (table_batch, table_schema) =
-        project_batch_to_sql_columns(&unified_batch, &plan.rewritten_sql);
+    let (table_batch, table_schema) = project_batch_to_sql_columns(&unified_batch, plan);
 
     let table = MemTable::try_new(table_schema, vec![vec![table_batch]])?;
     let ctx = SessionContext::new();
@@ -109,10 +108,13 @@ pub async fn execute_sql_batches(
 /// This prevents DataFusion 53's projection-reorder LIMIT bug where
 /// fetch-pushdown into MemTable's TableScan ignores LIMIT when projection
 /// reorders columns relative to the table schema.
-fn project_batch_to_sql_columns(batch: &RecordBatch, sql: &str) -> (RecordBatch, Arc<Schema>) {
+fn project_batch_to_sql_columns(
+    batch: &RecordBatch,
+    plan: &QueryPlan,
+) -> (RecordBatch, Arc<Schema>) {
     let schema = batch.schema();
 
-    let select_order = extract_select_column_order(sql);
+    let select_order = extract_select_column_order(&plan.rewritten_sql);
     if select_order.is_empty() {
         return (batch.clone(), schema);
     }
@@ -131,9 +133,9 @@ fn project_batch_to_sql_columns(batch: &RecordBatch, sql: &str) -> (RecordBatch,
     }
 
     // Add any remaining referenced columns (ORDER BY, WHERE) that aren't in SELECT
-    let all_referenced = extract_column_names_from_sql(sql);
+    let referenced_columns = referenced_columns_from_plan(plan);
     for (idx, field) in schema.fields().iter().enumerate() {
-        if all_referenced.contains(field.name()) && !ordered_indices.contains(&idx) {
+        if referenced_columns.contains(field.name().as_str()) && !ordered_indices.contains(&idx) {
             ordered_indices.push(idx);
         }
     }
@@ -162,6 +164,18 @@ fn project_batch_to_sql_columns(batch: &RecordBatch, sql: &str) -> (RecordBatch,
         Ok(projected) => (projected, new_schema),
         Err(_) => (batch.clone(), schema),
     }
+}
+
+fn referenced_columns_from_plan(plan: &QueryPlan) -> std::collections::HashSet<String> {
+    let mut names: std::collections::HashSet<String> =
+        plan.required_columns.iter().cloned().collect();
+    if plan.needs_id {
+        names.insert("_id".to_string());
+    }
+    if plan.needs_score {
+        names.insert("score".to_string());
+    }
+    names
 }
 
 /// Extract the ordered list of column names from the SELECT clause.
@@ -204,95 +218,6 @@ fn expr_to_simple_name(expr: &sqlparser::ast::Expr) -> Option<String> {
             parts.last().map(|ident| ident.value.clone())
         }
         _ => None,
-    }
-}
-
-/// Extract column names referenced in a SQL query using sqlparser.
-fn extract_column_names_from_sql(sql: &str) -> std::collections::HashSet<String> {
-    use sqlparser::ast::*;
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-
-    let mut names = std::collections::HashSet::new();
-    let dialect = GenericDialect {};
-    let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
-        return names;
-    };
-    for stmt in &statements {
-        if let Statement::Query(query) = stmt {
-            collect_column_refs_from_query(query, &mut names);
-        }
-    }
-    names
-}
-
-fn collect_column_refs_from_query(
-    query: &sqlparser::ast::Query,
-    names: &mut std::collections::HashSet<String>,
-) {
-    if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
-        for item in &select.projection {
-            match item {
-                sqlparser::ast::SelectItem::UnnamedExpr(expr)
-                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
-                    collect_column_refs_from_expr(expr, names);
-                }
-                sqlparser::ast::SelectItem::Wildcard(_)
-                | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
-                    names.clear();
-                    return;
-                }
-            }
-        }
-        if let Some(ref where_expr) = select.selection {
-            collect_column_refs_from_expr(where_expr, names);
-        }
-    }
-    if let Some(ref order_by) = query.order_by
-        && let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind
-    {
-        for expr in exprs {
-            collect_column_refs_from_expr(&expr.expr, names);
-        }
-    }
-}
-
-fn collect_column_refs_from_expr(
-    expr: &sqlparser::ast::Expr,
-    names: &mut std::collections::HashSet<String>,
-) {
-    match expr {
-        sqlparser::ast::Expr::Identifier(ident) => {
-            names.insert(ident.value.clone());
-        }
-        sqlparser::ast::Expr::CompoundIdentifier(parts) => {
-            if let Some(last) = parts.last() {
-                names.insert(last.value.clone());
-            }
-        }
-        sqlparser::ast::Expr::BinaryOp { left, right, .. } => {
-            collect_column_refs_from_expr(left, names);
-            collect_column_refs_from_expr(right, names);
-        }
-        sqlparser::ast::Expr::UnaryOp { expr, .. } => {
-            collect_column_refs_from_expr(expr, names);
-        }
-        sqlparser::ast::Expr::Function(func) => {
-            if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
-                for arg in &list.args {
-                    if let sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(e),
-                    ) = arg
-                    {
-                        collect_column_refs_from_expr(e, names);
-                    }
-                }
-            }
-        }
-        sqlparser::ast::Expr::Nested(inner) => {
-            collect_column_refs_from_expr(inner, names);
-        }
-        _ => {}
     }
 }
 
@@ -972,8 +897,9 @@ mod tests {
         .unwrap();
 
         // SQL selects lic, fare (reverse of schema positions 2, 3)
-        let (projected, new_schema) =
-            project_batch_to_sql_columns(&batch, "SELECT lic, fare FROM matched_rows LIMIT 5");
+        let plan =
+            super::super::planner::plan_sql("test", "SELECT lic, fare FROM test LIMIT 5").unwrap();
+        let (projected, new_schema) = project_batch_to_sql_columns(&batch, &plan);
 
         // Should have columns in SELECT order: lic, fare (not _id, score)
         assert_eq!(new_schema.fields().len(), 2);
@@ -1002,10 +928,12 @@ mod tests {
         .unwrap();
 
         // SQL selects lic but orders by fare — fare must be included
-        let (_, new_schema) = project_batch_to_sql_columns(
-            &batch,
-            "SELECT lic FROM matched_rows ORDER BY fare DESC LIMIT 5",
-        );
+        let plan = super::super::planner::plan_sql(
+            "test",
+            "SELECT lic FROM test ORDER BY fare DESC LIMIT 5",
+        )
+        .unwrap();
+        let (_, new_schema) = project_batch_to_sql_columns(&batch, &plan);
 
         assert_eq!(new_schema.fields().len(), 2);
         assert_eq!(new_schema.field(0).name(), "lic"); // SELECT column first
@@ -1027,11 +955,84 @@ mod tests {
         )
         .unwrap();
 
-        let (_, new_schema) =
-            project_batch_to_sql_columns(&batch, "SELECT * FROM matched_rows LIMIT 5");
+        let plan = super::super::planner::plan_sql("test", "SELECT * FROM test LIMIT 5").unwrap();
+        let (_, new_schema) = project_batch_to_sql_columns(&batch, &plan);
         // SELECT * should return the original schema unchanged
         assert_eq!(new_schema.fields().len(), 2);
         assert_eq!(new_schema.field(0).name(), "a");
         assert_eq!(new_schema.field(1).name(), "b");
+    }
+
+    #[test]
+    fn project_batch_to_sql_columns_keeps_case_dependencies() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, false),
+            Field::new("author", DataType::Utf8, true),
+            Field::new("upvotes", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["id1"])),
+                Arc::new(datafusion::arrow::array::Float32Array::from(vec![0.0f32])),
+                Arc::new(StringArray::from(vec!["alice"])),
+                Arc::new(Float64Array::from(vec![42.0])),
+            ],
+        )
+        .unwrap();
+
+        let plan = super::super::planner::plan_sql(
+            "test",
+            "SELECT author, SUM(CASE WHEN upvotes < 300 THEN upvotes ELSE 0 END) AS nonviral_upvotes FROM test GROUP BY author ORDER BY nonviral_upvotes DESC LIMIT 5",
+        )
+        .unwrap();
+        let (_, new_schema) = project_batch_to_sql_columns(&batch, &plan);
+
+        assert_eq!(new_schema.fields().len(), 2);
+        assert_eq!(new_schema.field(0).name(), "author");
+        assert_eq!(new_schema.field(1).name(), "upvotes");
+    }
+
+    #[tokio::test]
+    async fn execute_sql_batches_handles_case_aggregate_dependencies() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, false),
+            Field::new("author", DataType::Utf8, true),
+            Field::new("upvotes", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["id1", "id2", "id3", "id4", "id5"])),
+                Arc::new(datafusion::arrow::array::Float32Array::from(vec![
+                    0.0f32;
+                    5
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "alice", "alice", "bob", "bob", "carol",
+                ])),
+                Arc::new(Float64Array::from(vec![100.0, 400.0, 50.0, 200.0, 500.0])),
+            ],
+        )
+        .unwrap();
+
+        let plan = super::super::planner::plan_sql(
+            "test",
+            "SELECT author, COUNT(*) AS posts, SUM(CASE WHEN upvotes < 300 THEN upvotes ELSE 0 END) AS nonviral_upvotes, SUM(CASE WHEN upvotes < 300 THEN 1 ELSE 0 END) AS nonviral_posts, ROUND(SUM(CASE WHEN upvotes < 300 THEN upvotes ELSE 0 END) * 1.0 / NULLIF(SUM(CASE WHEN upvotes < 300 THEN 1 ELSE 0 END), 0), 1) AS avg_nonviral FROM test GROUP BY author HAVING COUNT(*) >= 2 ORDER BY avg_nonviral DESC, author ASC LIMIT 2",
+        )
+        .unwrap();
+
+        let result = execute_sql_batches(&plan, vec![batch]).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0]["author"], json!("bob"));
+        assert_eq!(result.rows[0]["posts"], json!(2));
+        assert_eq!(result.rows[0]["nonviral_upvotes"], json!(250.0));
+        assert_eq!(result.rows[0]["nonviral_posts"], json!(2));
+        assert_eq!(result.rows[0]["avg_nonviral"], json!(125.0));
+        assert_eq!(result.rows[1]["author"], json!("alice"));
+        assert_eq!(result.rows[1]["avg_nonviral"], json!(100.0));
     }
 }

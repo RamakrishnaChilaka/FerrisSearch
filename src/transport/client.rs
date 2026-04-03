@@ -68,8 +68,8 @@ impl TransportClient {
             let cache = self.channels.read().unwrap_or_else(|e| e.into_inner());
             if let Some(channel) = cache.get(&key) {
                 return Ok(InternalTransportClient::new(channel.clone())
-                    .max_decoding_message_size(64 * 1024 * 1024)
-                    .max_encoding_message_size(64 * 1024 * 1024));
+                    .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE));
             }
         }
 
@@ -96,8 +96,8 @@ impl TransportClient {
         }
 
         Ok(InternalTransportClient::new(channel)
-            .max_decoding_message_size(64 * 1024 * 1024)
-            .max_encoding_message_size(64 * 1024 * 1024))
+            .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE))
     }
 
     /// Attempts to join the cluster by contacting the seed hosts.

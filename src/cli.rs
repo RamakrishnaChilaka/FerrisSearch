@@ -344,6 +344,17 @@ fn render_metadata(body: &Value, client_ms: f64) {
 
     println!();
     println!(" {}", parts.join(" | ").dimmed());
+
+    // Truncation warning — results may be incomplete
+    if body.get("truncated").and_then(|v| v.as_bool()) == Some(true)
+        && let Some(hits) = body.get("matched_hits").and_then(|v| v.as_u64())
+    {
+        println!(
+            " {} query matched {} docs but results are capped — add filters or LIMIT",
+            "⚠ TRUNCATED:".bright_yellow().bold(),
+            format_number(hits).bright_yellow(),
+        );
+    }
 }
 
 fn render_explain(body: &Value, client_ms: f64) {

@@ -56,6 +56,7 @@ pub fn error_response(
 | `forward_exception` | gRPC forwarding to another node failed |
 | `raft_write_exception` | Raft client_write command failed |
 | `master_not_discovered_exception` | No master in cluster state |
+| `group_by_scan_limit_exceeded` | GROUP BY fallback query matched more docs than `sql_group_by_scan_limit` |
 
 ## API Handlers
 
@@ -139,7 +140,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
     - `tantivy_grouped_partials` when an eligible `GROUP BY` query executes as shard-local grouped partial aggregation with coordinator merge
     - `tantivy_fast_fields` when the query runs from local shard fast fields without materializing full hits first
     - `materialized_hits_fallback` when SQL runs over gathered hits for compatibility
-- Responses include a `planner` object showing pushed-down text match, structured filters, grouping columns, required columns, and whether residual predicates remained.
+- Responses include a `planner` object showing the compatibility `text_match` field, the full `text_matches` array, structured filters, grouping columns, required columns, and whether residual predicates remained.
 - Responses include a `truncated` boolean flag:
     - `true` only when the internal 100K collection ceiling silently drops matching documents.
     - `false` when the user specified an explicit `LIMIT` — they got what they asked for, that's not truncation.

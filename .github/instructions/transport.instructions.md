@@ -148,7 +148,11 @@ transport_tls_ca_file: /path/to/ca.pem
 **Architecture:**
 - `TlsConnector` trait in `client.rs` — abstracts TLS endpoint configuration, no `#[cfg]` on the struct or `connect()` method.
 - `TonicTlsConnector` in `transport/mod.rs` — concrete implementation behind `#[cfg(feature = "transport-tls")]`, applies `ClientTlsConfig` with CA verification.
+- `transport/mod.rs` installs the rustls ring crypto provider once before building server/client TLS config so feature builds do not panic at runtime.
 - `load_server_tls_config()` in `transport/mod.rs` — loads PEM cert+key into `tonic::transport::ServerTlsConfig`.
 - `TransportClient::with_tls_connector(Arc<dyn TlsConnector>)` — factory that sets up https:// scheme and TLS for all connections.
 - Server-side TLS (`node/mod.rs`): `Server::builder().tls_config(config)` when feature + config are both active.
-- When `transport_tls_enabled: false` (default) or the feature is not compiled, all behavior is identical to pre-TLS code — zero overhead.
+- `node/mod.rs` validates TLS config up front: `transport_tls_ca_file`, `transport_tls_cert_file`, and `transport_tls_key_file` are required when TLS is enabled.
+- Enabling `transport_tls_enabled: true` without compiling `--features transport-tls` must return a startup error. Never silently downgrade to plaintext transport.
+- When `transport_tls_enabled: false` (default), all behavior is identical to pre-TLS code — zero overhead.
+- Integration coverage for the encrypted path lives in `tests/replication_integration.rs` and should be run with `cargo test --test replication_integration --features transport-tls`.
