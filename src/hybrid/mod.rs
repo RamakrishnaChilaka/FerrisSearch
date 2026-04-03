@@ -300,7 +300,7 @@ mod tests {
     fn planner_extracts_text_match_and_rewrites_sql() {
         let plan = planner::plan_sql(
             "products",
-            "SELECT title, price, score FROM products WHERE text_match(description, 'iphone') AND price > 500 ORDER BY score DESC",
+            "SELECT title, price, _score FROM products WHERE text_match(description, 'iphone') AND price > 500 ORDER BY _score DESC",
         )
         .unwrap();
 
@@ -385,13 +385,13 @@ mod tests {
     fn planner_tracks_residual_predicates_that_cannot_be_pushed_down() {
         let plan = planner::plan_sql(
             "products",
-            "SELECT title, score FROM products WHERE text_match(description, 'iphone') AND price > 500 AND score > 1.0 ORDER BY score DESC",
+            "SELECT title, _score FROM products WHERE text_match(description, 'iphone') AND price > 500 AND _score > 1.0 ORDER BY _score DESC",
         )
         .unwrap();
 
         assert_eq!(plan.pushed_filters.len(), 1);
         assert!(plan.has_residual_predicates);
-        assert!(plan.rewritten_sql.contains("score > 1"));
+        assert!(plan.rewritten_sql.contains("_score > 1"));
     }
 
     // ── IN / BETWEEN pushdown ───────────────────────────────────────────
@@ -507,11 +507,11 @@ mod tests {
     fn in_on_score_stays_as_residual() {
         let plan = planner::plan_sql(
             "products",
-            "SELECT title FROM products WHERE text_match(description, 'iphone') AND score IN (1.0, 2.0)",
+            "SELECT title FROM products WHERE text_match(description, 'iphone') AND _score IN (1.0, 2.0)",
         )
         .unwrap();
 
-        // score is explicitly blocked from pushdown
+        // _score is explicitly blocked from pushdown
         assert_eq!(plan.pushed_filters.len(), 0);
         assert!(plan.has_residual_predicates);
     }
@@ -578,10 +578,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_planned_sql_orders_by_score() {
+    async fn execute_planned_sql_orders_by_underscore_score() {
         let plan = planner::plan_sql(
             "products",
-            "SELECT title, price, score FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC",
+            "SELECT title, price, _score FROM products WHERE text_match(description, 'iphone') ORDER BY _score DESC",
         )
         .unwrap();
 
@@ -599,7 +599,7 @@ mod tests {
         ];
 
         let result = execute_planned_sql(&plan, &hits).await.unwrap();
-        assert_eq!(result.columns, vec!["title", "price", "score"]);
+        assert_eq!(result.columns, vec!["title", "price", "_score"]);
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0]["title"], "Pro phone");
         assert_eq!(result.rows[1]["title"], "Budget phone");
@@ -822,7 +822,7 @@ mod tests {
     fn explain_shows_residual_predicates_in_datafusion_stage() {
         let plan = planner::plan_sql(
             "products",
-            "SELECT title, score FROM products WHERE text_match(description, 'iphone') AND score > 1.0 ORDER BY score DESC",
+            "SELECT title, _score FROM products WHERE text_match(description, 'iphone') AND _score > 1.0 ORDER BY _score DESC",
         )
         .unwrap();
 
@@ -899,7 +899,7 @@ mod tests {
 
         // Without hints: both columns would be Utf8 (the default for empty)
         let batch_no_hints = crate::hybrid::arrow_bridge::build_record_batch(&store).unwrap();
-        // _id, score, brand, price
+        // _id, _score, brand, price
         assert_eq!(
             batch_no_hints
                 .schema()
@@ -938,7 +938,7 @@ mod tests {
     fn limit_pushdown_with_order_by_score() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
-            "SELECT title, price, score FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC LIMIT 25",
+            "SELECT title, price, _score FROM products WHERE text_match(description, 'iphone') ORDER BY _score DESC LIMIT 25",
         ).unwrap();
         assert_eq!(plan.limit, Some(25));
         assert_eq!(plan.offset, None);
@@ -951,7 +951,7 @@ mod tests {
     fn limit_pushdown_with_offset() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
-            "SELECT title, price, score FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC LIMIT 10 OFFSET 20",
+            "SELECT title, price, _score FROM products WHERE text_match(description, 'iphone') ORDER BY _score DESC LIMIT 10 OFFSET 20",
         ).unwrap();
         assert_eq!(plan.limit, Some(10));
         assert_eq!(plan.offset, Some(20));
@@ -1016,10 +1016,10 @@ mod tests {
 
     #[test]
     fn limit_not_pushed_down_when_residual_predicates() {
-        // score > 1.0 is a residual predicate (not pushed into Tantivy)
+        // _score > 1.0 is a residual predicate (not pushed into Tantivy)
         let plan = crate::hybrid::planner::plan_sql(
             "products",
-            "SELECT title, score FROM products WHERE text_match(description, 'iphone') AND score > 1.0 ORDER BY score DESC LIMIT 5",
+            "SELECT title, _score FROM products WHERE text_match(description, 'iphone') AND _score > 1.0 ORDER BY _score DESC LIMIT 5",
         ).unwrap();
         assert_eq!(plan.limit, Some(5));
         assert!(plan.has_residual_predicates);
@@ -1032,7 +1032,7 @@ mod tests {
     fn no_limit_uses_sql_match_limit() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
-            "SELECT title, price FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC",
+            "SELECT title, price FROM products WHERE text_match(description, 'iphone') ORDER BY _score DESC",
         ).unwrap();
         assert_eq!(plan.limit, None);
         assert!(!plan.limit_pushed_down);
@@ -1048,7 +1048,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.limit, Some(50));
-        assert!(plan.limit_pushed_down); // no ORDER BY = default score sort, safe
+        assert!(plan.limit_pushed_down); // no ORDER BY = default _score sort, safe
         let req = plan.to_search_request();
         assert_eq!(req.size, 50);
     }
@@ -1083,7 +1083,7 @@ mod tests {
     fn explain_shows_limit_pushdown_info() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
-            "SELECT title, price, score FROM products WHERE text_match(description, 'iphone') ORDER BY score DESC LIMIT 25",
+            "SELECT title, price, _score FROM products WHERE text_match(description, 'iphone') ORDER BY _score DESC LIMIT 25",
         ).unwrap();
         let explain = plan.to_explain_json();
         assert_eq!(explain["columns"]["limit"], 25);
@@ -1129,7 +1129,7 @@ mod tests {
     fn plan_detects_needs_score_when_projected() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
-            "SELECT title, score FROM products WHERE text_match(description, 'test')",
+            "SELECT title, _score FROM products WHERE text_match(description, 'test')",
         )
         .unwrap();
         assert!(!plan.needs_id);
@@ -1140,7 +1140,7 @@ mod tests {
     fn plan_detects_needs_score_in_order_by() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
-            "SELECT title FROM products WHERE text_match(description, 'test') ORDER BY score DESC",
+            "SELECT title FROM products WHERE text_match(description, 'test') ORDER BY _score DESC",
         )
         .unwrap();
         assert!(!plan.needs_id);
@@ -1162,7 +1162,7 @@ mod tests {
     fn plan_detects_both_id_and_score() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
-            "SELECT _id, score, title FROM products WHERE text_match(description, 'test')",
+            "SELECT _id, _score, title FROM products WHERE text_match(description, 'test')",
         )
         .unwrap();
         assert!(plan.needs_id);
@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn select_literal_forces_needs_score() {
+    fn select_literal_does_not_force_needs_score() {
         let plan = crate::hybrid::planner::plan_sql(
             "products",
             "SELECT 1 AS one FROM products WHERE text_match(description, 'test')",
@@ -1309,10 +1309,7 @@ mod tests {
         .unwrap();
         // SELECT 1 has no data column references
         assert!(plan.required_columns.is_empty());
-        assert!(
-            plan.needs_score,
-            "needs_score must be true when no columns are projected"
-        );
+        assert!(!plan.needs_score);
     }
 
     #[test]

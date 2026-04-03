@@ -18,6 +18,18 @@ pub enum ColumnKind {
     Utf8,
 }
 
+impl ColumnKind {
+    /// Convert to the corresponding Arrow DataType.
+    pub fn to_arrow_type(&self) -> datafusion::arrow::datatypes::DataType {
+        match self {
+            ColumnKind::Float64 => datafusion::arrow::datatypes::DataType::Float64,
+            ColumnKind::Int64 => datafusion::arrow::datatypes::DataType::Int64,
+            ColumnKind::Boolean => datafusion::arrow::datatypes::DataType::Boolean,
+            ColumnKind::Utf8 => datafusion::arrow::datatypes::DataType::Utf8,
+        }
+    }
+}
+
 pub fn build_float64_array(values: &[Value]) -> Result<Float64Array> {
     let mut builder = Float64Builder::with_capacity(values.len());
     for value in values {
@@ -74,7 +86,7 @@ pub fn build_record_batch_with_hints(
     let row_count = column_store.row_count();
     let mut fields = vec![
         Field::new("_id", DataType::Utf8, false),
-        Field::new("score", DataType::Float32, false),
+        Field::new("_score", DataType::Float32, false),
     ];
 
     let mut arrays: Vec<ArrayRef> = if column_store.ids().is_empty() && row_count > 0 {
@@ -89,7 +101,7 @@ pub fn build_record_batch_with_hints(
     };
 
     if column_store.scores().is_empty() && row_count > 0 {
-        // score not needed: emit a column of zeros
+        // _score not needed: emit a column of zeros
         arrays.push(Arc::new(Float32Array::from(vec![0.0f32; row_count])));
     } else {
         arrays.push(Arc::new(build_score_array(column_store.scores())));

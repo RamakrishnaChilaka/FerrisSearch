@@ -142,8 +142,9 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
     - `materialized_hits_fallback` when SQL runs over gathered hits for compatibility
 - Responses include a `planner` object showing the compatibility `text_match` field, the full `text_matches` array, structured filters, grouping columns, required columns, and whether residual predicates remained.
 - Responses include a `truncated` boolean flag:
-    - `true` only when the internal 100K collection ceiling silently drops matching documents.
+    - `true` only when the flat-query internal 100K collection ceiling silently drops matching documents on the `tantivy_fast_fields` path.
     - `false` when the user specified an explicit `LIMIT` — they got what they asked for, that's not truncation.
+    - `false` for GROUP BY fast-field fallbacks — those use `sql_group_by_scan_limit` and return `group_by_scan_limit_exceeded` instead of truncated aggregates when capped.
     - Never `true` for grouped partials (they scan all matched docs via aggregation collectors).
 - Future SQL work should preserve these fields so manual testing can confirm whether a query stayed on the intended search-aware path.
 - API docs and responses should make it clear that `materialized_hits_fallback` is a compatibility mode, while `tantivy_grouped_partials` and `tantivy_fast_fields` reflect the intended search-aware execution paths.

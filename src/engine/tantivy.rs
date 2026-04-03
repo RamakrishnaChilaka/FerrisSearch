@@ -1,4 +1,5 @@
 use anyhow::Result;
+use datafusion::arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -255,7 +256,7 @@ impl HotEngine {
         // Build per-segment field readers for requested columns
         let mut field_plans = Vec::with_capacity(segment_readers.len());
         // Also open fast-field reader for _id per segment (only if needed)
-        let mut id_readers: Vec<Option<tantivy::columnar::StrColumn>> =
+        let mut id_readers: Vec<Option<StringFastFieldReader>> =
             Vec::with_capacity(segment_readers.len());
         let mut needs_stored_doc = false;
 
@@ -273,7 +274,7 @@ impl HotEngine {
 
             // Only open _id fast-field reader if we actually need _id
             let id_reader = if needs_id {
-                fast_fields.str("_id").ok().flatten()
+                StringFastFieldReader::open(fast_fields, "_id")
             } else {
                 None
             };
@@ -284,8 +285,9 @@ impl HotEngine {
         let mut scores = Vec::with_capacity(if needs_score { top_docs.len() } else { 0 });
 
         // Fast path: use column cache when no SourceFallback columns are needed.
-        // This avoids per-doc serde_json::Value allocation by working directly with Arrow arrays.
-        let use_cache = !needs_stored_doc && !columns.is_empty();
+        // This avoids per-doc serde_json::Value allocation by working directly with Arrow arrays,
+        // including zero-column queries like `SELECT 1 ...` that still need one output row per hit.
+        let use_cache = !needs_stored_doc;
 
         if use_cache {
             // Group matching doc IDs by segment ordinal
@@ -295,35 +297,59 @@ impl HotEngine {
                 seg_docs[seg_ord].push((doc_address.doc_id, *score));
             }
 
-            // Collect IDs and scores in doc order
-            for (score, doc_address) in &top_docs {
-                if needs_id {
-                    let seg_ord = doc_address.segment_ord as usize;
-                    let doc_id = doc_address.doc_id;
-                    let id_str = if let Some(ref id_reader) = id_readers[seg_ord] {
-                        let mut ords = id_reader.term_ords(doc_id);
-                        if let Some(ord) = ords.next() {
-                            let mut text = String::new();
-                            if id_reader.ord_to_str(ord, &mut text).unwrap_or(false) {
-                                text
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    };
-                    ids.push(id_str);
-                }
+            // Collect scores in doc order. _id now uses the same per-segment
+            // projection path as other fast-field columns.
+            for (score, _) in &top_docs {
                 if needs_score {
                     scores.push(*score);
                 }
             }
 
-            // For each column, build per-segment Arrow arrays via cache, then take() matching rows
             use datafusion::arrow::array::UInt32Array;
+
+            let id_array = if needs_id {
+                let mut segment_arrays: Vec<datafusion::arrow::array::ArrayRef> = Vec::new();
+
+                for (seg_ord, docs) in seg_docs.iter().enumerate() {
+                    if docs.is_empty() {
+                        continue;
+                    }
+
+                    let taken = if let Some(id_reader) = id_readers[seg_ord].as_ref() {
+                        let reader = SqlFieldReader::Str(id_reader.clone());
+                        build_projected_fast_field_array(
+                            self.column_cache.as_ref(),
+                            segment_readers[seg_ord].segment_id(),
+                            segment_readers[seg_ord].max_doc(),
+                            "_id",
+                            &reader,
+                            docs,
+                        )?
+                    } else {
+                        std::sync::Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                            "";
+                            docs.len()
+                        ]))
+                    };
+
+                    segment_arrays.push(taken);
+                }
+
+                let refs: Vec<&dyn datafusion::arrow::array::Array> =
+                    segment_arrays.iter().map(|a| a.as_ref()).collect();
+                let concatenated: datafusion::arrow::array::ArrayRef = if refs.is_empty() {
+                    std::sync::Arc::new(datafusion::arrow::array::StringArray::from(
+                        Vec::<&str>::new(),
+                    ))
+                } else {
+                    datafusion::arrow::compute::concat(&refs)?
+                };
+                Some(concatenated)
+            } else {
+                None
+            };
+
+            // For each column, build per-segment Arrow arrays via cache, then take() matching rows
 
             let mut result_columns: Vec<(String, datafusion::arrow::array::ArrayRef)> = Vec::new();
 
@@ -338,37 +364,15 @@ impl HotEngine {
                     let max_doc = segment_readers[seg_ord].max_doc();
                     let reader = &field_plans[seg_ord][col_idx];
 
-                    let cache_max = self.column_cache.max_capacity();
-                    let use_segment_cache =
-                        should_cache_full_segment_array(reader, max_doc, cache_max);
-
-                    if use_segment_cache {
-                        // Check cache — on hit, always use it regardless of selectivity
-                        let full_array = if let Some(cached) = self.column_cache.get(seg_id, column)
-                        {
-                            cached
-                        } else if self.column_cache.should_populate(docs.len(), max_doc) {
-                            // Selectivity above threshold — build and cache full-segment array
-                            let array = build_full_segment_array(reader, max_doc);
-                            self.column_cache.insert(seg_id, column, array.clone());
-                            array
-                        } else {
-                            // Selectivity too low — read only matching docs, skip cache population
-                            let taken = build_selective_array(reader, docs);
-                            segment_arrays.push(taken);
-                            continue;
-                        };
-
-                        // take() only matching doc IDs from the full array
-                        let indices =
-                            UInt32Array::from(docs.iter().map(|(d, _)| *d).collect::<Vec<u32>>());
-                        let taken = datafusion::arrow::compute::take(&full_array, &indices, None)?;
-                        segment_arrays.push(taken);
-                    } else {
-                        // Segment too large for cache — read only matching docs directly
-                        let taken = build_selective_array(reader, docs);
-                        segment_arrays.push(taken);
-                    }
+                    let taken = build_projected_fast_field_array(
+                        self.column_cache.as_ref(),
+                        seg_id,
+                        max_doc,
+                        column,
+                        reader,
+                        docs,
+                    )?;
+                    segment_arrays.push(taken);
                 }
 
                 // Concatenate across segments (preserving top_docs order within each segment)
@@ -419,9 +423,15 @@ impl HotEngine {
                 false,
             ));
             if needs_id {
-                ordered_arrays.push(std::sync::Arc::new(
-                    datafusion::arrow::array::StringArray::from(ids),
-                ));
+                let reordered = if let Some(arr) = &id_array {
+                    datafusion::arrow::compute::take(arr.as_ref(), &reorder_array, None)?
+                } else {
+                    let empty_ids: datafusion::arrow::array::ArrayRef = std::sync::Arc::new(
+                        datafusion::arrow::array::StringArray::from(vec![""; num_rows]),
+                    );
+                    empty_ids
+                };
+                ordered_arrays.push(reordered);
             } else {
                 ordered_arrays.push(std::sync::Arc::new(
                     datafusion::arrow::array::StringArray::from(vec![""; num_rows]),
@@ -430,7 +440,7 @@ impl HotEngine {
 
             // score column — zeros if not needed
             schema_fields.push(datafusion::arrow::datatypes::Field::new(
-                "score",
+                "_score",
                 datafusion::arrow::datatypes::DataType::Float32,
                 false,
             ));
@@ -489,14 +499,9 @@ impl HotEngine {
                         .unwrap_or("")
                         .to_string()
                 } else if let Some(ref id_reader) = id_readers[seg_ord] {
-                    let mut ords = id_reader.term_ords(doc_id);
-                    if let Some(ord) = ords.next() {
-                        let mut text = String::new();
-                        if id_reader.ord_to_str(ord, &mut text).unwrap_or(false) {
-                            text
-                        } else {
-                            String::new()
-                        }
+                    let mut text = String::new();
+                    if id_reader.first_text(doc_id, &mut text) {
+                        text
                     } else {
                         String::new()
                     }
@@ -523,14 +528,9 @@ impl HotEngine {
                         .map(serde_json::Value::from)
                         .unwrap_or(serde_json::Value::Null),
                     SqlFieldReader::Str(reader) => {
-                        let mut ords = reader.term_ords(doc_id);
-                        if let Some(ord) = ords.next() {
-                            let mut text = String::new();
-                            if reader.ord_to_str(ord, &mut text).unwrap_or(false) {
-                                serde_json::Value::String(text)
-                            } else {
-                                serde_json::Value::Null
-                            }
+                        let mut text = String::new();
+                        if reader.first_text(doc_id, &mut text) {
+                            serde_json::Value::String(text)
                         } else {
                             serde_json::Value::Null
                         }
@@ -1276,7 +1276,7 @@ impl HotEngine {
                                 // Determine if we can use flat array path:
                                 // single-column keyword GROUP BY with known dictionary size < 2M
                                 let use_flat = key_readers.len() == 1
-                                    && matches!(key_readers[0], GroupKeyReader::Str { .. })
+                                    && matches!(key_readers[0], GroupKeyReader::Str(_))
                                     && key_readers[0].num_terms() < 2_000_000;
 
                                 if use_flat {
@@ -1502,14 +1502,65 @@ impl std::hash::Hasher for OrdHasher {
 type OrdBuildHasher = std::hash::BuildHasherDefault<OrdHasher>;
 type OrdHashMap<V> = std::collections::HashMap<u64, V, OrdBuildHasher>;
 
+#[derive(Clone)]
+struct StringFastFieldReader {
+    str_col: tantivy::columnar::StrColumn,
+    ord_col: tantivy::columnar::Column<u64>,
+}
+
+impl StringFastFieldReader {
+    fn open(fast_fields: &tantivy::fastfield::FastFieldReaders, field_name: &str) -> Option<Self> {
+        let str_col = fast_fields.str(field_name).ok().flatten()?;
+        let ord_col = str_col.ords().clone();
+        Some(Self { str_col, ord_col })
+    }
+
+    #[inline]
+    fn first_ord(&self, doc: tantivy::DocId) -> Option<u64> {
+        self.ord_col.first(doc)
+    }
+
+    #[inline]
+    fn first_ords_batch(&self, docs: &[tantivy::DocId], output: &mut [Option<u64>]) {
+        self.ord_col.first_vals(docs, output);
+    }
+
+    #[inline]
+    fn first_text(&self, doc: tantivy::DocId, buf: &mut String) -> bool {
+        let Some(ord) = self.first_ord(doc) else {
+            return false;
+        };
+        buf.clear();
+        self.ord_to_str(ord, buf)
+    }
+
+    #[inline]
+    fn ord_to_str(&self, ord: u64, buf: &mut String) -> bool {
+        self.str_col.ord_to_str(ord, buf).unwrap_or(false)
+    }
+
+    fn num_terms(&self) -> usize {
+        self.str_col.num_terms()
+    }
+}
+
 enum SqlFieldReader {
     F64(tantivy::columnar::Column<f64>),
     I64(tantivy::columnar::Column<i64>),
-    Str(tantivy::columnar::StrColumn),
+    Str(StringFastFieldReader),
     SourceFallback,
 }
 
 impl SqlFieldReader {
+    fn type_name(&self) -> &'static str {
+        match self {
+            SqlFieldReader::F64(_) => "F64",
+            SqlFieldReader::I64(_) => "I64",
+            SqlFieldReader::Str(_) => "Str",
+            SqlFieldReader::SourceFallback => "SourceFallback",
+        }
+    }
+
     /// Read the first value for a doc as JSON. Used for count(field) null checks.
     #[allow(dead_code)]
     fn first_json(&self, doc: tantivy::DocId) -> serde_json::Value {
@@ -1523,14 +1574,9 @@ impl SqlFieldReader {
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
             SqlFieldReader::Str(reader) => {
-                let mut ords = reader.term_ords(doc);
-                if let Some(ord) = ords.next() {
-                    let mut text = String::new();
-                    if reader.ord_to_str(ord, &mut text).unwrap_or(false) {
-                        serde_json::Value::String(text)
-                    } else {
-                        serde_json::Value::Null
-                    }
+                let mut text = String::new();
+                if reader.first_text(doc, &mut text) {
+                    serde_json::Value::String(text)
                 } else {
                     serde_json::Value::Null
                 }
@@ -1558,10 +1604,7 @@ fn open_sql_field_reader(
             .i64(entry.name())
             .map(SqlFieldReader::I64)
             .unwrap_or(SqlFieldReader::SourceFallback),
-        _ => fast_fields
-            .str(entry.name())
-            .ok()
-            .flatten()
+        _ => StringFastFieldReader::open(fast_fields, entry.name())
             .map(SqlFieldReader::Str)
             .unwrap_or(SqlFieldReader::SourceFallback),
     }
@@ -1601,14 +1644,8 @@ fn build_full_segment_array(
             let mut builder = StringBuilder::with_capacity(max_doc as usize, 0);
             let mut buf = String::new();
             for doc in 0..max_doc {
-                let mut ords = col.term_ords(doc);
-                if let Some(ord) = ords.next() {
-                    buf.clear();
-                    if col.ord_to_str(ord, &mut buf).unwrap_or(false) {
-                        builder.append_value(&buf);
-                    } else {
-                        builder.append_null();
-                    }
+                if col.first_text(doc, &mut buf) {
+                    builder.append_value(&buf);
                 } else {
                     builder.append_null();
                 }
@@ -1647,7 +1684,7 @@ fn estimate_full_segment_array_bytes(reader: &SqlFieldReader, max_doc: u32) -> u
     }
 }
 
-fn estimate_string_array_value_bytes(col: &tantivy::columnar::StrColumn) -> u64 {
+fn estimate_string_array_value_bytes(col: &StringFastFieldReader) -> u64 {
     const MAX_SAMPLES: usize = 32;
 
     let num_terms = col.num_terms();
@@ -1664,7 +1701,7 @@ fn estimate_string_array_value_bytes(col: &tantivy::columnar::StrColumn) -> u64 
 
     while ord < num_terms && sampled < sample_count as u64 {
         buf.clear();
-        if col.ord_to_str(ord as u64, &mut buf).unwrap_or(false) {
+        if col.ord_to_str(ord as u64, &mut buf) {
             total_len = total_len.saturating_add(buf.len() as u64);
             sampled += 1;
         }
@@ -1714,12 +1751,14 @@ fn build_selective_array(
         }
         SqlFieldReader::Str(col) => {
             let mut builder = StringBuilder::with_capacity(docs.len(), docs.len() * 16);
+            let doc_ids: Vec<tantivy::DocId> = docs.iter().map(|(doc_id, _)| *doc_id).collect();
+            let mut ords = vec![None; docs.len()];
+            col.first_ords_batch(&doc_ids, &mut ords);
             let mut buf = String::new();
-            for (doc_id, _) in docs {
-                let mut ords = col.term_ords(*doc_id);
-                if let Some(ord) = ords.next() {
+            for ord in ords {
+                if let Some(ord) = ord {
                     buf.clear();
-                    if col.ord_to_str(ord, &mut buf).unwrap_or(false) {
+                    if col.ord_to_str(ord, &mut buf) {
                         builder.append_value(&buf);
                     } else {
                         builder.append_null();
@@ -1732,6 +1771,41 @@ fn build_selective_array(
         }
         SqlFieldReader::SourceFallback => Arc::new(StringBuilder::new().finish()),
     }
+}
+
+fn build_projected_fast_field_array(
+    column_cache: &super::column_cache::ColumnCache,
+    segment_id: tantivy::index::SegmentId,
+    max_doc: u32,
+    column_name: &str,
+    reader: &SqlFieldReader,
+    docs: &[(u32, f32)],
+) -> Result<datafusion::arrow::array::ArrayRef> {
+    use datafusion::arrow::array::UInt32Array;
+
+    let cache_max = column_cache.max_capacity();
+    let use_segment_cache = should_cache_full_segment_array(reader, max_doc, cache_max);
+
+    if use_segment_cache {
+        let full_array = if let Some(cached) = column_cache.get(segment_id, column_name) {
+            cached
+        } else if column_cache.should_populate(docs.len(), max_doc) {
+            let array = build_full_segment_array(reader, max_doc);
+            column_cache.insert(segment_id, column_name, array.clone());
+            array
+        } else {
+            return Ok(build_selective_array(reader, docs));
+        };
+
+        let indices = UInt32Array::from(docs.iter().map(|(d, _)| *d).collect::<Vec<u32>>());
+        return Ok(datafusion::arrow::compute::take(
+            &full_array,
+            &indices,
+            None,
+        )?);
+    }
+
+    Ok(build_selective_array(reader, docs))
 }
 
 /// Determine column type from Tantivy schema (for building typed empty arrays).
@@ -1785,9 +1859,7 @@ fn open_group_key_reader(
             fast_fields.i64(entry.name()).ok().map(GroupKeyReader::I64)
         }
         tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::Bytes(_) => {
-            let str_col = fast_fields.str(entry.name()).ok().flatten()?;
-            let ord_col = str_col.ords().clone();
-            Some(GroupKeyReader::Str { str_col, ord_col })
+            StringFastFieldReader::open(fast_fields, entry.name()).map(GroupKeyReader::Str)
         }
         _ => None,
     }
@@ -1823,10 +1895,7 @@ struct GroupedMetricEntry {
 enum GroupKeyReader {
     /// String column — reads ordinals from the underlying Column<u64> directly,
     /// bypassing the iterator-based `term_ords()` path.
-    Str {
-        str_col: tantivy::columnar::StrColumn,
-        ord_col: tantivy::columnar::Column<u64>,
-    },
+    Str(StringFastFieldReader),
     I64(tantivy::columnar::Column<i64>),
     F64(tantivy::columnar::Column<f64>),
 }
@@ -1837,8 +1906,8 @@ impl GroupKeyReader {
     #[inline]
     fn keys_batch(&self, docs: &[tantivy::DocId], output: &mut [Option<u64>]) {
         match self {
-            GroupKeyReader::Str { ord_col, .. } => {
-                ord_col.first_vals(docs, output);
+            GroupKeyReader::Str(reader) => {
+                reader.first_ords_batch(docs, output);
             }
             GroupKeyReader::I64(reader) => {
                 // Reinterpret: read i64s into a temp buffer, convert to u64
@@ -1861,7 +1930,7 @@ impl GroupKeyReader {
     /// Number of unique terms (for string columns), used for HashMap pre-sizing.
     fn num_terms(&self) -> usize {
         match self {
-            GroupKeyReader::Str { str_col, .. } => str_col.num_terms(),
+            GroupKeyReader::Str(reader) => reader.num_terms(),
             _ => 256,
         }
     }
@@ -1872,9 +1941,9 @@ impl GroupKeyReader {
             return serde_json::Value::Null;
         }
         match self {
-            GroupKeyReader::Str { str_col, .. } => {
+            GroupKeyReader::Str(reader) => {
                 let mut text = String::new();
-                if str_col.ord_to_str(key, &mut text).unwrap_or(false) {
+                if reader.ord_to_str(key, &mut text) {
                     serde_json::Value::String(text)
                 } else {
                     serde_json::Value::Null
@@ -3508,8 +3577,429 @@ impl super::SearchEngine for HotEngine {
         )?))
     }
 
+    fn sql_streaming_batches(
+        &self,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
+        batch_size: usize,
+    ) -> Result<Option<super::SqlStreamingResult>> {
+        if !self.can_stream_sql_batches(columns, needs_score) {
+            return Ok(None);
+        }
+
+        Ok(Some(HotEngine::sql_streaming_batches(
+            self,
+            req,
+            columns,
+            needs_id,
+            needs_score,
+            batch_size,
+        )?))
+    }
+
     fn doc_count(&self) -> u64 {
         self.reader.searcher().num_docs()
+    }
+}
+
+// ─── BitSet Collector ───────────────────────────────────────────────────────
+// Collects ALL matching doc IDs as a bitset per segment.
+// Memory: 1 bit per doc in the segment. 4M docs = 500KB. Trivial.
+// Used for GROUP BY fallback queries that need to see all matches.
+
+/// Per-segment bitset of matched doc IDs.
+struct SegmentBitSet {
+    segment_ord: u32,
+    words: Vec<u64>,
+    max_doc: u32,
+    count: u32,
+}
+
+impl SegmentBitSet {
+    fn new(segment_ord: u32, max_doc: u32) -> Self {
+        let num_words = (max_doc as usize).div_ceil(64);
+        Self {
+            segment_ord,
+            words: vec![0u64; num_words],
+            max_doc,
+            count: 0,
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, doc_id: u32) {
+        let word_idx = (doc_id / 64) as usize;
+        let bit_idx = doc_id % 64;
+        let mask = 1u64 << bit_idx;
+        if self.words[word_idx] & mask == 0 {
+            self.words[word_idx] |= mask;
+            self.count += 1;
+        }
+    }
+
+    /// Iterate all set bit positions.
+    fn iter_set_bits(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().enumerate().flat_map(|(word_idx, &word)| {
+            let base = (word_idx as u32) * 64;
+            BitIter { word, base }
+        })
+    }
+}
+
+/// Iterator over set bits in a single u64 word using trailing-zeros scan.
+struct BitIter {
+    word: u64,
+    base: u32,
+}
+
+impl Iterator for BitIter {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        if self.word == 0 {
+            return None;
+        }
+        let tz = self.word.trailing_zeros();
+        self.word &= self.word - 1; // clear lowest set bit
+        Some(self.base + tz)
+    }
+}
+
+/// Collects matched doc IDs into per-segment bitsets.
+struct BitSetCollector;
+
+struct BitSetSegmentCollector {
+    bitset: SegmentBitSet,
+}
+
+impl tantivy::collector::Collector for BitSetCollector {
+    type Fruit = Vec<SegmentBitSet>;
+    type Child = BitSetSegmentCollector;
+
+    fn for_segment(
+        &self,
+        seg_ord: u32,
+        segment: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(BitSetSegmentCollector {
+            bitset: SegmentBitSet::new(seg_ord, segment.max_doc()),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<SegmentBitSet>,
+    ) -> tantivy::Result<Vec<SegmentBitSet>> {
+        Ok(segment_fruits)
+    }
+}
+
+impl tantivy::collector::SegmentCollector for BitSetSegmentCollector {
+    type Fruit = SegmentBitSet;
+
+    fn collect(&mut self, doc: tantivy::DocId, _score: tantivy::Score) {
+        self.bitset.set(doc);
+    }
+
+    fn harvest(self) -> SegmentBitSet {
+        self.bitset
+    }
+}
+
+// ─── Streaming batch reader ────────────────────────────────────────────────
+// Reads fast-field columns for matched docs (from bitset) and produces
+// Arrow RecordBatches of `batch_size` rows each.
+
+/// Streaming batch size for bitset-based GROUP BY fallback queries.
+const STREAMING_BATCH_SIZE: usize = 8192;
+
+impl HotEngine {
+    /// Streaming is only valid when every requested column is fast-field backed
+    /// on every segment and the query does not require synthetic BM25 `_score`.
+    fn can_stream_sql_batches(&self, columns: &[String], needs_score: bool) -> bool {
+        if needs_score {
+            return false;
+        }
+
+        let searcher = self.reader.searcher();
+        let schema = self.index.schema();
+
+        searcher.segment_readers().iter().all(|segment_reader| {
+            let fast_fields = segment_reader.fast_fields();
+            columns.iter().all(|column| {
+                !matches!(
+                    open_sql_field_reader(&schema, fast_fields, column),
+                    SqlFieldReader::SourceFallback
+                )
+            })
+        })
+    }
+
+    /// Collect ALL matching docs via bitset, read fast-field columns in streaming
+    /// batches. Returns multiple small RecordBatches instead of one giant batch.
+    /// No scan limit — bitset is O(segment_size/8) memory regardless of match count.
+    pub fn sql_streaming_batches(
+        &self,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+        needs_id: bool,
+        _needs_score: bool,
+        batch_size: usize,
+    ) -> Result<super::SqlStreamingResult> {
+        let searcher = self.reader.searcher();
+        let query = self.build_query(&req.query)?;
+
+        // Collect all matching docs as bitsets + total count
+        let (segment_bitsets, total_hits) = searcher.search(&*query, &(BitSetCollector, Count))?;
+
+        let schema = self.index.schema();
+        let segment_readers = searcher.segment_readers();
+
+        // Build the Arrow schema: _id, _score, then user columns
+        let mut arrow_fields = Vec::with_capacity(columns.len() + 2);
+        arrow_fields.push(datafusion::arrow::datatypes::Field::new(
+            "_id",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ));
+        arrow_fields.push(datafusion::arrow::datatypes::Field::new(
+            "_score",
+            datafusion::arrow::datatypes::DataType::Float32,
+            false,
+        ));
+        for col_name in columns {
+            let dt = type_hint_from_schema(&schema, col_name).to_arrow_type();
+            arrow_fields.push(datafusion::arrow::datatypes::Field::new(col_name, dt, true));
+        }
+        let arrow_schema =
+            std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(arrow_fields));
+
+        let mut batches = Vec::new();
+        let batch_size = if batch_size == 0 {
+            STREAMING_BATCH_SIZE
+        } else {
+            batch_size
+        };
+
+        // Process each segment: iterate set bits, read fast fields, produce batches
+        for seg_bitset in &segment_bitsets {
+            if seg_bitset.count == 0 {
+                continue;
+            }
+            let seg_ord = seg_bitset.segment_ord as usize;
+            if seg_ord >= segment_readers.len() {
+                continue;
+            }
+            let seg_reader = &segment_readers[seg_ord];
+            let ff = seg_reader.fast_fields();
+
+            // Open fast-field readers for this segment
+            let field_readers: Vec<SqlFieldReader> = columns
+                .iter()
+                .map(|col_name| open_sql_field_reader(&schema, ff, col_name))
+                .collect();
+
+            // Open _id reader (StrColumn + ordinal Column<u64>) if needed
+            let id_reader = if needs_id {
+                StringFastFieldReader::open(ff, "_id")
+            } else {
+                None
+            };
+
+            // Iterate matched docs in batches
+            let mut id_builder =
+                datafusion::arrow::array::StringBuilder::with_capacity(batch_size, batch_size * 16);
+            let mut score_builder =
+                datafusion::arrow::array::Float32Builder::with_capacity(batch_size);
+            let mut col_builders: Vec<ColumnBuilder> = field_readers
+                .iter()
+                .map(|r| ColumnBuilder::new(r, batch_size))
+                .collect();
+            let mut rows_in_batch = 0usize;
+            let mut id_text = String::new();
+
+            for doc_id in seg_bitset.iter_set_bits() {
+                // Bounds check: bitset may have bits beyond max_doc if segment shrank
+                if doc_id >= seg_bitset.max_doc {
+                    break;
+                }
+
+                // _id
+                if needs_id {
+                    if let Some(ref reader) = id_reader {
+                        if reader.first_text(doc_id, &mut id_text) {
+                            id_builder.append_value(&id_text);
+                        } else {
+                            id_builder.append_value("");
+                        }
+                    } else {
+                        id_builder.append_value("");
+                    }
+                } else {
+                    id_builder.append_value("");
+                }
+
+                // _score: always 0.0 for bitset path (no scoring; can_stream rejects needs_score)
+                score_builder.append_value(0.0);
+
+                // data columns
+                for (i, reader) in field_readers.iter().enumerate() {
+                    col_builders[i].append(reader, doc_id);
+                }
+
+                rows_in_batch += 1;
+                if rows_in_batch >= batch_size {
+                    let batch = self.finalize_streaming_batch(
+                        &arrow_schema,
+                        &mut id_builder,
+                        &mut score_builder,
+                        &mut col_builders,
+                        columns,
+                    )?;
+                    batches.push(batch);
+                    rows_in_batch = 0;
+                }
+            }
+
+            // Flush remaining rows from this segment
+            if rows_in_batch > 0 {
+                let batch = self.finalize_streaming_batch(
+                    &arrow_schema,
+                    &mut id_builder,
+                    &mut score_builder,
+                    &mut col_builders,
+                    columns,
+                )?;
+                batches.push(batch);
+            }
+        }
+
+        // If no matches at all, produce one empty batch with correct schema
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(arrow_schema));
+        }
+
+        Ok(super::SqlStreamingResult {
+            batches,
+            total_hits,
+        })
+    }
+
+    fn finalize_streaming_batch(
+        &self,
+        schema: &std::sync::Arc<datafusion::arrow::datatypes::Schema>,
+        id_builder: &mut datafusion::arrow::array::StringBuilder,
+        score_builder: &mut datafusion::arrow::array::Float32Builder,
+        col_builders: &mut [ColumnBuilder],
+        _columns: &[String],
+    ) -> Result<RecordBatch> {
+        let mut arrays: Vec<datafusion::arrow::array::ArrayRef> =
+            Vec::with_capacity(col_builders.len() + 2);
+        arrays.push(std::sync::Arc::new(id_builder.finish()));
+        arrays.push(std::sync::Arc::new(score_builder.finish()));
+        for builder in col_builders.iter_mut() {
+            arrays.push(builder.finish());
+        }
+        Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+    }
+}
+
+// ─── Column builder helpers for streaming batches ──────────────────────────
+
+enum ColumnBuilder {
+    F64(datafusion::arrow::array::Float64Builder),
+    I64(datafusion::arrow::array::Int64Builder),
+    Str {
+        builder: datafusion::arrow::array::StringBuilder,
+        scratch: String,
+    },
+    Null(datafusion::arrow::array::StringBuilder),
+}
+
+impl ColumnBuilder {
+    fn new(reader: &SqlFieldReader, capacity: usize) -> Self {
+        match reader {
+            SqlFieldReader::F64(_) => ColumnBuilder::F64(
+                datafusion::arrow::array::Float64Builder::with_capacity(capacity),
+            ),
+            SqlFieldReader::I64(_) => ColumnBuilder::I64(
+                datafusion::arrow::array::Int64Builder::with_capacity(capacity),
+            ),
+            SqlFieldReader::Str(_) => ColumnBuilder::Str {
+                builder: datafusion::arrow::array::StringBuilder::with_capacity(
+                    capacity,
+                    capacity * 16,
+                ),
+                scratch: String::new(),
+            },
+            SqlFieldReader::SourceFallback => {
+                ColumnBuilder::Null(datafusion::arrow::array::StringBuilder::new())
+            }
+        }
+    }
+
+    fn append(&mut self, reader: &SqlFieldReader, doc_id: u32) {
+        match (self, reader) {
+            (ColumnBuilder::F64(b), SqlFieldReader::F64(col)) => match col.first(doc_id) {
+                Some(v) => b.append_value(v),
+                None => b.append_null(),
+            },
+            (ColumnBuilder::I64(b), SqlFieldReader::I64(col)) => match col.first(doc_id) {
+                Some(v) => b.append_value(v),
+                None => b.append_null(),
+            },
+            (ColumnBuilder::Str { builder, scratch }, SqlFieldReader::Str(col)) => {
+                if col.first_text(doc_id, scratch) {
+                    builder.append_value(scratch.as_str());
+                } else {
+                    builder.append_null();
+                }
+            }
+            (ColumnBuilder::Null(b), _) => {
+                b.append_null();
+            }
+            // SourceFallback should never reach here — can_stream_sql_batches rejects it.
+            // Type mismatches should also never happen. Panic to surface bugs immediately
+            // instead of silently producing column-length mismatches that crash later.
+            (_, SqlFieldReader::SourceFallback) => {
+                unreachable!(
+                    "SourceFallback column should have been rejected by can_stream_sql_batches"
+                );
+            }
+            (builder, reader) => {
+                unreachable!(
+                    "ColumnBuilder/SqlFieldReader type mismatch: builder={}, reader={}",
+                    builder.type_name(),
+                    reader.type_name(),
+                );
+            }
+        }
+    }
+
+    fn finish(&mut self) -> datafusion::arrow::array::ArrayRef {
+        use std::sync::Arc;
+        match self {
+            ColumnBuilder::F64(b) => Arc::new(b.finish()),
+            ColumnBuilder::I64(b) => Arc::new(b.finish()),
+            ColumnBuilder::Str { builder, .. } => Arc::new(builder.finish()),
+            ColumnBuilder::Null(b) => Arc::new(b.finish()),
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            ColumnBuilder::F64(_) => "F64",
+            ColumnBuilder::I64(_) => "I64",
+            ColumnBuilder::Str { .. } => "Str",
+            ColumnBuilder::Null(_) => "Null",
+        }
     }
 }
 
@@ -6201,6 +6691,196 @@ mod tests {
     }
 
     #[test]
+    fn sql_batch_fast_path_reads_keyword_values_correctly() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document(
+                "doc-alpha",
+                json!({"title": "Widget", "price": 19.99, "category": "gadgets"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "doc-beta",
+                json!({"title": "Sprocket", "price": 5.50, "category": "parts"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "doc-gamma",
+                json!({"title": "Widget", "price": 9.99, "category": "gadgets"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(
+                &req,
+                &["title".to_string(), "category".to_string()],
+                true,
+                false,
+            )
+            .unwrap();
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let title_col = result
+            .batch
+            .column_by_name("title")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let category_col = result
+            .batch
+            .column_by_name("category")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+
+        let mut rows: Vec<(String, String, String)> = (0..result.batch.num_rows())
+            .map(|i| {
+                (
+                    id_col.value(i).to_string(),
+                    title_col.value(i).to_string(),
+                    category_col.value(i).to_string(),
+                )
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("doc-alpha".into(), "Widget".into(), "gadgets".into()),
+                ("doc-beta".into(), "Sprocket".into(), "parts".into()),
+                ("doc-gamma".into(), "Widget".into(), "gadgets".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_batch_fast_path_reorders_ids_with_multi_segment_sort() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document("doc-low", json!({"title": "Low", "price": 10.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine
+            .add_document("doc-high", json!({"title": "High", "price": 30.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine
+            .add_document("doc-mid", json!({"title": "Mid", "price": 20.0}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let mut price_sort = HashMap::new();
+        price_sort.insert(
+            "price".to_string(),
+            crate::search::SortOrder::Direction(crate::search::SortDirection::Desc),
+        );
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![crate::search::SortClause::Field(price_sort)],
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(&req, &["price".to_string()], true, false)
+            .unwrap();
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let price_col = result
+            .batch
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+
+        let rows: Vec<(String, f64)> = (0..result.batch.num_rows())
+            .map(|i| (id_col.value(i).to_string(), price_col.value(i)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("doc-high".into(), 30.0),
+                ("doc-mid".into(), 20.0),
+                ("doc-low".into(), 10.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_batch_fast_path_id_only_query_returns_ids() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document("doc-alpha", json!({"title": "Widget", "price": 19.99}))
+            .unwrap();
+        engine
+            .add_document("doc-beta", json!({"title": "Sprocket", "price": 5.50}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine.sql_record_batch(&req, &[], true, false).unwrap();
+        assert_eq!(result.batch.num_rows(), 2);
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let score_col = result
+            .batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float32Array>()
+            .unwrap();
+
+        let mut ids: Vec<String> = (0..result.batch.num_rows())
+            .map(|i| id_col.value(i).to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["doc-alpha", "doc-beta"]);
+        assert_eq!(score_col.value(0), 0.0);
+        assert_eq!(score_col.value(1), 0.0);
+    }
+
+    #[test]
     fn sql_batch_source_fallback_still_works() {
         let (_dir, engine) = create_typed_engine();
         engine
@@ -6427,7 +7107,7 @@ mod tests {
         assert_eq!(notes, vec!["in stock", "special order"]);
     }
 
-    // ── _id/score skip optimization tests ───────────────────────────────
+    // ── _id/_score skip optimization tests ──────────────────────────────
 
     #[test]
     fn sql_batch_skip_id_and_score_when_not_needed() {
@@ -6470,10 +7150,10 @@ mod tests {
         assert_eq!(id_col.value(0), "");
         assert_eq!(id_col.value(1), "");
 
-        // score column should exist but contain zeros
+        // _score column should exist but contain zeros
         let score_col = result
             .batch
-            .column_by_name("score")
+            .column_by_name("_score")
             .unwrap()
             .as_any()
             .downcast_ref::<datafusion::arrow::array::Float32Array>()
@@ -6528,10 +7208,10 @@ mod tests {
             .unwrap();
         assert_eq!(id_col.value(0), "");
 
-        // score should have real value (> 0)
+        // _score should have real value (> 0)
         let score_col = result
             .batch
-            .column_by_name("score")
+            .column_by_name("_score")
             .unwrap()
             .as_any()
             .downcast_ref::<datafusion::arrow::array::Float32Array>()
@@ -6571,10 +7251,10 @@ mod tests {
             .unwrap();
         assert_eq!(id_col.value(0), "y1");
 
-        // score should be zero
+        // _score should be zero
         let score_col = result
             .batch
-            .column_by_name("score")
+            .column_by_name("_score")
             .unwrap()
             .as_any()
             .downcast_ref::<datafusion::arrow::array::Float32Array>()
@@ -6618,6 +7298,50 @@ mod tests {
             .unwrap();
         for i in 0..100 {
             assert_eq!(id_col.value(i), "");
+        }
+    }
+
+    #[test]
+    fn sql_batch_zero_projection_preserves_row_count_without_needs_score() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document("d1", json!({"title": "Widget", "price": 19.99}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "Gadget", "price": 29.99}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+        };
+        let result = engine.sql_record_batch(&req, &[], false, false).unwrap();
+        assert_eq!(result.batch.num_rows(), 2);
+        assert_eq!(result.batch.num_columns(), 2);
+
+        let id_col = result
+            .batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let score_col = result
+            .batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float32Array>()
+            .unwrap();
+
+        for row in 0..result.batch.num_rows() {
+            assert_eq!(id_col.value(row), "");
+            assert_eq!(score_col.value(row), 0.0);
         }
     }
 
@@ -6955,5 +7679,325 @@ mod tests {
             .unwrap();
         assert_eq!(metric_count(apple, "cnt"), 1025);
         assert_eq!(metric_count(samsung, "cnt"), 1025);
+    }
+
+    // ── BitSet collector + streaming batches ────────────────────────────
+
+    #[test]
+    fn bitset_collector_matches_topdocs_results() {
+        let (_dir, engine) = create_engine();
+        for i in 0..100 {
+            engine
+                .add_document(
+                    &format!("doc-{i}"),
+                    json!({"title": format!("rust post {i}"), "brand": "tech", "price": i as f64}),
+                )
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 200,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        // TopDocs path
+        let single = engine
+            .sql_record_batch(&req, &["brand".into(), "price".into()], false, false)
+            .unwrap();
+        assert_eq!(single.batch.num_rows(), 100);
+
+        // Streaming bitset path
+        let streaming = engine
+            .sql_streaming_batches(&req, &["brand".into(), "price".into()], false, false, 0)
+            .unwrap();
+        let total_rows: usize = streaming.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 100);
+        assert_eq!(streaming.total_hits, 100);
+    }
+
+    #[test]
+    fn bitset_streaming_produces_multiple_batches() {
+        let (_dir, engine) = create_engine();
+        // Insert more than one batch worth of docs (STREAMING_BATCH_SIZE = 8192)
+        for i in 0..100 {
+            engine
+                .add_document(
+                    &format!("doc-{i}"),
+                    json!({"title": format!("item {i}"), "brand": "test", "price": i as f64}),
+                )
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 200,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        // Use tiny batch size to force multiple batches
+        let streaming = engine
+            .sql_streaming_batches(&req, &["brand".into()], false, false, 10)
+            .unwrap();
+        assert!(
+            streaming.batches.len() >= 10,
+            "100 docs with batch_size=10 should produce >=10 batches, got {}",
+            streaming.batches.len()
+        );
+        let total_rows: usize = streaming.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 100);
+    }
+
+    #[test]
+    fn bitset_streaming_empty_result() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("doc-1", json!({"title": "hello", "brand": "test"}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Term(
+                [("title".into(), json!("nonexistent"))]
+                    .into_iter()
+                    .collect(),
+            ),
+            size: 100,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        let streaming = engine
+            .sql_streaming_batches(&req, &["brand".into()], false, false, 0)
+            .unwrap();
+        assert_eq!(streaming.total_hits, 0);
+        assert_eq!(streaming.batches.len(), 1); // one empty batch with correct schema
+        assert_eq!(streaming.batches[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn bitset_streaming_schema_matches_topdocs_schema() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "brand".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "price".into(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        for i in 0..10 {
+            engine
+                .add_document(
+                    &format!("doc-{i}"),
+                    json!({"title": format!("item {i}"), "brand": "test", "price": i as f64}),
+                )
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 100,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let cols = vec!["brand".to_string(), "price".to_string()];
+
+        let single = engine.sql_record_batch(&req, &cols, true, false).unwrap();
+        let streaming = engine
+            .sql_streaming_batches(&req, &cols, true, false, 0)
+            .unwrap();
+
+        // Verify both schemas match: column names, types, and nullability
+        let single_schema = single.batch.schema();
+        let streaming_schema = streaming.batches[0].schema();
+
+        let single_fields: Vec<(&str, &datafusion::arrow::datatypes::DataType, bool)> =
+            single_schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().as_str(), f.data_type(), f.is_nullable()))
+                .collect();
+        let streaming_fields: Vec<(&str, &datafusion::arrow::datatypes::DataType, bool)> =
+            streaming_schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().as_str(), f.data_type(), f.is_nullable()))
+                .collect();
+        assert_eq!(
+            single_fields, streaming_fields,
+            "streaming batch schema (names, types, nullability) must match single-batch schema"
+        );
+    }
+
+    #[test]
+    fn bitset_streaming_with_filtered_query() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document(
+                "doc-1",
+                json!({"title": "rust programming", "brand": "tech"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "doc-2",
+                json!({"title": "python scripting", "brand": "tech"}),
+            )
+            .unwrap();
+        engine
+            .add_document("doc-3", json!({"title": "rust systems", "brand": "infra"}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Match([("title".into(), json!("rust"))].into_iter().collect()),
+            size: 100,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        let streaming = engine
+            .sql_streaming_batches(&req, &["brand".into()], true, false, 0)
+            .unwrap();
+        let total_rows: usize = streaming.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2, "only 2 docs match 'rust'");
+        assert_eq!(streaming.total_hits, 2);
+    }
+
+    #[test]
+    fn bitset_streaming_preserves_ids_and_keyword_values() {
+        let (_dir, engine) = create_typed_engine();
+        engine
+            .add_document(
+                "doc-alpha",
+                json!({"title": "Widget", "price": 19.99, "category": "gadgets"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "doc-beta",
+                json!({"title": "Sprocket", "price": 5.50, "category": "parts"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "doc-gamma",
+                json!({"title": "Widget", "price": 9.99, "category": "gadgets"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        let streaming = engine
+            .sql_streaming_batches(&req, &["title".into(), "category".into()], true, false, 2)
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in &streaming.batches {
+            let id_col = batch
+                .column_by_name("_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .unwrap();
+            let title_col = batch
+                .column_by_name("title")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .unwrap();
+            let category_col = batch
+                .column_by_name("category")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    id_col.value(i).to_string(),
+                    title_col.value(i).to_string(),
+                    category_col.value(i).to_string(),
+                ));
+            }
+        }
+
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("doc-alpha".into(), "Widget".into(), "gadgets".into()),
+                ("doc-beta".into(), "Sprocket".into(), "parts".into()),
+                ("doc-gamma".into(), "Widget".into(), "gadgets".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bitset_streaming_rejected_for_source_fallback_columns() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document(
+                "doc-1",
+                json!({"title": "iphone", "description": "text-only field"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        assert!(
+            !engine.can_stream_sql_batches(&["description".into()], false),
+            "text/source-fallback columns must not use bitset streaming"
+        );
+    }
+
+    #[test]
+    fn bitset_streaming_rejected_when_score_needed() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document(
+                "doc-1",
+                json!({"title": "iphone", "brand": "Apple", "price": 999.0}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        assert!(
+            !engine.can_stream_sql_batches(&["brand".into()], true),
+            "score-dependent queries must stay on the scored path"
+        );
     }
 }

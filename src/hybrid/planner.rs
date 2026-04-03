@@ -11,6 +11,33 @@ use std::collections::{BTreeSet, HashMap};
 const INTERNAL_TABLE_NAME: &str = "matched_rows";
 const SQL_MATCH_LIMIT: usize = 100_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntheticColumn {
+    Id,
+    Score,
+}
+
+impl SyntheticColumn {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Id => "_id",
+            Self::Score => "_score",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "_id" => Some(Self::Id),
+            "_score" => Some(Self::Score),
+            _ => None,
+        }
+    }
+
+    fn matches_name(self, name: &str) -> bool {
+        name == self.name()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMatchPredicate {
     pub field: String,
@@ -108,9 +135,10 @@ pub struct QueryPlan {
     pub limit_pushed_down: bool,
     /// Whether the SQL query references `_id` in any projection, filter, or ordering.
     pub needs_id: bool,
-    /// Whether the SQL query references `score` in any projection, filter, or ordering.
+    /// Whether the SQL query references synthetic `_score` in any projection,
+    /// filter, or ordering.
     pub needs_score: bool,
-    /// When ORDER BY is a single non-score column, capture (field, descending) for
+    /// When ORDER BY is a single non-`_score` column, capture (field, descending) for
     /// fast-field sort pushdown into Tantivy's TopDocs collector.
     pub sort_pushdown: Option<(String, bool)>,
     /// True when the SQL has GROUP BY but it's not handled by the
@@ -248,6 +276,8 @@ impl QueryPlan {
             "Eligible GROUP BY query can execute as shard-local grouped partial aggregation"
         } else if self.selects_all_columns {
             "SELECT * requires _source materialization; fast-field path unavailable"
+        } else if self.has_group_by_fallback {
+            "GROUP BY fallback via fast fields. May use bitset streaming (no scan limit) at runtime if score-free and fully fast-field-backed; otherwise falls back to TopDocs with scan limit."
         } else {
             "All projected columns can be read from Tantivy fast fields"
         };
@@ -460,15 +490,6 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         && group_by_columns.is_empty()
         && (is_order_by_score_only(order_by.as_ref()) || sort_pushdown.is_some());
 
-    // Safety: if no data columns, _id, or score are needed and we're not on the
-    // grouped partial or SELECT * paths, force needs_score so the Arrow batch has
-    // the correct row count.  Edge case: `SELECT 1 FROM ... WHERE text_match(...)`.
-    let needs_score = needs_score
-        || (required_columns.is_empty()
-            && !needs_id
-            && !selects_all_columns
-            && grouped_sql.is_none());
-
     let has_group_by_fallback =
         (!group_by_columns.is_empty() || has_expression_group_by) && grouped_sql.is_none();
 
@@ -572,10 +593,9 @@ fn extract_grouped_sql_plan(
         match &order_by.kind {
             OrderByKind::Expressions(exprs) => {
                 for expr in exprs {
-                    let Some(name) = expr_to_field_name(&expr.expr) else {
-                        return Ok(None);
-                    };
-                    let Some(output_name) = valid_names.get(&name).cloned() else {
+                    let Some(output_name) =
+                        resolve_grouped_output_name(&expr.expr, &valid_names, &metrics)
+                    else {
                         return Ok(None);
                     };
                     order_items.push(SqlOrderBy {
@@ -632,7 +652,7 @@ fn parse_having_filters(
             };
             // Try field/aggregate op value
             if let (Some(name), Some(val)) = (
-                resolve_having_name(left, valid_names, metrics),
+                resolve_grouped_output_name(left, valid_names, metrics),
                 expr_to_f64(right),
             ) {
                 filters.push(HavingFilter {
@@ -645,7 +665,7 @@ fn parse_having_filters(
             // Try value op field/aggregate (flipped)
             if let (Some(val), Some(name)) = (
                 expr_to_f64(left),
-                resolve_having_name(right, valid_names, metrics),
+                resolve_grouped_output_name(right, valid_names, metrics),
             ) {
                 let flipped_op = match having_op {
                     HavingOp::Gt => HavingOp::Lt,
@@ -668,10 +688,9 @@ fn parse_having_filters(
     }
 }
 
-/// Resolve a HAVING expression to its output name.
-/// Tries identifier lookup first (e.g. `HAVING posts > 10`),
-/// then aggregate function matching (e.g. `HAVING COUNT(*) > 10`).
-fn resolve_having_name(
+/// Resolve a grouped-query reference to its output name.
+/// Tries identifier lookup first, then aggregate function matching.
+fn resolve_grouped_output_name(
     expr: &Expr,
     valid_names: &HashMap<String, String>,
     metrics: &[SqlGroupedMetric],
@@ -834,16 +853,16 @@ fn is_order_by_score_only(order_by: Option<&sqlparser::ast::OrderBy>) -> bool {
     match &order_by.kind {
         OrderByKind::Expressions(exprs) => exprs.iter().all(|expr| {
             expr_to_field_name(&expr.expr)
-                .map(|name| name == "score" || name == "_score")
+                .map(|name| SyntheticColumn::Score.matches_name(&name))
                 .unwrap_or(false)
         }),
         OrderByKind::All(_) => false,
     }
 }
 
-/// Extract a single-column ORDER BY on a non-score field for fast-field sort pushdown.
+/// Extract a single-column ORDER BY on a non-`_score` field for fast-field sort pushdown.
 /// Returns `Some((field_name, is_desc))` when the ORDER BY is a single data column
-/// (not `score` or `_score`), enabling Tantivy's `TopDocs::order_by_fast_field()`.
+/// (not synthetic `_score`), enabling Tantivy's `TopDocs::order_by_fast_field()`.
 fn extract_sort_pushdown(order_by: Option<&sqlparser::ast::OrderBy>) -> Option<(String, bool)> {
     let order_by = order_by?;
     let OrderByKind::Expressions(exprs) = &order_by.kind else {
@@ -854,7 +873,7 @@ fn extract_sort_pushdown(order_by: Option<&sqlparser::ast::OrderBy>) -> Option<(
     }
     let expr = &exprs[0];
     let name = expr_to_field_name(&expr.expr)?;
-    if name == "score" || name == "_score" {
+    if SyntheticColumn::Score.matches_name(&name) {
         return None;
     }
     let desc = expr.options.asc == Some(false);
@@ -1190,7 +1209,7 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
         let Some(field) = expr_to_field_name(between_expr) else {
             return Ok(None);
         };
-        if field == "score" || field == "_score" || field == "_id" {
+        if SyntheticColumn::parse(&field).is_some() {
             return Ok(None);
         }
         let (Some(low_val), Some(high_val)) = (expr_to_json_value(low)?, expr_to_json_value(high)?)
@@ -1217,7 +1236,7 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
         let Some(field) = expr_to_field_name(in_expr) else {
             return Ok(None);
         };
-        if field == "score" || field == "_score" || field == "_id" {
+        if SyntheticColumn::parse(&field).is_some() {
             return Ok(None);
         }
         let mut terms = Vec::new();
@@ -1249,7 +1268,7 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
         return Ok(None);
     };
 
-    if field == "score" || field == "_score" || field == "_id" {
+    if SyntheticColumn::parse(&field).is_some() {
         return Ok(None);
     }
 
@@ -1379,49 +1398,139 @@ fn collect_required_columns(
     select: &Select,
     order_by: Option<&sqlparser::ast::OrderBy>,
 ) -> (Vec<String>, bool, bool) {
+    let aliases = collect_select_aliases(select);
     let mut columns = BTreeSet::new();
 
     for item in &select.projection {
         collect_select_item_columns(item, &mut columns);
     }
     if let Some(selection) = &select.selection {
-        collect_expr_columns(selection, &mut columns);
+        collect_expr_columns_alias_aware(selection, &aliases, &mut columns);
     }
     collect_group_by_exprs(select, &mut columns);
+
     if let Some(having) = &select.having {
-        collect_expr_columns(having, &mut columns);
+        collect_expr_columns_alias_aware(having, &aliases, &mut columns);
     }
 
     if let Some(order_by) = order_by {
         match &order_by.kind {
             OrderByKind::Expressions(exprs) => {
                 for expr in exprs {
-                    collect_expr_columns(&expr.expr, &mut columns);
+                    collect_expr_columns_alias_aware(&expr.expr, &aliases, &mut columns);
                 }
             }
             OrderByKind::All(_) => {}
         }
     }
 
-    // Remove computed aliases (e.g., `count(*) AS total`) — these are not
-    // data columns that can be read from storage. ORDER BY or HAVING may
-    // reference them as identifiers, but they are resolved by DataFusion,
-    // not by the fast-field reader.
-    let aliases = collect_select_aliases(select);
-    for alias in &aliases {
-        columns.remove(alias);
-    }
-
     columns.remove(INTERNAL_TABLE_NAME);
 
-    // Detect whether _id and score are actually referenced before removing them
-    let needs_id = columns.contains("_id");
-    let needs_score = columns.contains("score") || columns.contains("_score");
+    // Detect whether `_id` and synthetic `_score` are actually referenced before
+    // removing synthetic columns from required_columns.
+    let needs_id = columns.contains(SyntheticColumn::Id.name());
+    let needs_score = columns.contains(SyntheticColumn::Score.name());
 
-    columns.remove("score");
-    columns.remove("_score");
-    columns.remove("_id");
+    for synthetic in [SyntheticColumn::Score, SyntheticColumn::Id] {
+        columns.remove(synthetic.name());
+    }
     (columns.into_iter().collect(), needs_id, needs_score)
+}
+
+fn collect_expr_columns_alias_aware(
+    expr: &Expr,
+    aliases: &BTreeSet<String>,
+    columns: &mut BTreeSet<String>,
+) {
+    if let Ok(Some(metric)) = parse_grouped_metric(expr, None)
+        && let Some(field) = metric.field
+    {
+        columns.insert(field);
+        return;
+    }
+
+    match expr {
+        Expr::Identifier(ident) => {
+            if !aliases.contains(ident.value.as_str()) {
+                columns.insert(ident.value.clone());
+            }
+        }
+        Expr::CompoundIdentifier(idents) => {
+            if let Some(ident) = idents.last()
+                && !aliases.contains(ident.value.as_str())
+            {
+                columns.insert(ident.value.clone());
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_columns_alias_aware(left, aliases, columns);
+            collect_expr_columns_alias_aware(right, aliases, columns);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr) => collect_expr_columns_alias_aware(expr, aliases, columns),
+        Expr::Between {
+            expr: between_expr,
+            low,
+            high,
+            ..
+        } => {
+            collect_expr_columns_alias_aware(between_expr, aliases, columns);
+            collect_expr_columns_alias_aware(low, aliases, columns);
+            collect_expr_columns_alias_aware(high, aliases, columns);
+        }
+        Expr::InList {
+            expr: in_expr,
+            list,
+            ..
+        } => {
+            collect_expr_columns_alias_aware(in_expr, aliases, columns);
+            for item in list {
+                collect_expr_columns_alias_aware(item, aliases, columns);
+            }
+        }
+        Expr::Function(function) => {
+            if let FunctionArguments::List(list) = &function.args {
+                for arg in &list.args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                            collect_expr_columns_alias_aware(expr, aliases, columns)
+                        }
+                        FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
+                            if let FunctionArgExpr::Expr(expr) = arg {
+                                collect_expr_columns_alias_aware(expr, aliases, columns)
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Expr::Cast { expr, .. } => collect_expr_columns_alias_aware(expr, aliases, columns),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_expr_columns_alias_aware(op, aliases, columns);
+            }
+            for case_when in conditions {
+                collect_expr_columns_alias_aware(&case_when.condition, aliases, columns);
+                collect_expr_columns_alias_aware(&case_when.result, aliases, columns);
+            }
+            if let Some(el) = else_result {
+                collect_expr_columns_alias_aware(el, aliases, columns);
+            }
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            collect_expr_columns_alias_aware(expr, aliases, columns);
+            collect_expr_columns_alias_aware(pattern, aliases, columns);
+        }
+        _ => {}
+    }
 }
 
 /// Returns (plain_column_names, has_expression_group_by).
@@ -1437,7 +1546,7 @@ fn collect_group_by_columns(select: &Select) -> (Vec<String>, bool) {
                 // Expression-based GROUP BY (e.g., LOWER(author), year / 10) must
                 // fall through to DataFusion, which can evaluate them correctly.
                 if let Some(name) = expr_to_field_name(expr) {
-                    if name != "score" && name != "_id" {
+                    if SyntheticColumn::parse(&name).is_none() {
                         columns.insert(name);
                     } else {
                         has_expression = true;
@@ -1572,6 +1681,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn synthetic_column_helper_identifies_internal_fields() {
+        assert_eq!(SyntheticColumn::parse("_id"), Some(SyntheticColumn::Id));
+        assert_eq!(
+            SyntheticColumn::parse("_score"),
+            Some(SyntheticColumn::Score)
+        );
+        assert_eq!(SyntheticColumn::parse("score"), None);
+        assert_eq!(SyntheticColumn::parse("title"), None);
+    }
+
+    #[test]
     fn count_star_only_simple() {
         let plan = plan_sql("idx", "SELECT count(*) AS total FROM \"idx\"").unwrap();
         assert!(plan.is_count_star_only());
@@ -1636,8 +1756,8 @@ mod tests {
     }
 
     #[test]
-    fn select_star_limit_order_by_score_pushes_down() {
-        let plan = plan_sql("idx", "SELECT * FROM \"idx\" ORDER BY score DESC LIMIT 4").unwrap();
+    fn select_star_limit_order_by_underscore_score_pushes_down() {
+        let plan = plan_sql("idx", "SELECT * FROM \"idx\" ORDER BY _score DESC LIMIT 4").unwrap();
         assert!(plan.selects_all_columns);
         assert!(plan.limit_pushed_down);
         assert_eq!(plan.limit, Some(4));
@@ -1732,6 +1852,89 @@ mod tests {
         // "upvotes" pushed; "posts" stays as residual
         assert_eq!(plan.pushed_filters.len(), 1);
         assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn alias_shadowing_real_column_preserves_required_column() {
+        // SELECT LOWER(author) AS author — alias "author" shadows the real
+        // column "author" that LOWER() needs. The planner must NOT strip it.
+        let plan = plan_sql(
+            "idx",
+            "SELECT LOWER(author) AS author, count(*) AS posts, avg(upvotes) AS avg_upvotes \
+             FROM idx WHERE text_match(title, 'rust') \
+             GROUP BY LOWER(author) ORDER BY avg_upvotes DESC LIMIT 20",
+        )
+        .unwrap();
+        assert!(
+            plan.required_columns.contains(&"author".to_string()),
+            "author must survive alias stripping: {:?}",
+            plan.required_columns
+        );
+        assert!(plan.required_columns.contains(&"upvotes".to_string()));
+        assert!(plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn pure_computed_alias_still_stripped() {
+        // count(*) AS total — "total" is purely computed, not a real column.
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS total FROM idx GROUP BY author ORDER BY total DESC",
+        )
+        .unwrap();
+        assert!(
+            !plan.required_columns.contains(&"total".to_string()),
+            "pure alias 'total' should not be in required_columns: {:?}",
+            plan.required_columns
+        );
+        assert!(plan.required_columns.contains(&"author".to_string()));
+    }
+
+    #[test]
+    fn having_aggregate_source_field_survives_alias_shadowing() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS price FROM idx GROUP BY author HAVING AVG(price) > 10 ORDER BY author",
+        )
+        .unwrap();
+        assert!(
+            plan.required_columns.contains(&"price".to_string()),
+            "price must survive alias stripping when only HAVING aggregate expressions reference the real field: {:?}",
+            plan.required_columns
+        );
+        assert!(plan.required_columns.contains(&"author".to_string()));
+    }
+
+    #[test]
+    fn wrapped_having_aggregate_source_field_survives_alias_shadowing() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS price FROM idx GROUP BY author HAVING COALESCE(AVG(price), 0) > 10 ORDER BY author",
+        )
+        .unwrap();
+        assert!(
+            plan.required_columns.contains(&"price".to_string()),
+            "price must survive alias stripping when wrapped HAVING aggregate expressions reference the real field: {:?}",
+            plan.required_columns
+        );
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        assert!(plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn wrapped_order_by_alias_still_stripped() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, count(*) AS total FROM idx GROUP BY author ORDER BY COALESCE(total, 0) DESC",
+        )
+        .unwrap();
+        assert!(
+            !plan.required_columns.contains(&"total".to_string()),
+            "wrapped alias 'total' should not be in required_columns: {:?}",
+            plan.required_columns
+        );
+        assert!(plan.required_columns.contains(&"author".to_string()));
+        assert!(plan.has_group_by_fallback);
     }
 
     // ── HAVING support tests ────────────────────────────────────────────
@@ -1857,6 +2060,26 @@ mod tests {
         assert!(matches!(grouped.having[0].op, super::HavingOp::Gt));
     }
 
+    #[test]
+    fn order_by_aggregate_expr_without_alias_uses_grouped_partials() {
+        let plan = plan_sql(
+            "hackernews",
+            "SELECT author, SUM(upvotes) FROM hackernews WHERE upvotes > 100 GROUP BY author ORDER BY SUM(upvotes) DESC LIMIT 5",
+        )
+        .unwrap();
+
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.metrics.len(), 1);
+        assert_eq!(grouped.metrics[0].field.as_deref(), Some("upvotes"));
+        assert_eq!(grouped.order_by.len(), 1);
+        assert_eq!(
+            grouped.order_by[0].output_name,
+            grouped.metrics[0].output_name
+        );
+        assert!(grouped.order_by[0].desc);
+    }
+
     // ── OR disjunction pushdown tests ──────────────────────────────────
 
     #[test]
@@ -1940,15 +2163,30 @@ mod tests {
     }
 
     #[test]
-    fn or_on_score_not_pushed() {
+    fn or_on_underscore_score_not_pushed() {
         let plan = plan_sql(
             "idx",
-            "SELECT author FROM idx WHERE score > 0.5 OR author = 'pg'",
+            "SELECT author FROM idx WHERE _score > 0.5 OR author = 'pg'",
         )
         .unwrap();
-        // score branch can't be pushed → whole OR stays residual
+        // _score branch can't be pushed → whole OR stays residual
         assert!(plan.pushed_filters.is_empty());
         assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn real_score_field_is_not_treated_as_synthetic() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT title, score FROM idx WHERE score > 10 ORDER BY score DESC LIMIT 5",
+        )
+        .unwrap();
+
+        assert!(plan.required_columns.contains(&"score".to_string()));
+        assert!(!plan.needs_score);
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert_eq!(plan.sort_pushdown, Some(("score".to_string(), true)));
+        assert!(plan.limit_pushed_down);
     }
 
     #[test]
@@ -2037,6 +2275,14 @@ mod tests {
         let plan = plan_sql("idx", "SELECT title FROM idx WHERE _score IN (0.5, 0.6)").unwrap();
         assert!(plan.pushed_filters.is_empty());
         assert!(plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn underscore_id_not_pushed_but_marked_needed() {
+        let plan = plan_sql("idx", "SELECT title FROM idx WHERE _id = 'doc-1'").unwrap();
+        assert!(plan.pushed_filters.is_empty());
+        assert!(plan.has_residual_predicates);
+        assert!(plan.needs_id);
     }
 
     // ── Bug fix: GROUP BY expression falls to DataFusion ────────────
