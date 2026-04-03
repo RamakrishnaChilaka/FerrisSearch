@@ -43,8 +43,8 @@ pub struct ClusterStateMachine {
 - ID: `snap-{last_applied_index}`
 
 ## Raft Config
-- heartbeat_interval: 500ms
-- election_timeout_min: 1500ms, election_timeout_max: 3000ms
+- heartbeat_interval: 1000ms
+- election_timeout_min: 3000ms, election_timeout_max: 6000ms
 
 ## Log Store
 ### DiskLogStore (src/consensus/disk_store.rs) — production

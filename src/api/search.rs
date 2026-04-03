@@ -4,6 +4,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
+use futures::FutureExt;
 use futures::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
@@ -434,6 +435,7 @@ pub async fn explain_sql(
             };
             explain["timings"] = timings;
             explain["execution_mode"] = serde_json::json!(result.execution_mode);
+            explain["streaming_used"] = serde_json::json!(result.streaming_used);
             explain["matched_hits"] = serde_json::json!(result.matched_hits);
             explain["row_count"] = serde_json::json!(result.sql_result.rows.len());
             explain["truncated"] = serde_json::json!(result.truncated);
@@ -458,6 +460,7 @@ struct SqlExecutionResult {
     successful_shards: u32,
     failed_shards: u32,
     execution_mode: &'static str,
+    streaming_used: bool,
     truncated: bool,
     timings: crate::hybrid::SqlTimings,
 }
@@ -571,6 +574,7 @@ async fn execute_sql_query(
             successful_shards,
             failed_shards,
             execution_mode: "count_star_fast",
+            streaming_used: false,
             truncated: false,
             timings: crate::hybrid::SqlTimings {
                 planning_ms,
@@ -639,6 +643,7 @@ async fn execute_sql_query(
             successful_shards: distributed.successful_shards,
             failed_shards: distributed.failed_shards,
             execution_mode: "tantivy_grouped_partials",
+            streaming_used: false,
             truncated: false,
             timings: crate::hybrid::SqlTimings {
                 planning_ms,
@@ -665,26 +670,58 @@ async fn execute_sql_query(
     let direct_sql = if !plan.selects_all_columns {
         let mut batches = Vec::new();
         let mut total_hits = 0usize;
+        let mut collected_hits = 0usize;
         let mut successful_shards = 0u32;
         let mut direct_error: Option<anyhow::Error> = None;
+        let mut used_streaming = false;
+
+        let use_streaming = plan.has_group_by_fallback;
 
         // Dispatch all local shard SQL reads in parallel
-        let sql_futures: Vec<_> = local_shards
-            .iter()
-            .map(|(_shard_id, engine)| {
-                let engine = engine.clone();
-                let req = search_req.clone();
-                let cols = plan.required_columns.clone();
-                let nid = plan.needs_id;
-                let nsc = plan.needs_score;
-                let pools = state.worker_pools.clone();
-                async move {
-                    pools
-                        .spawn_search(move || engine.sql_record_batch(&req, &cols, nid, nsc))
-                        .await
-                }
-            })
-            .collect();
+        let sql_futures: Vec<_> =
+            local_shards
+                .iter()
+                .map(|(_shard_id, engine)| {
+                    let engine = engine.clone();
+                    let req = search_req.clone();
+                    let cols = plan.required_columns.clone();
+                    let nid = plan.needs_id;
+                    let nsc = plan.needs_score;
+                    let pools = state.worker_pools.clone();
+                    if use_streaming {
+                        // Prefer bitset streaming for score-free, fully fast-field-backed
+                        // queries. If a shard needs stored-doc fallback or score, drop back
+                        // to the existing single-batch path for that shard only.
+                        async move {
+                            pools
+                                .spawn_search(move || {
+                                    match engine.sql_streaming_batches(&req, &cols, nid, nsc, 0)? {
+                                        Some(result) => {
+                                            Ok(Some((result.batches, result.total_hits, true)))
+                                        }
+                                        None => engine.sql_record_batch(&req, &cols, nid, nsc).map(
+                                            |opt| opt.map(|r| (vec![r.batch], r.total_hits, false)),
+                                        ),
+                                    }
+                                })
+                                .await
+                        }
+                        .boxed()
+                    } else {
+                        // TopDocs path: existing single-batch collection
+                        async move {
+                            pools
+                                .spawn_search(move || {
+                                    engine.sql_record_batch(&req, &cols, nid, nsc).map(|opt| {
+                                        opt.map(|r| (vec![r.batch], r.total_hits, false))
+                                    })
+                                })
+                                .await
+                        }
+                        .boxed()
+                    }
+                })
+                .collect();
         let sql_results = futures::future::join_all(sql_futures).await;
 
         for batch_result in sql_results {
@@ -692,10 +729,17 @@ async fn execute_sql_query(
                 break;
             }
             match batch_result {
-                Ok(Ok(Some(batch_result))) => {
+                Ok(Ok(Some((shard_batches, hits, streamed)))) => {
                     successful_shards += 1;
-                    total_hits += batch_result.total_hits;
-                    batches.push(batch_result.batch);
+                    total_hits += hits;
+                    collected_hits += shard_batches
+                        .iter()
+                        .map(|batch| batch.num_rows())
+                        .sum::<usize>();
+                    if streamed {
+                        used_streaming = true;
+                    }
+                    batches.extend(shard_batches);
                 }
                 Ok(Ok(None)) => {
                     direct_error = Some(anyhow::anyhow!(
@@ -742,6 +786,7 @@ async fn execute_sql_query(
                     Ok(Ok((batch, hits))) => {
                         successful_shards += 1;
                         total_hits += hits;
+                        collected_hits += batch.num_rows();
                         batches.push(batch);
                     }
                     Ok(Err(e)) => {
@@ -757,7 +802,14 @@ async fn execute_sql_query(
         }
 
         match direct_error {
-            None => Some((batches, total_hits, successful_shards, 0u32)),
+            None => Some((
+                batches,
+                total_hits,
+                collected_hits,
+                used_streaming,
+                successful_shards,
+                0u32,
+            )),
             Some(error) => {
                 tracing::warn!(
                     "Falling back to materialized SQL execution for [{}]: {}",
@@ -774,82 +826,101 @@ async fn execute_sql_query(
 
     // Stage 3: DataFusion SQL execution (or materialized fallback)
     let datafusion_start = Instant::now();
-    let (sql_result, matched_hits, successful_shards, failed_shards, execution_mode) =
-        if let Some((batches, total_hits, successful_shards, failed_shards)) = direct_sql {
-            let sql_result = match crate::hybrid::execute_planned_sql_batches(&plan, batches).await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    return Err(crate::api::error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "sql_execution_exception",
-                        e,
-                    ));
-                }
-            };
-            (
-                sql_result,
-                total_hits,
-                successful_shards,
-                failed_shards,
-                "tantivy_fast_fields",
-            )
-        } else {
-            let distributed = match crate::api::index::execute_distributed_dsl_search(
-                state,
-                index_name,
-                &search_req,
-            )
-            .await
+    let (
+        sql_result,
+        matched_hits,
+        collected_hits,
+        streaming_used,
+        successful_shards,
+        failed_shards,
+        execution_mode,
+    ) = if let Some((
+        batches,
+        total_hits,
+        collected_hits,
+        any_streamed,
+        successful_shards,
+        failed_shards,
+    )) = direct_sql
+    {
+        let sql_result = match crate::hybrid::execute_planned_sql_batches(&plan, batches).await {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sql_execution_exception",
+                    e,
+                ));
+            }
+        };
+        (
+            sql_result,
+            total_hits,
+            collected_hits,
+            any_streamed,
+            successful_shards,
+            failed_shards,
+            "tantivy_fast_fields",
+        )
+    } else {
+        let distributed =
+            match crate::api::index::execute_distributed_dsl_search(state, index_name, &search_req)
+                .await
             {
                 Ok(result) => result,
                 Err(err) => return Err(err),
             };
 
-            let sql_result = match crate::hybrid::execute_planned_sql_with_mappings(
-                &plan,
-                &distributed.all_hits,
-                &metadata.mappings,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    return Err(crate::api::error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "sql_execution_exception",
-                        e,
-                    ));
-                }
-            };
-            (
-                sql_result,
-                distributed.total_hits,
-                distributed.successful_shards,
-                distributed.failed_shards,
-                "materialized_hits_fallback",
-            )
+        let sql_result = match crate::hybrid::execute_planned_sql_with_mappings(
+            &plan,
+            &distributed.all_hits,
+            &metadata.mappings,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sql_execution_exception",
+                    e,
+                ));
+            }
         };
+        (
+            sql_result,
+            distributed.total_hits,
+            distributed.all_hits.len(),
+            false,
+            distributed.successful_shards,
+            distributed.failed_shards,
+            "materialized_hits_fallback",
+        )
+    };
     let datafusion_ms = datafusion_start.elapsed().as_secs_f64() * 1000.0;
 
     let truncated = !plan.limit_pushed_down
         && plan.limit.is_none()
-        && matched_hits > search_req.size
+        && collected_hits < matched_hits
         && execution_mode != "tantivy_grouped_partials";
 
     // GROUP BY over incomplete data produces wrong aggregates — error instead
     // of returning silently incorrect results.
+    // Note: streaming removes the local cap only for score-free queries whose
+    // requested columns are fully fast-field-backed. Local score/stored-doc
+    // fallbacks and the current remote gRPC path still use the scan limit, so
+    // the guard keys off whether we actually collected fewer rows than matched.
     if truncated && plan.has_group_by_fallback {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "group_by_scan_limit_exceeded",
             format!(
-                "GROUP BY query matched {} docs but the scan limit is {}. \
+                "GROUP BY query matched {} docs but only {} were collected. \
                  Results would be incorrect. Narrow the query with filters, \
                  rewrite to use simple GROUP BY columns with count/sum/avg/min/max \
                  for the grouped_partials path, or increase sql_group_by_scan_limit \
-                 in ferrissearch.yml.",
-                matched_hits, search_req.size
+                 (currently {}) in ferrissearch.yml.",
+                matched_hits, collected_hits, state.sql_group_by_scan_limit
             ),
         ));
     }
@@ -866,6 +937,7 @@ async fn execute_sql_query(
         successful_shards,
         failed_shards,
         execution_mode,
+        streaming_used,
         truncated,
         timings: crate::hybrid::SqlTimings {
             planning_ms,
@@ -915,6 +987,7 @@ pub async fn search_sql(
         StatusCode::OK,
         Json(serde_json::json!({
             "execution_mode": result.execution_mode,
+            "streaming_used": result.streaming_used,
             "truncated": result.truncated,
             "planner": planner_metadata_json(&result.plan),
             "_shards": {
@@ -986,6 +1059,7 @@ pub async fn global_sql(
         StatusCode::OK,
         Json(serde_json::json!({
             "execution_mode": result.execution_mode,
+            "streaming_used": result.streaming_used,
             "truncated": result.truncated,
             "planner": planner_metadata_json(&result.plan),
             "_shards": {
@@ -1559,10 +1633,40 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["execution_mode"], "tantivy_fast_fields");
+        assert_eq!(body["streaming_used"], false);
         assert!(body["timings"]["total_ms"].as_f64().unwrap() > 0.0);
         assert_eq!(body["matched_hits"], 3);
         let rows = body["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn search_sql_order_by_aggregate_expr_without_alias_uses_grouped_partials() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = search_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT brand, SUM(price) FROM products WHERE text_match(description, 'iphone') GROUP BY brand ORDER BY SUM(price) DESC LIMIT 2".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["execution_mode"], "tantivy_grouped_partials");
+        assert_eq!(body["matched_hits"], 3);
+
+        let columns = body["columns"].as_array().unwrap();
+        assert_eq!(columns.len(), 2);
+        let metric_column = columns[1].as_str().unwrap().to_string();
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["brand"], json!("Apple"));
+        assert_eq!(rows[0].get(&metric_column), Some(&json!(1898.0)));
+        assert_eq!(rows[1]["brand"], json!("Samsung"));
+        assert_eq!(rows[1].get(&metric_column), Some(&json!(799.0)));
     }
 
     // -------- Tests for global SQL helper functions --------
@@ -1815,7 +1919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expression_group_by_with_tiny_scan_limit_returns_error() {
+    async fn non_streamable_expression_group_by_with_tiny_scan_limit_returns_error() {
         // Set sql_group_by_scan_limit to 1 so even 3 docs triggers the error.
         let (_tmp, mut state) = make_test_app_state("products");
         state.sql_group_by_scan_limit = 1;
@@ -1824,9 +1928,8 @@ mod tests {
             State(state),
             Path("products".to_string()),
             Json(SqlQueryRequest {
-                query:
-                    "SELECT LOWER(brand) AS b, count(*) AS cnt FROM products GROUP BY LOWER(brand)"
-                        .to_string(),
+                query: "SELECT LOWER(description) AS d, count(*) AS cnt FROM products GROUP BY LOWER(description)"
+                    .to_string(),
                 ..Default::default()
             }),
         )
@@ -1839,9 +1942,88 @@ mod tests {
         );
         let reason = body["error"]["reason"].as_str().unwrap();
         assert!(
-            reason.contains("scan limit"),
-            "error should mention scan limit: {reason}"
+            reason.contains("only") && reason.contains("were collected"),
+            "error should mention collected vs matched: {reason}"
         );
+    }
+
+    #[tokio::test]
+    async fn streamable_expression_group_by_ignores_tiny_scan_limit() {
+        let (_tmp, mut state) = make_test_app_state("products");
+        state.sql_group_by_scan_limit = 1;
+
+        let (status, Json(body)) = search_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT LOWER(brand) AS b, count(*) AS cnt FROM products GROUP BY LOWER(brand) ORDER BY b"
+                    .to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["execution_mode"], "tantivy_fast_fields");
+        assert_eq!(body["streaming_used"], true);
+        assert_eq!(body["truncated"], false);
+
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["b"], "apple");
+        assert_eq!(rows[0]["cnt"], 2);
+        assert_eq!(rows[1]["b"], "samsung");
+        assert_eq!(rows[1]["cnt"], 1);
+    }
+
+    #[tokio::test]
+    async fn having_aggregate_source_field_survives_alias_shadowing() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = search_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT brand, count(*) AS price FROM products GROUP BY brand HAVING AVG(price) > 850 ORDER BY brand"
+                    .to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["execution_mode"], "tantivy_fast_fields");
+        assert_eq!(body["streaming_used"], true);
+
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["brand"], "Apple");
+        assert_eq!(rows[0]["price"], 2);
+    }
+
+    #[tokio::test]
+    async fn wrapped_having_aggregate_source_field_survives_alias_shadowing() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = search_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT brand, count(*) AS price FROM products GROUP BY brand HAVING COALESCE(AVG(price), 0) > 850 ORDER BY brand"
+                    .to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["execution_mode"], "tantivy_fast_fields");
+        assert_eq!(body["streaming_used"], true);
+
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["brand"], "Apple");
+        assert_eq!(rows[0]["price"], 2);
     }
 
     #[test]

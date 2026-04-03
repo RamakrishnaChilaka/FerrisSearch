@@ -1,7 +1,10 @@
 use anyhow::Result;
 use ferrissearch::api::{AppState, create_router};
 use ferrissearch::cluster::ClusterManager;
-use ferrissearch::cluster::state::{ClusterState, NodeInfo, NodeRole};
+use ferrissearch::cluster::state::{
+    ClusterState, FieldMapping, FieldType, IndexMetadata, IndexSettings, NodeInfo, NodeRole,
+    ShardRoutingEntry,
+};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::server::create_transport_service;
@@ -20,6 +23,28 @@ struct RestTestHarness {
     base_url: String,
     http_handle: JoinHandle<()>,
     transport_handle: JoinHandle<()>,
+}
+
+struct MultiNodeRestHarness {
+    client: Client,
+    nodes: Vec<MultiNodeRestNode>,
+}
+
+struct MultiNodeRestNode {
+    _temp_dir: TempDir,
+    app_state: AppState,
+    base_url: String,
+    http_handle: JoinHandle<()>,
+    transport_handle: JoinHandle<()>,
+}
+
+struct PendingMultiNodeRestNode {
+    temp_dir: TempDir,
+    node_id: String,
+    http_listener: tokio::net::TcpListener,
+    transport_listener: tokio::net::TcpListener,
+    http_addr: std::net::SocketAddr,
+    transport_addr: std::net::SocketAddr,
 }
 
 impl RestTestHarness {
@@ -188,11 +213,255 @@ impl RestTestHarness {
     }
 }
 
+impl MultiNodeRestHarness {
+    async fn start_three_nodes() -> Result<Self> {
+        let mut pending_nodes = Vec::new();
+        for index in 1..=3 {
+            let temp_dir = tempfile::tempdir()?;
+            let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let http_addr = http_listener.local_addr()?;
+            let transport_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let transport_addr = transport_listener.local_addr()?;
+
+            pending_nodes.push(PendingMultiNodeRestNode {
+                temp_dir,
+                node_id: format!("node-{index}"),
+                http_listener,
+                transport_listener,
+                http_addr,
+                transport_addr,
+            });
+        }
+
+        let all_nodes: Vec<NodeInfo> = pending_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| NodeInfo {
+                id: node.node_id.clone(),
+                name: node.node_id.clone(),
+                host: "127.0.0.1".into(),
+                transport_port: node.transport_addr.port(),
+                http_port: node.http_addr.port(),
+                roles: if index == 0 {
+                    vec![NodeRole::Master, NodeRole::Data]
+                } else {
+                    vec![NodeRole::Data]
+                },
+                raft_node_id: 0,
+            })
+            .collect();
+
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let mut nodes = Vec::new();
+
+        for pending in pending_nodes {
+            let mut cluster_state = ClusterState::new("test-cluster".into());
+            for node in &all_nodes {
+                cluster_state.add_node(node.clone());
+            }
+            cluster_state.master_node = Some("node-1".into());
+
+            let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+            manager.update_state(cluster_state);
+
+            let cluster_manager = Arc::new(manager);
+            let shard_manager = Arc::new(ShardManager::new(
+                pending.temp_dir.path(),
+                Duration::from_secs(60),
+            ));
+            let transport_client = TransportClient::new();
+            let app_state = AppState {
+                cluster_manager: cluster_manager.clone(),
+                shard_manager: shard_manager.clone(),
+                transport_client: transport_client.clone(),
+                local_node_id: pending.node_id.clone(),
+                raft: None,
+                worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
+                sql_group_by_scan_limit: 1_000_000,
+            };
+
+            let transport_service = create_transport_service(
+                cluster_manager,
+                shard_manager,
+                transport_client,
+                pending.node_id.clone(),
+            );
+            let transport_handle = tokio::spawn(async move {
+                let incoming = TcpListenerStream::new(pending.transport_listener);
+                if let Err(error) = tonic::transport::Server::builder()
+                    .add_service(transport_service)
+                    .serve_with_incoming(incoming)
+                    .await
+                {
+                    tracing::error!("Test gRPC transport server failed: {}", error);
+                }
+            });
+
+            let app = create_router(app_state.clone());
+            let http_handle = tokio::spawn(async move {
+                if let Err(error) = axum::serve(pending.http_listener, app).await {
+                    tracing::error!("Test HTTP server failed: {}", error);
+                }
+            });
+
+            nodes.push(MultiNodeRestNode {
+                _temp_dir: pending.temp_dir,
+                app_state,
+                base_url: format!("http://{}", pending.http_addr),
+                http_handle,
+                transport_handle,
+            });
+        }
+
+        let harness = Self { client, nodes };
+        harness.wait_until_ready().await?;
+        Ok(harness)
+    }
+
+    async fn wait_until_ready(&self) -> Result<()> {
+        for node in &self.nodes {
+            let mut ready = false;
+            for _ in 0..50 {
+                if let Ok(response) = self.client.get(format!("{}/", node.base_url)).send().await
+                    && response.status() == StatusCode::OK
+                {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !ready {
+                anyhow::bail!(
+                    "multi-node test HTTP server {} did not become ready in time",
+                    node.base_url
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn post_json(&self, path: &str, body: Value) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.nodes[0].base_url, path))
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json().await?;
+        Ok((status, value))
+    }
+}
+
 impl Drop for RestTestHarness {
     fn drop(&mut self) {
         self.http_handle.abort();
         self.transport_handle.abort();
     }
+}
+
+impl Drop for MultiNodeRestHarness {
+    fn drop(&mut self) {
+        for node in &mut self.nodes {
+            node.http_handle.abort();
+            node.transport_handle.abort();
+        }
+    }
+}
+
+async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarness) -> Result<()> {
+    let mut shard_routing = std::collections::HashMap::new();
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    shard_routing.insert(
+        1,
+        ShardRoutingEntry {
+            primary: "node-2".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    shard_routing.insert(
+        2,
+        ShardRoutingEntry {
+            primary: "node-3".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+
+    let metadata = IndexMetadata {
+        name: "stories".into(),
+        uuid: uuid::Uuid::new_v4().to_string(),
+        number_of_shards: 3,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings: std::collections::HashMap::from([
+            (
+                "upvotes".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Integer,
+                    dimension: None,
+                },
+            ),
+            (
+                "title".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            ),
+        ]),
+        settings: IndexSettings::default(),
+    };
+
+    for node in &harness.nodes {
+        let mut cluster_state = node.app_state.cluster_manager.get_state();
+        cluster_state.add_index(metadata.clone());
+        node.app_state.cluster_manager.update_state(cluster_state);
+    }
+
+    for (shard_id, node) in harness.nodes.iter().enumerate() {
+        node.app_state.shard_manager.open_shard_with_settings(
+            "stories",
+            shard_id as u32,
+            &metadata.mappings,
+            &metadata.settings,
+            &metadata.uuid,
+        )?;
+    }
+
+    let shard_docs = [
+        vec![0_i64, 1_i64, 2_i64],
+        vec![0_i64, 1_i64, 3_i64],
+        vec![0_i64, 2_i64],
+    ];
+
+    for (shard_id, upvotes) in shard_docs.into_iter().enumerate() {
+        let engine = harness.nodes[shard_id]
+            .app_state
+            .shard_manager
+            .get_shard("stories", shard_id as u32)
+            .expect("shard should be open");
+        for (doc_index, value) in upvotes.into_iter().enumerate() {
+            engine.add_document(
+                &format!("doc-{shard_id}-{doc_index}"),
+                json!({
+                    "title": format!("story-{shard_id}-{doc_index}"),
+                    "upvotes": value,
+                }),
+            )?;
+        }
+        engine.refresh()?;
+    }
+
+    Ok(())
 }
 
 async fn create_products_index(harness: &RestTestHarness) -> Result<()> {
@@ -249,6 +518,116 @@ async fn index_product_docs(harness: &RestTestHarness) -> Result<()> {
 async fn create_products_index_and_docs(harness: &RestTestHarness) -> Result<()> {
     create_products_index(harness).await?;
     index_product_docs(harness).await
+}
+
+async fn create_scored_products_index_and_docs(harness: &RestTestHarness) -> Result<()> {
+    create_products_index(harness).await?;
+
+    for (doc_id, payload) in [
+        (
+            "1",
+            json!({
+                "title": "iPhone Ultra",
+                "description": "iphone iphone iphone iphone iphone",
+                "brand": "Apple",
+                "price": 1099.0
+            }),
+        ),
+        (
+            "2",
+            json!({
+                "title": "iPhone Pro",
+                "description": "iphone iphone",
+                "brand": "Apple",
+                "price": 999.0
+            }),
+        ),
+        (
+            "3",
+            json!({
+                "title": "Galaxy",
+                "description": "iphone",
+                "brand": "Samsung",
+                "price": 799.0
+            }),
+        ),
+    ] {
+        let (status, body) = harness
+            .put_json(&format!("/products/_doc/{}?refresh=true", doc_id), payload)
+            .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["_id"], json!(doc_id));
+    }
+
+    Ok(())
+}
+
+async fn create_products_index_with_real_score_and_docs(harness: &RestTestHarness) -> Result<()> {
+    let (status, body) = harness
+        .put_json(
+            "/products",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 100
+                },
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "keyword" },
+                        "description": { "type": "text" },
+                        "brand": { "type": "keyword" },
+                        "price": { "type": "float" },
+                        "score": { "type": "float" }
+                    }
+                }
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["acknowledged"], json!(true));
+
+    for (doc_id, payload) in [
+        (
+            "1",
+            json!({
+                "title": "iPhone Ultra",
+                "description": "iphone iphone iphone iphone iphone",
+                "brand": "Apple",
+                "price": 1099.0,
+                "score": 3.0
+            }),
+        ),
+        (
+            "2",
+            json!({
+                "title": "iPhone Pro",
+                "description": "iphone iphone",
+                "brand": "Apple",
+                "price": 999.0,
+                "score": 100.0
+            }),
+        ),
+        (
+            "3",
+            json!({
+                "title": "Galaxy",
+                "description": "iphone",
+                "brand": "Samsung",
+                "price": 799.0,
+                "score": 50.0
+            }),
+        ),
+    ] {
+        let (status, body) = harness
+            .put_json(&format!("/products/_doc/{}?refresh=true", doc_id), payload)
+            .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["_id"], json!(doc_id));
+    }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -945,10 +1324,177 @@ async fn rest_sql_expression_group_by_uses_fast_fields_fallback() -> Result<()> 
         json!("tantivy_fast_fields"),
         "expression GROUP BY should fall to tantivy_fast_fields, not grouped_partials"
     );
+    assert_eq!(body["streaming_used"], json!(true));
     assert_eq!(body["truncated"], json!(false));
 
     let rows = body["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 2, "should have 2 groups: apple and samsung");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_expression_group_by_with_text_column_preserves_values() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT LOWER(description) AS desc_lower, count(*) AS cnt FROM products WHERE text_match(description, 'iphone') GROUP BY LOWER(description) ORDER BY desc_lower ASC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(body["streaming_used"], json!(false));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(
+        rows.len(),
+        3,
+        "text-valued GROUP BY should keep all 3 groups"
+    );
+
+    let grouped: Vec<(&str, i64)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["desc_lower"]
+                    .as_str()
+                    .expect("group key should be present"),
+                row["cnt"].as_i64().expect("count should be numeric"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        grouped,
+        vec![
+            ("iphone competitor", 1),
+            ("iphone flagship", 1),
+            ("iphone standard", 1),
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_group_by_underscore_score_preserves_distinct_scores() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_scored_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT _score, count(*) AS cnt FROM products WHERE text_match(description, 'iphone') GROUP BY _score ORDER BY _score DESC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(body["streaming_used"], json!(false));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(
+        rows.len(),
+        3,
+        "_score GROUP BY should keep one bucket per hit"
+    );
+
+    let scores: Vec<f64> = rows
+        .iter()
+        .map(|row| row["_score"].as_f64().expect("_score should be numeric"))
+        .collect();
+    assert!(scores[0] > scores[1] && scores[1] > scores[2]);
+    assert!(rows.iter().all(|row| row["cnt"] == json!(1)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_distinguishes_real_score_from_synthetic_underscore_score() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_with_real_score_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT title, score, _score FROM products WHERE text_match(description, 'iphone') ORDER BY _score DESC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(body["streaming_used"], json!(false));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 3);
+
+    let titles: Vec<&str> = rows
+        .iter()
+        .map(|row| row["title"].as_str().expect("title should be string"))
+        .collect();
+    assert_eq!(titles, vec!["iPhone Ultra", "iPhone Pro", "Galaxy"]);
+
+    let real_scores: Vec<f64> = rows
+        .iter()
+        .map(|row| row["score"].as_f64().expect("real score should be numeric"))
+        .collect();
+    assert_eq!(real_scores, vec![3.0, 100.0, 50.0]);
+
+    let relevance_scores: Vec<f64> = rows
+        .iter()
+        .map(|row| row["_score"].as_f64().expect("_score should be numeric"))
+        .collect();
+    assert!(relevance_scores[0] > relevance_scores[1] && relevance_scores[1] > relevance_scores[2]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_distributed_grouped_partials_merge_numeric_keys_across_shards() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/stories/_sql",
+            json!({
+                "query": "SELECT upvotes, count(*) AS cnt FROM stories GROUP BY upvotes ORDER BY upvotes ASC LIMIT 10"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_grouped_partials"));
+    assert_eq!(body["matched_hits"], json!(8));
+    assert_eq!(body["_shards"]["successful"], json!(3));
+    assert_eq!(body["_shards"]["failed"], json!(0));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(
+        rows.len(),
+        4,
+        "numeric group keys must merge into 4 buckets"
+    );
+
+    let grouped: Vec<(i64, i64)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["upvotes"].as_i64().expect("upvotes should be integer"),
+                row["cnt"].as_i64().expect("count should be integer"),
+            )
+        })
+        .collect();
+    assert_eq!(grouped, vec![(0, 3), (1, 2), (2, 2), (3, 1)]);
 
     Ok(())
 }

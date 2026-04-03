@@ -292,6 +292,8 @@ enum WireJsonValue {
     Bool(bool),
     Number(f64),
     String(String),
+    I64(i64),
+    U64(u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,7 +381,15 @@ impl From<&serde_json::Value> for WireJsonValue {
         match value {
             serde_json::Value::Null => Self::Null,
             serde_json::Value::Bool(value) => Self::Bool(*value),
-            serde_json::Value::Number(value) => Self::Number(value.as_f64().unwrap_or(0.0)),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_i64() {
+                    Self::I64(value)
+                } else if let Some(value) = value.as_u64() {
+                    Self::U64(value)
+                } else {
+                    Self::Number(value.as_f64().unwrap_or(0.0))
+                }
+            }
             serde_json::Value::String(value) => Self::String(value.clone()),
             other => Self::String(other.to_string()),
         }
@@ -393,6 +403,8 @@ impl From<WireJsonValue> for serde_json::Value {
             WireJsonValue::Bool(value) => serde_json::Value::Bool(value),
             WireJsonValue::Number(value) => serde_json::Value::from(value),
             WireJsonValue::String(value) => serde_json::Value::String(value),
+            WireJsonValue::I64(value) => serde_json::Value::from(value),
+            WireJsonValue::U64(value) => serde_json::Value::from(value),
         }
     }
 }
@@ -2543,6 +2555,33 @@ mod tests {
     }
 
     #[test]
+    fn grouped_partial_agg_bincode_roundtrip_preserves_integer_group_values() {
+        let partials = HashMap::from([(
+            "sql_grouped".to_string(),
+            PartialAggResult::GroupedMetrics {
+                buckets: vec![GroupedMetricsBucket {
+                    group_values: vec![json!(0), json!(42)],
+                    metrics: HashMap::from([(
+                        "total".to_string(),
+                        GroupedMetricPartial::Count { count: 2 },
+                    )]),
+                }],
+            },
+        )]);
+
+        let bytes = encode_partial_aggs(&partials).unwrap();
+        let decoded = decode_partial_aggs(&bytes).unwrap();
+
+        let PartialAggResult::GroupedMetrics { buckets } = &decoded["sql_grouped"] else {
+            panic!("expected grouped metrics partial");
+        };
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].group_values, vec![json!(0), json!(42)]);
+        assert_eq!(buckets[0].group_values[0].as_i64(), Some(0));
+        assert_eq!(buckets[0].group_values[1].as_i64(), Some(42));
+    }
+
+    #[test]
     fn merge_grouped_metrics_partials_combines_matching_groups() {
         let params = GroupedMetricsAggParams {
             group_by: vec!["brand".into()],
@@ -2621,6 +2660,54 @@ mod tests {
                 assert_eq!(*sum, 1898.0);
             }
             other => panic!("unexpected grouped stats partial: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_grouped_metrics_partials_merges_local_and_remote_integer_groups() {
+        let params = GroupedMetricsAggParams {
+            group_by: vec!["upvotes".into()],
+            metrics: vec![GroupedMetricAgg {
+                output_name: "count".into(),
+                function: GroupedMetricFunction::Count,
+                field: None,
+            }],
+        };
+
+        let local = HashMap::from([(
+            "sql_grouped".to_string(),
+            PartialAggResult::GroupedMetrics {
+                buckets: vec![GroupedMetricsBucket {
+                    group_values: vec![json!(0)],
+                    metrics: HashMap::from([(
+                        "count".to_string(),
+                        GroupedMetricPartial::Count { count: 180 },
+                    )]),
+                }],
+            },
+        )]);
+
+        let remote_source = HashMap::from([(
+            "sql_grouped".to_string(),
+            PartialAggResult::GroupedMetrics {
+                buckets: vec![GroupedMetricsBucket {
+                    group_values: vec![json!(0)],
+                    metrics: HashMap::from([(
+                        "count".to_string(),
+                        GroupedMetricPartial::Count { count: 403 },
+                    )]),
+                }],
+            },
+        )]);
+        let remote = decode_partial_aggs(&encode_partial_aggs(&remote_source).unwrap()).unwrap();
+
+        let merged = merge_grouped_metrics_partials(&[local, remote], "sql_grouped", &params);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].group_values, vec![json!(0)]);
+        match merged[0].metrics.get("count") {
+            Some(GroupedMetricPartial::Count { count }) => assert_eq!(*count, 583),
+            other => panic!("unexpected grouped count partial: {other:?}"),
         }
     }
 

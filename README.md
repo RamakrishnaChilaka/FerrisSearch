@@ -45,6 +45,7 @@ Every response tells you how the query ran:
 ```json
 {
   "execution_mode": "tantivy_grouped_partials",
+  "streaming_used": false,
   "planner": {
     "text_match": {"field": "title", "query": "rust"},
     "pushed_down_filters": [],
@@ -58,7 +59,7 @@ Every response tells you how the query ran:
 
 - **OpenSearch-compatible REST API** — `PUT /{index}`, `POST /_doc`, `GET /_search`, `POST /_bulk`
 - **Hybrid SQL over search results** — `text_match()` + `GROUP BY` + `HAVING` + `ORDER BY` + `LIMIT` in one query
-- **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, `materialized_hits_fallback` — chosen automatically by the planner
+- **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, `materialized_hits_fallback` — chosen automatically by the planner; executed fast-field fallbacks also report `streaming_used` when local bitset streaming runs
 - **Raft consensus** — cluster state via [openraft](https://github.com/datafuselabs/openraft); leader election, linearizable writes, automatic failover, persistent log via [redb](https://github.com/cberner/redb)
 - **Synchronous replication** — primary-replica with ISR tracking over gRPC; writes acknowledged after all in-sync replicas confirm
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) (HNSW); hybrid full-text + vector queries with pre-filtering
@@ -67,7 +68,7 @@ Every response tells you how the query ran:
 - **Dynamic field mapping** — fields are auto-detected and created on first document encounter
 - **Prometheus metrics** — `/_metrics` endpoint with request latencies, search/index counters, SQL mode tracking, cluster gauges, and process stats (CPU, RSS, threads, FDs)
 - **Column cache** — segment-aware Arrow array cache for SQL analytics; configurable memory limit (`column_cache_size_percent`) and selectivity threshold (`column_cache_populate_threshold`); ~1000× speedup on repeated fast-field queries
-- **Interactive SQL console** — `ferris-cli` with colored tables, EXPLAIN ANALYZE visualization, query history
+- **Interactive SQL console** — `ferris-cli` with colored tables, EXPLAIN ANALYZE visualization, query history, `Tab` completion, `\watch`, and `Ctrl-R` reverse search
 - **SQL correctness tests** — [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki) `.slt` files (same framework as DataFusion, CockroachDB, DuckDB)
 
 ## Tech Stack
@@ -149,7 +150,7 @@ Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variable
 | `raft_node_id` | `1` | Unique Raft consensus node ID |
 | `translog_durability` | `request` | WAL fsync mode: `request` (per-write) or `async` (timer) |
 | `translog_sync_interval_ms` | (unset) | Background fsync interval when durability is `async` |
-| `sql_group_by_scan_limit` | `1000000` | Max docs scanned for GROUP BY queries on the fast-fields fallback path (0 = unlimited) |
+| `sql_group_by_scan_limit` | `1000000` | Max docs scanned for GROUP BY fallback queries on the `tantivy_fast_fields` path (0 = unlimited). Flat non-grouped fast-field queries keep their own internal 100K default unless `LIMIT` pushdown applies. |
 | `transport_tls_enabled` | `false` | Enable inter-node gRPC TLS (requires building with `--features transport-tls`) |
 | `transport_tls_cert_file` | (unset) | PEM certificate for the gRPC transport server when TLS is enabled |
 | `transport_tls_key_file` | (unset) | PEM private key for the gRPC transport server when TLS is enabled |
@@ -171,6 +172,8 @@ SQL Query → Hybrid Planner
 
 The planner splits work between Tantivy and DataFusion. For eligible queries, each shard (local and remote) computes partial aggregates on fast-field columns. The coordinator merges the compact partials — no rows are shipped between nodes.
 
+Scan limits are mode-specific, not global. Flat `tantivy_fast_fields` queries still default to an internal 100K match cap unless `LIMIT` pushdown applies. `GROUP BY` queries that fall back to `tantivy_fast_fields` use `sql_group_by_scan_limit` instead (default 1M, `0 = unlimited`), while `tantivy_grouped_partials` scans all matching docs.
+
 ### SQL Features
 
 - `text_match(field, 'query')` — full-text search pushed into Tantivy; multiple top-level `AND`ed `text_match(...)` predicates become multiple search `must` clauses
@@ -178,7 +181,7 @@ The planner splits work between Tantivy and DataFusion. For eligible queries, ea
 - `GROUP BY` with `count(*)`, `sum()`, `avg()`, `min()`, `max()`
 - `HAVING` — post-merge filtering on grouped results
 - `ORDER BY` with `LIMIT` and `OFFSET`
-- `score` as a SQL column
+- `_score` as the synthetic SQL relevance column; mapped `score` remains a normal field
 - `EXPLAIN` and `EXPLAIN ANALYZE` with per-stage timings
 - `SHOW TABLES`, `DESCRIBE <index>`, `SHOW CREATE TABLE <index>`
 - Alias-safe pushdown — `WHERE posts > 10` when `posts` is `count(*) AS posts` correctly stays as a DataFusion residual, never pushed to Tantivy
@@ -451,7 +454,7 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 1. Planner splits: `text_match` + structured filters → Tantivy; `GROUP BY` + aggs → fast-field collectors; residual → DataFusion
 2. Each shard (local and remote) produces compact partial states (not rows)
 3. Coordinator merges partials, applies HAVING, sorts, applies LIMIT/OFFSET
-4. Response includes `execution_mode` and `planner` metadata
+4. Response includes `execution_mode`, `planner`, and runtime flags such as `streaming_used`
 
 ### Thread Pool Isolation
 
@@ -468,13 +471,13 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 820 tests
-cargo test --lib                                # Unit tests (692)
-cargo test --bin ferris-cli                      # CLI tests (40)
+cargo test                                      # All 873 tests
+cargo test --lib                                # Unit tests (726)
+cargo test --bin ferris-cli                      # CLI tests (55)
 cargo test --test consensus_integration          # Raft consensus (30)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (18)
+cargo test --test rest_api_integration           # REST API (22)
 cargo test --test sql_correctness                # SQL correctness (1 test, 163 sqllogictest assertions)
 ```
 
@@ -527,19 +530,21 @@ scripts/           Ingestion and benchmark scripts
 - [x] Dynamic field mapping (auto-detect on first document)
 - [x] Vector search (k-NN via USearch, hybrid with BM25, pre-filtering)
 - [x] Dedicated search/write thread pools (rayon)
-- [x] Interactive SQL console with EXPLAIN visualization
+- [x] Interactive SQL console with EXPLAIN visualization, `Tab` completion, and `\watch`
 - [x] Global `/_sql` with `SHOW TABLES`, `DESCRIBE`, `SHOW CREATE TABLE`
 - [x] sqllogictest correctness suite
 - [x] Prometheus metrics (`/_metrics`) — request latencies, search/index throughput, SQL mode counters, cluster gauges, process stats
 - [x] Column cache — segment-aware Arrow array cache with selectivity-based population, configurable memory limit and populate threshold
 - [x] Multiple `text_match()` predicates — top-level ANDed full-text searches lowered as separate Bool `must` clauses
-- [x] GROUP BY scan limit safety — configurable `sql_group_by_scan_limit` (default 1M) for expression GROUP BY / unsupported aggregates on fast-fields fallback; errors instead of silently wrong results
+- [x] GROUP BY fallback safety — configurable `sql_group_by_scan_limit` (default 1M) for expression GROUP BY / unsupported aggregates, plus guarded local bitset streaming for `_score`-free fully fast-field-backed fallbacks; errors instead of silently wrong results
 - [x] Inter-node gRPC TLS (`--features transport-tls`)
 - [x] CLI truncation warning for capped fast-field queries
 
 ### Planned
 
+- [ ] Semantic binder for SQL planning — introduce a clause-aware bound query IR before capability analysis so aliases, aggregate references, `_id`, and `_score` are resolved semantically; derive `required_columns`, `needs_id`, and `needs_score` from the bound plan instead of raw SQL AST walkers
 - [ ] Streaming fast-field TableProvider — custom DataFusion `TableProvider` reading Tantivy fast fields as streaming Arrow batches (8K rows/batch), eliminating the GROUP BY scan limit entirely
+- [ ] Streaming export / wildcard scan path — support large `SELECT *` and other unbounded result-set queries as block-streamed export-style execution instead of materializing full shard batches on remote nodes and the coordinator
 - [ ] `COUNT(DISTINCT field)`
 - [ ] `_msearch` API (batch searches)
 - [ ] `search_after` cursor-based pagination
@@ -547,6 +552,62 @@ scripts/           Ingestion and benchmark scripts
 - [ ] Snapshot and restore
 - [ ] Index aliases and templates
 - [ ] Parquet sidecar — write Parquet alongside Tantivy segments for 100M+ scale, cross-index joins, external tool integration
+
+#### Same-Index Semijoin / Subquery MVP
+
+Goal: support same-index uncorrelated semijoin queries such as:
+
+```sql
+SELECT title, author, upvotes
+FROM hackernews
+WHERE author IN (
+  SELECT author
+  FROM hackernews
+  GROUP BY author
+  HAVING COUNT(*) > 100
+)
+ORDER BY upvotes DESC
+LIMIT 20;
+```
+
+Initial scope:
+- same-index only
+- uncorrelated subqueries only
+- `IN (SELECT key ...)` only
+- inner query may use `GROUP BY`, `HAVING`, `text_match`, and pushable structured filters
+
+Non-goals for the MVP:
+- correlated subqueries
+- joins
+- CTEs / `WITH`
+- `EXISTS`, `NOT EXISTS`, `ANY`, `ALL`
+- multi-index subqueries
+- general DataFusion `TableProvider` integration
+
+Execution shape for the MVP:
+1. Bind the outer query and detect supported semijoin shape.
+2. Plan and execute the inner query first.
+3. Materialize the qualifying key set at the coordinator.
+4. Lower the outer predicate into the existing hybrid execution path.
+5. Keep unsupported shapes as explicit planning errors.
+
+Task tracker (target: about 1 hour per task):
+
+- [ ] 1. Add planner-side query-shape validation for subqueries and return clear `unsupported_query_shape` errors instead of leaking DataFusion table-resolution failures.
+- [ ] 2. Add regression tests for unsupported shapes: correlated subquery, join, CTE, `EXISTS`, and multi-index subquery.
+- [ ] 3. Introduce a small clause-aware binder layer for identifier resolution in the planner (`Source`, `Synthetic`, `Output`).
+- [ ] 4. Convert `_id` / `_score` detection and `required_columns` extraction to consume bound identifiers instead of raw string walkers.
+- [ ] 5. Convert GROUP BY plain-column eligibility checks to use the binder so expression keys and output aliases bail out cleanly.
+- [ ] 6. Add a bound representation for supported semijoin subqueries: outer key expression + inner query plan + same-index validation.
+- [ ] 7. Implement planner detection for `expr IN (SELECT key FROM same_index ...)` with exactly one projected inner key column.
+- [ ] 8. Validate MVP constraints during planning: same index, uncorrelated inner query, no joins, no `SELECT *`, no unsupported set operations.
+- [ ] 9. Reuse the existing grouped-partials / fast-field planner for the inner subquery so grouped `HAVING` queries stay search-aware.
+- [ ] 10. Add a coordinator-side execution step that runs the inner subquery first and materializes the qualifying key set.
+- [ ] 11. Lower the outer semijoin predicate into the existing hybrid path as a concrete key filter, with cardinality guardrails and a clear overflow error.
+- [ ] 12. Extend `EXPLAIN` / `EXPLAIN ANALYZE` output to show the two-stage semijoin pipeline: inner key build, outer filtered execution.
+- [ ] 13. Add single-node result-correctness coverage for supported semijoin queries, including grouped inner queries with `HAVING` and `text_match`.
+- [ ] 14. Add multi-node integration coverage to ensure remote shard partials and coordinator semijoin lowering produce the same result as single-node execution.
+- [ ] 15. Benchmark the MVP on `hackernews`, document latency/cardinality limits, and decide whether the next phase should be a real FerrisSearch `TableProvider` or additional binder-driven lowering shapes.
 
 ## What's Honestly Missing
 

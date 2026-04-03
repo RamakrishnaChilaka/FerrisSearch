@@ -121,12 +121,18 @@ for agg-only `size=0` requests. When no aggs are requested, `None` adds zero ove
 - Do not modify Tantivy fast-field storage format for hybrid SQL work. Use Tantivy's Rust APIs directly.
 - Direct access patterns already expected in this module:
     - numeric columns: `segment_reader.fast_fields().f64(name)` / `.i64(name)`
-    - keyword columns: `segment_reader.fast_fields().str(name)` with `term_ords(doc)` and `ord_to_str()`
+    - keyword columns: open `StringFastFieldReader` (`StrColumn` + ordinal `Column<u64>`) and use `first()` / `first_vals()` on the ordinal column, then `ord_to_str()`
 - `sql_record_batch(req, columns, needs_id, needs_score)` is the reference pattern for projecting matched docs from fast fields into Arrow without `_source` materialization. It builds `type_hints` from `SqlFieldReader` variants (F64/I64 → `ColumnKind::Float64`, Str → `ColumnKind::Utf8`) and passes them to `build_record_batch_with_hints()` so that zero-result queries still produce correctly-typed Arrow columns instead of defaulting to Utf8.
+- In the flat fast-field path, `_id` should reuse the same per-segment array/take/reorder flow as other string fast fields. Do not keep a separate top-doc-order decode/clone loop for `_id` unless profiling proves the shared path regressed.
+- `sql_streaming_batches(req, columns, needs_id, needs_score, batch_size)` is only valid for `_score`-free queries whose requested columns are fast-field-backed on every segment. If any column resolves to `SourceFallback` or the SQL query needs `_score`, return `None` and let the caller stay on `sql_record_batch()` or the broader fallback path.
+- **`can_stream_sql_batches(columns, needs_score)`** is the eligibility guard on `HotEngine`. Returns `false` if `needs_score` is true or any column on any segment resolves to `SqlFieldReader::SourceFallback`. Called by the `SearchEngine::sql_streaming_batches` impl before delegating to the inner method.
+- **`BitSetCollector`** is a custom `tantivy::collector::Collector` that collects ALL matched doc IDs as a `Vec<SegmentBitSet>`. Each `SegmentBitSet` is a `Vec<u64>` manual bitset (1 bit per doc, ~500KB for 4M docs). The streaming batch reader iterates set bits per segment, reads fast-field columns, and produces Arrow `RecordBatch`es of `STREAMING_BATCH_SIZE` (8192) rows each.
+- **`ColumnBuilder`** is an enum (`F64`/`I64`/`Str`/`Null`) that wraps Arrow builders and appends values from `SqlFieldReader`s. The string variant keeps a reusable scratch buffer so streaming string columns do not allocate a fresh `String` per doc. Catch-all arms use `unreachable!()` to fail loud on type mismatches instead of silently skipping rows.
+- If you touch SQL string fast-field reads (`_id`, keyword projections, selective arrays, or streaming batches), do not reintroduce per-doc `term_ords()` iterators in the hot path; use the shared ordinal reader instead.
 - When `needs_id` is false, `_id` fast-field reads are skipped and the Arrow `_id` column is filled with empty strings.
-- When `needs_score` is false, score collection is skipped and the Arrow `score` column is filled with zeros.
-- The planner detects `needs_id`/`needs_score` by checking whether the SQL query references `_id` or `score`/`_score` in any projection, filter, GROUP BY, or ORDER BY.
-- **Safety rule**: When `required_columns` is empty and neither `_id` nor `score` is referenced (e.g., `SELECT count(*)`), the planner forces `needs_score = true` so the batch has the correct row count. Without this, the Arrow batch would have 0 rows and DataFusion would return `count(*) = 0`.
+- When `needs_score` is false, score collection is skipped and the Arrow `_score` column is filled with zeros.
+- The planner detects `needs_id`/`needs_score` by checking whether the SQL query references `_id` or synthetic `_score` in any projection, filter, GROUP BY, or ORDER BY.
+- Zero-column SQL queries such as `SELECT 1 FROM ...` must still preserve one output row per hit without pretending they need `_score`. Handle that in `sql_record_batch()` directly rather than overloading `needs_score` for row-count preservation.
 - For grouped analytics over matched docs, prefer shard-local partial aggregation from fast fields and merge compact partials at the coordinator.
 - Fall back to `_source` materialization only for fields or expressions that cannot be read from fast fields or stored fields.
 - Tantivy is the preferred execution engine for search-aware work: pushdown, ranking, field reads, and shard-local partial aggregation should stay here.
@@ -240,7 +246,7 @@ When the fast path is eligible (`!needs_stored_doc && !columns.is_empty()`):
 1. Group matched docs by segment ordinal
 2. For each column × segment: check cache hit → on miss, check selectivity threshold → if above threshold, build full array + cache + `take()` → if below threshold, `build_selective_array` (no cache population)
 3. Concatenate per-segment arrays, reorder to match original `top_docs` order
-4. Build `RecordBatch` with `_id`/`score` columns + data columns
+4. Build `RecordBatch` with `_id`/`_score` columns + data columns
 Falls back to per-doc stored-doc reading when any column requires `SourceFallback`.
 
 ## Routing (src/engine/routing.rs)

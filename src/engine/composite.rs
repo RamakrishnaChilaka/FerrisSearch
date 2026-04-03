@@ -435,6 +435,24 @@ impl SearchEngine for CompositeEngine {
         )?))
     }
 
+    fn sql_streaming_batches(
+        &self,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
+        batch_size: usize,
+    ) -> Result<Option<super::SqlStreamingResult>> {
+        <HotEngine as super::SearchEngine>::sql_streaming_batches(
+            &self.text,
+            req,
+            columns,
+            needs_id,
+            needs_score,
+            batch_size,
+        )
+    }
+
     fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<serde_json::Value>> {
         self.search_knn_filtered(field, vector, k, None)
     }

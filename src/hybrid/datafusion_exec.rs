@@ -16,85 +16,51 @@ pub async fn execute_sql_batches(
     plan: &QueryPlan,
     batches: Vec<RecordBatch>,
 ) -> Result<SqlQueryResult> {
-    let schema = if let Some(batch) = batches.first() {
-        batch.schema()
-    } else {
-        Arc::new(Schema::new(vec![
-            datafusion::arrow::datatypes::Field::new(
-                "_id",
-                datafusion::arrow::datatypes::DataType::Utf8,
-                false,
-            ),
-            datafusion::arrow::datatypes::Field::new(
-                "score",
-                datafusion::arrow::datatypes::DataType::Float32,
-                false,
-            ),
-        ]))
-    };
+    // Derive the canonical projected schema from the merged base schema across
+    // ALL incoming batches + plan column ordering. This is deterministic and
+    // independent of batch order, so a broken first batch cannot corrupt the
+    // canonical schema or drop later columns before recovery runs.
+    let base_schema = merge_batch_schemas(&batches)?;
+    let final_schema = project_schema(&base_schema, plan);
 
-    // Unify all batches to the same schema (handles nullability mismatches
-    // between local and Arrow-IPC-deserialized remote batches).
-    let unified: Vec<RecordBatch> = batches
-        .into_iter()
-        .map(|b| {
-            if b.schema() == schema {
-                b
-            } else {
-                let columns: Vec<datafusion::arrow::array::ArrayRef> = schema
-                    .fields()
-                    .iter()
-                    .map(|field| {
-                        if let Some(col) = b.column_by_name(field.name()) {
-                            col.clone()
-                        } else {
-                            datafusion::arrow::array::new_null_array(
-                                field.data_type(),
-                                b.num_rows(),
-                            )
-                        }
-                    })
-                    .collect();
-                RecordBatch::try_new(schema.clone(), columns).unwrap_or(b)
-            }
+    // Keep the incoming batch boundaries so local streaming can reduce peak
+    // memory before DataFusion. Each batch is still projected into SQL column
+    // order to preserve the DataFusion 53 LIMIT workaround.
+    //
+    // If projection produces inconsistent schemas across batches (e.g. remote
+    // Arrow IPC schema drift), fall back to normalizing each batch against
+    // the plan-derived canonical schema.
+    let projected_batches: Vec<RecordBatch> = batches
+        .iter()
+        .map(|batch| {
+            let (projected, _) = project_batch_to_sql_columns(batch, plan);
+            projected
         })
         .collect();
 
-    // Concatenate all batches into a single batch so DataFusion sees one
-    // partition and applies LIMIT/ORDER BY across all shards correctly.
-    let unified_batch = if unified.len() > 1 {
-        match datafusion::arrow::compute::concat_batches(&schema, &unified) {
-            Ok(batch) => batch,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    batch_count = unified.len(),
-                    "concat_batches failed, falling back to separate partitions"
-                );
-                let table = MemTable::try_new(schema.clone(), vec![unified])?;
-                let ctx = SessionContext::new();
-                ctx.register_table("matched_rows", Arc::new(table))?;
-                let dataframe = ctx.sql(&plan.rewritten_sql).await?;
-                let batches = dataframe.collect().await?;
-                let (columns, rows) = record_batches_to_json_rows(&batches)?;
-                return Ok(SqlQueryResult { columns, rows });
-            }
-        }
-    } else if let Some(b) = unified.into_iter().next() {
-        b
+    let normalized_batches = if projected_batches.is_empty() {
+        vec![RecordBatch::new_empty(final_schema.clone())]
     } else {
-        RecordBatch::new_empty(schema.clone())
+        let schemas_consistent = projected_batches.iter().all(|b| b.schema() == final_schema);
+        if !schemas_consistent {
+            tracing::warn!(
+                batch_count = projected_batches.len(),
+                "projected batch schemas differ, normalizing to merged plan-derived schema"
+            );
+        }
+        projected_batches
+            .into_iter()
+            .map(|b| {
+                if b.schema() == final_schema {
+                    Ok(b)
+                } else {
+                    normalize_batch_to_schema(&b, &final_schema)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
     };
 
-    // Work around DataFusion 53 bug: when a SELECT projects columns in a
-    // different order than the table schema, the LIMIT fetch-pushdown into
-    // MemTable's TableScan silently ignores the limit. To avoid this, we
-    // project the RecordBatch down to only the columns referenced in the SQL
-    // (in schema order) so that DataFusion's projection is either identity
-    // or a simple prefix — preventing the reorder that triggers the bug.
-    let (table_batch, table_schema) = project_batch_to_sql_columns(&unified_batch, plan);
-
-    let table = MemTable::try_new(table_schema, vec![vec![table_batch]])?;
+    let table = MemTable::try_new(final_schema, vec![normalized_batches])?;
     let ctx = SessionContext::new();
     ctx.register_table("matched_rows", Arc::new(table))?;
     let dataframe = ctx.sql(&plan.rewritten_sql).await?;
@@ -166,6 +132,156 @@ fn project_batch_to_sql_columns(
     }
 }
 
+fn default_sql_batch_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new(
+            "_id",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        ),
+        datafusion::arrow::datatypes::Field::new(
+            "_score",
+            datafusion::arrow::datatypes::DataType::Float32,
+            false,
+        ),
+    ]))
+}
+
+fn merge_batch_schemas(batches: &[RecordBatch]) -> Result<Arc<Schema>> {
+    if batches.is_empty() {
+        return Ok(default_sql_batch_schema());
+    }
+
+    let mut merged_fields: Vec<datafusion::arrow::datatypes::Field> = Vec::new();
+    let mut field_positions = std::collections::HashMap::<String, usize>::new();
+
+    for batch in batches {
+        for field in batch.schema().fields() {
+            let field = field.as_ref();
+            if let Some(&idx) = field_positions.get(field.name().as_str()) {
+                merged_fields[idx] = merge_fields(&merged_fields[idx], field)?;
+            } else {
+                field_positions.insert(field.name().to_string(), merged_fields.len());
+                merged_fields.push(field.clone());
+            }
+        }
+    }
+
+    Ok(Arc::new(Schema::new(merged_fields)))
+}
+
+fn merge_fields(
+    left: &datafusion::arrow::datatypes::Field,
+    right: &datafusion::arrow::datatypes::Field,
+) -> Result<datafusion::arrow::datatypes::Field> {
+    if left.name() != right.name() {
+        return Err(anyhow::anyhow!(
+            "cannot merge different columns: '{}' vs '{}'",
+            left.name(),
+            right.name()
+        ));
+    }
+
+    let merged_type = merge_data_types(left.data_type(), right.data_type()).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot merge schemas for column '{}': {}",
+            left.name(),
+            error
+        )
+    })?;
+
+    Ok(datafusion::arrow::datatypes::Field::new(
+        left.name(),
+        merged_type,
+        left.is_nullable() || right.is_nullable(),
+    ))
+}
+
+fn merge_data_types(
+    left: &datafusion::arrow::datatypes::DataType,
+    right: &datafusion::arrow::datatypes::DataType,
+) -> Result<datafusion::arrow::datatypes::DataType> {
+    use datafusion::arrow::datatypes::DataType;
+
+    if left == right {
+        return Ok(left.clone());
+    }
+
+    let merged = match (left, right) {
+        (DataType::Null, other) | (other, DataType::Null) => other.clone(),
+        (DataType::Utf8, DataType::LargeUtf8) | (DataType::LargeUtf8, DataType::Utf8) => {
+            DataType::LargeUtf8
+        }
+        (DataType::Float64, DataType::Float32)
+        | (DataType::Float32, DataType::Float64)
+        | (DataType::Float64, DataType::Int64)
+        | (DataType::Int64, DataType::Float64)
+        | (DataType::Float64, DataType::UInt64)
+        | (DataType::UInt64, DataType::Float64)
+        | (DataType::Float64, DataType::Int32)
+        | (DataType::Int32, DataType::Float64)
+        | (DataType::Float64, DataType::UInt32)
+        | (DataType::UInt32, DataType::Float64)
+        | (DataType::Float32, DataType::Int64)
+        | (DataType::Int64, DataType::Float32)
+        | (DataType::Float32, DataType::UInt64)
+        | (DataType::UInt64, DataType::Float32)
+        | (DataType::Float32, DataType::Int32)
+        | (DataType::Int32, DataType::Float32)
+        | (DataType::Float32, DataType::UInt32)
+        | (DataType::UInt32, DataType::Float32)
+        | (DataType::Int64, DataType::UInt64)
+        | (DataType::UInt64, DataType::Int64) => DataType::Float64,
+        (DataType::Int64, DataType::Int32)
+        | (DataType::Int32, DataType::Int64)
+        | (DataType::Int64, DataType::UInt32)
+        | (DataType::UInt32, DataType::Int64) => DataType::Int64,
+        (DataType::UInt64, DataType::UInt32) | (DataType::UInt32, DataType::UInt64) => {
+            DataType::UInt64
+        }
+        (DataType::Int32, DataType::UInt32) | (DataType::UInt32, DataType::Int32) => {
+            DataType::Int64
+        }
+        (DataType::Utf8, other) | (other, DataType::Utf8)
+            if matches!(
+                other,
+                DataType::Boolean
+                    | DataType::Float64
+                    | DataType::Float32
+                    | DataType::Int64
+                    | DataType::Int32
+                    | DataType::UInt64
+                    | DataType::UInt32
+            ) =>
+        {
+            other.clone()
+        }
+        (DataType::LargeUtf8, other) | (other, DataType::LargeUtf8)
+            if matches!(
+                other,
+                DataType::Boolean
+                    | DataType::Float64
+                    | DataType::Float32
+                    | DataType::Int64
+                    | DataType::Int32
+                    | DataType::UInt64
+                    | DataType::UInt32
+            ) =>
+        {
+            other.clone()
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported type merge {:?} vs {:?}",
+                left,
+                right
+            ));
+        }
+    };
+
+    Ok(merged)
+}
+
 fn referenced_columns_from_plan(plan: &QueryPlan) -> std::collections::HashSet<String> {
     let mut names: std::collections::HashSet<String> =
         plan.required_columns.iter().cloned().collect();
@@ -173,7 +289,7 @@ fn referenced_columns_from_plan(plan: &QueryPlan) -> std::collections::HashSet<S
         names.insert("_id".to_string());
     }
     if plan.needs_score {
-        names.insert("score".to_string());
+        names.insert("_score".to_string());
     }
     names
 }
@@ -221,6 +337,100 @@ fn expr_to_simple_name(expr: &sqlparser::ast::Expr) -> Option<String> {
     }
 }
 
+/// Derive the canonical projected schema from the unified base schema and SQL
+/// column ordering, without depending on any particular batch. This ensures
+/// `final_schema` is always deterministic and plan-driven.
+fn project_schema(schema: &Arc<Schema>, plan: &QueryPlan) -> Arc<Schema> {
+    let select_order = extract_select_column_order(&plan.rewritten_sql);
+    if select_order.is_empty() {
+        return schema.clone();
+    }
+
+    let mut ordered_indices: Vec<usize> = Vec::new();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+    for col_name in &select_order {
+        if let Some(idx) = field_names.iter().position(|&n| n == col_name)
+            && !ordered_indices.contains(&idx)
+        {
+            ordered_indices.push(idx);
+        }
+    }
+
+    let referenced_columns = referenced_columns_from_plan(plan);
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if referenced_columns.contains(field.name().as_str()) && !ordered_indices.contains(&idx) {
+            ordered_indices.push(idx);
+        }
+    }
+
+    if ordered_indices.is_empty()
+        || (ordered_indices.len() == schema.fields().len()
+            && ordered_indices.iter().enumerate().all(|(i, &v)| i == v))
+    {
+        return schema.clone();
+    }
+
+    let new_fields: Vec<_> = ordered_indices
+        .iter()
+        .map(|&i| schema.field(i).clone())
+        .collect();
+    Arc::new(Schema::new(new_fields))
+}
+
+/// Normalize a batch to the target schema by picking columns by name and
+/// strictly casting compatible types. Missing columns are filled with nulls.
+/// Returns an error if a column exists but cannot be cast, so shard data is
+/// never silently dropped.
+fn normalize_batch_to_schema(batch: &RecordBatch, target: &Arc<Schema>) -> Result<RecordBatch> {
+    let cols: Vec<datafusion::arrow::array::ArrayRef> = target
+        .fields()
+        .iter()
+        .map(|field| {
+            if let Some(col) = batch.column_by_name(field.name()) {
+                if col.data_type() == field.data_type() {
+                    Ok(col.clone())
+                } else {
+                    cast_array_strict(col, field.data_type(), field.name())
+                }
+            } else {
+                Ok(datafusion::arrow::array::new_null_array(
+                    field.data_type(),
+                    batch.num_rows(),
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(target.clone(), cols)?)
+}
+
+fn cast_array_strict(
+    col: &datafusion::arrow::array::ArrayRef,
+    target_type: &datafusion::arrow::datatypes::DataType,
+    column_name: &str,
+) -> Result<datafusion::arrow::array::ArrayRef> {
+    let casted = datafusion::arrow::compute::cast(col, target_type).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot cast column '{}' from {:?} to {:?}: {}",
+            column_name,
+            col.data_type(),
+            target_type,
+            e
+        )
+    })?;
+
+    if casted.null_count() > col.null_count() {
+        return Err(anyhow::anyhow!(
+            "cannot cast column '{}' from {:?} to {:?} without losing non-null values",
+            column_name,
+            col.data_type(),
+            target_type
+        ));
+    }
+
+    Ok(casted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,7 +442,7 @@ mod tests {
     fn make_test_batch(n: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("price", DataType::Float64, true),
         ]));
@@ -268,7 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datafusion_limit_applied_on_concatenated_batches() {
+    async fn datafusion_limit_applied_on_multiple_batches() {
         let b1 = make_test_batch(10);
         let b2 = make_test_batch(10);
         let b3 = make_test_batch(10);
@@ -285,11 +495,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datafusion_limit_with_skip_id_score() {
-        // Simulate needs_id=false, needs_score=false: _id is empty, score is 0
+    async fn datafusion_reverse_order_limit_applied_on_multiple_batches() {
+        let b1 = make_test_batch(10);
+        let b2 = make_test_batch(10);
+        let b3 = make_test_batch(10);
+        let plan = super::super::planner::plan_sql("test", "SELECT price, name FROM test LIMIT 7")
+            .unwrap();
+        let result = execute_sql_batches(&plan, vec![b1, b2, b3]).await.unwrap();
+        assert_eq!(result.rows.len(), 7);
+        assert!(result.rows[0].get("price").is_some());
+        assert!(result.rows[0].get("name").is_some());
+    }
+
+    #[tokio::test]
+    async fn datafusion_select_literal_keeps_one_row_per_input_row_without_score_reference() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["", "", ""])),
+                Arc::new(datafusion::arrow::array::Float32Array::from(vec![
+                    0.0f32;
+                    3
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let plan = super::super::planner::plan_sql("test", "SELECT 1 AS one FROM test").unwrap();
+        assert!(!plan.needs_score);
+
+        let result = execute_sql_batches(&plan, vec![batch]).await.unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0]["one"], json!(1));
+        assert_eq!(result.rows[1]["one"], json!(1));
+        assert_eq!(result.rows[2]["one"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn datafusion_limit_with_skip_id_score() {
+        // Simulate needs_id=false, needs_score=false: _id is empty, _score is 0
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("category", DataType::Utf8, true),
             Field::new("amount", DataType::Float64, true),
         ]));
@@ -330,7 +581,7 @@ mod tests {
         // Simulate distributed path: build batches, IPC serialize, deserialize, then run SQL
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("val", DataType::Float64, true),
         ]));
@@ -463,7 +714,7 @@ mod tests {
         // (project_batch_to_sql_columns) correctly handles reverse-order SELECT.
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("base_passenger_fare", DataType::Float64, true),
             Field::new("hvfhs_license_num", DataType::Utf8, true),
         ]));
@@ -561,7 +812,7 @@ mod tests {
     async fn datafusion_limit_offset_with_projection_order_different_from_schema() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("base_passenger_fare", DataType::Float64, true),
             Field::new("hvfhs_license_num", DataType::Utf8, true),
         ]));
@@ -840,10 +1091,10 @@ mod tests {
         let plan = super::super::planner::plan_sql("test", "SELECT col_c, col_b FROM test LIMIT 7")
             .unwrap();
         // Re-create batch with proper schema for execute_sql_batches
-        // (it expects _id and score columns)
+        // (it expects _id and _score columns)
         let workaround_schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("col_b", DataType::Float64, true),
             Field::new("col_c", DataType::Utf8, true),
         ]));
@@ -881,7 +1132,7 @@ mod tests {
     fn project_batch_to_sql_columns_reorders_correctly() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("fare", DataType::Float64, true),
             Field::new("lic", DataType::Utf8, true),
         ]));
@@ -901,7 +1152,7 @@ mod tests {
             super::super::planner::plan_sql("test", "SELECT lic, fare FROM test LIMIT 5").unwrap();
         let (projected, new_schema) = project_batch_to_sql_columns(&batch, &plan);
 
-        // Should have columns in SELECT order: lic, fare (not _id, score)
+        // Should have columns in SELECT order: lic, fare (not _id, _score)
         assert_eq!(new_schema.fields().len(), 2);
         assert_eq!(new_schema.field(0).name(), "lic");
         assert_eq!(new_schema.field(1).name(), "fare");
@@ -912,7 +1163,7 @@ mod tests {
     fn project_batch_to_sql_columns_includes_order_by_columns() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("fare", DataType::Float64, true),
             Field::new("lic", DataType::Utf8, true),
         ]));
@@ -967,7 +1218,7 @@ mod tests {
     fn project_batch_to_sql_columns_keeps_case_dependencies() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("author", DataType::Utf8, true),
             Field::new("upvotes", DataType::Float64, true),
         ]));
@@ -998,7 +1249,7 @@ mod tests {
     async fn execute_sql_batches_handles_case_aggregate_dependencies() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Utf8, false),
-            Field::new("score", DataType::Float32, false),
+            Field::new("_score", DataType::Float32, false),
             Field::new("author", DataType::Utf8, true),
             Field::new("upvotes", DataType::Float64, true),
         ]));
@@ -1034,5 +1285,165 @@ mod tests {
         assert_eq!(result.rows[0]["avg_nonviral"], json!(125.0));
         assert_eq!(result.rows[1]["author"], json!("alice"));
         assert_eq!(result.rows[1]["avg_nonviral"], json!(100.0));
+    }
+
+    // ── Schema-drift tests ──────────────────────────────────────────────
+
+    /// Make a batch with the same column names but a different type for `price`.
+    fn make_drifted_batch(n: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Utf8, true), // Utf8 instead of Float64
+        ]));
+        let ids: Vec<String> = (0..n).map(|i| format!("id-{}", i)).collect();
+        let scores: Vec<f32> = vec![1.0f32; n];
+        let names: Vec<String> = (0..n).map(|i| format!("item-{}", i)).collect();
+        let prices: Vec<String> = (0..n).map(|i| format!("{}", i as f64 * 10.0)).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(datafusion::arrow::array::Float32Array::from(scores)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(prices)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_uncastable_drifted_batch(n: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Utf8, true),
+        ]));
+        let ids: Vec<String> = (0..n).map(|i| format!("bad-{}", i)).collect();
+        let scores: Vec<f32> = vec![1.0f32; n];
+        let names: Vec<String> = (0..n).map(|i| format!("broken-{}", i)).collect();
+        let prices: Vec<String> = (0..n).map(|i| format!("not-a-number-{}", i)).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(datafusion::arrow::array::Float32Array::from(scores)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(prices)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn schema_drift_uses_first_batch_schema_and_casts_others() {
+        // Finding 2 regression: canonical schema must come from the plan/unified
+        // schema, not from whichever batch is first. Here the first batch has
+        // the correct Float64 type for price.
+        let good = make_test_batch(5);
+        let drifted = make_drifted_batch(5);
+
+        let plan = super::super::planner::plan_sql("test", "SELECT name, price FROM test LIMIT 10")
+            .unwrap();
+        let result = execute_sql_batches(&plan, vec![good, drifted])
+            .await
+            .unwrap();
+        // All 10 rows must be present — the drifted batch is cast, not dropped
+        assert_eq!(
+            result.rows.len(),
+            10,
+            "schema-drift normalization must preserve all rows, got {}",
+            result.rows.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_drift_first_batch_drifted_still_uses_correct_schema() {
+        // Finding 2 regression: even when the FIRST batch is the broken one,
+        // the plan-derived canonical schema should still produce the correct
+        // Float64 type for price.
+        let drifted = make_drifted_batch(5);
+        let good = make_test_batch(5);
+
+        let plan = super::super::planner::plan_sql("test", "SELECT name, price FROM test LIMIT 10")
+            .unwrap();
+        let result = execute_sql_batches(&plan, vec![drifted, good])
+            .await
+            .unwrap();
+        // All 10 rows must be present
+        assert_eq!(
+            result.rows.len(),
+            10,
+            "drifted-first normalization must preserve all rows, got {}",
+            result.rows.len()
+        );
+        assert!(
+            result.rows.iter().all(|row| row["price"].is_number()),
+            "drifted-first recovery must restore numeric price type"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_drift_first_batch_missing_column_still_preserves_later_column() {
+        // A batch that's entirely missing the "price" column
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, false),
+            Field::new("name", DataType::Utf8, true),
+            // no "price" column
+        ]));
+        let batch_missing = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x1", "x2"])),
+                Arc::new(datafusion::arrow::array::Float32Array::from(vec![
+                    0.0f32;
+                    2
+                ])),
+                Arc::new(StringArray::from(vec!["missing-1", "missing-2"])),
+            ],
+        )
+        .unwrap();
+
+        let good = make_test_batch(3);
+        let plan = super::super::planner::plan_sql("test", "SELECT name, price FROM test").unwrap();
+        let result = execute_sql_batches(&plan, vec![batch_missing, good])
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 5, "both batches' rows must be present");
+        let null_prices = result
+            .rows
+            .iter()
+            .filter(|row| row["price"].is_null())
+            .count();
+        let numeric_prices = result
+            .rows
+            .iter()
+            .filter(|row| row["price"].is_number())
+            .count();
+        assert_eq!(
+            null_prices, 2,
+            "missing-column rows should have null prices"
+        );
+        assert_eq!(
+            numeric_prices, 3,
+            "later batch values must survive even when the first batch lacks the column"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_drift_first_batch_uncastable_returns_error() {
+        let drifted = make_uncastable_drifted_batch(2);
+        let good = make_test_batch(3);
+        let plan = super::super::planner::plan_sql("test", "SELECT name, price FROM test").unwrap();
+
+        let error = execute_sql_batches(&plan, vec![drifted, good])
+            .await
+            .expect_err("uncastable schema drift must return an error");
+        assert!(
+            error.to_string().contains("cannot cast column 'price'"),
+            "unexpected error: {error}"
+        );
     }
 }

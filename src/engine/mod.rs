@@ -15,6 +15,11 @@ pub struct SqlBatchResult {
     pub total_hits: usize,
 }
 
+pub struct SqlStreamingResult {
+    pub batches: Vec<RecordBatch>,
+    pub total_hits: usize,
+}
+
 /// Trait abstracting a search engine backend.
 /// Each shard/split is backed by one `SearchEngine` implementation.
 /// Implementations handle both text and vector indexing/search.
@@ -100,6 +105,21 @@ pub trait SearchEngine: Send + Sync {
         _needs_id: bool,
         _needs_score: bool,
     ) -> Result<Option<SqlBatchResult>> {
+        Ok(None)
+    }
+
+    /// Build multiple smaller RecordBatches from local Tantivy columns using bitset
+    /// collection instead of TopDocs. Collects ALL matching docs (no scan limit),
+    /// produces batches of `batch_size` rows for streaming DataFusion execution.
+    /// Used for GROUP BY fallback queries where the TopDocs cap would produce wrong results.
+    fn sql_streaming_batches(
+        &self,
+        _req: &crate::search::SearchRequest,
+        _columns: &[String],
+        _needs_id: bool,
+        _needs_score: bool,
+        _batch_size: usize,
+    ) -> Result<Option<SqlStreamingResult>> {
         Ok(None)
     }
 

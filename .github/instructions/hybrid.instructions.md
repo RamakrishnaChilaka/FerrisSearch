@@ -23,25 +23,29 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 ## Stored Fields Optimization (sql_record_batch)
 - When all requested SQL columns have fast-field readers (no `SourceFallback`), `sql_record_batch` reads `_id` from its fast-field column and skips `searcher.doc()` entirely.
 - This avoids loading the full stored document (which includes the `_source` JSON blob) from disk for every hit in the SQL fast-field execution path.
+- When `_id` is requested and no stored docs are needed, the flat fast-field path should project `_id` through the same per-segment Arrow array builder and reorder flow as ordinary string fast fields rather than building a separate top-doc-order `Vec<String>`.
 - When any column requires `SourceFallback` (unmapped or non-fast field), the stored doc is loaded as before and `_id` is read from it.
 - The `needs_stored_doc` flag is computed once per query by scanning all field plans for `SourceFallback`.
 
-## _id/score Skip Optimization
-- `QueryPlan` has `needs_id: bool` and `needs_score: bool` flags, detected by checking whether the SQL query references `_id` or `score`/`_score` in any projection, filter, GROUP BY, or ORDER BY.
+## _id/_score Skip Optimization
+- `QueryPlan` has `needs_id: bool` and `needs_score: bool` flags, detected by checking whether the SQL query references `_id` or synthetic `_score` in any projection, filter, GROUP BY, or ORDER BY.
+- Planner-side synthetic column classification should go through one internal helper/enum instead of repeated raw string comparisons, so `_id` / `_score` exclusions stay aligned across pushdown guards, required-column extraction, and GROUP BY eligibility checks.
 - When `needs_id` is false, the engine skips reading `_id` from fast-field columns entirely and the Arrow bridge emits an empty-string `_id` column.
-- When `needs_score` is false, the engine skips collecting scores and the Arrow bridge emits a zero-filled `score` column.
-- The DataFusion table schema always includes `_id` and `score` columns for compatibility, but they contain dummy values when not referenced.
+- When `required_columns` is empty but `_id` and/or `_score` are requested, the engine may still stay on the fast path as long as no stored-doc fallback is required.
+- When `needs_score` is false, the engine skips collecting scores and the Arrow bridge emits a zero-filled `_score` column.
+- The DataFusion table schema always includes `_id` and `_score` columns for compatibility, but they contain dummy values when not referenced.
 - Typical SQL queries like `SELECT category, avg(price) FROM ... GROUP BY category` benefit from this: zero `_id` reads across all matched docs.
-- **Safety rule**: When `required_columns` is empty, `_id`/`score` are unreferenced, and the query is not grouped or `SELECT *`, `needs_score` is forced true as a fallback for edge cases like `SELECT 1 FROM ...`.
+- Zero-column queries such as `SELECT 1 FROM ... WHERE text_match(...)` should not fake a `_score` dependency. `sql_record_batch()` must still preserve one output row per hit when `required_columns` is empty and neither `_id` nor `_score` is referenced.
 
 ## Ungrouped Aggregate Pushdown
 - SQL queries with only aggregate functions (no GROUP BY) now use the `tantivy_grouped_partials` execution path with zero group-by columns.
 
 ## Scan Limits and GROUP BY Correctness
-- **Flat queries** (no GROUP BY): `SQL_MATCH_LIMIT = 100_000` caps `TopDocs` collection. Truncation only affects completeness — individual rows are correct. The response includes `truncated: true`. The CLI renders a `⚠ TRUNCATED` warning.
+- **Flat `tantivy_fast_fields` queries** (no GROUP BY): `SQL_MATCH_LIMIT = 100_000` caps `TopDocs` collection unless `LIMIT` pushdown applies. Truncation only affects completeness — individual rows are correct. The response includes `truncated: true`. The CLI renders a `⚠ TRUNCATED` warning.
 - **GROUP BY on grouped_partials path**: No scan limit. Aggregation collectors process ALL matched docs per shard.
 - **GROUP BY on fast-fields fallback**: The planner sets `has_group_by_fallback = true` when GROUP BY exists but `grouped_sql` is `None` (expression GROUP BY, unsupported aggregates, residual predicates). The API layer overrides `SearchRequest.size` from 100K to `sql_group_by_scan_limit` (default: 1M, configurable via `ferrissearch.yml`, 0 = unlimited).
-- **Error on overflow**: If matched docs exceed the scan limit on a GROUP BY fallback query, the API returns HTTP 400 `group_by_scan_limit_exceeded` with an actionable error message instead of silently wrong aggregates. This is fundamentally different from flat-query truncation: GROUP BY over incomplete data produces wrong counts, missing groups, and biased averages.
+- **Guarded local streaming**: Local GROUP BY fallback queries may use `sql_streaming_batches()` only when they are `_score`-free and every requested column is fast-field-backed on every local segment. If any column needs `SourceFallback`/stored-doc loading or the SQL query references `_score`, stay on `sql_record_batch()` (or the broader fallback path) so results remain correct.
+- **Error on overflow**: If a GROUP BY fallback query still collects fewer rows than it matched after guarded local streaming is applied, the API returns HTTP 400 `group_by_scan_limit_exceeded` with an actionable error message instead of silently wrong aggregates. This is fundamentally different from flat-query truncation: GROUP BY over incomplete data produces wrong counts, missing groups, and biased averages.
 - **Why not raise the flat-query limit too?** Flat query truncation makes individual rows correct but incomplete. GROUP BY truncation makes aggregates mathematically wrong. These are different severity levels requiring different treatment.
 - **ClickHouse comparison**: ClickHouse has no scan limit — it processes all matching rows for GROUP BY. It uses `max_rows_to_group_by` to limit output cardinality and `max_bytes_before_external_group_by` to spill to disk when memory is tight. Our approach is the right trade-off for a search engine that isn't designed for full-table OLAP scans.
 - `SELECT count(*), avg(price), sum(price) FROM ...` produces a single global bucket via fast-field collectors — no row materialization needed.
@@ -67,7 +71,12 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - The `tantivy_fast_fields` path now works across multi-node clusters.
 - For non-`SELECT *` queries, the coordinator scatters `SqlRecordBatch` gRPC RPCs to remote shards in parallel.
 - Remote shards run `sql_record_batch()` locally and return Arrow IPC-serialized `RecordBatch` bytes.
-- The coordinator deserializes Arrow IPC, concatenates batches from all shards (local + remote), and runs DataFusion for final SQL execution.
+- The coordinator deserializes Arrow IPC, preserves the incoming batch boundaries in one MemTable partition, and runs DataFusion for final SQL execution.
+- Large unbounded `SELECT *` queries are still a compatibility/export limitation today: wildcard projection uses `materialized_hits_fallback`, and remote fast-field SQL is still unary batch transport rather than end-to-end streaming.
+- Future work for that query class is a dedicated export-style streaming path: server-streamed Arrow or row batches from shard primaries, plus coordinator/client streaming consumption, instead of full result materialization on both sides.
+- **Plan-driven canonical schema**: `execute_sql_batches()` first merges the base schema across ALL incoming batches via `merge_batch_schemas()`, then derives `final_schema` from that merged schema + the plan's SQL column ordering via `project_schema()`. This prevents a broken/drifted first batch from corrupting canonical types or dropping columns that appear later.
+- **Schema-recovery fallback**: If projected batches have inconsistent schemas (e.g., remote Arrow IPC schema drift), each batch is normalized to the plan-derived canonical schema via `normalize_batch_to_schema()`. Missing columns are filled with nulls. Type casts are strict: `cast_array_strict()` rejects any cast that would introduce additional nulls, so bad shard data is surfaced as an error instead of silently degrading into nulls.
+- **Per-shard streaming fallback**: When `plan.has_group_by_fallback` is true, `execute_sql_query()` tries `sql_streaming_batches()` first on each local shard. If a shard returns `None` (score needed or SourceFallback column), that shard transparently falls back to `sql_record_batch()`. This is per-shard, not global — some shards can stream while others use the TopDocs path.
 - Arrow IPC helpers: `record_batch_to_ipc()` and `record_batch_from_ipc()` in `arrow_bridge.rs`.
 - `SELECT *` queries always use the materialized fallback path (`materialized_hits_fallback`) — the fast-field path requires explicit column projection.
 
@@ -99,11 +108,12 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - If any OR branch is not pushable (e.g., contains `text_match`), the planner returns an error. `text_match()` must appear as a top-level AND predicate, not inside OR or complex expressions.
 - The `expr_contains_text_match` guard walks all expression shapes that can survive as residual predicates: `BinaryOp`, `Nested`, `UnaryOp`, `IsNull`, `IsNotNull`, `Cast`, `Case` (with `CaseWhen` arms), `Between`, `InList`, and `Function` arguments (for `COALESCE(text_match(...), false)` etc.).
 - `NOT IN` and `NOT BETWEEN` are NOT pushed — they remain as residual predicates for DataFusion.
-- `score`, `_score`, and `_id` fields are never pushed (score is computed by Tantivy, _id is a doc identifier).
-- **GROUP BY expressions** (e.g., `GROUP BY LOWER(author)`, `GROUP BY year / 10`) are NOT eligible for the grouped partials path. Only plain column references in GROUP BY enable `tantivy_grouped_partials`. Expression-based GROUP BY falls through to `tantivy_fast_fields` + DataFusion. Mixed GROUP BY (plain columns + expressions, e.g., `GROUP BY author, LOWER(category)`) also bails — `collect_group_by_columns` returns `has_expression_group_by = true` which gates `extract_grouped_sql_plan`.
-- **GROUP BY fallback scan limit**: When a GROUP BY query falls to `tantivy_fast_fields` (expression GROUP BY, unsupported aggregates like `STDDEV_POP`, residual predicates), the planner sets `has_group_by_fallback = true`. The API layer overrides `SearchRequest.size` from the default 100K to `sql_group_by_scan_limit` (default: 1M, configurable, 0 = unlimited). If matched docs still exceed this limit, the query returns a `group_by_scan_limit_exceeded` error instead of silently wrong aggregates. The default 100K `SQL_MATCH_LIMIT` remains for flat (non-GROUP BY) queries where truncation only affects completeness, not correctness.
+- `_score` and `_id` fields are never pushed (`_score` is computed by Tantivy, `_id` is a doc identifier).
+- **GROUP BY expressions** (e.g., `GROUP BY LOWER(author)`, `GROUP BY year / 10`) are NOT eligible for the grouped partials path. Only plain column references in GROUP BY enable `tantivy_grouped_partials`. Expression-based GROUP BY falls through to `tantivy_fast_fields` + DataFusion. When the fallback query is `_score`-free and fully fast-field-backed, the runtime may use bitset streaming internally; responses expose this separately as `streaming_used: true`. Mixed GROUP BY (plain columns + expressions, e.g., `GROUP BY author, LOWER(category)`) also bails — `collect_group_by_columns` returns `has_expression_group_by = true` which gates `extract_grouped_sql_plan`.
+- **GROUP BY fallback scan limit**: When a GROUP BY query falls to `tantivy_fast_fields` (expression GROUP BY, unsupported aggregates like `STDDEV_POP`, residual predicates), the planner sets `has_group_by_fallback = true`. The API layer overrides `SearchRequest.size` from the default 100K to `sql_group_by_scan_limit` (default: 1M, configurable, 0 = unlimited). If any shard still returns fewer rows than it matched on the capped fallback paths, the query returns a `group_by_scan_limit_exceeded` error instead of silently wrong aggregates. The default 100K `SQL_MATCH_LIMIT` remains for flat (non-GROUP BY) queries where truncation only affects completeness, not correctness.
 - `collect_expr_columns` handles `Cast`, `Case` (with `CaseWhen` arms), and `Like`/`ILike` expressions to ensure all referenced columns are read from fast fields.
 - **SELECT aliases are never pushed down.** If a WHERE predicate references a SELECT alias (e.g., `WHERE posts > 10` when `posts` is `count(*) AS posts`), it stays as a residual predicate for DataFusion. This prevents pushing filters on nonexistent Tantivy fields, which silently fall back to the `body` catch-all field and match nearly everything.
+- **Alias shadowing and required columns**: `collect_required_columns()` must use alias-aware walkers for WHERE/HAVING/ORDER BY so bare alias references do not leak into `required_columns`, while real source fields still survive through wrapped aggregate expressions like `COALESCE(AVG(price), 0)` or `CAST(AVG(price) AS FLOAT)` when a SELECT alias shadows that field name.
 - Prefer shard-local partial execution before coordinator-side row materialization.
 - Treat `materialized_hits_fallback` as a compatibility path, not the target architecture.
 
@@ -111,6 +121,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - `HAVING` clauses are supported in the `tantivy_grouped_partials` path as post-merge filters.
 - Simple comparisons (`>`, `>=`, `<`, `<=`, `=`) on output columns (group columns or metric aliases) are converted to `HavingFilter` structs.
 - **Both alias-based and aggregate-expression HAVING are supported**: `HAVING posts > 10` (alias) and `HAVING COUNT(*) > 10` (aggregate expression) both route correctly to `tantivy_grouped_partials`.
+- **ORDER BY can also resolve supported aggregate expressions directly**: `ORDER BY posts DESC` and `ORDER BY SUM(upvotes) DESC` should both stay on `tantivy_grouped_partials` when the aggregate itself is eligible. Do not require a SELECT alias just to keep grouped-partials planning.
 - Mixed HAVING conditions (e.g., `HAVING posts > 10 AND AVG(upvotes) > 5`) are supported — each condition can independently use an alias or an aggregate expression.
 - Flipped comparisons (e.g., `HAVING 20 < COUNT(*)`) are also supported with correct operator inversion.
 - `resolve_having_name()` resolves HAVING operands: tries identifier lookup first (alias path), then matches aggregate functions against the parsed metrics list (aggregate expression path).
@@ -133,11 +144,12 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 ## Grouped Analytics Direction
 - For grouped analytics over matched docs, prefer shard-local partial aggregation from fast fields.
 - Ship compact partial states to the coordinator and merge there.
+- Grouped-partial wire formats must preserve numeric group-key type fidelity across shards. Do not coerce all numeric keys to `f64`, or coordinator merge can split logically identical integer buckets like `0` and `0.0` between local and remote shards.
 - Only fall back to row materialization when a query requires unsupported expressions, wildcard projection, or unavailable columnar data.
 
 ## Critical Invariants
 - `doc_id` must remain the row index for any columnar representation built from matched docs.
-- `score` must be surfaced as a normal Arrow/DataFusion column.
+- `_score` must be surfaced as a normal Arrow/DataFusion column.
 - Avoid extra maps or indirection unless there is a proven need.
 
 ## Execution Priorities
@@ -145,6 +157,48 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 2. Fast fields provide structured columns directly.
 3. Arrow batches represent the matched tabular view.
 4. DataFusion executes only the residual SQL semantics that still need a relational engine.
+
+## Longer-Term Planner Direction
+- The current planner still relies on raw `sqlparser` expression walking for parts of dependency extraction. The long-term target is a clause-aware semantic binder that resolves each identifier as a base field, SELECT alias, aggregate output, or synthetic field like `_id` / `_score` before capability analysis runs.
+- `required_columns`, `needs_id`, and `needs_score` should ultimately be derived from that bound query IR rather than from raw AST walkers plus alias filtering. This is the clean way to eliminate recurring alias-shadowing edge cases in WHERE/HAVING/ORDER BY.
+- Keep the separation of responsibilities: semantic binding first, then search-aware capability analysis, then execution planning. Do not fold this into ad-hoc pushdown walkers or a second SQL dependency pass.
+
+## Small Bound-Column IR Plan
+- Near-term step before the full semantic binder: introduce a small clause-aware bound-column layer, not a full bound-query IR.
+- Goal: resolve every identifier the planner inspects into a semantic kind so dependency extraction and pushdown rules stop depending on raw string checks plus alias stripping.
+- The current `SyntheticColumn` enum is stage 0 of this plan. Keep it and compose it into the next layer instead of reintroducing raw `_id` / `_score` comparisons elsewhere.
+- Recommended minimal shape:
+  - `BoundColumn::Source(String)` — physical mapped field / fast-field candidate
+  - `BoundColumn::Synthetic(SyntheticColumn)` — `_id` / `_score`
+  - `BoundColumn::Output(String)` — SELECT alias, group output, or metric output visible in HAVING / ORDER BY output space
+  - optional `BoundColumn::Unknown(String)` only at binder boundaries; capability analysis should not silently treat unknown names as source fields
+- Keep the first version small:
+  - Do NOT build a full bound expression tree yet
+  - Reuse `sqlparser` AST for expression structure
+  - Bind only the identifier-bearing expression paths the planner already inspects: projection, WHERE, GROUP BY, HAVING, ORDER BY, and aggregate arguments
+- Clause rules for the small binder:
+  - WHERE: bare identifiers bind only to source fields or synthetic columns; SELECT aliases stay residual and must not leak into pushdown or required-column extraction
+  - Projection and aggregate arguments: identifiers inside expressions bind to source fields or synthetic columns, never to SELECT aliases from the same projection list
+  - GROUP BY eligibility: only `BoundColumn::Source` counts as a plain grouped-partials key; `Synthetic` or expression-derived outputs must bail to residual SQL execution
+  - HAVING and ORDER BY on grouped queries: resolve output-space names first (`BoundColumn::Output`), then aggregate-expression matching, then source fields only when semantically valid
+  - `_id` / `_score` must always bind through `SyntheticColumn`, never through ad-hoc string checks
+- First consumers of the small IR:
+  - `required_columns`
+  - `needs_id` / `needs_score`
+  - pushdown exclusion guards
+  - GROUP BY plain-column eligibility
+  - HAVING / ORDER BY name resolution in grouped planning
+- Suggested migration order:
+  1. Add a small binder helper that resolves identifiers into `BoundColumn` for a given clause context
+  2. Convert `collect_required_columns()` and synthetic-column detection to consume bound refs instead of raw names
+  3. Convert pushdown capability checks to reject `Output` and non-source refs explicitly
+  4. Convert grouped HAVING / ORDER BY resolution to use output-space binding instead of mixed raw-name maps
+  5. Only after that decide whether a fuller `BoundExpr` / bound-query IR is still needed
+- Non-goals for the small IR:
+  - no DataFusion-side semantic model
+  - no full SQL type inference
+  - no replacement of the `sqlparser` AST in this phase
+  - no broad planner rewrite before the current pushdown and grouped-partials behavior is re-expressed through the binder
 
 ## Preferred Language In Reviews And Docs
 - Say: "search-aware planning", "residual SQL execution", and "grouped analytics over matched docs".
@@ -162,6 +216,10 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
   - `tantivy_grouped_partials`
   - `tantivy_fast_fields`
   - `materialized_hits_fallback`
+- Add a regression where grouped SQL uses an unaliased aggregate expression in `ORDER BY` (for example `ORDER BY SUM(price) DESC`) and assert it still stays on `tantivy_grouped_partials`.
+- Add assertions for the separate `streaming_used` runtime flag so streaming and non-streaming fallback queries stay distinguishable without overloading `execution_mode`.
+- Add a distributed grouped-partials regression test that round-trips partials through `encode_partial_aggs()` / `decode_partial_aggs()` and verifies integer group keys still merge with local shard keys instead of splitting `0` and `0.0` into separate buckets.
+- Add an end-to-end multi-node query test for grouped-partials wire-format changes. A local unit test is not enough when the bug only appears after remote shards serialize partials over gRPC.
 - Add regression tests for zero-result or all-null columns: verify that schema-derived `type_hints` override `infer_column_kind` to produce correct Arrow DataTypes (e.g. Float64, not Utf8 for numeric columns).
 - Add tests verifying that the fast-field path reads `_id` from the fast-field column (not from stored docs) when all columns are fast-field-backed.
 - Add tests verifying that mixed fast+fallback column queries still return correct `_id` values.

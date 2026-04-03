@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **692 unit tests** (`cargo test --lib`)
-- **40 CLI tests** (`cargo test --bin ferris-cli`)
+- **726 unit tests** (`cargo test --lib`)
+- **55 CLI tests** (`cargo test --bin ferris-cli`)
 - **30 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **18 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **22 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 163 assertions across 4 files
-- **820 total** (`cargo test`)
+- **873 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -25,8 +25,12 @@ cargo test -- test_name                         # Single test by name
 - Use `#[tokio::test]` for async tests
 - Use `tempfile::TempDir` for isolated data directories
 - Test every code path: happy path, edge cases, error conditions, empty inputs
+- For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
+- For `ferris-cli` interactive features, test command parsing and completion token boundaries in pure helpers; keep watch-mode behavior factored so the logic is covered without relying on terminal I/O in tests.
 - For feature-gated transport TLS changes, run both `cargo test --lib` and `cargo test --lib --features transport-tls`; enabling TLS without the feature must error instead of silently downgrading to plaintext.
 - For transport TLS end-to-end coverage, also run `cargo test --test replication_integration --features transport-tls`.
+- For SQL fast-field string changes, add regressions for both `sql_record_batch()` and `sql_streaming_batches()` that assert `_id` and keyword values survive the optimized ordinal path.
+- For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
 
 ## Integration Test Infrastructure
 ### Consensus Tests (tests/consensus_integration.rs)
@@ -68,7 +72,7 @@ cargo test -- test_name                         # Single test by name
 	- LIMIT pushdown detection and rewritten SQL preservation
 	- residual predicate detection
 	- `needs_id` / `needs_score` detection
-	- truncation flag logic (explicit LIMIT = not truncated, no LIMIT = may truncate at 100K ceiling)
+	- truncation flag logic (explicit LIMIT = not truncated, flat no-LIMIT fast-field queries may truncate at the 100K ceiling, GROUP BY fallback uses the separate scan-limit/error path)
 - For direct fast-field execution changes, add tests that assert eligible queries use fast-field readers without requiring `_source` materialization.
 - For API-level SQL changes, validate both execution modes where practical:
 	- `tantivy_grouped_partials` for eligible grouped SQL queries over matched docs
@@ -77,9 +81,16 @@ cargo test -- test_name                         # Single test by name
 - **LIMIT correctness**: Always assert exact row counts for LIMIT queries — `LIMIT N` must produce exactly N rows, not N × number_of_shards. This was a previous test gap.
 - **DataFusion 53 LIMIT regression**: Include pure DataFusion tests that reproduce the projection-reorder LIMIT bug (schema-order SELECT works, reverse-order SELECT without the workaround returns too many rows). These tests document the upstream bug and verify the `project_batch_to_sql_columns` workaround.
 - **Projection helper invariant**: `project_batch_to_sql_columns` must use planner-derived dependencies (`required_columns`, `needs_id`, `needs_score`) instead of a second ad-hoc SQL walker. Complex expressions such as `CASE`, `HAVING`, and grouped residual SQL can otherwise register an incomplete MemTable schema and fail at execution time.
-- **Truncation flag**: Assert `truncated=false` for explicit LIMIT queries. Assert `truncated=true` only when matched_hits exceeds the internal 100K ceiling without an explicit LIMIT.
-- **GROUP BY scan limit**: Expression GROUP BY and unsupported-aggregate GROUP BY fall to `tantivy_fast_fields` with a raised scan limit (`sql_group_by_scan_limit`, default 1M). Test that: (1) `has_group_by_fallback` is true for expression GROUP BY / unsupported aggs, false for plain GROUP BY and flat queries, (2) the `group_by_scan_limit_exceeded` error fires when matched docs exceed the limit (unit test with `sql_group_by_scan_limit: 1`), (3) expression GROUP BY under the limit succeeds on `tantivy_fast_fields` (REST API test).
-- Live tests should inspect the `planner`, `execution_mode`, and `truncated` fields, not just the returned rows.
+- **Distributed grouped-partials key stability**: Add a regression test that round-trips grouped partials through `encode_partial_aggs()` / `decode_partial_aggs()` and verifies integer group keys still merge with local shard keys. Coordinator merge must not split logically identical buckets like `0` and `0.0` across local vs remote shards.
+- **Distributed SQL transport coverage**: The sqllogictest harness is single-node and single-shard. Any bug that depends on remote shard fan-out, gRPC transport, or partial-state encode/decode must also have a multi-node integration test (REST or transport-level) in addition to local result-correctness coverage.
+- **Schema drift recovery**: Add unit tests for both safe and unsafe remote-schema drift. Cover at least: (1) a drifted-first batch with later typed batches still preserves the later column and canonical type, (2) a missing-first batch fills later-missing values with nulls instead of dropping the column, and (3) an uncastable drifted batch fails loudly instead of degrading values into nulls.
+- **Alias shadowing**: Cover cases where a SELECT alias matches a real field name. Real source fields must stay in `required_columns` when projection/GROUP BY expressions or wrapped HAVING aggregate inputs still need them, while pure computed aliases referenced only from ORDER BY/HAVING wrappers like `COALESCE(total, 0)` must still be stripped.
+- **Grouped ORDER BY aggregate expressions**: Cover aliasless grouped queries like `SELECT author, SUM(upvotes) ... ORDER BY SUM(upvotes) DESC`. Supported aggregate expressions in ORDER BY must resolve back to the grouped metric and stay on `tantivy_grouped_partials` instead of falling through to the generic fast-fields/DataFusion path.
+- **Zero-column SQL batches**: Add regressions for literal-only queries such as `SELECT 1 FROM ... WHERE text_match(...)`. The planner must not fake `needs_score`, and the execution path must still return one output row per hit.
+- **Bound-column IR migrations**: When the small planner binder lands, add unit tests that resolve the same identifier name across clauses to different semantic kinds: source field vs output alias vs synthetic `_id` / `_score`. Cover at least WHERE alias residual behavior, HAVING/ORDER BY output-space binding, aggregate-argument source-field binding under alias shadowing, GROUP BY source-only eligibility, and real `score` vs synthetic `_score` separation.
+- **Truncation flag**: Assert `truncated=false` for explicit LIMIT queries. Assert `truncated=true` only for flat fast-field queries when `matched_hits` exceeds the internal 100K ceiling without an explicit LIMIT. GROUP BY fallback queries should error via `group_by_scan_limit_exceeded` instead of returning `truncated=true`.
+- **GROUP BY scan limit**: Expression GROUP BY and unsupported-aggregate GROUP BY fall to `tantivy_fast_fields` with a raised scan limit (`sql_group_by_scan_limit`, default 1M). Test that: (1) `has_group_by_fallback` is true for expression GROUP BY / unsupported aggs, false for plain GROUP BY and flat queries, (2) the `group_by_scan_limit_exceeded` error fires when a capped fallback path collects fewer rows than it matched (unit test with `sql_group_by_scan_limit: 1` and a text/source-fallback GROUP BY), (3) a fully fast-field-backed local expression GROUP BY can stream past that tiny limit and still succeed, and (4) fallback queries that reference text/source-fallback columns or `_score` stay correct instead of being forced onto the bitset streaming path.
+- Live tests should inspect the `planner`, `execution_mode`, `streaming_used`, and `truncated` fields, not just the returned rows.
 - Add regression tests when planner or execution changes accidentally widen the fallback path for queries that should stay search-aware.
 
 ## SQL Correctness Testing Strategy
@@ -95,10 +106,13 @@ The industry standard for SQL engine correctness testing is [sqllogictest](https
 ### Testing Rules for SQL Changes
 1. **Always test result values, not just plan metadata.** A test that asserts `plan.limit_pushed_down == true` but never checks if the returned rows are correct is incomplete.
 2. **Always test WHERE/HAVING on aliases.** SELECT aliases like `count(*) AS posts` must NEVER be pushed down to Tantivy — they are computed values, not physical fields. Test that alias-referencing predicates stay as residual.
-3. **Test multi-shard correctness.** GROUP BY results must be identical regardless of how data is distributed across shards. Compare single-shard vs multi-shard results.
+3. **Test multi-shard correctness.** GROUP BY results must be identical regardless of how data is distributed across shards. Compare single-shard vs multi-shard results, and cross the remote partial-state encode/decode boundary when the query uses distributed grouped partials.
 4. **Test boundary conditions for LIMIT.** `LIMIT N` on grouped partials must return exactly N rows after merge+sort, not N rows per shard.
 5. **Test HAVING with LIMIT and OFFSET together.** The execution order must be: merge → HAVING → sort → LIMIT/OFFSET.
 6. **Every new SQL feature MUST have sqllogictest coverage.** When adding a new SQL capability (new aggregate function, new clause, new pushdown, new execution path), add `.slt` tests in `tests/slt/` that assert the correct output values. This is a BLOCKING requirement — do not merge SQL changes without corresponding `.slt` tests.
+
+### sqllogictest Scope
+- `tests/sql_correctness.rs` builds a single-node, single-shard sample cluster. It is the right place to assert SQL result correctness, but it cannot catch distributed transport or remote partial-state serialization bugs by itself.
 
 ### sqllogictest Infrastructure (Implemented)
 - **Crate**: `sqllogictest = "0.29"` as a dev dependency

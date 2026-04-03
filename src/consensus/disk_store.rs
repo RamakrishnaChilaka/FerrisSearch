@@ -554,13 +554,7 @@ mod tests {
         {
             let log_store = DiskLogStore::open(&db_path).unwrap();
             let sm = crate::consensus::state_machine::ClusterStateMachine::new("test".into());
-            let config = openraft::Config {
-                cluster_name: "test".into(),
-                heartbeat_interval: 500,
-                election_timeout_min: 1500,
-                election_timeout_max: 3000,
-                ..Default::default()
-            };
+            let config = crate::consensus::default_raft_config("test".into());
             let raft = openraft::Raft::new(
                 1u64,
                 std::sync::Arc::new(config),
@@ -603,13 +597,7 @@ mod tests {
         {
             let log_store = DiskLogStore::open(&db_path).unwrap();
             let sm = crate::consensus::state_machine::ClusterStateMachine::new("test".into());
-            let config = openraft::Config {
-                cluster_name: "test".into(),
-                heartbeat_interval: 500,
-                election_timeout_min: 1500,
-                election_timeout_max: 3000,
-                ..Default::default()
-            };
+            let config = crate::consensus::default_raft_config("test".into());
             let raft = openraft::Raft::new(
                 1u64,
                 std::sync::Arc::new(config),

@@ -74,8 +74,11 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Without type hints, `infer_column_kind()` scans data values and defaults to `Utf8` for empty/all-null columns — this breaks aggregation functions like `avg()`, `sum()` on zero-result queries
 - The fast-field path (`sql_record_batch`) MUST populate `type_hints` from `SqlFieldReader` variants (F64/I64 → Float64, Str → Utf8) or the Tantivy schema when no segments exist
 - The fast-field path skips `searcher.doc()` entirely when all requested columns have fast-field readers — reads `_id` from its fast-field column instead of loading stored docs
-- When the SQL query does not reference `_id` or `score`, those columns are filled with empty/zero values and fast-field reads for `_id` are skipped entirely (`needs_id`/`needs_score` flags on `QueryPlan`)
-- When `required_columns` is empty and neither `_id` nor `score` is referenced (e.g., `SELECT 1 FROM ...`), `needs_score` is forced true so the batch has the correct row count — without this, DataFusion sees 0 rows and returns `count(*) = 0`\n- Ungrouped aggregates (`SELECT count(*), avg(price) FROM ...` without GROUP BY) use the grouped partial path with zero group-by columns — no row materialization needed
+- String fast-field SQL paths use a shared `StringFastFieldReader` (`StrColumn` + ordinal `Column<u64>`) so `_id`, selective arrays, and streaming batches read ordinals directly instead of per-doc `term_ords()` iterators
+- In the flat `sql_record_batch()` fast path, `_id` now uses the same per-segment array/take/reorder flow as other string fast fields instead of a separate top-doc-order decode/clone loop
+- When the SQL query does not reference `_id` or `_score`, those columns are filled with empty/zero values and fast-field reads for `_id` are skipped entirely (`needs_id`/`needs_score` flags on `QueryPlan`)
+- Zero-column SQL queries such as `SELECT 1 FROM ...` keep one row per hit directly in `sql_record_batch()`; do not overload `needs_score` just to preserve batch cardinality
+- Ungrouped aggregates (`SELECT count(*), avg(price) FROM ...` without GROUP BY) use the grouped partial path with zero group-by columns — no row materialization needed
 - The `materialized_hits_fallback` path uses plain `build_record_batch()` (no hints, data-driven inference only)
 - SELECT aliases must be excluded from `required_columns` — aliases (e.g. `total` from `count(*) AS total`) are not real schema fields and cause `SourceFallback` → Null → Utf8 misclassification
 
@@ -92,11 +95,11 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 692 unit tests + 40 CLI tests + 30 consensus integration + 39 replication integration + 18 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 820 total
+- 726 unit tests + 55 CLI tests + 30 consensus integration + 39 replication integration + 22 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 873 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
-- SQL console: `cargo run --bin ferris-cli` (interactive) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
+- SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, and history) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
 
 ## Node Lifecycle (Raft-driven)
 - First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
@@ -496,7 +499,7 @@ ClusterStateMachine { state: Arc<RwLock<ClusterState>>, last_applied: Option<Log
 - Snapshot format: JSON-serialized ClusterState, ID: `snap-{last_applied_index}`
 
 ### Raft Config
-- heartbeat_interval: 500ms, election_timeout_min: 1500ms, election_timeout_max: 3000ms
+- heartbeat_interval: 1000ms, election_timeout_min: 3000ms, election_timeout_max: 6000ms
 
 ### Module Functions
 - `create_raft_instance(node_id, cluster_name, data_dir)` — persistent disk store (production)
@@ -586,6 +589,8 @@ If you add a hybrid execution path that mixes full-text search with SQL-style pr
     - string/keyword: `segment_reader.fast_fields().str(name)` plus `term_ords(doc)` and `ord_to_str(ord, buf)`
 - For shard-local partial execution, prefer segment-local collectors and column readers over `_source` materialization.
 - For grouped analytics, compute shard-local partials from fast fields, ship compact partial states, and merge at the coordinator. Do not ship full matched rows unless the query needs expressions that cannot run from fast fields.
+- Runtime SQL reporting should keep `execution_mode` at the authoritative high-level path; if a local fast-field fallback uses bitset streaming internally, expose that separately via `streaming_used` instead of inventing a new execution mode.
+- Grouped-partial wire formats must preserve numeric group-key type fidelity across shards. Do not coerce integer group keys into `f64`, or coordinator merge can split logically identical buckets like `0` and `0.0` between local and remote shards.
 - Only introduce new storage or sidecar column formats if a required SQL feature cannot be served by Tantivy fast fields or stored fields. Planning and partial aggregation alone are not sufficient reasons.
 
 ### Responsibility Split
@@ -624,7 +629,7 @@ If you add a hybrid execution path that mixes full-text search with SQL-style pr
 ### Critical Invariants
 - `doc_id` must equal the row index in any columnar representation used for hybrid execution
 - Direct lookup should remain `column[doc_id as usize]`; avoid extra maps and indirection unless there is a proven need
-- `score` must be represented as a normal Arrow/DataFusion column so SQL can sort or aggregate over it
+- `_score` must be represented as a normal Arrow/DataFusion column so SQL can sort or aggregate over it
 - Simple structured predicates (`=`, `>`, `>=`, `<`, `<=`) should be pushed into Tantivy `Term`/`Range` queries before DataFusion sees the rows
 
 ### Required Comments To Anchor Generation
@@ -639,7 +644,7 @@ When creating new hybrid-search modules, add explicit comments like these near t
 
 ```rust
 // IMPORTANT:
-// Treat 'score' as a normal column in Arrow
+// Treat '_score' as a normal column in Arrow
 // so that SQL can sort and filter using it.
 ```
 
@@ -672,7 +677,7 @@ When creating new hybrid-search modules, add explicit comments like these near t
 ### Suggested Implementation Order
 1. Tantivy search executor returning `Vec<(u32, f32)>`
 2. Column store with direct `doc_id -> row index` semantics
-3. Arrow `RecordBatch` bridge that includes `score`
+3. Arrow `RecordBatch` bridge that includes `_score`
 4. DataFusion execution for projection, sort, `avg`, and `count`
 5. Query planner that splits `text_match(...)` from SQL-style operations
 6. Shard-local partial aggregation on fast fields for `GROUP BY` / `COUNT` / `SUM` / `MIN` / `MAX` / `AVG`

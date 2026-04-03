@@ -6,13 +6,87 @@ use comfy_table::{
     presets::UTF8_FULL,
 };
 use reqwest::Client;
-use rustyline::DefaultEditor;
+use rustyline::completion::{Completer, Pair};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{
+    Config as LineEditorConfig, Context as RustylineContext, EditMode, Editor, Helper,
+};
 use serde_json::Value;
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser as SqlParser;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_COLUMN_WIDTH: usize = 60;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_WATCH_INTERVAL_SECS: f64 = 2.0;
+
+const EDITOR_SHORTCUTS: [(&str, &str); 2] = [
+    ("Tab", "complete commands and SQL keywords"),
+    ("Ctrl-R", "reverse-search query history"),
+];
+
+const SQL_KEYWORDS: &[&str] = &[
+    "ANALYZE", "AND", "AS", "AVG", "BY", "COUNT", "DESC", "DESCRIBE", "EXPLAIN", "FALSE", "FROM",
+    "GROUP", "HAVING", "INDICES", "LIMIT", "MAX", "MIN", "OFFSET", "OR", "ORDER", "SELECT", "SHOW",
+    "SUM", "TABLES", "TRUE", "WHERE",
+];
+
+const SHELL_COMMANDS: &[&str] = &[
+    "\\clear",
+    "\\h",
+    "\\help",
+    "\\indices",
+    "\\q",
+    "\\quit",
+    "\\tables",
+    "\\watch",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ShellCommand {
+    Quit,
+    Help,
+    Clear,
+    QueryShortcut(&'static str),
+    Watch(Duration),
+}
+
+#[derive(Default)]
+struct CliEditorHelper {
+    hinter: HistoryHinter,
+}
+
+impl Helper for CliEditorHelper {}
+
+impl Highlighter for CliEditorHelper {}
+
+impl Validator for CliEditorHelper {}
+
+impl Hinter for CliEditorHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &RustylineContext<'_>) -> Option<Self::Hint> {
+        self.hinter.hint(line, pos, ctx)
+    }
+}
+
+impl Completer for CliEditorHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &RustylineContext<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        Ok(complete_input(line, pos))
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -151,6 +225,11 @@ fn print_welcome(cluster_name: &str, node_count: usize, connection: &str) {
         "\\q".bright_cyan(),
         ";".bright_cyan(),
     );
+    println!(
+        " {} {}",
+        "Tip:".bright_white().bold(),
+        format_shortcut_hint().dimmed(),
+    );
     println!();
 }
 
@@ -200,6 +279,10 @@ fn print_help() {
         "\\clear".bright_cyan()
     );
     println!(
+        "   {}            — rerun the last successful query",
+        "\\watch [seconds]".bright_cyan()
+    );
+    println!(
         "   {}                    — exit the console",
         "\\quit".bright_cyan()
     );
@@ -209,6 +292,15 @@ fn print_help() {
         "exit".bright_cyan()
     );
     println!();
+    println!(" {}", "Editor Shortcuts:".bright_white().bold());
+    for (shortcut, description) in editor_shortcuts() {
+        println!(
+            "   {}                  — {}",
+            shortcut.bright_cyan(),
+            description
+        );
+    }
+    println!();
     println!(" {}", "Examples:".bright_white().bold());
     println!(
         "   {}",
@@ -217,6 +309,24 @@ fn print_help() {
     println!("   {}", r#"SELECT author, count(*) AS posts FROM "hackernews" WHERE text_match(title, 'python') GROUP BY author ORDER BY posts DESC LIMIT 5;"#.dimmed());
     println!("   {}", r#"EXPLAIN SELECT title, upvotes FROM "hackernews" WHERE text_match(title, 'startup') AND upvotes > 100 ORDER BY upvotes DESC LIMIT 10;"#.dimmed());
     println!();
+}
+
+fn editor_shortcuts() -> &'static [(&'static str, &'static str)] {
+    &EDITOR_SHORTCUTS
+}
+
+fn format_shortcut_hint() -> String {
+    editor_shortcuts()
+        .iter()
+        .map(|(shortcut, description)| format!("{} {}", shortcut, description))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn line_editor_config() -> LineEditorConfig {
+    LineEditorConfig::builder()
+        .edit_mode(EditMode::Emacs)
+        .build()
 }
 
 fn render_table(columns: &[String], rows: &[Value]) {
@@ -313,6 +423,10 @@ fn render_metadata(body: &Value, client_ms: f64) {
         parts.push(format!("mode: {}", mode_colored));
     }
 
+    if body.get("streaming_used").and_then(|v| v.as_bool()) == Some(true) {
+        parts.push(format!("streaming: {}", "bitset".bright_cyan()));
+    }
+
     // Matched hits
     if let Some(hits) = body.get("matched_hits").and_then(|v| v.as_u64()) {
         parts.push(format!("matched: {}", format_number(hits)));
@@ -372,6 +486,14 @@ fn render_explain(body: &Value, client_ms: f64) {
             _ => mode.bold().to_string(),
         };
         println!(" {} {}", "Execution Mode:".bright_white(), mode_colored);
+    }
+
+    if body.get("streaming_used").and_then(|v| v.as_bool()) == Some(true) {
+        println!(
+            " {} {}",
+            "Bitset Streaming:".bright_white(),
+            "used".bright_cyan().bold()
+        );
     }
 
     // Strategy reason
@@ -526,22 +648,225 @@ fn strip_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
 
 /// Try to extract the table name from a SELECT query for the EXPLAIN endpoint.
 fn extract_table_for_explain(sql: &str) -> Option<String> {
-    let upper = sql.to_ascii_uppercase();
-    let from_pos = upper.find(" FROM ")?;
-    let after_from = sql[from_pos + 6..].trim();
-    // Handle quoted and unquoted table names
-    if after_from.starts_with('"') {
-        let end = after_from.strip_prefix('"')?.find('"')?;
-        Some(after_from[1..=end].to_string())
-    } else if let Some(stripped) = after_from.strip_prefix('\'') {
-        // Single-quoted table names (non-standard but common user mistake)
-        let end = stripped.find('\'')?;
-        Some(stripped[..end].to_string())
+    let dialect = GenericDialect {};
+    let mut statements = SqlParser::parse_sql(&dialect, sql).ok()?;
+    if statements.len() != 1 {
+        return None;
+    }
+
+    let statement = statements.pop()?;
+    let sqlparser::ast::Statement::Query(query) = statement else {
+        return None;
+    };
+    let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+        return None;
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+
+    match &select.from[0].relation {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            if name.0.len() != 1 {
+                return None;
+            }
+            match &name.0[0] {
+                sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn complete_input(line: &str, pos: usize) -> (usize, Vec<Pair>) {
+    let safe_pos = pos.min(line.len());
+    let start = current_token_start(line, safe_pos);
+    let prefix = &line[start..safe_pos];
+    let trimmed = line[..safe_pos].trim_start();
+
+    let leading_whitespace = line[..safe_pos].len() - trimmed.len();
+    let command_end =
+        leading_whitespace + trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+
+    if trimmed.starts_with('\\') && safe_pos <= command_end {
+        return (start, completion_pairs(prefix, SHELL_COMMANDS, true));
+    }
+
+    (start, completion_pairs(prefix, SQL_KEYWORDS, false))
+}
+
+fn current_token_start(line: &str, pos: usize) -> usize {
+    line[..pos]
+        .rfind(char::is_whitespace)
+        .map(|idx| idx + 1)
+        .unwrap_or(0)
+}
+
+fn completion_pairs(prefix: &str, candidates: &[&str], case_insensitive: bool) -> Vec<Pair> {
+    let needle = if case_insensitive {
+        prefix.to_ascii_lowercase()
     } else {
-        let end = after_from
-            .find(|c: char| c.is_whitespace() || c == ';')
-            .unwrap_or(after_from.len());
-        Some(after_from[..end].to_string())
+        prefix.to_ascii_uppercase()
+    };
+
+    candidates
+        .iter()
+        .filter(|candidate| {
+            if case_insensitive {
+                candidate.to_ascii_lowercase().starts_with(&needle)
+            } else {
+                candidate.to_ascii_uppercase().starts_with(&needle)
+            }
+        })
+        .map(|candidate| Pair {
+            display: (*candidate).to_string(),
+            replacement: (*candidate).to_string(),
+        })
+        .collect()
+}
+
+fn parse_shell_command(input: &str) -> Result<Option<ShellCommand>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let Some(command) = parts.next() else {
+        return Ok(None);
+    };
+
+    let command = command.to_ascii_lowercase();
+    let parsed = match command.as_str() {
+        "\\quit" | "\\q" | "exit" | "quit" => Some(ShellCommand::Quit),
+        "\\help" | "\\h" | "help" => Some(ShellCommand::Help),
+        "\\clear" => Some(ShellCommand::Clear),
+        "\\tables" | "\\indices" => Some(ShellCommand::QueryShortcut("SHOW TABLES")),
+        "\\watch" => {
+            let interval = parse_watch_interval(parts.next())?;
+            if parts.next().is_some() {
+                bail!("Usage: \\watch [seconds]");
+            }
+            Some(ShellCommand::Watch(interval))
+        }
+        _ => None,
+    };
+
+    Ok(parsed)
+}
+
+fn parse_watch_interval(raw: Option<&str>) -> Result<Duration> {
+    let Some(raw) = raw else {
+        return Ok(Duration::from_secs_f64(DEFAULT_WATCH_INTERVAL_SECS));
+    };
+
+    let seconds: f64 = raw
+        .parse()
+        .with_context(|| format!("Invalid watch interval: {raw}"))?;
+
+    if !seconds.is_finite() || seconds <= 0.0 {
+        bail!("Watch interval must be a positive number of seconds");
+    }
+
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn format_watch_interval(interval: Duration) -> String {
+    let secs = interval.as_secs_f64();
+    if secs.fract() == 0.0 {
+        format!("{secs:.0}s")
+    } else {
+        format!("{secs:.1}s")
+    }
+}
+
+fn clear_screen() {
+    print!("\x1B[2J\x1B[H");
+    let _ = io::stdout().flush();
+}
+
+fn render_sql_response(body: &Value, elapsed: f64) {
+    let columns = body
+        .get("columns")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let rows = body
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(create_stmt) = body.get("create_statement") {
+        println!();
+        if let Some(index) = body.get("index").and_then(|v| v.as_str()) {
+            println!(
+                " {} {}",
+                "Index:".bright_white().bold(),
+                index.bright_cyan()
+            );
+        }
+        println!();
+        let pretty = serde_json::to_string_pretty(create_stmt).unwrap_or_default();
+        for line in pretty.lines() {
+            println!("   {}", line.dimmed());
+        }
+        println!();
+        println!(" {}", format!("{elapsed:.1}ms").bright_green().dimmed());
+        return;
+    }
+
+    render_table(&columns, &rows);
+    render_metadata(body, elapsed);
+}
+
+async fn execute_query_and_render(client: &FerrisClient, query: &str) -> Result<()> {
+    if let Some(inner_sql) = parse_explain(query) {
+        let Some(table) = extract_table_for_explain(&inner_sql) else {
+            bail!("Could not determine index from SQL. Use: EXPLAIN SELECT ... FROM \"index\" ...");
+        };
+
+        let (body, elapsed) = client.explain_sql(&inner_sql, &table).await?;
+        render_explain(&body, elapsed);
+        return Ok(());
+    }
+
+    let (body, elapsed) = client.execute_sql(query).await?;
+    render_sql_response(&body, elapsed);
+    Ok(())
+}
+
+async fn run_watch_mode(client: &FerrisClient, query: &str, interval: Duration) -> Result<()> {
+    loop {
+        clear_screen();
+        println!();
+        println!(
+            " {} {} {}",
+            "Watching".bright_white().bold(),
+            format_watch_interval(interval).bright_cyan(),
+            "Press Ctrl-C to stop.".dimmed()
+        );
+        println!(" {}", query.dimmed());
+
+        if let Err(err) = execute_query_and_render(client, query).await {
+            print_error(&err.to_string());
+        }
+
+        println!();
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!(" {}", "(watch stopped)".dimmed());
+                return Ok(());
+            }
+            _ = tokio::time::sleep(interval) => {}
+        }
     }
 }
 
@@ -563,11 +888,13 @@ async fn run_interactive(client: &FerrisClient) -> Result<()> {
 
     print_welcome(cluster_name, node_count, &client.connection_label());
 
-    let mut rl = DefaultEditor::new()?;
+    let mut rl = Editor::<CliEditorHelper, DefaultHistory>::with_config(line_editor_config())?;
+    rl.set_helper(Some(CliEditorHelper::default()));
     let history_path = dirs_home().join(".ferris_history");
     let _ = rl.load_history(&history_path);
 
     let mut buffer = String::new();
+    let mut last_successful_query: Option<String> = None;
 
     loop {
         let prompt = if buffer.is_empty() {
@@ -582,24 +909,36 @@ async fn run_interactive(client: &FerrisClient) -> Result<()> {
 
                 // Handle backslash commands immediately (no buffering)
                 if buffer.is_empty() {
-                    match trimmed.to_lowercase().as_str() {
-                        "\\quit" | "\\q" | "exit" | "quit" => {
+                    match parse_shell_command(trimmed) {
+                        Ok(Some(ShellCommand::Quit)) => {
                             println!(" {}", "Goodbye! 🦀".bright_yellow());
                             break;
                         }
-                        "\\help" | "\\h" | "help" => {
+                        Ok(Some(ShellCommand::Help)) => {
                             print_help();
                             continue;
                         }
-                        "\\clear" => {
-                            print!("\x1B[2J\x1B[H");
+                        Ok(Some(ShellCommand::Clear)) => {
+                            clear_screen();
                             continue;
                         }
-                        "\\tables" | "\\indices" => {
-                            // Shortcut for SHOW TABLES
-                            buffer = "SHOW TABLES".to_string();
+                        Ok(Some(ShellCommand::QueryShortcut(query))) => {
+                            buffer = query.to_string();
                         }
-                        _ => {}
+                        Ok(Some(ShellCommand::Watch(interval))) => {
+                            let Some(query) = last_successful_query.as_deref() else {
+                                print_error("No successful query to watch yet");
+                                continue;
+                            };
+                            run_watch_mode(client, query, interval).await?;
+                            println!();
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            print_error(&err.to_string());
+                            continue;
+                        }
                     }
                 }
 
@@ -617,79 +956,23 @@ async fn run_interactive(client: &FerrisClient) -> Result<()> {
                 }
 
                 let query = buffer.trim_end_matches(';').trim().to_string();
+                let history_entry = history_entry_for_buffer(&buffer);
                 buffer.clear();
 
                 if query.is_empty() {
                     continue;
                 }
 
-                let _ = rl.add_history_entry(&query);
+                if let Some(history_entry) = history_entry.as_deref() {
+                    let _ = rl.add_history_entry(history_entry);
+                }
 
                 // Auto-quote unquoted table names that contain hyphens
                 let query = auto_quote_table_names(&query);
 
-                // Execute
-                if let Some(inner_sql) = parse_explain(&query) {
-                    // EXPLAIN path
-                    if let Some(table) = extract_table_for_explain(&inner_sql) {
-                        match client.explain_sql(&inner_sql, &table).await {
-                            Ok((body, elapsed)) => render_explain(&body, elapsed),
-                            Err(e) => print_error(&e.to_string()),
-                        }
-                    } else {
-                        print_error(
-                            "Could not determine index from SQL. Use: EXPLAIN SELECT ... FROM \"index\" ...",
-                        );
-                    }
-                } else {
-                    // Regular SQL / SHOW / DESCRIBE
-                    match client.execute_sql(&query).await {
-                        Ok((body, elapsed)) => {
-                            // Extract columns and rows
-                            let columns = body
-                                .get("columns")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str().map(String::from))
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-
-                            let rows = body
-                                .get("rows")
-                                .and_then(|v| v.as_array())
-                                .cloned()
-                                .unwrap_or_default();
-
-                            // Special handling for SHOW CREATE TABLE
-                            if let Some(create_stmt) = body.get("create_statement") {
-                                println!();
-                                if let Some(index) = body.get("index").and_then(|v| v.as_str()) {
-                                    println!(
-                                        " {} {}",
-                                        "Index:".bright_white().bold(),
-                                        index.bright_cyan()
-                                    );
-                                }
-                                println!();
-                                let pretty =
-                                    serde_json::to_string_pretty(create_stmt).unwrap_or_default();
-                                for line in pretty.lines() {
-                                    println!("   {}", line.dimmed());
-                                }
-                                println!();
-                                println!(
-                                    " {}",
-                                    format!("{:.1}ms", elapsed).bright_green().dimmed()
-                                );
-                            } else {
-                                render_table(&columns, &rows);
-                                render_metadata(&body, elapsed);
-                            }
-                        }
-                        Err(e) => print_error(&e.to_string()),
-                    }
+                match execute_query_and_render(client, &query).await {
+                    Ok(()) => last_successful_query = Some(query),
+                    Err(err) => print_error(&err.to_string()),
                 }
                 println!();
             }
@@ -721,6 +1004,24 @@ fn is_instant_command(input: &str) -> bool {
         || upper.starts_with("DESC ")
         || upper == "SHOW TABLES"
         || upper == "SHOW INDICES"
+}
+
+fn history_entry_for_buffer(buffer: &str) -> Option<String> {
+    let trimmed = buffer.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let query = trimmed.trim_end_matches(';').trim();
+    if query.is_empty() {
+        return None;
+    }
+
+    if trimmed.ends_with(';') {
+        Some(format!("{};", query))
+    } else {
+        Some(query.to_string())
+    }
 }
 
 /// Auto-quote unquoted table names that contain hyphens so the SQL parser
@@ -798,46 +1099,7 @@ fn dirs_home() -> std::path::PathBuf {
 
 async fn run_single_command(client: &FerrisClient, query: &str) -> Result<()> {
     let query = auto_quote_table_names(query);
-    if let Some(inner_sql) = parse_explain(&query) {
-        if let Some(table) = extract_table_for_explain(&inner_sql) {
-            let (body, elapsed) = client.explain_sql(&inner_sql, &table).await?;
-            render_explain(&body, elapsed);
-        } else {
-            bail!("Could not determine index from SQL");
-        }
-    } else {
-        let (body, elapsed) = client.execute_sql(&query).await?;
-
-        let columns = body
-            .get("columns")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let rows = body
-            .get("rows")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        if let Some(create_stmt) = body.get("create_statement") {
-            if let Some(index) = body.get("index").and_then(|v| v.as_str()) {
-                println!("Index: {}", index);
-            }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(create_stmt).unwrap_or_default()
-            );
-        } else {
-            render_table(&columns, &rows);
-            render_metadata(&body, elapsed);
-        }
-    }
-    Ok(())
+    execute_query_and_render(client, &query).await
 }
 
 #[tokio::main]
@@ -855,6 +1117,114 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_editor_config_uses_emacs_mode() {
+        assert_eq!(line_editor_config().edit_mode(), EditMode::Emacs);
+    }
+
+    #[test]
+    fn editor_shortcuts_include_reverse_search() {
+        assert!(editor_shortcuts().iter().any(|(shortcut, description)| {
+            *shortcut == "Ctrl-R" && description.contains("reverse-search")
+        }));
+        assert!(format_shortcut_hint().contains("Ctrl-R reverse-search query history"));
+        assert!(format_shortcut_hint().contains("Tab complete commands and SQL keywords"));
+    }
+
+    #[test]
+    fn parse_watch_interval_defaults_to_two_seconds() {
+        assert_eq!(
+            parse_watch_interval(None).unwrap(),
+            Duration::from_secs_f64(DEFAULT_WATCH_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn parse_watch_interval_accepts_fractional_seconds() {
+        assert_eq!(
+            parse_watch_interval(Some("0.5")).unwrap(),
+            Duration::from_secs_f64(0.5)
+        );
+    }
+
+    #[test]
+    fn parse_watch_interval_rejects_non_positive_values() {
+        assert!(parse_watch_interval(Some("0")).is_err());
+        assert!(parse_watch_interval(Some("-1")).is_err());
+    }
+
+    #[test]
+    fn parse_shell_command_handles_watch_and_shortcuts() {
+        assert_eq!(
+            parse_shell_command("\\watch 1.5").unwrap(),
+            Some(ShellCommand::Watch(Duration::from_secs_f64(1.5)))
+        );
+        assert_eq!(
+            parse_shell_command("\\tables").unwrap(),
+            Some(ShellCommand::QueryShortcut("SHOW TABLES"))
+        );
+        assert_eq!(
+            parse_shell_command("quit").unwrap(),
+            Some(ShellCommand::Quit)
+        );
+    }
+
+    #[test]
+    fn parse_shell_command_rejects_invalid_watch_usage() {
+        assert!(parse_shell_command("\\watch nope").is_err());
+        assert!(parse_shell_command("\\watch 1 extra").is_err());
+    }
+
+    #[test]
+    fn complete_input_suggests_shell_commands() {
+        let (start, pairs) = complete_input("\\wa", 3);
+        assert_eq!(start, 0);
+        assert!(pairs.iter().any(|pair| pair.replacement == "\\watch"));
+    }
+
+    #[test]
+    fn complete_input_suggests_sql_keywords_case_insensitively() {
+        let (start, pairs) = complete_input("select co", 9);
+        assert_eq!(start, 7);
+        assert!(pairs.iter().any(|pair| pair.replacement == "COUNT"));
+    }
+
+    #[test]
+    fn complete_input_does_not_complete_watch_arguments_as_commands() {
+        let (_, pairs) = complete_input("\\watch 2", 8);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn history_entry_preserves_trailing_semicolon_for_sql() {
+        assert_eq!(
+            history_entry_for_buffer("SELECT * FROM movies;"),
+            Some("SELECT * FROM movies;".to_string())
+        );
+        assert_eq!(
+            history_entry_for_buffer("SELECT * FROM movies;;;"),
+            Some("SELECT * FROM movies;".to_string())
+        );
+    }
+
+    #[test]
+    fn history_entry_keeps_instant_commands_without_semicolon() {
+        assert_eq!(
+            history_entry_for_buffer("SHOW TABLES"),
+            Some("SHOW TABLES".to_string())
+        );
+        assert_eq!(
+            history_entry_for_buffer("   DESCRIBE movies   "),
+            Some("DESCRIBE movies".to_string())
+        );
+    }
+
+    #[test]
+    fn history_entry_ignores_empty_buffer() {
+        assert_eq!(history_entry_for_buffer("   "), None);
+        assert_eq!(history_entry_for_buffer(";;;"), None);
+    }
 
     // ── parse_explain ──────────────────────────────────────────────
 
@@ -983,6 +1353,15 @@ mod tests {
         assert_eq!(
             extract_table_for_explain("SELECT title FROM hackernews WHERE title = 'from 2024'"),
             Some("hackernews".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_multiline_query() {
+        let query = "SELECT category,\n       COUNT(*) AS products\nFROM \"benchmark-1gb\"\nWHERE price > 200";
+        assert_eq!(
+            extract_table_for_explain(query),
+            Some("benchmark-1gb".to_string())
         );
     }
 
@@ -1131,6 +1510,17 @@ mod tests {
         );
         let table =
             extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");
+        assert_eq!(table, "benchmark-1gb");
+    }
+
+    #[test]
+    fn e2e_multiline_explain_analyze_query() {
+        let input = "EXPLAIN ANALYZE\nSELECT category, in_stock, COUNT(*) AS products, AVG(price) AS avg_price\nFROM 'benchmark-1gb'\nWHERE price > 200\nGROUP BY category, in_stock\nORDER BY category, in_stock";
+        let quoted = auto_quote_table_names(input);
+        let inner_sql = parse_explain(&quoted)
+            .expect("parse_explain should succeed for multiline EXPLAIN ANALYZE SELECT");
+        let table = extract_table_for_explain(&inner_sql)
+            .expect("extract_table should find benchmark-1gb in multiline query");
         assert_eq!(table, "benchmark-1gb");
     }
 

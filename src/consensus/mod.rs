@@ -22,6 +22,20 @@ use state_machine::ClusterStateMachine;
 use store::MemLogStore;
 use types::RaftInstance;
 
+pub(crate) const RAFT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+pub(crate) const RAFT_ELECTION_TIMEOUT_MIN_MS: u64 = 3_000;
+pub(crate) const RAFT_ELECTION_TIMEOUT_MAX_MS: u64 = 6_000;
+
+pub(crate) fn default_raft_config(cluster_name: String) -> Config {
+    Config {
+        cluster_name,
+        heartbeat_interval: RAFT_HEARTBEAT_INTERVAL_MS,
+        election_timeout_min: RAFT_ELECTION_TIMEOUT_MIN_MS,
+        election_timeout_max: RAFT_ELECTION_TIMEOUT_MAX_MS,
+        ..Default::default()
+    }
+}
+
 /// Create a new Raft instance and return it together with a shared handle to
 /// the cluster state managed by the Raft state machine.
 ///
@@ -38,13 +52,7 @@ pub async fn create_raft_instance(
     cluster_name: String,
     data_dir: &str,
 ) -> anyhow::Result<(Arc<RaftInstance>, Arc<RwLock<ClusterState>>)> {
-    let config = Config {
-        cluster_name: cluster_name.clone(),
-        heartbeat_interval: 500,
-        election_timeout_min: 1500,
-        election_timeout_max: 3000,
-        ..Default::default()
-    };
+    let config = default_raft_config(cluster_name.clone());
 
     let state_machine = ClusterStateMachine::new(cluster_name);
     let state_handle = state_machine.state_handle();
@@ -68,13 +76,7 @@ pub async fn create_raft_instance_mem(
     node_id: u64,
     cluster_name: String,
 ) -> anyhow::Result<(Arc<RaftInstance>, Arc<RwLock<ClusterState>>)> {
-    let config = Config {
-        cluster_name: cluster_name.clone(),
-        heartbeat_interval: 500,
-        election_timeout_min: 1500,
-        election_timeout_max: 3000,
-        ..Default::default()
-    };
+    let config = default_raft_config(cluster_name.clone());
 
     let state_machine = ClusterStateMachine::new(cluster_name);
     let state_handle = state_machine.state_handle();
@@ -100,4 +102,18 @@ pub async fn bootstrap_single_node(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bootstrap Raft cluster: {}", e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_raft_config_uses_less_aggressive_timeouts() {
+        let config = default_raft_config("test".to_string());
+
+        assert_eq!(config.heartbeat_interval, RAFT_HEARTBEAT_INTERVAL_MS);
+        assert_eq!(config.election_timeout_min, RAFT_ELECTION_TIMEOUT_MIN_MS);
+        assert_eq!(config.election_timeout_max, RAFT_ELECTION_TIMEOUT_MAX_MS);
+    }
 }
