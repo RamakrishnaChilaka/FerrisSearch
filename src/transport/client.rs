@@ -4,6 +4,8 @@ use crate::cluster::state::{ClusterState, NodeInfo};
 use crate::transport::proto::internal_transport_client::InternalTransportClient;
 use crate::transport::proto::*;
 use crate::transport::server::{cluster_state_to_proto, proto_to_cluster_state};
+use datafusion::arrow::record_batch::RecordBatch;
+use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -29,6 +31,46 @@ pub trait TlsConnector: Send + Sync {
         &self,
         endpoint: tonic::transport::Endpoint,
     ) -> Result<tonic::transport::Endpoint, tonic::transport::Error>;
+}
+
+pub struct SqlBatchStream {
+    first_batch: Option<RecordBatch>,
+    total_hits: usize,
+    inner: tonic::Streaming<SqlRecordBatchResponse>,
+}
+
+impl SqlBatchStream {
+    pub fn total_hits(&self) -> usize {
+        self.total_hits
+    }
+
+    pub fn into_stream(
+        self,
+    ) -> impl futures::Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static {
+        futures::stream::try_unfold(
+            (self.first_batch, self.inner, self.total_hits),
+            |(first_batch, mut inner, total_hits)| async move {
+                if let Some(batch) = first_batch {
+                    return Ok(Some((batch, (None, inner, total_hits))));
+                }
+
+                match inner.message().await? {
+                    Some(response) => {
+                        let (batch, hits) = decode_sql_batch_response(response)?;
+                        if hits != total_hits {
+                            return Err(anyhow::anyhow!(
+                                "Shard SQL batch stream returned inconsistent hit counts: {} vs {}",
+                                total_hits,
+                                hits
+                            ));
+                        }
+                        Ok(Some((batch, (None, inner, total_hits))))
+                    }
+                    None => Ok(None),
+                }
+            },
+        )
+    }
 }
 
 impl Default for TransportClient {
@@ -134,9 +176,18 @@ impl TransportClient {
                     match client.join_cluster(request).await {
                         Ok(response) => {
                             if let Some(state) = response.into_inner().state {
-                                let cs = proto_to_cluster_state(&state);
-                                info!("Successfully joined cluster via {}", host);
-                                return Some(cs);
+                                match proto_to_cluster_state(&state) {
+                                    Ok(cs) => {
+                                        info!("Successfully joined cluster via {}", host);
+                                        return Some(cs);
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Join response from {} contained invalid cluster snapshot: {}",
+                                            host, e
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(e) => debug!("Join RPC to {} failed: {}", host, e),
@@ -374,17 +425,76 @@ impl TransportClient {
             columns: columns.to_vec(),
             needs_id,
             needs_score,
+            batch_size: 0,
         });
         let response = client.sql_record_batch(request).await?.into_inner();
-        if response.success {
-            let batch = crate::hybrid::arrow_bridge::record_batch_from_ipc(&response.arrow_ipc)?;
-            Ok((batch, response.total_hits as usize))
-        } else {
-            Err(anyhow::anyhow!(
-                "Shard SQL batch failed: {}",
-                response.error
-            ))
-        }
+        decode_sql_batch_response(response)
+    }
+
+    /// Forward a streaming SQL RecordBatch request to a specific shard.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_sql_batch_stream_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
+        batch_size: usize,
+    ) -> Result<(Vec<RecordBatch>, usize), anyhow::Error> {
+        let stream = self
+            .open_sql_batch_stream_to_shard(
+                node,
+                index_name,
+                shard_id,
+                req,
+                columns,
+                needs_id,
+                needs_score,
+                batch_size,
+            )
+            .await?;
+        let hits = stream.total_hits();
+        let batches = stream.into_stream().try_collect().await?;
+        Ok((batches, hits))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_sql_batch_stream_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
+        batch_size: usize,
+    ) -> Result<SqlBatchStream, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(SqlRecordBatchRequest {
+            index_name: index_name.to_string(),
+            shard_id,
+            search_request_json: serde_json::to_vec(req)?,
+            columns: columns.to_vec(),
+            needs_id,
+            needs_score,
+            batch_size: batch_size as u32,
+        });
+        let mut stream = client.sql_record_batch_stream(request).await?.into_inner();
+        let Some(first_response) = stream.message().await? else {
+            return Err(anyhow::anyhow!(
+                "Shard SQL batch stream returned no batches"
+            ));
+        };
+        let (first_batch, total_hits) = decode_sql_batch_response(first_response)?;
+        Ok(SqlBatchStream {
+            first_batch: Some(first_batch),
+            total_hits,
+            inner: stream,
+        })
     }
 
     /// Sends a heartbeat ping to another node
@@ -671,6 +781,20 @@ impl TransportClient {
     }
 }
 
+fn decode_sql_batch_response(
+    response: SqlRecordBatchResponse,
+) -> Result<(RecordBatch, usize), anyhow::Error> {
+    if !response.success {
+        return Err(anyhow::anyhow!(
+            "Shard SQL batch failed: {}",
+            response.error
+        ));
+    }
+
+    let batch = crate::hybrid::arrow_bridge::record_batch_from_ipc(&response.arrow_ipc)?;
+    Ok((batch, response.total_hits as usize))
+}
+
 fn decode_search_hits(hits: &[SearchHit]) -> Result<Vec<serde_json::Value>, anyhow::Error> {
     hits.iter()
         .map(|hit| serde_json::from_slice(&hit.source_json).map_err(anyhow::Error::from))
@@ -702,12 +826,60 @@ fn node_info_to_proto(n: &NodeInfo) -> crate::transport::proto::NodeInfo {
                 crate::cluster::state::NodeRole::Client => "client".into(),
             })
             .collect(),
+        raft_node_id: n.raft_node_id,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn decode_sql_batch_response_round_trips_arrow_ipc() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![3_i64, 7_i64]))])
+                .expect("record batch");
+
+        let response = SqlRecordBatchResponse {
+            success: true,
+            arrow_ipc: crate::hybrid::arrow_bridge::record_batch_to_ipc(&batch)
+                .expect("encode batch"),
+            total_hits: 9,
+            error: String::new(),
+        };
+
+        let (decoded, hits) = decode_sql_batch_response(response).expect("decode batch");
+        assert_eq!(hits, 9);
+        assert_eq!(decoded.num_rows(), 2);
+        let values = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 column");
+        assert_eq!(values.value(0), 3);
+        assert_eq!(values.value(1), 7);
+    }
+
+    #[test]
+    fn decode_sql_batch_response_returns_rpc_error() {
+        let err = decode_sql_batch_response(SqlRecordBatchResponse {
+            success: false,
+            arrow_ipc: vec![],
+            total_hits: 0,
+            error: "boom".to_string(),
+        })
+        .expect_err("unsuccessful response should fail");
+
+        assert!(err.to_string().contains("boom"));
+    }
 
     #[test]
     fn new_client_has_empty_cache() {

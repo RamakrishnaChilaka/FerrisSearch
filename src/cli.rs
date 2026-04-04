@@ -115,6 +115,95 @@ struct FerrisClient {
     port: u16,
 }
 
+#[derive(Default)]
+struct SqlStreamAccumulator {
+    meta: Option<Value>,
+    rows: Vec<Value>,
+}
+
+impl SqlStreamAccumulator {
+    fn push_frame(&mut self, mut frame: Value) -> Result<()> {
+        let Some(frame_type) = frame.get("type").and_then(|value| value.as_str()) else {
+            bail!("Malformed SQL stream frame: missing type");
+        };
+
+        match frame_type {
+            "meta" => {
+                if self.meta.is_some() {
+                    bail!("Malformed SQL stream: duplicate meta frame");
+                }
+
+                let object = frame
+                    .as_object_mut()
+                    .context("Malformed SQL stream meta frame: expected object")?;
+                object.remove("type");
+                self.meta = Some(frame);
+                Ok(())
+            }
+            "rows" => {
+                if self.meta.is_none() {
+                    bail!("Malformed SQL stream: rows frame received before meta");
+                }
+
+                let rows = frame
+                    .get("rows")
+                    .and_then(|value| value.as_array())
+                    .context("Malformed SQL stream rows frame: missing rows array")?;
+                self.rows.extend(rows.iter().cloned());
+                Ok(())
+            }
+            "error" => {
+                let reason = frame
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Unknown streamed SQL error");
+                bail!("{}", reason);
+            }
+            other => bail!("Malformed SQL stream frame: unknown type [{other}]"),
+        }
+    }
+
+    fn finish(mut self) -> Result<Value> {
+        let Some(mut meta) = self.meta.take() else {
+            bail!("SQL stream ended before a meta frame was received");
+        };
+
+        let object = meta
+            .as_object_mut()
+            .context("Malformed SQL stream meta frame: expected object")?;
+        object.insert("rows".to_string(), Value::Array(self.rows));
+        Ok(meta)
+    }
+}
+
+fn drain_ndjson_frames(buffer: &mut Vec<u8>) -> Result<Vec<Value>> {
+    let mut frames = Vec::new();
+
+    while let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=newline_pos).collect();
+        let payload = &line[..line.len() - 1];
+        if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+
+        let frame = serde_json::from_slice(payload).context("Failed to parse SQL stream frame")?;
+        frames.push(frame);
+    }
+
+    Ok(frames)
+}
+
+fn finish_ndjson_frames(buffer: &mut Vec<u8>) -> Result<Vec<Value>> {
+    let mut frames = drain_ndjson_frames(buffer)?;
+    if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        let frame =
+            serde_json::from_slice(buffer).context("Failed to parse trailing SQL stream frame")?;
+        frames.push(frame);
+    }
+    buffer.clear();
+    Ok(frames)
+}
+
 impl FerrisClient {
     fn new(host: &str, port: u16) -> Self {
         let client = Client::builder()
@@ -145,25 +234,51 @@ impl FerrisClient {
 
     async fn execute_sql(&self, query: &str) -> Result<(Value, f64)> {
         let start = Instant::now();
-        let resp = self
+        let mut resp = self
             .client
-            .post(format!("{}/_sql", self.base_url))
+            .post(format!("{}/_sql/stream", self.base_url))
             .json(&serde_json::json!({"query": query}))
             .send()
             .await
             .context("Query execution failed")?;
-
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         let status = resp.status();
-        let body: Value = resp.json().await.context("Failed to parse response")?;
 
         if !status.is_success() {
-            let reason = body
-                .pointer("/error/reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown error");
+            let text = resp.text().await.unwrap_or_default();
+            let reason = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|body| {
+                    body.pointer("/error/reason")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| {
+                    if text.is_empty() {
+                        format!("HTTP {}", status)
+                    } else {
+                        let preview: String = text.chars().take(200).collect();
+                        format!("HTTP {}: {}", status, preview)
+                    }
+                });
             bail!("{}", reason);
         }
+
+        let mut stream = SqlStreamAccumulator::default();
+        let mut buffer = Vec::new();
+
+        while let Some(chunk) = resp.chunk().await.context("Failed to read SQL stream")? {
+            buffer.extend_from_slice(&chunk);
+            for frame in drain_ndjson_frames(&mut buffer)? {
+                stream.push_frame(frame)?;
+            }
+        }
+
+        for frame in finish_ndjson_frames(&mut buffer)? {
+            stream.push_frame(frame)?;
+        }
+
+        let body = stream.finish()?;
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
         Ok((body, elapsed))
     }
@@ -403,6 +518,18 @@ fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
+fn uses_bitset_collector(body: &Value) -> bool {
+    body.get("streaming_used").and_then(|v| v.as_bool()) == Some(true)
+}
+
+fn metadata_collector_label(body: &Value) -> Option<&'static str> {
+    if uses_bitset_collector(body) {
+        Some("collector: bitset")
+    } else {
+        None
+    }
+}
+
 fn render_metadata(body: &Value, client_ms: f64) {
     let mut parts = Vec::new();
 
@@ -423,8 +550,8 @@ fn render_metadata(body: &Value, client_ms: f64) {
         parts.push(format!("mode: {}", mode_colored));
     }
 
-    if body.get("streaming_used").and_then(|v| v.as_bool()) == Some(true) {
-        parts.push(format!("streaming: {}", "bitset".bright_cyan()));
+    if metadata_collector_label(body).is_some() {
+        parts.push(format!("collector: {}", "bitset".bright_cyan()));
     }
 
     // Matched hits
@@ -488,11 +615,11 @@ fn render_explain(body: &Value, client_ms: f64) {
         println!(" {} {}", "Execution Mode:".bright_white(), mode_colored);
     }
 
-    if body.get("streaming_used").and_then(|v| v.as_bool()) == Some(true) {
+    if uses_bitset_collector(body) {
         println!(
             " {} {}",
-            "Bitset Streaming:".bright_white(),
-            "used".bright_cyan().bold()
+            "Shard Collector:".bright_white(),
+            "bitset".bright_cyan().bold()
         );
     }
 
@@ -1569,5 +1696,108 @@ mod tests {
     #[test]
     fn truncate_empty_string() {
         assert_eq!(truncate_string("", 10), "");
+    }
+
+    #[test]
+    fn drain_ndjson_frames_handles_chunk_boundaries() {
+        let mut buffer = br#"{"type":"meta","columns":["brand"]}"#.to_vec();
+        assert!(drain_ndjson_frames(&mut buffer).unwrap().is_empty());
+
+        buffer.extend_from_slice(b"\n{\"type\":\"rows\",\"rows\":[{\"brand\":\"Apple\"}]}");
+
+        let frames = drain_ndjson_frames(&mut buffer).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], serde_json::json!("meta"));
+        assert!(!buffer.is_empty());
+
+        buffer.extend_from_slice(b"\n");
+        let frames = finish_ndjson_frames(&mut buffer).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], serde_json::json!("rows"));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn sql_stream_accumulator_merges_meta_and_rows() {
+        let mut stream = SqlStreamAccumulator::default();
+        stream
+            .push_frame(serde_json::json!({
+                "type": "meta",
+                "execution_mode": "tantivy_fast_fields",
+                "columns": ["brand"],
+                "streaming_used": true,
+            }))
+            .unwrap();
+        stream
+            .push_frame(serde_json::json!({
+                "type": "rows",
+                "rows": [{"brand": "Apple"}],
+            }))
+            .unwrap();
+        stream
+            .push_frame(serde_json::json!({
+                "type": "rows",
+                "rows": [{"brand": "Samsung"}],
+            }))
+            .unwrap();
+
+        let body = stream.finish().unwrap();
+        assert_eq!(
+            body["execution_mode"],
+            serde_json::json!("tantivy_fast_fields")
+        );
+        assert_eq!(
+            body["rows"],
+            serde_json::json!([
+                {"brand": "Apple"},
+                {"brand": "Samsung"}
+            ])
+        );
+        assert!(body.get("type").is_none());
+    }
+
+    #[test]
+    fn sql_stream_accumulator_rejects_rows_before_meta() {
+        let mut stream = SqlStreamAccumulator::default();
+        assert!(
+            stream
+                .push_frame(serde_json::json!({
+                    "type": "rows",
+                    "rows": [{"brand": "Apple"}],
+                }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sql_stream_accumulator_surfaces_error_frames() {
+        let mut stream = SqlStreamAccumulator::default();
+        let error = stream
+            .push_frame(serde_json::json!({
+                "type": "error",
+                "reason": "stream failed",
+            }))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "stream failed");
+    }
+
+    #[test]
+    fn metadata_collector_label_is_bitset_when_streaming_used() {
+        let body = serde_json::json!({
+            "streaming_used": true,
+        });
+
+        assert!(uses_bitset_collector(&body));
+        assert_eq!(metadata_collector_label(&body), Some("collector: bitset"));
+    }
+
+    #[test]
+    fn metadata_collector_label_is_none_when_streaming_unused() {
+        let body = serde_json::json!({
+            "streaming_used": false,
+        });
+
+        assert!(!uses_bitset_collector(&body));
+        assert_eq!(metadata_collector_label(&body), None);
     }
 }

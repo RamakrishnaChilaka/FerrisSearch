@@ -114,11 +114,14 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | POST | `/{index}/_search` | `search_documents_dsl()` — DSL body (SearchRequest) |
 | GET/POST | `/{index}/_count` | `count_documents()` — document count (match_all or query body) |
 | POST | `/{index}/_sql` | `search_sql()` — SQL over matched docs with planner metadata and execution mode |
+| POST | `/{index}/_sql/stream` | `search_sql_stream()` — NDJSON SQL stream (`meta` frame then `rows` frames) |
 | POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan; with `"analyze": true`, execute and return plan + per-stage timings + rows |
 | POST | `/_sql` | `global_sql()` — global SQL endpoint: SHOW TABLES, DESCRIBE, SHOW CREATE TABLE, and SELECT (index auto-extracted from FROM clause) |
+| POST | `/_sql/stream` | `global_sql_stream()` — global NDJSON SQL stream endpoint |
 
 ### Global SQL Endpoint
 - `POST /_sql` handles SQL commands that don't require an index in the URL path.
+- `POST /_sql/stream` exposes the same commands over `application/x-ndjson`, emitting one `meta` frame followed by zero or more `rows` frames.
 - Supported commands:
     - `SHOW TABLES` / `SHOW INDICES` — lists all indices with doc counts, shards, replicas, field count
     - `DESCRIBE <index>` / `DESC <index>` — shows field names and types for an index
@@ -129,7 +132,9 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 
 ### SQL Endpoint Expectations
 - `POST /{index}/_sql` must remain coordinator-safe like other search endpoints.
+- `POST /{index}/_sql/stream` must keep the same coordinator-safe routing semantics as `POST /{index}/_sql`; only the HTTP response format changes.
 - `POST /{index}/_sql/explain` returns the query plan without executing it — validates SQL, shows pushdown decisions, execution strategy, rewritten SQL, and the full pipeline stages.
+- Streamed SQL responses use `application/x-ndjson` with a first `meta` frame and subsequent `rows` frames. Execution metadata (`execution_mode`, `streaming_used`, `planner`, `_shards`, `matched_hits`, `columns`, `truncated`) stays in the `meta` frame.
 - With `"analyze": true`, `explain_sql` executes the query fully and returns the plan JSON enriched with:
     - `timings` object: `planning_ms`, `search_ms`, `collect_ms`, `merge_ms`, `datafusion_ms`, `total_ms` (fractional milliseconds)
     - `rows` and `row_count`: the actual query results

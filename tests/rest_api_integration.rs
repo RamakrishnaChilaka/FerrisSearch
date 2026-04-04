@@ -157,6 +157,18 @@ impl RestTestHarness {
         Ok((status, value))
     }
 
+    async fn post_json_text(&self, path: &str, body: Value) -> Result<(StatusCode, String)> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        Ok((status, text))
+    }
+
     async fn get_json(&self, path: &str) -> Result<(StatusCode, Value)> {
         let response = self
             .client
@@ -1329,6 +1341,103 @@ async fn rest_sql_expression_group_by_uses_fast_fields_fallback() -> Result<()> 
 
     let rows = body["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 2, "should have 2 groups: apple and samsung");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_stream_endpoint_returns_ndjson_frames() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json_text(
+            "/products/_sql/stream",
+            json!({
+                "query": "SELECT LOWER(brand) AS brand_lower, count(*) AS cnt FROM products GROUP BY LOWER(brand) ORDER BY brand_lower ASC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let frames: Vec<Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<_, _>>()?;
+
+    assert!(!frames.is_empty(), "expected at least one NDJSON frame");
+    assert_eq!(frames[0]["type"], json!("meta"));
+    assert_eq!(frames[0]["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(frames[0]["streaming_used"], json!(true));
+
+    let rows: Vec<Value> = frames
+        .iter()
+        .skip(1)
+        .flat_map(|frame| {
+            frame["rows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .collect();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["brand_lower"], json!("apple"));
+    assert_eq!(rows[0]["cnt"], json!(2));
+    assert_eq!(rows[1]["brand_lower"], json!("samsung"));
+    assert_eq!(rows[1]["cnt"], json!(1));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_global_sql_stream_endpoint_routes_select_queries() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json_text(
+            "/_sql/stream",
+            json!({
+                "query": "SELECT brand, price FROM \"products\" ORDER BY brand ASC, price DESC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let frames: Vec<Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<_, _>>()?;
+
+    assert!(!frames.is_empty(), "expected at least one NDJSON frame");
+    assert_eq!(frames[0]["type"], json!("meta"));
+    assert_eq!(frames[0]["execution_mode"], json!("tantivy_fast_fields"));
+
+    let rows: Vec<Value> = frames
+        .iter()
+        .skip(1)
+        .flat_map(|frame| {
+            frame["rows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .collect();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["brand"], json!("Apple"));
+    assert_eq!(rows[0]["price"], json!(999.0));
+    assert_eq!(rows[1]["brand"], json!("Apple"));
+    assert_eq!(rows[1]["price"], json!(899.0));
+    assert_eq!(rows[2]["brand"], json!("Samsung"));
+    assert_eq!(rows[2]["price"], json!(799.0));
 
     Ok(())
 }

@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **767 unit tests** (`cargo test --lib`)
-- **55 CLI tests** (`cargo test --bin ferris-cli`)
-- **30 consensus integration tests** (`cargo test --test consensus_integration`)
-- **39 replication integration tests** (`cargo test --test replication_integration`)
-- **22 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **780 unit tests** (`cargo test --lib`)
+- **61 CLI tests** (`cargo test --bin ferris-cli`)
+- **33 consensus integration tests** (`cargo test --test consensus_integration`)
+- **40 replication integration tests** (`cargo test --test replication_integration`)
+- **24 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 163 assertions across 4 files
-- **914 total** (`cargo test`)
+- **939 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -27,10 +27,14 @@ cargo test -- test_name                         # Single test by name
 - Test every code path: happy path, edge cases, error conditions, empty inputs
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For `ferris-cli` interactive features, test command parsing and completion token boundaries in pure helpers; keep watch-mode behavior factored so the logic is covered without relying on terminal I/O in tests.
+- For streamed `ferris-cli` SQL changes, add pure chunk-boundary NDJSON parsing tests and at least one REST integration test covering the global `POST /_sql/stream` route the console uses.
 - For feature-gated transport TLS changes, run both `cargo test --lib` and `cargo test --lib --features transport-tls`; enabling TLS without the feature must error instead of silently downgrading to plaintext.
 - For transport TLS end-to-end coverage, also run `cargo test --test replication_integration --features transport-tls`.
 - For SQL fast-field string changes, add regressions for both `sql_record_batch()` and `sql_streaming_batches()` that assert `_id` and keyword values survive the optimized ordinal path.
+- For streamed shard SQL transport changes, add a real gRPC integration test that forces multiple Arrow batches from `forward_sql_batch_stream_to_shard()` / `SqlRecordBatchStream`, not just unit tests around IPC decoding.
+- For JoinCluster or cluster-state transport fixes, add one roundtrip regression that proves `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` survive proto conversion, one regression that unknown field types fail snapshot decoding instead of being coerced, plus concurrent gRPC regressions for duplicate `raft_node_id` rejection and full voter-set preservation across overlapping joins.
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
+- For node startup/rejoin cleanup changes, add tempdir regressions that prove empty pre-catch-up state does not delete live UUID directories, and that authoritative UUID sets still remove true orphaned directories.
 
 ## Integration Test Infrastructure
 ### Consensus Tests (tests/consensus_integration.rs)

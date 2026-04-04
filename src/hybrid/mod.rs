@@ -60,6 +60,49 @@ pub async fn execute_planned_sql_batches(
     datafusion_exec::execute_sql_batches(plan, batches).await
 }
 
+pub async fn execute_planned_sql_batches_stream(
+    plan: &QueryPlan,
+    batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+) -> Result<(
+    Vec<String>,
+    datafusion::physical_plan::SendableRecordBatchStream,
+)> {
+    datafusion_exec::execute_sql_batches_stream(plan, batches).await
+}
+
+pub async fn execute_planned_sql_partition_streams(
+    plan: &QueryPlan,
+    schema: std::sync::Arc<datafusion::arrow::datatypes::Schema>,
+    partitions: Vec<std::sync::Arc<dyn datafusion::physical_plan::streaming::PartitionStream>>,
+) -> Result<(
+    Vec<String>,
+    datafusion::physical_plan::SendableRecordBatchStream,
+)> {
+    datafusion_exec::execute_sql_partition_streams(plan, schema, partitions).await
+}
+
+pub fn direct_sql_input_schema(
+    plan: &QueryPlan,
+    mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<std::sync::Arc<datafusion::arrow::datatypes::Schema>> {
+    datafusion_exec::direct_sql_input_schema(plan, mappings)
+}
+
+pub fn normalize_sql_batch_for_schema(
+    batch: datafusion::arrow::record_batch::RecordBatch,
+    plan: &QueryPlan,
+    target_schema: &std::sync::Arc<datafusion::arrow::datatypes::Schema>,
+) -> Result<datafusion::arrow::record_batch::RecordBatch> {
+    datafusion_exec::normalize_sql_batch_for_schema(batch, plan, target_schema)
+}
+
+pub fn one_shot_partition_stream(
+    schema: std::sync::Arc<datafusion::arrow::datatypes::Schema>,
+    stream: datafusion::physical_plan::SendableRecordBatchStream,
+) -> std::sync::Arc<dyn datafusion::physical_plan::streaming::PartitionStream> {
+    datafusion_exec::one_shot_partition_stream(schema, stream)
+}
+
 pub fn execute_grouped_partial_sql(
     plan: &QueryPlan,
     partials: &[std::collections::HashMap<String, crate::search::PartialAggResult>],

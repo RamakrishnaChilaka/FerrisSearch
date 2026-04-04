@@ -14,9 +14,11 @@ use ferrissearch::transport::proto::{
 };
 use ferrissearch::transport::server::create_transport_service_with_raft;
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Barrier;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -898,6 +900,33 @@ async fn start_raft_grpc_server(
     addr
 }
 
+async fn start_raft_follower_grpc_server(
+    raft: Arc<consensus::types::RaftInstance>,
+    state_handle: Arc<std::sync::RwLock<ferrissearch::cluster::state::ClusterState>>,
+    local_node_id: &str,
+) -> std::net::SocketAddr {
+    let cm = Arc::new(ClusterManager::with_shared_state(state_handle));
+    let dir = tempfile::tempdir().unwrap();
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let tc = TransportClient::new();
+    let service = create_transport_service_with_raft(cm, sm, tc, raft, local_node_id.into());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+        let _ = dir;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
 async fn connect_grpc(
     addr: std::net::SocketAddr,
 ) -> InternalTransportClient<tonic::transport::Channel> {
@@ -964,6 +993,7 @@ async fn grpc_join_cluster_refreshes_existing_voter_registration() {
             transport_port: 19370,
             http_port: 19270,
             roles: vec!["master".into(), "data".into()],
+            raft_node_id: 1,
         }),
         raft_node_id: 1,
     };
@@ -998,6 +1028,237 @@ async fn grpc_join_cluster_refreshes_existing_voter_registration() {
 
     let state = state_handle.read().unwrap();
     assert!(state.nodes.contains_key("node-1"));
+}
+
+#[tokio::test]
+async fn grpc_join_cluster_rejects_duplicate_raft_node_id_for_different_node() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-join-duplicate".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19372".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    raft.client_write(ClusterCommand::AddNode {
+        node: NodeInfo {
+            id: "existing-node".into(),
+            name: "existing-node".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 19372,
+            http_port: 19272,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 2,
+        },
+    })
+    .await
+    .unwrap();
+
+    let addr = start_raft_grpc_server(raft.clone(), state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+    let error = client
+        .join_cluster(tonic::Request::new(JoinRequest {
+            node_info: Some(ProtoNodeInfo {
+                id: "different-node".into(),
+                name: "different-node".into(),
+                host: "127.0.0.1".into(),
+                transport_port: 19373,
+                http_port: 19273,
+                roles: vec!["data".into()],
+                raft_node_id: 2,
+            }),
+            raft_node_id: 2,
+        }))
+        .await
+        .expect_err("duplicate raft_node_id should be rejected");
+
+    assert!(
+        error
+            .message()
+            .contains("raft_node_id 2 is already registered"),
+        "unexpected duplicate-id error: {}",
+        error.message()
+    );
+
+    let state = state_handle.read().unwrap();
+    assert!(state.nodes.contains_key("existing-node"));
+    assert!(!state.nodes.contains_key("different-node"));
+    assert!(
+        !raft.voter_ids().any(|id| id == 2),
+        "rejected duplicate joins must not alter the voter set"
+    );
+}
+
+#[tokio::test]
+async fn grpc_join_cluster_preserves_all_voters_across_concurrent_joins() {
+    let (raft, state_handle) =
+        consensus::create_raft_instance_mem(1, "grpc-join-concurrent-voters".into())
+            .await
+            .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19374".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let (raft2, state2) =
+        consensus::create_raft_instance_mem(2, "grpc-join-concurrent-voters".into())
+            .await
+            .unwrap();
+    let node2_addr = start_raft_follower_grpc_server(raft2, state2, "node-2").await;
+
+    let (raft3, state3) =
+        consensus::create_raft_instance_mem(3, "grpc-join-concurrent-voters".into())
+            .await
+            .unwrap();
+    let node3_addr = start_raft_follower_grpc_server(raft3, state3, "node-3").await;
+
+    let addr = start_raft_grpc_server(raft.clone(), state_handle.clone()).await;
+    let barrier = Arc::new(Barrier::new(3));
+
+    let join_node_2 = {
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            let mut client = connect_grpc(addr).await;
+            barrier.wait().await;
+            client
+                .join_cluster(tonic::Request::new(JoinRequest {
+                    node_info: Some(ProtoNodeInfo {
+                        id: "node-2".into(),
+                        name: "node-2".into(),
+                        host: "127.0.0.1".into(),
+                        transport_port: node2_addr.port() as u32,
+                        http_port: 19275,
+                        roles: vec!["data".into()],
+                        raft_node_id: 2,
+                    }),
+                    raft_node_id: 2,
+                }))
+                .await
+        })
+    };
+
+    let join_node_3 = {
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            let mut client = connect_grpc(addr).await;
+            barrier.wait().await;
+            client
+                .join_cluster(tonic::Request::new(JoinRequest {
+                    node_info: Some(ProtoNodeInfo {
+                        id: "node-3".into(),
+                        name: "node-3".into(),
+                        host: "127.0.0.1".into(),
+                        transport_port: node3_addr.port() as u32,
+                        http_port: 19276,
+                        roles: vec!["data".into()],
+                        raft_node_id: 3,
+                    }),
+                    raft_node_id: 3,
+                }))
+                .await
+        })
+    };
+
+    barrier.wait().await;
+
+    let resp2 = join_node_2.await.unwrap().unwrap();
+    let resp3 = join_node_3.await.unwrap().unwrap();
+    assert!(resp2.into_inner().state.is_some());
+    assert!(resp3.into_inner().state.is_some());
+
+    let state = state_handle.read().unwrap();
+    assert!(state.nodes.contains_key("node-2"));
+    assert!(state.nodes.contains_key("node-3"));
+
+    let voters: BTreeSet<u64> = raft.voter_ids().collect();
+    assert_eq!(voters, BTreeSet::from([1_u64, 2_u64, 3_u64]));
+}
+
+#[tokio::test]
+async fn grpc_join_cluster_serializes_concurrent_duplicate_identity_checks() {
+    let (raft, state_handle) =
+        consensus::create_raft_instance_mem(1, "grpc-join-concurrent-duplicate".into())
+            .await
+            .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19377".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let (raft2, state2) =
+        consensus::create_raft_instance_mem(2, "grpc-join-concurrent-duplicate".into())
+            .await
+            .unwrap();
+    let node2_addr = start_raft_follower_grpc_server(raft2, state2, "node-2").await;
+
+    let addr = start_raft_grpc_server(raft.clone(), state_handle.clone()).await;
+    let barrier = Arc::new(Barrier::new(3));
+
+    let join_node_a = {
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            let mut client = connect_grpc(addr).await;
+            barrier.wait().await;
+            client
+                .join_cluster(tonic::Request::new(JoinRequest {
+                    node_info: Some(ProtoNodeInfo {
+                        id: "node-2a".into(),
+                        name: "node-2a".into(),
+                        host: "127.0.0.1".into(),
+                        transport_port: node2_addr.port() as u32,
+                        http_port: 19278,
+                        roles: vec!["data".into()],
+                        raft_node_id: 2,
+                    }),
+                    raft_node_id: 2,
+                }))
+                .await
+        })
+    };
+
+    let join_node_b = {
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            let mut client = connect_grpc(addr).await;
+            barrier.wait().await;
+            client
+                .join_cluster(tonic::Request::new(JoinRequest {
+                    node_info: Some(ProtoNodeInfo {
+                        id: "node-2b".into(),
+                        name: "node-2b".into(),
+                        host: "127.0.0.1".into(),
+                        transport_port: node2_addr.port() as u32,
+                        http_port: 19279,
+                        roles: vec!["data".into()],
+                        raft_node_id: 2,
+                    }),
+                    raft_node_id: 2,
+                }))
+                .await
+        })
+    };
+
+    barrier.wait().await;
+
+    let res_a = join_node_a.await.unwrap();
+    let res_b = join_node_b.await.unwrap();
+    assert!(
+        res_a.is_ok() ^ res_b.is_ok(),
+        "exactly one concurrent duplicate join must succeed"
+    );
+
+    let state = state_handle.read().unwrap();
+    let registered_with_raft_id_2 = state
+        .nodes
+        .values()
+        .filter(|node| node.raft_node_id == 2)
+        .count();
+    assert_eq!(registered_with_raft_id_2, 1);
+    assert!(state.nodes.contains_key("node-2a") || state.nodes.contains_key("node-2b"));
+    assert!(!(state.nodes.contains_key("node-2a") && state.nodes.contains_key("node-2b")));
+
+    let voters: BTreeSet<u64> = raft.voter_ids().collect();
+    assert_eq!(voters, BTreeSet::from([1_u64, 2_u64]));
 }
 
 #[tokio::test]

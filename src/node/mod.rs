@@ -218,6 +218,7 @@ impl Node {
         tokio::spawn(async move {
             // Give servers a tiny moment to bind
             tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut startup_state = None;
 
             // ── Bootstrap or join ──────────────────────────────────────
             if let Some(ref raft) = raft {
@@ -228,9 +229,12 @@ impl Node {
 
                 if already_initialized {
                     info!("Raft already initialized (recovered from disk), rejoining cluster");
-                    if try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 20).await
-                    {
+                    let joined_state =
+                        try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 20)
+                            .await;
+                    if joined_state.is_some() {
                         info!("Recovered node re-registered with the cluster leader");
+                        startup_state = joined_state;
                     } else if !remote_seeds.is_empty() {
                         tracing::warn!(
                             "Recovered node could not re-register via seed hosts yet; will retry in lifecycle loop"
@@ -240,18 +244,19 @@ impl Node {
                     // Try to join an existing cluster with retries.
                     // Other nodes may not be ready yet — retry a few times
                     // before falling back to single-node bootstrap.
-                    let joined = if !remote_seeds.is_empty() {
+                    let joined_state = if !remote_seeds.is_empty() {
                         try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 5).await
                     } else {
-                        false
+                        None
                     };
 
-                    if joined {
+                    if let Some(state) = joined_state {
                         // Don't call update_state — Raft log replication will
                         // propagate the authoritative state to our state machine.
                         info!(
                             "Joined existing cluster via seed hosts (Raft membership managed by leader)"
                         );
+                        startup_state = Some(state);
                     } else {
                         // No peers reachable — bootstrap a single-node Raft cluster
                         info!("No cluster found, bootstrapping single-node Raft cluster");
@@ -295,19 +300,20 @@ impl Node {
                             tracing::error!("Failed to set master via Raft: {}", e);
                         }
                         info!("Bootstrapped as master: {}", local_id);
+                        startup_state = Some(manager.get_state());
                     }
                 }
             }
 
-            let state = manager.get_state();
+            let has_authoritative_startup_state = startup_state.is_some();
+            let state = startup_state.clone().unwrap_or_else(|| manager.get_state());
             open_local_assigned_shards(&state, &local_id, manager_clone.as_ref());
 
-            // Clean up orphaned data directories from previously deleted indices
-            {
-                let known_uuids: std::collections::HashSet<String> =
-                    state.indices.values().map(|m| m.uuid.clone()).collect();
-                manager_clone.cleanup_orphaned_data(&known_uuids);
-            }
+            let mut orphan_cleanup_done = cleanup_orphaned_data_if_authoritative(
+                Some(&state),
+                manager_clone.as_ref(),
+                has_authoritative_startup_state,
+            );
 
             // ── Lifecycle loop ─────────────────────────────────────────
             let mut leader_since: Option<Instant> = None;
@@ -317,6 +323,14 @@ impl Node {
 
                 let state = manager.get_state();
                 open_local_assigned_shards(&state, &local_id, manager_clone.as_ref());
+
+                if !orphan_cleanup_done {
+                    orphan_cleanup_done = cleanup_orphaned_data_if_authoritative(
+                        Some(&state),
+                        manager_clone.as_ref(),
+                        false,
+                    );
+                }
 
                 if let Some(ref raft) = raft {
                     if raft.is_leader() {
@@ -352,6 +366,11 @@ impl Node {
                         }
 
                         for dead in &dead_nodes {
+                            // Re-read cluster state so shard routing mutations from
+                            // previous dead-node removals are visible. Without this,
+                            // multi-node death in the same tick can double-promote or
+                            // miscount unassigned_replicas.
+                            let fresh_state = manager.get_state();
                             tracing::warn!("Node {} has died. Removing via Raft.", dead);
 
                             // ── Shard failover: promote replicas for orphaned primaries ──
@@ -359,7 +378,7 @@ impl Node {
                             // 1. Find all indices where the dead node hosts a primary or replica
                             // 2. For orphaned primaries: pick best replica (highest checkpoint) and promote
                             // 3. For lost replicas: increment unassigned count for re-allocation
-                            for idx_meta in state.indices.values() {
+                            for idx_meta in fresh_state.indices.values() {
                                 let mut updated = idx_meta.clone();
                                 let orphaned_primaries = updated.remove_node(dead);
                                 let mut changed = false;
@@ -440,17 +459,27 @@ impl Node {
                             }
 
                             // Remove from Raft membership first
-                            if let Some(dead_info) = state.nodes.get(dead)
+                            if let Some(dead_info) = fresh_state.nodes.get(dead)
                                 && dead_info.raft_node_id > 0
                             {
                                 let remaining: std::collections::BTreeSet<u64> = raft
                                     .voter_ids()
                                     .filter(|id| *id != dead_info.raft_node_id)
                                     .collect();
-                                if !remaining.is_empty()
-                                    && let Err(e) = raft.change_membership(remaining, false).await
-                                {
-                                    tracing::error!("Failed to remove {} from Raft: {}", dead, e);
+                                if remaining.is_empty() {
+                                    tracing::error!(
+                                        "Refusing to remove {} from cluster state because Raft membership would become empty",
+                                        dead
+                                    );
+                                    continue;
+                                }
+                                if let Err(e) = raft.change_membership(remaining, false).await {
+                                    tracing::error!(
+                                        "Failed to remove {} from Raft membership; leaving node in cluster state: {}",
+                                        dead,
+                                        e
+                                    );
+                                    continue;
                                 }
                             }
 
@@ -470,14 +499,21 @@ impl Node {
                         }
 
                         // ── Shard allocator: assign unassigned replicas to available nodes ──
-                        let data_nodes: Vec<String> = state
+                        // Re-read state after dead-node removals so allocator sees
+                        // current routing and node membership.
+                        let alloc_state = if dead_nodes.is_empty() {
+                            state.clone()
+                        } else {
+                            manager.get_state()
+                        };
+                        let data_nodes: Vec<String> = alloc_state
                             .nodes
                             .values()
                             .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
                             .map(|n| n.id.clone())
                             .collect();
 
-                        for idx_meta in state.indices.values() {
+                        for idx_meta in alloc_state.indices.values() {
                             if idx_meta.unassigned_replica_count() > 0 {
                                 let mut updated = idx_meta.clone();
                                 if updated.allocate_unassigned_replicas(&data_nodes) {
@@ -505,30 +541,32 @@ impl Node {
                         leader_since = None;
 
                         // ── Follower duties ────────────────────────
-                        // Only try to rejoin if this node is genuinely not part of
-                        // the cluster. Skip if:
-                        // - already in cluster state (state.nodes)
-                        // - already a Raft voter (recovered from disk)
-                        // - Raft is initialized (has persisted vote/log — means we
-                        //   were previously part of the cluster)
-                        let is_voter = raft.voter_ids().any(|id| id == raft_node_id);
-                        let is_initialized = raft.is_initialized().await.unwrap_or(false);
-                        if !state.nodes.contains_key(&local_id)
-                            && !is_voter
-                            && !is_initialized
-                            && try_join_cluster(
-                                &client,
-                                &remote_seeds,
-                                &local_node,
-                                raft_node_id,
-                                1,
-                            )
-                            .await
-                        {
+                        // Retry join whenever the authoritative cluster state does not
+                        // include us. Recovered nodes are already initialized/voters, so
+                        // gating on those flags prevents the promised retry path.
+                        let joined_state = if should_retry_cluster_join(&state, &local_id) {
+                            try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 1)
+                                .await
+                        } else {
+                            None
+                        };
+                        if let Some(joined_state) = joined_state {
                             tracing::info!(
                                 "Recovered follower {} re-registered with leader",
                                 local_id
                             );
+                            open_local_assigned_shards(
+                                &joined_state,
+                                &local_id,
+                                manager_clone.as_ref(),
+                            );
+                            if !orphan_cleanup_done {
+                                orphan_cleanup_done = cleanup_orphaned_data_if_authoritative(
+                                    Some(&joined_state),
+                                    manager_clone.as_ref(),
+                                    true,
+                                );
+                            }
                         }
 
                         // Ping the master for health monitoring
@@ -608,6 +646,35 @@ impl Node {
     }
 }
 
+fn cleanup_orphaned_data_if_authoritative(
+    state: Option<&crate::cluster::state::ClusterState>,
+    shard_manager: &ShardManager,
+    allow_empty_indices: bool,
+) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+
+    if state.indices.is_empty() && !allow_empty_indices {
+        tracing::info!(
+            "Skipping orphaned data cleanup until authoritative cluster index UUIDs are available"
+        );
+        return false;
+    }
+
+    let known_uuids: std::collections::HashSet<String> =
+        state.indices.values().map(|m| m.uuid.clone()).collect();
+    shard_manager.cleanup_orphaned_data(&known_uuids);
+    true
+}
+
+fn should_retry_cluster_join(
+    state: &crate::cluster::state::ClusterState,
+    local_node_id: &str,
+) -> bool {
+    !state.nodes.contains_key(local_node_id)
+}
+
 fn open_local_assigned_shards(
     state: &crate::cluster::state::ClusterState,
     local_node_id: &str,
@@ -662,18 +729,17 @@ async fn try_join_cluster(
     local_node: &NodeInfo,
     raft_node_id: u64,
     attempts: usize,
-) -> bool {
+) -> Option<crate::cluster::state::ClusterState> {
     if remote_seeds.is_empty() {
-        return false;
+        return None;
     }
 
     for attempt in 0..attempts {
-        if client
+        if let Some(state) = client
             .join_cluster(remote_seeds, local_node, raft_node_id)
             .await
-            .is_some()
         {
-            return true;
+            return Some(state);
         }
 
         if attempt + 1 < attempts {
@@ -683,7 +749,7 @@ async fn try_join_cluster(
         }
     }
 
-    false
+    None
 }
 
 /// Apply recovered translog operations from the primary to a replica shard engine.
@@ -873,6 +939,97 @@ mod tests {
         assert!(shard_manager.get_shard("idx", 0).is_none());
         open_local_assigned_shards(&state, "node-1", &shard_manager);
         assert!(shard_manager.get_shard("idx", 0).is_some());
+    }
+
+    #[test]
+    fn cleanup_orphaned_data_if_authoritative_skips_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let live_uuid = "live-uuid";
+
+        std::fs::create_dir_all(dir.path().join(live_uuid).join("shard_0")).unwrap();
+
+        let state = crate::cluster::state::ClusterState::new("node-test".into());
+        assert!(!cleanup_orphaned_data_if_authoritative(
+            Some(&state),
+            &shard_manager,
+            false,
+        ));
+        assert!(dir.path().join(live_uuid).exists());
+    }
+
+    #[test]
+    fn cleanup_orphaned_data_if_authoritative_allows_empty_authoritative_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let orphan_uuid = "orphan-uuid";
+
+        std::fs::create_dir_all(dir.path().join(orphan_uuid).join("shard_0")).unwrap();
+
+        let state = crate::cluster::state::ClusterState::new("node-test".into());
+        assert!(cleanup_orphaned_data_if_authoritative(
+            Some(&state),
+            &shard_manager,
+            true,
+        ));
+        assert!(!dir.path().join(orphan_uuid).exists());
+    }
+
+    #[test]
+    fn cleanup_orphaned_data_if_authoritative_keeps_known_uuid_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let known_uuid = "known-uuid";
+        let orphan_uuid = "orphan-uuid";
+
+        std::fs::create_dir_all(dir.path().join(known_uuid).join("shard_0")).unwrap();
+        std::fs::create_dir_all(dir.path().join(orphan_uuid).join("shard_0")).unwrap();
+
+        let mut state = crate::cluster::state::ClusterState::new("node-test".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: known_uuid.into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+
+        assert!(cleanup_orphaned_data_if_authoritative(
+            Some(&state),
+            &shard_manager,
+            true,
+        ));
+        assert!(dir.path().join(known_uuid).exists());
+        assert!(!dir.path().join(orphan_uuid).exists());
+    }
+
+    #[test]
+    fn should_retry_cluster_join_only_when_local_node_missing() {
+        let mut state = crate::cluster::state::ClusterState::new("node-test".into());
+        assert!(should_retry_cluster_join(&state, "node-1"));
+
+        state.add_node(crate::cluster::state::NodeInfo {
+            id: "node-1".into(),
+            name: "node-1".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![crate::cluster::state::NodeRole::Data],
+            raft_node_id: 1,
+        });
+
+        assert!(!should_retry_cluster_join(&state, "node-1"));
     }
 
     #[test]

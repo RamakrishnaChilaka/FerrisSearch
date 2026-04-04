@@ -59,8 +59,8 @@ Every response tells you how the query ran:
 
 - **OpenSearch-compatible REST API** — `PUT /{index}`, `POST /_doc`, `GET /_search`, `POST /_bulk`
 - **Hybrid SQL over search results** — `text_match()` + `GROUP BY` + `HAVING` + `ORDER BY` + `LIMIT` in one query
-- **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, `materialized_hits_fallback` — chosen automatically by the planner; executed fast-field fallbacks also report `streaming_used` when local bitset streaming runs
-- **Raft consensus** — cluster state via [openraft](https://github.com/datafuselabs/openraft); leader election, linearizable writes, automatic failover, persistent log via [redb](https://github.com/cberner/redb)
+- **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, `materialized_hits_fallback` — chosen automatically by the planner; executed fast-field fallbacks also report `streaming_used` when local bitset streaming or remote streamed shard batches are used
+- **Raft consensus** — cluster state via [openraft](https://github.com/datafuselabs/openraft); leader election, linearizable writes, automatic failover, persistent log via [redb](https://github.com/cberner/redb), and authoritative join snapshots so shard reopen/orphan cleanup never run from lossy pre-catch-up state
 - **Synchronous replication** — primary-replica with ISR tracking over gRPC; writes acknowledged after all in-sync replicas confirm
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) (HNSW); hybrid full-text + vector queries with pre-filtering
 - **Write-ahead log** — binary WAL with configurable durability (`request` fsync-per-write or `async` timer-based)
@@ -68,7 +68,7 @@ Every response tells you how the query ran:
 - **Dynamic field mapping** — fields are auto-detected and created on first document encounter
 - **Prometheus metrics** — `/_metrics` endpoint with request latencies, search/index counters, SQL mode tracking, cluster gauges, and process stats (CPU, RSS, threads, FDs)
 - **Column cache** — segment-aware Arrow array cache for SQL analytics; configurable memory limit (`column_cache_size_percent`) and selectivity threshold (`column_cache_populate_threshold`); ~1000× speedup on repeated fast-field queries
-- **Interactive SQL console** — `ferris-cli` with colored tables, EXPLAIN ANALYZE visualization, query history, `Tab` completion, `\watch`, and `Ctrl-R` reverse search
+- **Interactive SQL console** — `ferris-cli` with colored tables, EXPLAIN ANALYZE visualization, query history, `Tab` completion, `\watch`, `Ctrl-R` reverse search, and NDJSON SQL stream consumption via `/_sql/stream`
 - **SQL correctness tests** — [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki) `.slt` files (same framework as DataFusion, CockroachDB, DuckDB)
 
 ## Tech Stack
@@ -128,6 +128,8 @@ cargo build --release --bin ferris-cli
 ./target/release/ferris-cli -c "SELECT count(*) FROM \"hackernews\""
 ```
 
+`ferris-cli` now reads the global `POST /_sql/stream` endpoint and reconstructs the normal table view from streamed `meta` and `rows` NDJSON frames. For explicit-column fast-field queries, the coordinator now feeds remote shard batches into DataFusion through streaming partitions instead of first staging them in a coordinator `MemTable`.
+
 ### Load 4M Hacker News stories
 
 ```bash
@@ -174,6 +176,8 @@ The planner splits work between Tantivy and DataFusion. For eligible queries, ea
 
 Scan limits are mode-specific, not global. Flat `tantivy_fast_fields` queries still default to an internal 100K match cap unless `LIMIT` pushdown applies. `GROUP BY` queries that fall back to `tantivy_fast_fields` use `sql_group_by_scan_limit` instead (default 1M, `0 = unlimited`), while `tantivy_grouped_partials` scans all matching docs.
 
+When a fast-field fallback query can stay fully columnar, remote shards now send multiple Arrow IPC batches to the coordinator over gRPC instead of one large unary payload, the coordinator feeds those batches into DataFusion through streaming partitions, and the client receives the final SQL result as NDJSON over one long-lived HTTP response. The remaining major limitation is wildcard/export-style `SELECT *`, which still uses `materialized_hits_fallback`.
+
 ### SQL Features
 
 - `text_match(field, 'query')` — full-text search pushed into Tantivy; multiple top-level `AND`ed `text_match(...)` predicates become multiple search `must` clauses
@@ -183,6 +187,7 @@ Scan limits are mode-specific, not global. Flat `tantivy_fast_fields` queries st
 - `ORDER BY` with `LIMIT` and `OFFSET`
 - `_score` as the synthetic SQL relevance column; mapped `score` remains a normal field
 - `EXPLAIN` and `EXPLAIN ANALYZE` with per-stage timings
+- `POST /{index}/_sql/stream` and `POST /_sql/stream` — NDJSON SQL stream endpoints (`meta` frame followed by `rows` frames)
 - `SHOW TABLES`, `DESCRIBE <index>`, `SHOW CREATE TABLE <index>`
 - Alias-safe pushdown — `WHERE posts > 10` when `posts` is `count(*) AS posts` correctly stays as a DataFusion residual, never pushed to Tantivy
 
@@ -471,13 +476,13 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 914 tests
-cargo test --lib                                # Unit tests (767)
-cargo test --bin ferris-cli                      # CLI tests (55)
-cargo test --test consensus_integration          # Raft consensus (30)
-cargo test --test replication_integration        # Replication (39)
+cargo test                                      # All 939 tests
+cargo test --lib                                # Unit tests (780)
+cargo test --bin ferris-cli                      # CLI tests (61)
+cargo test --test consensus_integration          # Raft consensus (33)
+cargo test --test replication_integration        # Replication (40)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (22)
+cargo test --test rest_api_integration           # REST API (24)
 cargo test --test sql_correctness                # SQL correctness (1 test, 163 sqllogictest assertions)
 ```
 
@@ -525,6 +530,7 @@ scripts/           Ingestion and benchmark scripts
 - [x] `EXPLAIN ANALYZE` with per-stage timings
 - [x] Distributed grouped partial aggregation across shards
 - [x] Distributed fast-field SQL (Arrow IPC between nodes)
+- [x] Streamed shard SQL batches over gRPC for fast-field fallback queries
 - [x] `count_star_fast` metadata path
 - [x] `ORDER BY` + `LIMIT` pushdown into Tantivy's TopDocs
 - [x] Dynamic field mapping (auto-detect on first document)

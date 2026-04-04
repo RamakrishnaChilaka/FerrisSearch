@@ -21,6 +21,7 @@ SearchShardDsl(ShardSearchDslRequest) → ShardSearchResponse
 
 // Distributed SQL (scatter Arrow IPC batches from remote shards)
 SqlRecordBatch(SqlRecordBatchRequest) → SqlRecordBatchResponse
+SqlRecordBatchStream(SqlRecordBatchRequest) → stream SqlRecordBatchResponse
 
 // Replication (primary → replica)
 ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse
@@ -64,22 +65,25 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - The `local_node_id` field is required by the constructors: `create_transport_service(cm, sm, tc, local_node_id)` and `create_transport_service_with_raft(cm, sm, tc, raft, local_node_id)`
 
 ### Key Handler Patterns
-- **join_cluster**: If leader → registers node via Raft (`AddNode` + `add_learner` + `change_membership`). If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
+- **join_cluster**: If leader → serialize concurrent joins, validate `node_id` / `raft_node_id`, register the transport address with `add_learner()` for non-voters, apply `AddNode`, then recompute the latest full voter set before `change_membership()`. If promotion fails, roll back the `AddNode`. If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
 - **index_doc / bulk_index / delete_doc**: Look up shard in ShardManager, execute engine operation, replicate to all replicas. **Returns `success: false` if replication fails** — write is only acknowledged after all ISR replicas confirm (synchronous replication contract).
 - **replicate_doc / replicate_bulk**: Apply to local replica engine using the seq_no supplied by the primary, persist that same seq_no in the replica WAL, return checkpoint
 - **recover_replica**: Read WAL entries via `read_from()`, return operations
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
+- **sql_record_batch / sql_record_batch_stream**: Execute local shard SQL fast-field reads and return Arrow IPC batches. `SqlRecordBatchStream` may emit multiple batches for the same shard; `batch_size = 0` means use the engine default.
 - **raft_vote / raft_append_entries / raft_snapshot**: Deserialize JSON, forward to Raft instance
 - **create_index / delete_index**: Must be leader; execute via `raft.client_write()`
 - **update_settings**: Must be leader; apply via `UpdateIndex` Raft command
 
 ### Critical Invariants
 - **join_cluster MUST forward on followers**: A follower receiving a JoinCluster RPC must forward it to the Raft leader. It must NEVER fall through to `cluster_manager.add_node()` when Raft is active, as this would add the node to local state without Raft membership.
+- **Join identity MUST be unique and stable**: `raft_node_id` cannot be reused by a different logical node, and an existing `node_id` cannot silently switch to a different `raft_node_id`. Reject the join instead of mutating membership.
 - **Shard writes MUST fail on replication failure**: The `index_doc`, `bulk_index`, and `delete_doc` handlers must return `success: false` when `replicate_write()` / `replicate_bulk()` returns `Err`. Logging the error and returning `success: true` violates the synchronous replication contract.
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc`, `replicate_bulk`, and recovery replay must call the explicit-seq engine methods. Do not route replicated writes through local seq allocation APIs.
 - **Write-side shard reopen MUST validate metadata**: `get_or_open_shard()` must return `NOT_FOUND` when the index or shard is absent from cluster state. It must NEVER create a shard with empty mappings/default settings on write or replication paths.
 - **Transport serialization must fail loudly**: gRPC handlers and clients must not use `unwrap_or_default()` for protocol payloads (`source_json`, `payload_json`, `partial_aggs_json`, Raft snapshot fields). Serialization or decode failures must surface as RPC errors, not empty payloads or silently dropped hits.
 - **Raft snapshot RPCs must require all fields**: missing `vote`, `meta`, or `data` in `RaftSnapshot` is `INVALID_ARGUMENT`, not a defaulted empty snapshot.
+- **ClusterState transport snapshots must be lossless**: startup consumes `JoinCluster` snapshots for shard reopen and orphan cleanup, so proto/domain conversion must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and `uuid` exactly. Never synthesize defaults or new UUIDs during roundtrip, and reject unknown field types instead of coercing them.
 
 ## TransportClient (src/transport/client.rs)
 ```rust
@@ -104,6 +108,7 @@ pub struct TransportClient {
 | `forward_search_to_shard()` | Scatter search to remote shard |
 | `forward_search_dsl_to_shard()` | Scatter DSL search to remote shard |
 | `forward_sql_batch_to_shard()` | Scatter SQL RecordBatch to remote shard (Arrow IPC) |
+| `forward_sql_batch_stream_to_shard()` | Stream multiple SQL RecordBatches from a remote shard (Arrow IPC) |
 | `get_shard_stats()` | Collect shard doc counts from remote node |
 | `forward_refresh()` | Fan out refresh to remote node |
 | `forward_flush()` | Fan out flush to remote node |
@@ -127,7 +132,7 @@ pub struct TransportClient {
 
 ### Worker Pool Integration
 All blocking engine calls in `TransportService` handlers are dispatched to dedicated rayon thread pools via `self.worker_pools.spawn_search()` / `self.worker_pools.spawn_write()`:
-- **Search pool** (`search-N` threads): `get_doc`, `search_shard`, `search_shard_dsl`, `sql_record_batch`, `recover_replica` (WAL I/O)
+- **Search pool** (`search-N` threads): `get_doc`, `search_shard`, `search_shard_dsl`, `sql_record_batch`, `sql_record_batch_stream`, `recover_replica` (WAL I/O)
 - **Write pool** (`write-N` threads): `index_doc`, `bulk_index`, `delete_doc`, `replicate_doc`, `replicate_bulk`, `refresh_index`, `flush_index`
 - The `TransportService` struct holds `worker_pools: WorkerPools` initialized in `create_transport_service*()` constructors.
 

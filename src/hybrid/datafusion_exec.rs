@@ -2,11 +2,177 @@ use super::SqlQueryResult;
 use super::merge::record_batches_to_json_rows;
 use super::planner::QueryPlan;
 use anyhow::Result;
-use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::streaming::StreamingTable;
+use datafusion::common::DataFusionError;
 use datafusion::datasource::MemTable;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::prelude::SessionContext;
-use std::sync::Arc;
+use futures::StreamExt;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
+/// A single-use partition wrapper for DataFusion's `StreamingTable`.
+///
+/// The inner stream is consumed exactly once via `execute()`. If DataFusion
+/// calls `execute()` a second time (e.g. due to re-planning or adaptive
+/// re-partitioning in a future version), the call returns an error stream
+/// instead of panicking — but the query will fail. This is acceptable
+/// because our SQL queries are one-shot coordinator operations with no
+/// retry semantics at the DataFusion level.
+pub struct OneShotPartitionStream {
+    schema: SchemaRef,
+    stream: Mutex<Option<SendableRecordBatchStream>>,
+}
+
+impl OneShotPartitionStream {
+    pub fn new(schema: SchemaRef, stream: SendableRecordBatchStream) -> Self {
+        Self {
+            schema,
+            stream: Mutex::new(Some(stream)),
+        }
+    }
+}
+
+impl fmt::Debug for OneShotPartitionStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OneShotPartitionStream")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartitionStream for OneShotPartitionStream {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let mut stream = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stream) = stream.take() {
+            stream
+        } else {
+            let schema = self.schema.clone();
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::once(async {
+                    Err(DataFusionError::Execution(
+                        "SQL partition stream already consumed".to_string(),
+                    ))
+                }),
+            ))
+        }
+    }
+}
+
+pub fn one_shot_partition_stream(
+    schema: SchemaRef,
+    stream: SendableRecordBatchStream,
+) -> Arc<dyn PartitionStream> {
+    Arc::new(OneShotPartitionStream::new(schema, stream))
+}
+
+pub fn direct_sql_input_schema(
+    plan: &QueryPlan,
+    mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<SchemaRef> {
+    let mut field_names = Vec::new();
+
+    if plan.needs_id {
+        field_names.push("_id".to_string());
+    }
+    if plan.needs_score {
+        field_names.push("_score".to_string());
+    }
+    for name in &plan.required_columns {
+        if !field_names.contains(name) {
+            field_names.push(name.clone());
+        }
+    }
+
+    let fields = field_names
+        .into_iter()
+        .map(|name| match name.as_str() {
+            "_id" => Ok(datafusion::arrow::datatypes::Field::new(
+                "_id",
+                datafusion::arrow::datatypes::DataType::Utf8,
+                false,
+            )),
+            "_score" => Ok(datafusion::arrow::datatypes::Field::new(
+                "_score",
+                datafusion::arrow::datatypes::DataType::Float32,
+                false,
+            )),
+            other => {
+                let mapping = mappings.get(other).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "direct SQL streaming requires mapped column [{}] to derive the canonical schema",
+                        other
+                    )
+                })?;
+                Ok(datafusion::arrow::datatypes::Field::new(
+                    other,
+                    crate::hybrid::arrow_bridge::column_kind_from_field_type(&mapping.field_type)
+                        .to_arrow_type(),
+                    true,
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(project_schema(&Arc::new(Schema::new(fields)), plan))
+}
+
+pub fn normalize_sql_batch_for_schema(
+    batch: RecordBatch,
+    plan: &QueryPlan,
+    target_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let (projected, _) = project_batch_to_sql_columns(&batch, plan);
+    if projected.schema().as_ref() == target_schema.as_ref() {
+        Ok(projected)
+    } else {
+        normalize_batch_to_schema(&projected, target_schema)
+    }
+}
+
+pub async fn execute_sql_partition_streams(
+    plan: &QueryPlan,
+    schema: SchemaRef,
+    mut partitions: Vec<Arc<dyn PartitionStream>>,
+) -> Result<(Vec<String>, SendableRecordBatchStream)> {
+    if partitions.is_empty() {
+        let empty_schema = schema.clone();
+        let empty_stream = RecordBatchStreamAdapter::new(
+            empty_schema.clone(),
+            futures::stream::once(async move {
+                Ok::<RecordBatch, DataFusionError>(RecordBatch::new_empty(empty_schema))
+            }),
+        );
+        partitions.push(one_shot_partition_stream(
+            schema.clone(),
+            Box::pin(empty_stream),
+        ));
+    }
+
+    let table = StreamingTable::try_new(schema, partitions)?;
+    let ctx = SessionContext::new();
+    ctx.register_table("matched_rows", Arc::new(table))?;
+    let dataframe = ctx.sql(&plan.rewritten_sql).await?;
+    let stream = dataframe.execute_stream().await?;
+    let columns = stream
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect();
+
+    Ok((columns, stream))
+}
 
 pub async fn execute_sql(plan: &QueryPlan, batch: RecordBatch) -> Result<SqlQueryResult> {
     execute_sql_batches(plan, vec![batch]).await
@@ -16,6 +182,20 @@ pub async fn execute_sql_batches(
     plan: &QueryPlan,
     batches: Vec<RecordBatch>,
 ) -> Result<SqlQueryResult> {
+    let (columns, mut stream) = execute_sql_batches_stream(plan, batches).await?;
+    let mut result_batches = Vec::new();
+    while let Some(batch) = stream.next().await {
+        result_batches.push(batch?);
+    }
+    let (_, rows) = record_batches_to_json_rows(&result_batches)?;
+
+    Ok(SqlQueryResult { columns, rows })
+}
+
+pub async fn execute_sql_batches_stream(
+    plan: &QueryPlan,
+    batches: Vec<RecordBatch>,
+) -> Result<(Vec<String>, SendableRecordBatchStream)> {
     // Derive the canonical projected schema from the merged base schema across
     // ALL incoming batches + plan column ordering. This is deterministic and
     // independent of batch order, so a broken first batch cannot corrupt the
@@ -64,10 +244,15 @@ pub async fn execute_sql_batches(
     let ctx = SessionContext::new();
     ctx.register_table("matched_rows", Arc::new(table))?;
     let dataframe = ctx.sql(&plan.rewritten_sql).await?;
-    let result_batches = dataframe.collect().await?;
-    let (columns, rows) = record_batches_to_json_rows(&result_batches)?;
+    let stream = dataframe.execute_stream().await?;
+    let columns = stream
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect();
 
-    Ok(SqlQueryResult { columns, rows })
+    Ok((columns, stream))
 }
 
 /// Reorder a RecordBatch so its columns match the SELECT list order from the SQL.
@@ -1445,5 +1630,36 @@ mod tests {
             error.to_string().contains("cannot cast column 'price'"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_partition_streams_handles_reordered_limit_queries() {
+        let batch = make_test_batch(5);
+        let plan = super::super::planner::plan_sql("test", "SELECT price, name FROM test LIMIT 2")
+            .unwrap();
+        let (projected, schema) = project_batch_to_sql_columns(&batch, &plan);
+        let stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(projected)]),
+        );
+        let partitions = vec![one_shot_partition_stream(schema.clone(), Box::pin(stream))];
+
+        let (columns, mut stream) = execute_sql_partition_streams(&plan, schema, partitions)
+            .await
+            .unwrap();
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.unwrap());
+        }
+        let (_, rows) = record_batches_to_json_rows(&batches).unwrap();
+
+        assert_eq!(columns, vec!["price".to_string(), "name".to_string()]);
+        assert_eq!(
+            rows.len(),
+            2,
+            "LIMIT should still apply on streaming partitions"
+        );
+        assert_eq!(rows[0]["name"], json!("item-0"));
+        assert_eq!(rows[1]["name"], json!("item-1"));
     }
 }
