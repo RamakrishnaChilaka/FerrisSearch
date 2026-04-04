@@ -1217,7 +1217,7 @@ pub(crate) async fn execute_distributed_dsl_search(
         }
     };
 
-    let mut text_hits = Vec::new();
+    let mut shard_hit_lists: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut knn_hits = Vec::new();
     let mut successful = 0u32;
     let mut failed = 0u32;
@@ -1254,14 +1254,16 @@ pub(crate) async fn execute_distributed_dsl_search(
                 if !partial_aggs.is_empty() {
                     all_partial_aggs.push(partial_aggs);
                 }
+                let mut shard_list = Vec::with_capacity(hits.len());
                 for hit in hits {
-                    text_hits.push(serde_json::json!({
+                    shard_list.push(serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
                         "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
                         "_score": hit.get("_score"),
                         "_source": hit.get("_source").unwrap_or(&hit)
                     }));
                 }
+                shard_hit_lists.push(shard_list);
             }
             Ok(Err(e)) | Err(e) => {
                 tracing::error!("Shard {}/{} search failed: {}", index_name, shard_id, e);
@@ -1347,6 +1349,7 @@ pub(crate) async fn execute_distributed_dsl_search(
                 if !partial_aggs.is_empty() {
                     all_partial_aggs.push(partial_aggs);
                 }
+                let mut shard_text = Vec::new();
                 for hit in hits {
                     let enriched = serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
@@ -1359,8 +1362,11 @@ pub(crate) async fn execute_distributed_dsl_search(
                     if hit.get("_knn_field").is_some() {
                         knn_hits.push(enriched);
                     } else {
-                        text_hits.push(enriched);
+                        shard_text.push(enriched);
                     }
+                }
+                if !shard_text.is_empty() {
+                    shard_hit_lists.push(shard_text);
                 }
             }
             Ok((shard_id, Err(e))) => {
@@ -1380,11 +1386,16 @@ pub(crate) async fn execute_distributed_dsl_search(
     }
 
     let mut all_hits = if is_hybrid {
+        // Hybrid search: flatten shard lists, merge with kNN via RRF
+        let text_hits: Vec<serde_json::Value> = shard_hit_lists.into_iter().flatten().collect();
         crate::search::merge_hybrid_hits(text_hits, knn_hits)
     } else {
-        text_hits
+        // K-way merge of pre-sorted shard hit lists (O(N log K) vs O(N log N))
+        crate::search::merge_sorted_hit_lists(shard_hit_lists, &search_req.sort)
     };
-    crate::search::sort_hits(&mut all_hits, &search_req.sort);
+    if is_hybrid {
+        crate::search::sort_hits(&mut all_hits, &search_req.sort);
+    }
 
     let merged_aggs = if !all_partial_aggs.is_empty() {
         crate::search::merge_aggregations(all_partial_aggs.clone(), &search_req.aggs)

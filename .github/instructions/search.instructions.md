@@ -87,7 +87,7 @@ pub struct KnnParams {
 2. Look up all shards for the index from cluster state
 3. Local shards → `engine.search_query(req)` directly
 4. Remote shards → scatter via gRPC `forward_search_dsl_to_shard()`
-5. Gather results: merge hits by score, merge aggregations, apply from/size
+5. Gather results: merge default-score shard hit lists at the coordinator, re-apply explicit/custom sorts at the coordinator when shard-local ordering is not sufficient, merge aggregations, apply from/size
 6. Return `{ "_shards": {...}, "hits": { "total": {...}, "hits": [...] }, "aggregations": {...} }`
 
 ## Hybrid SQL Planning Guidance

@@ -1188,6 +1188,106 @@ fn merge_grouped_metrics_json(
     serde_json::json!({ "buckets": buckets })
 }
 
+/// K-way merge of pre-sorted hit lists from multiple shards.
+/// Each shard's hits are already sorted by the search engine (TopDocs by score
+/// or fast-field sort).  Instead of concatenating all lists and re-sorting
+/// O(N log N), this performs a heap-based merge in O(N log K) where K = number
+/// of shards.  Returns a single sorted list.
+pub fn merge_sorted_hit_lists(
+    mut shard_hits: Vec<Vec<serde_json::Value>>,
+    sort_clauses: &[SortClause],
+) -> Vec<serde_json::Value> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    // Remove empty lists
+    shard_hits.retain(|list| !list.is_empty());
+
+    if !sort_clauses.is_empty() {
+        // Custom sorts are not guaranteed to be fully applied at the shard
+        // layer, so always flatten and re-sort at the coordinator.
+        let mut all: Vec<serde_json::Value> = shard_hits.into_iter().flatten().collect();
+        sort_hits(&mut all, sort_clauses);
+        return all;
+    }
+
+    if shard_hits.len() <= 1 {
+        return shard_hits.into_iter().next().unwrap_or_default();
+    }
+
+    let total: usize = shard_hits.iter().map(|l| l.len()).sum();
+    let mut result = Vec::with_capacity(total);
+
+    // Reverse each list so we can pop from the end (O(1)) instead of
+    // removing from the front (O(N)).
+    for list in &mut shard_hits {
+        list.reverse();
+    }
+
+    // Heap entry: (sort key wrapper, shard index)
+    // We use Reverse because BinaryHeap is a max-heap but we want min-first.
+    struct HeapEntry {
+        value: serde_json::Value,
+        shard_idx: usize,
+    }
+
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other) == std::cmp::Ordering::Equal
+        }
+    }
+    impl Eq for HeapEntry {}
+
+    // Default sort: _score DESC — the common case for text search.
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            // Higher score = should come first = "less" in min-heap terms
+            let sa = self
+                .value
+                .get("_score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let sb = other
+                .value
+                .get("_score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            // Reverse: higher score = smaller in heap ordering (comes out first)
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+
+    let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::with_capacity(shard_hits.len());
+
+    // Seed the heap with the first (highest-scored) element from each shard
+    for (shard_idx, list) in shard_hits.iter_mut().enumerate() {
+        if let Some(value) = list.pop() {
+            heap.push(Reverse(HeapEntry { value, shard_idx }));
+        }
+    }
+
+    while let Some(Reverse(entry)) = heap.pop() {
+        let shard_idx = entry.shard_idx;
+        result.push(entry.value);
+
+        // Push the next element from the same shard
+        if let Some(next_value) = shard_hits[shard_idx].pop() {
+            heap.push(Reverse(HeapEntry {
+                value: next_value,
+                shard_idx,
+            }));
+        }
+    }
+
+    result
+}
+
 /// Sort a list of search hits according to the given sort clauses.
 /// Each hit is a JSON object with `_score` and `_source` fields.
 /// Sort clauses are applied in order (primary sort first).
@@ -2052,6 +2152,47 @@ mod tests {
         let merged = merge_hybrid_hits(text, knn);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn merge_sorted_hit_lists_custom_sort_single_shard_reorders_hits() {
+        let shard_hits = vec![vec![
+            json!({"_id": "d1", "_score": 1.0, "_source": {"title": "bravo"}}),
+            json!({"_id": "d2", "_score": 0.5, "_source": {"title": "alpha"}}),
+        ]];
+        let sort = vec![SortClause::Field({
+            let mut m = HashMap::new();
+            m.insert(
+                "title".to_string(),
+                SortOrder::Direction(SortDirection::Asc),
+            );
+            m
+        })];
+
+        let merged = merge_sorted_hit_lists(shard_hits, &sort);
+        assert_eq!(merged[0]["_id"], "d2");
+        assert_eq!(merged[1]["_id"], "d1");
+    }
+
+    #[test]
+    fn merge_sorted_hit_lists_default_score_desc_across_shards() {
+        let shard_hits = vec![
+            vec![
+                json!({"_id": "d1", "_score": 0.9, "_source": {}}),
+                json!({"_id": "d2", "_score": 0.6, "_source": {}}),
+            ],
+            vec![
+                json!({"_id": "d3", "_score": 1.1, "_source": {}}),
+                json!({"_id": "d4", "_score": 0.7, "_source": {}}),
+            ],
+        ];
+
+        let merged = merge_sorted_hit_lists(shard_hits, &[]);
+        let ids: Vec<&str> = merged
+            .iter()
+            .map(|hit| hit["_id"].as_str().expect("id should be present"))
+            .collect();
+        assert_eq!(ids, vec!["d3", "d1", "d4", "d2"]);
     }
 
     // ── Sort tests ──────────────────────────────────────────────────────

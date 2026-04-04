@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **792 unit tests** (`cargo test --lib`)
+- **794 unit tests** (`cargo test --lib`)
 - **61 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **40 replication integration tests** (`cargo test --test replication_integration`)
-- **24 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **25 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 163 assertions across 4 files
-- **951 total** (`cargo test`)
+- **954 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -34,6 +34,7 @@ cargo test -- test_name                         # Single test by name
 - For streamed shard SQL transport changes, add a real gRPC integration test that forces multiple Arrow batches from `forward_sql_batch_stream_to_shard()` / `SqlRecordBatchStream`, not just unit tests around IPC decoding.
 - For JoinCluster or cluster-state transport fixes, add one roundtrip regression that proves `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` survive proto conversion, one regression that unknown field types fail snapshot decoding instead of being coerced, plus concurrent gRPC regressions for duplicate `raft_node_id` rejection and full voter-set preservation across overlapping joins.
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
+- For distributed hit-merge changes, add unit coverage for `merge_sorted_hit_lists()` and a multi-node REST regression where only one shard returns hits but the coordinator still must apply a custom sort.
 - For node startup/rejoin cleanup changes, add tempdir regressions that prove empty pre-catch-up state does not delete live UUID directories, and that authoritative UUID sets still remove true orphaned directories.
 
 ## Integration Test Infrastructure
