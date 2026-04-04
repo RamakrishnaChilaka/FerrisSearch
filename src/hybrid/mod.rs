@@ -149,7 +149,60 @@ pub fn execute_grouped_partial_sql(
         )
         .collect();
 
-    let mut rows = merged
+    // ── HAVING / ORDER BY / LIMIT on native buckets (no JSON allocation) ──
+    // We filter, sort, and paginate on the native GroupedMetricsBucket structs
+    // first, then convert only the surviving rows to JSON.  For a 364K-group
+    // query with LIMIT 10, this avoids 364K serde_json::Map allocations.
+
+    let mut buckets = merged;
+
+    // Apply HAVING filters on native buckets
+    if !grouped_sql.having.is_empty() {
+        buckets.retain(|bucket| {
+            grouped_sql.having.iter().all(|filter| {
+                let val = bucket_metric_f64(bucket, &filter.output_name, grouped_sql);
+                match val {
+                    Some(v) => match filter.op {
+                        planner::HavingOp::Gt => v > filter.value,
+                        planner::HavingOp::GtEq => v >= filter.value,
+                        planner::HavingOp::Lt => v < filter.value,
+                        planner::HavingOp::LtEq => v <= filter.value,
+                        planner::HavingOp::Eq => (v - filter.value).abs() < f64::EPSILON,
+                    },
+                    None => false,
+                }
+            })
+        });
+    }
+
+    // Top-K selection on native buckets
+    let needed = plan.offset.unwrap_or(0) + plan.limit.unwrap_or(usize::MAX);
+    let has_order = !grouped_sql.order_by.is_empty();
+
+    if has_order && needed < buckets.len() {
+        let n = needed.min(buckets.len()) - 1;
+        buckets.select_nth_unstable_by(n, |a, b| {
+            compare_native_buckets(a, b, &grouped_sql.order_by, grouped_sql)
+        });
+        buckets.truncate(needed);
+        buckets.sort_by(|a, b| compare_native_buckets(a, b, &grouped_sql.order_by, grouped_sql));
+    } else if has_order {
+        buckets.sort_by(|a, b| compare_native_buckets(a, b, &grouped_sql.order_by, grouped_sql));
+    }
+
+    // Apply LIMIT and OFFSET on native buckets
+    let offset = plan.offset.unwrap_or(0);
+    if offset > 0 || plan.limit.is_some() {
+        let start = offset.min(buckets.len());
+        let end = plan
+            .limit
+            .map(|limit| (start + limit).min(buckets.len()))
+            .unwrap_or(buckets.len());
+        buckets = buckets[start..end].to_vec();
+    }
+
+    // Convert only the surviving buckets to JSON rows
+    let rows = buckets
         .into_iter()
         .map(|bucket| {
             let mut row = serde_json::Map::new();
@@ -163,67 +216,15 @@ pub fn execute_grouped_partial_sql(
                         .unwrap_or(serde_json::Value::Null),
                 );
             }
-
             for metric in &grouped_sql.metrics {
                 row.insert(
                     metric.output_name.clone(),
                     grouped_metric_value(bucket.metrics.get(&metric.output_name), metric),
                 );
             }
-
             serde_json::Value::Object(row)
         })
         .collect::<Vec<_>>();
-
-    // Apply HAVING filters before sorting
-    if !grouped_sql.having.is_empty() {
-        rows.retain(|row| {
-            grouped_sql.having.iter().all(|filter| {
-                let val = row.get(&filter.output_name).and_then(json_to_f64);
-                match val {
-                    Some(v) => match filter.op {
-                        planner::HavingOp::Gt => v > filter.value,
-                        planner::HavingOp::GtEq => v >= filter.value,
-                        planner::HavingOp::Lt => v < filter.value,
-                        planner::HavingOp::LtEq => v <= filter.value,
-                        planner::HavingOp::Eq => (v - filter.value).abs() < f64::EPSILON,
-                    },
-                    None => false, // NULL doesn't pass any filter
-                }
-            })
-        });
-    }
-
-    // Top-K selection: when LIMIT is small relative to total rows and ORDER BY
-    // is present, use partial sort (select_nth_unstable_by) instead of full sort.
-    // This is O(N) average vs O(N log N) for full sort.
-    let needed = plan.offset.unwrap_or(0) + plan.limit.unwrap_or(usize::MAX);
-    let has_order = !grouped_sql.order_by.is_empty();
-
-    if has_order && needed < rows.len() {
-        // select_nth_unstable_by partitions: elements [0..n] are <= nth, [n+1..] are >=
-        // This gives us the top-K without fully sorting.
-        let n = needed.min(rows.len()) - 1;
-        rows.select_nth_unstable_by(n, |left, right| {
-            compare_grouped_rows(left, right, &grouped_sql.order_by)
-        });
-        rows.truncate(needed);
-        // Now sort only the top-K subset (much smaller)
-        rows.sort_by(|left, right| compare_grouped_rows(left, right, &grouped_sql.order_by));
-    } else if has_order {
-        rows.sort_by(|left, right| compare_grouped_rows(left, right, &grouped_sql.order_by));
-    }
-
-    // Apply LIMIT and OFFSET after sorting
-    let offset = plan.offset.unwrap_or(0);
-    if offset > 0 || plan.limit.is_some() {
-        let start = offset.min(rows.len());
-        let end = plan
-            .limit
-            .map(|limit| (start + limit).min(rows.len()))
-            .unwrap_or(rows.len());
-        rows = rows[start..end].to_vec();
-    }
 
     Ok(SqlQueryResult { columns, rows })
 }
@@ -286,21 +287,108 @@ fn grouped_metric_value(
     }
 }
 
-fn compare_grouped_rows(
-    left: &serde_json::Value,
-    right: &serde_json::Value,
+/// Extract a metric's f64 value from a native GroupedMetricsBucket.
+/// Used for HAVING filters and ORDER BY on native buckets without JSON conversion.
+fn bucket_metric_f64(
+    bucket: &crate::search::GroupedMetricsBucket,
+    output_name: &str,
+    grouped_sql: &planner::GroupedSqlPlan,
+) -> Option<f64> {
+    // Check if it's a group column (returns the group value's f64 representation)
+    for (index, col) in grouped_sql.group_columns.iter().enumerate() {
+        if col.output_name == output_name {
+            return bucket.group_values.get(index).and_then(json_to_f64);
+        }
+    }
+    // Check metrics
+    let metric = grouped_sql
+        .metrics
+        .iter()
+        .find(|m| m.output_name == output_name)?;
+    let partial = bucket.metrics.get(output_name)?;
+    match (partial, &metric.function) {
+        (crate::search::GroupedMetricPartial::Count { count }, _) => Some(*count as f64),
+        (
+            crate::search::GroupedMetricPartial::Stats { count, sum, .. },
+            planner::SqlGroupedMetricFunction::Sum,
+        ) => {
+            if *count > 0 {
+                Some(*sum)
+            } else {
+                None
+            }
+        }
+        (
+            crate::search::GroupedMetricPartial::Stats { count, sum, .. },
+            planner::SqlGroupedMetricFunction::Avg,
+        ) => {
+            if *count > 0 {
+                Some(*sum / *count as f64)
+            } else {
+                None
+            }
+        }
+        (
+            crate::search::GroupedMetricPartial::Stats { count, min, .. },
+            planner::SqlGroupedMetricFunction::Min,
+        ) => {
+            if *count > 0 {
+                Some(*min)
+            } else {
+                None
+            }
+        }
+        (
+            crate::search::GroupedMetricPartial::Stats { count, max, .. },
+            planner::SqlGroupedMetricFunction::Max,
+        ) => {
+            if *count > 0 {
+                Some(*max)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Compare two native GroupedMetricsBuckets for ORDER BY without JSON conversion.
+fn compare_native_buckets(
+    left: &crate::search::GroupedMetricsBucket,
+    right: &crate::search::GroupedMetricsBucket,
     order_by: &[planner::SqlOrderBy],
+    grouped_sql: &planner::GroupedSqlPlan,
 ) -> std::cmp::Ordering {
     for order in order_by {
-        let left_value = left
-            .get(&order.output_name)
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let right_value = right
-            .get(&order.output_name)
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let ordering = compare_json_values(&left_value, &right_value);
+        // Check if ORDER BY references a group column
+        let is_group = grouped_sql
+            .group_columns
+            .iter()
+            .position(|col| col.output_name == order.output_name);
+
+        let ordering = if let Some(index) = is_group {
+            // Compare group values directly (string/number/null)
+            let lv = left
+                .group_values
+                .get(index)
+                .unwrap_or(&serde_json::Value::Null);
+            let rv = right
+                .group_values
+                .get(index)
+                .unwrap_or(&serde_json::Value::Null);
+            compare_json_values(lv, rv)
+        } else {
+            // Compare metric values as f64
+            let lv = bucket_metric_f64(left, &order.output_name, grouped_sql);
+            let rv = bucket_metric_f64(right, &order.output_name, grouped_sql);
+            match (lv, rv) {
+                (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less, // NULL sorts last
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        };
+
         let ordering = if order.desc {
             ordering.reverse()
         } else {

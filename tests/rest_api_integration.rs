@@ -1570,6 +1570,44 @@ async fn rest_sql_distinguishes_real_score_from_synthetic_underscore_score() -> 
 }
 
 #[tokio::test]
+async fn rest_distributed_search_applies_custom_sort_when_one_shard_matches() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/stories/_search",
+            json!({
+                "query": { "wildcard": { "title": "story-0-*" } },
+                "sort": [{ "title": "desc" }],
+                "size": 10,
+                "from": 0
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hits"]["total"]["value"], json!(3));
+    assert_eq!(body["_shards"]["successful"], json!(3));
+    assert_eq!(body["_shards"]["failed"], json!(0));
+
+    let hits = body["hits"]["hits"]
+        .as_array()
+        .expect("hits should be an array");
+    let titles: Vec<&str> = hits
+        .iter()
+        .map(|hit| {
+            hit["_source"]["title"]
+                .as_str()
+                .expect("title should be a string")
+        })
+        .collect();
+    assert_eq!(titles, vec!["story-0-2", "story-0-1", "story-0-0"]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_sql_distributed_grouped_partials_merge_numeric_keys_across_shards() -> Result<()> {
     let harness = MultiNodeRestHarness::start_three_nodes().await?;
     create_distributed_stories_index_and_docs(&harness).await?;
