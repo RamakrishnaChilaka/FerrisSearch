@@ -981,7 +981,17 @@ pub fn merge_grouped_metrics_partials(
     agg_name: &str,
     params: &GroupedMetricsAggParams,
 ) -> Vec<GroupedMetricsBucket> {
-    let mut merged: HashMap<String, GroupedMetricsBucket> = HashMap::new();
+    // Pre-size from the first shard's bucket count to avoid rehashing.
+    let initial_capacity = partials
+        .iter()
+        .filter_map(|p| match p.get(agg_name) {
+            Some(PartialAggResult::GroupedMetrics { buckets }) => Some(buckets.len()),
+            _ => None,
+        })
+        .next()
+        .unwrap_or(0);
+    let mut merged: HashMap<String, GroupedMetricsBucket> =
+        HashMap::with_capacity(initial_capacity);
 
     for partial in partials {
         let Some(PartialAggResult::GroupedMetrics { buckets }) = partial.get(agg_name) else {
