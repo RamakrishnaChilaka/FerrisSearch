@@ -11,12 +11,24 @@ message NodeInfo {
     uint32 transport_port = 4;
     uint32 http_port = 5;
     repeated string roles = 6;  // "master", "data", "client"
+    uint64 raft_node_id = 7;
 }
 
 message ShardAssignment {
     uint32 shard_id = 1;
     string node_id = 2;          // primary node
     repeated string replica_node_ids = 3; // replica nodes
+    uint32 unassigned_replicas = 4;
+}
+
+message FieldMappingEntry {
+    string name = 1;
+    string field_type = 2;
+    optional uint32 dimension = 3;
+}
+
+message IndexSettings {
+    optional uint64 refresh_interval_ms = 1;
 }
 
 message IndexMetadata {
@@ -25,6 +37,8 @@ message IndexMetadata {
     repeated ShardAssignment shards = 3;
     uint32 number_of_replicas = 4;
     string uuid = 5;
+    repeated FieldMappingEntry mappings = 6;
+    IndexSettings settings = 7;
 }
 
 message ClusterState {
@@ -262,6 +276,7 @@ message SqlRecordBatchRequest {
     repeated string columns = 4;     // required SQL columns (fast-field names)
     bool needs_id = 5;
     bool needs_score = 6;
+    uint32 batch_size = 7;           // 0 = server default
 }
 
 message SqlRecordBatchResponse {
@@ -302,6 +317,7 @@ service InternalTransport {
 
     // Shard-level SQL (returns Arrow IPC RecordBatch)
     rpc SqlRecordBatch(SqlRecordBatchRequest) returns (SqlRecordBatchResponse);
+    rpc SqlRecordBatchStream(SqlRecordBatchRequest) returns (stream SqlRecordBatchResponse);
 
     // Primary-to-replica replication
     rpc ReplicateDoc(ReplicateDocRequest) returns (ReplicateDocResponse);

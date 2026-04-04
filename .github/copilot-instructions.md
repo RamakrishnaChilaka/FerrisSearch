@@ -95,17 +95,17 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 767 unit tests + 55 CLI tests + 30 consensus integration + 39 replication integration + 22 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 914 total
+- 780 unit tests + 61 CLI tests + 33 consensus integration + 40 replication integration + 24 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 939 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
-- SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, and history) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
+- SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, history, and NDJSON `/_sql/stream` consumption) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
 
 ## Node Lifecycle (Raft-driven)
 - First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
-- Joining node: sends JoinCluster gRPC (with raft_node_id) → leader does `AddNode` + `add_learner` + `change_membership`
-- Joining node does NOT call `update_state` — Raft log replication propagates state
-- Nodes reopen locally assigned shards after startup and reconcile unopened assignments in the lifecycle loop
+- Joining node: sends JoinCluster gRPC (with raft_node_id) → leader serializes concurrent joins, validates identity, does `add_learner` for non-voters, applies `AddNode`, then recomputes the latest voter set for `change_membership` (rolling back `AddNode` if promotion fails)
+- Joining node does NOT call `update_state` — Raft log replication propagates state, but `JoinCluster` returns an authoritative snapshot for initial shard reopen/cleanup decisions
+- Nodes reopen locally assigned shards after startup using the authoritative bootstrap/join snapshot when available, reconcile unopened assignments in the lifecycle loop, and skip orphan cleanup until index UUIDs are known
 - Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader), shard failover (promote best ISR replica to primary for orphaned shards)
 - Follower lifecycle loop: pings the master for liveness
 
@@ -114,10 +114,12 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterManager::update_state()` is a full overwrite — never use it to replace Raft-managed state
 - `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft. Populated by `add_node()` and `ping_node()`
 - New leader gets a 20s grace period (`leader_since`) before scanning for dead nodes to avoid false positives
-- Dead node handling: leader removes node from Raft + cluster, promotes best ISR replica for orphaned primary shards (highest checkpoint wins), increments `unassigned_replicas` for lost replica slots
+- Dead node handling: leader removes node from Raft + cluster only after successful membership change, promotes best ISR replica for orphaned primary shards (highest checkpoint wins), increments `unassigned_replicas` for lost replica slots, and refuses removals that would empty the voter set
 - `promote_replica_to(shard_id, node_name)` for targeted promotion; `promote_replica()` as fallback (first available)
 - Shard failover uses existing `UpdateIndex` Raft command — no new command variant needed
 - `raft_node_id` field on NodeInfo is critical for Raft membership changes — must be non-zero for Raft-managed nodes
+- `raft_node_id` must remain unique across node IDs; JoinCluster must reject conflicting identity reuse
+- Transport `ClusterState` snapshots are authoritative startup inputs — proto/domain roundtrips must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` exactly, and must reject unknown field types instead of coercing them
 
 ## Dynamic Settings
 - `PUT /{index}/_settings` and `GET /{index}/_settings` API endpoints
@@ -243,6 +245,7 @@ if let Some(ref raft) = state.raft {
 | `SearchShard` | Scatter search to remote shards | `forward_search_to_shard()` |
 | `SearchShardDsl` | Scatter DSL search to remote shards | `forward_search_dsl_to_shard()` |
 | `SqlRecordBatch` | Scatter SQL fast-field batch to remote shards (Arrow IPC) | `forward_sql_batch_to_shard()` |
+| `SqlRecordBatchStream` | Stream multiple SQL fast-field batches from a remote shard (Arrow IPC) | `forward_sql_batch_stream_to_shard()` |
 
 ### Adding a new Raft-write API endpoint (checklist)
 1. Add proto messages (`<Op>Request` / `<Op>Response`) to `proto/transport.proto`
@@ -290,10 +293,13 @@ if let Some(ref raft) = state.raft {
 | HTTP | Path | Handler | Purpose |
 |------|------|---------|--------|
 | GET | `/{index}/_search` | `search_documents()` | Query-string search (q=, size, from) |
-| POST | `/{index}/_search` | `search_documents_dsl()` | DSL search (SearchRequest body) |\n| GET/POST | `/{index}/_count` | `count_documents()` | Document count (match_all fast path or query) |
+| POST | `/{index}/_search` | `search_documents_dsl()` | DSL search (SearchRequest body) |
+| GET/POST | `/{index}/_count` | `count_documents()` | Document count (match_all fast path or query) |
 | POST | `/{index}/_sql` | `search_sql()` | SQL over matched docs (search-aware planning) |
+| POST | `/{index}/_sql/stream` | `search_sql_stream()` | NDJSON SQL stream (`meta` frame then `rows` frames) |
 | POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan without executing |
 | POST | `/_sql` | `global_sql()` | Global SQL: SHOW TABLES, DESCRIBE, SHOW CREATE TABLE, SELECT (auto-extracts index from FROM) |
+| POST | `/_sql/stream` | `global_sql_stream()` | Global NDJSON SQL stream endpoint |
 
 ### Maintenance
 | HTTP | Path | Handler | Purpose |
@@ -428,7 +434,7 @@ pub struct ShardManager {
 - `IndexMetadata.uuid` is a UUID v4 string, auto-generated on index creation
 - Passed to `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)`
 - `close_index_shards()` uses stored UUID mapping to find the directory to delete
-- `cleanup_orphaned_data(known_uuids)` deletes directories not matching any known index UUID (called on startup)
+- `cleanup_orphaned_data(known_uuids)` deletes directories not matching any authoritative known index UUID; startup must skip cleanup until index UUIDs are available
 - **NEVER** construct shard paths from index names — always use the UUID
 
 ### Key Methods
@@ -527,6 +533,7 @@ SearchShardDsl(ShardSearchDslRequest) → ShardSearchResponse
 
 // Distributed SQL (Arrow IPC)
 SqlRecordBatch(SqlRecordBatchRequest) → SqlRecordBatchResponse
+SqlRecordBatchStream(SqlRecordBatchRequest) → stream SqlRecordBatchResponse
 
 // Replication
 ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse

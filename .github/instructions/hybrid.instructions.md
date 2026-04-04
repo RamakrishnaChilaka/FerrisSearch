@@ -69,14 +69,16 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 
 ## Distributed Fast-Field SQL
 - The `tantivy_fast_fields` path now works across multi-node clusters.
-- For non-`SELECT *` queries, the coordinator scatters `SqlRecordBatch` gRPC RPCs to remote shards in parallel.
-- Remote shards run `sql_record_batch()` locally and return Arrow IPC-serialized `RecordBatch` bytes.
-- The coordinator deserializes Arrow IPC, preserves the incoming batch boundaries in one MemTable partition, and runs DataFusion for final SQL execution.
-- Large unbounded `SELECT *` queries are still a compatibility/export limitation today: wildcard projection uses `materialized_hits_fallback`, and remote fast-field SQL is still unary batch transport rather than end-to-end streaming.
-- Future work for that query class is a dedicated export-style streaming path: server-streamed Arrow or row batches from shard primaries, plus coordinator/client streaming consumption, instead of full result materialization on both sides.
+- For buffered non-`SELECT *` queries, the coordinator can still scatter unary `SqlRecordBatch` gRPC RPCs to remote shards in parallel.
+- For streamed explicit-column SQL (`POST /_sql/stream` or `POST /{index}/_sql/stream`), the coordinator opens `SqlRecordBatchStream` gRPC streams to remote shards and keeps those shard streams live.
+- Remote shards run `sql_streaming_batches()` when eligible and otherwise fall back to `sql_record_batch()`, but both shapes travel over the same Arrow IPC stream RPC.
+- The streamed SQL path registers `StreamingTable` partitions in DataFusion, so explicit-column remote shard batches flow through the coordinator without an extra coordinator-side `MemTable` staging step.
+- Large unbounded `SELECT *` queries are still a compatibility/export limitation today: wildcard projection uses `materialized_hits_fallback`, and export-style wildcard streaming remains the next major gap.
+- Future work for that query class is a dedicated export-style path that avoids that coordinator-side pre-DataFusion buffering entirely, instead of full result materialization inside the coordinator.
 - **Plan-driven canonical schema**: `execute_sql_batches()` first merges the base schema across ALL incoming batches via `merge_batch_schemas()`, then derives `final_schema` from that merged schema + the plan's SQL column ordering via `project_schema()`. This prevents a broken/drifted first batch from corrupting canonical types or dropping columns that appear later.
+- **Streamed canonical schema**: `direct_sql_input_schema()` derives the coordinator input schema from planner dependencies + index mappings before execution starts, and each streamed batch is normalized through `normalize_sql_batch_for_schema()` to keep the registered `StreamingTable` schema stable.
 - **Schema-recovery fallback**: If projected batches have inconsistent schemas (e.g., remote Arrow IPC schema drift), each batch is normalized to the plan-derived canonical schema via `normalize_batch_to_schema()`. Missing columns are filled with nulls. Type casts are strict: `cast_array_strict()` rejects any cast that would introduce additional nulls, so bad shard data is surfaced as an error instead of silently degrading into nulls.
-- **Per-shard streaming fallback**: When `plan.has_group_by_fallback` is true, `execute_sql_query()` tries `sql_streaming_batches()` first on each local shard. If a shard returns `None` (score needed or SourceFallback column), that shard transparently falls back to `sql_record_batch()`. This is per-shard, not global — some shards can stream while others use the TopDocs path.
+- **Per-shard streaming fallback**: `execute_sql_stream_query()` always tries `sql_streaming_batches()` on local shards and `SqlRecordBatchStream` on remote shards for eligible explicit-column queries. If a shard returns `None` (score needed or SourceFallback column), that shard transparently falls back to `sql_record_batch()`. This is per-shard, not global — some shards can stream while others use the TopDocs path.
 - Arrow IPC helpers: `record_batch_to_ipc()` and `record_batch_from_ipc()` in `arrow_bridge.rs`.
 - `SELECT *` queries always use the materialized fallback path (`materialized_hits_fallback`) — the fast-field path requires explicit column projection.
 
@@ -88,10 +90,10 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Without `"analyze": true`, `explain_sql` returns plan-only (no execution, no timings, no rows) — unchanged from the original behavior.
 
 ## DataFusion 53 LIMIT Workaround
-- DataFusion 53.0.0 has a bug where `LIMIT` fetch-pushdown into `MemTable`'s `TableScan` is silently ignored when the SQL `SELECT` projects columns in a different order than the table schema.
+- DataFusion 53.0.0 has a bug where `LIMIT` fetch-pushdown into the registered input table scan can be silently ignored when the SQL `SELECT` projects columns in a different order than the table schema.
 - Example: schema `[base_passenger_fare, hvfhs_license_num]` + SQL `SELECT hvfhs_license_num, base_passenger_fare ... LIMIT 5` → returns all rows instead of 5.
 - The same query with columns in schema order (`SELECT base_passenger_fare, hvfhs_license_num`) correctly returns 5 rows.
-- **Workaround**: `project_batch_to_sql_columns()` in `datafusion_exec.rs` reorders the `RecordBatch` columns to match the SQL `SELECT` list order before creating the `MemTable`. This ensures DataFusion's projection is identity (no reorder), preventing the buggy optimizer path.
+- **Workaround**: `project_batch_to_sql_columns()` in `datafusion_exec.rs` reorders each `RecordBatch` to match the SQL `SELECT` list order before registering the input table (buffered or streamed). This keeps DataFusion's projection identity-like, preventing the buggy optimizer path.
 - The workaround uses `sqlparser` only for SELECT-list order. The set of required columns must come from the planner (`required_columns`, `needs_id`, `needs_score`), not from a second SQL AST walker, so CASE/HAVING/GROUP BY dependencies are preserved.
 - DataFusion still handles LIMIT/OFFSET execution — we do NOT strip LIMIT from the SQL or apply it manually. The workaround only prevents the specific optimizer misfire.
 - When DataFusion fixes this upstream, the workaround can be removed — the reordering is a no-op when projection already matches schema order.

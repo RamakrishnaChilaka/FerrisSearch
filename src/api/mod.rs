@@ -205,6 +205,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_update/{id}", post(index::update_document))
         .route("/_bulk", post(index::bulk_index_global))
         .route("/_sql", post(search::global_sql))
+        .route("/_sql/stream", post(search::global_sql_stream))
         .route("/{index}/_bulk", post(index::bulk_index))
         // Search
         .route("/{index}/_search", get(search::search_documents))
@@ -212,6 +213,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_count", get(search::count_documents))
         .route("/{index}/_count", post(search::count_documents))
         .route("/{index}/_sql", post(search::search_sql))
+        .route("/{index}/_sql/stream", post(search::search_sql_stream))
         .route("/{index}/_sql/explain", post(search::explain_sql))
         // Maintenance
         .route("/{index}/_refresh", post(index::refresh_index))

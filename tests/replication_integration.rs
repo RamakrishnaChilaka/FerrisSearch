@@ -3,11 +3,13 @@
 //! These tests spin up real gRPC transport servers (in-process) and exercise the
 //! full write → replicate → read path, similar to OpenSearch's ESIntegTestCase.
 
+use datafusion::arrow::array::StringArray;
 use ferrissearch::cluster::manager::ClusterManager;
 use ferrissearch::cluster::state::{
     FieldMapping, FieldType, IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
 };
 use ferrissearch::engine::{CompositeEngine, SearchEngine};
+use ferrissearch::search::{QueryClause, SearchRequest};
 use ferrissearch::shard::ShardManager;
 #[cfg(feature = "transport-tls")]
 use ferrissearch::transport::TonicTlsConnector;
@@ -682,6 +684,7 @@ async fn join_cluster_and_publish_state_via_grpc() {
                 transport_port: 9301,
                 http_port: 9201,
                 roles: vec!["data".into()],
+                raft_node_id: 0,
             }),
             raft_node_id: 0,
         }))
@@ -1569,6 +1572,146 @@ async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
     assert_eq!(sum, 60.0);
     assert_eq!(min, 10.0);
     assert_eq!(max, 30.0);
+}
+
+#[tokio::test]
+async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("sql-stream-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+
+    let mut mappings = HashMap::new();
+    mappings.insert(
+        "brand".into(),
+        FieldMapping {
+            field_type: FieldType::Keyword,
+            dimension: None,
+        },
+    );
+
+    let mut cs = cm.get_state();
+    cs.add_node(DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9300,
+        http_port: 9200,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    cs.add_index(IndexMetadata {
+        name: "sql-stream-idx".into(),
+        uuid: String::new(),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings,
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    cm.update_state(cs);
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut grpc_client = connect_client(addr).await;
+
+    assert!(
+        index_doc_with_vectors(
+            &mut grpc_client,
+            "sql-stream-idx",
+            0,
+            "d1",
+            serde_json::json!({"brand": "Apple"})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut grpc_client,
+            "sql-stream-idx",
+            0,
+            "d2",
+            serde_json::json!({"brand": "Apple"})
+        )
+        .await
+    );
+    assert!(
+        index_doc_with_vectors(
+            &mut grpc_client,
+            "sql-stream-idx",
+            0,
+            "d3",
+            serde_json::json!({"brand": "Samsung"})
+        )
+        .await
+    );
+    refresh_all(&sm);
+
+    let transport_client = TransportClient::new();
+    let remote_node = DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: addr.port(),
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    };
+    let search_req = SearchRequest {
+        query: QueryClause::MatchAll(serde_json::json!({})),
+        size: 10,
+        from: 0,
+        knn: None,
+        sort: vec![],
+        aggs: HashMap::new(),
+    };
+
+    let (batches, total_hits) = transport_client
+        .forward_sql_batch_stream_to_shard(
+            &remote_node,
+            "sql-stream-idx",
+            0,
+            &search_req,
+            &["brand".to_string()],
+            false,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(total_hits, 3);
+    assert_eq!(batches.len(), 3);
+    assert!(batches.iter().all(|batch| batch.num_rows() == 1));
+
+    let brand_index = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == "brand")
+        .expect("brand column present");
+    let mut brands: Vec<String> = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .column(brand_index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_string()
+        })
+        .collect();
+    brands.sort();
+    assert_eq!(brands, vec!["Apple", "Apple", "Samsung"]);
 }
 
 #[tokio::test]

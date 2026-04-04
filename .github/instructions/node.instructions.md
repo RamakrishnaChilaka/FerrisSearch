@@ -31,20 +31,20 @@ pub struct Node {
 3. If no seed responds, bootstraps single-node Raft via `bootstrap_single_node()`
 4. Registers self via `raft.client_write(AddNode)` + `raft.client_write(SetMaster)`
 5. Opens shards for any indices assigned to this node
-6. Cleans up orphaned data directories via `cleanup_orphaned_data(known_uuids)`
+6. Cleans up orphaned data directories only after authoritative index UUIDs are available (bootstrap state or a `JoinCluster` response snapshot)
 
 ### Joining Node (seed reachable)
 1. Tries `try_join_cluster()` with 5 retries and exponential backoff
 2. Sends `JoinCluster` gRPC to seed hosts (includes `raft_node_id`)
-3. Leader handles: `AddNode` Raft command → `add_learner()` → `change_membership()`
+3. Leader handles: validate node identity → `add_learner()` for non-voters → `AddNode` Raft command → `change_membership()`; if promotion fails, roll back the `AddNode`
 4. Raft log replication propagates state (joiner does NOT call `update_state`)
-5. After joining, opens shards assigned to this node
+5. `JoinCluster` returns an authoritative cluster-state snapshot; use it for initial local shard reopen and orphan-cleanup decisions before Raft catch-up finishes
 
 ### Leader Duties (every 5s tick)
 1. `SetMaster` if not already set
 2. Dead node scan (skip first 20s after becoming leader — grace period):
    - Nodes not seen for 15s → dead
-   - Call `remove_node()` on each dead node
+   - Remove from Raft membership before cluster state; if membership removal fails or would empty the voter set, leave the node registered
    - Shard failover for orphaned primaries (see shard failover section)
 3. Reopen any locally assigned shards that are still not open
 4. Allocate unassigned replicas to available data nodes
@@ -54,6 +54,7 @@ pub struct Node {
 2. Reopen any locally assigned shards that are still not open
 3. Request translog-based replica recovery for replica shards once opened
 4. Replay recovered operations using the seq_no carried by the primary so the replica WAL stays in the shared shard seq space
+5. Retry `JoinCluster` whenever the authoritative cluster state does not contain the local node, even if local Raft state is already initialized from disk
 
 ## Recovery Invariant
 - `apply_recovery_ops()` must use the explicit-seq engine write methods for both index and delete operations

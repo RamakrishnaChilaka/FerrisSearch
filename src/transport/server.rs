@@ -8,8 +8,11 @@ use crate::transport::proto::internal_transport_server::{
 };
 use crate::transport::proto::*;
 use crate::wal::WriteAheadLog;
+use futures::{Stream, stream};
 use openraft::type_config::async_runtime::WatchReceiver;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, trace};
 
@@ -25,6 +28,13 @@ pub struct TransportService {
     pub local_node_id: String,
     /// Dedicated thread pools for search and write workloads.
     pub worker_pools: crate::worker::WorkerPools,
+    /// Serializes leader-side JoinCluster handling so concurrent joins cannot
+    /// race identity validation or submit stale full voter sets.
+    join_lock: Arc<Mutex<()>>,
+}
+
+fn new_join_lock() -> Arc<Mutex<()>> {
+    Arc::new(Mutex::new(()))
 }
 
 // ─── Conversion helpers: domain types ↔ proto types ─────────────────────────
@@ -45,6 +55,7 @@ fn node_info_to_proto(n: &crate::cluster::state::NodeInfo) -> NodeInfo {
                 crate::cluster::state::NodeRole::Client => "client".into(),
             })
             .collect(),
+        raft_node_id: n.raft_node_id,
     }
 }
 
@@ -65,8 +76,85 @@ fn proto_to_node_info(p: &NodeInfo) -> crate::cluster::state::NodeInfo {
                 _ => crate::cluster::state::NodeRole::Data,
             })
             .collect(),
-        raft_node_id: 0,
+        raft_node_id: p.raft_node_id,
     }
+}
+
+fn field_type_to_proto(field_type: &crate::cluster::state::FieldType) -> String {
+    match field_type {
+        crate::cluster::state::FieldType::Text => "text",
+        crate::cluster::state::FieldType::Keyword => "keyword",
+        crate::cluster::state::FieldType::Integer => "integer",
+        crate::cluster::state::FieldType::Float => "float",
+        crate::cluster::state::FieldType::Boolean => "boolean",
+        crate::cluster::state::FieldType::KnnVector => "knn_vector",
+    }
+    .to_string()
+}
+
+#[allow(clippy::result_large_err)]
+fn proto_to_field_type(field_type: &str) -> Result<crate::cluster::state::FieldType, Status> {
+    match field_type {
+        "text" => Ok(crate::cluster::state::FieldType::Text),
+        "keyword" => Ok(crate::cluster::state::FieldType::Keyword),
+        "integer" | "long" => Ok(crate::cluster::state::FieldType::Integer),
+        "float" | "double" => Ok(crate::cluster::state::FieldType::Float),
+        "boolean" => Ok(crate::cluster::state::FieldType::Boolean),
+        "knn_vector" => Ok(crate::cluster::state::FieldType::KnnVector),
+        other => Err(Status::invalid_argument(format!(
+            "unknown field type in cluster state snapshot: {}",
+            other
+        ))),
+    }
+}
+
+fn index_settings_to_proto(settings: &crate::cluster::state::IndexSettings) -> IndexSettings {
+    IndexSettings {
+        refresh_interval_ms: settings.refresh_interval_ms,
+    }
+}
+
+fn proto_to_index_settings(
+    settings: Option<&IndexSettings>,
+) -> crate::cluster::state::IndexSettings {
+    let Some(settings) = settings else {
+        return crate::cluster::state::IndexSettings::default();
+    };
+
+    crate::cluster::state::IndexSettings {
+        refresh_interval_ms: settings.refresh_interval_ms,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_join_identity(
+    state: &crate::cluster::state::ClusterState,
+    node_id: &str,
+    raft_node_id: u64,
+) -> Result<(), Status> {
+    if let Some(existing) = state.nodes.get(node_id)
+        && existing.raft_node_id > 0
+        && existing.raft_node_id != raft_node_id
+    {
+        return Err(Status::already_exists(format!(
+            "node [{}] is already registered with raft_node_id {}",
+            node_id, existing.raft_node_id
+        )));
+    }
+
+    if raft_node_id > 0
+        && let Some(existing) = state
+            .nodes
+            .values()
+            .find(|existing| existing.raft_node_id == raft_node_id && existing.id != node_id)
+    {
+        return Err(Status::already_exists(format!(
+            "raft_node_id {} is already registered to node [{}]",
+            raft_node_id, existing.id
+        )));
+    }
+
+    Ok(())
 }
 
 pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> ClusterState {
@@ -90,14 +178,28 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
                         shard_id: *sid,
                         node_id: routing.primary.clone(),
                         replica_node_ids: routing.replicas.clone(),
+                        unassigned_replicas: routing.unassigned_replicas,
                     })
                     .collect(),
+                mappings: idx
+                    .mappings
+                    .iter()
+                    .map(|(name, mapping)| FieldMappingEntry {
+                        name: name.clone(),
+                        field_type: field_type_to_proto(&mapping.field_type),
+                        dimension: mapping.dimension.map(|dimension| dimension as u32),
+                    })
+                    .collect(),
+                settings: Some(index_settings_to_proto(&idx.settings)),
             })
             .collect(),
     }
 }
 
-pub fn proto_to_cluster_state(p: &ClusterState) -> crate::cluster::state::ClusterState {
+#[allow(clippy::result_large_err)]
+pub fn proto_to_cluster_state(
+    p: &ClusterState,
+) -> Result<crate::cluster::state::ClusterState, Status> {
     let mut state = crate::cluster::state::ClusterState::new(p.cluster_name.clone());
     state.version = p.version;
     state.master_node = p.master_node.clone();
@@ -113,7 +215,23 @@ pub fn proto_to_cluster_state(p: &ClusterState) -> crate::cluster::state::Cluste
                 crate::cluster::state::ShardRoutingEntry {
                     primary: sa.node_id.clone(),
                     replicas: sa.replica_node_ids.clone(),
-                    unassigned_replicas: 0,
+                    unassigned_replicas: sa.unassigned_replicas,
+                },
+            );
+        }
+        let mut mappings = std::collections::HashMap::new();
+        for mapping in &idx.mappings {
+            let field_type = proto_to_field_type(&mapping.field_type).map_err(|_| {
+                Status::invalid_argument(format!(
+                    "unknown field type '{}' for field '{}' in index '{}'",
+                    mapping.field_type, mapping.name, idx.name
+                ))
+            })?;
+            mappings.insert(
+                mapping.name.clone(),
+                crate::cluster::state::FieldMapping {
+                    field_type,
+                    dimension: mapping.dimension.map(|dimension| dimension as usize),
                 },
             );
         }
@@ -121,26 +239,48 @@ pub fn proto_to_cluster_state(p: &ClusterState) -> crate::cluster::state::Cluste
             idx.name.clone(),
             crate::cluster::state::IndexMetadata {
                 name: idx.name.clone(),
-                uuid: if idx.uuid.is_empty() {
-                    uuid::Uuid::new_v4().to_string()
-                } else {
-                    idx.uuid.clone()
-                },
+                uuid: idx.uuid.clone(),
                 number_of_shards: idx.number_of_shards,
                 number_of_replicas: idx.number_of_replicas,
                 shard_routing,
-                mappings: std::collections::HashMap::new(),
-                settings: crate::cluster::state::IndexSettings::default(),
+                mappings,
+                settings: proto_to_index_settings(idx.settings.as_ref()),
             },
         );
     }
-    state
+    Ok(state)
 }
 
 // ─── gRPC Service Implementation ───────────────────────────────────────────
 
+fn sql_batch_success_response(
+    batch: datafusion::arrow::record_batch::RecordBatch,
+    total_hits: usize,
+) -> anyhow::Result<SqlRecordBatchResponse> {
+    let ipc_bytes = crate::hybrid::arrow_bridge::record_batch_to_ipc(&batch)
+        .map_err(|e| anyhow::anyhow!("Arrow IPC encode error: {}", e))?;
+    Ok(SqlRecordBatchResponse {
+        success: true,
+        arrow_ipc: ipc_bytes,
+        total_hits: total_hits as u64,
+        error: String::new(),
+    })
+}
+
+fn sql_batch_error_response(error: impl Into<String>) -> SqlRecordBatchResponse {
+    SqlRecordBatchResponse {
+        success: false,
+        arrow_ipc: vec![],
+        total_hits: 0,
+        error: error.into(),
+    }
+}
+
 #[tonic::async_trait]
 impl InternalTransport for TransportService {
+    type SqlRecordBatchStreamStream =
+        Pin<Box<dyn Stream<Item = Result<SqlRecordBatchResponse, Status>> + Send + 'static>>;
+
     async fn join_cluster(
         &self,
         request: Request<JoinRequest>,
@@ -187,33 +327,63 @@ impl InternalTransport for TransportService {
             }
 
             if joining_raft_id > 0 {
+                let _join_guard = self.join_lock.lock().await;
+                let state = self.cluster_manager.get_state();
+                validate_join_identity(&state, &ni.id, joining_raft_id)?;
                 ni.raft_node_id = joining_raft_id;
 
-                // 1. Register the node in cluster state via Raft
-                let cmd = crate::consensus::types::ClusterCommand::AddNode { node: ni.clone() };
-                raft.client_write(cmd)
-                    .await
-                    .map_err(|e| Status::internal(format!("Raft AddNode failed: {}", e)))?;
-
-                let voters: std::collections::BTreeSet<u64> = raft.voter_ids().collect();
-                let already_voter = voters.contains(&joining_raft_id);
+                let already_voter = raft.voter_ids().any(|id| id == joining_raft_id);
 
                 if !already_voter {
-                    // 2. Add as Raft learner (non-blocking — replication starts in background)
+                    // Register the transport address as a learner (non-blocking).
+                    // Using blocking=false so unreachable nodes don't stall the
+                    // leader's gRPC handler; change_membership below handles
+                    // the catch-up semantics.
                     let addr = format!("{}:{}", ni.host, ni.transport_port);
                     raft.add_learner(joining_raft_id, openraft::BasicNode { addr }, false)
                         .await
                         .map_err(|e| Status::internal(format!("Raft add_learner failed: {}", e)))?;
+                }
 
-                    // 3. Promote to voter
-                    let voters: std::collections::BTreeSet<u64> = voters
-                        .into_iter()
-                        .chain(std::iter::once(joining_raft_id))
-                        .collect();
-                    raft.change_membership(voters, false).await.map_err(|e| {
-                        Status::internal(format!("Raft change_membership failed: {}", e))
-                    })?;
-                } else {
+                let cmd = crate::consensus::types::ClusterCommand::AddNode { node: ni.clone() };
+                if let Err(e) = raft.client_write(cmd).await {
+                    return Err(Status::internal(format!("Raft AddNode failed: {}", e)));
+                }
+
+                if !already_voter {
+                    let mut target_voters: std::collections::BTreeSet<u64> =
+                        raft.voter_ids().collect();
+                    target_voters.insert(joining_raft_id);
+                    if let Err(e) = raft.change_membership(target_voters, false).await {
+                        // NOTE: The learner registered by add_learner above is NOT
+                        // removed here because openraft has no remove_learner API.
+                        // The orphan learner is harmless — the leader will stop
+                        // replicating to it once a future membership change cleans
+                        // it up, or if the node restarts and re-joins successfully.
+                        let rollback = raft
+                            .client_write(crate::consensus::types::ClusterCommand::RemoveNode {
+                                node_id: ni.id.clone(),
+                            })
+                            .await;
+                        if let Err(rollback_error) = rollback {
+                            tracing::error!(
+                                "Join for node {} failed during membership promotion and cluster-state rollback also failed: {}",
+                                ni.id,
+                                rollback_error
+                            );
+                            return Err(Status::internal(format!(
+                                "Raft change_membership failed after AddNode: {}; rollback failed: {}",
+                                e, rollback_error
+                            )));
+                        }
+                        return Err(Status::internal(format!(
+                            "Raft change_membership failed: {}",
+                            e
+                        )));
+                    }
+                }
+
+                if already_voter {
                     tracing::info!(
                         "Join request for existing voter {} — refreshed cluster-state node registration only",
                         ni.id
@@ -243,7 +413,7 @@ impl InternalTransport for TransportService {
         let proto_state = req
             .state
             .ok_or_else(|| Status::invalid_argument("missing state"))?;
-        let new_state = proto_to_cluster_state(&proto_state);
+        let new_state = proto_to_cluster_state(&proto_state)?;
         info!("gRPC: cluster state update, version {}", new_state.version);
 
         // Detect indices that were removed and close their local shards + delete data
@@ -761,30 +931,85 @@ impl InternalTransport for TransportService {
         };
 
         match batch_result {
-            Ok(Some(batch_result)) => {
-                let ipc_bytes =
-                    crate::hybrid::arrow_bridge::record_batch_to_ipc(&batch_result.batch)
-                        .map_err(|e| Status::internal(format!("Arrow IPC encode error: {}", e)))?;
-                Ok(Response::new(SqlRecordBatchResponse {
-                    success: true,
-                    arrow_ipc: ipc_bytes,
-                    total_hits: batch_result.total_hits as u64,
-                    error: String::new(),
-                }))
-            }
-            Ok(None) => Ok(Response::new(SqlRecordBatchResponse {
-                success: false,
-                arrow_ipc: vec![],
-                total_hits: 0,
-                error: "shard does not support sql_record_batch".to_string(),
-            })),
-            Err(e) => Ok(Response::new(SqlRecordBatchResponse {
-                success: false,
-                arrow_ipc: vec![],
-                total_hits: 0,
-                error: e.to_string(),
-            })),
+            Ok(Some(batch_result)) => Ok(Response::new(
+                sql_batch_success_response(batch_result.batch, batch_result.total_hits)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            )),
+            Ok(None) => Ok(Response::new(sql_batch_error_response(
+                "shard does not support sql_record_batch",
+            ))),
+            Err(e) => Ok(Response::new(sql_batch_error_response(e.to_string()))),
         }
+    }
+
+    async fn sql_record_batch_stream(
+        &self,
+        request: Request<SqlRecordBatchRequest>,
+    ) -> Result<Response<Self::SqlRecordBatchStreamStream>, Status> {
+        let req = request.into_inner();
+        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+            Ok(engine) => engine,
+            Err(status) => {
+                let response_stream: Self::SqlRecordBatchStreamStream = Box::pin(stream::iter(
+                    vec![Ok(sql_batch_error_response(status.message().to_string()))],
+                ));
+                return Ok(Response::new(response_stream));
+            }
+        };
+
+        let search_req: crate::search::SearchRequest =
+            serde_json::from_slice(&req.search_request_json).map_err(|e| {
+                Status::invalid_argument(format!("invalid SearchRequest JSON: {}", e))
+            })?;
+
+        let columns = req.columns;
+        let batch_size = req.batch_size as usize;
+        let stream_result = {
+            let engine = engine.clone();
+            let search_req = search_req.clone();
+            let columns = columns.clone();
+            let needs_id = req.needs_id;
+            let needs_score = req.needs_score;
+            self.worker_pools
+                .spawn_search(move || {
+                    match engine.sql_streaming_batches(
+                        &search_req,
+                        &columns,
+                        needs_id,
+                        needs_score,
+                        batch_size,
+                    )? {
+                        Some(result) => Ok(Some((result.batches, result.total_hits))),
+                        None => engine
+                            .sql_record_batch(&search_req, &columns, needs_id, needs_score)
+                            .map(|opt| opt.map(|r| (vec![r.batch], r.total_hits))),
+                    }
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        // Lazily encode each batch to IPC as it is consumed by the gRPC
+        // transport, avoiding holding raw batches + IPC bytes + proto
+        // wrappers simultaneously in memory.
+        let response_stream: Self::SqlRecordBatchStreamStream = match stream_result {
+            Ok(Some((batches, total_hits))) => Box::pin(stream::unfold(
+                (batches.into_iter(), total_hits),
+                |(mut batches, total_hits)| async move {
+                    let batch = batches.next()?;
+                    let item = sql_batch_success_response(batch, total_hits)
+                        .map_err(|error| Status::internal(error.to_string()));
+                    Some((item, (batches, total_hits)))
+                },
+            )),
+            Ok(None) => Box::pin(stream::iter(vec![Ok(sql_batch_error_response(
+                "shard does not support sql_record_batch_stream",
+            ))])),
+            Err(e) => Box::pin(stream::iter(vec![Ok(sql_batch_error_response(
+                e.to_string(),
+            ))])),
+        };
+        Ok(Response::new(response_stream))
     }
 
     async fn replicate_doc(
@@ -1661,6 +1886,7 @@ pub fn create_transport_service(
         raft: None,
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),
+        join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)
         .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
@@ -1682,6 +1908,7 @@ pub fn create_transport_service_with_raft(
         raft: Some(raft),
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),
+        join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)
         .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
@@ -1693,8 +1920,9 @@ mod tests {
     use super::*;
     use crate::cluster::manager::ClusterManager;
     use crate::cluster::state::{
-        ClusterState as DomainClusterState, IndexMetadata as DomainIndexMetadata,
-        NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
+        ClusterState as DomainClusterState, FieldMapping, FieldType,
+        IndexMetadata as DomainIndexMetadata, NodeInfo as DomainNodeInfo, NodeRole,
+        ShardRoutingEntry,
     };
     use crate::engine::{CompositeEngine, SearchEngine};
     use crate::shard::ShardManager;
@@ -1714,7 +1942,7 @@ mod tests {
             transport_port: 9300,
             http_port: 9200,
             roles: vec![NodeRole::Master, NodeRole::Data],
-            raft_node_id: 0,
+            raft_node_id: 11,
         });
         cs.add_node(DomainNodeInfo {
             id: "node-2".into(),
@@ -1723,7 +1951,7 @@ mod tests {
             transport_port: 9300,
             http_port: 9200,
             roles: vec![NodeRole::Data],
-            raft_node_id: 0,
+            raft_node_id: 22,
         });
 
         // Reset version (add_node bumps it)
@@ -1743,18 +1971,36 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-2".into(),
                 replicas: vec!["node-1".into()],
-                unassigned_replicas: 0,
+                unassigned_replicas: 1,
+            },
+        );
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "embedding".into(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(384),
             },
         );
 
         cs.add_index(DomainIndexMetadata {
             name: "products".into(),
-            uuid: String::new(),
+            uuid: "products-uuid".into(),
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing,
-            mappings: std::collections::HashMap::new(),
-            settings: crate::cluster::state::IndexSettings::default(),
+            mappings,
+            settings: crate::cluster::state::IndexSettings {
+                refresh_interval_ms: Some(1500),
+            },
         });
         cs.version = 42; // reset again after add_index
 
@@ -1765,7 +2011,7 @@ mod tests {
     fn cluster_state_roundtrip_preserves_metadata() {
         let original = make_full_cluster_state();
         let proto = cluster_state_to_proto(&original);
-        let restored = proto_to_cluster_state(&proto);
+        let restored = proto_to_cluster_state(&proto).unwrap();
 
         assert_eq!(restored.cluster_name, "roundtrip-cluster");
         assert_eq!(restored.version, 42);
@@ -1778,7 +2024,7 @@ mod tests {
     fn roundtrip_preserves_node_info() {
         let original = make_full_cluster_state();
         let proto = cluster_state_to_proto(&original);
-        let restored = proto_to_cluster_state(&proto);
+        let restored = proto_to_cluster_state(&proto).unwrap();
 
         let n1 = restored.nodes.get("node-1").unwrap();
         assert_eq!(n1.name, "primary-node");
@@ -1787,17 +2033,19 @@ mod tests {
         assert_eq!(n1.http_port, 9200);
         assert!(n1.roles.contains(&NodeRole::Master));
         assert!(n1.roles.contains(&NodeRole::Data));
+        assert_eq!(n1.raft_node_id, 11);
 
         let n2 = restored.nodes.get("node-2").unwrap();
         assert_eq!(n2.name, "replica-node");
         assert_eq!(n2.roles, vec![NodeRole::Data]);
+        assert_eq!(n2.raft_node_id, 22);
     }
 
     #[test]
     fn roundtrip_preserves_shard_routing() {
         let original = make_full_cluster_state();
         let proto = cluster_state_to_proto(&original);
-        let restored = proto_to_cluster_state(&proto);
+        let restored = proto_to_cluster_state(&proto).unwrap();
 
         let idx = restored.indices.get("products").unwrap();
         assert_eq!(idx.number_of_shards, 2);
@@ -1811,13 +2059,28 @@ mod tests {
         let shard1 = idx.shard_routing.get(&1).unwrap();
         assert_eq!(shard1.primary, "node-2");
         assert_eq!(shard1.replicas, vec!["node-1".to_string()]);
+        assert_eq!(shard1.unassigned_replicas, 1);
+    }
+
+    #[test]
+    fn roundtrip_preserves_index_mappings_and_settings() {
+        let original = make_full_cluster_state();
+        let proto = cluster_state_to_proto(&original);
+        let restored = proto_to_cluster_state(&proto).unwrap();
+
+        let idx = restored.indices.get("products").unwrap();
+        assert_eq!(idx.uuid, "products-uuid");
+        assert_eq!(idx.settings.refresh_interval_ms, Some(1500));
+        assert_eq!(idx.mappings["title"].field_type, FieldType::Text);
+        assert_eq!(idx.mappings["embedding"].field_type, FieldType::KnnVector);
+        assert_eq!(idx.mappings["embedding"].dimension, Some(384));
     }
 
     #[test]
     fn roundtrip_empty_cluster_state() {
         let original = DomainClusterState::new("empty".into());
         let proto = cluster_state_to_proto(&original);
-        let restored = proto_to_cluster_state(&proto);
+        let restored = proto_to_cluster_state(&proto).unwrap();
 
         assert_eq!(restored.cluster_name, "empty");
         assert_eq!(restored.version, 0);
@@ -1849,7 +2112,7 @@ mod tests {
         });
 
         let proto = cluster_state_to_proto(&cs);
-        let restored = proto_to_cluster_state(&proto);
+        let restored = proto_to_cluster_state(&proto).unwrap();
 
         let idx = restored.indices.get("logs").unwrap();
         assert_eq!(idx.number_of_replicas, 0);
@@ -1870,7 +2133,7 @@ mod tests {
         });
 
         let proto = cluster_state_to_proto(&cs);
-        let restored = proto_to_cluster_state(&proto);
+        let restored = proto_to_cluster_state(&proto).unwrap();
 
         let node = restored.nodes.get("coord").unwrap();
         assert_eq!(node.roles, vec![NodeRole::Client]);
@@ -1991,6 +2254,7 @@ mod tests {
             raft: None,
             local_node_id: "node-1".into(),
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
         };
 
         let engine = service
@@ -2044,6 +2308,7 @@ mod tests {
             raft: None,
             local_node_id: "node-1".into(),
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
         };
 
         let response = service
@@ -2075,6 +2340,7 @@ mod tests {
             raft: None,
             local_node_id: "node-1".into(),
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
         };
 
         let response = service
@@ -2099,6 +2365,7 @@ mod tests {
             raft: None,
             local_node_id: "node-1".into(),
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
         };
 
         let err = match service.get_or_open_search_shard("missing-idx", 99) {
@@ -2119,6 +2386,7 @@ mod tests {
             raft: None,
             local_node_id: "node-1".into(),
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
         };
 
         let err = match service.get_or_open_shard("missing-idx", 99) {
@@ -2184,6 +2452,7 @@ mod tests {
             raft: None,
             local_node_id: "node-1".into(),
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
         };
 
         let (successful, failed) =
@@ -2241,6 +2510,7 @@ mod tests {
             raft: None,
             local_node_id: "node-1".into(),
             worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
         };
 
         let (successful, failed) =
@@ -2248,5 +2518,105 @@ mod tests {
         // Shard 0 primary + shard 1 replica = 2
         assert_eq!(successful, 2, "primary + replica assigned here");
         assert_eq!(failed, 0);
+    }
+
+    #[test]
+    fn validate_join_identity_allows_zero_raft_id_for_multiple_nodes() {
+        // raft_node_id=0 is the legacy/non-Raft value. Multiple nodes can share
+        // it without triggering the duplicate-identity rejection.
+        let mut state = DomainClusterState::new("test".into());
+        state.add_node(DomainNodeInfo {
+            id: "node-a".into(),
+            name: "a".into(),
+            host: "10.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 0,
+        });
+        state.add_node(DomainNodeInfo {
+            id: "node-b".into(),
+            name: "b".into(),
+            host: "10.0.0.2".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 0,
+        });
+
+        // A third node joining with raft_node_id=0 must NOT be rejected
+        assert!(validate_join_identity(&state, "node-c", 0).is_ok());
+    }
+
+    #[test]
+    fn validate_join_identity_rejects_duplicate_nonzero_raft_id() {
+        let mut state = DomainClusterState::new("test".into());
+        state.add_node(DomainNodeInfo {
+            id: "node-a".into(),
+            name: "a".into(),
+            host: "10.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 5,
+        });
+
+        // Different node trying to reuse raft_node_id=5 must fail
+        let err = validate_join_identity(&state, "node-b", 5).unwrap_err();
+        assert!(
+            err.message()
+                .contains("raft_node_id 5 is already registered")
+        );
+    }
+
+    #[test]
+    fn validate_join_identity_allows_same_node_same_raft_id() {
+        let mut state = DomainClusterState::new("test".into());
+        state.add_node(DomainNodeInfo {
+            id: "node-a".into(),
+            name: "a".into(),
+            host: "10.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 5,
+        });
+
+        // Same node re-joining with its own raft_node_id must succeed (idempotent)
+        assert!(validate_join_identity(&state, "node-a", 5).is_ok());
+    }
+
+    #[test]
+    fn roundtrip_unknown_field_type_returns_error() {
+        // Unknown field types must fail snapshot decoding so startup never
+        // consumes a lossy authoritative JoinCluster snapshot.
+        let proto = ClusterState {
+            cluster_name: "test".into(),
+            version: 1,
+            master_node: None,
+            nodes: vec![],
+            indices: vec![IndexMetadata {
+                name: "test-idx".into(),
+                uuid: "test-uuid".into(),
+                number_of_shards: 1,
+                number_of_replicas: 0,
+                shards: vec![],
+                mappings: vec![FieldMappingEntry {
+                    name: "weird_field".into(),
+                    field_type: "future_type_v99".into(),
+                    dimension: None,
+                }],
+                settings: None,
+            }],
+        };
+
+        let err = proto_to_cluster_state(&proto).unwrap_err();
+        assert!(
+            err.message().contains(
+                "unknown field type 'future_type_v99' for field 'weird_field' in index 'test-idx'"
+            ),
+            "unexpected error: {}",
+            err.message()
+        );
     }
 }

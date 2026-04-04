@@ -24,14 +24,14 @@ pub struct ShardManager {
 - `register_index_uuid(index, uuid)` — store the UUID mapping for an index
 - `index_uuid(index) -> Option<String>` — get registered UUID
 - `shard_data_dir(index, shard_id) -> Option<PathBuf>` — on-disk path using UUID
-- `cleanup_orphaned_data(known_uuids)` — delete dirs not matching any known UUID
+- `cleanup_orphaned_data(known_uuids)` — delete dirs not matching any authoritative known UUID
 
 ### UUID-Based Data Directories
 - On-disk path: `<data_dir>/<uuid>/shard_<id>` (NOT `<data_dir>/<index_name>/shard_<id>`)
 - The UUID comes from `IndexMetadata.uuid` and is passed to `open_shard_with_settings()`
 - If `index_uuid` is empty, `get_or_generate_uuid()` creates a random one (test/test convenience)
 - `close_index_shards()` looks up the stored UUID to find and delete the correct directory
-- `cleanup_orphaned_data(known_uuids)` is called on startup to delete stale data from deleted indices
+- `cleanup_orphaned_data(known_uuids)` is called on startup only after authoritative index UUIDs are available; empty pre-catch-up state must skip cleanup to avoid deleting live shard data
 - **NEVER** construct shard paths using the index name — always go through UUID
 
 ### Shard Opening Sequence
