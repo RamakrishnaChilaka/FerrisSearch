@@ -937,6 +937,33 @@ async fn rest_sql_uses_tantivy_fast_fields_for_supported_query() -> Result<()> {
 }
 
 #[tokio::test]
+async fn rest_sql_duplicate_grouped_output_alias_returns_ambiguous_error() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT brand AS total, count(*) AS total FROM products GROUP BY brand"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], json!("parsing_exception"));
+    let reason = body["error"]["reason"]
+        .as_str()
+        .expect("error reason should be present");
+    assert!(
+        reason.contains("ambiguous column reference 'total'"),
+        "expected ambiguous-column error, got: {reason}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_sql_uses_materialized_hits_fallback_for_select_star() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     create_products_index_and_docs(&harness).await?;

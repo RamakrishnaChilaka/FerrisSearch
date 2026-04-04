@@ -83,6 +83,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Ungrouped aggregates (`SELECT count(*), avg(price) FROM ...` without GROUP BY) use the grouped partial path with zero group-by columns — no row materialization needed
 - The `materialized_hits_fallback` path uses plain `build_record_batch()` (no hints, data-driven inference only)
 - SELECT aliases must be excluded from `required_columns` — aliases (e.g. `total` from `count(*) AS total`) are not real schema fields and cause `SourceFallback` → Null → Utf8 misclassification
+- Grouped-partials planning rejects duplicate output aliases (for example `SELECT brand AS total, count(*) AS total ... GROUP BY brand`) as ambiguous instead of allowing HAVING, ORDER BY, and output materialization to disagree
 
 ## Cluster Commands (Raft log entries)
 - `ClusterCommand::AddNode { node: NodeInfo }` — register/update a node in cluster state
@@ -97,7 +98,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 794 unit tests + 61 CLI tests + 33 consensus integration + 40 replication integration + 25 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 954 total
+- 796 unit tests + 61 CLI tests + 33 consensus integration + 40 replication integration + 26 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 957 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)

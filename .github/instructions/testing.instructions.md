@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **794 unit tests** (`cargo test --lib`)
+- **796 unit tests** (`cargo test --lib`)
 - **61 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **40 replication integration tests** (`cargo test --test replication_integration`)
-- **25 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **26 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 163 assertions across 4 files
-- **954 total** (`cargo test`)
+- **957 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -90,6 +90,7 @@ cargo test -- test_name                         # Single test by name
 - **Distributed SQL transport coverage**: The sqllogictest harness is single-node and single-shard. Any bug that depends on remote shard fan-out, gRPC transport, or partial-state encode/decode must also have a multi-node integration test (REST or transport-level) in addition to local result-correctness coverage.
 - **Schema drift recovery**: Add unit tests for both safe and unsafe remote-schema drift. Cover at least: (1) a drifted-first batch with later typed batches still preserves the later column and canonical type, (2) a missing-first batch fills later-missing values with nulls instead of dropping the column, and (3) an uncastable drifted batch fails loudly instead of degrading values into nulls.
 - **Alias shadowing**: Cover cases where a SELECT alias matches a real field name. Real source fields must stay in `required_columns` when projection/GROUP BY expressions or wrapped HAVING aggregate inputs still need them, while pure computed aliases referenced only from ORDER BY/HAVING wrappers like `COALESCE(total, 0)` must still be stripped.
+- **Duplicate grouped output aliases**: Cover the end-to-end `/_sql` path where a grouped column alias and metric alias collide, for example `SELECT brand AS total, count(*) AS total ... GROUP BY brand`. Grouped-partials planning must reject the query with an ambiguous-column error instead of silently picking one meaning.
 - **Grouped ORDER BY aggregate expressions**: Cover aliasless grouped queries like `SELECT author, SUM(upvotes) ... ORDER BY SUM(upvotes) DESC`. Supported aggregate expressions in ORDER BY must resolve back to the grouped metric and stay on `tantivy_grouped_partials` instead of falling through to the generic fast-fields/DataFusion path.
 - **Zero-column SQL batches**: Add regressions for literal-only queries such as `SELECT 1 FROM ... WHERE text_match(...)`. The planner must not fake `needs_score`, and the execution path must still return one output row per hit.
 - **Bound-column IR migrations**: When the small planner binder lands, add unit tests that resolve the same identifier name across clauses to different semantic kinds: source field vs output alias vs synthetic `_id` / `_score`. Cover at least WHERE alias residual behavior, HAVING/ORDER BY output-space binding, aggregate-argument source-field binding under alias shadowing, GROUP BY source-only eligibility, and real `score` vs synthetic `_score` separation.
