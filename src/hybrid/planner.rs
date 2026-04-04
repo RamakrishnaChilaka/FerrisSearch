@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
-    ObjectNamePart, OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor,
+    ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
     UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 
 const INTERNAL_TABLE_NAME: &str = "matched_rows";
 const SQL_MATCH_LIMIT: usize = 100_000;
+pub const SQL_SEMIJOIN_MAX_KEYS: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyntheticColumn {
@@ -723,6 +724,14 @@ pub struct SqlGroupedMetric {
     pub output_name: String,
     pub function: SqlGroupedMetricFunction,
     pub field: Option<String>,
+    pub projected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemijoinPlan {
+    pub outer_key: String,
+    pub inner_key: String,
+    pub inner_plan: Box<QueryPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -768,6 +777,7 @@ pub struct QueryPlan {
     pub index_name: String,
     pub original_sql: String,
     pub rewritten_sql: String,
+    pub semijoin: Option<SemijoinPlan>,
     pub text_matches: Vec<TextMatchPredicate>,
     pub pushed_filters: Vec<crate::search::QueryClause>,
     pub required_columns: Vec<String>,
@@ -818,6 +828,9 @@ impl QueryPlan {
     /// no GROUP BY, and no non-count aggregates — meaning we can answer it from
     /// `doc_count()` metadata without scanning any documents.
     pub fn is_count_star_only(&self) -> bool {
+        if self.semijoin.is_some() {
+            return false;
+        }
         if !self.text_matches.is_empty() || !self.pushed_filters.is_empty() {
             return false;
         }
@@ -967,9 +980,21 @@ impl QueryPlan {
         // Build pipeline stages
         let mut stages = Vec::new();
 
+        if let Some(semijoin) = &self.semijoin {
+            stages.push(serde_json::json!({
+                "stage": 0,
+                "name": "semijoin_key_build",
+                "description": "Execute the inner same-index subquery, materialize the qualifying key set at the coordinator, and lower it into the outer search filter",
+                "outer_key": semijoin.outer_key,
+                "inner_key": semijoin.inner_key,
+                "key_limit": SQL_SEMIJOIN_MAX_KEYS,
+                "inner_plan": semijoin.inner_plan.to_explain_json(),
+            }));
+        }
+
         // Stage 1: Tantivy search
         let mut tantivy_stage = serde_json::json!({
-            "stage": 1,
+            "stage": 0,
             "name": "tantivy_search",
             "description": "Execute search query in Tantivy to collect matching doc IDs and scores",
             "search_query": search_request.query,
@@ -995,7 +1020,7 @@ impl QueryPlan {
         // Stage 2: Column extraction
         if let Some(grouped_sql) = &self.grouped_sql {
             stages.push(serde_json::json!({
-                "stage": 2,
+                "stage": 0,
                 "name": "grouped_partial_collect",
                 "description": "Compute grouped partial metrics on each shard using Tantivy fast fields",
                 "group_by": grouped_sql
@@ -1010,16 +1035,17 @@ impl QueryPlan {
                         "output": metric.output_name,
                         "function": format!("{:?}", metric.function).to_lowercase(),
                         "field": metric.field,
+                        "hidden": !metric.projected,
                     }))
                     .collect::<Vec<_>>(),
             }));
             stages.push(serde_json::json!({
-                "stage": 3,
+                "stage": 0,
                 "name": "grouped_partial_merge",
                 "description": "Merge compact grouped partial states at the coordinator",
             }));
             let mut final_stage = serde_json::json!({
-                "stage": 4,
+                "stage": 0,
                 "name": "final_grouped_sql_shape",
                 "description": "Apply final projection and ordering to merged grouped results",
             });
@@ -1044,14 +1070,14 @@ impl QueryPlan {
             stages.push(final_stage);
         } else if !self.selects_all_columns {
             stages.push(serde_json::json!({
-                "stage": 2,
+                "stage": 0,
                 "name": "fast_field_read",
                 "description": "Read required columns directly from Tantivy fast fields (columnar storage)",
                 "columns": self.required_columns,
             }));
         } else {
             stages.push(serde_json::json!({
-                "stage": 2,
+                "stage": 0,
                 "name": "source_materialization",
                 "description": "Materialize full _source documents for SELECT * projection",
             }));
@@ -1060,14 +1086,14 @@ impl QueryPlan {
         if self.grouped_sql.is_none() {
             // Stage 3: Arrow batch building
             stages.push(serde_json::json!({
-                "stage": 3,
+                "stage": 0,
                 "name": "arrow_batch",
                 "description": "Build Arrow RecordBatch from extracted columns with score column",
             }));
 
             // Stage 4: DataFusion SQL execution
             let mut datafusion_stage = serde_json::json!({
-                "stage": 4,
+                "stage": 0,
                 "name": "datafusion_sql",
                 "description": "Execute rewritten SQL over Arrow batches for projection, sorting, and aggregation",
                 "rewritten_sql": self.rewritten_sql,
@@ -1084,7 +1110,11 @@ impl QueryPlan {
             stages.push(datafusion_stage);
         }
 
-        serde_json::json!({
+        for (index, stage) in stages.iter_mut().enumerate() {
+            stage["stage"] = serde_json::json!(index + 1);
+        }
+
+        let mut explain = serde_json::json!({
             "original_sql": self.original_sql,
             "index": self.index_name,
             "execution_strategy": execution_strategy,
@@ -1110,7 +1140,18 @@ impl QueryPlan {
             },
             "rewritten_sql": self.rewritten_sql,
             "pipeline": stages,
-        })
+        });
+
+        if let Some(semijoin) = &self.semijoin {
+            explain["semijoin"] = serde_json::json!({
+                "outer_key": semijoin.outer_key,
+                "inner_key": semijoin.inner_key,
+                "key_limit": SQL_SEMIJOIN_MAX_KEYS,
+                "inner_plan": semijoin.inner_plan.to_explain_json(),
+            });
+        }
+
+        explain
     }
 }
 
@@ -1143,7 +1184,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         _ => bail!("Only simple SELECT queries are supported"),
     };
 
-    let source_table = extract_single_table(select)?;
+    let (source_table, source_alias) = extract_single_table_info(select)?;
     if source_table != index_name {
         bail!(
             "SQL FROM [{}] must match request index [{}]",
@@ -1158,6 +1199,14 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     // and finally derive required_columns / GROUP BY from bound items.
     let bind_ctx = bind_select(select);
     let selects_all_columns = bind_ctx.selects_all_columns;
+
+    let semijoin = extract_semijoin_predicate(
+        &mut select.selection,
+        index_name,
+        source_alias.as_deref(),
+        &bind_ctx.alias_set,
+        &bind_ctx.identity_source_aliases,
+    )?;
 
     let (text_matches, pushed_filters) = extract_pushdowns(
         &mut select.selection,
@@ -1197,6 +1246,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         index_name: index_name.to_string(),
         original_sql: sql.to_string(),
         rewritten_sql: statement.to_string(),
+        semijoin,
         text_matches,
         pushed_filters,
         required_columns,
@@ -1249,7 +1299,7 @@ fn extract_grouped_sql_plan(
                 }
 
                 if let Some(metric) = parse_grouped_metric(expr, None)? {
-                    metrics.push(metric);
+                    ensure_grouped_metric(&mut metrics, metric, true);
                     continue;
                 }
                 return Ok(None);
@@ -1266,13 +1316,20 @@ fn extract_grouped_sql_plan(
                 }
 
                 if let Some(metric) = parse_grouped_metric(expr, Some(alias.value.clone()))? {
-                    metrics.push(metric);
+                    ensure_grouped_metric(&mut metrics, metric, true);
                     continue;
                 }
                 return Ok(None);
             }
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return Ok(None),
         }
+    }
+
+    if let Some(order_by) = order_by {
+        register_hidden_grouped_metrics_from_order_by(order_by, &mut metrics)?;
+    }
+    if let Some(having_expr) = &select.having {
+        register_hidden_grouped_metrics_from_having(having_expr, &mut metrics)?;
     }
 
     if metrics.is_empty() {
@@ -1523,7 +1580,82 @@ fn parse_grouped_metric(expr: &Expr, alias: Option<String>) -> Result<Option<Sql
         output_name: alias.unwrap_or(default_name),
         function,
         field,
+        projected: true,
     }))
+}
+
+fn ensure_grouped_metric(
+    metrics: &mut Vec<SqlGroupedMetric>,
+    parsed: SqlGroupedMetric,
+    projected: bool,
+) -> String {
+    if let Some(existing) = metrics
+        .iter_mut()
+        .find(|metric| metric.function == parsed.function && metric.field == parsed.field)
+    {
+        if projected {
+            existing.projected = true;
+            existing.output_name = parsed.output_name.clone();
+        }
+        return existing.output_name.clone();
+    }
+
+    let output_name = if projected {
+        parsed.output_name.clone()
+    } else {
+        format!("__hidden_grouped_metric_{}", metrics.len())
+    };
+    metrics.push(SqlGroupedMetric {
+        output_name: output_name.clone(),
+        function: parsed.function,
+        field: parsed.field,
+        projected,
+    });
+    output_name
+}
+
+fn register_hidden_grouped_metrics_from_order_by(
+    order_by: &sqlparser::ast::OrderBy,
+    metrics: &mut Vec<SqlGroupedMetric>,
+) -> Result<()> {
+    let OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return Ok(());
+    };
+
+    for expr in exprs {
+        register_hidden_grouped_metric(&expr.expr, metrics)?;
+    }
+    Ok(())
+}
+
+fn register_hidden_grouped_metrics_from_having(
+    expr: &Expr,
+    metrics: &mut Vec<SqlGroupedMetric>,
+) -> Result<()> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            register_hidden_grouped_metrics_from_having(left, metrics)?;
+            register_hidden_grouped_metrics_from_having(right, metrics)?;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            register_hidden_grouped_metric(left, metrics)?;
+            register_hidden_grouped_metric(right, metrics)?;
+        }
+        Expr::Nested(inner) => register_hidden_grouped_metrics_from_having(inner, metrics)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn register_hidden_grouped_metric(expr: &Expr, metrics: &mut Vec<SqlGroupedMetric>) -> Result<()> {
+    if let Some(metric) = parse_grouped_metric(expr, None)? {
+        ensure_grouped_metric(metrics, metric, false);
+    }
+    Ok(())
 }
 
 fn extract_limit_offset(
@@ -1622,7 +1754,7 @@ fn validate_query_shape(query: &sqlparser::ast::Query) -> Result<()> {
             validate_from_clause(select)?;
             // Check WHERE clause for subqueries
             if let Some(ref selection) = select.selection {
-                validate_where_clause(selection)?;
+                validate_where_clause(selection, true)?;
             }
             // Check HAVING for subqueries
             if let Some(ref having) = select.having
@@ -1707,13 +1839,27 @@ fn validate_projection(select: &Select) -> Result<()> {
 }
 
 /// Validate WHERE clause: reject subquery expressions.
-fn validate_where_clause(expr: &Expr) -> Result<()> {
+fn validate_where_clause(expr: &Expr, semijoin_leaf_allowed: bool) -> Result<()> {
     match expr {
-        Expr::InSubquery { .. } => {
-            bail!(
-                "Subqueries (IN (SELECT ...)) are not yet supported. \
-                 Rewrite as separate queries."
-            );
+        Expr::InSubquery {
+            expr: inner_expr,
+            subquery,
+            negated,
+        } => {
+            if *negated {
+                bail!(
+                    "NOT IN subqueries are not supported. \
+                     Rewrite as separate queries."
+                );
+            }
+            if !semijoin_leaf_allowed {
+                bail!(
+                    "Subqueries (IN (SELECT ...)) are only supported as top-level AND predicates. \
+                     Rewrite the expression or run the subquery separately."
+                );
+            }
+            validate_where_clause(inner_expr, false)?;
+            validate_query_shape(subquery)?;
         }
         Expr::Exists { .. } => {
             bail!(
@@ -1728,24 +1874,35 @@ fn validate_where_clause(expr: &Expr) -> Result<()> {
             );
         }
         // Recurse into compound expressions
-        Expr::BinaryOp { left, right, .. } => {
-            validate_where_clause(left)?;
-            validate_where_clause(right)?;
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            validate_where_clause(left, semijoin_leaf_allowed)?;
+            validate_where_clause(right, semijoin_leaf_allowed)?;
         }
-        Expr::UnaryOp { expr: inner, .. } | Expr::Nested(inner) => {
-            validate_where_clause(inner)?;
+        Expr::BinaryOp { left, right, .. } => {
+            validate_where_clause(left, false)?;
+            validate_where_clause(right, false)?;
+        }
+        Expr::UnaryOp { expr: inner, .. } => {
+            validate_where_clause(inner, false)?;
+        }
+        Expr::Nested(inner) => {
+            validate_where_clause(inner, semijoin_leaf_allowed)?;
         }
         Expr::Between {
             expr: e, low, high, ..
         } => {
-            validate_where_clause(e)?;
-            validate_where_clause(low)?;
-            validate_where_clause(high)?;
+            validate_where_clause(e, false)?;
+            validate_where_clause(low, false)?;
+            validate_where_clause(high, false)?;
         }
         Expr::InList { expr: e, list, .. } => {
-            validate_where_clause(e)?;
+            validate_where_clause(e, false)?;
             for item in list {
-                validate_where_clause(item)?;
+                validate_where_clause(item, false)?;
             }
         }
         Expr::Like {
@@ -1754,11 +1911,11 @@ fn validate_where_clause(expr: &Expr) -> Result<()> {
         | Expr::ILike {
             expr: e, pattern, ..
         } => {
-            validate_where_clause(e)?;
-            validate_where_clause(pattern)?;
+            validate_where_clause(e, false)?;
+            validate_where_clause(pattern, false)?;
         }
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            validate_where_clause(inner)?;
+            validate_where_clause(inner, false)?;
         }
         Expr::Case {
             operand,
@@ -1767,15 +1924,15 @@ fn validate_where_clause(expr: &Expr) -> Result<()> {
             ..
         } => {
             if let Some(op) = operand {
-                validate_where_clause(op)?;
+                validate_where_clause(op, false)?;
             }
             for cond in conditions {
                 let sqlparser::ast::CaseWhen { condition, result } = cond;
-                validate_where_clause(condition)?;
-                validate_where_clause(result)?;
+                validate_where_clause(condition, false)?;
+                validate_where_clause(result, false)?;
             }
             if let Some(else_res) = else_result {
-                validate_where_clause(else_res)?;
+                validate_where_clause(else_res, false)?;
             }
         }
         Expr::Function(func) => {
@@ -1797,7 +1954,7 @@ fn validate_where_clause(expr: &Expr) -> Result<()> {
                             arg: FunctionArgExpr::Expr(e),
                             ..
                         } => {
-                            validate_where_clause(e)?;
+                            validate_where_clause(e, false)?;
                         }
                         _ => {}
                     }
@@ -1805,7 +1962,7 @@ fn validate_where_clause(expr: &Expr) -> Result<()> {
             }
         }
         Expr::Cast { expr: inner, .. } => {
-            validate_where_clause(inner)?;
+            validate_where_clause(inner, false)?;
         }
         // Leaf expressions (literals, identifiers, etc.) — no subqueries possible
         _ => {}
@@ -1877,7 +2034,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
     }
 }
 
-fn extract_single_table(select: &Select) -> Result<String> {
+fn extract_single_table_info(select: &Select) -> Result<(String, Option<String>)> {
     if select.from.len() != 1 {
         bail!("Exactly one FROM table is supported");
     }
@@ -1888,12 +2045,15 @@ fn extract_single_table(select: &Select) -> Result<String> {
     }
 
     match &table.relation {
-        TableFactor::Table { name, .. } => {
+        TableFactor::Table { name, alias, .. } => {
             if name.0.len() != 1 {
                 bail!("Qualified table names are not supported in the SQL search MVP");
             }
             match &name.0[0] {
-                ObjectNamePart::Identifier(ident) => Ok(ident.value.clone()),
+                ObjectNamePart::Identifier(ident) => Ok((
+                    ident.value.clone(),
+                    alias.as_ref().map(|alias| alias.name.value.clone()),
+                )),
                 _ => bail!("Unsupported table name syntax"),
             }
         }
@@ -1963,6 +2123,266 @@ fn extract_pushdowns(
     }
 
     Ok((text_matches, pushed_filters))
+}
+
+fn extract_semijoin_predicate(
+    selection: &mut Option<Expr>,
+    index_name: &str,
+    outer_source_alias: Option<&str>,
+    select_aliases: &BTreeSet<String>,
+    identity_source_aliases: &BTreeSet<String>,
+) -> Result<Option<SemijoinPlan>> {
+    let Some(expr) = selection.take() else {
+        return Ok(None);
+    };
+
+    let mut predicates = Vec::new();
+    split_conjunction(expr, &mut predicates);
+
+    let mut semijoins = Vec::new();
+    let mut residual = Vec::new();
+
+    for predicate in predicates {
+        match parse_semijoin_predicate(
+            &predicate,
+            index_name,
+            outer_source_alias,
+            select_aliases,
+            identity_source_aliases,
+        )? {
+            Some(semijoin) => semijoins.push(semijoin),
+            None => residual.push(predicate),
+        }
+    }
+
+    *selection = combine_conjunctions(residual);
+
+    match semijoins.len() {
+        0 => Ok(None),
+        1 => Ok(semijoins.into_iter().next()),
+        _ => bail!("Only one IN (SELECT ...) semijoin predicate is supported per query in the MVP"),
+    }
+}
+
+fn parse_semijoin_predicate(
+    predicate: &Expr,
+    index_name: &str,
+    outer_source_alias: Option<&str>,
+    select_aliases: &BTreeSet<String>,
+    identity_source_aliases: &BTreeSet<String>,
+) -> Result<Option<SemijoinPlan>> {
+    let Expr::InSubquery {
+        expr,
+        subquery,
+        negated: false,
+    } = predicate
+    else {
+        return Ok(None);
+    };
+
+    let outer_key = resolve_semijoin_outer_key(expr, select_aliases, identity_source_aliases)?;
+    let inner_key = extract_semijoin_inner_key(subquery)?;
+
+    if let Some(outer_alias) = outer_source_alias
+        && query_references_outer_alias(subquery, outer_alias)
+    {
+        bail!(
+            "Correlated semijoin subqueries are not supported in the MVP. \
+             Remove the outer alias reference [{}] from the inner query.",
+            outer_alias
+        );
+    }
+
+    let inner_sql = subquery.to_string();
+    let inner_plan = plan_sql(index_name, &inner_sql)?;
+    if inner_plan.semijoin.is_some() {
+        bail!("Nested semijoin subqueries are not supported in the MVP");
+    }
+
+    Ok(Some(SemijoinPlan {
+        outer_key,
+        inner_key,
+        inner_plan: Box::new(inner_plan),
+    }))
+}
+
+fn resolve_semijoin_outer_key(
+    expr: &Expr,
+    select_aliases: &BTreeSet<String>,
+    identity_source_aliases: &BTreeSet<String>,
+) -> Result<String> {
+    let Some(name) = expr_to_field_name(expr) else {
+        bail!(
+            "Semijoin outer key must be a plain source column. \
+             Expressions like LOWER(author) are not supported in the MVP."
+        );
+    };
+    if alias_blocks_source_name(&name, select_aliases, identity_source_aliases) {
+        bail!(
+            "Semijoin outer key [{}] cannot reference a SELECT alias. \
+             Use the underlying source column instead.",
+            name
+        );
+    }
+    if SyntheticColumn::parse(&name).is_some() {
+        bail!(
+            "Semijoin outer key [{}] cannot use synthetic columns like _id or _score",
+            name
+        );
+    }
+    Ok(name)
+}
+
+fn extract_semijoin_inner_key(subquery: &Query) -> Result<String> {
+    let SetExpr::Select(select) = subquery.body.as_ref() else {
+        bail!("Semijoin subqueries must be simple SELECT queries");
+    };
+
+    if select.projection.len() != 1 {
+        bail!("Semijoin subqueries must project exactly one key column in the MVP");
+    }
+
+    match &select.projection[0] {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            let Some(name) = expr_to_field_name(expr) else {
+                bail!(
+                    "Semijoin subquery keys must be plain source columns. \
+                     Computed expressions are not supported in the MVP."
+                );
+            };
+            if SyntheticColumn::parse(&name).is_some() {
+                bail!("Semijoin subquery keys cannot use synthetic columns like _id or _score");
+            }
+            Ok(name)
+        }
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+            bail!("Semijoin subqueries cannot use SELECT * in the MVP")
+        }
+    }
+}
+
+fn query_references_outer_alias(query: &Query, outer_alias: &str) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+
+    if select
+        .from
+        .iter()
+        .filter_map(|table_with_joins| match &table_with_joins.relation {
+            TableFactor::Table { alias, .. } => {
+                alias.as_ref().map(|alias| alias.name.value.as_str())
+            }
+            _ => None,
+        })
+        .any(|alias| alias.eq_ignore_ascii_case(outer_alias))
+    {
+        return false;
+    }
+
+    select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            expr_references_qualified_prefix(expr, outer_alias)
+        }
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
+    }) || select
+        .selection
+        .as_ref()
+        .is_some_and(|expr| expr_references_qualified_prefix(expr, outer_alias))
+        || select
+            .having
+            .as_ref()
+            .is_some_and(|expr| expr_references_qualified_prefix(expr, outer_alias))
+        || match &select.group_by {
+            sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs
+                .iter()
+                .any(|expr| expr_references_qualified_prefix(expr, outer_alias)),
+            _ => false,
+        }
+        || query
+            .order_by
+            .as_ref()
+            .is_some_and(|order_by| match &order_by.kind {
+                OrderByKind::Expressions(exprs) => exprs
+                    .iter()
+                    .any(|expr| expr_references_qualified_prefix(&expr.expr, outer_alias)),
+                OrderByKind::All(_) => false,
+            })
+}
+
+fn expr_references_qualified_prefix(expr: &Expr, prefix: &str) -> bool {
+    match expr {
+        Expr::CompoundIdentifier(parts) => parts
+            .first()
+            .is_some_and(|ident| ident.value.eq_ignore_ascii_case(prefix)),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_qualified_prefix(left, prefix)
+                || expr_references_qualified_prefix(right, prefix)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => expr_references_qualified_prefix(inner, prefix),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_references_qualified_prefix(e, prefix)
+                || expr_references_qualified_prefix(low, prefix)
+                || expr_references_qualified_prefix(high, prefix)
+        }
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        } => {
+            expr_references_qualified_prefix(e, prefix)
+                || expr_references_qualified_prefix(pattern, prefix)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            expr_references_qualified_prefix(e, prefix)
+                || list
+                    .iter()
+                    .any(|item| expr_references_qualified_prefix(item, prefix))
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|expr| expr_references_qualified_prefix(expr, prefix))
+                || conditions.iter().any(|case_when| {
+                    expr_references_qualified_prefix(&case_when.condition, prefix)
+                        || expr_references_qualified_prefix(&case_when.result, prefix)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(|expr| expr_references_qualified_prefix(expr, prefix))
+        }
+        Expr::Function(func) => {
+            if let FunctionArguments::List(list) = &func.args {
+                list.args.iter().any(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(expr),
+                        ..
+                    }
+                    | FunctionArg::ExprNamed {
+                        arg: FunctionArgExpr::Expr(expr),
+                        ..
+                    } => expr_references_qualified_prefix(expr, prefix),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 fn text_match_to_query_clause(predicate: &TextMatchPredicate) -> crate::search::QueryClause {
@@ -2846,6 +3266,45 @@ mod tests {
         assert!(grouped.order_by[0].desc);
     }
 
+    #[test]
+    fn having_hidden_metric_without_projection_stays_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author FROM idx GROUP BY author HAVING COUNT(*) > 20 ORDER BY author ASC",
+        )
+        .unwrap();
+
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.group_columns.len(), 1);
+        assert_eq!(grouped.metrics.len(), 1);
+        assert!(!grouped.metrics[0].projected);
+        assert_eq!(grouped.having.len(), 1);
+        assert_eq!(
+            grouped.having[0].output_name,
+            grouped.metrics[0].output_name
+        );
+    }
+
+    #[test]
+    fn order_by_hidden_metric_without_projection_stays_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author FROM idx GROUP BY author ORDER BY SUM(upvotes) DESC LIMIT 5",
+        )
+        .unwrap();
+
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.metrics.len(), 1);
+        assert!(!grouped.metrics[0].projected);
+        assert_eq!(grouped.order_by.len(), 1);
+        assert_eq!(
+            grouped.order_by[0].output_name,
+            grouped.metrics[0].output_name
+        );
+    }
+
     // ── OR disjunction pushdown tests ──────────────────────────────────
 
     #[test]
@@ -3284,14 +3743,18 @@ mod tests {
     // ── Unsupported query shape validation tests ───────────────────────
 
     #[test]
-    fn rejects_in_subquery() {
-        let result = plan_sql("idx", "SELECT * FROM idx WHERE id IN (SELECT id FROM idx)");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Subqueries") && err.contains("not"),
-            "Expected subquery error, got: {err}"
-        );
+    fn supports_same_index_semijoin() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT title FROM idx WHERE id IN (SELECT id FROM idx)",
+        )
+        .unwrap();
+        let semijoin = plan.semijoin.as_ref().expect("semijoin plan");
+
+        assert_eq!(semijoin.outer_key, "id");
+        assert_eq!(semijoin.inner_key, "id");
+        assert!(!plan.has_residual_predicates);
+        assert!(!plan.rewritten_sql.contains("IN (SELECT"));
     }
 
     #[test]
@@ -3400,16 +3863,85 @@ mod tests {
     }
 
     #[test]
-    fn rejects_subquery_nested_in_and() {
-        let result = plan_sql(
+    fn supports_semijoin_nested_in_and_conjunction() {
+        let plan = plan_sql(
             "idx",
             "SELECT * FROM idx WHERE price > 10 AND id IN (SELECT id FROM idx)",
+        )
+        .unwrap();
+
+        assert!(plan.semijoin.is_some());
+        assert_eq!(plan.pushed_filters.len(), 1);
+        assert!(!plan.has_residual_predicates);
+    }
+
+    #[test]
+    fn rejects_semijoin_inside_or() {
+        let result = plan_sql(
+            "idx",
+            "SELECT * FROM idx WHERE id IN (SELECT id FROM idx) OR price > 10",
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("Subqueries") || err.contains("not"),
-            "Expected subquery error, got: {err}"
+            err.contains("top-level AND predicates"),
+            "Expected top-level semijoin error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_correlated_semijoin_subquery() {
+        let result = plan_sql(
+            "idx",
+            "SELECT outer_idx.id FROM idx AS outer_idx WHERE outer_idx.id IN (SELECT inner_idx.id FROM idx AS inner_idx WHERE inner_idx.price > outer_idx.price)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Correlated semijoin") || err.contains("outer alias"),
+            "Expected correlated semijoin error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_multi_index_semijoin_subquery() {
+        let result = plan_sql(
+            "idx",
+            "SELECT * FROM idx WHERE id IN (SELECT id FROM other)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("must match request index"),
+            "Expected same-index error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_semijoin_predicates() {
+        let result = plan_sql(
+            "idx",
+            "SELECT * FROM idx WHERE id IN (SELECT id FROM idx) AND author IN (SELECT author FROM idx)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Only one IN (SELECT ...) semijoin predicate"),
+            "Expected multiple-semijoin error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_semijoin_outer_expression_key() {
+        let result = plan_sql(
+            "idx",
+            "SELECT * FROM idx WHERE LOWER(author) IN (SELECT author FROM idx)",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("plain source column"),
+            "Expected outer-key shape error, got: {err}"
         );
     }
 

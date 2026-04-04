@@ -111,6 +111,14 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Roadmap for this limitation: support `text_match()` inside `OR` / more complex boolean trees only with branch-aware boolean lowering when the entire subtree is fully pushable into Tantivy. Never leave residual `text_match()` evaluation to DataFusion.
 - The `expr_contains_text_match` guard walks all expression shapes that can survive as residual predicates: `BinaryOp`, `Nested`, `UnaryOp`, `IsNull`, `IsNotNull`, `Cast`, `Case` (with `CaseWhen` arms), `Between`, `InList`, and `Function` arguments (for `COALESCE(text_match(...), false)` etc.).
 - `NOT IN` and `NOT BETWEEN` are NOT pushed — they remain as residual predicates for DataFusion.
+- Same-index semijoin MVP rules:
+  - only top-level `AND` predicates in `WHERE`
+  - same index only
+  - uncorrelated inner query only
+  - exactly one projected inner key column
+  - distinct inner keys are deduplicated, exactly `SQL_SEMIJOIN_MAX_KEYS = 50_000` keys are allowed, and the next distinct key must fail before lowering
+  - `NULL` inner keys are ignored during lowering
+  - lower supported semijoins into the existing concrete outer filter path; do not leave them as DataFusion residual subqueries
 - `_score` and `_id` fields are never pushed (`_score` is computed by Tantivy, `_id` is a doc identifier).
 - **GROUP BY expressions** (e.g., `GROUP BY LOWER(author)`, `GROUP BY year / 10`) are NOT eligible for the grouped partials path. Only plain column references in GROUP BY enable `tantivy_grouped_partials`. Expression-based GROUP BY falls through to `tantivy_fast_fields` + DataFusion. When the fallback query is `_score`-free and fully fast-field-backed, the runtime may use bitset streaming internally; responses expose this separately as `streaming_used: true`. Mixed GROUP BY (plain columns + expressions, e.g., `GROUP BY author, LOWER(category)`) also bails — `collect_group_by_columns` returns `has_expression_group_by = true` which gates `extract_grouped_sql_plan`.
 - **GROUP BY fallback scan limit**: When a GROUP BY query falls to `tantivy_fast_fields` (expression GROUP BY, unsupported aggregates like `STDDEV_POP`, residual predicates), the planner sets `has_group_by_fallback = true`. The API layer overrides `SearchRequest.size` from the default 100K to `sql_group_by_scan_limit` (default: 1M, configurable, 0 = unlimited). If any shard still returns fewer rows than it matched on the capped fallback paths, the query returns a `group_by_scan_limit_exceeded` error instead of silently wrong aggregates. The default 100K `SQL_MATCH_LIMIT` remains for flat (non-GROUP BY) queries where truncation only affects completeness, not correctness.
@@ -132,6 +140,8 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Multiple HAVING conditions (ANDed) are supported.
 - Complex HAVING expressions (OR, subqueries, expressions not matching a known metric) cause fallback to the DataFusion path.
 - The pipeline order in grouped partials is: merge → HAVING → top-K selection → LIMIT/OFFSET.
+- Grouped-partials may register hidden support metrics for aggregate expressions referenced only from HAVING / ORDER BY. These metrics must be collected and merged, but they must not appear in the final SQL columns or rows.
+- Ungrouped grouped-partials queries with zero matches must still synthesize the empty global bucket so `count(*)` returns `0` and other aggregates return `NULL`, rather than producing an empty result set.
 
 ## GROUP BY Field Type Validation
 - `GROUP BY` on `Text` fields returns a `group_by_text_field_exception` error (HTTP 400).
@@ -230,4 +240,5 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Add regression tests for zero-result or all-null columns: verify that schema-derived `type_hints` override `infer_column_kind` to produce correct Arrow DataTypes (e.g. Float64, not Utf8 for numeric columns).
 - Add tests verifying that the fast-field path reads `_id` from the fast-field column (not from stored docs) when all columns are fast-field-backed.
 - Add tests verifying that mixed fast+fallback column queries still return correct `_id` values.
+- Add semijoin regressions for supported top-level same-index shapes, rejected correlated / OR-wrapped / multi-index / multi-semijoin shapes, zero-key aggregate semantics, exact key-cap boundaries, inner grouped `ORDER BY` aggregate shapes, and EXPLAIN ANALYZE semijoin pipeline visibility.
 - Live tests should inspect both returned rows and planner metadata.

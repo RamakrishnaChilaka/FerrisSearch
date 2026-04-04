@@ -453,6 +453,9 @@ pub async fn explain_sql(
             });
             explain["columns"] = serde_json::json!(result.sql_result.columns);
             explain["rows"] = serde_json::json!(result.sql_result.rows);
+            if let Some(key_count) = result.semijoin_key_count {
+                explain["semijoin"]["resolved_key_count"] = serde_json::json!(key_count);
+            }
             (StatusCode::OK, Json(explain))
         }
         Err(err) => err,
@@ -469,6 +472,7 @@ struct SqlExecutionResult {
     execution_mode: &'static str,
     streaming_used: bool,
     truncated: bool,
+    semijoin_key_count: Option<usize>,
     timings: crate::hybrid::SqlTimings,
 }
 
@@ -908,30 +912,143 @@ pub async fn execute_sql_for_testing(
     Ok(result.sql_result)
 }
 
-/// Execute a SQL query end-to-end with per-stage timing instrumentation.
-/// Used by both `search_sql` (for the normal response) and `explain_sql`
-/// (for EXPLAIN ANALYZE with timings + rows).
-async fn execute_sql_query(
-    state: &AppState,
-    index_name: &str,
-    query: &str,
-) -> Result<SqlExecutionResult, (StatusCode, Json<Value>)> {
-    let total_start = Instant::now();
-    let _sql_timer = crate::metrics::SQL_LATENCY_SECONDS.start_timer();
+fn semijoin_filter_clause(outer_key: &str, key_values: &[Value]) -> crate::search::QueryClause {
+    if key_values.len() == 1 {
+        return crate::search::QueryClause::Term(HashMap::from([(
+            outer_key.to_string(),
+            key_values[0].clone(),
+        )]));
+    }
 
-    // Stage 1: Planning
-    let plan_start = Instant::now();
-    let plan = match crate::hybrid::planner::plan_sql(index_name, query) {
-        Ok(plan) => plan,
-        Err(e) => {
-            return Err(crate::api::error_response(
-                StatusCode::BAD_REQUEST,
-                "parsing_exception",
-                e,
-            ));
+    crate::search::QueryClause::Bool(crate::search::BoolQuery {
+        should: key_values
+            .iter()
+            .cloned()
+            .map(|value| {
+                crate::search::QueryClause::Term(HashMap::from([(outer_key.to_string(), value)]))
+            })
+            .collect(),
+        ..Default::default()
+    })
+}
+
+fn apply_semijoin_filter(
+    search_req: &mut crate::search::SearchRequest,
+    semijoin: &crate::hybrid::planner::SemijoinPlan,
+    key_values: &[Value],
+) {
+    if key_values.is_empty() {
+        search_req.query = crate::search::QueryClause::MatchNone(serde_json::json!({}));
+        return;
+    }
+
+    let filter_clause = semijoin_filter_clause(&semijoin.outer_key, key_values);
+    match &mut search_req.query {
+        crate::search::QueryClause::MatchAll(_) => {
+            search_req.query = crate::search::QueryClause::Bool(crate::search::BoolQuery {
+                filter: vec![filter_clause],
+                ..Default::default()
+            });
         }
-    };
+        crate::search::QueryClause::Bool(bool_query) => {
+            bool_query.filter.push(filter_clause);
+        }
+        existing => {
+            let current = existing.clone();
+            search_req.query = crate::search::QueryClause::Bool(crate::search::BoolQuery {
+                must: vec![current],
+                filter: vec![filter_clause],
+                ..Default::default()
+            });
+        }
+    }
+}
+
+fn collect_semijoin_key(
+    keys: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    value: Value,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if value.is_null() {
+        return Ok(());
+    }
+
+    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
+    if !seen.insert(serialized) {
+        return Ok(());
+    }
+
+    if keys.len() >= crate::hybrid::planner::SQL_SEMIJOIN_MAX_KEYS {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "semijoin_key_limit_exceeded",
+            format!(
+                "Semijoin inner query produced more than {} distinct keys. Narrow the inner query or add stronger filters before lowering it into the outer search.",
+                crate::hybrid::planner::SQL_SEMIJOIN_MAX_KEYS
+            ),
+        ));
+    }
+
+    keys.push(value);
+    Ok(())
+}
+
+async fn resolve_semijoin_keys(
+    state: &AppState,
+    semijoin: &crate::hybrid::planner::SemijoinPlan,
+) -> Result<Vec<Value>, (StatusCode, Json<Value>)> {
+    let inner_result = execute_sql_query_with_plan(
+        state,
+        semijoin.inner_plan.as_ref().clone(),
+        0.0,
+        Instant::now(),
+        false,
+    );
+    let inner_result = Box::pin(inner_result).await?;
+
+    let column = inner_result
+        .sql_result
+        .columns
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sql_execution_exception",
+                "semijoin inner query did not return a key column",
+            )
+        })?;
+
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for row in &inner_result.sql_result.rows {
+        let Some(value) = row.get(&column).cloned() else {
+            continue;
+        };
+        collect_semijoin_key(&mut keys, &mut seen, value)?;
+    }
+
+    Ok(keys)
+}
+
+async fn execute_sql_query_with_plan(
+    state: &AppState,
+    plan: crate::hybrid::QueryPlan,
+    planning_ms: f64,
+    total_start: Instant,
+    record_metrics: bool,
+) -> Result<SqlExecutionResult, (StatusCode, Json<Value>)> {
+    let mut semijoin_key_count = None;
+    let mut semijoin_ms = 0.0;
     let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
+
+    if let Some(semijoin) = &plan.semijoin {
+        let semijoin_start = Instant::now();
+        let key_values = resolve_semijoin_keys(state, semijoin).await?;
+        semijoin_ms = semijoin_start.elapsed().as_secs_f64() * 1000.0;
+        semijoin_key_count = Some(key_values.len());
+        apply_semijoin_filter(&mut search_req, semijoin, &key_values);
+    }
 
     // GROUP BY fallback: override the default 100K cap so DataFusion sees all
     // matching docs.  Uses the configurable sql_group_by_scan_limit (0 = unlimited).
@@ -943,16 +1060,14 @@ async fn execute_sql_query(
         };
     }
 
-    let planning_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
-
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(index_name) {
+    let metadata = match cluster_state.indices.get(&plan.index_name) {
         Some(m) => m.clone(),
         None => {
             return Err(crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{}]", plan.index_name),
             ));
         }
     };
@@ -961,7 +1076,7 @@ async fn execute_sql_query(
     if plan.is_count_star_only() {
         let search_start = Instant::now();
         let (count, successful_shards, failed_shards) =
-            count_docs_from_metadata(state, index_name, &metadata).await;
+            count_docs_from_metadata(state, &plan.index_name, &metadata).await;
         let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         let Some(grouped_sql) = plan.grouped_sql.as_ref() else {
@@ -974,17 +1089,20 @@ async fn execute_sql_query(
         let columns: Vec<String> = grouped_sql
             .metrics
             .iter()
-            .map(|m| m.output_name.clone())
+            .filter(|metric| metric.projected)
+            .map(|metric| metric.output_name.clone())
             .collect();
         let mut row = serde_json::Map::new();
-        for m in &grouped_sql.metrics {
+        for m in grouped_sql.metrics.iter().filter(|metric| metric.projected) {
             row.insert(m.output_name.clone(), serde_json::json!(count));
         }
         let rows = vec![serde_json::Value::Object(row)];
 
-        crate::metrics::SQL_QUERIES_TOTAL
-            .with_label_values(&["count_star_fast"])
-            .inc();
+        if record_metrics {
+            crate::metrics::SQL_QUERIES_TOTAL
+                .with_label_values(&["count_star_fast"])
+                .inc();
+        }
 
         return Ok(SqlExecutionResult {
             plan,
@@ -995,8 +1113,10 @@ async fn execute_sql_query(
             execution_mode: "count_star_fast",
             streaming_used: false,
             truncated: false,
+            semijoin_key_count,
             timings: crate::hybrid::SqlTimings {
                 planning_ms,
+                semijoin_ms,
                 search_ms,
                 collect_ms: 0.0,
                 merge_ms: 0.0,
@@ -1028,13 +1148,16 @@ async fn execute_sql_query(
         }
 
         let search_start = Instant::now();
-        let distributed =
-            match crate::api::index::execute_distributed_dsl_search(state, index_name, &search_req)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => return Err(err),
-            };
+        let distributed = match crate::api::index::execute_distributed_dsl_search(
+            state,
+            &plan.index_name,
+            &search_req,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(err),
+        };
         let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         let merge_start = Instant::now();
@@ -1051,9 +1174,11 @@ async fn execute_sql_query(
             };
         let merge_ms = merge_start.elapsed().as_secs_f64() * 1000.0;
 
-        crate::metrics::SQL_QUERIES_TOTAL
-            .with_label_values(&["tantivy_grouped_partials"])
-            .inc();
+        if record_metrics {
+            crate::metrics::SQL_QUERIES_TOTAL
+                .with_label_values(&["tantivy_grouped_partials"])
+                .inc();
+        }
 
         return Ok(SqlExecutionResult {
             plan,
@@ -1064,8 +1189,10 @@ async fn execute_sql_query(
             execution_mode: "tantivy_grouped_partials",
             streaming_used: false,
             truncated: false,
+            semijoin_key_count,
             timings: crate::hybrid::SqlTimings {
                 planning_ms,
+                semijoin_ms,
                 search_ms,
                 collect_ms: 0.0,
                 merge_ms,
@@ -1077,7 +1204,7 @@ async fn execute_sql_query(
 
     let local_shards = crate::api::index::ensure_local_index_shards_open(
         state,
-        index_name,
+        &plan.index_name,
         &metadata,
         "SQL search",
     );
@@ -1089,7 +1216,7 @@ async fn execute_sql_query(
     let direct_sql = if !plan.selects_all_columns {
         match collect_direct_sql_batches(
             state,
-            index_name,
+            &plan.index_name,
             &metadata,
             &plan,
             &search_req,
@@ -1102,7 +1229,7 @@ async fn execute_sql_query(
             Err(error) => {
                 tracing::warn!(
                     "Falling back to materialized SQL execution for [{}]: {}",
-                    index_name,
+                    plan.index_name,
                     error
                 );
                 None
@@ -1145,13 +1272,16 @@ async fn execute_sql_query(
             "tantivy_fast_fields",
         )
     } else {
-        let distributed =
-            match crate::api::index::execute_distributed_dsl_search(state, index_name, &search_req)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => return Err(err),
-            };
+        let distributed = match crate::api::index::execute_distributed_dsl_search(
+            state,
+            &plan.index_name,
+            &search_req,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(err),
+        };
 
         let sql_result = match crate::hybrid::execute_planned_sql_with_mappings(
             &plan,
@@ -1207,10 +1337,11 @@ async fn execute_sql_query(
         ));
     }
 
-    // Record SQL metrics
-    crate::metrics::SQL_QUERIES_TOTAL
-        .with_label_values(&[execution_mode])
-        .inc();
+    if record_metrics {
+        crate::metrics::SQL_QUERIES_TOTAL
+            .with_label_values(&[execution_mode])
+            .inc();
+    }
 
     Ok(SqlExecutionResult {
         plan,
@@ -1221,8 +1352,10 @@ async fn execute_sql_query(
         execution_mode,
         streaming_used,
         truncated,
+        semijoin_key_count,
         timings: crate::hybrid::SqlTimings {
             planning_ms,
+            semijoin_ms,
             search_ms,
             collect_ms: 0.0,
             merge_ms: 0.0,
@@ -1230,6 +1363,34 @@ async fn execute_sql_query(
             total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
         },
     })
+}
+
+/// Execute a SQL query end-to-end with per-stage timing instrumentation.
+/// Used by both `search_sql` (for the normal response) and `explain_sql`
+/// (for EXPLAIN ANALYZE with timings + rows).
+async fn execute_sql_query(
+    state: &AppState,
+    index_name: &str,
+    query: &str,
+) -> Result<SqlExecutionResult, (StatusCode, Json<Value>)> {
+    let total_start = Instant::now();
+    let _sql_timer = crate::metrics::SQL_LATENCY_SECONDS.start_timer();
+
+    // Stage 1: Planning
+    let plan_start = Instant::now();
+    let plan = match crate::hybrid::planner::plan_sql(index_name, query) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return Err(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                e,
+            ));
+        }
+    };
+    let planning_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+
+    execute_sql_query_with_plan(state, plan, planning_ms, total_start, true).await
 }
 
 fn planner_metadata_json(plan: &crate::hybrid::planner::QueryPlan) -> Value {
@@ -1243,6 +1404,11 @@ fn planner_metadata_json(plan: &crate::hybrid::planner::QueryPlan) -> Value {
         "group_by_columns": &plan.group_by_columns,
         "required_columns": &plan.required_columns,
         "has_residual_predicates": plan.has_residual_predicates,
+        "semijoin": plan.semijoin.as_ref().map(|semijoin| serde_json::json!({
+            "outer_key": semijoin.outer_key,
+            "inner_key": semijoin.inner_key,
+            "key_limit": crate::hybrid::planner::SQL_SEMIJOIN_MAX_KEYS,
+        })),
     })
 }
 
@@ -2215,6 +2381,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_sql_semijoin_inner_hidden_order_by_metric_executes() {
+        let (_tmp, state) = make_test_app_state("products");
+
+        let (status, Json(body)) = search_sql(
+            State(state),
+            Path("products".to_string()),
+            Json(SqlQueryRequest {
+                query: "SELECT title, brand FROM products WHERE brand IN (SELECT brand FROM products GROUP BY brand ORDER BY SUM(price) DESC LIMIT 1) ORDER BY title ASC".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+        assert_eq!(body["matched_hits"], json!(2));
+        assert_eq!(body["planner"]["semijoin"]["outer_key"], json!("brand"));
+
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["title"], json!("iPhone"));
+        assert_eq!(rows[0]["brand"], json!("Apple"));
+        assert_eq!(rows[1]["title"], json!("iPhone Pro"));
+        assert_eq!(rows[1]["brand"], json!("Apple"));
+    }
+
+    #[test]
+    fn collect_semijoin_key_allows_exact_limit_and_rejects_next_distinct_key() {
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+
+        for key in 0..crate::hybrid::planner::SQL_SEMIJOIN_MAX_KEYS {
+            collect_semijoin_key(&mut keys, &mut seen, json!(key)).unwrap();
+        }
+
+        let err = collect_semijoin_key(
+            &mut keys,
+            &mut seen,
+            json!(crate::hybrid::planner::SQL_SEMIJOIN_MAX_KEYS),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(keys.len(), crate::hybrid::planner::SQL_SEMIJOIN_MAX_KEYS);
+    }
+
+    #[tokio::test]
     async fn explain_without_analyze_has_no_timings_or_rows() {
         let (_tmp, state) = make_test_app_state("products");
 
@@ -2613,8 +2826,8 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["execution_mode"], "tantivy_fast_fields");
-        assert_eq!(body["streaming_used"], true);
+        assert_eq!(body["execution_mode"], "tantivy_grouped_partials");
+        assert_eq!(body["streaming_used"], false);
 
         let rows = body["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 1);

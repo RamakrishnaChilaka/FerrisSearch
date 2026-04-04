@@ -871,11 +871,12 @@ impl HotEngine {
     ) -> Result<Box<dyn tantivy::query::Query>> {
         use crate::search::QueryClause;
         use tantivy::Term;
-        use tantivy::query::{AllQuery, BooleanQuery, Occur, TermQuery};
+        use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, TermQuery};
         use tantivy::schema::IndexRecordOption;
 
         match clause {
             QueryClause::MatchAll(_) => Ok(Box::new(AllQuery)),
+            QueryClause::MatchNone(_) => Ok(Box::new(EmptyQuery)),
             QueryClause::Match(fields) => {
                 if let Some((field_name, value)) = fields.iter().next() {
                     let query_str = match value {
