@@ -214,6 +214,48 @@ SELECT author, count(*) AS cnt, avg(upvotes) AS avg_up FROM stories WHERE text_m
 ----
 alice 3 183.3
 
+# ── Same-index semijoin over grouped inner queries ───────────────────
+
+query TT nosort
+SELECT title, author
+FROM stories
+WHERE author IN (
+	SELECT author
+	FROM stories
+	GROUP BY author
+	HAVING COUNT(*) > 2
+)
+ORDER BY title ASC
+----
+Rust vs Go performance alice
+Show HN: Rust search engine alice
+Why Rust is great for systems alice
+
+query I nosort
+SELECT count(*)
+FROM stories
+WHERE author IN (
+	SELECT author
+	FROM stories
+	GROUP BY author
+	HAVING COUNT(*) > 10
+)
+----
+0
+
+query I nosort
+SELECT count(*)
+FROM stories
+WHERE author IN (
+	SELECT author
+	FROM stories
+	WHERE text_match(title, 'rust')
+	GROUP BY author
+	HAVING COUNT(*) > 2
+)
+----
+3
+
 # ── Pushdown filter + GROUP BY ───────────────────────────────────────
 
 query TI nosort
@@ -256,12 +298,13 @@ SELECT author, count(*) AS cnt FROM stories GROUP BY author HAVING cnt > 10 ORDE
 
 # ── text_match returning no results ──────────────────────────────────
 
-# count(*) with text_match returning zero matches gives empty result
-# (no rows, not a row with 0) because the grouped partials path
-# produces zero partial states when nothing matches.
+# count(*) with text_match returning zero matches now returns a single
+# aggregate row with 0. The grouped partials path synthesizes the empty
+# global bucket instead of dropping the result set entirely.
 query I nosort
 SELECT count(*) FROM stories WHERE text_match(title, 'zzzznonexistent')
 ----
+0
 
 # ── HAVING with aggregate expression (not alias) ────────────────────
 # These tests verify that HAVING COUNT(*) > N (using the raw aggregate

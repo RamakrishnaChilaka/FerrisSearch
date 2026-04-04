@@ -98,11 +98,19 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 796 unit tests + 61 CLI tests + 33 consensus integration + 40 replication integration + 26 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 957 total
+- 807 unit tests + 61 CLI tests + 33 consensus integration + 40 replication integration + 30 REST API integration + 1 SQL correctness harness (sqllogictest, 166 assertions) = 972 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 - SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, history, and NDJSON `/_sql/stream` consumption) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
+
+## Same-Index Semijoin SQL
+- Supported shape: top-level `expr IN (SELECT key FROM same_index ...)` in `WHERE`
+- MVP limits: same-index only, uncorrelated only, one projected inner key column, no joins/CTEs/`EXISTS`/multi-index subqueries
+- Planner stores a semijoin plan (`outer_key`, `inner_key`, `inner_plan`) and removes the subquery from residual SQL
+- Inner grouped queries may use hidden non-projected support metrics so `HAVING COUNT(*) > ...` or aggregate `ORDER BY` stay on `tantivy_grouped_partials` even when the inner query only projects the key column
+- Coordinator deduplicates inner keys, ignores `NULL`s, allows exactly 50,000 distinct keys, rejects the next distinct key, then lowers the outer predicate into the existing concrete filter path
+- `EXPLAIN` / `EXPLAIN ANALYZE` must show the semijoin key-build stage and include `semijoin_ms` timing when executed
 
 ## Node Lifecycle (Raft-driven)
 - First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write

@@ -14,6 +14,7 @@ pub use planner::QueryPlan;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SqlTimings {
     pub planning_ms: f64,
+    pub semijoin_ms: f64,
     pub search_ms: f64,
     pub collect_ms: f64,
     pub merge_ms: f64,
@@ -145,6 +146,7 @@ pub fn execute_grouped_partial_sql(
             grouped_sql
                 .metrics
                 .iter()
+                .filter(|metric| metric.projected)
                 .map(|metric| metric.output_name.clone()),
         )
         .collect();
@@ -155,6 +157,21 @@ pub fn execute_grouped_partial_sql(
     // query with LIMIT 10, this avoids 364K serde_json::Map allocations.
 
     let mut buckets = merged;
+    if buckets.is_empty() && grouped_sql.group_columns.is_empty() {
+        buckets.push(crate::search::GroupedMetricsBucket {
+            group_values: Vec::new(),
+            metrics: grouped_sql
+                .metrics
+                .iter()
+                .map(|metric| {
+                    (
+                        metric.output_name.clone(),
+                        empty_grouped_metric_partial(metric),
+                    )
+                })
+                .collect(),
+        });
+    }
 
     // Apply HAVING filters on native buckets
     if !grouped_sql.having.is_empty() {
@@ -217,6 +234,9 @@ pub fn execute_grouped_partial_sql(
                 );
             }
             for metric in &grouped_sql.metrics {
+                if !metric.projected {
+                    continue;
+                }
                 row.insert(
                     metric.output_name.clone(),
                     grouped_metric_value(bucket.metrics.get(&metric.output_name), metric),
@@ -227,6 +247,25 @@ pub fn execute_grouped_partial_sql(
         .collect::<Vec<_>>();
 
     Ok(SqlQueryResult { columns, rows })
+}
+
+fn empty_grouped_metric_partial(
+    metric: &planner::SqlGroupedMetric,
+) -> crate::search::GroupedMetricPartial {
+    match metric.function {
+        planner::SqlGroupedMetricFunction::Count => {
+            crate::search::GroupedMetricPartial::Count { count: 0 }
+        }
+        planner::SqlGroupedMetricFunction::Sum
+        | planner::SqlGroupedMetricFunction::Avg
+        | planner::SqlGroupedMetricFunction::Min
+        | planner::SqlGroupedMetricFunction::Max => crate::search::GroupedMetricPartial::Stats {
+            count: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        },
+    }
 }
 
 fn grouped_metric_value(
@@ -1420,6 +1459,21 @@ mod tests {
         let grouped = plan.grouped_sql.as_ref().unwrap();
         assert!(grouped.group_columns.is_empty());
         assert_eq!(grouped.metrics.len(), 3);
+    }
+
+    #[test]
+    fn ungrouped_zero_match_returns_count_row() {
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT count(*) AS cnt, avg(price) AS avg_price FROM products WHERE text_match(description, 'missing')",
+        )
+        .unwrap();
+
+        let result = execute_grouped_partial_sql(&plan, &[]).unwrap();
+        assert_eq!(result.columns, vec!["cnt", "avg_price"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0]["cnt"], json!(0));
+        assert!(result.rows[0]["avg_price"].is_null());
     }
 
     #[test]

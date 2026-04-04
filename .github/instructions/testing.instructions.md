@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **796 unit tests** (`cargo test --lib`)
+- **807 unit tests** (`cargo test --lib`)
 - **61 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **40 replication integration tests** (`cargo test --test replication_integration`)
-- **26 REST API integration tests** (`cargo test --test rest_api_integration`)
-- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 163 assertions across 4 files
-- **957 total** (`cargo test`)
+- **30 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 166 assertions across 4 files
+- **972 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -31,6 +31,7 @@ cargo test -- test_name                         # Single test by name
 - For feature-gated transport TLS changes, run both `cargo test --lib` and `cargo test --lib --features transport-tls`; enabling TLS without the feature must error instead of silently downgrading to plaintext.
 - For transport TLS end-to-end coverage, also run `cargo test --test replication_integration --features transport-tls`.
 - For SQL fast-field string changes, add regressions for both `sql_record_batch()` and `sql_streaming_batches()` that assert `_id` and keyword values survive the optimized ordinal path.
+- For new `SearchRequest` / `QueryClause` variants, add a serde JSON roundtrip regression because search DSL requests cross transport boundaries as serialized JSON.
 - For streamed shard SQL transport changes, add a real gRPC integration test that forces multiple Arrow batches from `forward_sql_batch_stream_to_shard()` / `SqlRecordBatchStream`, not just unit tests around IPC decoding.
 - For JoinCluster or cluster-state transport fixes, add one roundtrip regression that proves `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` survive proto conversion, one regression that unknown field types fail snapshot decoding instead of being coerced, plus concurrent gRPC regressions for duplicate `raft_node_id` rejection and full voter-set preservation across overlapping joins.
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
@@ -116,6 +117,7 @@ The industry standard for SQL engine correctness testing is [sqllogictest](https
 4. **Test boundary conditions for LIMIT.** `LIMIT N` on grouped partials must return exactly N rows after merge+sort, not N rows per shard.
 5. **Test HAVING with LIMIT and OFFSET together.** The execution order must be: merge → HAVING → sort → LIMIT/OFFSET.
 6. **Every new SQL feature MUST have sqllogictest coverage.** When adding a new SQL capability (new aggregate function, new clause, new pushdown, new execution path), add `.slt` tests in `tests/slt/` that assert the correct output values. This is a BLOCKING requirement — do not merge SQL changes without corresponding `.slt` tests.
+7. **Same-index semijoin changes need three layers of coverage.** Add planner/unit coverage for supported and rejected shapes, at least one single-node end-to-end `/_sql` regression with grouped inner `HAVING` or `text_match`, and one multi-node regression where the inner grouped query merges remote shard partials before the outer filter is lowered.
 
 ### sqllogictest Scope
 - `tests/sql_correctness.rs` builds a single-node, single-shard sample cluster. It is the right place to assert SQL result correctness, but it cannot catch distributed transport or remote partial-state serialization bugs by itself.
@@ -125,7 +127,7 @@ The industry standard for SQL engine correctness testing is [sqllogictest](https
 - **Runner**: `tests/sql_correctness.rs` — implements sync `DB` trait via `FerrisDB` adapter that calls `execute_sql_for_testing()` with `block_in_place` + `Handle::current()` bridge
 - **Test files**: `tests/slt/*.slt` — automatically discovered and run
 - **Dataset**: 10 HN-style docs with known values (5 authors, 5 categories, deterministic upvotes/comments)
-- **Coverage**: 163 assertions across 4 `.slt` files covering `count(*)`, `GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, single and multiple top-level `text_match` predicates, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY, and CASE-based grouped aggregates
+- **Coverage**: 166 assertions across 4 `.slt` files covering `count(*)`, `GROUP BY`, `HAVING`, same-index semijoins, `LIMIT`, `OFFSET`, single and multiple top-level `text_match` predicates, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY, and CASE-based grouped aggregates
 - **HAVING coverage rule**: Always test HAVING with **both** alias-based (`HAVING cnt > 1`) and aggregate-expression (`HAVING COUNT(*) > 1`) forms. These take different code paths in the planner — alias goes through `expr_to_field_name`, aggregate expression goes through `resolve_having_name` → `parse_grouped_metric`. Missing one form caused a regression where HAVING with aggregate expressions silently fell to the wrong execution path.
 - **Adding tests**: Create new `.slt` files in `tests/slt/` — the runner picks them up automatically
 - **Tie-breaking**: Always use secondary sort (e.g., `ORDER BY posts DESC, author ASC`) in `.slt` tests to avoid non-deterministic ordering

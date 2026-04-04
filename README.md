@@ -183,6 +183,7 @@ When a fast-field fallback query can stay fully columnar, remote shards now send
 - `text_match(field, 'query')` — full-text search pushed into Tantivy; multiple top-level `AND`ed `text_match(...)` predicates become multiple search `must` clauses
 - `=`, `>`, `>=`, `<`, `<=`, `BETWEEN`, `IN` — structured filter pushdown
 - `GROUP BY` with `count(*)`, `sum()`, `avg()`, `min()`, `max()`
+- same-index semijoin subqueries: top-level `expr IN (SELECT key FROM same_index ...)` with uncorrelated inner queries
 - `HAVING` — post-merge filtering on grouped results
 - `ORDER BY` with `LIMIT` and `OFFSET`
 - `_score` as the synthetic SQL relevance column; mapped `score` remains a normal field
@@ -207,6 +208,18 @@ SELECT author, count(*) AS posts, avg(upvotes) AS avg_up
 FROM hackernews WHERE text_match(title, 'rust')
 GROUP BY author HAVING posts > 5
 ORDER BY avg_up DESC LIMIT 10;
+
+-- Same-index semijoin with grouped inner query
+SELECT title, author, upvotes
+FROM hackernews
+WHERE author IN (
+  SELECT author
+  FROM hackernews
+  GROUP BY author
+  HAVING COUNT(*) > 100
+)
+ORDER BY upvotes DESC
+LIMIT 20;
 
 -- Filtered aggregation (~3ms)
 SELECT count(*) AS posts, avg(upvotes) AS avg_up, avg(comments) AS avg_disc
@@ -476,14 +489,14 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 957 tests
-cargo test --lib                                # Unit tests (796)
+cargo test                                      # All 972 tests
+cargo test --lib                                # Unit tests (807)
 cargo test --bin ferris-cli                      # CLI tests (61)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (40)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (26)
-cargo test --test sql_correctness                # SQL correctness (1 test, 163 sqllogictest assertions)
+cargo test --test rest_api_integration           # REST API (30)
+cargo test --test sql_correctness                # SQL correctness (1 test, 166 sqllogictest assertions)
 ```
 
 Integration tests run in-process with isolated temp directories. No external services needed.
@@ -606,16 +619,20 @@ Task tracker (target: about 1 hour per task):
 - [x] 3. Introduce a small clause-aware binder layer for identifier resolution in the planner (`Source`, `Synthetic`, `Output`).
 - [x] 4. Convert `_id` / `_score` detection and `required_columns` extraction to consume bound identifiers instead of raw string walkers.
 - [x] 5. Convert GROUP BY plain-column eligibility checks to use the binder so expression keys and output aliases bail out cleanly.
-- [ ] 6. Add a bound representation for supported semijoin subqueries: outer key expression + inner query plan + same-index validation.
-- [ ] 7. Implement planner detection for `expr IN (SELECT key FROM same_index ...)` with exactly one projected inner key column.
-- [ ] 8. Validate MVP constraints during planning: same index, uncorrelated inner query, no joins, no `SELECT *`, no unsupported set operations.
-- [ ] 9. Reuse the existing grouped-partials / fast-field planner for the inner subquery so grouped `HAVING` queries stay search-aware.
-- [ ] 10. Add a coordinator-side execution step that runs the inner subquery first and materializes the qualifying key set.
-- [ ] 11. Lower the outer semijoin predicate into the existing hybrid path as a concrete key filter, with cardinality guardrails and a clear overflow error.
-- [ ] 12. Extend `EXPLAIN` / `EXPLAIN ANALYZE` output to show the two-stage semijoin pipeline: inner key build, outer filtered execution.
-- [ ] 13. Add single-node result-correctness coverage for supported semijoin queries, including grouped inner queries with `HAVING` and `text_match`.
-- [ ] 14. Add multi-node integration coverage to ensure remote shard partials and coordinator semijoin lowering produce the same result as single-node execution.
+- [x] 6. Add a bound representation for supported semijoin subqueries: outer key expression + inner query plan + same-index validation.
+- [x] 7. Implement planner detection for `expr IN (SELECT key FROM same_index ...)` with exactly one projected inner key column.
+- [x] 8. Validate MVP constraints during planning: same index, uncorrelated inner query, no joins, no `SELECT *`, no unsupported set operations.
+- [x] 9. Reuse the existing grouped-partials / fast-field planner for the inner subquery so grouped `HAVING` queries stay search-aware.
+- [x] 10. Add a coordinator-side execution step that runs the inner subquery first and materializes the qualifying key set.
+- [x] 11. Lower the outer semijoin predicate into the existing hybrid path as a concrete key filter, with cardinality guardrails and a clear overflow error.
+- [x] 12. Extend `EXPLAIN` / `EXPLAIN ANALYZE` output to show the two-stage semijoin pipeline: inner key build, outer filtered execution.
+- [x] 13. Add single-node result-correctness coverage for supported semijoin queries, including grouped inner queries with `HAVING` and `text_match`.
+- [x] 14. Add multi-node integration coverage to ensure remote shard partials and coordinator semijoin lowering produce the same result as single-node execution.
 - [ ] 15. Benchmark the MVP on `hackernews`, document latency/cardinality limits, and decide whether the next phase should be a real FerrisSearch `TableProvider` or additional binder-driven lowering shapes.
+
+Current implementation notes:
+- Distinct inner keys are deduplicated at the coordinator and capped at 50,000 before outer lowering.
+- `NULL` inner keys are ignored during semijoin key materialization.
 
 ## What's Honestly Missing
 

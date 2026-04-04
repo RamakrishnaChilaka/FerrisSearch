@@ -431,6 +431,13 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
                     dimension: None,
                 },
             ),
+            (
+                "author".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            ),
         ]),
         settings: IndexSettings::default(),
     };
@@ -452,23 +459,24 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
     }
 
     let shard_docs = [
-        vec![0_i64, 1_i64, 2_i64],
-        vec![0_i64, 1_i64, 3_i64],
-        vec![0_i64, 2_i64],
+        vec![(0_i64, "alice"), (1_i64, "alice"), (2_i64, "bob")],
+        vec![(0_i64, "alice"), (1_i64, "carol"), (3_i64, "carol")],
+        vec![(0_i64, "carol"), (2_i64, "dave")],
     ];
 
-    for (shard_id, upvotes) in shard_docs.into_iter().enumerate() {
+    for (shard_id, docs) in shard_docs.into_iter().enumerate() {
         let engine = harness.nodes[shard_id]
             .app_state
             .shard_manager
             .get_shard("stories", shard_id as u32)
             .expect("shard should be open");
-        for (doc_index, value) in upvotes.into_iter().enumerate() {
+        for (doc_index, (value, author)) in docs.into_iter().enumerate() {
             engine.add_document(
                 &format!("doc-{shard_id}-{doc_index}"),
                 json!({
                     "title": format!("story-{shard_id}-{doc_index}"),
                     "upvotes": value,
+                    "author": author,
                 }),
             )?;
         }
@@ -1206,6 +1214,92 @@ async fn rest_sql_explain_analyze_returns_timings_and_rows() -> Result<()> {
 }
 
 #[tokio::test]
+async fn rest_sql_same_index_semijoin_uses_grouped_inner_having_and_text_match() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT title, brand, price FROM products WHERE brand IN (SELECT brand FROM products WHERE text_match(description, 'iphone') GROUP BY brand HAVING COUNT(*) > 1) ORDER BY price DESC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(body["matched_hits"], json!(2));
+    assert_eq!(body["planner"]["has_residual_predicates"], json!(false));
+    assert_eq!(body["planner"]["semijoin"]["outer_key"], json!("brand"));
+    assert_eq!(body["planner"]["semijoin"]["inner_key"], json!("brand"));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["title"], json!("iPhone Pro"));
+    assert_eq!(rows[0]["brand"], json!("Apple"));
+    assert_eq!(rows[1]["title"], json!("iPhone"));
+    assert_eq!(rows[1]["brand"], json!("Apple"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_same_index_semijoin_zero_keys_preserves_aggregate_semantics() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT count(*) AS total FROM products WHERE brand IN (SELECT brand FROM products GROUP BY brand HAVING COUNT(*) > 10)"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_grouped_partials"));
+    assert_eq!(body["matched_hits"], json!(0));
+    assert_eq!(body["planner"]["semijoin"]["outer_key"], json!("brand"));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["total"], json!(0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_explain_analyze_surfaces_semijoin_pipeline() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql/explain",
+            json!({
+                "query": "SELECT title, brand, price FROM products WHERE brand IN (SELECT brand FROM products WHERE text_match(description, 'iphone') GROUP BY brand HAVING COUNT(*) > 1) ORDER BY price DESC",
+                "analyze": true
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(body["pipeline"][0]["name"], json!("semijoin_key_build"));
+    assert_eq!(body["semijoin"]["outer_key"], json!("brand"));
+    assert_eq!(body["semijoin"]["resolved_key_count"], json!(1));
+    assert_eq!(
+        body["semijoin"]["inner_plan"]["execution_strategy"],
+        json!("tantivy_grouped_partials")
+    );
+    assert!(body["timings"]["semijoin_ms"].as_f64().unwrap() >= 0.0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_sql_in_and_between_pushdown() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     create_products_index_and_docs(&harness).await?;
@@ -1671,6 +1765,47 @@ async fn rest_sql_distributed_grouped_partials_merge_numeric_keys_across_shards(
         })
         .collect();
     assert_eq!(grouped, vec![(0, 3), (1, 2), (2, 2), (3, 1)]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_distributed_semijoin_merges_inner_groups_across_shards() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/stories/_sql",
+            json!({
+                "query": "SELECT title, author FROM stories WHERE author IN (SELECT author FROM stories GROUP BY author HAVING COUNT(*) > 2) ORDER BY title ASC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(body["matched_hits"], json!(6));
+    assert_eq!(body["_shards"]["successful"], json!(3));
+    assert_eq!(body["_shards"]["failed"], json!(0));
+    assert_eq!(body["planner"]["semijoin"]["outer_key"], json!("author"));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    let titles: Vec<&str> = rows
+        .iter()
+        .map(|row| row["title"].as_str().expect("title should be present"))
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "story-0-0",
+            "story-0-1",
+            "story-1-0",
+            "story-1-1",
+            "story-1-2",
+            "story-2-0",
+        ]
+    );
 
     Ok(())
 }

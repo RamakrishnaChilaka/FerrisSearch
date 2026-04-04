@@ -101,6 +101,8 @@ pub enum QueryClause {
     Match(HashMap<String, serde_json::Value>),
     /// Match all documents.
     MatchAll(serde_json::Value),
+    /// Match no documents.
+    MatchNone(serde_json::Value),
     /// Boolean query: `{ "bool": { "must": [...], "should": [...], "must_not": [...], "filter": [...] } }`
     Bool(BoolQuery),
     /// Range query: `{ "range": { "field": { "gte": 10, "lt": 100 } } }`
@@ -117,6 +119,11 @@ impl QueryClause {
     /// Returns true if this query matches all documents.
     pub fn is_match_all(&self) -> bool {
         matches!(self, QueryClause::MatchAll(_))
+    }
+
+    /// Returns true if this query matches no documents.
+    pub fn is_match_none(&self) -> bool {
+        matches!(self, QueryClause::MatchNone(_))
     }
 }
 
@@ -1599,6 +1606,24 @@ mod tests {
         assert_eq!(req2.size, 20);
         assert_eq!(req2.from, 5);
         assert!(matches!(req2.query, QueryClause::MatchAll(_)));
+    }
+
+    #[test]
+    fn match_none_roundtrips_through_json_bytes() {
+        let req = SearchRequest {
+            query: QueryClause::MatchNone(json!({})),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        let payload = serde_json::to_vec(&req).unwrap();
+        let decoded: SearchRequest = serde_json::from_slice(&payload).unwrap();
+
+        assert!(decoded.query.is_match_none());
+        assert_eq!(decoded.size, 0);
     }
 
     #[test]
