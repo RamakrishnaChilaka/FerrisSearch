@@ -1316,6 +1316,28 @@ fn extract_grouped_sql_plan(
         return Ok(None);
     }
 
+    // Reject duplicate output aliases — HAVING/ORDER BY resolution would be
+    // ambiguous (same behavior as PostgreSQL "column reference is ambiguous").
+    {
+        let mut seen = std::collections::HashSet::new();
+        for col in &group_columns {
+            if !seen.insert(&col.output_name) {
+                return Err(anyhow::anyhow!(
+                    "ambiguous column reference '{}' in GROUP BY output",
+                    col.output_name
+                ));
+            }
+        }
+        for metric in &metrics {
+            if !seen.insert(&metric.output_name) {
+                return Err(anyhow::anyhow!(
+                    "ambiguous column reference '{}' in GROUP BY output",
+                    metric.output_name
+                ));
+            }
+        }
+    }
+
     Ok(Some(GroupedSqlPlan {
         group_columns,
         metrics,
@@ -3738,5 +3760,36 @@ mod tests {
             plan.has_group_by_fallback,
             "GROUP BY aggregate alias should trigger fallback"
         );
+    }
+
+    #[test]
+    fn duplicate_output_alias_in_grouped_partials_returns_error() {
+        // SELECT brand AS x, count(*) AS x FROM t GROUP BY brand
+        // → "ambiguous column reference 'x'" error, matching PostgreSQL semantics
+        let err = plan_sql(
+            "products",
+            "SELECT brand AS x, count(*) AS x FROM products GROUP BY brand",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous column reference"),
+            "expected ambiguous column error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn non_duplicate_aliases_in_grouped_partials_are_accepted() {
+        let plan = plan_sql(
+            "products",
+            "SELECT brand, count(*) AS cnt FROM products GROUP BY brand HAVING cnt > 1 ORDER BY cnt DESC",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+        assert_eq!(grouped.group_columns[0].output_name, "brand");
+        assert_eq!(grouped.metrics[0].output_name, "cnt");
+        assert_eq!(grouped.having.len(), 1);
+        assert_eq!(grouped.order_by.len(), 1);
     }
 }
