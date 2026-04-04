@@ -931,7 +931,7 @@ async fn execute_sql_query(
             ));
         }
     };
-    let mut search_req = plan.to_search_request();
+    let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
 
     // GROUP BY fallback: override the default 100K cap so DataFusion sees all
     // matching docs.  Uses the configurable sql_group_by_scan_limit (0 = unlimited).
@@ -1392,7 +1392,7 @@ async fn execute_sql_stream_query(
         return Ok(stream_json_response(sql_response_body(&result)));
     }
 
-    let mut search_req = plan.to_search_request();
+    let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
     if plan.has_group_by_fallback {
         search_req.size = if state.sql_group_by_scan_limit == 0 {
             usize::MAX
@@ -1984,6 +1984,7 @@ mod tests {
             raft: None,
             worker_pools: crate::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
+            sql_approximate_top_k: false,
         };
 
         let metadata = cluster_state.indices.get(index_name).unwrap().clone();
@@ -2502,6 +2503,7 @@ mod tests {
             raft: None,
             worker_pools: crate::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
+            sql_approximate_top_k: false,
         };
 
         // GROUP BY on text field should return error

@@ -76,6 +76,15 @@ pub struct AppConfig {
     /// Default: 1,000,000. Set to 0 for unlimited.
     #[serde(default = "default_sql_group_by_scan_limit")]
     pub sql_group_by_scan_limit: usize,
+    /// Enable approximate shard-level top-K pruning for grouped-partials
+    /// GROUP BY queries with ORDER BY + LIMIT.  When true, each shard keeps
+    /// only `(offset + limit) * 3 + 10` buckets sorted by the ORDER BY metric
+    /// before shipping to the coordinator.  This is NOT standard SQL semantics
+    /// (a bucket below every shard's cutoff can still be in the exact global
+    /// top-K), but reduces latency dramatically on high-cardinality GROUP BY.
+    /// Default: false.
+    #[serde(default)]
+    pub sql_approximate_top_k: bool,
     /// Enable TLS for gRPC inter-node transport. Requires `transport-tls` feature.
     /// Default: false.
     #[serde(default)]
@@ -130,6 +139,7 @@ impl Default for AppConfig {
             column_cache_size_percent: 10,
             column_cache_populate_threshold: 5,
             sql_group_by_scan_limit: 1_000_000,
+            sql_approximate_top_k: false,
             transport_tls_enabled: false,
             transport_tls_cert_file: None,
             transport_tls_key_file: None,

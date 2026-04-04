@@ -83,6 +83,7 @@ impl RestTestHarness {
             raft: None,
             worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
+            sql_approximate_top_k: false,
         };
 
         let transport_service = create_transport_service(
@@ -290,6 +291,7 @@ impl MultiNodeRestHarness {
                 raft: None,
                 worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
                 sql_group_by_scan_limit: 1_000_000,
+                sql_approximate_top_k: false,
             };
 
             let transport_service = create_transport_service(

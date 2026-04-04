@@ -217,11 +217,44 @@ pub struct HistogramAggParams {
     pub interval: f64,
 }
 
+/// Shard-level top-K pruning hint for grouped partial aggregations.
+/// When present, each shard sorts its partial buckets by `sort_metric`
+/// and keeps only the top `limit` groups, reducing network transfer
+/// and coordinator merge cost by orders of magnitude on high-cardinality
+/// GROUP BY queries with ORDER BY + LIMIT.
+///
+/// This is an approximation: a group that ranks below the cutoff on every
+/// shard could theoretically rank in the global top-K after merge.  The
+/// default multiplier (3× + 10) makes this extremely unlikely in practice.
+///
+/// Disabled when HAVING is present (pruned groups could satisfy HAVING
+/// only after cross-shard merge) or when ORDER BY has multiple columns
+/// (secondary sort keys are not evaluated during pruning).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardTopK {
+    /// Maximum number of buckets each shard should emit.
+    pub limit: usize,
+    /// The `output_name` of the metric to sort by (must match a
+    /// `GroupedMetricAgg.output_name` in the same request).
+    pub sort_by: String,
+    /// The aggregate function of the sort metric, so shard-level pruning
+    /// computes the same ordering as the final SQL sort (avg = sum/count,
+    /// min = min, etc.) instead of blindly using `sum` as a proxy.
+    pub sort_function: GroupedMetricFunction,
+    /// True = sort descending (highest first).
+    pub descending: bool,
+}
+
 /// Internal grouped metrics request for SQL `GROUP BY` execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupedMetricsAggParams {
     pub group_by: Vec<String>,
     pub metrics: Vec<GroupedMetricAgg>,
+    /// Optional shard-level top-K pruning.  When set, each shard sorts its
+    /// partial results by the named metric and truncates to `limit` buckets
+    /// before shipping to the coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_top_k: Option<ShardTopK>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2597,6 +2630,7 @@ mod tests {
                     field: Some("price".into()),
                 },
             ],
+            shard_top_k: None,
         };
 
         let partials = vec![
@@ -2672,6 +2706,7 @@ mod tests {
                 function: GroupedMetricFunction::Count,
                 field: None,
             }],
+            shard_top_k: None,
         };
 
         let local = HashMap::from([(
