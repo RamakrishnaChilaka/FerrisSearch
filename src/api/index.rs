@@ -2196,6 +2196,7 @@ mod tests {
             raft: None,
             worker_pools: crate::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
+            sql_approximate_top_k: false,
         };
         (temp_dir, state)
     }

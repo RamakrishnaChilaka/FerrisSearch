@@ -62,6 +62,8 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `merge_fruits()` merges per-segment data, returns `HashMap<String, PartialAggResult>` per shard
 - Per-shard partial results are serialized into the gRPC `partial_aggs_json` bytes field with `bincode-next`, then merged at coordinator via `merge_aggregations()`
 - O(matching_docs) with minimal memory; agg-only queries avoid hit materialization and still run in a single query execution pass
+- **Shard-level top-K pruning**: When ORDER BY + LIMIT are present on grouped partials, each shard keeps only `(offset + limit) * 3 + 10` buckets (sorted by the ORDER BY metric) before shipping to the coordinator. Uses `select_nth_unstable_by` (O(N) average) on flat-array ordinals BEFORE resolving strings, avoiding ord→string resolution for 99%+ of groups. `ShardTopK { limit, sort_by, sort_function, descending }` on `GroupedMetricsAggParams` carries the hint. This is approximate — the 3× multiplier makes missed global top-K groups extremely unlikely. Disabled when HAVING is present (pruned groups could satisfy HAVING only after cross-shard merge), when ORDER BY has multiple columns (secondary keys not evaluated during pruning), or when ORDER BY references a group column instead of a metric.
+- **StringArena**: Batch ordinal→string resolution uses a contiguous `Vec<u8>` arena instead of N individual heap-allocated Strings. Each resolved string is `(offset, len)` into the arena; only the final `serde_json::Value::String` conversion allocates per-group.
 
 ## Tantivy Type Safety Gotchas
 - **NEVER** create `Term` objects directly with `Term::from_field_text/i64/f64` in query building — always use `self.typed_term(field, value)` which checks the schema field type
@@ -95,7 +97,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 780 unit tests + 61 CLI tests + 33 consensus integration + 40 replication integration + 24 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 939 total
+- 792 unit tests + 61 CLI tests + 33 consensus integration + 40 replication integration + 24 REST API integration + 1 SQL correctness harness (sqllogictest, 163 assertions) = 951 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)

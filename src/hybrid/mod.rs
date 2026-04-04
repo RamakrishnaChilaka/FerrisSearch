@@ -127,6 +127,8 @@ pub fn execute_grouped_partial_sql(
                 field: metric.field.clone(),
             })
             .collect(),
+        // Coordinator merges ALL shard partials — no shard-level pruning here.
+        shard_top_k: None,
     };
 
     let merged = crate::search::merge_grouped_metrics_partials(
@@ -564,7 +566,7 @@ mod tests {
         let plan =
             planner::plan_sql("products", "SELECT title FROM products ORDER BY title ASC").unwrap();
 
-        match plan.to_search_request().query {
+        match plan.to_search_request(false).query {
             crate::search::QueryClause::MatchAll(_) => {}
             other => panic!("expected MatchAll query, got {other:?}"),
         }
@@ -578,7 +580,7 @@ mod tests {
         )
         .unwrap();
 
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         match req.query {
             crate::search::QueryClause::Bool(bool_query) => {
                 assert_eq!(bool_query.must.len(), 1);
@@ -596,7 +598,7 @@ mod tests {
         )
         .unwrap();
 
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 0);
         assert!(req.aggs.contains_key(planner::INTERNAL_SQL_GROUPED_AGG));
     }
@@ -610,7 +612,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.text_matches.len(), 2);
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         match req.query {
             crate::search::QueryClause::Bool(bool_query) => {
                 assert_eq!(bool_query.must.len(), 2);
@@ -986,7 +988,7 @@ mod tests {
         assert_eq!(plan.limit, Some(25));
         assert_eq!(plan.offset, None);
         assert!(plan.limit_pushed_down);
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 25);
     }
 
@@ -999,7 +1001,7 @@ mod tests {
         assert_eq!(plan.limit, Some(10));
         assert_eq!(plan.offset, Some(20));
         assert!(plan.limit_pushed_down);
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 30); // limit + offset
     }
 
@@ -1015,7 +1017,7 @@ mod tests {
             "single fast-field ORDER BY should push down LIMIT"
         );
         assert_eq!(plan.sort_pushdown, Some(("price".to_string(), true)));
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 10); // pushed down, not 100K
         assert_eq!(req.sort.len(), 1); // sort clause populated
     }
@@ -1067,7 +1069,7 @@ mod tests {
         assert_eq!(plan.limit, Some(5));
         assert!(plan.has_residual_predicates);
         assert!(!plan.limit_pushed_down);
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 100_000);
     }
 
@@ -1079,7 +1081,7 @@ mod tests {
         ).unwrap();
         assert_eq!(plan.limit, None);
         assert!(!plan.limit_pushed_down);
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 100_000);
     }
 
@@ -1092,7 +1094,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.limit, Some(50));
         assert!(plan.limit_pushed_down); // no ORDER BY = default _score sort, safe
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 50);
     }
 
@@ -1107,7 +1109,7 @@ mod tests {
         assert!(plan.selects_all_columns);
         assert!(plan.limit_pushed_down);
         // Search request should collect only 10 docs, not 100K
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 10);
     }
 

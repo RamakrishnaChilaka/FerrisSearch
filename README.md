@@ -476,8 +476,8 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 939 tests
-cargo test --lib                                # Unit tests (780)
+cargo test                                      # All 951 tests
+cargo test --lib                                # Unit tests (792)
 cargo test --bin ferris-cli                      # CLI tests (61)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (40)

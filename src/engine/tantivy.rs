@@ -1163,6 +1163,15 @@ impl HotEngine {
         let schema = self.index.schema();
         let segment_readers = searcher.segment_readers();
 
+        // Extract shard_top_k from the first grouped metrics agg (if any).
+        let shard_top_k: Option<&crate::search::ShardTopK> =
+            req.aggs.values().find_map(|agg| match agg {
+                crate::search::AggregationRequest::GroupedMetrics(params) => {
+                    params.shard_top_k.as_ref()
+                }
+                _ => None,
+            });
+
         let specs: Vec<ResolvedGroupedAggSpec> = req
             .aggs
             .iter()
@@ -1281,11 +1290,17 @@ impl HotEngine {
 
                                 if use_flat {
                                     let num_groups = key_readers[0].num_terms();
+                                    // Do NOT pass shard_top_k here — per-segment pruning
+                                    // is incorrect because a group below the cutoff in every
+                                    // segment can still be top-K after segment totals are
+                                    // merged. Shard-level pruning happens after segment merge
+                                    // at the end of grouped_partials_direct_scan.
                                     let buckets = flat_scan_segment(
                                         &key_readers[0],
                                         &metric_entries,
                                         max_doc,
                                         num_groups,
+                                        None,
                                     );
                                     segment_results.push((spec.name.clone(), buckets));
                                 } else {
@@ -1417,11 +1432,17 @@ impl HotEngine {
 
         let mut results = std::collections::HashMap::new();
         for spec in &specs {
-            let buckets = merged
+            let mut buckets: Vec<_> = merged
                 .remove(&spec.name)
                 .unwrap_or_default()
                 .into_values()
-                .collect::<Vec<_>>();
+                .collect();
+
+            // Shard-level top-K pruning after segment merge.
+            if let Some(top_k) = shard_top_k {
+                apply_shard_top_k(&mut buckets, top_k);
+            }
+
             results.insert(
                 spec.name.clone(),
                 crate::search::PartialAggResult::GroupedMetrics { buckets },
@@ -2008,6 +2029,7 @@ const BATCH_SIZE: usize = 1024;
 pub(crate) struct GroupedAggCollector {
     specs: Vec<ResolvedGroupedAggSpec>,
     schema: Schema,
+    shard_top_k: Option<crate::search::ShardTopK>,
 }
 
 pub(crate) struct GroupedAggSegmentCollector {
@@ -2047,7 +2069,15 @@ impl GroupedAggCollector {
                 _ => None,
             })
             .collect();
-        Self { specs, schema }
+        let shard_top_k = aggs.values().find_map(|agg| match agg {
+            crate::search::AggregationRequest::GroupedMetrics(params) => params.shard_top_k.clone(),
+            _ => None,
+        });
+        Self {
+            specs,
+            schema,
+            shard_top_k,
+        }
     }
 }
 
@@ -2219,11 +2249,17 @@ impl tantivy::collector::Collector for GroupedAggCollector {
 
         let mut results = std::collections::HashMap::new();
         for spec in &self.specs {
-            let buckets = merged
+            let mut buckets: Vec<_> = merged
                 .remove(&spec.name)
                 .unwrap_or_default()
                 .into_values()
-                .collect::<Vec<_>>();
+                .collect();
+
+            // Shard-level top-K pruning after segment merge (collector path).
+            if let Some(top_k) = &self.shard_top_k {
+                apply_shard_top_k(&mut buckets, top_k);
+            }
+
             results.insert(
                 spec.name.clone(),
                 crate::search::PartialAggResult::GroupedMetrics { buckets },
@@ -2295,6 +2331,152 @@ impl tantivy::collector::SegmentCollector for GroupedAggSegmentCollector {
     }
 }
 
+/// Contiguous string arena — avoids N individual heap allocations when batch-
+/// resolving ordinals to strings.  All strings live in one `Vec<u8>` and are
+/// referenced by `(offset, len)`.  Only the final `serde_json::Value::String`
+/// conversion allocates a new owned String per group.
+struct StringArena {
+    buf: Vec<u8>,
+    /// (start_offset, byte_length) for each interned string.
+    entries: Vec<(u32, u32)>,
+}
+
+impl StringArena {
+    fn with_capacity(num_strings: usize, avg_len: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(num_strings * avg_len),
+            entries: Vec::with_capacity(num_strings),
+        }
+    }
+
+    /// Append a string slice to the arena; returns its index.
+    fn push(&mut self, s: &str) -> u32 {
+        let idx = self.entries.len() as u32;
+        let offset = self.buf.len() as u32;
+        self.buf.extend_from_slice(s.as_bytes());
+        self.entries.push((offset, s.len() as u32));
+        idx
+    }
+
+    /// Retrieve a reference to a previously interned string.
+    fn get(&self, idx: u32) -> &str {
+        let (offset, len) = self.entries[idx as usize];
+        // SAFETY: all data pushed through `push` is valid UTF-8 (`&str`).
+        unsafe {
+            std::str::from_utf8_unchecked(&self.buf[offset as usize..(offset + len) as usize])
+        }
+    }
+
+    fn to_json_value(&self, idx: u32) -> serde_json::Value {
+        serde_json::Value::String(self.get(idx).to_string())
+    }
+}
+
+/// Extract a sort value from flat metric arrays for a given ordinal.
+/// Used by shard-level top-K pruning to rank groups without resolving strings.
+fn flat_sort_value(
+    flat_metrics: &[FlatMetric],
+    metric_entries: &[GroupedMetricEntry],
+    sort_by: &str,
+    ord: usize,
+) -> f64 {
+    for (idx, me) in metric_entries.iter().enumerate() {
+        if me.output_name != sort_by {
+            continue;
+        }
+        return match (&me.function, &flat_metrics[idx]) {
+            (_, FlatMetric::Count(counts)) => counts[ord] as f64,
+            (crate::search::GroupedMetricFunction::Sum, FlatMetric::Stats { sum, .. }) => sum[ord],
+            (crate::search::GroupedMetricFunction::Avg, FlatMetric::Stats { count, sum, .. }) => {
+                if count[ord] > 0 {
+                    sum[ord] / count[ord] as f64
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }
+            (crate::search::GroupedMetricFunction::Min, FlatMetric::Stats { min, .. }) => min[ord],
+            (crate::search::GroupedMetricFunction::Max, FlatMetric::Stats { max, .. }) => max[ord],
+            _ => 0.0,
+        };
+    }
+    0.0
+}
+
+/// Extract a sort value from a fully-resolved `GroupedMetricsBucket`.
+/// Uses the metric function from `ShardTopK` to compute the correct value
+/// (avg = sum/count, min = min, max = max) instead of blindly using sum.
+fn bucket_sort_value(
+    bucket: &crate::search::GroupedMetricsBucket,
+    sort_by: &str,
+    sort_function: &crate::search::GroupedMetricFunction,
+) -> f64 {
+    let Some(partial) = bucket.metrics.get(sort_by) else {
+        return f64::NEG_INFINITY;
+    };
+    match partial {
+        crate::search::GroupedMetricPartial::Count { count } => *count as f64,
+        crate::search::GroupedMetricPartial::Stats {
+            count,
+            sum,
+            min,
+            max,
+        } => match sort_function {
+            crate::search::GroupedMetricFunction::Count => *count as f64,
+            crate::search::GroupedMetricFunction::Sum => {
+                if *count > 0 {
+                    *sum
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }
+            crate::search::GroupedMetricFunction::Avg => {
+                if *count > 0 {
+                    *sum / *count as f64
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }
+            crate::search::GroupedMetricFunction::Min => {
+                if *count > 0 {
+                    *min
+                } else {
+                    f64::INFINITY
+                }
+            }
+            crate::search::GroupedMetricFunction::Max => {
+                if *count > 0 {
+                    *max
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }
+        },
+    }
+}
+
+/// Apply shard-level top-K pruning to a vec of grouped buckets.
+/// Sorts by the named metric and truncates to `top_k.limit`.
+fn apply_shard_top_k(
+    buckets: &mut Vec<crate::search::GroupedMetricsBucket>,
+    top_k: &crate::search::ShardTopK,
+) {
+    if buckets.len() <= top_k.limit {
+        return;
+    }
+    let k = top_k.limit.min(buckets.len());
+    // Partial sort: place the top-K elements in [0..k) in O(N) average.
+    buckets.select_nth_unstable_by(k - 1, |a, b| {
+        let va = bucket_sort_value(a, &top_k.sort_by, &top_k.sort_function);
+        let vb = bucket_sort_value(b, &top_k.sort_by, &top_k.sort_function);
+        if top_k.descending {
+            vb.total_cmp(&va)
+        } else {
+            va.total_cmp(&vb)
+        }
+    });
+    buckets.truncate(k);
+}
+
 /// Flat-array accumulation for single-column keyword GROUP BY on match_all scans.
 /// Replaces HashMap with pre-allocated Vec<u64>/Vec<f64> arrays indexed directly
 /// by ordinal — zero hash computation, zero collision handling, cache-friendly
@@ -2304,6 +2486,7 @@ fn flat_scan_segment(
     metric_entries: &[GroupedMetricEntry],
     max_doc: u32,
     num_groups: usize,
+    shard_top_k: Option<&crate::search::ShardTopK>,
 ) -> Vec<crate::search::GroupedMetricsBucket> {
     // Build flat metric arrays — one layout per metric
     let mut flat_metrics: Vec<FlatMetric> = metric_entries
@@ -2373,21 +2556,68 @@ fn flat_scan_segment(
         start = end;
     }
 
-    // Convert flat arrays → GroupedMetricsBucket (only non-zero groups)
-    let mut buckets = Vec::new();
-    for ord in 0..num_groups {
-        // Check if this group was populated (any count > 0)
-        let populated = flat_metrics.iter().any(|fm| match fm {
-            FlatMetric::Count(counts) => counts[ord] > 0,
-            FlatMetric::Stats { count, .. } => count[ord] > 0,
+    // Convert flat arrays → GroupedMetricsBucket.
+    //
+    // Optimization 1 — shard-level top-K: when ORDER BY + LIMIT is present,
+    // select only the top-K ordinals by the sort metric value BEFORE resolving
+    // strings. This avoids 364K ord_to_str calls for LIMIT 10 queries.
+    //
+    // Optimization 2 — StringArena: batch-resolve all needed ordinals into one
+    // contiguous buffer instead of N individual String heap allocations.
+
+    // Step 1: collect populated ordinals.
+    let mut populated_ords: Vec<usize> = (0..num_groups)
+        .filter(|&ord| {
+            flat_metrics.iter().any(|fm| match fm {
+                FlatMetric::Count(counts) => counts[ord] > 0,
+                FlatMetric::Stats { count, .. } => count[ord] > 0,
+            })
+        })
+        .collect();
+
+    // Step 2: top-K pruning on ordinals (before string resolution).
+    if let Some(top_k) = shard_top_k
+        && populated_ords.len() > top_k.limit
+    {
+        let k = top_k.limit.min(populated_ords.len());
+        populated_ords.select_nth_unstable_by(k - 1, |&a, &b| {
+            let va = flat_sort_value(&flat_metrics, metric_entries, &top_k.sort_by, a);
+            let vb = flat_sort_value(&flat_metrics, metric_entries, &top_k.sort_by, b);
+            if top_k.descending {
+                vb.total_cmp(&va)
+            } else {
+                va.total_cmp(&vb)
+            }
         });
-        if !populated {
-            continue;
+        populated_ords.truncate(k);
+    }
+
+    // Step 3: batch-resolve ordinals into a StringArena.
+    let mut arena = StringArena::with_capacity(populated_ords.len(), 16);
+    let mut resolve_buf = String::with_capacity(64);
+    // Map: position in populated_ords → arena index.
+    // For non-string keys, arena is unused and we resolve inline.
+    let is_str_key = matches!(key_reader, GroupKeyReader::Str(_));
+    if is_str_key {
+        for &ord in &populated_ords {
+            resolve_buf.clear();
+            if let GroupKeyReader::Str(reader) = key_reader {
+                reader.ord_to_str(ord as u64, &mut resolve_buf);
+            }
+            arena.push(&resolve_buf);
         }
+    }
 
-        let group_value = key_reader.resolve(ord as u64);
+    // Step 4: build buckets from the pruned + arena-resolved ordinals.
+    let mut buckets = Vec::with_capacity(populated_ords.len());
+    for (pos, &ord) in populated_ords.iter().enumerate() {
+        let group_value = if is_str_key {
+            arena.to_json_value(pos as u32)
+        } else {
+            key_reader.resolve(ord as u64)
+        };
+
         let mut metrics = std::collections::HashMap::new();
-
         for (metric_idx, me) in metric_entries.iter().enumerate() {
             let partial = match &flat_metrics[metric_idx] {
                 FlatMetric::Count(counts) => {
@@ -4316,6 +4546,7 @@ mod tests {
                             field: Some("price".into()),
                         },
                     ],
+                    shard_top_k: None,
                 }),
             )]),
         };
@@ -7437,6 +7668,7 @@ mod tests {
                 AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
                     group_by: vec!["brand".into()],
                     metrics,
+                    shard_top_k: None,
                 }),
             )]),
         }
@@ -7999,5 +8231,361 @@ mod tests {
             !engine.can_stream_sql_batches(&["brand".into()], true),
             "score-dependent queries must stay on the scored path"
         );
+    }
+
+    // ── StringArena tests ──────────────────────────────────────────
+
+    #[test]
+    fn string_arena_push_and_get() {
+        let mut arena = StringArena::with_capacity(4, 8);
+        let i0 = arena.push("hello");
+        let i1 = arena.push("world");
+        let i2 = arena.push("");
+        let i3 = arena.push("ferris");
+        assert_eq!(arena.get(i0), "hello");
+        assert_eq!(arena.get(i1), "world");
+        assert_eq!(arena.get(i2), "");
+        assert_eq!(arena.get(i3), "ferris");
+    }
+
+    #[test]
+    fn string_arena_to_json_value() {
+        let mut arena = StringArena::with_capacity(2, 8);
+        let idx = arena.push("test_value");
+        let json = arena.to_json_value(idx);
+        assert_eq!(json, serde_json::Value::String("test_value".into()));
+    }
+
+    // ── Shard top-K pruning tests ──────────────────────────────────
+
+    #[test]
+    fn apply_shard_top_k_prunes_to_limit() {
+        let mut buckets: Vec<crate::search::GroupedMetricsBucket> = (0..100)
+            .map(|i| crate::search::GroupedMetricsBucket {
+                group_values: vec![serde_json::Value::String(format!("author_{}", i))],
+                metrics: std::collections::HashMap::from([(
+                    "posts".to_string(),
+                    crate::search::GroupedMetricPartial::Count { count: i as u64 },
+                )]),
+            })
+            .collect();
+
+        apply_shard_top_k(
+            &mut buckets,
+            &crate::search::ShardTopK {
+                limit: 10,
+                sort_by: "posts".to_string(),
+                sort_function: crate::search::GroupedMetricFunction::Count,
+                descending: true,
+            },
+        );
+
+        assert_eq!(buckets.len(), 10);
+        // All remaining buckets should have count >= 90 (top 10 of 0..100)
+        for bucket in &buckets {
+            let count = match bucket.metrics.get("posts").unwrap() {
+                crate::search::GroupedMetricPartial::Count { count } => *count,
+                _ => panic!("expected Count"),
+            };
+            assert!(
+                count >= 90,
+                "top-K pruning kept count={} below cutoff",
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn apply_shard_top_k_noop_when_under_limit() {
+        let mut buckets: Vec<crate::search::GroupedMetricsBucket> = (0..5)
+            .map(|i| crate::search::GroupedMetricsBucket {
+                group_values: vec![serde_json::Value::from(i)],
+                metrics: std::collections::HashMap::from([(
+                    "cnt".to_string(),
+                    crate::search::GroupedMetricPartial::Count { count: i as u64 },
+                )]),
+            })
+            .collect();
+
+        apply_shard_top_k(
+            &mut buckets,
+            &crate::search::ShardTopK {
+                limit: 20,
+                sort_by: "cnt".to_string(),
+                sort_function: crate::search::GroupedMetricFunction::Count,
+                descending: true,
+            },
+        );
+
+        assert_eq!(buckets.len(), 5, "should not prune when under limit");
+    }
+
+    #[test]
+    fn apply_shard_top_k_ascending_order() {
+        let mut buckets: Vec<crate::search::GroupedMetricsBucket> = (0..50)
+            .map(|i| crate::search::GroupedMetricsBucket {
+                group_values: vec![serde_json::Value::from(i)],
+                metrics: std::collections::HashMap::from([(
+                    "val".to_string(),
+                    crate::search::GroupedMetricPartial::Stats {
+                        count: 1,
+                        sum: i as f64,
+                        min: i as f64,
+                        max: i as f64,
+                    },
+                )]),
+            })
+            .collect();
+
+        apply_shard_top_k(
+            &mut buckets,
+            &crate::search::ShardTopK {
+                limit: 5,
+                sort_by: "val".to_string(),
+                sort_function: crate::search::GroupedMetricFunction::Sum,
+                descending: false,
+            },
+        );
+
+        assert_eq!(buckets.len(), 5);
+        // All remaining should have sum <= 4 (bottom 5 of 0..50)
+        for bucket in &buckets {
+            let sum = match bucket.metrics.get("val").unwrap() {
+                crate::search::GroupedMetricPartial::Stats { sum, .. } => *sum,
+                _ => panic!("expected Stats"),
+            };
+            assert!(sum <= 4.0, "ascending top-K kept sum={} above cutoff", sum);
+        }
+    }
+
+    #[test]
+    fn flat_sort_value_extracts_correct_metric() {
+        let flat_metrics = vec![
+            FlatMetric::Count(vec![100, 200, 50]),
+            FlatMetric::Stats {
+                count: vec![10, 20, 5],
+                sum: vec![1000.0, 2000.0, 500.0],
+                min: vec![1.0, 2.0, 3.0],
+                max: vec![99.0, 199.0, 49.0],
+            },
+        ];
+        let metric_entries = vec![
+            GroupedMetricEntry {
+                output_name: "posts".to_string(),
+                function: crate::search::GroupedMetricFunction::Count,
+                source: GroupedMetricSource::CountAll,
+            },
+            GroupedMetricEntry {
+                output_name: "total".to_string(),
+                function: crate::search::GroupedMetricFunction::Sum,
+                source: GroupedMetricSource::CountAll, // dummy, unused by sort
+            },
+        ];
+
+        assert_eq!(
+            flat_sort_value(&flat_metrics, &metric_entries, "posts", 0),
+            100.0
+        );
+        assert_eq!(
+            flat_sort_value(&flat_metrics, &metric_entries, "posts", 1),
+            200.0
+        );
+        assert_eq!(
+            flat_sort_value(&flat_metrics, &metric_entries, "total", 0),
+            1000.0
+        );
+        assert_eq!(
+            flat_sort_value(&flat_metrics, &metric_entries, "total", 2),
+            500.0
+        );
+        // Non-existent metric falls back to 0.0
+        assert_eq!(
+            flat_sort_value(&flat_metrics, &metric_entries, "unknown", 0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn bucket_sort_value_count_metric() {
+        let bucket = crate::search::GroupedMetricsBucket {
+            group_values: vec![serde_json::Value::String("alice".into())],
+            metrics: std::collections::HashMap::from([(
+                "posts".to_string(),
+                crate::search::GroupedMetricPartial::Count { count: 42 },
+            )]),
+        };
+        assert_eq!(
+            bucket_sort_value(
+                &bucket,
+                "posts",
+                &crate::search::GroupedMetricFunction::Count
+            ),
+            42.0
+        );
+        assert_eq!(
+            bucket_sort_value(
+                &bucket,
+                "missing",
+                &crate::search::GroupedMetricFunction::Count
+            ),
+            f64::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn shard_top_k_serialization_roundtrip() {
+        let params = crate::search::GroupedMetricsAggParams {
+            group_by: vec!["author".into()],
+            metrics: vec![crate::search::GroupedMetricAgg {
+                output_name: "posts".into(),
+                function: crate::search::GroupedMetricFunction::Count,
+                field: None,
+            }],
+            shard_top_k: Some(crate::search::ShardTopK {
+                limit: 40,
+                sort_by: "posts".into(),
+                sort_function: crate::search::GroupedMetricFunction::Count,
+                descending: true,
+            }),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let restored: crate::search::GroupedMetricsAggParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.shard_top_k.as_ref().unwrap().limit, 40);
+        assert_eq!(restored.shard_top_k.as_ref().unwrap().sort_by, "posts");
+        assert!(restored.shard_top_k.as_ref().unwrap().descending);
+    }
+
+    #[test]
+    fn shard_top_k_none_omitted_in_serialization() {
+        let params = crate::search::GroupedMetricsAggParams {
+            group_by: vec!["x".into()],
+            metrics: vec![],
+            shard_top_k: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(!json.contains("shard_top_k"), "None should be omitted");
+    }
+
+    #[test]
+    fn bucket_sort_value_avg_sorts_by_average_not_sum() {
+        // GPT-identified regression: sorting by avg must use sum/count, not sum.
+        // A group with sum=100, count=100 (avg=1.0) should rank LOWER than
+        // sum=50, count=1 (avg=50.0) when sorting by avg DESC.
+        let high_sum_low_avg = crate::search::GroupedMetricsBucket {
+            group_values: vec![serde_json::Value::String("prolific".into())],
+            metrics: std::collections::HashMap::from([(
+                "avg_upvotes".to_string(),
+                crate::search::GroupedMetricPartial::Stats {
+                    count: 100,
+                    sum: 100.0,
+                    min: 1.0,
+                    max: 1.0,
+                },
+            )]),
+        };
+        let low_sum_high_avg = crate::search::GroupedMetricsBucket {
+            group_values: vec![serde_json::Value::String("rare".into())],
+            metrics: std::collections::HashMap::from([(
+                "avg_upvotes".to_string(),
+                crate::search::GroupedMetricPartial::Stats {
+                    count: 1,
+                    sum: 50.0,
+                    min: 50.0,
+                    max: 50.0,
+                },
+            )]),
+        };
+
+        let avg_fn = crate::search::GroupedMetricFunction::Avg;
+        let va = bucket_sort_value(&high_sum_low_avg, "avg_upvotes", &avg_fn);
+        let vb = bucket_sort_value(&low_sum_high_avg, "avg_upvotes", &avg_fn);
+
+        assert!(
+            va < vb,
+            "avg=1.0 should rank below avg=50.0, got va={} vb={}",
+            va,
+            vb
+        );
+    }
+
+    #[test]
+    fn bucket_sort_value_min_and_max() {
+        let bucket = crate::search::GroupedMetricsBucket {
+            group_values: vec![serde_json::Value::String("test".into())],
+            metrics: std::collections::HashMap::from([(
+                "price".to_string(),
+                crate::search::GroupedMetricPartial::Stats {
+                    count: 10,
+                    sum: 500.0,
+                    min: 5.0,
+                    max: 99.0,
+                },
+            )]),
+        };
+
+        assert_eq!(
+            bucket_sort_value(&bucket, "price", &crate::search::GroupedMetricFunction::Min),
+            5.0
+        );
+        assert_eq!(
+            bucket_sort_value(&bucket, "price", &crate::search::GroupedMetricFunction::Max),
+            99.0
+        );
+        assert_eq!(
+            bucket_sort_value(&bucket, "price", &crate::search::GroupedMetricFunction::Sum),
+            500.0
+        );
+        // avg = 500.0 / 10 = 50.0
+        assert!(
+            (bucket_sort_value(&bucket, "price", &crate::search::GroupedMetricFunction::Avg)
+                - 50.0)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn apply_shard_top_k_avg_keeps_highest_average() {
+        // 20 groups: group i has count=10, sum=i*10 → avg=i
+        // Top 5 by avg DESC should keep groups 15..20 (avg 15..19)
+        let mut buckets: Vec<crate::search::GroupedMetricsBucket> = (0..20)
+            .map(|i| crate::search::GroupedMetricsBucket {
+                group_values: vec![serde_json::Value::from(i)],
+                metrics: std::collections::HashMap::from([(
+                    "avg_val".to_string(),
+                    crate::search::GroupedMetricPartial::Stats {
+                        count: 10,
+                        sum: i as f64 * 10.0,
+                        min: i as f64,
+                        max: i as f64,
+                    },
+                )]),
+            })
+            .collect();
+
+        apply_shard_top_k(
+            &mut buckets,
+            &crate::search::ShardTopK {
+                limit: 5,
+                sort_by: "avg_val".to_string(),
+                sort_function: crate::search::GroupedMetricFunction::Avg,
+                descending: true,
+            },
+        );
+
+        assert_eq!(buckets.len(), 5);
+        for bucket in &buckets {
+            let avg = match bucket.metrics.get("avg_val").unwrap() {
+                crate::search::GroupedMetricPartial::Stats { count, sum, .. } => {
+                    sum / *count as f64
+                }
+                _ => panic!("expected Stats"),
+            };
+            assert!(
+                avg >= 15.0,
+                "avg-sorted top-K should keep avg >= 15, got {}",
+                avg
+            );
+        }
     }
 }

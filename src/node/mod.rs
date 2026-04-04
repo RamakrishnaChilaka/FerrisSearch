@@ -147,6 +147,7 @@ impl Node {
             raft: self.raft.clone(),
             worker_pools: crate::worker::WorkerPools::default_for_system(),
             sql_group_by_scan_limit: self.config.sql_group_by_scan_limit,
+            sql_approximate_top_k: self.config.sql_approximate_top_k,
         };
 
         // 1. Start internal gRPC Transport Server (Port 9300)

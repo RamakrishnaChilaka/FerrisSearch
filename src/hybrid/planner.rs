@@ -832,7 +832,7 @@ impl QueryPlan {
         }
     }
 
-    pub fn to_search_request(&self) -> crate::search::SearchRequest {
+    pub fn to_search_request(&self, approximate_top_k: bool) -> crate::search::SearchRequest {
         let query = if self.text_matches.is_empty() && self.pushed_filters.is_empty() {
             crate::search::QueryClause::MatchAll(serde_json::Value::Object(Default::default()))
         } else {
@@ -856,6 +856,42 @@ impl QueryPlan {
                     field: metric.field.clone(),
                 })
                 .collect();
+
+            // Shard-level top-K pruning is opt-in via `sql_approximate_top_k: true`
+            // in ferrissearch.yml.  Standard SQL engines compute exact GROUP BY
+            // results; this approximation trades correctness for latency on
+            // high-cardinality full-scan GROUP BY with ORDER BY + LIMIT.
+            //
+            // Safety guards (when enabled):
+            // - Disabled when HAVING is present (pruned groups could satisfy
+            //   HAVING only after cross-shard merge).
+            // - Disabled for multi-column ORDER BY (secondary keys not evaluated).
+            // - Disabled when ORDER BY references a group column (not a metric).
+            let shard_top_k = if approximate_top_k
+                && grouped_sql.uses_top_k(self.limit)
+                && grouped_sql.having.is_empty()
+                && grouped_sql.order_by.len() == 1
+                && let Some(first_order) = grouped_sql.order_by.first()
+            {
+                let matching_metric = grouped_sql
+                    .metrics
+                    .iter()
+                    .find(|m| m.output_name == first_order.output_name);
+                if let Some(metric) = matching_metric {
+                    let needed = self.offset.unwrap_or(0) + self.limit.unwrap_or(0);
+                    Some(crate::search::ShardTopK {
+                        limit: needed * 3 + 10,
+                        sort_by: first_order.output_name.clone(),
+                        sort_function: metric.function.to_search_function(),
+                        descending: first_order.desc,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             (
                 0,
                 HashMap::from([(
@@ -868,6 +904,7 @@ impl QueryPlan {
                                 .map(|column| column.source_name.clone())
                                 .collect(),
                             metrics,
+                            shard_top_k,
                         },
                     ),
                 )]),
@@ -906,7 +943,7 @@ impl QueryPlan {
 
     /// Build a structured explanation of the query plan for the EXPLAIN API.
     pub fn to_explain_json(&self) -> serde_json::Value {
-        let search_request = self.to_search_request();
+        let search_request = self.to_search_request(false);
 
         // Determine which execution strategy would be chosen
         let execution_strategy = if self.grouped_sql.is_some() {
@@ -2449,7 +2486,7 @@ mod tests {
         assert!(plan.selects_all_columns);
         assert!(plan.limit_pushed_down);
         assert_eq!(plan.limit, Some(10));
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 10);
     }
 
@@ -2458,7 +2495,7 @@ mod tests {
         let plan = plan_sql("idx", "SELECT * FROM \"idx\" LIMIT 5 OFFSET 20").unwrap();
         assert!(plan.selects_all_columns);
         assert!(plan.limit_pushed_down);
-        let req = plan.to_search_request();
+        let req = plan.to_search_request(false);
         assert_eq!(req.size, 25); // limit + offset
     }
 
@@ -3114,7 +3151,7 @@ mod tests {
         )));
         assert!(!plan.has_residual_predicates);
 
-        let request = plan.to_search_request();
+        let request = plan.to_search_request(false);
         match request.query {
             crate::search::QueryClause::Bool(bool_query) => {
                 assert_eq!(bool_query.must.len(), 2);
@@ -3145,7 +3182,7 @@ mod tests {
         );
         assert!(plan.pushed_filters.is_empty());
 
-        let request = plan.to_search_request();
+        let request = plan.to_search_request(false);
         match request.query {
             crate::search::QueryClause::Bool(bool_query) => {
                 assert_eq!(bool_query.must.len(), 2);

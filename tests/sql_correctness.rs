@@ -112,6 +112,7 @@ impl FerrisDB {
             raft: None,
             worker_pools: WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
+            sql_approximate_top_k: false,
         };
 
         // Open the shard (CompositeEngine spawns refresh loop on current runtime)

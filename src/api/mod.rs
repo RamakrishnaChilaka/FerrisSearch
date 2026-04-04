@@ -52,6 +52,12 @@ pub struct AppState {
     /// Max docs to scan for GROUP BY queries on the fast-fields fallback path.
     /// 0 = unlimited.
     pub sql_group_by_scan_limit: usize,
+    /// Enable approximate shard-level top-K pruning for grouped-partials GROUP BY.
+    /// When true, each shard keeps only (offset + limit) * 3 + 10 buckets before
+    /// shipping to the coordinator.  Reduces latency on high-cardinality GROUP BY
+    /// with LIMIT, but results are approximate (not standard SQL semantics).
+    /// Default: false.
+    pub sql_approximate_top_k: bool,
 }
 
 /// Build a consistent OpenSearch-compatible error response.
