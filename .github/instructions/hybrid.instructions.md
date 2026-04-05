@@ -175,6 +175,8 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - The current planner still relies on raw `sqlparser` expression walking for parts of dependency extraction. The long-term target is a clause-aware semantic binder that resolves each identifier as a base field, SELECT alias, aggregate output, or synthetic field like `_id` / `_score` before capability analysis runs.
 - `required_columns`, `needs_id`, and `needs_score` should ultimately be derived from that bound query IR rather than from raw AST walkers plus alias filtering. This is the clean way to eliminate recurring alias-shadowing edge cases in WHERE/HAVING/ORDER BY.
 - Keep the separation of responsibilities: semantic binding first, then search-aware capability analysis, then execution planning. Do not fold this into ad-hoc pushdown walkers or a second SQL dependency pass.
+- Until the binder carries enough source-identifier semantics through execution, the API SQL execution layer canonicalizes unquoted source field names against index mappings case-insensitively before building Tantivy queries or Arrow schemas. This is a bridge, not the long-term planner architecture.
+- `project_batch_to_sql_columns` and `project_schema` in `datafusion_exec.rs` use case-insensitive matching (`eq_ignore_ascii_case`) when aligning `extract_select_column_order` names from `rewritten_sql` against batch schema fields, because `rewritten_sql` preserves the user's original casing while batch schemas use canonicalized names.
 
 ## Small Bound-Column IR Plan
 - Near-term step before the full semantic binder: introduce a small clause-aware bound-column layer, not a full bound-query IR.

@@ -98,7 +98,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 807 unit tests + 61 CLI tests + 33 consensus integration + 40 replication integration + 30 REST API integration + 1 SQL correctness harness (sqllogictest, 166 assertions) = 972 total
+- 824 unit tests + 62 CLI tests + 33 consensus integration + 40 replication integration + 35 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 995 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)

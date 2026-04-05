@@ -210,5 +210,6 @@ pip install opensearch-py pyarrow requests
 python3 scripts/ingest_1gb.py                              # 2M synthetic docs
 python3 scripts/search_1gb.py --queries 200 --concurrency 1  # search benchmark
 python3 scripts/ingest_hackernews.py                       # 4M HN stories
+bash scripts/load_nyc_taxis_100m.sh                        # 100M NYC taxi rows end-to-end: build/start cluster, download, ingest, benchmark
 bash scripts/hackernews_queries.sh                         # SQL benchmark
 ```

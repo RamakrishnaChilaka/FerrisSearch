@@ -279,3 +279,42 @@ SELECT author, max(upvotes) - min(upvotes) AS spread FROM stories GROUP BY autho
 carol 600
 bob 200
 alice 130
+
+# ── Case-insensitive unquoted column resolution ─────────────────────
+
+# Uppercase source columns resolve to the lowercase mapping
+query T rowsort
+SELECT AUTHOR FROM stories
+----
+alice
+alice
+alice
+bob
+bob
+carol
+carol
+dave
+dave
+eve
+
+# Mixed-case columns with aliases
+query TI nosort
+SELECT AUTHOR AS author, UPVOTES AS upvotes FROM stories ORDER BY UPVOTES DESC LIMIT 3
+----
+carol 1000
+eve 800
+bob 500
+
+# Uppercase GROUP BY + aggregate columns
+query TI nosort
+SELECT AUTHOR, COUNT(*) AS cnt FROM stories GROUP BY AUTHOR ORDER BY cnt DESC, AUTHOR ASC LIMIT 3
+----
+alice 3
+bob 2
+carol 2
+
+# Uppercase in WHERE pushdown
+query I nosort
+SELECT COUNT(*) FROM stories WHERE UPVOTES > 400
+----
+3

@@ -276,7 +276,9 @@ fn project_batch_to_sql_columns(
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
     for col_name in &select_order {
-        if let Some(idx) = field_names.iter().position(|&n| n == col_name)
+        if let Some(idx) = field_names
+            .iter()
+            .position(|&n| n.eq_ignore_ascii_case(col_name))
             && !ordered_indices.contains(&idx)
         {
             ordered_indices.push(idx);
@@ -535,7 +537,9 @@ fn project_schema(schema: &Arc<Schema>, plan: &QueryPlan) -> Arc<Schema> {
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
     for col_name in &select_order {
-        if let Some(idx) = field_names.iter().position(|&n| n == col_name)
+        if let Some(idx) = field_names
+            .iter()
+            .position(|&n| n.eq_ignore_ascii_case(col_name))
             && !ordered_indices.contains(&idx)
         {
             ordered_indices.push(idx);
