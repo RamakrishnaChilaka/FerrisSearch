@@ -22,6 +22,7 @@ use ferrissearch::transport::proto::{
 };
 use ferrissearch::transport::server::create_transport_service;
 use ferrissearch::wal::{HotTranslog, WriteAheadLog};
+use futures::TryStreamExt;
 
 use std::collections::HashMap;
 #[cfg(feature = "transport-tls")]
@@ -1674,7 +1675,7 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
         aggs: HashMap::new(),
     };
 
-    let (batches, total_hits) = transport_client
+    let (batches, total_hits, streaming_used) = transport_client
         .forward_sql_batch_stream_to_shard(
             &remote_node,
             "sql-stream-idx",
@@ -1689,8 +1690,35 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
         .unwrap();
 
     assert_eq!(total_hits, 3);
+    assert!(streaming_used);
     assert_eq!(batches.len(), 3);
     assert!(batches.iter().all(|batch| batch.num_rows() == 1));
+
+    let live_stream = transport_client
+        .open_sql_batch_stream_to_shard(
+            &remote_node,
+            "sql-stream-idx",
+            0,
+            &search_req,
+            &["brand".to_string()],
+            false,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(live_stream.total_hits(), 3);
+    assert_eq!(live_stream.collected_rows(), 3);
+    assert!(live_stream.streaming_used());
+
+    let live_batches = live_stream
+        .into_stream()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(live_batches.len(), 3);
+    assert!(live_batches.iter().all(|batch| batch.num_rows() == 1));
 
     let brand_index = batches[0]
         .schema()
@@ -1712,6 +1740,27 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
         .collect();
     brands.sort();
     assert_eq!(brands, vec!["Apple", "Apple", "Samsung"]);
+
+    let live_brand_index = live_batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == "brand")
+        .expect("brand column present");
+    let mut live_brands: Vec<String> = live_batches
+        .iter()
+        .map(|batch| {
+            batch
+                .column(live_brand_index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_string()
+        })
+        .collect();
+    live_brands.sort();
+    assert_eq!(live_brands, vec!["Apple", "Apple", "Samsung"]);
 }
 
 #[tokio::test]

@@ -435,15 +435,15 @@ impl SearchEngine for CompositeEngine {
         )?))
     }
 
-    fn sql_streaming_batches(
+    fn sql_streaming_batch_handle(
         &self,
         req: &crate::search::SearchRequest,
         columns: &[String],
         needs_id: bool,
         needs_score: bool,
         batch_size: usize,
-    ) -> Result<Option<super::SqlStreamingResult>> {
-        <HotEngine as super::SearchEngine>::sql_streaming_batches(
+    ) -> Result<Option<super::SqlStreamingBatchHandle>> {
+        <HotEngine as super::SearchEngine>::sql_streaming_batch_handle(
             &self.text,
             req,
             columns,

@@ -128,11 +128,11 @@ cargo build --release --bin ferris-cli
 ./target/release/ferris-cli -c "SELECT count(*) FROM \"hackernews\""
 ```
 
-`ferris-cli` now reads the global `POST /_sql/stream` endpoint and reconstructs the normal table view from streamed `meta` and `rows` NDJSON frames. For explicit-column fast-field queries, the coordinator now feeds remote shard batches into DataFusion through streaming partitions instead of first staging them in a coordinator `MemTable`.
+`ferris-cli` now reads the global `POST /_sql/stream` endpoint and reconstructs the normal table view from streamed `meta` and `rows` NDJSON frames. For explicit-column fast-field queries, the coordinator now keeps remote shard gRPC streams live into DataFusion `StreamingTable` partitions instead of first collecting those remote batches into coordinator memory.
 
 Quoted hyphenated index names work through the global SQL endpoints and the CLI regardless of SQL keyword casing, so both `SELECT count(*) FROM "nyc-taxis"` and `select count(*) from "nyc-taxis"` route to the same index.
 
-Unquoted SQL source columns are resolved case-insensitively against index mappings on both buffered and streamed SQL endpoints, so `SELECT PRICE FROM products` and `select price from products` target the same field unless the mapping itself contains an ambiguous case-only collision.
+Unquoted SQL source columns are resolved case-insensitively against index mappings on both buffered and streamed SQL endpoints, so `SELECT PRICE FROM products` and `select price from products` target the same field unless the mapping itself contains an ambiguous case-only collision. Mixed-case mapped fields such as `PULocationID` are also rewritten to quoted canonical source identifiers before the residual DataFusion stage runs, while quoted identifiers and output aliases keep their exact spelling.
 
 ### Load 4M Hacker News stories
 
@@ -180,7 +180,7 @@ The planner splits work between Tantivy and DataFusion. For eligible queries, ea
 
 Scan limits are mode-specific, not global. Flat `tantivy_fast_fields` queries still default to an internal 100K match cap unless `LIMIT` pushdown applies. `GROUP BY` queries that fall back to `tantivy_fast_fields` use `sql_group_by_scan_limit` instead (default 1M, `0 = unlimited`), while `tantivy_grouped_partials` scans all matching docs.
 
-When a fast-field fallback query can stay fully columnar, remote shards now send multiple Arrow IPC batches to the coordinator over gRPC instead of one large unary payload, the coordinator feeds those batches into DataFusion through streaming partitions, and the client receives the final SQL result as NDJSON over one long-lived HTTP response. The remaining major limitation is wildcard/export-style `SELECT *`, which still uses `materialized_hits_fallback`.
+When a fast-field fallback query can stay fully columnar, local shards now emit fast-field batches lazily from HotEngine and remote shards send multiple Arrow IPC batches to the coordinator over gRPC instead of one large unary payload. The coordinator reads just the first shard response to learn `total_hits`, `collected_rows`, and `streaming_used`, then passes both the remaining live remote shard streams and the lazy local shard streams into DataFusion through streaming partitions. The client receives the final SQL result as NDJSON over one long-lived HTTP response. The remaining major limitation is wildcard/export-style `SELECT *`, which still uses `materialized_hits_fallback`.
 
 ### SQL Features
 
@@ -493,13 +493,13 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 995 tests
-cargo test --lib                                # Unit tests (824)
+cargo test                                      # All 1005 tests
+cargo test --lib                                # Unit tests (831)
 cargo test --bin ferris-cli                      # CLI tests (62)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (40)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (35)
+cargo test --test rest_api_integration           # REST API (38)
 cargo test --test sql_correctness                # SQL correctness (1 test, 170 sqllogictest assertions)
 ```
 

@@ -3808,19 +3808,19 @@ impl super::SearchEngine for HotEngine {
         )?))
     }
 
-    fn sql_streaming_batches(
+    fn sql_streaming_batch_handle(
         &self,
         req: &crate::search::SearchRequest,
         columns: &[String],
         needs_id: bool,
         needs_score: bool,
         batch_size: usize,
-    ) -> Result<Option<super::SqlStreamingResult>> {
+    ) -> Result<Option<super::SqlStreamingBatchHandle>> {
         if !self.can_stream_sql_batches(columns, needs_score) {
             return Ok(None);
         }
 
-        Ok(Some(HotEngine::sql_streaming_batches(
+        Ok(Some(HotEngine::sql_streaming_batch_handle(
             self,
             req,
             columns,
@@ -3868,34 +3868,6 @@ impl SegmentBitSet {
             self.words[word_idx] |= mask;
             self.count += 1;
         }
-    }
-
-    /// Iterate all set bit positions.
-    fn iter_set_bits(&self) -> impl Iterator<Item = u32> + '_ {
-        self.words.iter().enumerate().flat_map(|(word_idx, &word)| {
-            let base = (word_idx as u32) * 64;
-            BitIter { word, base }
-        })
-    }
-}
-
-/// Iterator over set bits in a single u64 word using trailing-zeros scan.
-struct BitIter {
-    word: u64,
-    base: u32,
-}
-
-impl Iterator for BitIter {
-    type Item = u32;
-
-    #[inline]
-    fn next(&mut self) -> Option<u32> {
-        if self.word == 0 {
-            return None;
-        }
-        let tz = self.word.trailing_zeros();
-        self.word &= self.word - 1; // clear lowest set bit
-        Some(self.base + tz)
     }
 }
 
@@ -3951,6 +3923,206 @@ impl tantivy::collector::SegmentCollector for BitSetSegmentCollector {
 /// Streaming batch size for bitset-based GROUP BY fallback queries.
 const STREAMING_BATCH_SIZE: usize = 8192;
 
+struct SegmentBitSetCursor {
+    segment_ord: u32,
+    max_doc: u32,
+    words: Vec<u64>,
+    next_word_idx: usize,
+    current_word: u64,
+    current_base: u32,
+}
+
+impl SegmentBitSetCursor {
+    fn new(bitset: SegmentBitSet) -> Self {
+        Self {
+            segment_ord: bitset.segment_ord,
+            max_doc: bitset.max_doc,
+            words: bitset.words,
+            next_word_idx: 0,
+            current_word: 0,
+            current_base: 0,
+        }
+    }
+
+    fn next_doc(&mut self) -> Option<u32> {
+        loop {
+            if self.current_word != 0 {
+                let tz = self.current_word.trailing_zeros();
+                self.current_word &= self.current_word - 1;
+                return Some(self.current_base + tz);
+            }
+
+            let next_word = *self.words.get(self.next_word_idx)?;
+            self.current_base = (self.next_word_idx as u32) * 64;
+            self.current_word = next_word;
+            self.next_word_idx += 1;
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.current_word == 0 && self.next_word_idx >= self.words.len()
+    }
+}
+
+struct StreamingSegmentState {
+    cursor: SegmentBitSetCursor,
+    id_reader: Option<StringFastFieldReader>,
+    field_readers: Vec<SqlFieldReader>,
+    id_builder: datafusion::arrow::array::StringBuilder,
+    score_builder: datafusion::arrow::array::Float32Builder,
+    col_builders: Vec<ColumnBuilder>,
+    id_text: String,
+    rows_in_batch: usize,
+}
+
+impl StreamingSegmentState {
+    fn new(
+        cursor: SegmentBitSetCursor,
+        id_reader: Option<StringFastFieldReader>,
+        field_readers: Vec<SqlFieldReader>,
+        batch_size: usize,
+    ) -> Self {
+        let col_builders = field_readers
+            .iter()
+            .map(|reader| ColumnBuilder::new(reader, batch_size))
+            .collect();
+
+        Self {
+            cursor,
+            id_reader,
+            field_readers,
+            id_builder: datafusion::arrow::array::StringBuilder::with_capacity(
+                batch_size,
+                batch_size * 16,
+            ),
+            score_builder: datafusion::arrow::array::Float32Builder::with_capacity(batch_size),
+            col_builders,
+            id_text: String::new(),
+            rows_in_batch: 0,
+        }
+    }
+}
+
+struct StreamingBatchState {
+    searcher: tantivy::Searcher,
+    schema: tantivy::schema::Schema,
+    columns: Vec<String>,
+    arrow_schema: std::sync::Arc<datafusion::arrow::datatypes::Schema>,
+    batch_size: usize,
+    needs_id: bool,
+    remaining_segments: std::vec::IntoIter<SegmentBitSet>,
+    current_segment: Option<StreamingSegmentState>,
+    empty_batch_pending: bool,
+}
+
+impl StreamingBatchState {
+    fn open_next_segment(&mut self) -> Result<bool> {
+        while let Some(segment_bitset) = self.remaining_segments.next() {
+            if segment_bitset.count == 0 {
+                continue;
+            }
+
+            let cursor = SegmentBitSetCursor::new(segment_bitset);
+            let seg_ord = cursor.segment_ord as usize;
+            let Some(seg_reader) = self.searcher.segment_readers().get(seg_ord) else {
+                continue;
+            };
+            let fast_fields = seg_reader.fast_fields();
+            let field_readers = self
+                .columns
+                .iter()
+                .map(|col_name| open_sql_field_reader(&self.schema, fast_fields, col_name))
+                .collect();
+            let id_reader = if self.needs_id {
+                StringFastFieldReader::open(fast_fields, "_id")
+            } else {
+                None
+            };
+
+            self.current_segment = Some(StreamingSegmentState::new(
+                cursor,
+                id_reader,
+                field_readers,
+                self.batch_size,
+            ));
+            return Ok(true);
+        }
+
+        self.current_segment = None;
+        Ok(false)
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if self.empty_batch_pending {
+            self.empty_batch_pending = false;
+            return Ok(Some(RecordBatch::new_empty(self.arrow_schema.clone())));
+        }
+
+        loop {
+            if self.current_segment.is_none() && !self.open_next_segment()? {
+                return Ok(None);
+            }
+
+            let segment = self
+                .current_segment
+                .as_mut()
+                .expect("segment state must exist after open_next_segment");
+
+            while segment.rows_in_batch < self.batch_size {
+                let Some(doc_id) = segment.cursor.next_doc() else {
+                    break;
+                };
+
+                if doc_id >= segment.cursor.max_doc {
+                    break;
+                }
+
+                if self.needs_id {
+                    if let Some(reader) = &segment.id_reader {
+                        if reader.first_text(doc_id, &mut segment.id_text) {
+                            segment.id_builder.append_value(&segment.id_text);
+                        } else {
+                            segment.id_builder.append_value("");
+                        }
+                    } else {
+                        segment.id_builder.append_value("");
+                    }
+                } else {
+                    segment.id_builder.append_value("");
+                }
+
+                segment.score_builder.append_value(0.0);
+
+                for (builder, reader) in segment
+                    .col_builders
+                    .iter_mut()
+                    .zip(segment.field_readers.iter())
+                {
+                    builder.append(reader, doc_id);
+                }
+
+                segment.rows_in_batch += 1;
+            }
+
+            if segment.rows_in_batch > 0 {
+                let batch = HotEngine::finalize_streaming_batch(
+                    &self.arrow_schema,
+                    &mut segment.id_builder,
+                    &mut segment.score_builder,
+                    &mut segment.col_builders,
+                )?;
+                segment.rows_in_batch = 0;
+                if segment.cursor.finished() {
+                    self.current_segment = None;
+                }
+                return Ok(Some(batch));
+            }
+
+            self.current_segment = None;
+        }
+    }
+}
+
 impl HotEngine {
     /// Streaming is only valid when every requested column is fast-field backed
     /// on every segment and the query does not require synthetic BM25 `_score`.
@@ -3973,17 +4145,16 @@ impl HotEngine {
         })
     }
 
-    /// Collect ALL matching docs via bitset, read fast-field columns in streaming
-    /// batches. Returns multiple small RecordBatches instead of one giant batch.
-    /// No scan limit — bitset is O(segment_size/8) memory regardless of match count.
-    pub fn sql_streaming_batches(
+    /// Build a lazy batch handle for bitset-based SQL streaming. The caller gets
+    /// `total_hits` / `collected_rows` immediately and can pull batches incrementally.
+    pub fn sql_streaming_batch_handle(
         &self,
         req: &crate::search::SearchRequest,
         columns: &[String],
         needs_id: bool,
         _needs_score: bool,
         batch_size: usize,
-    ) -> Result<super::SqlStreamingResult> {
+    ) -> Result<super::SqlStreamingBatchHandle> {
         let searcher = self.reader.searcher();
         let query = self.build_query(&req.query)?;
 
@@ -3991,7 +4162,6 @@ impl HotEngine {
         let (segment_bitsets, total_hits) = searcher.search(&*query, &(BitSetCollector, Count))?;
 
         let schema = self.index.schema();
-        let segment_readers = searcher.segment_readers();
 
         // Build the Arrow schema: _id, _score, then user columns
         let mut arrow_fields = Vec::with_capacity(columns.len() + 2);
@@ -4012,124 +4182,63 @@ impl HotEngine {
         let arrow_schema =
             std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(arrow_fields));
 
-        let mut batches = Vec::new();
         let batch_size = if batch_size == 0 {
             STREAMING_BATCH_SIZE
         } else {
             batch_size
         };
 
-        // Process each segment: iterate set bits, read fast fields, produce batches
-        for seg_bitset in &segment_bitsets {
-            if seg_bitset.count == 0 {
-                continue;
-            }
-            let seg_ord = seg_bitset.segment_ord as usize;
-            if seg_ord >= segment_readers.len() {
-                continue;
-            }
-            let seg_reader = &segment_readers[seg_ord];
-            let ff = seg_reader.fast_fields();
+        let mut state = StreamingBatchState {
+            searcher,
+            schema,
+            columns: columns.to_vec(),
+            arrow_schema,
+            batch_size,
+            needs_id,
+            remaining_segments: segment_bitsets.into_iter(),
+            current_segment: None,
+            empty_batch_pending: total_hits == 0,
+        };
 
-            // Open fast-field readers for this segment
-            let field_readers: Vec<SqlFieldReader> = columns
-                .iter()
-                .map(|col_name| open_sql_field_reader(&schema, ff, col_name))
-                .collect();
+        Ok(super::SqlStreamingBatchHandle::new(
+            total_hits,
+            total_hits,
+            move || state.next_batch(),
+        ))
+    }
 
-            // Open _id reader (StrColumn + ordinal Column<u64>) if needed
-            let id_reader = if needs_id {
-                StringFastFieldReader::open(ff, "_id")
-            } else {
-                None
-            };
-
-            // Iterate matched docs in batches
-            let mut id_builder =
-                datafusion::arrow::array::StringBuilder::with_capacity(batch_size, batch_size * 16);
-            let mut score_builder =
-                datafusion::arrow::array::Float32Builder::with_capacity(batch_size);
-            let mut col_builders: Vec<ColumnBuilder> = field_readers
-                .iter()
-                .map(|r| ColumnBuilder::new(r, batch_size))
-                .collect();
-            let mut rows_in_batch = 0usize;
-            let mut id_text = String::new();
-
-            for doc_id in seg_bitset.iter_set_bits() {
-                // Bounds check: bitset may have bits beyond max_doc if segment shrank
-                if doc_id >= seg_bitset.max_doc {
-                    break;
-                }
-
-                // _id
-                if needs_id {
-                    if let Some(ref reader) = id_reader {
-                        if reader.first_text(doc_id, &mut id_text) {
-                            id_builder.append_value(&id_text);
-                        } else {
-                            id_builder.append_value("");
-                        }
-                    } else {
-                        id_builder.append_value("");
-                    }
-                } else {
-                    id_builder.append_value("");
-                }
-
-                // _score: always 0.0 for bitset path (no scoring; can_stream rejects needs_score)
-                score_builder.append_value(0.0);
-
-                // data columns
-                for (i, reader) in field_readers.iter().enumerate() {
-                    col_builders[i].append(reader, doc_id);
-                }
-
-                rows_in_batch += 1;
-                if rows_in_batch >= batch_size {
-                    let batch = self.finalize_streaming_batch(
-                        &arrow_schema,
-                        &mut id_builder,
-                        &mut score_builder,
-                        &mut col_builders,
-                        columns,
-                    )?;
-                    batches.push(batch);
-                    rows_in_batch = 0;
-                }
-            }
-
-            // Flush remaining rows from this segment
-            if rows_in_batch > 0 {
-                let batch = self.finalize_streaming_batch(
-                    &arrow_schema,
-                    &mut id_builder,
-                    &mut score_builder,
-                    &mut col_builders,
-                    columns,
-                )?;
-                batches.push(batch);
-            }
-        }
-
-        // If no matches at all, produce one empty batch with correct schema
-        if batches.is_empty() {
-            batches.push(RecordBatch::new_empty(arrow_schema));
+    /// Collect ALL matching docs via bitset, read fast-field columns in streaming
+    /// batches, and drain them eagerly into memory. The lazy handle above is the
+    /// primary implementation; this wrapper exists for tests and buffered callers.
+    pub fn sql_streaming_batches(
+        &self,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
+        batch_size: usize,
+    ) -> Result<super::SqlStreamingResult> {
+        let mut handle =
+            self.sql_streaming_batch_handle(req, columns, needs_id, needs_score, batch_size)?;
+        let total_hits = handle.total_hits;
+        let collected_rows = handle.collected_rows;
+        let mut batches = Vec::new();
+        while let Some(batch) = handle.next_batch()? {
+            batches.push(batch);
         }
 
         Ok(super::SqlStreamingResult {
             batches,
             total_hits,
+            collected_rows,
         })
     }
 
     fn finalize_streaming_batch(
-        &self,
         schema: &std::sync::Arc<datafusion::arrow::datatypes::Schema>,
         id_builder: &mut datafusion::arrow::array::StringBuilder,
         score_builder: &mut datafusion::arrow::array::Float32Builder,
         col_builders: &mut [ColumnBuilder],
-        _columns: &[String],
     ) -> Result<RecordBatch> {
         let mut arrays: Vec<datafusion::arrow::array::ArrayRef> =
             Vec::with_capacity(col_builders.len() + 2);
@@ -7990,6 +8099,54 @@ mod tests {
     }
 
     #[test]
+    fn lazy_streaming_handle_matches_eager_batches() {
+        let (_dir, engine) = create_engine();
+        for i in 0..48 {
+            engine
+                .add_document(
+                    &format!("doc-{i}"),
+                    json!({"title": format!("item {i}"), "brand": "test", "price": i as f64}),
+                )
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 100,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        let eager = engine
+            .sql_streaming_batches(&req, &["brand".into(), "price".into()], true, false, 7)
+            .unwrap();
+        let mut handle = engine
+            .sql_streaming_batch_handle(&req, &["brand".into(), "price".into()], true, false, 7)
+            .unwrap();
+
+        let total_hits = handle.total_hits;
+        let collected_rows = handle.collected_rows;
+        let mut lazy_batches = Vec::new();
+        while let Some(batch) = handle.next_batch().unwrap() {
+            lazy_batches.push(batch);
+        }
+
+        assert_eq!(total_hits, 48);
+        assert_eq!(collected_rows, 48);
+        assert_eq!(eager.total_hits, total_hits);
+        assert_eq!(eager.collected_rows, collected_rows);
+        assert_eq!(lazy_batches.len(), eager.batches.len());
+
+        let eager_rows: usize = eager.batches.iter().map(|batch| batch.num_rows()).sum();
+        let lazy_rows: usize = lazy_batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(lazy_rows, eager_rows);
+        assert_eq!(lazy_rows, 48);
+    }
+
+    #[test]
     fn bitset_streaming_empty_result() {
         let (_dir, engine) = create_engine();
         engine
@@ -8016,6 +8173,41 @@ mod tests {
         assert_eq!(streaming.total_hits, 0);
         assert_eq!(streaming.batches.len(), 1); // one empty batch with correct schema
         assert_eq!(streaming.batches[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn lazy_streaming_handle_empty_result_emits_single_empty_batch() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("doc-1", json!({"title": "hello", "brand": "test"}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Term(
+                [("title".into(), json!("nonexistent"))]
+                    .into_iter()
+                    .collect(),
+            ),
+            size: 100,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        let mut handle = engine
+            .sql_streaming_batch_handle(&req, &["brand".into()], false, false, 0)
+            .unwrap();
+        assert_eq!(handle.total_hits, 0);
+        assert_eq!(handle.collected_rows, 0);
+
+        let first = handle
+            .next_batch()
+            .unwrap()
+            .expect("empty result should still emit one empty batch");
+        assert_eq!(first.num_rows(), 0);
+        assert!(handle.next_batch().unwrap().is_none());
     }
 
     #[test]

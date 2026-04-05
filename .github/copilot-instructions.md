@@ -98,7 +98,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 824 unit tests + 62 CLI tests + 33 consensus integration + 40 replication integration + 35 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 995 total
+- 831 unit tests + 62 CLI tests + 33 consensus integration + 40 replication integration + 38 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 1005 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
@@ -257,6 +257,8 @@ if let Some(ref raft) = state.raft {
 | `SearchShardDsl` | Scatter DSL search to remote shards | `forward_search_dsl_to_shard()` |
 | `SqlRecordBatch` | Scatter SQL fast-field batch to remote shards (Arrow IPC) | `forward_sql_batch_to_shard()` |
 | `SqlRecordBatchStream` | Stream multiple SQL fast-field batches from a remote shard (Arrow IPC) | `forward_sql_batch_stream_to_shard()` |
+
+`SqlRecordBatchStream` now carries shard-level `total_hits`, `collected_rows`, and actual `streaming_used` metadata on every batch so streamed SQL endpoints can emit accurate NDJSON `meta` frames before draining the remaining live shard stream into DataFusion.
 
 ### Adding a new Raft-write API endpoint (checklist)
 1. Add proto messages (`<Op>Request` / `<Op>Response`) to `proto/transport.proto`

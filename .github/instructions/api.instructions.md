@@ -130,13 +130,17 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 - Helper functions: `matches_command()`, `strip_command()`, `unquote_identifier()`, `extract_index_from_sql()`
 - All commands are case-insensitive and handle optional trailing semicolons and quoted identifiers
 - Global SQL index extraction must work for quoted hyphenated names on both `POST /_sql` and `POST /_sql/stream`, including aliasless count-fast shapes like `SELECT count(*) FROM "my-index"` and `select count(*) from "my-index"`.
-- Unquoted SQL source column references must resolve case-insensitively against index mappings on both buffered and streamed SQL endpoints. Quoted identifiers and output aliases keep their exact spelling; only execution-bearing source fields are canonicalized.
+- Unquoted SQL source column references must resolve case-insensitively against index mappings on both buffered and streamed SQL endpoints. Quoted identifiers and output aliases keep their exact spelling; only execution-bearing source fields are canonicalized. When the query falls through to residual DataFusion execution, canonicalize those source identifiers by rewriting the SQL AST to quoted canonical mapping names rather than by mutating Arrow schema casing.
 
 ### SQL Endpoint Expectations
 - `POST /{index}/_sql` must remain coordinator-safe like other search endpoints.
 - `POST /{index}/_sql/stream` must keep the same coordinator-safe routing semantics as `POST /{index}/_sql`; only the HTTP response format changes.
 - `POST /{index}/_sql/explain` returns the query plan without executing it — validates SQL, shows pushdown decisions, execution strategy, rewritten SQL, and the full pipeline stages.
 - Streamed SQL responses use `application/x-ndjson` with a first `meta` frame and subsequent `rows` frames. Execution metadata (`execution_mode`, `streaming_used`, `planner`, `_shards`, `matched_hits`, `columns`, `truncated`) stays in the `meta` frame.
+- The live partition path is only for explicit-column `tantivy_fast_fields` queries. `count_star_fast`, `tantivy_grouped_partials`, and wildcard `SELECT *` queries still execute through the buffered `execute_sql_query()` path and are re-framed as NDJSON.
+- For streamed explicit-column SQL, eligible local shards should expose metadata-bearing lazy batch handles and drain them on the search pool into local `StreamingTable` partitions instead of prebuilding a local `Vec<RecordBatch>`.
+- For streamed explicit-column SQL, keep remote shard gRPC streams live into DataFusion partitions after reading the first shard response for metadata. Do not `try_collect()` remote batches just to build the `meta` frame.
+- Streamed shard SQL metadata must distinguish `total_hits` from `collected_rows` and report actual per-shard `streaming_used`, so `truncated` and `group_by_scan_limit_exceeded` remain correct before the remaining batches are drained.
 - With `"analyze": true`, `explain_sql` executes the query fully and returns the plan JSON enriched with:
     - `timings` object: `planning_ms`, `search_ms`, `collect_ms`, `merge_ms`, `datafusion_ms`, `total_ms` (fractional milliseconds)
     - `rows` and `row_count`: the actual query results

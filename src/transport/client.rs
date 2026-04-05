@@ -36,6 +36,8 @@ pub trait TlsConnector: Send + Sync {
 pub struct SqlBatchStream {
     first_batch: Option<RecordBatch>,
     total_hits: usize,
+    collected_rows: usize,
+    streaming_used: bool,
     inner: tonic::Streaming<SqlRecordBatchResponse>,
 }
 
@@ -44,27 +46,61 @@ impl SqlBatchStream {
         self.total_hits
     }
 
+    pub fn collected_rows(&self) -> usize {
+        self.collected_rows
+    }
+
+    pub fn streaming_used(&self) -> bool {
+        self.streaming_used
+    }
+
     pub fn into_stream(
         self,
     ) -> impl futures::Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static {
         futures::stream::try_unfold(
-            (self.first_batch, self.inner, self.total_hits),
-            |(first_batch, mut inner, total_hits)| async move {
+            (
+                self.first_batch,
+                self.inner,
+                self.total_hits,
+                self.collected_rows,
+                self.streaming_used,
+            ),
+            |(first_batch, mut inner, total_hits, collected_rows, streaming_used)| async move {
                 if let Some(batch) = first_batch {
-                    return Ok(Some((batch, (None, inner, total_hits))));
+                    return Ok(Some((
+                        batch,
+                        (None, inner, total_hits, collected_rows, streaming_used),
+                    )));
                 }
 
                 match inner.message().await? {
                     Some(response) => {
-                        let (batch, hits) = decode_sql_batch_response(response)?;
-                        if hits != total_hits {
+                        let decoded = decode_sql_batch_response(response)?;
+                        if decoded.total_hits != total_hits {
                             return Err(anyhow::anyhow!(
                                 "Shard SQL batch stream returned inconsistent hit counts: {} vs {}",
                                 total_hits,
-                                hits
+                                decoded.total_hits
                             ));
                         }
-                        Ok(Some((batch, (None, inner, total_hits))))
+                        if decoded.collected_rows != collected_rows {
+                            return Err(anyhow::anyhow!(
+                                "Shard SQL batch stream returned inconsistent collected row counts: {} vs {}",
+                                collected_rows,
+                                decoded.collected_rows
+                            ));
+                        }
+                        if decoded.streaming_used != streaming_used {
+                            return Err(anyhow::anyhow!(
+                                "Shard SQL batch stream returned inconsistent streaming flags: {} vs {}",
+                                streaming_used,
+                                decoded.streaming_used
+                            ));
+                        }
+                        Ok(Some((
+                            decoded.batch,
+                            (None, inner, total_hits, collected_rows, streaming_used),
+                        )))
                     }
                     None => Ok(None),
                 }
@@ -428,7 +464,8 @@ impl TransportClient {
             batch_size: 0,
         });
         let response = client.sql_record_batch(request).await?.into_inner();
-        decode_sql_batch_response(response)
+        let decoded = decode_sql_batch_response(response)?;
+        Ok((decoded.batch, decoded.total_hits))
     }
 
     /// Forward a streaming SQL RecordBatch request to a specific shard.
@@ -443,7 +480,7 @@ impl TransportClient {
         needs_id: bool,
         needs_score: bool,
         batch_size: usize,
-    ) -> Result<(Vec<RecordBatch>, usize), anyhow::Error> {
+    ) -> Result<(Vec<RecordBatch>, usize, bool), anyhow::Error> {
         let stream = self
             .open_sql_batch_stream_to_shard(
                 node,
@@ -457,8 +494,9 @@ impl TransportClient {
             )
             .await?;
         let hits = stream.total_hits();
+        let streaming_used = stream.streaming_used();
         let batches = stream.into_stream().try_collect().await?;
-        Ok((batches, hits))
+        Ok((batches, hits, streaming_used))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -489,10 +527,12 @@ impl TransportClient {
                 "Shard SQL batch stream returned no batches"
             ));
         };
-        let (first_batch, total_hits) = decode_sql_batch_response(first_response)?;
+        let decoded = decode_sql_batch_response(first_response)?;
         Ok(SqlBatchStream {
-            first_batch: Some(first_batch),
-            total_hits,
+            first_batch: Some(decoded.batch),
+            total_hits: decoded.total_hits,
+            collected_rows: decoded.collected_rows,
+            streaming_used: decoded.streaming_used,
             inner: stream,
         })
     }
@@ -781,9 +821,17 @@ impl TransportClient {
     }
 }
 
+#[derive(Debug)]
+struct DecodedSqlBatchResponse {
+    batch: RecordBatch,
+    total_hits: usize,
+    collected_rows: usize,
+    streaming_used: bool,
+}
+
 fn decode_sql_batch_response(
     response: SqlRecordBatchResponse,
-) -> Result<(RecordBatch, usize), anyhow::Error> {
+) -> Result<DecodedSqlBatchResponse, anyhow::Error> {
     if !response.success {
         return Err(anyhow::anyhow!(
             "Shard SQL batch failed: {}",
@@ -792,7 +840,12 @@ fn decode_sql_batch_response(
     }
 
     let batch = crate::hybrid::arrow_bridge::record_batch_from_ipc(&response.arrow_ipc)?;
-    Ok((batch, response.total_hits as usize))
+    Ok(DecodedSqlBatchResponse {
+        batch,
+        total_hits: response.total_hits as usize,
+        collected_rows: response.collected_rows as usize,
+        streaming_used: response.streaming_used,
+    })
 }
 
 fn decode_search_hits(hits: &[SearchHit]) -> Result<Vec<serde_json::Value>, anyhow::Error> {
@@ -854,12 +907,17 @@ mod tests {
                 .expect("encode batch"),
             total_hits: 9,
             error: String::new(),
+            collected_rows: 2,
+            streaming_used: true,
         };
 
-        let (decoded, hits) = decode_sql_batch_response(response).expect("decode batch");
-        assert_eq!(hits, 9);
-        assert_eq!(decoded.num_rows(), 2);
+        let decoded = decode_sql_batch_response(response).expect("decode batch");
+        assert_eq!(decoded.total_hits, 9);
+        assert_eq!(decoded.collected_rows, 2);
+        assert!(decoded.streaming_used);
+        assert_eq!(decoded.batch.num_rows(), 2);
         let values = decoded
+            .batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -869,14 +927,45 @@ mod tests {
     }
 
     #[test]
+    fn decode_sql_batch_response_preserves_non_stream_metadata() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![11_i64]))])
+            .expect("record batch");
+
+        let response = SqlRecordBatchResponse {
+            success: true,
+            arrow_ipc: crate::hybrid::arrow_bridge::record_batch_to_ipc(&batch)
+                .expect("encode batch"),
+            total_hits: 5,
+            error: String::new(),
+            collected_rows: 1,
+            streaming_used: false,
+        };
+
+        let decoded = decode_sql_batch_response(response).expect("decode batch");
+        assert_eq!(decoded.total_hits, 5);
+        assert_eq!(decoded.collected_rows, 1);
+        assert!(!decoded.streaming_used);
+        assert_eq!(decoded.batch.num_rows(), 1);
+    }
+
+    #[test]
     fn decode_sql_batch_response_returns_rpc_error() {
-        let err = decode_sql_batch_response(SqlRecordBatchResponse {
+        let err = match decode_sql_batch_response(SqlRecordBatchResponse {
             success: false,
             arrow_ipc: vec![],
             total_hits: 0,
             error: "boom".to_string(),
-        })
-        .expect_err("unsuccessful response should fail");
+            collected_rows: 0,
+            streaming_used: false,
+        }) {
+            Ok(_) => panic!("unsuccessful response should fail"),
+            Err(err) => err,
+        };
 
         assert!(err.to_string().contains("boom"));
     }
