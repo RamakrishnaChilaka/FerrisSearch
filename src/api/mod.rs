@@ -23,6 +23,8 @@ use axum::{
 use serde::Serialize;
 use std::sync::Arc;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Serialize)]
 struct NodeInfoResponse {
     name: String,
@@ -33,7 +35,7 @@ struct NodeInfoResponse {
 async fn handle_root() -> Json<NodeInfoResponse> {
     Json(NodeInfoResponse {
         name: "ferrissearch-node".into(),
-        version: "0.1.0".into(),
+        version: VERSION.into(),
         engine: "tantivy".into(),
     })
 }
@@ -234,6 +236,13 @@ pub fn create_router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn handle_root_uses_package_version() {
+        let Json(response) = handle_root().await;
+
+        assert_eq!(response.version, VERSION);
+    }
 
     #[test]
     fn normalize_root() {
