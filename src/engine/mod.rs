@@ -18,6 +18,30 @@ pub struct SqlBatchResult {
 pub struct SqlStreamingResult {
     pub batches: Vec<RecordBatch>,
     pub total_hits: usize,
+    pub collected_rows: usize,
+}
+
+pub struct SqlStreamingBatchHandle {
+    pub total_hits: usize,
+    pub collected_rows: usize,
+    next_batch: Box<dyn FnMut() -> Result<Option<RecordBatch>> + Send>,
+}
+
+impl SqlStreamingBatchHandle {
+    pub fn new<F>(total_hits: usize, collected_rows: usize, next_batch: F) -> Self
+    where
+        F: FnMut() -> Result<Option<RecordBatch>> + Send + 'static,
+    {
+        Self {
+            total_hits,
+            collected_rows,
+            next_batch: Box::new(next_batch),
+        }
+    }
+
+    pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        (self.next_batch)()
+    }
 }
 
 /// Trait abstracting a search engine backend.
@@ -112,15 +136,46 @@ pub trait SearchEngine: Send + Sync {
     /// collection instead of TopDocs. Collects ALL matching docs (no scan limit),
     /// produces batches of `batch_size` rows for streaming DataFusion execution.
     /// Used for GROUP BY fallback queries where the TopDocs cap would produce wrong results.
-    fn sql_streaming_batches(
+    fn sql_streaming_batch_handle(
         &self,
         _req: &crate::search::SearchRequest,
         _columns: &[String],
         _needs_id: bool,
         _needs_score: bool,
         _batch_size: usize,
-    ) -> Result<Option<SqlStreamingResult>> {
+    ) -> Result<Option<SqlStreamingBatchHandle>> {
         Ok(None)
+    }
+
+    /// Build multiple smaller RecordBatches eagerly by draining the lazy streaming
+    /// handle into memory. This keeps the old API surface for tests and buffered
+    /// compatibility paths while the streamed coordinator path consumes batches lazily.
+    fn sql_streaming_batches(
+        &self,
+        req: &crate::search::SearchRequest,
+        columns: &[String],
+        needs_id: bool,
+        needs_score: bool,
+        batch_size: usize,
+    ) -> Result<Option<SqlStreamingResult>> {
+        let Some(mut handle) =
+            self.sql_streaming_batch_handle(req, columns, needs_id, needs_score, batch_size)?
+        else {
+            return Ok(None);
+        };
+
+        let total_hits = handle.total_hits;
+        let collected_rows = handle.collected_rows;
+        let mut batches = Vec::new();
+        while let Some(batch) = handle.next_batch()? {
+            batches.push(batch);
+        }
+
+        Ok(Some(SqlStreamingResult {
+            batches,
+            total_hits,
+            collected_rows,
+        }))
     }
 
     /// k-NN vector search. Returns hits with _id, _score, _source, _knn_distance.

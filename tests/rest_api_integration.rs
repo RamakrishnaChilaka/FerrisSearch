@@ -561,6 +561,61 @@ async fn create_products_index_and_docs_named(
     index_product_docs_named(harness, index_name).await
 }
 
+async fn create_mixed_case_rides_index(harness: &RestTestHarness) -> Result<()> {
+    let (status, body) = harness
+        .put_json(
+            "/rides",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 100
+                },
+                "mappings": {
+                    "properties": {
+                        "PULocationID": { "type": "integer" },
+                        "DOLocationID": { "type": "integer" },
+                        "trip_miles": { "type": "float" }
+                    }
+                }
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["acknowledged"], json!(true));
+    Ok(())
+}
+
+async fn index_mixed_case_rides_docs(harness: &RestTestHarness) -> Result<()> {
+    for (doc_id, payload) in [
+        (
+            "1",
+            json!({"PULocationID": 101, "DOLocationID": 201, "trip_miles": 1.4}),
+        ),
+        (
+            "2",
+            json!({"PULocationID": 102, "DOLocationID": 202, "trip_miles": 2.1}),
+        ),
+        (
+            "3",
+            json!({"PULocationID": 205, "DOLocationID": 303, "trip_miles": 6.3}),
+        ),
+    ] {
+        let (status, body) = harness
+            .put_json(&format!("/rides/_doc/{}?refresh=true", doc_id), payload)
+            .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["_id"], json!(doc_id));
+    }
+    Ok(())
+}
+
+async fn create_mixed_case_rides_index_and_docs(harness: &RestTestHarness) -> Result<()> {
+    create_mixed_case_rides_index(harness).await?;
+    index_mixed_case_rides_docs(harness).await
+}
+
 async fn create_scored_products_index_and_docs(harness: &RestTestHarness) -> Result<()> {
     create_products_index(harness).await?;
 
@@ -1618,6 +1673,54 @@ async fn rest_sql_stream_endpoint_returns_ndjson_frames() -> Result<()> {
 }
 
 #[tokio::test]
+async fn rest_sql_stream_text_expression_group_by_preserves_nonstreaming_meta() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json_text(
+            "/products/_sql/stream",
+            json!({
+                "query": "SELECT LOWER(description) AS desc_lower, count(*) AS cnt FROM products WHERE text_match(description, 'iphone') GROUP BY LOWER(description) ORDER BY desc_lower ASC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let frames: Vec<Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<_, _>>()?;
+
+    assert!(!frames.is_empty(), "expected at least one NDJSON frame");
+    assert_eq!(frames[0]["type"], json!("meta"));
+    assert_eq!(frames[0]["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(frames[0]["streaming_used"], json!(false));
+
+    let rows: Vec<Value> = frames
+        .iter()
+        .skip(1)
+        .flat_map(|frame| {
+            frame["rows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .collect();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["desc_lower"], json!("iphone competitor"));
+    assert_eq!(rows[0]["cnt"], json!(1));
+    assert_eq!(rows[1]["desc_lower"], json!("iphone flagship"));
+    assert_eq!(rows[2]["desc_lower"], json!("iphone standard"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_global_sql_stream_endpoint_routes_select_queries() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     create_products_index_and_docs(&harness).await?;
@@ -1709,6 +1812,82 @@ async fn rest_global_sql_stream_accepts_case_insensitive_unquoted_columns() -> R
     assert_eq!(rows[0]["price"], json!(999.0));
     assert_eq!(rows[1]["brand"], json!("Apple"));
     assert_eq!(rows[1]["price"], json!(899.0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_residual_path_accepts_mixed_case_mapping_fields_unquoted() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_mixed_case_rides_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/rides/_sql",
+            json!({
+                "query": "SELECT CAST(PULocationID / 100 AS INT) AS bucket, COUNT(*) AS rides FROM rides GROUP BY CAST(PULocationID / 100 AS INT) ORDER BY bucket"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(body["streaming_used"], json!(true));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["bucket"], json!(1));
+    assert_eq!(rows[0]["rides"], json!(2));
+    assert_eq!(rows[1]["bucket"], json!(2));
+    assert_eq!(rows[1]["rides"], json!(1));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_stream_residual_path_preserves_quoted_mixed_case_mapping_fields() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_mixed_case_rides_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json_text(
+            "/rides/_sql/stream",
+            json!({
+                "query": "SELECT CAST(\"PULocationID\" / 100 AS INT) AS bucket, COUNT(*) AS rides FROM rides GROUP BY CAST(\"PULocationID\" / 100 AS INT) ORDER BY bucket"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let frames: Vec<Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<_, _>>()?;
+
+    assert!(!frames.is_empty(), "expected at least one NDJSON frame");
+    assert_eq!(frames[0]["type"], json!("meta"));
+    assert_eq!(frames[0]["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(frames[0]["streaming_used"], json!(true));
+
+    let rows: Vec<Value> = frames
+        .iter()
+        .skip(1)
+        .flat_map(|frame| {
+            frame["rows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .collect();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["bucket"], json!(1));
+    assert_eq!(rows[0]["rides"], json!(2));
+    assert_eq!(rows[1]["bucket"], json!(2));
+    assert_eq!(rows[1]["rides"], json!(1));
 
     Ok(())
 }

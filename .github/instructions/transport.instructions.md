@@ -70,7 +70,7 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **replicate_doc / replicate_bulk**: Apply to local replica engine using the seq_no supplied by the primary, persist that same seq_no in the replica WAL, return checkpoint
 - **recover_replica**: Read WAL entries via `read_from()`, return operations
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
-- **sql_record_batch / sql_record_batch_stream**: Execute local shard SQL fast-field reads and return Arrow IPC batches. `SqlRecordBatchStream` may emit multiple batches for the same shard; `batch_size = 0` means use the engine default.
+- **sql_record_batch / sql_record_batch_stream**: Execute local shard SQL fast-field reads and return Arrow IPC batches. `SqlRecordBatchStream` may emit multiple batches for the same shard; `batch_size = 0` means use the engine default. Stream responses must carry `total_hits`, `collected_rows`, and actual `streaming_used` metadata on every batch so the coordinator can build accurate `meta` / truncation decisions before draining the rest of the stream. The coordinator-facing live path should prefer `open_sql_batch_stream_to_shard()` so only the first response is read eagerly.
 - **raft_vote / raft_append_entries / raft_snapshot**: Deserialize JSON, forward to Raft instance
 - **create_index / delete_index**: Must be leader; execute via `raft.client_write()`
 - **update_settings**: Must be leader; apply via `UpdateIndex` Raft command
@@ -108,7 +108,8 @@ pub struct TransportClient {
 | `forward_search_to_shard()` | Scatter search to remote shard |
 | `forward_search_dsl_to_shard()` | Scatter DSL search to remote shard |
 | `forward_sql_batch_to_shard()` | Scatter SQL RecordBatch to remote shard (Arrow IPC) |
-| `forward_sql_batch_stream_to_shard()` | Stream multiple SQL RecordBatches from a remote shard (Arrow IPC) |
+| `open_sql_batch_stream_to_shard()` | Open a live remote SQL batch stream, eagerly decode only the first batch + metadata, then keep the remaining gRPC stream live for `StreamingTable` partitions |
+| `forward_sql_batch_stream_to_shard()` | Stream multiple SQL RecordBatches from a remote shard (Arrow IPC) and report whether the shard actually used streaming |
 | `get_shard_stats()` | Collect shard doc counts from remote node |
 | `forward_refresh()` | Fan out refresh to remote node |
 | `forward_flush()` | Fan out flush to remote node |
@@ -123,6 +124,11 @@ pub struct TransportClient {
 - `forward_search_to_shard()` and `forward_search_dsl_to_shard()` must fail if a remote hit payload cannot be decoded.
 - Do not use `filter_map(...ok())` on transport hits — returning partial results as success hides wire-format and compatibility bugs.
 - Partial aggregation decode failures must also return `Err(...)`, not an empty aggregation map.
+
+### Critical Invariant: Stream Metadata Must Stay Stable Across Batches
+- `SqlBatchStream` must treat `total_hits`, `collected_rows`, and `streaming_used` as shard-level invariants captured from the first response.
+- If any later `SqlRecordBatchStream` response disagrees with those first-batch values, decoding must fail instead of letting the coordinator emit a misleading NDJSON `meta` frame.
+- The server-side `SqlRecordBatchStream` path should consume `SqlStreamingBatchHandle` lazily on the search pool so remote shards do not prebuild all Arrow batches in memory before tonic starts draining them.
 
 ### gRPC Limits
 - **Max message size**: 64MB (`max_decoding_message_size` / `max_encoding_message_size`) on both client and server. Default tonic limit is 4MB, insufficient for high-cardinality GROUP BY partial results (~7MB for 200K groups).

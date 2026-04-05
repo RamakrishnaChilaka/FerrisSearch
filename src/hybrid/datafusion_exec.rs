@@ -1666,4 +1666,47 @@ mod tests {
         assert_eq!(rows[0]["name"], json!("item-0"));
         assert_eq!(rows[1]["name"], json!("item-1"));
     }
+
+    #[tokio::test]
+    async fn execute_sql_partition_streams_recovers_from_schema_drift() {
+        let drifted = make_drifted_batch(2);
+        let good = make_test_batch(3);
+        let plan = super::super::planner::plan_sql("test", "SELECT name, price FROM test").unwrap();
+        let (_, target_schema) = project_batch_to_sql_columns(&make_test_batch(1), &plan);
+
+        let make_partition = |batch: RecordBatch| {
+            let normalize_plan = plan.clone();
+            let normalize_schema = target_schema.clone();
+            let partition_schema = target_schema.clone();
+            let stream = futures::stream::iter(vec![Ok::<RecordBatch, anyhow::Error>(batch)]).map(
+                move |batch_result| match batch_result {
+                    Ok(batch) => {
+                        normalize_sql_batch_for_schema(batch, &normalize_plan, &normalize_schema)
+                            .map_err(|error| DataFusionError::Execution(error.to_string()))
+                    }
+                    Err(error) => Err(DataFusionError::Execution(error.to_string())),
+                },
+            );
+            let stream = RecordBatchStreamAdapter::new(partition_schema.clone(), stream);
+            one_shot_partition_stream(partition_schema, Box::pin(stream))
+        };
+
+        let partitions = vec![make_partition(drifted), make_partition(good)];
+        let (columns, mut stream) = execute_sql_partition_streams(&plan, target_schema, partitions)
+            .await
+            .unwrap();
+
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.unwrap());
+        }
+        let (_, rows) = record_batches_to_json_rows(&batches).unwrap();
+
+        assert_eq!(columns, vec!["name".to_string(), "price".to_string()]);
+        assert_eq!(rows.len(), 5);
+        assert!(
+            rows.iter().all(|row| row["price"].is_number()),
+            "streamed schema-drift recovery must restore numeric price type"
+        );
+    }
 }

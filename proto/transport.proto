@@ -284,6 +284,8 @@ message SqlRecordBatchResponse {
     bytes arrow_ipc = 2;     // Arrow IPC-serialized RecordBatch
     uint64 total_hits = 3;
     string error = 4;
+    uint64 collected_rows = 5;
+    bool streaming_used = 6;
 }
 
 // ─── Index Maintenance (refresh/flush fan-out) ──────────────────────────────

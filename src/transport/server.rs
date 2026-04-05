@@ -256,6 +256,8 @@ pub fn proto_to_cluster_state(
 fn sql_batch_success_response(
     batch: datafusion::arrow::record_batch::RecordBatch,
     total_hits: usize,
+    collected_rows: usize,
+    streaming_used: bool,
 ) -> anyhow::Result<SqlRecordBatchResponse> {
     let ipc_bytes = crate::hybrid::arrow_bridge::record_batch_to_ipc(&batch)
         .map_err(|e| anyhow::anyhow!("Arrow IPC encode error: {}", e))?;
@@ -264,6 +266,8 @@ fn sql_batch_success_response(
         arrow_ipc: ipc_bytes,
         total_hits: total_hits as u64,
         error: String::new(),
+        collected_rows: collected_rows as u64,
+        streaming_used,
     })
 }
 
@@ -273,6 +277,8 @@ fn sql_batch_error_response(error: impl Into<String>) -> SqlRecordBatchResponse 
         arrow_ipc: vec![],
         total_hits: 0,
         error: error.into(),
+        collected_rows: 0,
+        streaming_used: false,
     }
 }
 
@@ -905,6 +911,8 @@ impl InternalTransport for TransportService {
                     arrow_ipc: vec![],
                     total_hits: 0,
                     error: status.message().to_string(),
+                    collected_rows: 0,
+                    streaming_used: false,
                 }));
             }
         };
@@ -931,10 +939,18 @@ impl InternalTransport for TransportService {
         };
 
         match batch_result {
-            Ok(Some(batch_result)) => Ok(Response::new(
-                sql_batch_success_response(batch_result.batch, batch_result.total_hits)
+            Ok(Some(batch_result)) => {
+                let collected_rows = batch_result.batch.num_rows();
+                Ok(Response::new(
+                    sql_batch_success_response(
+                        batch_result.batch,
+                        batch_result.total_hits,
+                        collected_rows,
+                        false,
+                    )
                     .map_err(|error| Status::internal(error.to_string()))?,
-            )),
+                ))
+            }
             Ok(None) => Ok(Response::new(sql_batch_error_response(
                 "shard does not support sql_record_batch",
             ))),
@@ -946,6 +962,16 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<SqlRecordBatchRequest>,
     ) -> Result<Response<Self::SqlRecordBatchStreamStream>, Status> {
+        enum SqlStreamSource {
+            Lazy(crate::engine::SqlStreamingBatchHandle),
+            Buffered {
+                batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+                total_hits: usize,
+                collected_rows: usize,
+                streaming_used: bool,
+            },
+        }
+
         let req = request.into_inner();
         let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
             Ok(engine) => engine,
@@ -972,17 +998,27 @@ impl InternalTransport for TransportService {
             let needs_score = req.needs_score;
             self.worker_pools
                 .spawn_search(move || {
-                    match engine.sql_streaming_batches(
+                    match engine.sql_streaming_batch_handle(
                         &search_req,
                         &columns,
                         needs_id,
                         needs_score,
                         batch_size,
                     )? {
-                        Some(result) => Ok(Some((result.batches, result.total_hits))),
+                        Some(handle) => Ok(Some(SqlStreamSource::Lazy(handle))),
                         None => engine
                             .sql_record_batch(&search_req, &columns, needs_id, needs_score)
-                            .map(|opt| opt.map(|r| (vec![r.batch], r.total_hits))),
+                            .map(|opt| {
+                                opt.map(|r| {
+                                    let collected_rows = r.batch.num_rows();
+                                    SqlStreamSource::Buffered {
+                                        batches: vec![r.batch],
+                                        total_hits: r.total_hits,
+                                        collected_rows,
+                                        streaming_used: false,
+                                    }
+                                })
+                            }),
                     }
                 })
                 .await
@@ -990,16 +1026,70 @@ impl InternalTransport for TransportService {
         };
 
         // Lazily encode each batch to IPC as it is consumed by the gRPC
-        // transport, avoiding holding raw batches + IPC bytes + proto
-        // wrappers simultaneously in memory.
+        // transport. The streaming-handle path also keeps raw RecordBatches
+        // lazy on the shard instead of draining them into a Vec upfront.
         let response_stream: Self::SqlRecordBatchStreamStream = match stream_result {
-            Ok(Some((batches, total_hits))) => Box::pin(stream::unfold(
-                (batches.into_iter(), total_hits),
-                |(mut batches, total_hits)| async move {
+            Ok(Some(SqlStreamSource::Lazy(handle))) => {
+                let total_hits = handle.total_hits;
+                let collected_rows = handle.collected_rows;
+                let worker_pools = self.worker_pools.clone();
+                let handle = Arc::new(std::sync::Mutex::new(handle));
+                Box::pin(stream::try_unfold(
+                    (handle, worker_pools, total_hits, collected_rows),
+                    |(handle, worker_pools, total_hits, collected_rows)| async move {
+                        let handle_for_batch = handle.clone();
+                        let next_batch = worker_pools
+                            .clone()
+                            .spawn_search(move || {
+                                let mut handle =
+                                    handle_for_batch.lock().unwrap_or_else(|e| e.into_inner());
+                                handle.next_batch()
+                            })
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))?;
+
+                        match next_batch {
+                            Ok(Some(batch)) => {
+                                let item = sql_batch_success_response(
+                                    batch,
+                                    total_hits,
+                                    collected_rows,
+                                    true,
+                                )
+                                .map_err(|error| Status::internal(error.to_string()))?;
+                                Ok(Some((
+                                    item,
+                                    (handle, worker_pools, total_hits, collected_rows),
+                                )))
+                            }
+                            Ok(None) => Ok(None),
+                            Err(error) => Err(Status::internal(error.to_string())),
+                        }
+                    },
+                ))
+            }
+            Ok(Some(SqlStreamSource::Buffered {
+                batches,
+                total_hits,
+                collected_rows,
+                streaming_used,
+            })) => Box::pin(stream::unfold(
+                (
+                    batches.into_iter(),
+                    total_hits,
+                    collected_rows,
+                    streaming_used,
+                ),
+                |(mut batches, total_hits, collected_rows, streaming_used)| async move {
                     let batch = batches.next()?;
-                    let item = sql_batch_success_response(batch, total_hits)
-                        .map_err(|error| Status::internal(error.to_string()));
-                    Some((item, (batches, total_hits)))
+                    let item = sql_batch_success_response(
+                        batch,
+                        total_hits,
+                        collected_rows,
+                        streaming_used,
+                    )
+                    .map_err(|error| Status::internal(error.to_string()));
+                    Some((item, (batches, total_hits, collected_rows, streaming_used)))
                 },
             )),
             Ok(None) => Box::pin(stream::iter(vec![Ok(sql_batch_error_response(

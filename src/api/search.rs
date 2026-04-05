@@ -10,13 +10,21 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::join_all;
-use futures::{FutureExt, StreamExt, stream};
+use futures::{FutureExt, StreamExt, channel::mpsc, stream};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
+
+use sqlparser::ast::{
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    OrderByKind as SqlOrderByKind, Query as SqlQuery, Select as SqlSelect,
+    SelectItem as SqlSelectItem, SetExpr as SqlSetExpr, Statement as SqlStatement,
+};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 
 /// GET/POST /{index}/_count — Count documents matching a query.
 /// GET returns total doc count (match_all). POST accepts an optional query body.
@@ -510,6 +518,93 @@ struct SqlStreamMeta {
     columns: Vec<String>,
 }
 
+enum RemoteSqlPartitionResult {
+    Stream(Box<crate::transport::client::SqlBatchStream>),
+    Batch {
+        batch: RecordBatch,
+        total_hits: usize,
+    },
+}
+
+enum LocalSqlPartitionResult {
+    Stream(crate::engine::SqlStreamingBatchHandle),
+    Batch {
+        batch: RecordBatch,
+        total_hits: usize,
+    },
+}
+
+fn direct_sql_partition_from_stream<S>(
+    target_schema: Arc<datafusion::arrow::datatypes::Schema>,
+    plan: Arc<crate::hybrid::QueryPlan>,
+    batch_stream: S,
+) -> Arc<dyn datafusion::physical_plan::streaming::PartitionStream>
+where
+    S: futures::Stream<Item = Result<RecordBatch, anyhow::Error>> + Send + 'static,
+{
+    let partition_schema = target_schema.clone();
+    let normalize_schema = target_schema.clone();
+    let normalize_plan = plan.clone();
+    let stream = batch_stream.map(move |batch_result| match batch_result {
+        Ok(batch) => crate::hybrid::normalize_sql_batch_for_schema(
+            batch,
+            normalize_plan.as_ref(),
+            &normalize_schema,
+        )
+        .map_err(|error| DataFusionError::Execution(error.to_string())),
+        Err(error) => Err(DataFusionError::Execution(error.to_string())),
+    });
+    let stream = RecordBatchStreamAdapter::new(partition_schema.clone(), stream);
+    crate::hybrid::one_shot_partition_stream(partition_schema, Box::pin(stream))
+}
+
+fn direct_sql_partition_from_batches(
+    target_schema: Arc<datafusion::arrow::datatypes::Schema>,
+    plan: Arc<crate::hybrid::QueryPlan>,
+    batches: Vec<RecordBatch>,
+) -> Arc<dyn datafusion::physical_plan::streaming::PartitionStream> {
+    direct_sql_partition_from_stream(
+        target_schema,
+        plan,
+        stream::iter(batches.into_iter().map(Ok::<RecordBatch, anyhow::Error>)),
+    )
+}
+
+fn direct_sql_partition_from_local_handle(
+    target_schema: Arc<datafusion::arrow::datatypes::Schema>,
+    plan: Arc<crate::hybrid::QueryPlan>,
+    worker_pools: crate::worker::WorkerPools,
+    mut handle: crate::engine::SqlStreamingBatchHandle,
+) -> Arc<dyn datafusion::physical_plan::streaming::PartitionStream> {
+    let (tx, rx) = mpsc::unbounded::<Result<RecordBatch, anyhow::Error>>();
+
+    tokio::spawn(async move {
+        let batch_tx = tx.clone();
+        let producer = worker_pools
+            .spawn_search(move || -> anyhow::Result<()> {
+                while let Some(batch) = handle.next_batch()? {
+                    if batch_tx.unbounded_send(Ok(batch)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            })
+            .await;
+
+        match producer {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = tx.unbounded_send(Err(error));
+            }
+            Err(error) => {
+                let _ = tx.unbounded_send(Err(error));
+            }
+        }
+    });
+
+    direct_sql_partition_from_stream(target_schema, plan, rx)
+}
+
 async fn collect_direct_sql_batches(
     state: &AppState,
     index_name: &str,
@@ -626,7 +721,6 @@ async fn collect_direct_sql_batches(
                             0,
                         )
                         .await
-                        .map(|(batches, hits)| (batches, hits, true))
                 } else {
                     client
                         .forward_sql_batch_to_shard(
@@ -673,6 +767,8 @@ async fn collect_direct_sql_batches(
         collected_hits,
         streaming_used: used_streaming,
         successful_shards,
+        // This direct fast-field path is all-or-nothing today: any local or remote
+        // shard error aborts the query before we return a partial result.
         failed_shards: 0,
     })
 }
@@ -712,17 +808,22 @@ async fn collect_direct_sql_partitions(
                 async move {
                     pools
                         .spawn_search(move || {
-                            match engine.sql_streaming_batches(
+                            match engine.sql_streaming_batch_handle(
                                 &req,
                                 &columns,
                                 needs_id,
                                 needs_score,
                                 0,
                             )? {
-                                Some(result) => Ok(Some((result.batches, result.total_hits, true))),
+                                Some(result) => Ok(Some(LocalSqlPartitionResult::Stream(result))),
                                 None => engine
                                     .sql_record_batch(&req, &columns, needs_id, needs_score)
-                                    .map(|opt| opt.map(|r| (vec![r.batch], r.total_hits, false))),
+                                    .map(|opt| {
+                                        opt.map(|r| LocalSqlPartitionResult::Batch {
+                                            batch: r.batch,
+                                            total_hits: r.total_hits,
+                                        })
+                                    }),
                             }
                         })
                         .await
@@ -734,7 +835,12 @@ async fn collect_direct_sql_partitions(
                         .spawn_search(move || {
                             engine
                                 .sql_record_batch(&req, &columns, needs_id, needs_score)
-                                .map(|opt| opt.map(|r| (vec![r.batch], r.total_hits, false)))
+                                .map(|opt| {
+                                    opt.map(|r| LocalSqlPartitionResult::Batch {
+                                        batch: r.batch,
+                                        total_hits: r.total_hits,
+                                    })
+                                })
                         })
                         .await
                 }
@@ -745,37 +851,29 @@ async fn collect_direct_sql_partitions(
 
     for batch_result in join_all(local_futures).await {
         match batch_result {
-            Ok(Ok(Some((shard_batches, hits, streamed)))) => {
+            Ok(Ok(Some(LocalSqlPartitionResult::Stream(handle)))) => {
+                successful_shards += 1;
+                total_hits += handle.total_hits;
+                collected_hits += handle.collected_rows;
+                used_streaming = true;
+                partitions.push(direct_sql_partition_from_local_handle(
+                    target_schema.clone(),
+                    plan.clone(),
+                    state.worker_pools.clone(),
+                    handle,
+                ));
+            }
+            Ok(Ok(Some(LocalSqlPartitionResult::Batch {
+                batch,
+                total_hits: hits,
+            }))) => {
                 successful_shards += 1;
                 total_hits += hits;
-                collected_hits += shard_batches
-                    .iter()
-                    .map(|batch| batch.num_rows())
-                    .sum::<usize>();
-                used_streaming |= streamed;
-
-                let normalized_batches = shard_batches
-                    .into_iter()
-                    .map(|batch| {
-                        crate::hybrid::normalize_sql_batch_for_schema(
-                            batch,
-                            plan.as_ref(),
-                            &target_schema,
-                        )
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                let partition_schema = target_schema.clone();
-                let stream = RecordBatchStreamAdapter::new(
-                    partition_schema.clone(),
-                    stream::iter(
-                        normalized_batches
-                            .into_iter()
-                            .map(Ok::<RecordBatch, DataFusionError>),
-                    ),
-                );
-                partitions.push(crate::hybrid::one_shot_partition_stream(
-                    partition_schema,
-                    Box::pin(stream),
+                collected_hits += batch.num_rows();
+                partitions.push(direct_sql_partition_from_batches(
+                    target_schema.clone(),
+                    plan.clone(),
+                    vec![batch],
                 ));
             }
             Ok(Ok(None)) => {
@@ -808,7 +906,7 @@ async fn collect_direct_sql_partitions(
             remote_futures.push(tokio::spawn(async move {
                 if use_streaming {
                     client
-                        .forward_sql_batch_stream_to_shard(
+                        .open_sql_batch_stream_to_shard(
                             &node,
                             &index_name,
                             shard_id,
@@ -819,7 +917,7 @@ async fn collect_direct_sql_partitions(
                             0,
                         )
                         .await
-                        .map(|(batches, hits)| (batches, hits, true))
+                        .map(|stream| RemoteSqlPartitionResult::Stream(Box::new(stream)))
                 } else {
                     client
                         .forward_sql_batch_to_shard(
@@ -832,7 +930,10 @@ async fn collect_direct_sql_partitions(
                             needs_score,
                         )
                         .await
-                        .map(|(batch, hits)| (vec![batch], hits, false))
+                        .map(|(batch, hits)| RemoteSqlPartitionResult::Batch {
+                            batch,
+                            total_hits: hits,
+                        })
                 }
             }));
         }
@@ -840,39 +941,28 @@ async fn collect_direct_sql_partitions(
 
     for result in join_all(remote_futures).await {
         match result {
-            Ok(Ok((shard_batches, hits, streamed))) => {
+            Ok(Ok(RemoteSqlPartitionResult::Stream(shard_stream))) => {
+                successful_shards += 1;
+                total_hits += shard_stream.total_hits();
+                collected_hits += shard_stream.collected_rows();
+                used_streaming |= shard_stream.streaming_used();
+                partitions.push(direct_sql_partition_from_stream(
+                    target_schema.clone(),
+                    plan.clone(),
+                    shard_stream.into_stream(),
+                ));
+            }
+            Ok(Ok(RemoteSqlPartitionResult::Batch {
+                batch,
+                total_hits: hits,
+            })) => {
                 successful_shards += 1;
                 total_hits += hits;
-                collected_hits += shard_batches
-                    .iter()
-                    .map(|batch| batch.num_rows())
-                    .sum::<usize>();
-                if streamed {
-                    used_streaming = true;
-                }
-
-                let normalized_batches = shard_batches
-                    .into_iter()
-                    .map(|batch| {
-                        crate::hybrid::normalize_sql_batch_for_schema(
-                            batch,
-                            plan.as_ref(),
-                            &target_schema,
-                        )
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                let partition_schema = target_schema.clone();
-                let stream = RecordBatchStreamAdapter::new(
-                    partition_schema.clone(),
-                    stream::iter(
-                        normalized_batches
-                            .into_iter()
-                            .map(Ok::<RecordBatch, DataFusionError>),
-                    ),
-                );
-                partitions.push(crate::hybrid::one_shot_partition_stream(
-                    partition_schema,
-                    Box::pin(stream),
+                collected_hits += batch.num_rows();
+                partitions.push(direct_sql_partition_from_batches(
+                    target_schema.clone(),
+                    plan.clone(),
+                    vec![batch],
                 ));
             }
             Ok(Err(error)) => return Err(error),
@@ -889,6 +979,8 @@ async fn collect_direct_sql_partitions(
         collected_hits,
         streaming_used: used_streaming,
         successful_shards,
+        // This direct fast-field path is all-or-nothing today: any local or remote
+        // shard error aborts the query before we return a partial result.
         failed_shards: 0,
     })
 }
@@ -1147,7 +1239,355 @@ fn canonicalize_sql_plan_fields(
             canonicalize_sql_plan_fields(semijoin.inner_plan.as_ref().clone(), mappings)?;
     }
 
+    plan.rewritten_sql = canonicalize_rewritten_sql_source_fields(&plan.rewritten_sql, mappings)?;
+
     Ok(plan)
+}
+
+#[derive(Default)]
+struct SqlAliasContext {
+    aliases: HashSet<String>,
+    identity_source_aliases: HashSet<String>,
+}
+
+impl SqlAliasContext {
+    fn blocks_source_name(&self, name: &str) -> bool {
+        let folded = name.to_ascii_lowercase();
+        self.aliases.contains(&folded) && !self.identity_source_aliases.contains(&folded)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SqlExprRewriteMode {
+    SourceOnly,
+    OutputAware,
+}
+
+fn canonicalize_rewritten_sql_source_fields(
+    sql: &str,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, sql).map_err(|error| {
+        crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "planning_exception",
+            format!("Failed to parse rewritten SQL for execution: {}", error),
+        )
+    })?;
+
+    if statements.len() != 1 {
+        return Err(crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "planning_exception",
+            format!(
+                "Expected one rewritten SQL statement, got {}",
+                statements.len()
+            ),
+        ));
+    }
+
+    match statements.first_mut() {
+        Some(SqlStatement::Query(query)) => {
+            canonicalize_query_source_fields(query, mappings)?;
+        }
+        _ => {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "planning_exception",
+                "Rewritten SQL is not a simple SELECT query",
+            ));
+        }
+    }
+
+    Ok(statements.remove(0).to_string())
+}
+
+fn canonicalize_query_source_fields(
+    query: &mut SqlQuery,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let alias_ctx = match query.body.as_ref() {
+        SqlSetExpr::Select(select) => collect_sql_alias_context(select),
+        _ => {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "planning_exception",
+                "Rewritten SQL contains an unsupported query shape",
+            ));
+        }
+    };
+
+    match query.body.as_mut() {
+        SqlSetExpr::Select(select) => {
+            canonicalize_select_source_fields(select, mappings, &alias_ctx)?
+        }
+        _ => unreachable!("query shape checked above"),
+    }
+
+    if let Some(order_by) = &mut query.order_by
+        && let SqlOrderByKind::Expressions(order_by_exprs) = &mut order_by.kind
+    {
+        for order_by_expr in order_by_exprs {
+            canonicalize_sql_expr_source_fields(
+                &mut order_by_expr.expr,
+                mappings,
+                &alias_ctx,
+                SqlExprRewriteMode::OutputAware,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn canonicalize_select_source_fields(
+    select: &mut SqlSelect,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    alias_ctx: &SqlAliasContext,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    for projection_item in &mut select.projection {
+        match projection_item {
+            SqlSelectItem::UnnamedExpr(expr) | SqlSelectItem::ExprWithAlias { expr, .. } => {
+                canonicalize_sql_expr_source_fields(
+                    expr,
+                    mappings,
+                    alias_ctx,
+                    SqlExprRewriteMode::SourceOnly,
+                )?;
+            }
+            SqlSelectItem::Wildcard(_) | SqlSelectItem::QualifiedWildcard(_, _) => {}
+        }
+    }
+
+    if let Some(selection) = &mut select.selection {
+        canonicalize_sql_expr_source_fields(
+            selection,
+            mappings,
+            alias_ctx,
+            SqlExprRewriteMode::SourceOnly,
+        )?;
+    }
+
+    if let Some(having) = &mut select.having {
+        canonicalize_sql_expr_source_fields(
+            having,
+            mappings,
+            alias_ctx,
+            SqlExprRewriteMode::OutputAware,
+        )?;
+    }
+
+    if let GroupByExpr::Expressions(group_by_exprs, _) = &mut select.group_by {
+        for expr in group_by_exprs {
+            canonicalize_sql_expr_source_fields(
+                expr,
+                mappings,
+                alias_ctx,
+                SqlExprRewriteMode::OutputAware,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_sql_alias_context(select: &SqlSelect) -> SqlAliasContext {
+    let mut alias_ctx = SqlAliasContext::default();
+
+    for projection_item in &select.projection {
+        if let SqlSelectItem::ExprWithAlias { expr, alias } = projection_item {
+            let alias_folded = alias.value.to_ascii_lowercase();
+            if let Some(source_name) = sql_expr_source_name(expr)
+                && source_name.eq_ignore_ascii_case(&alias.value)
+            {
+                alias_ctx
+                    .identity_source_aliases
+                    .insert(alias_folded.clone());
+            }
+            alias_ctx.aliases.insert(alias_folded);
+        }
+    }
+
+    alias_ctx
+}
+
+fn sql_expr_source_name(expr: &SqlExpr) -> Option<&str> {
+    match expr {
+        SqlExpr::Identifier(ident) => Some(ident.value.as_str()),
+        SqlExpr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
+        _ => None,
+    }
+}
+
+fn canonicalize_sql_expr_source_fields(
+    expr: &mut SqlExpr,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    alias_ctx: &SqlAliasContext,
+    mode: SqlExprRewriteMode,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    match expr {
+        SqlExpr::Identifier(ident) => {
+            canonicalize_sql_ident(ident, mappings, alias_ctx, mode)?;
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            if let Some(last_ident) = parts.last_mut() {
+                canonicalize_sql_ident(
+                    last_ident,
+                    mappings,
+                    alias_ctx,
+                    SqlExprRewriteMode::SourceOnly,
+                )?;
+            }
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            canonicalize_sql_expr_source_fields(left, mappings, alias_ctx, mode)?;
+            canonicalize_sql_expr_source_fields(right, mappings, alias_ctx, mode)?;
+        }
+        SqlExpr::UnaryOp { expr: inner, .. }
+        | SqlExpr::Nested(inner)
+        | SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::Cast { expr: inner, .. } => {
+            canonicalize_sql_expr_source_fields(inner, mappings, alias_ctx, mode)?;
+        }
+        SqlExpr::Between {
+            expr: between_expr,
+            low,
+            high,
+            ..
+        } => {
+            canonicalize_sql_expr_source_fields(between_expr, mappings, alias_ctx, mode)?;
+            canonicalize_sql_expr_source_fields(low, mappings, alias_ctx, mode)?;
+            canonicalize_sql_expr_source_fields(high, mappings, alias_ctx, mode)?;
+        }
+        SqlExpr::InList {
+            expr: list_expr,
+            list,
+            ..
+        } => {
+            canonicalize_sql_expr_source_fields(list_expr, mappings, alias_ctx, mode)?;
+            for item in list {
+                canonicalize_sql_expr_source_fields(item, mappings, alias_ctx, mode)?;
+            }
+        }
+        SqlExpr::Function(function) => {
+            let next_mode = if sql_function_is_aggregate(function.name.to_string().as_str()) {
+                SqlExprRewriteMode::SourceOnly
+            } else {
+                mode
+            };
+            if let FunctionArguments::List(list) = &mut function.args {
+                for arg in &mut list.args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(inner),
+                            ..
+                        }
+                        | FunctionArg::ExprNamed {
+                            arg: FunctionArgExpr::Expr(inner),
+                            ..
+                        } => {
+                            canonicalize_sql_expr_source_fields(
+                                inner, mappings, alias_ctx, next_mode,
+                            )?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                canonicalize_sql_expr_source_fields(operand, mappings, alias_ctx, mode)?;
+            }
+            for case_when in conditions {
+                canonicalize_sql_expr_source_fields(
+                    &mut case_when.condition,
+                    mappings,
+                    alias_ctx,
+                    mode,
+                )?;
+                canonicalize_sql_expr_source_fields(
+                    &mut case_when.result,
+                    mappings,
+                    alias_ctx,
+                    mode,
+                )?;
+            }
+            if let Some(else_result) = else_result {
+                canonicalize_sql_expr_source_fields(else_result, mappings, alias_ctx, mode)?;
+            }
+        }
+        SqlExpr::Like {
+            expr: like_expr,
+            pattern,
+            ..
+        }
+        | SqlExpr::ILike {
+            expr: like_expr,
+            pattern,
+            ..
+        } => {
+            canonicalize_sql_expr_source_fields(like_expr, mappings, alias_ctx, mode)?;
+            canonicalize_sql_expr_source_fields(pattern, mappings, alias_ctx, mode)?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn canonicalize_sql_ident(
+    ident: &mut sqlparser::ast::Ident,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    alias_ctx: &SqlAliasContext,
+    mode: SqlExprRewriteMode,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if ident.quote_style.is_some() || matches!(ident.value.as_str(), "_id" | "_score") {
+        return Ok(());
+    }
+
+    if matches!(mode, SqlExprRewriteMode::OutputAware) && alias_ctx.blocks_source_name(&ident.value)
+    {
+        return Ok(());
+    }
+
+    if let Some(canonical) = resolve_case_insensitive_mapping_name(&ident.value, mappings)?
+        && canonical != ident.value
+    {
+        ident.value = canonical;
+        ident.quote_style = Some('"');
+    } else if mappings.contains_key(&ident.value) {
+        ident.quote_style = Some('"');
+    }
+
+    Ok(())
+}
+
+fn sql_function_is_aggregate(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "stddev"
+            | "stddev_pop"
+            | "stddev_samp"
+            | "variance"
+            | "var_pop"
+            | "var_samp"
+            | "value_count"
+            | "any_value"
+    )
 }
 
 async fn resolve_semijoin_keys(
@@ -2199,10 +2639,25 @@ mod tests {
         ShardRoutingEntry,
     };
     use axum::extract::{Path, State};
+    use datafusion::arrow::array::{Float32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::prelude::SessionContext;
+    use futures::StreamExt;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    struct DropSignal(Option<std::sync::mpsc::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
 
     fn sorted_remote_targets(
         cluster_state: &ClusterState,
@@ -2750,6 +3205,134 @@ mod tests {
         assert_eq!(grouped_sql.group_columns[0].source_name, "brand");
         assert_eq!(grouped_sql.group_columns[0].output_name, "brand");
         assert_eq!(grouped_sql.metrics[0].field.as_deref(), Some("price"));
+        assert!(plan.rewritten_sql.contains("AVG(\"price\")"));
+        assert!(plan.rewritten_sql.contains("GROUP BY \"brand\""));
+        assert!(plan.rewritten_sql.contains("ORDER BY avg_price DESC"));
+    }
+
+    #[tokio::test]
+    async fn canonicalize_sql_plan_fields_quotes_mixed_case_source_identifiers_for_datafusion() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let mappings = HashMap::from([
+            (
+                "PULocationID".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Integer,
+                    dimension: None,
+                },
+            ),
+            (
+                "DOLocationID".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Integer,
+                    dimension: None,
+                },
+            ),
+        ]);
+
+        let plan = crate::hybrid::planner::plan_sql(
+            "rides",
+            "SELECT CAST(PULocationID / 100 AS INT) AS bucket, COUNT(*) AS rides FROM rides GROUP BY CAST(PULocationID / 100 AS INT) HAVING COUNT(*) > 0 ORDER BY bucket",
+        )
+        .unwrap();
+
+        let plan = super::canonicalize_sql_plan_fields(plan, &mappings).unwrap();
+
+        assert!(
+            plan.rewritten_sql
+                .contains("CAST(\"PULocationID\" / 100 AS INT)")
+        );
+        assert!(plan.rewritten_sql.contains("HAVING COUNT(*) > 0"));
+        assert!(plan.rewritten_sql.contains("ORDER BY bucket"));
+    }
+
+    #[tokio::test]
+    async fn canonicalize_sql_plan_fields_preserves_quoted_mixed_case_identifiers() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let mappings = HashMap::from([(
+            "PULocationID".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        )]);
+
+        let plan = crate::hybrid::planner::plan_sql(
+            "rides",
+            "SELECT \"PULocationID\" FROM rides ORDER BY \"PULocationID\"",
+        )
+        .unwrap();
+
+        let plan = super::canonicalize_sql_plan_fields(plan, &mappings).unwrap();
+
+        assert!(plan.rewritten_sql.contains("\"PULocationID\""));
+        assert!(!plan.rewritten_sql.contains("\"pulocationid\""));
+    }
+
+    #[tokio::test]
+    async fn direct_sql_partition_from_local_handle_stops_after_consumer_drop() {
+        let plan =
+            Arc::new(crate::hybrid::planner::plan_sql("test", "SELECT brand FROM test").unwrap());
+        let target_schema = Arc::new(Schema::new(vec![Field::new("brand", DataType::Utf8, true)]));
+        let worker_pools = crate::worker::WorkerPools::new(1, 1);
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let handle = crate::engine::SqlStreamingBatchHandle::new(100, 100, {
+            let batch_calls = batch_calls.clone();
+            let drop_signal = DropSignal(Some(done_tx));
+            move || {
+                let _keep_drop_signal_alive = &drop_signal;
+                let batch_no = batch_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if batch_no > 100 {
+                    return Ok(None);
+                }
+
+                if batch_no > 1 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("_id", DataType::Utf8, false),
+                        Field::new("_score", DataType::Float32, false),
+                        Field::new("brand", DataType::Utf8, true),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec![format!("id-{batch_no}")])),
+                        Arc::new(Float32Array::from(vec![0.0f32])),
+                        Arc::new(StringArray::from(vec![format!("brand-{batch_no}")])),
+                    ],
+                )?;
+                Ok(Some(batch))
+            }
+        });
+
+        let partition = super::direct_sql_partition_from_local_handle(
+            target_schema,
+            plan,
+            worker_pools,
+            handle,
+        );
+
+        let mut stream = partition.execute(SessionContext::new().task_ctx());
+        let first_batch = stream
+            .next()
+            .await
+            .expect("stream should yield first batch")
+            .expect("first batch should be valid");
+        assert_eq!(first_batch.num_rows(), 1);
+        drop(stream);
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer should stop after consumer drop");
+        assert!(
+            batch_calls.load(Ordering::SeqCst) <= 2,
+            "producer should stop shortly after the receiver drops"
+        );
     }
 
     #[tokio::test]
