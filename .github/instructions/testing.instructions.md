@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **831 unit tests** (`cargo test --lib`)
+- **832 unit tests** (`cargo test --lib`)
 - **62 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **40 replication integration tests** (`cargo test --test replication_integration`)
 - **38 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 170 assertions across 4 files
-- **1005 total** (`cargo test`)
+- **1006 total** (`cargo test`)
 
 ## Running Tests
 ```bash

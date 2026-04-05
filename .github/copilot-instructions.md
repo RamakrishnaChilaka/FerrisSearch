@@ -98,7 +98,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 831 unit tests + 62 CLI tests + 33 consensus integration + 40 replication integration + 38 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 1005 total
+- 832 unit tests + 62 CLI tests + 33 consensus integration + 40 replication integration + 38 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 1006 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
@@ -706,7 +706,7 @@ When creating new hybrid-search modules, add explicit comments like these near t
 ### Copilot Review Standard
 Generated code is acceptable only if it preserves the invariants above and avoids unnecessary copying. Prefer slices, iterators, builders, and cache-friendly access patterns over collecting intermediate vectors unless materialization is required by the API boundary.
 
-## Vector Search Plan (0.1.0)
+## Vector Search Plan
 Uses USearch (C++ with Rust bindings) for HNSW-based approximate nearest neighbor search.
 
 Architecture per shard:

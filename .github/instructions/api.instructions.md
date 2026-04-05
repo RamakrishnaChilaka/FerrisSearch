@@ -71,6 +71,8 @@ pub fn error_response(
 | GET | `/_cat/indices` | `cat_indices()` | Index listing (health, shards, docs) |
 | GET | `/_cat/master` | `cat_master()` | Current master node |
 
+`handle_root()` must source its `version` field from `env!("CARGO_PKG_VERSION")` so the root REST response stays in sync with `Cargo.toml` during releases.
+
 ### Shard Display State
 The `_cat/shards` endpoint shows three possible shard states:
 - **`STARTED`**: The shard engine is open and serving docs.
