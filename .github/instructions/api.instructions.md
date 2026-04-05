@@ -129,6 +129,8 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
     - `SELECT ... FROM "index" ...` — auto-extracts index name from the FROM clause and routes to `execute_sql_query()`
 - Helper functions: `matches_command()`, `strip_command()`, `unquote_identifier()`, `extract_index_from_sql()`
 - All commands are case-insensitive and handle optional trailing semicolons and quoted identifiers
+- Global SQL index extraction must work for quoted hyphenated names on both `POST /_sql` and `POST /_sql/stream`, including aliasless count-fast shapes like `SELECT count(*) FROM "my-index"` and `select count(*) from "my-index"`.
+- Unquoted SQL source column references must resolve case-insensitively against index mappings on both buffered and streamed SQL endpoints. Quoted identifiers and output aliases keep their exact spelling; only execution-bearing source fields are canonicalized.
 
 ### SQL Endpoint Expectations
 - `POST /{index}/_sql` must remain coordinator-safe like other search endpoints.

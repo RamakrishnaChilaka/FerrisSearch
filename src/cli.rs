@@ -773,10 +773,21 @@ fn strip_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
     }
 }
 
+fn object_name_to_string(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    ferrissearch::common::sql_parse::object_name_to_string(name)
+}
+
+fn extract_table_for_explain_fallback(sql: &str) -> Option<String> {
+    ferrissearch::common::sql_parse::extract_index_from_sql_fallback(sql)
+}
+
 /// Try to extract the table name from a SELECT query for the EXPLAIN endpoint.
 fn extract_table_for_explain(sql: &str) -> Option<String> {
     let dialect = GenericDialect {};
-    let mut statements = SqlParser::parse_sql(&dialect, sql).ok()?;
+    let mut statements = match SqlParser::parse_sql(&dialect, sql) {
+        Ok(statements) => statements,
+        Err(_) => return extract_table_for_explain_fallback(sql),
+    };
     if statements.len() != 1 {
         return None;
     }
@@ -794,13 +805,7 @@ fn extract_table_for_explain(sql: &str) -> Option<String> {
 
     match &select.from[0].relation {
         sqlparser::ast::TableFactor::Table { name, .. } => {
-            if name.0.len() != 1 {
-                return None;
-            }
-            match &name.0[0] {
-                sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-                _ => None,
-            }
+            object_name_to_string(name).or_else(|| extract_table_for_explain_fallback(sql))
         }
         _ => None,
     }
@@ -1463,6 +1468,18 @@ mod tests {
         assert_eq!(
             extract_table_for_explain("SELECT count(*) FROM hackernews"),
             Some("hackernews".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_quoted_hyphenated_count_star_is_case_insensitive() {
+        assert_eq!(
+            extract_table_for_explain(r#"SELECT count(*) FROM "benchmark-1gb""#),
+            Some("benchmark-1gb".to_string())
+        );
+        assert_eq!(
+            extract_table_for_explain(r#"SELECT count(*) from "benchmark-1gb""#),
+            Some("benchmark-1gb".to_string())
         );
     }
 

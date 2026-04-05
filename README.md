@@ -130,6 +130,10 @@ cargo build --release --bin ferris-cli
 
 `ferris-cli` now reads the global `POST /_sql/stream` endpoint and reconstructs the normal table view from streamed `meta` and `rows` NDJSON frames. For explicit-column fast-field queries, the coordinator now feeds remote shard batches into DataFusion through streaming partitions instead of first staging them in a coordinator `MemTable`.
 
+Quoted hyphenated index names work through the global SQL endpoints and the CLI regardless of SQL keyword casing, so both `SELECT count(*) FROM "nyc-taxis"` and `select count(*) from "nyc-taxis"` route to the same index.
+
+Unquoted SQL source columns are resolved case-insensitively against index mappings on both buffered and streamed SQL endpoints, so `SELECT PRICE FROM products` and `select price from products` target the same field unless the mapping itself contains an ambiguous case-only collision.
+
 ### Load 4M Hacker News stories
 
 ```bash
@@ -489,14 +493,14 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 972 tests
-cargo test --lib                                # Unit tests (807)
-cargo test --bin ferris-cli                      # CLI tests (61)
+cargo test                                      # All 995 tests
+cargo test --lib                                # Unit tests (824)
+cargo test --bin ferris-cli                      # CLI tests (62)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (40)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (30)
-cargo test --test sql_correctness                # SQL correctness (1 test, 166 sqllogictest assertions)
+cargo test --test rest_api_integration           # REST API (35)
+cargo test --test sql_correctness                # SQL correctness (1 test, 170 sqllogictest assertions)
 ```
 
 Integration tests run in-process with isolated temp directories. No external services needed.

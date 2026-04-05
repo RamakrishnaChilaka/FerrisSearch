@@ -487,9 +487,13 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
 }
 
 async fn create_products_index(harness: &RestTestHarness) -> Result<()> {
+    create_products_index_named(harness, "products").await
+}
+
+async fn create_products_index_named(harness: &RestTestHarness, index_name: &str) -> Result<()> {
     let (status, body) = harness
         .put_json(
-            "/products",
+            &format!("/{index_name}"),
             json!({
                 "settings": {
                     "number_of_shards": 1,
@@ -514,6 +518,10 @@ async fn create_products_index(harness: &RestTestHarness) -> Result<()> {
 }
 
 async fn index_product_docs(harness: &RestTestHarness) -> Result<()> {
+    index_product_docs_named(harness, "products").await
+}
+
+async fn index_product_docs_named(harness: &RestTestHarness, index_name: &str) -> Result<()> {
     for (doc_id, payload) in [
         (
             "1",
@@ -529,7 +537,10 @@ async fn index_product_docs(harness: &RestTestHarness) -> Result<()> {
         ),
     ] {
         let (status, body) = harness
-            .put_json(&format!("/products/_doc/{}?refresh=true", doc_id), payload)
+            .put_json(
+                &format!("/{index_name}/_doc/{}?refresh=true", doc_id),
+                payload,
+            )
             .await?;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body["_id"], json!(doc_id));
@@ -540,6 +551,14 @@ async fn index_product_docs(harness: &RestTestHarness) -> Result<()> {
 async fn create_products_index_and_docs(harness: &RestTestHarness) -> Result<()> {
     create_products_index(harness).await?;
     index_product_docs(harness).await
+}
+
+async fn create_products_index_and_docs_named(
+    harness: &RestTestHarness,
+    index_name: &str,
+) -> Result<()> {
+    create_products_index_named(harness, index_name).await?;
+    index_product_docs_named(harness, index_name).await
 }
 
 async fn create_scored_products_index_and_docs(harness: &RestTestHarness) -> Result<()> {
@@ -1023,6 +1042,88 @@ async fn rest_sql_fast_field_path_returns_correct_ids_and_values() -> Result<()>
     // Verify brand values are present and correct
     let brands: Vec<&str> = rows.iter().filter_map(|r| r["brand"].as_str()).collect();
     assert_eq!(brands.len(), 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_grouped_partials_accepts_case_insensitive_unquoted_columns() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT BRAND AS brand, AVG(PRICE) AS avg_price FROM products WHERE text_match(DESCRIPTION, 'iphone') AND PRICE > 700 GROUP BY BRAND ORDER BY avg_price DESC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_grouped_partials"));
+    assert_eq!(body["planner"]["group_by_columns"], json!(["brand"]));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["brand"], json!("Apple"));
+    assert_eq!(rows[0]["avg_price"], json!(949.0));
+    assert_eq!(rows[1]["brand"], json!("Samsung"));
+    assert_eq!(rows[1]["avg_price"], json!(799.0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_fast_fields_accepts_case_insensitive_unquoted_columns_with_limit() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    // This exercises the tantivy_fast_fields path (no GROUP BY) with uppercase
+    // source columns. The LIMIT workaround in project_batch_to_sql_columns must
+    // match canonicalized column names case-insensitively.
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql",
+            json!({
+                "query": "SELECT BRAND AS brand, PRICE AS price FROM products WHERE text_match(DESCRIPTION, 'iphone') ORDER BY PRICE DESC LIMIT 2"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+
+    let rows = body["rows"].as_array().expect("rows should be array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["brand"], json!("Apple"));
+    assert_eq!(rows[0]["price"], json!(999.0));
+    assert_eq!(rows[1]["brand"], json!("Apple"));
+    assert_eq!(rows[1]["price"], json!(899.0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_explain_plan_only_shows_canonicalized_fields() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json(
+            "/products/_sql/explain",
+            json!({
+                "query": "SELECT BRAND, PRICE FROM products WHERE text_match(DESCRIPTION, 'iphone')"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    // Plan-only EXPLAIN should show canonicalized field names
+    let pipeline = body["pipeline"].as_array().expect("pipeline");
+    let search_stage = &pipeline[0];
+    let text_match = &search_stage["text_match"];
+    assert_eq!(text_match["field"], json!("description"));
 
     Ok(())
 }
@@ -1561,6 +1662,100 @@ async fn rest_global_sql_stream_endpoint_routes_select_queries() -> Result<()> {
     assert_eq!(rows[1]["price"], json!(899.0));
     assert_eq!(rows[2]["brand"], json!("Samsung"));
     assert_eq!(rows[2]["price"], json!(799.0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_global_sql_stream_accepts_case_insensitive_unquoted_columns() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json_text(
+            "/_sql/stream",
+            json!({
+                "query": "SELECT BRAND AS brand, PRICE AS price FROM \"products\" WHERE text_match(DESCRIPTION, 'iphone') AND PRICE > 800 ORDER BY PRICE DESC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let frames: Vec<Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<_, _>>()?;
+
+    assert!(!frames.is_empty(), "expected at least one NDJSON frame");
+    assert_eq!(frames[0]["type"], json!("meta"));
+    assert_eq!(frames[0]["execution_mode"], json!("tantivy_fast_fields"));
+
+    let rows: Vec<Value> = frames
+        .iter()
+        .skip(1)
+        .flat_map(|frame| {
+            frame["rows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .collect();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["brand"], json!("Apple"));
+    assert_eq!(rows[0]["price"], json!(999.0));
+    assert_eq!(rows[1]["brand"], json!("Apple"));
+    assert_eq!(rows[1]["price"], json!(899.0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_global_sql_stream_count_star_handles_quoted_hyphenated_indices_case_insensitively()
+-> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs_named(&harness, "product-catalog").await?;
+
+    for query in [
+        r#"SELECT count(*) FROM "product-catalog""#,
+        r#"SELECT count(*) from "product-catalog""#,
+    ] {
+        let (status, body) = harness
+            .post_json_text("/_sql/stream", json!({ "query": query }))
+            .await?;
+
+        assert_eq!(status, StatusCode::OK, "query should succeed: {query}");
+
+        let frames: Vec<Value> = body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<_, _>>()?;
+
+        assert!(!frames.is_empty(), "expected at least one NDJSON frame");
+        assert_eq!(frames[0]["type"], json!("meta"));
+        assert_eq!(frames[0]["execution_mode"], json!("count_star_fast"));
+
+        let rows: Vec<Value> = frames
+            .iter()
+            .skip(1)
+            .flat_map(|frame| {
+                frame["rows"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+            })
+            .collect();
+
+        assert_eq!(rows.len(), 1, "count(*) should return exactly one row");
+        let row = rows[0].as_object().expect("count row should be an object");
+        assert_eq!(row.len(), 1, "count(*) row should have a single column");
+        assert_eq!(row.values().next(), Some(&json!(3)));
+    }
 
     Ok(())
 }

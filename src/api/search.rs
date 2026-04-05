@@ -416,12 +416,17 @@ pub async fn explain_sql(
     }
 
     if !req.analyze {
-        // Plan-only mode: parse and return the plan without executing
+        // Plan-only mode: parse, canonicalize field names, and return the plan
         let plan = match crate::hybrid::planner::plan_sql(&index_name, &req.query) {
             Ok(plan) => plan,
             Err(e) => {
                 return crate::api::error_response(StatusCode::BAD_REQUEST, "parsing_exception", e);
             }
+        };
+        let mappings = &cluster_state.indices.get(&index_name).unwrap().mappings;
+        let plan = match canonicalize_sql_plan_fields(plan, mappings) {
+            Ok(plan) => plan,
+            Err(err) => return err,
         };
         return (StatusCode::OK, Json(plan.to_explain_json()));
     }
@@ -993,6 +998,158 @@ fn collect_semijoin_key(
     Ok(())
 }
 
+fn resolve_case_insensitive_mapping_name(
+    field_name: &str,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<Option<String>, (StatusCode, Json<Value>)> {
+    if matches!(field_name, "_id" | "_score") || mappings.contains_key(field_name) {
+        return Ok(Some(field_name.to_string()));
+    }
+
+    let matches: Vec<&String> = mappings
+        .keys()
+        .filter(|candidate| candidate.eq_ignore_ascii_case(field_name))
+        .collect();
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some((*only).clone())),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|candidate| candidate.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "ambiguous_column_reference_exception",
+                format!(
+                    "Unquoted SQL column [{}] is ambiguous. Quote the exact field name. Candidates: {}",
+                    field_name, candidates
+                ),
+            ))
+        }
+    }
+}
+
+fn canonicalize_sql_source_field_name(
+    field_name: &str,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    Ok(resolve_case_insensitive_mapping_name(field_name, mappings)?
+        .unwrap_or_else(|| field_name.to_string()))
+}
+
+fn canonicalize_query_field_map<T>(
+    fields: &mut HashMap<String, T>,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+
+    let old_fields = std::mem::take(fields);
+    let mut canonical_fields = HashMap::with_capacity(old_fields.len());
+    for (field_name, value) in old_fields {
+        canonical_fields.insert(
+            canonicalize_sql_source_field_name(&field_name, mappings)?,
+            value,
+        );
+    }
+    *fields = canonical_fields;
+    Ok(())
+}
+
+fn canonicalize_query_clause_fields(
+    clause: &mut crate::search::QueryClause,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    match clause {
+        crate::search::QueryClause::Term(fields)
+        | crate::search::QueryClause::Match(fields)
+        | crate::search::QueryClause::Wildcard(fields)
+        | crate::search::QueryClause::Prefix(fields) => {
+            canonicalize_query_field_map(fields, mappings)
+        }
+        crate::search::QueryClause::Range(fields) => canonicalize_query_field_map(fields, mappings),
+        crate::search::QueryClause::Fuzzy(fields) => canonicalize_query_field_map(fields, mappings),
+        crate::search::QueryClause::Bool(bool_query) => {
+            for nested in &mut bool_query.must {
+                canonicalize_query_clause_fields(nested, mappings)?;
+            }
+            for nested in &mut bool_query.should {
+                canonicalize_query_clause_fields(nested, mappings)?;
+            }
+            for nested in &mut bool_query.must_not {
+                canonicalize_query_clause_fields(nested, mappings)?;
+            }
+            for nested in &mut bool_query.filter {
+                canonicalize_query_clause_fields(nested, mappings)?;
+            }
+            Ok(())
+        }
+        crate::search::QueryClause::MatchAll(_) | crate::search::QueryClause::MatchNone(_) => {
+            Ok(())
+        }
+    }
+}
+
+fn canonicalize_sql_field_list(
+    fields: &mut Vec<String>,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let mut canonical_fields = Vec::with_capacity(fields.len());
+    let mut seen = HashSet::with_capacity(fields.len());
+    for field_name in fields.drain(..) {
+        let canonical = canonicalize_sql_source_field_name(&field_name, mappings)?;
+        if seen.insert(canonical.clone()) {
+            canonical_fields.push(canonical);
+        }
+    }
+    *fields = canonical_fields;
+    Ok(())
+}
+
+fn canonicalize_sql_plan_fields(
+    mut plan: crate::hybrid::QueryPlan,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<crate::hybrid::QueryPlan, (StatusCode, Json<Value>)> {
+    for text_match in &mut plan.text_matches {
+        text_match.field = canonicalize_sql_source_field_name(&text_match.field, mappings)?;
+    }
+
+    for filter in &mut plan.pushed_filters {
+        canonicalize_query_clause_fields(filter, mappings)?;
+    }
+
+    canonicalize_sql_field_list(&mut plan.required_columns, mappings)?;
+    canonicalize_sql_field_list(&mut plan.group_by_columns, mappings)?;
+
+    if let Some((field_name, _)) = &mut plan.sort_pushdown {
+        *field_name = canonicalize_sql_source_field_name(field_name, mappings)?;
+    }
+
+    if let Some(grouped_sql) = &mut plan.grouped_sql {
+        for column in &mut grouped_sql.group_columns {
+            column.source_name = canonicalize_sql_source_field_name(&column.source_name, mappings)?;
+        }
+        for metric in &mut grouped_sql.metrics {
+            if let Some(field_name) = &mut metric.field {
+                *field_name = canonicalize_sql_source_field_name(field_name, mappings)?;
+            }
+        }
+    }
+
+    if let Some(semijoin) = &mut plan.semijoin {
+        semijoin.outer_key = canonicalize_sql_source_field_name(&semijoin.outer_key, mappings)?;
+        semijoin.inner_key = canonicalize_sql_source_field_name(&semijoin.inner_key, mappings)?;
+        *semijoin.inner_plan =
+            canonicalize_sql_plan_fields(semijoin.inner_plan.as_ref().clone(), mappings)?;
+    }
+
+    Ok(plan)
+}
+
 async fn resolve_semijoin_keys(
     state: &AppState,
     semijoin: &crate::hybrid::planner::SemijoinPlan,
@@ -1038,6 +1195,19 @@ async fn execute_sql_query_with_plan(
     total_start: Instant,
     record_metrics: bool,
 ) -> Result<SqlExecutionResult, (StatusCode, Json<Value>)> {
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = match cluster_state.indices.get(&plan.index_name) {
+        Some(m) => m.clone(),
+        None => {
+            return Err(crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", plan.index_name),
+            ));
+        }
+    };
+    let plan = canonicalize_sql_plan_fields(plan, &metadata.mappings)?;
+
     let mut semijoin_key_count = None;
     let mut semijoin_ms = 0.0;
     let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
@@ -1050,8 +1220,6 @@ async fn execute_sql_query_with_plan(
         apply_semijoin_filter(&mut search_req, semijoin, &key_values);
     }
 
-    // GROUP BY fallback: override the default 100K cap so DataFusion sees all
-    // matching docs.  Uses the configurable sql_group_by_scan_limit (0 = unlimited).
     if plan.has_group_by_fallback {
         search_req.size = if state.sql_group_by_scan_limit == 0 {
             usize::MAX
@@ -1059,18 +1227,6 @@ async fn execute_sql_query_with_plan(
             state.sql_group_by_scan_limit
         };
     }
-
-    let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(&plan.index_name) {
-        Some(m) => m.clone(),
-        None => {
-            return Err(crate::api::error_response(
-                StatusCode::NOT_FOUND,
-                "index_not_found_exception",
-                format!("no such index [{}]", plan.index_name),
-            ));
-        }
-    };
 
     // count(*) fast path: answer from doc_count() metadata without scanning docs
     if plan.is_count_star_only() {
@@ -1558,15 +1714,6 @@ async fn execute_sql_stream_query(
         return Ok(stream_json_response(sql_response_body(&result)));
     }
 
-    let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
-    if plan.has_group_by_fallback {
-        search_req.size = if state.sql_group_by_scan_limit == 0 {
-            usize::MAX
-        } else {
-            state.sql_group_by_scan_limit
-        };
-    }
-
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(index_name) {
         Some(metadata) => metadata.clone(),
@@ -1578,6 +1725,16 @@ async fn execute_sql_stream_query(
             ));
         }
     };
+    let plan = canonicalize_sql_plan_fields(plan, &metadata.mappings)?;
+
+    let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
+    if plan.has_group_by_fallback {
+        search_req.size = if state.sql_group_by_scan_limit == 0 {
+            usize::MAX
+        } else {
+            state.sql_group_by_scan_limit
+        };
+    }
 
     let local_shards = crate::api::index::ensure_local_index_shards_open(
         state,
@@ -1851,12 +2008,15 @@ fn strip_command<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// Remove surrounding quotes from an identifier: "foo" -> foo, `foo` -> foo
 fn unquote_identifier(s: &str) -> String {
-    let s = s.trim().trim_end_matches(';').trim();
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('`') && s.ends_with('`')) {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
-    }
+    crate::common::sql_parse::unquote_identifier(s)
+}
+
+fn object_name_to_string(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    crate::common::sql_parse::object_name_to_string(name)
+}
+
+fn extract_index_from_sql_fallback(sql: &str) -> Option<String> {
+    crate::common::sql_parse::extract_index_from_sql_fallback(sql)
 }
 
 /// Extract the index/table name from a SELECT ... FROM "index" ... query.
@@ -1865,7 +2025,10 @@ fn extract_index_from_sql(sql: &str) -> Option<String> {
     use sqlparser::parser::Parser;
 
     let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql).ok()?;
+    let statements = match Parser::parse_sql(&dialect, sql) {
+        Ok(statements) => statements,
+        Err(_) => return extract_index_from_sql_fallback(sql),
+    };
     if statements.len() != 1 {
         return None;
     }
@@ -1873,20 +2036,11 @@ fn extract_index_from_sql(sql: &str) -> Option<String> {
         sqlparser::ast::Statement::Query(query) => {
             if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref()
                 && select.from.len() == 1
+                && select.from[0].joins.is_empty()
                 && let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation
             {
-                return Some(
-                    name.0
-                        .iter()
-                        .filter_map(|p| match p {
-                            sqlparser::ast::ObjectNamePart::Identifier(id) => {
-                                Some(id.value.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("."),
-                );
+                return object_name_to_string(name)
+                    .or_else(|| extract_index_from_sql_fallback(sql));
             }
             None
         }
@@ -2555,8 +2709,107 @@ mod tests {
             super::extract_index_from_sql("SELECT count(*) FROM hackernews"),
             Some("hackernews".to_string())
         );
+        assert_eq!(
+            super::extract_index_from_sql(r#"SELECT count(*) FROM "benchmark-1gb""#),
+            Some("benchmark-1gb".to_string())
+        );
+        assert_eq!(
+            super::extract_index_from_sql(r#"SELECT count(*) from "benchmark-1gb""#),
+            Some("benchmark-1gb".to_string())
+        );
         assert_eq!(super::extract_index_from_sql("SHOW TABLES"), None);
         assert_eq!(super::extract_index_from_sql("not valid sql at all"), None);
+    }
+
+    #[tokio::test]
+    async fn canonicalize_sql_plan_fields_rewrites_case_insensitive_columns() {
+        let (_tmp, state) = make_test_app_state("products");
+        let cluster_state = state.cluster_manager.get_state();
+        let mappings = &cluster_state.indices.get("products").unwrap().mappings;
+
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT BRAND AS brand, AVG(PRICE) AS avg_price FROM products WHERE text_match(DESCRIPTION, 'iphone') AND PRICE > 800 GROUP BY BRAND ORDER BY avg_price DESC",
+        )
+        .unwrap();
+
+        let plan = super::canonicalize_sql_plan_fields(plan, mappings).unwrap();
+
+        assert_eq!(plan.text_matches[0].field, "description");
+        assert_eq!(plan.required_columns, vec!["brand", "price"]);
+        assert_eq!(plan.group_by_columns, vec!["brand"]);
+
+        match &plan.pushed_filters[0] {
+            crate::search::QueryClause::Range(fields) => {
+                assert!(fields.contains_key("price"));
+            }
+            other => panic!("expected range filter, got {other:?}"),
+        }
+
+        let grouped_sql = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped_sql.group_columns[0].source_name, "brand");
+        assert_eq!(grouped_sql.group_columns[0].output_name, "brand");
+        assert_eq!(grouped_sql.metrics[0].field.as_deref(), Some("price"));
+    }
+
+    #[tokio::test]
+    async fn canonicalize_sql_plan_fields_rewrites_semijoin_keys_case_insensitively() {
+        let (_tmp, state) = make_test_app_state("products");
+        let cluster_state = state.cluster_manager.get_state();
+        let mappings = &cluster_state.indices.get("products").unwrap().mappings;
+
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT TITLE AS title FROM products WHERE BRAND IN (SELECT BRAND FROM products WHERE PRICE > 800)",
+        )
+        .unwrap();
+
+        let plan = super::canonicalize_sql_plan_fields(plan, mappings).unwrap();
+        let semijoin = plan.semijoin.as_ref().unwrap();
+
+        assert_eq!(semijoin.outer_key, "brand");
+        assert_eq!(semijoin.inner_key, "brand");
+        assert_eq!(semijoin.inner_plan.required_columns, vec!["brand"]);
+
+        match &semijoin.inner_plan.pushed_filters[0] {
+            crate::search::QueryClause::Range(fields) => {
+                assert!(fields.contains_key("price"));
+            }
+            other => panic!("expected range filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_rejects_ambiguous_case_only_mappings() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "Price".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "PRICE".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+
+        let result = super::resolve_case_insensitive_mapping_name("price", &mappings);
+        let err = result.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = err.1.0;
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("ambiguous"),
+            "Expected ambiguous error, got: {body}"
+        );
     }
 
     #[tokio::test]
