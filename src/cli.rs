@@ -530,6 +530,30 @@ fn metadata_collector_label(body: &Value) -> Option<&'static str> {
     }
 }
 
+fn metadata_hits_label(body: &Value) -> &'static str {
+    if body.get("execution_mode").is_some() {
+        "search hits"
+    } else {
+        "matched"
+    }
+}
+
+fn explain_hits_label(body: &Value) -> &'static str {
+    if body.get("execution_mode").is_some() {
+        "Search Hits:"
+    } else {
+        "Matched Docs:"
+    }
+}
+
+fn truncation_hits_phrase(body: &Value) -> &'static str {
+    if body.get("execution_mode").is_some() {
+        "search stage matched"
+    } else {
+        "query matched"
+    }
+}
+
 fn render_metadata(body: &Value, client_ms: f64) {
     let mut parts = Vec::new();
 
@@ -556,7 +580,11 @@ fn render_metadata(body: &Value, client_ms: f64) {
 
     // Matched hits
     if let Some(hits) = body.get("matched_hits").and_then(|v| v.as_u64()) {
-        parts.push(format!("matched: {}", format_number(hits)));
+        parts.push(format!(
+            "{}: {}",
+            metadata_hits_label(body),
+            format_number(hits)
+        ));
     }
 
     // Shard info
@@ -591,8 +619,9 @@ fn render_metadata(body: &Value, client_ms: f64) {
         && let Some(hits) = body.get("matched_hits").and_then(|v| v.as_u64())
     {
         println!(
-            " {} query matched {} docs but results are capped — add filters or LIMIT",
+            " {} {} {} docs but results are capped — add filters or LIMIT",
             "⚠ TRUNCATED:".bright_yellow().bold(),
+            truncation_hits_phrase(body),
             format_number(hits).bright_yellow(),
         );
     }
@@ -632,7 +661,7 @@ fn render_explain(body: &Value, client_ms: f64) {
     if let Some(hits) = body.get("matched_hits").and_then(|v| v.as_u64()) {
         println!(
             " {} {}",
-            "Matched Docs:".bright_white(),
+            explain_hits_label(body).bright_white(),
             format_number(hits).bright_cyan()
         );
     }
@@ -1816,5 +1845,27 @@ mod tests {
 
         assert!(!uses_bitset_collector(&body));
         assert_eq!(metadata_collector_label(&body), None);
+    }
+
+    #[test]
+    fn metadata_hits_label_uses_search_hits_for_sql_metadata() {
+        let body = serde_json::json!({
+            "execution_mode": "tantivy_fast_fields",
+        });
+
+        assert_eq!(metadata_hits_label(&body), "search hits");
+        assert_eq!(explain_hits_label(&body), "Search Hits:");
+        assert_eq!(truncation_hits_phrase(&body), "search stage matched");
+    }
+
+    #[test]
+    fn metadata_hits_label_uses_legacy_matched_for_non_sql_metadata() {
+        let body = serde_json::json!({
+            "took": 1,
+        });
+
+        assert_eq!(metadata_hits_label(&body), "matched");
+        assert_eq!(explain_hits_label(&body), "Matched Docs:");
+        assert_eq!(truncation_hits_phrase(&body), "query matched");
     }
 }

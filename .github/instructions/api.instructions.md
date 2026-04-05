@@ -152,6 +152,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
     - `tantivy_fast_fields` when the query runs from local shard fast fields without materializing full hits first
     - `materialized_hits_fallback` when SQL runs over gathered hits for compatibility
 - Responses include a `planner` object showing the compatibility `text_match` field, the full `text_matches` array, structured filters, grouping columns, required columns, and whether residual predicates remained.
+- SQL responses include `matched_hits` as the search-stage document count feeding SQL execution, not the final grouped/projection row count. CLI and UI surfaces should label it as search hits (or equivalent), not as returned rows.
 - Responses include a `truncated` boolean flag:
     - `true` only when the flat-query internal 100K collection ceiling silently drops matching documents on the `tantivy_fast_fields` path.
     - `false` when the user specified an explicit `LIMIT` — they got what they asked for, that's not truncation.
