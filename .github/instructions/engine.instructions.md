@@ -102,6 +102,8 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - `replay_translog()` — crash recovery from WAL, streaming entries via `for_each_from()` and replaying only entries at or above the persisted committed checkpoint
 - Replay must stay idempotent across repeated crash recovery: delete-before-add on `_id`, commit in batches, and persist `translog.committed` after each intermediate batch commit
 - `translog_size_bytes()` exposes the current WAL size for the auto-flush loop
+- The Tantivy `IndexWriter` heap budget is intentionally capped at 64 MiB per shard. Multi-shard restart/open paths must not reserve the old 512 MiB-per-shard budget or nodes with many local shards can OOM before recovery completes.
+- `rebuild_vectors()` is only called when the index has `KnnVector` fields in its mappings. The shard manager gates this check; the composite engine's `rebuild_vectors()` itself is still a 100K-doc MatchAll scan, so never call it unconditionally.
 - Even the legacy `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used directly; never run Tantivy commit/reload inline on an async interval task
 - Replica/recovery writes use `append_with_seq()` / `write_bulk_with_start_seq()` under the hood so persisted WAL seq_nos match the primary's numbering
 

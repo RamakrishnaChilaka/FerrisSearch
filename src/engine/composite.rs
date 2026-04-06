@@ -60,7 +60,7 @@ impl CompositeEngine {
             column_cache.clone(),
         )?;
 
-        // Load existing vector index if present
+        // Load existing vector index if present.
         let vector_path = data_dir.join("vectors.usearch");
         let vector = if vector_path.exists() {
             // We don't know the dimensions yet — we'll discover on first vector field.
@@ -289,6 +289,9 @@ impl CompositeEngine {
 
     /// Rebuild vector index from all documents in Tantivy.
     /// Called on startup to recover vectors from persisted text documents.
+    /// The primary guard is at the shard-manager level (only called when
+    /// knn_vector fields exist in the index mappings). This method does
+    /// its own early-return if the MatchAll scan finds no documents.
     pub fn rebuild_vectors(&self) -> Result<()> {
         let req = crate::search::SearchRequest {
             query: crate::search::QueryClause::MatchAll(serde_json::Value::Object(

@@ -338,8 +338,12 @@ impl ShardManager {
             flush_threshold_rx,
         );
 
-        // Rebuild vector index from persisted documents (covers crash recovery)
-        if let Err(e) = engine.rebuild_vectors() {
+        // Only rebuild vectors when the index has knn_vector fields — otherwise
+        // the 100K-doc MatchAll search is pure waste and can OOM on large indices.
+        let has_vectors = mappings
+            .values()
+            .any(|m| matches!(m.field_type, crate::cluster::state::FieldType::KnnVector));
+        if has_vectors && let Err(e) = engine.rebuild_vectors() {
             tracing::warn!(
                 "Failed to rebuild vectors for {}/shard_{}: {}",
                 index,
@@ -1013,5 +1017,43 @@ mod tests {
             .unwrap();
 
         assert!(err.to_string().contains("missing authoritative UUID"));
+    }
+
+    #[tokio::test]
+    async fn open_shard_skips_rebuild_vectors_for_non_vector_mappings() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = ShardManager::new(dir.path(), Duration::from_secs(60));
+
+        // Non-vector mappings only
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "score".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+
+        let engine = mgr
+            .open_shard_with_settings("idx", 0, &mappings, &IndexSettings::default(), "test-uuid")
+            .unwrap();
+
+        // Index some docs and flush
+        engine
+            .add_document("d1", json!({"title": "hello", "score": 10}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // Engine opened successfully without triggering 100K-doc MatchAll
+        assert_eq!(engine.doc_count(), 1);
     }
 }

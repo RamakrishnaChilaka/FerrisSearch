@@ -41,6 +41,7 @@ pub struct HotEngine {
 }
 
 const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 10_000;
+const TANTIVY_WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
 impl HotEngine {
     pub fn new<P: AsRef<Path>>(data_dir: P, refresh_interval: Duration) -> Result<Self> {
@@ -117,7 +118,9 @@ impl HotEngine {
             }
         }
 
-        let writer = index.writer(512_000_000)?; // 512MB heap — matches OpenSearch's recommended minimum
+        // Keep the per-shard writer heap modest so nodes reopening many local shards
+        // do not reserve multiple GiB before they can finish recovery.
+        let writer = index.writer(TANTIVY_WRITER_HEAP_BYTES)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -5005,16 +5008,16 @@ mod tests {
     #[test]
     fn streaming_replay_with_batched_commits_recovers_all_docs() {
         // Write more docs than the replay batch size to exercise the intermediate
-        // commit path in streaming replay.
+        // commit path in streaming replay.  Use bulk_add_documents so the WAL is
+        // written with a single fsync instead of 10K+ individual fsyncs.
         let dir = tempfile::tempdir().unwrap();
         let doc_count = TRANSLOG_REPLAY_BATCH_SIZE + 500;
         {
             let engine = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
-            for i in 0..doc_count {
-                engine
-                    .add_document(&format!("d-{i}"), json!({"n": i}))
-                    .unwrap();
-            }
+            let docs: Vec<(String, serde_json::Value)> = (0..doc_count)
+                .map(|i| (format!("d-{i}"), json!({"n": i})))
+                .collect();
+            engine.bulk_add_documents(docs).unwrap();
             // Intentionally do NOT flush — simulating crash.
         }
 
@@ -5065,11 +5068,10 @@ mod tests {
         let doc_count = TRANSLOG_REPLAY_BATCH_SIZE + 500;
         {
             let engine = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
-            for i in 0..doc_count {
-                engine
-                    .add_document(&format!("d-{i}"), json!({"n": i}))
-                    .unwrap();
-            }
+            let docs: Vec<(String, serde_json::Value)> = (0..doc_count)
+                .map(|i| (format!("d-{i}"), json!({"n": i})))
+                .collect();
+            engine.bulk_add_documents(docs).unwrap();
         }
 
         // First reopen replays the full translog into Tantivy segments.
