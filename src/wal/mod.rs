@@ -23,6 +23,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+async fn sync_file_in_background(file: Arc<Mutex<File>>) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let f = recover_lock(file.as_ref(), "file");
+        f.sync_data()
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("background translog sync task failed: {}", e)))?
+}
+
 /// Controls when the translog is fsynced to disk.
 ///
 /// Matches OpenSearch's `index.translog.durability` setting.
@@ -129,6 +138,19 @@ pub trait WriteAheadLog: Send + Sync {
     /// Get the next sequence number that will be assigned on append.
     /// This is exclusive: if seq_no 0 has been written, this returns 1.
     fn next_seq_no(&self) -> u64;
+
+    /// Return the current on-disk size of the translog in bytes.
+    /// Used by the auto-flush mechanism to trigger flush when the translog
+    /// exceeds a configurable threshold.
+    fn size_bytes(&self) -> Result<u64>;
+
+    /// Stream entries with seq_no >= `min_seq_no` through `callback` without
+    /// accumulating them in memory. Returns the number of entries processed.
+    fn for_each_from(
+        &self,
+        min_seq_no: u64,
+        callback: &mut dyn FnMut(TranslogEntry) -> Result<()>,
+    ) -> Result<u64>;
 }
 
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
@@ -160,6 +182,20 @@ fn encode_entry_borrowed(seq_no: u64, op: &str, payload: &serde_json::Value) -> 
 /// Read all length-prefixed entries from a reader, stopping at EOF or a partial frame.
 fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
     let mut entries = Vec::new();
+    decode_entries_streaming(reader, |entry| {
+        entries.push(entry);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+/// Stream through all length-prefixed entries from a reader, calling `callback`
+/// for each decoded entry without accumulating them in memory. Stops at EOF or
+/// a partial frame.
+fn decode_entries_streaming<R: Read>(
+    reader: &mut R,
+    mut callback: impl FnMut(TranslogEntry) -> Result<()>,
+) -> Result<()> {
     let mut len_buf = [0u8; 4];
     loop {
         match reader.read_exact(&mut len_buf) {
@@ -183,9 +219,38 @@ fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
         }
         let (wire, _): (WireEntry, _) =
             bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
-        entries.push(wire.into_translog()?);
+        callback(wire.into_translog()?)?;
     }
-    Ok(entries)
+    Ok(())
+}
+
+/// Scan a translog file and return only the maximum seq_no found,
+/// without retaining any entries in memory. Returns 0 if the file is empty.
+fn scan_max_seq_no<R: Read>(reader: &mut R) -> Result<u64> {
+    let mut max_seq: u64 = 0;
+    let mut found_any = false;
+    let mut len_buf = [0u8; 4];
+    // We only need seq_no — full WireEntry is still decoded (bincode doesn't
+    // support partial decode), but no entries are accumulated in memory.
+    loop {
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload_buf = vec![0u8; payload_len];
+        match reader.read_exact(&mut payload_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let (wire, _): (WireEntry, _) =
+            bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
+        max_seq = max_seq.max(wire.seq_no);
+        found_any = true;
+    }
+    if found_any { Ok(max_seq + 1) } else { Ok(0) }
 }
 
 fn recover_lock<'a, T>(mutex: &'a Mutex<T>, lock_name: &'static str) -> MutexGuard<'a, T> {
@@ -249,9 +314,8 @@ impl HotTranslog {
             0
         };
 
-        // Check translog entries — take the max of persisted and on-disk entries
-        let existing = Self::read_entries_from_path(&path)?;
-        let entry_max = existing.last().map(|e| e.seq_no + 1).unwrap_or(0);
+        // Scan translog entries for max seq_no without loading all payloads
+        let entry_max = Self::scan_max_seq_no_from_path(&path)?;
         let next_seq = std::cmp::max(persisted_seq, entry_max);
 
         // Seek to end for subsequent appends
@@ -265,9 +329,8 @@ impl HotTranslog {
             }
         };
         tracing::info!(
-            "Translog opened at {:?} ({} pending entries, next seq_no: {}, durability: {})",
+            "Translog opened at {:?} (next seq_no: {}, durability: {})",
             path,
-            existing.len(),
             next_seq,
             durability_label
         );
@@ -298,8 +361,7 @@ impl HotTranslog {
         Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let f = recover_lock(file.as_ref(), "file");
-                if let Err(e) = f.sync_data() {
+                if let Err(e) = sync_file_in_background(file.clone()).await {
                     tracing::error!("Background translog fsync failed: {}", e);
                 }
             }
@@ -313,11 +375,16 @@ impl HotTranslog {
         Ok(())
     }
 
-    /// Helper to read entries directly from a path (used during open to check existing state)
-    fn read_entries_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<TranslogEntry>> {
-        let file = OpenOptions::new().read(true).open(&path)?;
+    /// Scan a translog file for the maximum seq_no without loading all entries into memory.
+    /// Returns next_seq_no (max + 1), or 0 if the file is empty or does not exist.
+    fn scan_max_seq_no_from_path<P: AsRef<Path>>(path: P) -> Result<u64> {
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
         let mut reader = BufReader::new(file);
-        decode_entries(&mut reader)
+        scan_max_seq_no(&mut reader)
     }
 }
 
@@ -516,6 +583,30 @@ impl WriteAheadLog for HotTranslog {
 
     fn next_seq_no(&self) -> u64 {
         *recover_lock(&self.seq_no, "seq_no")
+    }
+
+    fn size_bytes(&self) -> Result<u64> {
+        let file = recover_lock(self.file.as_ref(), "file");
+        Ok(file.metadata()?.len())
+    }
+
+    fn for_each_from(
+        &self,
+        min_seq_no: u64,
+        callback: &mut dyn FnMut(TranslogEntry) -> Result<()>,
+    ) -> Result<u64> {
+        let mut file = recover_lock(self.file.as_ref(), "file");
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(&*file);
+        let mut count: u64 = 0;
+        decode_entries_streaming(&mut reader, |entry| {
+            if entry.seq_no >= min_seq_no {
+                count += 1;
+                callback(entry)?;
+            }
+            Ok(())
+        })?;
+        Ok(count)
     }
 }
 
@@ -994,6 +1085,46 @@ mod tests {
         assert!(tl.start_sync_task().is_none());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_sync_helper_does_not_starve_runtime_when_file_lock_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open_with_durability(
+            dir.path(),
+            TranslogDurability::Async {
+                sync_interval_ms: 1,
+            },
+        )
+        .unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let file = tl.file.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = file.lock().unwrap_or_else(|e| e.into_inner());
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let file = tl.file.clone();
+        let sync_task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            sync_file_in_background(file).await.unwrap()
+        });
+
+        let start = std::time::Instant::now();
+        started_rx.await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "background translog sync stalled the async runtime for {:?}",
+            elapsed
+        );
+
+        sync_task.await.unwrap();
+        holder.join().unwrap();
+    }
+
     #[test]
     fn async_mode_truncate_works() {
         let dir = tempfile::tempdir().unwrap();
@@ -1071,5 +1202,142 @@ mod tests {
         let entries = tl.read_all().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].payload["doc"], 1);
+    }
+
+    // ── size_bytes ──────────────────────────────────────────────────
+
+    #[test]
+    fn size_bytes_empty_translog_is_zero() {
+        let (_dir, tl) = open_translog();
+        assert_eq!(tl.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn size_bytes_grows_after_appends() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        let s1 = tl.size_bytes().unwrap();
+        assert!(s1 > 0);
+
+        tl.append("index", json!({"b": 2})).unwrap();
+        let s2 = tl.size_bytes().unwrap();
+        assert!(s2 > s1);
+    }
+
+    #[test]
+    fn size_bytes_resets_after_truncate() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        assert!(tl.size_bytes().unwrap() > 0);
+
+        tl.truncate().unwrap();
+        assert_eq!(tl.size_bytes().unwrap(), 0);
+    }
+
+    // ── for_each_from (streaming replay) ────────────────────────────
+
+    #[test]
+    fn for_each_from_streams_all_entries_when_min_is_zero() {
+        let (_dir, tl) = open_translog();
+        for i in 0..5 {
+            tl.append("index", json!({"doc": i})).unwrap();
+        }
+
+        let mut collected = Vec::new();
+        let count = tl
+            .for_each_from(0, &mut |entry| {
+                collected.push(entry.seq_no);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(count, 5);
+        assert_eq!(collected, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn for_each_from_filters_below_min_seq() {
+        let (_dir, tl) = open_translog();
+        for i in 0..5 {
+            tl.append("index", json!({"doc": i})).unwrap();
+        }
+
+        let mut collected = Vec::new();
+        let count = tl
+            .for_each_from(3, &mut |entry| {
+                collected.push(entry.seq_no);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(collected, vec![3, 4]);
+    }
+
+    #[test]
+    fn for_each_from_empty_translog_returns_zero() {
+        let (_dir, tl) = open_translog();
+        let count = tl.for_each_from(0, &mut |_| Ok(())).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn for_each_from_with_min_above_all_entries_returns_zero() {
+        let (_dir, tl) = open_translog();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+
+        let count = tl.for_each_from(100, &mut |_| Ok(())).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ── scan_max_seq_no ─────────────────────────────────────────────
+
+    #[test]
+    fn scan_max_seq_no_from_path_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _tl = HotTranslog::open(dir.path()).unwrap();
+        let path = dir.path().join("translog.bin");
+        let result = HotTranslog::scan_max_seq_no_from_path(&path).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn scan_max_seq_no_from_path_with_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let tl = HotTranslog::open(dir.path()).unwrap();
+        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append("index", json!({"b": 2})).unwrap();
+        tl.append("index", json!({"c": 3})).unwrap();
+        drop(tl);
+
+        let path = dir.path().join("translog.bin");
+        let result = HotTranslog::scan_max_seq_no_from_path(&path).unwrap();
+        // max seq_no is 2, so next_seq_no (max + 1) = 3
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn scan_max_seq_no_from_path_nonexistent_file_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.bin");
+        let result = HotTranslog::scan_max_seq_no_from_path(&path).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn scan_max_seq_no_matches_open_with_durability_result() {
+        // Verify the new scan_max_seq_no path produces the same seq_no
+        // that reading all entries would produce (regression guard).
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let tl = HotTranslog::open(dir.path()).unwrap();
+            for i in 0..100 {
+                tl.append("index", json!({"doc": i})).unwrap();
+            }
+        }
+        // Reopen — the constructor now uses scan_max_seq_no internally
+        let tl2 = HotTranslog::open(dir.path()).unwrap();
+        assert_eq!(tl2.next_seq_no(), 100);
     }
 }

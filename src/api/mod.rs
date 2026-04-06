@@ -174,8 +174,19 @@ fn normalize_metrics_path(path: &str) -> String {
 
 /// Prometheus metrics endpoint. Returns metrics in text exposition format.
 async fn handle_metrics(State(state): State<AppState>) -> Response {
-    crate::metrics::update_cluster_metrics(&state);
-    let body = crate::metrics::gather();
+    let metrics_state = state.clone();
+    let body = match tokio::task::spawn_blocking(move || {
+        crate::metrics::update_cluster_metrics(&metrics_state);
+        crate::metrics::gather()
+    })
+    .await
+    {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("Metrics rendering task failed: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(

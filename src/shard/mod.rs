@@ -235,13 +235,22 @@ impl ShardManager {
     }
 
     /// Open or create the engine for a specific shard with explicit field mappings.
+    /// Local/test helpers reuse one generated UUID per index so all shard paths
+    /// stay under the same index root.
     pub fn open_shard_with_mappings(
         &self,
         index: &str,
         shard_id: u32,
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
     ) -> Result<Arc<dyn SearchEngine>> {
-        self.open_shard_with_settings(index, shard_id, mappings, &IndexSettings::default(), "")
+        let generated_uuid = self.get_or_generate_uuid(index);
+        self.open_shard_with_settings(
+            index,
+            shard_id,
+            mappings,
+            &IndexSettings::default(),
+            &generated_uuid,
+        )
     }
 
     /// Open or create the engine for a specific shard with explicit field mappings
@@ -249,7 +258,7 @@ impl ShardManager {
     /// the refresh loop automatically adjusts when settings change.
     ///
     /// `index_uuid` determines the on-disk directory: `<data_dir>/<uuid>/shard_<id>`.
-    /// If empty, falls back to index-name-based directory for backwards compat.
+    /// Callers must provide the authoritative UUID from cluster metadata.
     pub fn open_shard_with_settings(
         &self,
         index: &str,
@@ -266,18 +275,23 @@ impl ShardManager {
             }
         }
 
-        // Register UUID mapping (or generate one if missing)
-        let uuid = if index_uuid.is_empty() {
-            self.get_or_generate_uuid(index)
-        } else {
-            self.register_index_uuid(index, index_uuid);
-            index_uuid.to_string()
-        };
+        if index_uuid.is_empty() {
+            return Err(anyhow::anyhow!(
+                "missing authoritative UUID for index '{}' — refusing to open shard {}/{}",
+                index,
+                index,
+                shard_id
+            ));
+        }
+
+        self.register_index_uuid(index, index_uuid);
+        let uuid = index_uuid.to_string();
 
         // Ensure a settings manager exists for this index
         let settings_mgr = self.ensure_settings_manager(index, settings);
         let refresh_interval = settings_mgr.refresh_interval();
         let refresh_rx = settings_mgr.watch_refresh_interval();
+        let flush_threshold_rx = settings_mgr.watch_flush_threshold();
 
         let shard_dir = self
             .data_dir
@@ -318,7 +332,11 @@ impl ShardManager {
                 }
             }
         };
-        CompositeEngine::start_refresh_loop_reactive(engine.clone(), refresh_rx);
+        CompositeEngine::start_refresh_loop_reactive(
+            engine.clone(),
+            refresh_rx,
+            flush_threshold_rx,
+        );
 
         // Rebuild vector index from persisted documents (covers crash recovery)
         if let Err(e) = engine.rebuild_vectors() {
@@ -341,6 +359,30 @@ impl ShardManager {
         let mut shards = self.shards.write().unwrap_or_else(|e| e.into_inner());
         shards.insert(key, dyn_engine.clone());
         Ok(dyn_engine)
+    }
+
+    /// Async wrapper for shard open/create on Tokio call sites.
+    /// Shard open can perform blocking filesystem recovery and engine startup work.
+    pub async fn open_shard_with_settings_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: IndexSettings,
+        index_uuid: String,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            shard_manager.open_shard_with_settings(
+                &index,
+                shard_id,
+                &mappings,
+                &settings,
+                &index_uuid,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking shard open task failed: {}", e))?
     }
 
     /// Get an already-open shard engine.
@@ -421,6 +463,14 @@ impl ShardManager {
         Ok(())
     }
 
+    /// Async wrapper for shard shutdown + directory deletion on Tokio call sites.
+    pub async fn close_index_shards_blocking(self: &Arc<Self>, index: String) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || shard_manager.close_index_shards(&index))
+            .await
+            .map_err(|e| anyhow::anyhow!("blocking shard close task failed: {}", e))?
+    }
+
     fn remove_dir_all_with_retry(path: &std::path::Path) -> Result<()> {
         const MAX_ATTEMPTS: usize = 10;
         const RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -464,17 +514,19 @@ impl ShardManager {
         uuids.insert(index.to_string(), uuid.to_string());
     }
 
-    /// Get the registered UUID for an index, or generate and register a new one.
+    /// Get the UUID for an index if one is registered, or generate and store one.
+    /// Used only by local/test helpers that do not have cluster metadata yet.
     fn get_or_generate_uuid(&self, index: &str) -> String {
-        {
-            let uuids = self.index_uuids.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(u) = uuids.get(index) {
-                return u.clone();
-            }
+        if let Some(uuid) = self.index_uuid(index) {
+            return uuid;
         }
+
         let new_uuid = uuid::Uuid::new_v4().to_string();
         let mut uuids = self.index_uuids.write().unwrap_or_else(|e| e.into_inner());
-        uuids.entry(index.to_string()).or_insert(new_uuid).clone()
+        uuids
+            .entry(index.to_string())
+            .or_insert_with(|| new_uuid.clone())
+            .clone()
     }
 
     /// Get the UUID for an index if one is registered.
@@ -525,6 +577,18 @@ impl ShardManager {
                 }
             }
         }
+    }
+
+    /// Async wrapper for orphan cleanup on Tokio call sites.
+    pub async fn cleanup_orphaned_data_blocking(
+        self: &Arc<Self>,
+        known_uuids: std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || shard_manager.cleanup_orphaned_data(&known_uuids))
+            .await
+            .map_err(|e| anyhow::anyhow!("blocking orphan cleanup task failed: {}", e))?;
+        Ok(())
     }
 }
 
@@ -591,6 +655,40 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&e1, &e2));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_shard_with_settings_blocking_does_not_starve_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let manager = mgr.clone();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            manager
+                .open_shard_with_settings_blocking(
+                    "idx".to_string(),
+                    0,
+                    HashMap::new(),
+                    IndexSettings::default(),
+                    "uuid-1".to_string(),
+                )
+                .await
+                .unwrap()
+        });
+
+        let start = std::time::Instant::now();
+        started_rx.await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "blocking shard-open wrapper stalled the async runtime for {:?}",
+            elapsed
+        );
+
+        task.await.unwrap();
+        assert!(mgr.get_shard("idx", 0).is_some());
+    }
+
     // ── get_index_shards / all_shards ───────────────────────────────────
 
     #[tokio::test]
@@ -613,6 +711,30 @@ mod tests {
         mgr.open_shard("idx-a", 0).unwrap();
         mgr.open_shard("idx-b", 0).unwrap();
         assert_eq!(mgr.all_shards().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn open_shard_reuses_generated_uuid_for_same_index() {
+        let (_dir, mgr) = create_shard_manager();
+        mgr.open_shard("idx", 0).unwrap();
+        let first_uuid = mgr.index_uuid("idx").unwrap();
+
+        mgr.open_shard("idx", 1).unwrap();
+        let second_uuid = mgr.index_uuid("idx").unwrap();
+
+        assert_eq!(first_uuid, second_uuid);
+        assert_eq!(
+            mgr.shard_data_dir("idx", 0)
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+            mgr.shard_data_dir("idx", 1)
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        );
     }
 
     // ── close_index_shards ──────────────────────────────────────────────
@@ -747,8 +869,9 @@ mod tests {
         let (_dir, mgr) = create_shard_manager();
         let settings = IndexSettings {
             refresh_interval_ms: Some(2000),
+            ..Default::default()
         };
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings, "")
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings, "uuid-1")
             .unwrap();
 
         let sm = mgr.get_settings_manager("idx");
@@ -768,8 +891,14 @@ mod tests {
     #[tokio::test]
     async fn apply_settings_updates_refresh_interval() {
         let (_dir, mgr) = create_shard_manager();
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default(), "")
-            .unwrap();
+        mgr.open_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+        )
+        .unwrap();
 
         let sm = mgr.get_settings_manager("idx").unwrap();
         let rx = sm.watch_refresh_interval();
@@ -782,6 +911,7 @@ mod tests {
             "idx",
             &IndexSettings {
                 refresh_interval_ms: Some(3000),
+                ..Default::default()
             },
         );
         assert_eq!(*rx.borrow(), std::time::Duration::from_millis(3000));
@@ -796,6 +926,7 @@ mod tests {
             "new-idx",
             &IndexSettings {
                 refresh_interval_ms: Some(7000),
+                ..Default::default()
             },
         );
 
@@ -809,8 +940,14 @@ mod tests {
     #[tokio::test]
     async fn close_index_shards_removes_settings_manager() {
         let (_dir, mgr) = create_shard_manager();
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default(), "")
-            .unwrap();
+        mgr.open_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+        )
+        .unwrap();
         assert!(mgr.get_settings_manager("idx").is_some());
 
         mgr.close_index_shards("idx").unwrap();
@@ -820,8 +957,14 @@ mod tests {
     #[tokio::test]
     async fn open_shard_with_default_settings_uses_cluster_default() {
         let (_dir, mgr) = create_shard_manager();
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default(), "")
-            .unwrap();
+        mgr.open_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+        )
+        .unwrap();
 
         let sm = mgr.get_settings_manager("idx").unwrap();
         assert_eq!(
@@ -835,10 +978,11 @@ mod tests {
         let (_dir, mgr) = create_shard_manager();
         let settings = IndexSettings {
             refresh_interval_ms: Some(4000),
+            ..Default::default()
         };
-        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings, "")
+        mgr.open_shard_with_settings("idx", 0, &HashMap::new(), &settings, "uuid-1")
             .unwrap();
-        mgr.open_shard_with_settings("idx", 1, &HashMap::new(), &settings, "")
+        mgr.open_shard_with_settings("idx", 1, &HashMap::new(), &settings, "uuid-1")
             .unwrap();
 
         let sm0 = mgr.get_settings_manager("idx").unwrap();
@@ -854,8 +998,20 @@ mod tests {
             "idx",
             &IndexSettings {
                 refresh_interval_ms: Some(9000),
+                ..Default::default()
             },
         );
         assert_eq!(*rx.borrow(), std::time::Duration::from_millis(9000));
+    }
+
+    #[test]
+    fn open_shard_with_settings_rejects_missing_uuid() {
+        let (_dir, mgr) = create_shard_manager();
+        let err = mgr
+            .open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default(), "")
+            .err()
+            .unwrap();
+
+        assert!(err.to_string().contains("missing authoritative UUID"));
     }
 }

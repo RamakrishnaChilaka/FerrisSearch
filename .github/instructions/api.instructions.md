@@ -22,6 +22,7 @@ async fn metrics_middleware(req: Request<Body>, next: Next) -> Response
 - Calls `update_cluster_metrics(state)` on each scrape to refresh cluster/shard/index gauges.
 - Calls `initialize_metrics()` to force-register all `LazyLock` statics even before first traffic, so metrics appear in output from the first scrape.
 - `INDEX_DOCS` gauge is reset before rebuilding to remove stale series from deleted indices.
+- Metrics rendering must run through Tokio's blocking pool because cluster metric refresh and process inspection can touch procfs / filesystem state; do not gather inline on the async request task.
 
 ### Metrics Placement Rules
 - **HTTP-level latency**: `INDEX_LATENCY_SECONDS` and `SEARCH_LATENCY_SECONDS` use RAII `start_timer()` at the top of API handlers. These measure full request wall-clock time including routing, forwarding, and replication — NOT engine-level latency.
@@ -97,6 +98,13 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | GET | `/{index}/_settings` | `get_index_settings()` — local read |
 | PUT | `/{index}/_settings` | `update_index_settings()` — forwarded to leader |
 | POST | `/_cluster/transfer_master` | `transfer_master()` — forwarded |
+
+`create_index()`, `get_index_settings()`, and `update_index_settings()` must keep `refresh_interval_ms` and `flush_threshold_bytes` in sync end-to-end across HTTP parsing, gRPC forwarding, and Raft state updates. `GET /{index}/_settings` must return both fields when set. `flush_threshold_bytes: 0` is a valid disable value and must not be treated as "missing".
+
+### Local Shard Reopen Rule
+- `ensure_local_index_shards_open()` is async and must be awaited by search/count/SQL/maintenance paths.
+- When an API handler needs to reopen local shards, use `ShardManager::open_shard_with_settings_blocking()` rather than calling the synchronous shard-open helper inline on an async task.
+- Read and maintenance paths must fail closed when the authoritative shard UUID path is missing. Do not create a fresh shard directory on `/_search`, `/_count`, SQL, or maintenance fan-out just because a local reopen is needed.
 
 ### Document Operations — src/api/index.rs (routed to shard primary)
 | HTTP | Path | Handler |
@@ -198,6 +206,9 @@ Document and bulk handlers auto-create missing indices via `auto_create_index()`
 - If NOT leader → forwards `CreateIndex` to master via `forward_create_index()` gRPC
 - If leader → commits directly via `raft.client_write(CreateIndex)`
 - NEVER calls `raft.client_write()` from a follower node
+
+## Bulk Error Reporting
+- `bulk_index()` and `bulk_index_global()` must preserve the underlying shard forwarding error string in failed item responses. Do not collapse intermittent write or replication failures into a generic "Failed to index to shard" reason, because the ingest clients need the original message to diagnose flaky bulk errors.
 
 All four auto-create callsites use this shared helper:
 - `index_document()` (POST `/{index}/_doc`)

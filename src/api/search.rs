@@ -142,7 +142,8 @@ async fn count_docs_from_metadata(
         index_name,
         metadata,
         "count_fast",
-    );
+    )
+    .await;
     let local_shard_ids: HashSet<u32> = local_shards.iter().map(|(id, _)| *id).collect();
 
     let mut count: u64 = 0;
@@ -273,7 +274,8 @@ pub async fn search_documents(
         &index_name,
         &metadata,
         "GET search",
-    );
+    )
+    .await;
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
 
@@ -1803,7 +1805,8 @@ async fn execute_sql_query_with_plan(
         &plan.index_name,
         &metadata,
         "SQL search",
-    );
+    )
+    .await;
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
 
@@ -2181,7 +2184,8 @@ async fn execute_sql_stream_query(
         index_name,
         &metadata,
         "SQL search",
-    );
+    )
+    .await;
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
 
@@ -2731,7 +2735,7 @@ mod tests {
 
         IndexMetadata {
             name: index.to_string(),
-            uuid: String::new(),
+            uuid: format!("{}-uuid", index),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -2764,11 +2768,16 @@ mod tests {
 
         let metadata = cluster_state.indices.get(index_name).unwrap().clone();
         assert!(
-            crate::api::index::ensure_local_index_shards_open(
-                &state, index_name, &metadata, "SQL test"
-            )
-            .len()
-                == 1
+            state
+                .shard_manager
+                .open_shard_with_settings(
+                    index_name,
+                    0,
+                    &metadata.mappings,
+                    &metadata.settings,
+                    &metadata.uuid,
+                )
+                .is_ok()
         );
 
         let shard = state.shard_manager.get_shard(index_name, 0).unwrap();
@@ -3530,7 +3539,7 @@ mod tests {
 
         cluster_state.add_index(IndexMetadata {
             name: "texttest".to_string(),
-            uuid: String::new(),
+            uuid: "texttest-uuid".to_string(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,

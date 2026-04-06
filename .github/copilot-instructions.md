@@ -14,7 +14,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Protobuf (proto/transport.proto)
 - redb 3 (persistent Raft log storage — v3 file format, ~15% faster bulk writes, smaller files)
 - jemalloc (global allocator via tikv-jemallocator — reduces post-workload RSS retention vs glibc malloc)
-- rayon (dedicated thread pools for search/write workload isolation)
+- rayon (dedicated thread pools for search/write workload isolation; not for Raft heartbeats or other async control-plane tasks)
 
 ## Architecture
 - **Raft consensus** manages cluster state (leader election, node membership, index metadata).
@@ -23,6 +23,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - **TransportService** (gRPC) handles inter-node RPCs including Raft vote/append/snapshot.
 - **ShardManager** manages local Tantivy index shards.
 - Data replication (document-level) still uses gossip/gRPC, separate from Raft.
+- Async control-plane work (Raft heartbeats, master pings, HTTP/gRPC futures) stays on Tokio; blocking shard/disk work on those paths must use Tokio's blocking pool rather than rayon.
 
 ## Key Modules
 - `src/consensus/` — Raft: types.rs (TypeConfig, ClusterCommand, ClusterResponse), store.rs (MemLogStore), disk_store.rs, state_machine.rs, network.rs, mod.rs
@@ -98,7 +99,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 832 unit tests + 62 CLI tests + 33 consensus integration + 40 replication integration + 38 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 1006 total
+- 874 unit tests + 64 CLI tests + 33 consensus integration + 40 replication integration + 38 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 1050 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
@@ -116,7 +117,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
 - Joining node: sends JoinCluster gRPC (with raft_node_id) → leader serializes concurrent joins, validates identity, does `add_learner` for non-voters, applies `AddNode`, then recomputes the latest voter set for `change_membership` (rolling back `AddNode` if promotion fails)
 - Joining node does NOT call `update_state` — Raft log replication propagates state, but `JoinCluster` returns an authoritative snapshot for initial shard reopen/cleanup decisions
-- Nodes reopen locally assigned shards after startup using the authoritative bootstrap/join snapshot when available, reconcile unopened assignments in the lifecycle loop, and skip orphan cleanup until index UUIDs are known
+- Nodes reopen locally assigned shards after startup using the authoritative bootstrap/join snapshot when available, keep recovered-node startup assignments fail-closed when their expected UUID dirs are missing, allow later assignments to create their shard dirs in the lifecycle loop, and skip orphan cleanup until index UUIDs are known and the expected local shard UUID paths exist
 - Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader), shard failover (promote best ISR replica to primary for orphaned shards)
 - Follower lifecycle loop: pings the master for liveness
 
@@ -134,11 +135,14 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 
 ## Dynamic Settings
 - `PUT /{index}/_settings` and `GET /{index}/_settings` API endpoints
-- `IndexSettings` struct on `IndexMetadata` holds `refresh_interval_ms: Option<u64>`
+- `IndexSettings` struct on `IndexMetadata` holds `refresh_interval_ms: Option<u64>` and `flush_threshold_bytes: Option<u64>`
 - `SettingsManager` (src/cluster/settings.rs) uses `tokio::sync::watch` channels for reactive pub/sub
-- Consumers subscribe via `watch_refresh_interval()` and react in `tokio::select!` loops
+- Consumers subscribe via `watch_refresh_interval()` / `watch_flush_threshold()` and react in `tokio::select!` loops
 - Non-leader nodes forward settings updates to master via gRPC `UpdateSettings` RPC
 - Settings changes go through Raft (`UpdateIndex` command), then `ShardManager::apply_settings()` pushes to `SettingsManager::update()`
+- `flush_threshold_bytes` defaults to 512 MB, `0` disables background auto-flush, and the refresh loop must skip auto-flush while `global_checkpoint == 0` because `flush_with_global_checkpoint(0)` falls back to full WAL truncation
+- Background auto-flush is best-effort: it uses nonblocking flush/save helpers and defers the tick when the shard is busy ingesting or the vector index is already being mutated
+- Refresh/auto-flush ticks must run through Tokio's blocking pool instead of inline on async runtime workers; the maintenance path performs blocking commit/truncate/vector-save work and can otherwise starve Raft heartbeats during multi-shard compaction bursts
 - To add a new reactive setting: add field to `IndexSettings`, add `watch::Sender<T>` to `SettingsManager`, detect changes in `update()`, subscribe in consumer
 
 ## AppState (shared across all API handlers)
@@ -165,7 +169,7 @@ pub struct AppState {
 ```
 NodeInfo { id: NodeId, name: String, host: String, transport_port: u16, http_port: u16, roles: Vec<NodeRole>, raft_node_id: u64 }
 FieldMapping { field_type: FieldType, dimension: Option<usize> }  // dimension for knn_vector only
-IndexSettings { refresh_interval_ms: Option<u64> }  // None = cluster default 5000ms
+IndexSettings { refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // None = cluster defaults (5000ms, 512MB)
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary: NodeId, replicas: Vec<NodeId>, unassigned_replicas: u32 }
 IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing: HashMap<u32, ShardRoutingEntry>, mappings: HashMap<String, FieldMapping>, settings: IndexSettings }
@@ -324,7 +328,7 @@ if let Some(ref raft) = state.raft {
 ### Create Index Body Format
 ```json
 {
-  "settings": { "number_of_shards": 3, "number_of_replicas": 1, "refresh_interval_ms": 5000 },
+    "settings": { "number_of_shards": 3, "number_of_replicas": 1, "refresh_interval_ms": 5000, "flush_threshold_bytes": 536870912 },
   "mappings": {
     "properties": {
       "title": { "type": "text" },
@@ -447,11 +451,12 @@ pub struct ShardManager {
 - `IndexMetadata.uuid` is a UUID v4 string, auto-generated on index creation
 - Passed to `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)`
 - `close_index_shards()` uses stored UUID mapping to find the directory to delete
-- `cleanup_orphaned_data(known_uuids)` deletes directories not matching any authoritative known index UUID; startup must skip cleanup until index UUIDs are available
+- `cleanup_orphaned_data(known_uuids)` deletes directories not matching any authoritative known index UUID; startup must skip cleanup until index UUIDs are available and the expected UUID directories for locally assigned shards are present
+- Missing UUIDs must fail closed on reopen paths — never synthesize a fresh UUID while reopening an existing cluster index
 - **NEVER** construct shard paths from index names — always use the UUID
 
 ### Key Methods
-- `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)` — creates CompositeEngine, starts reactive refresh, rebuilds vectors
+- `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)` — creates CompositeEngine, starts reactive refresh, rebuilds vectors; requires the authoritative index UUID and must reject empty UUIDs
 - `get_shard(index, shard_id)`, `get_index_shards(index)`, `all_shards()`
 - `close_index_shards(index)` — remove engines, clean ISR, delete directory
 - `apply_settings(index, new_settings)` — notify consumers via watch channels
@@ -476,20 +481,25 @@ TranslogEntry { seq_no: u64, op: String /* "index"|"delete" */, payload: Value }
 
 trait WriteAheadLog: Send + Sync {
     fn append(&self, op: &str, payload: Value) -> Result<TranslogEntry>;
+    fn append_with_seq(&self, seq_no: u64, op: &str, payload: Value) -> Result<TranslogEntry>;
     fn append_bulk(&self, ops: &[(&str, Value)]) -> Result<Vec<TranslogEntry>>;
+    fn write_bulk(&self, ops: &[(&str, Value)]) -> Result<()>;
+    fn write_bulk_with_start_seq(&self, start_seq_no: u64, ops: &[(&str, Value)]) -> Result<()>;
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;  // replica recovery
     fn truncate(&self) -> Result<()>;       // clear after commit
     fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;
     fn last_seq_no(&self) -> u64;
     fn next_seq_no(&self) -> u64;
+    fn size_bytes(&self) -> Result<u64>;
+    fn for_each_from(&self, min_seq_no: u64, callback: &mut dyn FnMut(TranslogEntry) -> Result<()>) -> Result<u64>;
 }
 ```
 
 ### HotTranslog (Binary Format)
 - Length-prefixed: `[u32 LE: payload_len][bincode(WireEntry { seq_no, op, payload_json })]`
 - Seq numbers are monotonically increasing, survive truncation (persisted in `.seqno` file)
-- `translog.committed` stores the exclusive committed seq_no so restart replay skips already committed entries
+- `translog.committed` stores the exclusive committed seq_no so restart replay skips already committed entries; replay persists this checkpoint after each intermediate batch commit to stay idempotent across repeated crash recovery
 - Handles partial writes at EOF gracefully (skips/truncates)
 
 ## Replication Protocol (src/replication/mod.rs)

@@ -60,11 +60,11 @@ Every response tells you how the query ran:
 - **OpenSearch-compatible REST API** — `PUT /{index}`, `POST /_doc`, `GET /_search`, `POST /_bulk`
 - **Hybrid SQL over search results** — `text_match()` + `GROUP BY` + `HAVING` + `ORDER BY` + `LIMIT` in one query
 - **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, `materialized_hits_fallback` — chosen automatically by the planner; executed fast-field fallbacks also report `streaming_used` when local bitset streaming or remote streamed shard batches are used
-- **Raft consensus** — cluster state via [openraft](https://github.com/datafuselabs/openraft); leader election, linearizable writes, automatic failover, persistent log via [redb](https://github.com/cberner/redb), and authoritative join snapshots so shard reopen/orphan cleanup never run from lossy pre-catch-up state
+- **Raft consensus** — cluster state via [openraft](https://github.com/datafuselabs/openraft); leader election, linearizable writes, automatic failover, persistent log via [redb](https://github.com/cberner/redb), and authoritative join snapshots so shard reopen/orphan cleanup never run from lossy pre-catch-up state or silently invent new shard UUIDs during restart
 - **Synchronous replication** — primary-replica with ISR tracking over gRPC; writes acknowledged after all in-sync replicas confirm
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) (HNSW); hybrid full-text + vector queries with pre-filtering
-- **Write-ahead log** — binary WAL with configurable durability (`request` fsync-per-write or `async` timer-based)
-- **Workload isolation** — dedicated [rayon](https://github.com/rayon-rs/rayon) thread pools for search and write traffic; bulk indexing cannot starve search latency or Raft heartbeats
+- **Write-ahead log** — binary WAL with configurable durability (`request` fsync-per-write or `async` timer-based), streaming crash recovery, and per-index auto-flush via `flush_threshold_bytes` (default 512 MB, `0` disables); background maintenance runs on blocking threads so Raft heartbeats stay responsive during compaction
+- **Workload isolation** — dedicated [rayon](https://github.com/rayon-rs/rayon) thread pools for search and write traffic; async control-plane work stays on Tokio, while blocking shard/storage maintenance is offloaded to Tokio's blocking pool so heartbeats stay responsive
 - **Dynamic field mapping** — fields are auto-detected and created on first document encounter
 - **Prometheus metrics** — `/_metrics` endpoint with request latencies, search/index counters, SQL mode tracking, cluster gauges, and process stats (CPU, RSS, threads, FDs)
 - **Column cache** — segment-aware Arrow array cache for SQL analytics; configurable memory limit (`column_cache_size_percent`) and selectivity threshold (`column_cache_populate_threshold`); ~1000× speedup on repeated fast-field queries
@@ -251,8 +251,11 @@ curl -X DELETE 'http://localhost:9200/movies'
 # Settings
 curl 'http://localhost:9200/movies/_settings'
 curl -X PUT 'http://localhost:9200/movies/_settings' -H 'Content-Type: application/json' \
-  -d '{"index": {"number_of_replicas": 2, "refresh_interval_ms": 10000}}'
+  -d '{"index": {"number_of_replicas": 2, "refresh_interval_ms": 10000, "flush_threshold_bytes": 536870912}}'
 ```
+
+`flush_threshold_bytes` is a per-index WAL auto-flush threshold. The default is `536870912` (512 MB). Setting it to `0` disables automatic background flushes.
+Background auto-flush is best-effort: it skips the tick while the shard is busy ingesting or persisting vectors instead of blocking live writes, and the maintenance tick itself runs on blocking threads so compaction does not stall Raft heartbeats.
 
 **Field types:** `text`, `keyword`, `integer`, `float`, `boolean`, `knn_vector`. Unmapped fields are auto-detected on first document.
 
@@ -480,7 +483,7 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 
 ### Thread Pool Isolation
 
-Dedicated rayon thread pools for search and write workloads. Bulk indexing cannot starve search latency or Raft heartbeats.
+Dedicated rayon thread pools handle search and write engine work. Async control-plane tasks such as Raft heartbeats, master pings, and HTTP/gRPC futures stay on Tokio; blocking shard reopen, compaction, WAL fsync, redb I/O, and metrics rendering are offloaded to Tokio's blocking pool.
 
 ### Replication
 
@@ -493,9 +496,9 @@ Dedicated rayon thread pools for search and write workloads. Bulk indexing canno
 ## Testing
 
 ```bash
-cargo test                                      # All 1006 tests
-cargo test --lib                                # Unit tests (832)
-cargo test --bin ferris-cli                      # CLI tests (62)
+cargo test                                      # All 1050 tests
+cargo test --lib                                # Unit tests (874)
+cargo test --bin ferris-cli                      # CLI tests (64)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (40)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport

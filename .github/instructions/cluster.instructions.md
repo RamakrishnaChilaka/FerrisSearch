@@ -11,7 +11,7 @@
 ```
 NodeInfo { id, name, host, transport_port, http_port, roles, raft_node_id }
 FieldMapping { field_type, dimension }  // dimension for knn_vector only
-IndexSettings { refresh_interval_ms: Option<u64> }  // None = cluster default 5000ms
+IndexSettings { refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // None = cluster defaults (5000ms, 512MB)
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary, replicas, unassigned_replicas }
 IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, settings }
@@ -65,12 +65,15 @@ pub struct ClusterManager { state: Arc<RwLock<ClusterState>> }
 ```rust
 pub struct SettingsManager {
     refresh_interval_tx: watch::Sender<Duration>,
+    flush_threshold_tx: watch::Sender<u64>,
 }
 
 impl SettingsManager {
     pub fn new(initial: &IndexSettings) -> Self
     pub fn watch_refresh_interval(&self) -> watch::Receiver<Duration>  // subscribe
     pub fn refresh_interval(&self) -> Duration                         // current value
+    pub fn watch_flush_threshold(&self) -> watch::Receiver<u64>        // subscribe
+    pub fn flush_threshold(&self) -> u64                               // current value
     pub fn update(&self, new_values: &IndexSettings)                   // push to channels
     pub fn current(&self) -> IndexSettings                             // snapshot
 }
@@ -83,10 +86,16 @@ impl SettingsManager {
 4. Raft replicates → all nodes apply in state machine
 5. `ShardManager::apply_settings(index, new_settings)` called
 6. `SettingsManager::update()` pushes to `watch::Sender`
-7. All `watch::Receiver`s (engine refresh loops) react immediately
+7. All `watch::Receiver`s (engine refresh / auto-flush loops) react immediately
 
 ### Adding a New Reactive Setting
 1. Add field to `IndexSettings`
 2. Add `watch::Sender<T>` + `watch::Receiver<T>` to `SettingsManager`
 3. Detect change in `SettingsManager::update()`
 4. Subscribe in consumer (e.g., engine refresh loop)
+
+### Auto-Flush Setting
+- `flush_threshold_bytes` drives background WAL auto-flush in `CompositeEngine`
+- Default: 512 MB; `0` disables auto-flush
+- The consumer must skip auto-flush while `global_checkpoint == 0`, because `flush_with_global_checkpoint(0)` degrades to full WAL truncation and can discard replica recovery history
+- Background auto-flush should be best-effort: if the shard is already ingesting or persisting vectors, defer the tick instead of blocking foreground writes
