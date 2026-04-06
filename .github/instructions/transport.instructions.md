@@ -72,8 +72,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **sql_record_batch / sql_record_batch_stream**: Execute local shard SQL fast-field reads and return Arrow IPC batches. `SqlRecordBatchStream` may emit multiple batches for the same shard; `batch_size = 0` means use the engine default. Stream responses must carry `total_hits`, `collected_rows`, and actual `streaming_used` metadata on every batch so the coordinator can build accurate `meta` / truncation decisions before draining the rest of the stream. The coordinator-facing live path should prefer `open_sql_batch_stream_to_shard()` so only the first response is read eagerly.
 - **raft_vote / raft_append_entries / raft_snapshot**: Deserialize JSON, forward to Raft instance
-- **create_index / delete_index**: Must be leader; execute via `raft.client_write()`
-- **update_settings**: Must be leader; apply via `UpdateIndex` Raft command
+- **create_index / delete_index**: Must be leader; execute via `raft.client_write()`. `create_index` must preserve index settings from the forwarded JSON body, including `refresh_interval_ms` and `flush_threshold_bytes`.
+- **update_settings**: Must be leader; apply via `UpdateIndex` Raft command. Preserve `flush_threshold_bytes` exactly, including `null` resets and `0` as a valid disable value.
 
 ### Critical Invariants
 - **join_cluster MUST forward on followers**: A follower receiving a JoinCluster RPC must forward it to the Raft leader. It must NEVER fall through to `cluster_manager.add_node()` when Raft is active, as this would add the node to local state without Raft membership.
@@ -81,6 +81,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Shard writes MUST fail on replication failure**: The `index_doc`, `bulk_index`, and `delete_doc` handlers must return `success: false` when `replicate_write()` / `replicate_bulk()` returns `Err`. Logging the error and returning `success: true` violates the synchronous replication contract.
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc`, `replicate_bulk`, and recovery replay must call the explicit-seq engine methods. Do not route replicated writes through local seq allocation APIs.
 - **Write-side shard reopen MUST validate metadata**: `get_or_open_shard()` must return `NOT_FOUND` when the index or shard is absent from cluster state. It must NEVER create a shard with empty mappings/default settings on write or replication paths.
+- **Shard reopen on gRPC paths MUST be async-safe**: `get_or_open_shard()` / `get_or_open_search_shard()` are async helpers and must use `open_shard_with_settings_blocking()` so shard recovery/open does not block tonic's async tasks. Likewise, leader-side delete/publish-state cleanup must use `close_index_shards_blocking()`.
+- **Read-side shard reopen MUST fail closed on UUID mismatch**: `get_or_open_search_shard()` must reject empty UUIDs and missing expected UUID directories instead of creating a fresh shard on a read path.
 - **Transport serialization must fail loudly**: gRPC handlers and clients must not use `unwrap_or_default()` for protocol payloads (`source_json`, `payload_json`, `partial_aggs_json`, Raft snapshot fields). Serialization or decode failures must surface as RPC errors, not empty payloads or silently dropped hits.
 - **Raft snapshot RPCs must require all fields**: missing `vote`, `meta`, or `data` in `RaftSnapshot` is `INVALID_ARGUMENT`, not a defaulted empty snapshot.
 - **ClusterState transport snapshots must be lossless**: startup consumes `JoinCluster` snapshots for shard reopen and orphan cleanup, so proto/domain conversion must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and `uuid` exactly. Never synthesize defaults or new UUIDs during roundtrip, and reject unknown field types instead of coercing them.
@@ -141,6 +143,7 @@ All blocking engine calls in `TransportService` handlers are dispatched to dedic
 - **Search pool** (`search-N` threads): `get_doc`, `search_shard`, `search_shard_dsl`, `sql_record_batch`, `sql_record_batch_stream`, `recover_replica` (WAL I/O)
 - **Write pool** (`write-N` threads): `index_doc`, `bulk_index`, `delete_doc`, `replicate_doc`, `replicate_bulk`, `refresh_index`, `flush_index`
 - The `TransportService` struct holds `worker_pools: WorkerPools` initialized in `create_transport_service*()` constructors.
+- Shard open/close/reopen are separate from engine work: use Tokio blocking-pool wrappers for those filesystem/Tantivy recovery steps before dispatching the steady-state engine call onto rayon.
 
 ### Transport TLS (optional, feature-gated)
 Inter-node gRPC can be encrypted via the `transport-tls` Cargo feature flag. Disabled by default.

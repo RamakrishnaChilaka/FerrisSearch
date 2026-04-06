@@ -92,11 +92,32 @@ impl CompositeEngine {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                if let Err(e) = engine.text.refresh() {
-                    tracing::error!("Background refresh failed: {}", e);
+                if let Err(e) = Self::run_background_maintenance(engine.clone(), None).await {
+                    tracing::error!("Background shard maintenance task failed: {}", e);
                 }
             }
         });
+    }
+
+    async fn run_background_maintenance(
+        engine: Arc<Self>,
+        flush_threshold: Option<u64>,
+    ) -> Result<()> {
+        tokio::task::spawn_blocking(move || {
+            // Commit/truncate/save work is blocking I/O and must stay off the async
+            // scheduler so Raft heartbeats and transport RPCs keep making progress.
+            if let Err(e) = engine.text.refresh() {
+                tracing::error!("Background refresh failed: {}", e);
+            }
+            if let Some(flush_threshold) = flush_threshold
+                && let Err(e) = engine.maybe_auto_flush(flush_threshold)
+            {
+                tracing::error!("Auto-flush failed: {}", e);
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("background shard maintenance task failed: {}", e))?;
+        Ok(())
     }
 
     /// Start a reactive refresh loop that adjusts its interval when the
@@ -105,18 +126,26 @@ impl CompositeEngine {
     /// Uses `tokio::select!` to either:
     /// - Sleep for the current interval, then refresh
     /// - Wake up immediately when the interval setting changes
+    ///
+    /// After each refresh tick, checks the translog size and triggers an
+    /// automatic flush+truncate if it exceeds the configured threshold.
     pub fn start_refresh_loop_reactive(
         engine: Arc<Self>,
         mut refresh_rx: tokio::sync::watch::Receiver<std::time::Duration>,
+        mut flush_threshold_rx: tokio::sync::watch::Receiver<u64>,
     ) {
         tokio::spawn(async move {
             const MIN_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
             let mut interval = (*refresh_rx.borrow_and_update()).max(MIN_REFRESH);
+            let mut flush_threshold = *flush_threshold_rx.borrow_and_update();
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(interval) => {
-                        if let Err(e) = engine.text.refresh() {
-                            tracing::error!("Background refresh failed: {}", e);
+                        if let Err(e) = Self::run_background_maintenance(
+                            engine.clone(),
+                            Some(flush_threshold),
+                        ).await {
+                            tracing::error!("Background shard maintenance task failed: {}", e);
                         }
                     }
                     result = refresh_rx.changed() => {
@@ -132,9 +161,66 @@ impl CompositeEngine {
                             }
                         }
                     }
+                    result = flush_threshold_rx.changed() => {
+                        match result {
+                            Ok(()) => {
+                                flush_threshold = *flush_threshold_rx.borrow_and_update();
+                                tracing::info!("Flush threshold updated to {} bytes", flush_threshold);
+                            }
+                            Err(_) => {
+                                tracing::info!("Flush threshold channel closed, stopping refresh loop");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });
+    }
+
+    fn maybe_auto_flush(&self, flush_threshold: u64) -> Result<bool> {
+        if flush_threshold == 0 {
+            return Ok(false);
+        }
+
+        let tl_size = self.text.translog_size_bytes();
+        if tl_size < flush_threshold {
+            return Ok(false);
+        }
+
+        // `flush_with_global_checkpoint(0)` falls back to full truncation.
+        // A zero checkpoint is ambiguous in this codebase, so skip auto-flush
+        // until it advances past zero instead of risking loss of replica
+        // recovery history.
+        if self.global_checkpoint() == 0 {
+            tracing::debug!(
+                "Skipping auto-flush with translog size {} bytes because global checkpoint is 0",
+                tl_size
+            );
+            return Ok(false);
+        }
+
+        tracing::info!(
+            "Translog size ({} bytes) exceeds threshold ({} bytes), auto-flushing",
+            tl_size,
+            flush_threshold
+        );
+        if !self
+            .text
+            .try_flush_with_global_checkpoint(self.global_checkpoint())?
+        {
+            tracing::debug!(
+                "Skipping auto-flush with translog size {} bytes because the shard is busy ingesting or committing",
+                tl_size
+            );
+            return Ok(false);
+        }
+        if !self.try_save_vectors()? {
+            tracing::debug!(
+                "Deferred vector index save during auto-flush because the vector index is busy"
+            );
+        }
+        Ok(true)
     }
 
     /// Ensure a vector index exists with the given dimensions.
@@ -188,6 +274,17 @@ impl CompositeEngine {
             vi.save(&vector_path)?;
         }
         Ok(())
+    }
+
+    /// Best-effort vector persistence used by background auto-flush.
+    /// Returns `Ok(false)` when the vector lock is poisoned-and-unrecoverable.
+    fn try_save_vectors(&self) -> Result<bool> {
+        let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref vi) = *guard {
+            let vector_path = self.data_dir.join("vectors.usearch");
+            vi.save(&vector_path)?;
+        }
+        Ok(true)
     }
 
     /// Rebuild vector index from all documents in Tantivy.
@@ -1236,6 +1333,106 @@ mod tests {
         // Verify documents are still searchable
         engine.refresh().unwrap();
         assert_eq!(engine.doc_count(), 3);
+    }
+
+    #[test]
+    fn maybe_auto_flush_zero_threshold_disables_auto_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+
+        let before = engine.text.translog_size_bytes();
+        assert!(before > 0);
+
+        let flushed = engine.maybe_auto_flush(0).unwrap();
+
+        assert!(!flushed);
+        assert_eq!(engine.text.translog_size_bytes(), before);
+    }
+
+    #[test]
+    fn maybe_auto_flush_skips_when_global_checkpoint_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+
+        let before = engine.text.translog_size_bytes();
+        assert!(before > 0);
+        assert_eq!(engine.global_checkpoint(), 0);
+
+        let flushed = engine.maybe_auto_flush(1).unwrap();
+
+        assert!(!flushed);
+        assert_eq!(engine.text.translog_size_bytes(), before);
+    }
+
+    #[test]
+    fn maybe_auto_flush_uses_checkpoint_aware_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        engine.add_document("d2", json!({"x": 2})).unwrap();
+        engine.add_document("d3", json!({"x": 3})).unwrap();
+        engine.update_global_checkpoint(1);
+
+        let before = engine.text.translog_size_bytes();
+        let flushed = engine.maybe_auto_flush(1).unwrap();
+        let after = engine.text.translog_size_bytes();
+
+        assert!(flushed);
+        assert!(after > 0);
+        assert!(after < before);
+    }
+
+    #[test]
+    fn maybe_auto_flush_succeeds_with_vectors_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine
+            .add_document("d1", json!({"emb": [1.0, 0.0, 0.0], "x": 1}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"emb": [0.0, 1.0, 0.0], "x": 2}))
+            .unwrap();
+        engine.update_global_checkpoint(1);
+
+        let flushed = engine.maybe_auto_flush(1).unwrap();
+
+        assert!(flushed, "text + vector auto-flush should succeed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_maintenance_tick_does_not_starve_async_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap());
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let lock_engine = engine.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = lock_engine.text.writer_lock_for_test();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let maintenance_engine = engine.clone();
+        let maintenance = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            CompositeEngine::run_background_maintenance(maintenance_engine, None).await
+        });
+
+        let start = std::time::Instant::now();
+        started_rx.await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "background maintenance blocked the async runtime for {:?}",
+            elapsed
+        );
+
+        maintenance.await.unwrap().unwrap();
+        holder.join().unwrap();
     }
 
     // ── Checkpoint auto-update on writes ────────────────────────────────

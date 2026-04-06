@@ -51,6 +51,8 @@ pub struct ClusterStateMachine {
 - Backed by `redb` (embedded key-value store)
 - Persists to `{data_dir}/raft.db`
 - Survives process restarts
+- redb transactions are blocking; any async openraft storage method that touches the database must offload through a Tokio blocking-pool helper such as `run_blocking_io()` rather than lock/read/write inline on an async worker
+- Keep Raft heartbeats, vote handling, and other control-plane futures on Tokio; do not move them to rayon to compensate for blocking disk I/O
 
 ### MemLogStore (src/consensus/store.rs) — tests only
 - In-memory `BTreeMap`

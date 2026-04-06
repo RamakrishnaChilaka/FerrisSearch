@@ -31,6 +31,8 @@ pub trait WriteAheadLog: Send + Sync {
     fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;  // retain above for recovery
     fn last_seq_no(&self) -> u64;
     fn next_seq_no(&self) -> u64;
+    fn size_bytes(&self) -> Result<u64>;  // auto-flush threshold check
+    fn for_each_from(&self, min_seq_no: u64, callback: &mut dyn FnMut(TranslogEntry) -> Result<()>) -> Result<u64>;  // streaming replay
 }
 ```
 
@@ -42,19 +44,23 @@ pub trait WriteAheadLog: Send + Sync {
 - Seq numbers are monotonically increasing, persisted in `.seqno` sidecar file
 
 ### Files on Disk (per shard)
-- `{data_dir}/{index}/shard_{id}/translog.bin` — the WAL file
-- `{data_dir}/{index}/shard_{id}/translog.seqno` — last assigned sequence number
-- `{data_dir}/{index}/shard_{id}/translog.committed` — exclusive committed seq_no used to skip already committed entries on restart
+- `{data_dir}/{index_uuid}/shard_{id}/translog.bin` — the WAL file
+- `{data_dir}/{index_uuid}/shard_{id}/translog.seqno` — last assigned sequence number
+- `{data_dir}/{index_uuid}/shard_{id}/translog.committed` — exclusive committed seq_no used to skip already committed entries on restart
 
 ## Key Behaviors
 - `append()` returns the assigned seq_no in the TranslogEntry
 - `append_with_seq()` persists a caller-supplied seq_no and advances the local allocator past it
 - `write_bulk_with_start_seq()` persists contiguous caller-supplied seq_nos for replica/recovery bulk apply
 - `read_from(seq_no)` reads all entries with seq_no > the given value (used for replica recovery)
+- `for_each_from(seq_no, callback)` streams entries with seq_no >= the given value without loading the whole WAL into memory (used by startup replay)
+- `size_bytes()` returns the current WAL file size so the engine can trigger checkpoint-aware auto-flush
 - `truncate_below(global_checkpoint)` removes entries ≤ global_checkpoint, keeps entries above for replica recovery
 - `truncate()` clears entire log (used on full flush)
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths
-- Async durability: background task fsyncs every `sync_interval_ms` — safe when replicas provide durability
+- Async durability: background task fsyncs every `sync_interval_ms` via Tokio's blocking pool — never call `File::sync_data()` inline on an async worker
+- `scan_max_seq_no_from_path()` must be used on reopen to find the allocator high-water mark without loading every WAL payload into memory
+- `translog.committed` should be persisted after each intermediate replay batch commit so replay remains idempotent across repeated crash recovery
 
 ## Seq Ownership Invariant
 - Primary-originated writes use `append()` / `append_bulk()` and allocate new seq_nos locally

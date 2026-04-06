@@ -345,6 +345,7 @@ import statistics
 import sys
 import threading
 import time
+import json
 
 import pyarrow.parquet as pq
 from opensearchpy import OpenSearch, helpers
@@ -416,12 +417,28 @@ class IngestStats:
         self.ingested = 0
         self.errors = 0
         self.batch_latencies = []
+        self.logged_bulk_error_batches = 0
+        self.logged_exceptions = 0
 
     def add(self, success, errors, latency_ms):
         with self.lock:
             self.ingested += success
             self.errors += errors
             self.batch_latencies.append(latency_ms)
+
+    def should_log_bulk_errors(self):
+        with self.lock:
+            if self.logged_bulk_error_batches >= 5:
+                return None
+            self.logged_bulk_error_batches += 1
+            return self.logged_bulk_error_batches
+
+    def should_log_exception(self):
+        with self.lock:
+            if self.logged_exceptions >= 5:
+                return None
+            self.logged_exceptions += 1
+            return self.logged_exceptions
 
     def snapshot(self):
         with self.lock:
@@ -447,8 +464,19 @@ def worker_fn(work_queue, stats):
             success, errs = helpers.bulk(client, item, raise_on_error=False)
             err_count = len(errs) if isinstance(errs, list) else errs
             stats.add(success, err_count, (time.perf_counter() - start) * 1000)
+            if isinstance(errs, list) and errs:
+                sample_no = stats.should_log_bulk_errors()
+                if sample_no is not None:
+                    print(f"\nBulk error sample {sample_no} ({len(errs)} item errors in batch):")
+                    for err in errs[:3]:
+                        print(json.dumps(err, indent=2, default=str))
         except Exception:
             stats.add(0, len(item), (time.perf_counter() - start) * 1000)
+            sample_no = stats.should_log_exception()
+            if sample_no is not None:
+                exc_type, exc, _ = sys.exc_info()
+                exc_name = exc_type.__name__ if exc_type is not None else "Exception"
+                print(f"\nBulk exception sample {sample_no}: {exc_name}: {exc}")
         work_queue.task_done()
 
 

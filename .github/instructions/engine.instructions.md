@@ -69,7 +69,7 @@ pub struct CompositeEngine {
 
 ### Refresh Loop (reactive)
 ```rust
-// start_refresh_loop_reactive(engine, refresh_rx)
+// start_refresh_loop_reactive(engine, refresh_rx, flush_threshold_rx)
 tokio::select! {
     () = tokio::time::sleep(interval) => { engine.refresh(); }
     result = refresh_rx.changed() => {
@@ -79,7 +79,11 @@ tokio::select! {
 }
 ```
 - Subscribes to `SettingsManager::watch_refresh_interval()` watch channel
-- Reacts to dynamic `refresh_interval_ms` settings changes without restart
+- Subscribes to `SettingsManager::watch_flush_threshold()` for WAL auto-flush
+- Reacts to dynamic `refresh_interval_ms` and `flush_threshold_bytes` settings changes without restart
+- Each refresh/auto-flush tick must run on Tokio's blocking pool (`spawn_blocking`) because `refresh()`, checkpoint-aware truncation, and vector persistence all perform blocking I/O; never run shard maintenance inline on async runtime workers or Raft heartbeats can stall during multi-shard compaction bursts
+- Auto-flush must use `flush_with_global_checkpoint()` and skip the operation entirely when `global_checkpoint == 0`; `flush_with_global_checkpoint(0)` falls back to full WAL truncation
+- Background auto-flush should use best-effort helpers so maintenance ticks defer instead of blocking active ingestion or vector persistence
 
 ### Vector Auto-detection
 - On `add_document()`: scans payload for arrays of numbers
@@ -95,7 +99,10 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - **Dynamic fields**: creates Tantivy fields on first encounter
 - **`body` field**: catch-all for unmapped textual content
 - `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
-- `replay_translog()` — crash recovery from WAL, replaying only entries at or above the persisted committed checkpoint
+- `replay_translog()` — crash recovery from WAL, streaming entries via `for_each_from()` and replaying only entries at or above the persisted committed checkpoint
+- Replay must stay idempotent across repeated crash recovery: delete-before-add on `_id`, commit in batches, and persist `translog.committed` after each intermediate batch commit
+- `translog_size_bytes()` exposes the current WAL size for the auto-flush loop
+- Even the legacy `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used directly; never run Tantivy commit/reload inline on an async interval task
 - Replica/recovery writes use `append_with_seq()` / `write_bulk_with_start_seq()` under the hood so persisted WAL seq_nos match the primary's numbering
 
 ### Field Schema Flags

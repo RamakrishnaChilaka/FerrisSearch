@@ -5,7 +5,7 @@
 //! `MemLogStore` so that the SM worker's log reader sees live data.
 
 use std::io;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -100,6 +100,16 @@ impl DiskLogStore {
     }
 }
 
+async fn run_blocking_io<R, F>(operation: F) -> io::Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce() -> io::Result<R> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|e| io::Error::other(format!("disk-store blocking task failed: {}", e)))?
+}
+
 // ─── RaftLogReader ──────────────────────────────────────────────────────────
 
 impl RaftLogReader<TypeConfig> for DiskLogStore {
@@ -107,22 +117,40 @@ impl RaftLogReader<TypeConfig> for DiskLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<types::Entry>, io::Error> {
-        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = db.begin_read().map_err(Self::io_err)?;
-        let table = tx.open_table(LOG_TABLE).map_err(Self::io_err)?;
+        let start_bound = match range.start_bound() {
+            Bound::Included(value) => Bound::Included(*value),
+            Bound::Excluded(value) => Bound::Excluded(*value),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let end_bound = match range.end_bound() {
+            Bound::Included(value) => Bound::Included(*value),
+            Bound::Excluded(value) => Bound::Excluded(*value),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let store = self.clone();
+        run_blocking_io(move || {
+            let db = store.db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = db.begin_read().map_err(DiskLogStore::io_err)?;
+            let table = tx.open_table(LOG_TABLE).map_err(DiskLogStore::io_err)?;
 
-        let mut entries = Vec::new();
-        for item in table.range(range).map_err(Self::io_err)? {
-            let (_, val) = item.map_err(Self::io_err)?;
-            let entry: types::Entry = serde_json::from_slice(val.value())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            entries.push(entry);
-        }
-        Ok(entries)
+            let mut entries = Vec::new();
+            for item in table
+                .range((start_bound, end_bound))
+                .map_err(DiskLogStore::io_err)?
+            {
+                let (_, val) = item.map_err(DiskLogStore::io_err)?;
+                let entry: types::Entry = serde_json::from_slice(val.value())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                entries.push(entry);
+            }
+            Ok(entries)
+        })
+        .await
     }
 
     async fn read_vote(&mut self) -> Result<Option<types::Vote>, io::Error> {
-        self.read_meta("vote")
+        let store = self.clone();
+        run_blocking_io(move || store.read_meta("vote")).await
     }
 }
 
@@ -132,26 +160,30 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, io::Error> {
-        let last_purged: Option<types::LogId> = self.read_meta("last_purged")?;
+        let store = self.clone();
+        run_blocking_io(move || {
+            let last_purged: Option<types::LogId> = store.read_meta("last_purged")?;
 
-        let last_log_id = {
-            let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-            let tx = db.begin_read().map_err(Self::io_err)?;
-            let table = tx.open_table(LOG_TABLE).map_err(Self::io_err)?;
-            match table.last().map_err(Self::io_err)? {
-                Some((_, val)) => {
-                    let entry: types::Entry = serde_json::from_slice(val.value())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    Some(entry.log_id)
+            let last_log_id = {
+                let db = store.db.lock().unwrap_or_else(|e| e.into_inner());
+                let tx = db.begin_read().map_err(DiskLogStore::io_err)?;
+                let table = tx.open_table(LOG_TABLE).map_err(DiskLogStore::io_err)?;
+                match table.last().map_err(DiskLogStore::io_err)? {
+                    Some((_, val)) => {
+                        let entry: types::Entry = serde_json::from_slice(val.value())
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        Some(entry.log_id)
+                    }
+                    None => None,
                 }
-                None => None,
-            }
-        };
+            };
 
-        Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id: last_log_id.or(last_purged),
+            Ok(LogState {
+                last_purged_log_id: last_purged,
+                last_log_id: last_log_id.or(last_purged),
+            })
         })
+        .await
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -159,18 +191,23 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
     }
 
     async fn save_vote(&mut self, vote: &types::Vote) -> Result<(), io::Error> {
-        self.write_meta("vote", vote)
+        let store = self.clone();
+        let vote = *vote;
+        run_blocking_io(move || store.write_meta("vote", &vote)).await
     }
 
     async fn save_committed(&mut self, committed: Option<types::LogId>) -> Result<(), io::Error> {
-        match committed {
-            Some(ref c) => self.write_meta("committed", c),
-            None => self.delete_meta("committed"),
-        }
+        let store = self.clone();
+        run_blocking_io(move || match committed {
+            Some(c) => store.write_meta("committed", &c),
+            None => store.delete_meta("committed"),
+        })
+        .await
     }
 
     async fn read_committed(&mut self) -> Result<Option<types::LogId>, io::Error> {
-        self.read_meta("committed")
+        let store = self.clone();
+        run_blocking_io(move || store.read_meta("committed")).await
     }
 
     async fn append<I>(
@@ -182,92 +219,110 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
         I: IntoIterator<Item = types::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        {
-            let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-            let tx = db.begin_write().map_err(Self::io_err)?;
+        let store = self.clone();
+        let entries: Vec<types::Entry> = entries.into_iter().collect();
+        run_blocking_io(move || {
+            let db = store.db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = db.begin_write().map_err(DiskLogStore::io_err)?;
             {
-                let mut table = tx.open_table(LOG_TABLE).map_err(Self::io_err)?;
+                let mut table = tx.open_table(LOG_TABLE).map_err(DiskLogStore::io_err)?;
                 for entry in entries {
                     let idx = entry.log_id.index;
                     let data = serde_json::to_vec(&entry)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    table.insert(idx, data.as_slice()).map_err(Self::io_err)?;
+                    table
+                        .insert(idx, data.as_slice())
+                        .map_err(DiskLogStore::io_err)?;
                 }
             }
-            tx.commit().map_err(Self::io_err)?;
-        }
+            tx.commit().map_err(DiskLogStore::io_err)?;
+            Ok(())
+        })
+        .await?;
         callback.io_completed(Ok(()));
         Ok(())
     }
 
     async fn truncate_after(&mut self, last_log_id: Option<types::LogId>) -> Result<(), io::Error> {
-        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = db.begin_write().map_err(Self::io_err)?;
-        {
-            let mut table = tx.open_table(LOG_TABLE).map_err(Self::io_err)?;
-            match last_log_id {
-                Some(id) => {
-                    // Collect keys to remove (everything after id.index)
-                    let keys: Vec<u64> = {
-                        let read_tx = db.begin_read().map_err(Self::io_err)?;
-                        let read_table = read_tx.open_table(LOG_TABLE).map_err(Self::io_err)?;
-                        read_table
-                            .range((id.index + 1)..)
-                            .map_err(Self::io_err)?
-                            .map(|item| item.map(|(k, _)| k.value()))
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(Self::io_err)?
-                    };
-                    for k in keys {
-                        table.remove(k).map_err(Self::io_err)?;
+        let store = self.clone();
+        run_blocking_io(move || {
+            let db = store.db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = db.begin_write().map_err(DiskLogStore::io_err)?;
+            {
+                let mut table = tx.open_table(LOG_TABLE).map_err(DiskLogStore::io_err)?;
+                match last_log_id {
+                    Some(id) => {
+                        let keys: Vec<u64> = {
+                            let read_tx = db.begin_read().map_err(DiskLogStore::io_err)?;
+                            let read_table = read_tx
+                                .open_table(LOG_TABLE)
+                                .map_err(DiskLogStore::io_err)?;
+                            read_table
+                                .range((id.index + 1)..)
+                                .map_err(DiskLogStore::io_err)?
+                                .map(|item| item.map(|(k, _)| k.value()))
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(DiskLogStore::io_err)?
+                        };
+                        for key in keys {
+                            table.remove(key).map_err(DiskLogStore::io_err)?;
+                        }
                     }
-                }
-                None => {
-                    // Remove all — drain the table
-                    let keys: Vec<u64> = {
-                        let read_tx = db.begin_read().map_err(Self::io_err)?;
-                        let read_table = read_tx.open_table(LOG_TABLE).map_err(Self::io_err)?;
-                        read_table
-                            .iter()
-                            .map_err(Self::io_err)?
-                            .map(|item| item.map(|(k, _)| k.value()))
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(Self::io_err)?
-                    };
-                    for k in keys {
-                        table.remove(k).map_err(Self::io_err)?;
+                    None => {
+                        let keys: Vec<u64> = {
+                            let read_tx = db.begin_read().map_err(DiskLogStore::io_err)?;
+                            let read_table = read_tx
+                                .open_table(LOG_TABLE)
+                                .map_err(DiskLogStore::io_err)?;
+                            read_table
+                                .iter()
+                                .map_err(DiskLogStore::io_err)?
+                                .map(|item| item.map(|(k, _)| k.value()))
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(DiskLogStore::io_err)?
+                        };
+                        for key in keys {
+                            table.remove(key).map_err(DiskLogStore::io_err)?;
+                        }
                     }
                 }
             }
-        }
-        tx.commit().map_err(Self::io_err)?;
-        Ok(())
+            tx.commit().map_err(DiskLogStore::io_err)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn purge(&mut self, upto: types::LogId) -> Result<(), io::Error> {
-        {
-            let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-            let tx = db.begin_write().map_err(Self::io_err)?;
+        let store = self.clone();
+        run_blocking_io(move || {
             {
-                let mut table = tx.open_table(LOG_TABLE).map_err(Self::io_err)?;
-                let keys: Vec<u64> = {
-                    let read_tx = db.begin_read().map_err(Self::io_err)?;
-                    let read_table = read_tx.open_table(LOG_TABLE).map_err(Self::io_err)?;
-                    read_table
-                        .range(..=upto.index)
-                        .map_err(Self::io_err)?
-                        .map(|item| item.map(|(k, _)| k.value()))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(Self::io_err)?
-                };
-                for k in keys {
-                    table.remove(k).map_err(Self::io_err)?;
+                let db = store.db.lock().unwrap_or_else(|e| e.into_inner());
+                let tx = db.begin_write().map_err(DiskLogStore::io_err)?;
+                {
+                    let mut table = tx.open_table(LOG_TABLE).map_err(DiskLogStore::io_err)?;
+                    let keys: Vec<u64> = {
+                        let read_tx = db.begin_read().map_err(DiskLogStore::io_err)?;
+                        let read_table = read_tx
+                            .open_table(LOG_TABLE)
+                            .map_err(DiskLogStore::io_err)?;
+                        read_table
+                            .range(..=upto.index)
+                            .map_err(DiskLogStore::io_err)?
+                            .map(|item| item.map(|(k, _)| k.value()))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(DiskLogStore::io_err)?
+                    };
+                    for key in keys {
+                        table.remove(key).map_err(DiskLogStore::io_err)?;
+                    }
                 }
+                tx.commit().map_err(DiskLogStore::io_err)?;
             }
-            tx.commit().map_err(Self::io_err)?;
-        }
-        self.write_meta("last_purged", &upto)?;
-        Ok(())
+            store.write_meta("last_purged", &upto)?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -320,6 +375,41 @@ mod tests {
         assert!(state.last_log_id.is_none());
         assert!(store.read_vote().await.unwrap().is_none());
         assert!(store.read_committed().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_vote_does_not_starve_runtime_when_db_mutex_is_busy() {
+        let store = temp_store();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let db = store.db.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = db.lock().unwrap_or_else(|e| e.into_inner());
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let read_task = tokio::spawn(async move {
+            let mut store = store;
+            let _ = started_tx.send(());
+            store.read_vote().await.unwrap()
+        });
+
+        let start = std::time::Instant::now();
+        started_rx.await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "disk-store read wrapper stalled the async runtime for {:?}",
+            elapsed
+        );
+
+        read_task.await.unwrap();
+        holder.join().unwrap();
     }
 
     #[tokio::test]

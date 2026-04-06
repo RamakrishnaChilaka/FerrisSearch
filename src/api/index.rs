@@ -19,7 +19,7 @@ pub(crate) struct DistributedDslSearchResult {
     pub partial_aggs: Vec<HashMap<String, crate::search::PartialAggResult>>,
 }
 
-pub(crate) fn ensure_local_index_shards_open(
+pub(crate) async fn ensure_local_index_shards_open(
     state: &AppState,
     index_name: &str,
     metadata: &IndexMetadata,
@@ -40,13 +40,43 @@ pub(crate) fn ensure_local_index_shards_open(
             continue;
         }
 
-        if let Err(e) = state.shard_manager.open_shard_with_settings(
-            index_name,
-            *shard_id,
-            &metadata.mappings,
-            &metadata.settings,
-            &metadata.uuid,
-        ) {
+        if !metadata.has_uuid() {
+            tracing::error!(
+                "{}: refusing to reopen shard {}/{} without an authoritative index UUID",
+                context,
+                index_name,
+                shard_id
+            );
+            continue;
+        }
+
+        let expected_dir = state
+            .shard_manager
+            .data_dir()
+            .join(&metadata.uuid)
+            .join(format!("shard_{}", shard_id));
+        if !expected_dir.exists() {
+            tracing::error!(
+                "{}: refusing to create fresh shard data for {}/{} on a read/maintenance path because {:?} is missing",
+                context,
+                index_name,
+                shard_id,
+                expected_dir
+            );
+            continue;
+        }
+
+        if let Err(e) = state
+            .shard_manager
+            .open_shard_with_settings_blocking(
+                index_name.to_string(),
+                *shard_id,
+                metadata.mappings.clone(),
+                metadata.settings.clone(),
+                metadata.uuid.clone(),
+            )
+            .await
+        {
             tracing::error!(
                 "{}: failed to open shard {}/{}: {}",
                 context,
@@ -58,6 +88,24 @@ pub(crate) fn ensure_local_index_shards_open(
     }
 
     state.shard_manager.get_index_shards(index_name)
+}
+
+async fn wait_for_index_metadata(state: &AppState, index_name: &str) -> Option<IndexMetadata> {
+    const MAX_ATTEMPTS: usize = 20;
+    const RETRY_DELAY_MS: u64 = 50;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let cluster_state = state.cluster_manager.get_state();
+        if let Some(metadata) = cluster_state.indices.get(index_name) {
+            return Some(metadata.clone());
+        }
+
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+    }
+
+    None
 }
 
 /// Auto-create an index with 1 shard, respecting the coordinator pattern.
@@ -89,7 +137,7 @@ async fn auto_create_index(
         mappings: HashMap::new(),
         settings: crate::cluster::state::IndexSettings::default(),
     };
-    if let Some(ref raft) = state.raft {
+    let created_metadata = if let Some(ref raft) = state.raft {
         if !raft.is_leader() {
             // Forward auto-create to the leader via gRPC
             let master_id = match cluster_state.master_node.as_ref() {
@@ -121,15 +169,19 @@ async fn auto_create_index(
                 .forward_create_index(&master_node, index_name, &body_bytes)
                 .await
             {
-                Ok(_) => {
-                    // Re-read cluster state after leader has created the index
-                    let updated_cs = state.cluster_manager.get_state();
-                    if let Some(created_meta) = updated_cs.indices.get(index_name) {
-                        return Ok(created_meta.clone());
+                Ok(_) => match wait_for_index_metadata(state, index_name).await {
+                    Some(metadata) => metadata,
+                    None => {
+                        return Err(crate::api::error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "master_not_discovered_exception",
+                            format!(
+                                "Index [{}] was created by the leader but the local cluster state has not caught up yet",
+                                index_name
+                            ),
+                        ));
                     }
-                    // Raft replication may not have arrived yet; use our local metadata
-                    return Ok(m);
-                }
+                },
                 Err(e) => {
                     return Err(crate::api::error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -138,25 +190,55 @@ async fn auto_create_index(
                     ));
                 }
             }
-        }
-        let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
-            metadata: m.clone(),
-        };
-        if let Err(e) = raft.client_write(cmd).await {
-            return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "raft_write_exception",
-                format!("Auto-create index via Raft failed: {}", e),
-            ));
+        } else {
+            let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
+                metadata: m.clone(),
+            };
+            if let Err(e) = raft.client_write(cmd).await {
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "raft_write_exception",
+                    format!("Auto-create index via Raft failed: {}", e),
+                ));
+            }
+            wait_for_index_metadata(state, index_name)
+                .await
+                .unwrap_or_else(|| m.clone())
         }
     } else {
         let mut new_state = cluster_state.clone();
         new_state.add_index(m.clone());
         state.cluster_manager.update_state(new_state.clone());
         state.transport_client.publish_state(&new_state).await;
+        m.clone()
+    };
+
+    if let Some(routing) = created_metadata.shard_routing.get(&0)
+        && (routing.primary == state.local_node_id
+            || routing
+                .replicas
+                .iter()
+                .any(|node_id| node_id == &state.local_node_id))
+        && let Err(e) = state
+            .shard_manager
+            .open_shard_with_settings_blocking(
+                created_metadata.name.clone(),
+                0,
+                created_metadata.mappings.clone(),
+                created_metadata.settings.clone(),
+                created_metadata.uuid.clone(),
+            )
+            .await
+    {
+        tracing::error!(
+            "Failed to open auto-created shard {}/0 with authoritative UUID {}: {}",
+            created_metadata.name,
+            created_metadata.uuid,
+            e
+        );
     }
-    let _ = state.shard_manager.open_shard(index_name, 0);
-    Ok(m)
+
+    Ok(created_metadata)
 }
 
 /// Query parameter for `?refresh=true|false|wait_for`.
@@ -218,6 +300,9 @@ pub async fn create_index(
     let refresh_interval_ms = settings
         .pointer("/settings/refresh_interval_ms")
         .and_then(|v| v.as_u64());
+    let flush_threshold_bytes = settings
+        .pointer("/settings/flush_threshold_bytes")
+        .and_then(|v| v.as_u64());
 
     let cluster_state = state.cluster_manager.get_state();
 
@@ -251,6 +336,9 @@ pub async fn create_index(
     // Apply per-index settings
     if let Some(ms) = refresh_interval_ms {
         metadata.settings.refresh_interval_ms = Some(ms);
+    }
+    if let Some(bytes) = flush_threshold_bytes {
+        metadata.settings.flush_threshold_bytes = Some(bytes);
     }
 
     // Parse field mappings: { "mappings": { "properties": { "title": { "type": "text" }, ... } } }
@@ -373,13 +461,16 @@ pub async fn create_index(
     for (shard_id, routing) in &shard_assignment {
         if (routing.primary == state.local_node_id
             || routing.replicas.contains(&state.local_node_id))
-            && let Err(e) = state.shard_manager.open_shard_with_settings(
-                &index_name,
-                *shard_id,
-                &index_mappings,
-                &index_settings,
-                &index_uuid,
-            )
+            && let Err(e) = state
+                .shard_manager
+                .open_shard_with_settings_blocking(
+                    index_name.clone(),
+                    *shard_id,
+                    index_mappings.clone(),
+                    index_settings.clone(),
+                    index_uuid.clone(),
+                )
+                .await
         {
             tracing::error!(
                 "Failed to open shard {} for {}: {}",
@@ -660,7 +751,8 @@ async fn fan_out_maintenance(state: &AppState, index_name: &str, op: Maintenance
     // Local shards — dispatch to write pool
     let cs = state.cluster_manager.get_state();
     if let Some(meta) = cs.indices.get(index_name) {
-        let local_shards = ensure_local_index_shards_open(state, index_name, meta, "Maintenance");
+        let local_shards =
+            ensure_local_index_shards_open(state, index_name, meta, "Maintenance").await;
         let is_flush = matches!(op, MaintenanceOp::Flush);
         for (_, engine) in local_shards {
             let result = state
@@ -828,7 +920,7 @@ async fn forward_bulk_batches(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
     routed_docs: &[RoutedBulkDoc],
-) -> std::collections::HashSet<BulkTargetKey> {
+) -> HashMap<BulkTargetKey, String> {
     let mut shard_batches: HashMap<BulkTargetKey, Vec<(String, Value)>> = HashMap::new();
     for doc in routed_docs {
         shard_batches
@@ -839,7 +931,7 @@ async fn forward_bulk_batches(
 
     let mut futures = Vec::new();
     let mut shard_keys = Vec::new();
-    let mut failed_targets = std::collections::HashSet::new();
+    let mut failed_targets = HashMap::new();
 
     for ((index_name, node_id, shard_id), batch) in shard_batches {
         if let Some(node_info) = cluster_state.nodes.get(&node_id) {
@@ -853,14 +945,23 @@ async fn forward_bulk_batches(
             }));
             shard_keys.push((index_name, node_id, shard_id));
         } else {
-            failed_targets.insert((index_name, node_id, shard_id));
+            failed_targets.insert(
+                (index_name, node_id, shard_id),
+                "Primary node missing from cluster state".to_string(),
+            );
         }
     }
 
     let results = join_all(futures).await;
     for (key, result) in shard_keys.into_iter().zip(results.into_iter()) {
-        if !matches!(result, Ok(Ok(_))) {
-            failed_targets.insert(key);
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                failed_targets.insert(key, e.to_string());
+            }
+            Err(join_err) => {
+                failed_targets.insert(key, format!("bulk forwarding task failed: {}", join_err));
+            }
         }
     }
 
@@ -870,17 +971,17 @@ async fn forward_bulk_batches(
 fn finalize_bulk_items(
     mut item_results: Vec<Option<Value>>,
     routed_docs: Vec<RoutedBulkDoc>,
-    failed_targets: &std::collections::HashSet<BulkTargetKey>,
+    failed_targets: &HashMap<BulkTargetKey, String>,
 ) -> Vec<Value> {
     for doc in routed_docs {
         let target = (doc.index_name.clone(), doc.node_id.clone(), doc.shard_id);
-        let item = if failed_targets.contains(&target) {
+        let item = if let Some(reason) = failed_targets.get(&target) {
             bulk_error_item(
                 Some(&doc.index_name),
                 &doc.doc_id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "shard_failure",
-                "Failed to index to shard",
+                reason,
             )
         } else {
             bulk_success_item(&doc.index_name, &doc.doc_id)
@@ -1226,7 +1327,8 @@ pub(crate) async fn execute_distributed_dsl_search(
 
     let mut all_partial_aggs: Vec<HashMap<String, crate::search::PartialAggResult>> = Vec::new();
 
-    let local_shards = ensure_local_index_shards_open(state, index_name, &metadata, "DSL search");
+    let local_shards =
+        ensure_local_index_shards_open(state, index_name, &metadata, "DSL search").await;
 
     // Dispatch all local shard searches in parallel
     let search_futures: Vec<_> = local_shards
@@ -1751,6 +1853,7 @@ pub async fn get_index_settings(
                         "number_of_shards": metadata.number_of_shards,
                         "number_of_replicas": metadata.number_of_replicas,
                         "refresh_interval_ms": metadata.settings.refresh_interval_ms,
+                        "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
                     }
                 }
             }
@@ -1763,6 +1866,7 @@ pub async fn get_index_settings(
 /// Supported dynamic settings:
 /// - `index.number_of_replicas` (u32) — adjusts replica count
 /// - `index.refresh_interval_ms` (u64 | null) — per-index refresh interval
+/// - `index.flush_threshold_bytes` (u64 | null) — auto-flush threshold for the WAL
 ///
 /// Immutable settings (rejected with 400):
 /// - `index.number_of_shards`
@@ -1772,7 +1876,8 @@ pub async fn get_index_settings(
 /// {
 ///   "index": {
 ///     "number_of_replicas": 2,
-///     "refresh_interval_ms": 10000
+///     "refresh_interval_ms": 10000,
+///     "flush_threshold_bytes": 536870912
 ///   }
 /// }
 /// ```
@@ -1835,6 +1940,21 @@ pub async fn update_index_settings(
             && metadata.settings.refresh_interval_ms != Some(ms)
         {
             metadata.settings.refresh_interval_ms = Some(ms);
+            changed = true;
+        }
+    }
+
+    // Update flush_threshold_bytes
+    if let Some(val) = body.pointer("/index/flush_threshold_bytes") {
+        if val.is_null() {
+            if metadata.settings.flush_threshold_bytes.is_some() {
+                metadata.settings.flush_threshold_bytes = None;
+                changed = true;
+            }
+        } else if let Some(bytes) = val.as_u64()
+            && metadata.settings.flush_threshold_bytes != Some(bytes)
+        {
+            metadata.settings.flush_threshold_bytes = Some(bytes);
             changed = true;
         }
     }
@@ -2002,7 +2122,11 @@ pub async fn delete_index(
     }
 
     // Close local shard engines and delete data
-    if let Err(e) = state.shard_manager.close_index_shards(&index_name) {
+    if let Err(e) = state
+        .shard_manager
+        .close_index_shards_blocking(index_name.clone())
+        .await
+    {
         tracing::error!("Failed to close shards for index '{}': {}", index_name, e);
     }
 
@@ -2183,7 +2307,7 @@ mod tests {
         }
         IndexMetadata {
             name: "idx".into(),
-            uuid: String::new(),
+            uuid: "idx-uuid".into(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -2279,6 +2403,121 @@ mod tests {
         assert_eq!(
             body["items"][0]["index"]["error"]["type"],
             "action_request_validation_exception"
+        );
+    }
+
+    #[test]
+    fn finalize_bulk_items_preserves_shard_error_reason() {
+        let routed_docs = vec![RoutedBulkDoc {
+            position: 0,
+            index_name: "idx".into(),
+            doc_id: "doc-1".into(),
+            payload: serde_json::json!({"title": "hello"}),
+            shard_id: 0,
+            node_id: "node-1".into(),
+        }];
+        let failed_targets = HashMap::from([(
+            ("idx".to_string(), "node-1".to_string(), 0),
+            "Shard bulk index failed: Replication failed: replica node-2 timed out".to_string(),
+        )]);
+
+        let items = finalize_bulk_items(vec![None], routed_docs, &failed_targets);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["index"]["status"], 500);
+        assert_eq!(items[0]["index"]["error"]["type"], "shard_failure");
+        assert_eq!(
+            items[0]["index"]["error"]["reason"],
+            "Shard bulk index failed: Replication failed: replica node-2 timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_index_applies_flush_threshold_setting() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        let (_tmp, state) = make_test_app_state(cluster_state);
+
+        let body = axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "flush_threshold_bytes": 4096
+                }
+            }))
+            .unwrap(),
+        );
+
+        let (status, _) = create_index(State(state.clone()), Path("idx".to_string()), body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let created = state.cluster_manager.get_state();
+        assert_eq!(
+            created.indices["idx"].settings.flush_threshold_bytes,
+            Some(4096)
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_create_index_opens_local_shard_with_cluster_uuid() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        let (_tmp, state) = make_test_app_state(cluster_state.clone());
+
+        let metadata = auto_create_index(&state, "auto-idx", &cluster_state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.shard_manager.index_uuid("auto-idx"),
+            Some(metadata.uuid.clone())
+        );
+        assert!(state.shard_manager.get_shard("auto-idx", 0).is_some());
+    }
+
+    #[tokio::test]
+    async fn get_index_settings_includes_flush_threshold_setting() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        let mut metadata = make_test_metadata(Some("node-1"));
+        metadata.settings.flush_threshold_bytes = Some(8192);
+        cluster_state.add_index(metadata);
+
+        let (_tmp, state) = make_test_app_state(cluster_state);
+        let (status, Json(body)) = get_index_settings(State(state), Path("idx".to_string())).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["idx"]["settings"]["index"]["flush_threshold_bytes"],
+            8192
+        );
+    }
+
+    #[tokio::test]
+    async fn update_index_settings_updates_flush_threshold_setting() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        cluster_state.add_index(make_test_metadata(Some("node-1")));
+
+        let (_tmp, state) = make_test_app_state(cluster_state);
+        let (status, Json(body)) = update_index_settings(
+            State(state.clone()),
+            Path("idx".to_string()),
+            Json(serde_json::json!({
+                "index": {
+                    "flush_threshold_bytes": 16384
+                }
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["acknowledged"], true);
+        let updated = state.cluster_manager.get_state();
+        assert_eq!(
+            updated.indices["idx"].settings.flush_threshold_bytes,
+            Some(16384)
         );
     }
 }

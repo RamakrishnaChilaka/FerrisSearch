@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **832 unit tests** (`cargo test --lib`)
-- **62 CLI tests** (`cargo test --bin ferris-cli`)
+- **874 unit tests** (`cargo test --lib`)
+- **64 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **40 replication integration tests** (`cargo test --test replication_integration`)
 - **38 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 170 assertions across 4 files
-- **1006 total** (`cargo test`)
+- **1050 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -25,6 +25,11 @@ cargo test -- test_name                         # Single test by name
 - Use `#[tokio::test]` for async tests
 - Use `tempfile::TempDir` for isolated data directories
 - Test every code path: happy path, edge cases, error conditions, empty inputs
+- For WAL auto-flush or replay changes, add regressions for disabled thresholds (`flush_threshold_bytes = 0`), zero global checkpoint safety (no auto-truncate), and stale `translog.committed` checkpoints that force a replayed suffix after a prior batch commit.
+- For auto-flush concurrency changes, add regressions proving maintenance ticks defer instead of blocking when the text flush path or vector persistence path is already busy.
+- For maintenance scheduling changes, add a `#[tokio::test(flavor = "current_thread")]` regression that blocks the Tantivy writer lock from another thread and proves the async runtime still makes progress while the maintenance tick waits.
+- For async scheduling changes around shard open/close, orphan cleanup, translog fsync, redb-backed Raft storage, or other blocking wrappers, add a `#[tokio::test(flavor = "current_thread")]` regression that holds the relevant lock or resource from another thread and proves the runtime still advances while the wrapper waits.
+- For index UUID / orphan-cleanup fixes, add a regression that an auto-created index opens its local shard with the same UUID stored in cluster state, plus a restart-path regression that missing expected UUID directories cause cleanup to bail out instead of deleting unknown shard data.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For SQL identifier case-sensitivity fixes, add helper-level canonicalization coverage plus REST regressions for both buffered and streamed SQL endpoints using real mixed-case mapping fields, and cover both unquoted source references and quoted exact-identifier preservation on the residual/DataFusion path.

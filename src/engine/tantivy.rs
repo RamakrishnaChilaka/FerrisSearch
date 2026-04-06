@@ -40,6 +40,8 @@ pub struct HotEngine {
     column_cache: Arc<super::column_cache::ColumnCache>,
 }
 
+const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 10_000;
+
 impl HotEngine {
     pub fn new<P: AsRef<Path>>(data_dir: P, refresh_interval: Duration) -> Result<Self> {
         Self::new_with_mappings(
@@ -709,52 +711,77 @@ impl HotEngine {
         doc
     }
 
-    /// Replays all pending translog entries into the Tantivy buffer.
+    /// Replays pending translog entries into the Tantivy buffer in a streaming
+    /// fashion — entries are never all held in memory at once.
     /// Called on startup to recover from an unclean shutdown.
     fn replay_translog(&self) -> Result<()> {
         let committed_next_seq = self.load_committed_next_seq_no()?;
-        let entries = {
+
+        let mut replayed: u64 = 0;
+        let mut last_seq: u64 = committed_next_seq;
+        let mut batch_count: u64 = 0;
+
+        let id_field = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .id_field;
+
+        {
             let tl = self.translog.lock().unwrap();
-            tl.read_all()?
-                .into_iter()
-                .filter(|entry| entry.seq_no >= committed_next_seq)
-                .collect::<Vec<_>>()
-        };
+            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
 
-        if entries.is_empty() {
-            return Ok(());
+            tl.for_each_from(committed_next_seq, &mut |entry| {
+                if replayed == 0 {
+                    tracing::warn!(
+                        "Replaying translog entries from seq_no {} after restart...",
+                        committed_next_seq
+                    );
+                }
+
+                let doc_id = entry
+                    .payload
+                    .get("_doc_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let source = entry.payload.get("_source").unwrap_or(&entry.payload);
+
+                // Delete-before-add (upsert) so replay is idempotent even if
+                // a previous replay was interrupted after an intermediate commit.
+                writer.delete_term(Term::from_field_text(id_field, doc_id));
+                let doc = self.build_tantivy_doc(doc_id, source);
+                writer.add_document(doc)?;
+
+                last_seq = entry.seq_no;
+                replayed += 1;
+                batch_count += 1;
+
+                // Intermediate commit to cap writer memory usage.
+                // Persist the checkpoint so a crash here won't re-replay
+                // entries that are already committed to Tantivy segments.
+                if batch_count >= TRANSLOG_REPLAY_BATCH_SIZE {
+                    writer.commit()?;
+                    self.persist_committed_next_seq_no(last_seq + 1)?;
+                    batch_count = 0;
+                }
+
+                Ok(())
+            })?;
+
+            // Final commit for any remaining entries
+            if batch_count > 0 {
+                writer.commit()?;
+            }
         }
 
-        tracing::warn!(
-            "Replaying {} translog entries from seq_no {} after restart...",
-            entries.len(),
-            committed_next_seq
-        );
-
-        let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        for entry in &entries {
-            let doc_id = entry
-                .payload
-                .get("_doc_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let source = entry.payload.get("_source").unwrap_or(&entry.payload);
-            let doc = self.build_tantivy_doc(doc_id, source);
-            writer.add_document(doc)?;
+        if replayed > 0 {
+            self.reader.reload()?;
+            self.persist_committed_next_seq_no(last_seq + 1)?;
+            tracing::info!(
+                "Translog replay complete. {} documents recovered.",
+                replayed
+            );
         }
-        writer.commit()?;
-        self.reader.reload()?;
-        self.persist_committed_next_seq_no(
-            entries
-                .last()
-                .map(|entry| entry.seq_no + 1)
-                .unwrap_or(committed_next_seq),
-        )?;
-
-        tracing::info!(
-            "Translog replay complete. {} documents recovered.",
-            entries.len()
-        );
         Ok(())
     }
 
@@ -779,11 +806,25 @@ impl HotEngine {
             tracing::info!("Index refresh loop started (interval: {:?})", interval);
             loop {
                 tokio::time::sleep(interval).await;
-                if let Err(e) = engine.refresh() {
-                    tracing::error!("Background refresh failed: {}", e);
+                let engine = engine.clone();
+                match tokio::task::spawn_blocking(move || engine.refresh()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!("Background refresh failed: {}", e);
+                    }
+                    Err(e) => {
+                        tracing::error!("Background refresh task failed: {}", e);
+                    }
                 }
             }
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writer_lock_for_test(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, tantivy::IndexWriter> {
+        self.writer.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Shared search execution helper — returns _id + _source from each hit.
@@ -1037,6 +1078,39 @@ impl HotEngine {
     pub fn last_seq_no(&self) -> u64 {
         let tl = self.translog.lock().unwrap();
         tl.last_seq_no()
+    }
+
+    /// Return the current on-disk size of the translog in bytes.
+    pub fn translog_size_bytes(&self) -> u64 {
+        let tl = self.translog.lock().unwrap();
+        tl.size_bytes().unwrap_or(0)
+    }
+
+    /// Best-effort checkpoint-aware flush used by background auto-flush.
+    /// Returns `Ok(false)` when a foreground write or another commit path is
+    /// already holding the required locks, so ingestion is not blocked.
+    pub fn try_flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<bool> {
+        let tl = match self.translog.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        let committed_next_seq = tl.next_seq_no();
+        let mut writer = match self.writer.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        writer.commit()?;
+        drop(writer);
+        self.reader.reload()?;
+        self.persist_committed_next_seq_no(committed_next_seq)?;
+        if global_checkpoint > 0 {
+            tl.truncate_below(global_checkpoint)?;
+        } else {
+            tl.truncate()?;
+        }
+        Ok(true)
     }
 
     pub fn flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<()> {
@@ -3480,7 +3554,9 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
 
 impl super::SearchEngine for HotEngine {
     fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String> {
-        // 1. Write to translog — durable before anything else
+        // Keep WAL append and the corresponding writer mutation in one critical
+        // section so refresh/flush cannot commit past a translog entry that has
+        // not yet been applied to the Tantivy writer.
         {
             let tl = self.translog.lock().unwrap();
             let wal_entry = serde_json::json!({
@@ -3488,20 +3564,20 @@ impl super::SearchEngine for HotEngine {
                 "_source": payload
             });
             tl.append("index", wal_entry)?;
+
+            // 2. Delete any existing doc with same _id (upsert semantics)
+            let id_field = self
+                .field_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .id_field;
+            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            writer.delete_term(Term::from_field_text(id_field, doc_id));
+
+            // 3. Write to Tantivy in-memory buffer
+            let doc = self.build_tantivy_doc(doc_id, &payload);
+            writer.add_document(doc)?;
         }
-
-        // 2. Delete any existing doc with same _id (upsert semantics)
-        let id_field = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .id_field;
-        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        writer.delete_term(Term::from_field_text(id_field, doc_id));
-
-        // 3. Write to Tantivy in-memory buffer
-        let doc = self.build_tantivy_doc(doc_id, &payload);
-        writer.add_document(doc)?;
 
         Ok(doc_id.to_string())
     }
@@ -3519,47 +3595,47 @@ impl super::SearchEngine for HotEngine {
                 "_source": payload
             });
             tl.append_with_seq(seq_no, "index", wal_entry)?;
+
+            let id_field = self
+                .field_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .id_field;
+            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            writer.delete_term(Term::from_field_text(id_field, doc_id));
+
+            let doc = self.build_tantivy_doc(doc_id, &payload);
+            writer.add_document(doc)?;
         }
-
-        let id_field = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .id_field;
-        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        writer.delete_term(Term::from_field_text(id_field, doc_id));
-
-        let doc = self.build_tantivy_doc(doc_id, &payload);
-        writer.add_document(doc)?;
 
         Ok(doc_id.to_string())
     }
 
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
-        // 1. Write all ops to translog with a single fsync (write_bulk skips entry construction)
+        // Keep WAL persistence and writer mutation serialized with refresh/flush.
         let ops: Vec<(&str, serde_json::Value)> = docs
             .iter()
             .map(|(id, p)| ("index", serde_json::json!({ "_doc_id": id, "_source": p })))
             .collect();
+        let mut doc_ids = Vec::with_capacity(docs.len());
         {
             let tl = self.translog.lock().unwrap();
             tl.write_bulk(&ops)?;
-        }
 
-        // 2. Write all docs to Tantivy in-memory buffer under one lock
-        // Acquire registry once for the entire batch (not per-doc)
-        let registry = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        let mut doc_ids = Vec::with_capacity(docs.len());
-        for (doc_id, payload) in &docs {
-            writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-            let doc =
-                Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload);
-            writer.add_document(doc)?;
-            doc_ids.push(doc_id.clone());
+            // 2. Write all docs to Tantivy in-memory buffer under one lock
+            // Acquire registry once for the entire batch (not per-doc)
+            let registry = self
+                .field_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            for (doc_id, payload) in &docs {
+                writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
+                let doc =
+                    Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload);
+                writer.add_document(doc)?;
+                doc_ids.push(doc_id.clone());
+            }
         }
 
         Ok(doc_ids)
@@ -3574,45 +3650,44 @@ impl super::SearchEngine for HotEngine {
             .iter()
             .map(|(id, p)| ("index", serde_json::json!({ "_doc_id": id, "_source": p })))
             .collect();
+        let mut doc_ids = Vec::with_capacity(docs.len());
         {
             let tl = self.translog.lock().unwrap();
             tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
-        }
 
-        let registry = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        let mut doc_ids = Vec::with_capacity(docs.len());
-        for (doc_id, payload) in &docs {
-            writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-            let doc =
-                Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload);
-            writer.add_document(doc)?;
-            doc_ids.push(doc_id.clone());
+            let registry = self
+                .field_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            for (doc_id, payload) in &docs {
+                writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
+                let doc =
+                    Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload);
+                writer.add_document(doc)?;
+                doc_ids.push(doc_id.clone());
+            }
         }
 
         Ok(doc_ids)
     }
 
     fn delete_document(&self, doc_id: &str) -> Result<u64> {
-        // 1. Write to translog
         {
             let tl = self.translog.lock().unwrap();
             tl.append("delete", serde_json::json!({ "_doc_id": doc_id }))?;
-        }
 
-        // 2. Delete from Tantivy
-        let id_field = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .id_field;
-        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
-        // delete_term returns an OpStamp, not a count — we report 1 optimistically
-        let _ = opstamp;
+            // 2. Delete from Tantivy
+            let id_field = self
+                .field_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .id_field;
+            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
+            // delete_term returns an OpStamp, not a count — we report 1 optimistically
+            let _ = opstamp;
+        }
         Ok(1)
     }
 
@@ -3620,16 +3695,16 @@ impl super::SearchEngine for HotEngine {
         {
             let tl = self.translog.lock().unwrap();
             tl.append_with_seq(seq_no, "delete", serde_json::json!({ "_doc_id": doc_id }))?;
-        }
 
-        let id_field = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .id_field;
-        let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
-        let _ = opstamp;
+            let id_field = self
+                .field_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .id_field;
+            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
+            let _ = opstamp;
+        }
         Ok(1)
     }
 
@@ -4925,6 +5000,108 @@ mod tests {
             "document should survive reopen with reordered mappings"
         );
         assert_eq!(doc.unwrap()["title"], "schema order");
+    }
+
+    #[test]
+    fn streaming_replay_with_batched_commits_recovers_all_docs() {
+        // Write more docs than the replay batch size to exercise the intermediate
+        // commit path in streaming replay.
+        let dir = tempfile::tempdir().unwrap();
+        let doc_count = TRANSLOG_REPLAY_BATCH_SIZE + 500;
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+            for i in 0..doc_count {
+                engine
+                    .add_document(&format!("d-{i}"), json!({"n": i}))
+                    .unwrap();
+            }
+            // Intentionally do NOT flush — simulating crash.
+        }
+
+        // Reopen — streaming replay should recover all documents via batched commits.
+        let engine2 = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+        engine2.refresh().unwrap();
+        assert_eq!(
+            engine2.doc_count(),
+            doc_count,
+            "all {} docs must be recovered by streaming replay",
+            doc_count
+        );
+        // Spot-check first and last
+        assert!(engine2.get_document("d-0").unwrap().is_some());
+        assert!(
+            engine2
+                .get_document(&format!("d-{}", doc_count - 1))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn translog_size_bytes_returns_nonzero_after_writes() {
+        let (_dir, engine) = create_engine();
+        assert_eq!(engine.translog_size_bytes(), 0);
+
+        engine.add_document("x", json!({"a": 1})).unwrap();
+        assert!(engine.translog_size_bytes() > 0);
+    }
+
+    #[test]
+    fn translog_size_bytes_resets_after_flush() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("x", json!({"a": 1})).unwrap();
+        assert!(engine.translog_size_bytes() > 0);
+
+        engine.flush().unwrap();
+        assert_eq!(engine.translog_size_bytes(), 0);
+    }
+
+    #[test]
+    fn replay_is_idempotent_when_a_batched_suffix_is_replayed_again() {
+        // Simulate a crash after replay committed a batch to Tantivy segments but
+        // before the final checkpoint was fully advanced. The next startup should
+        // safely replay that suffix again without producing duplicates.
+        let dir = tempfile::tempdir().unwrap();
+        let doc_count = TRANSLOG_REPLAY_BATCH_SIZE + 500;
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+            for i in 0..doc_count {
+                engine
+                    .add_document(&format!("d-{i}"), json!({"n": i}))
+                    .unwrap();
+            }
+        }
+
+        // First reopen replays the full translog into Tantivy segments.
+        {
+            let engine2 = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+            engine2.refresh().unwrap();
+            assert_eq!(engine2.doc_count(), doc_count);
+        }
+
+        // Simulate a stale checkpoint left behind by an interrupted replay after
+        // the first batch checkpoint had already been persisted.
+        std::fs::write(
+            dir.path().join("translog.committed"),
+            TRANSLOG_REPLAY_BATCH_SIZE.to_string(),
+        )
+        .unwrap();
+
+        // Second reopen replays the already-committed suffix again.
+        let engine3 = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+        engine3.refresh().unwrap();
+        assert_eq!(
+            engine3.doc_count(),
+            doc_count,
+            "replaying a committed suffix must not create duplicates"
+        );
+        assert!(engine3.get_document("d-0").unwrap().is_some());
+        assert!(
+            engine3
+                .get_document(&format!("d-{}", doc_count - 1))
+                .unwrap()
+                .is_some()
+        );
     }
 
     // ── doc_count ───────────────────────────────────────────────────────
@@ -6808,6 +6985,30 @@ mod tests {
         // Docs still searchable (committed)
         engine.refresh().unwrap();
         assert_eq!(engine.doc_count(), 2);
+    }
+
+    #[test]
+    fn try_flush_with_global_checkpoint_returns_false_when_translog_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        let _tl = engine.translog.lock().unwrap();
+
+        let flushed = engine.try_flush_with_global_checkpoint(1).unwrap();
+        assert!(!flushed);
+    }
+
+    #[test]
+    fn try_flush_with_global_checkpoint_returns_false_when_writer_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        let _writer = engine.writer.write().unwrap_or_else(|e| e.into_inner());
+
+        let flushed = engine.try_flush_with_global_checkpoint(1).unwrap();
+        assert!(!flushed);
     }
 
     // ── refresh visibility ──────────────────────────────────────────────

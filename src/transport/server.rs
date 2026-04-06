@@ -111,6 +111,7 @@ fn proto_to_field_type(field_type: &str) -> Result<crate::cluster::state::FieldT
 fn index_settings_to_proto(settings: &crate::cluster::state::IndexSettings) -> IndexSettings {
     IndexSettings {
         refresh_interval_ms: settings.refresh_interval_ms,
+        flush_threshold_bytes: settings.flush_threshold_bytes,
     }
 }
 
@@ -123,6 +124,7 @@ fn proto_to_index_settings(
 
     crate::cluster::state::IndexSettings {
         refresh_interval_ms: settings.refresh_interval_ms,
+        flush_threshold_bytes: settings.flush_threshold_bytes,
     }
 }
 
@@ -430,7 +432,11 @@ impl InternalTransport for TransportService {
                     "Index '{}' removed from cluster state — closing local shards",
                     old_index
                 );
-                if let Err(e) = self.shard_manager.close_index_shards(old_index) {
+                if let Err(e) = self
+                    .shard_manager
+                    .close_index_shards_blocking(old_index.clone())
+                    .await
+                {
                     tracing::error!(
                         "Failed to close shards for deleted index '{}': {}",
                         old_index,
@@ -455,7 +461,9 @@ impl InternalTransport for TransportService {
         request: Request<ShardDocRequest>,
     ) -> Result<Response<ShardDocResponse>, Status> {
         let req = request.into_inner();
-        let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
+        let engine = self
+            .get_or_open_shard(&req.index_name, req.shard_id)
+            .await?;
 
         let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
             .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
@@ -542,7 +550,9 @@ impl InternalTransport for TransportService {
         request: Request<ShardBulkRequest>,
     ) -> Result<Response<ShardBulkResponse>, Status> {
         let req = request.into_inner();
-        let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
+        let engine = self
+            .get_or_open_shard(&req.index_name, req.shard_id)
+            .await?;
 
         let mut docs: Vec<(String, serde_json::Value)> =
             Vec::with_capacity(req.documents_json.len());
@@ -633,7 +643,9 @@ impl InternalTransport for TransportService {
         request: Request<ShardDeleteRequest>,
     ) -> Result<Response<ShardDeleteResponse>, Status> {
         let req = request.into_inner();
-        let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
+        let engine = self
+            .get_or_open_shard(&req.index_name, req.shard_id)
+            .await?;
         info!(
             "gRPC: delete doc '{}' from {}/shard_{}",
             req.doc_id, req.index_name, req.shard_id
@@ -706,7 +718,10 @@ impl InternalTransport for TransportService {
         request: Request<ShardGetRequest>,
     ) -> Result<Response<ShardGetResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+        let engine = match self
+            .get_or_open_search_shard(&req.index_name, req.shard_id)
+            .await
+        {
             Ok(engine) => engine,
             Err(status) => {
                 return Ok(Response::new(ShardGetResponse {
@@ -753,7 +768,10 @@ impl InternalTransport for TransportService {
         request: Request<ShardSearchRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+        let engine = match self
+            .get_or_open_search_shard(&req.index_name, req.shard_id)
+            .await
+        {
             Ok(engine) => engine,
             Err(status) => {
                 return Ok(Response::new(ShardSearchResponse {
@@ -809,7 +827,10 @@ impl InternalTransport for TransportService {
         request: Request<ShardSearchDslRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+        let engine = match self
+            .get_or_open_search_shard(&req.index_name, req.shard_id)
+            .await
+        {
             Ok(engine) => engine,
             Err(status) => {
                 return Ok(Response::new(ShardSearchResponse {
@@ -903,7 +924,10 @@ impl InternalTransport for TransportService {
         request: Request<SqlRecordBatchRequest>,
     ) -> Result<Response<SqlRecordBatchResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+        let engine = match self
+            .get_or_open_search_shard(&req.index_name, req.shard_id)
+            .await
+        {
             Ok(engine) => engine,
             Err(status) => {
                 return Ok(Response::new(SqlRecordBatchResponse {
@@ -973,7 +997,10 @@ impl InternalTransport for TransportService {
         }
 
         let req = request.into_inner();
-        let engine = match self.get_or_open_search_shard(&req.index_name, req.shard_id) {
+        let engine = match self
+            .get_or_open_search_shard(&req.index_name, req.shard_id)
+            .await
+        {
             Ok(engine) => engine,
             Err(status) => {
                 let response_stream: Self::SqlRecordBatchStreamStream = Box::pin(stream::iter(
@@ -1107,7 +1134,9 @@ impl InternalTransport for TransportService {
         request: Request<ReplicateDocRequest>,
     ) -> Result<Response<ReplicateDocResponse>, Status> {
         let req = request.into_inner();
-        let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
+        let engine = self
+            .get_or_open_shard(&req.index_name, req.shard_id)
+            .await?;
 
         info!(
             "gRPC: replicate {} doc '{}' (seq_no={}) to {}/shard_{}",
@@ -1163,7 +1192,9 @@ impl InternalTransport for TransportService {
         request: Request<ReplicateBulkRequest>,
     ) -> Result<Response<ReplicateBulkResponse>, Status> {
         let req = request.into_inner();
-        let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
+        let engine = self
+            .get_or_open_shard(&req.index_name, req.shard_id)
+            .await?;
 
         info!(
             "gRPC: replicate bulk {} ops to {}/shard_{}",
@@ -1210,7 +1241,9 @@ impl InternalTransport for TransportService {
         request: Request<RecoverReplicaRequest>,
     ) -> Result<Response<RecoverReplicaResponse>, Status> {
         let req = request.into_inner();
-        let engine = self.get_or_open_shard(&req.index_name, req.shard_id)?;
+        let engine = self
+            .get_or_open_shard(&req.index_name, req.shard_id)
+            .await?;
 
         info!(
             "gRPC: recover_replica for {}/shard_{} from checkpoint {}",
@@ -1358,6 +1391,20 @@ impl InternalTransport for TransportService {
             }
         }
 
+        if let Some(val) = body.pointer("/index/flush_threshold_bytes") {
+            if val.is_null() {
+                if metadata.settings.flush_threshold_bytes.is_some() {
+                    metadata.settings.flush_threshold_bytes = None;
+                    changed = true;
+                }
+            } else if let Some(bytes) = val.as_u64()
+                && metadata.settings.flush_threshold_bytes != Some(bytes)
+            {
+                metadata.settings.flush_threshold_bytes = Some(bytes);
+                changed = true;
+            }
+        }
+
         if !changed {
             return Ok(Response::new(UpdateSettingsResponse {
                 acknowledged: true,
@@ -1427,6 +1474,9 @@ impl InternalTransport for TransportService {
         let refresh_interval_ms = body
             .pointer("/settings/refresh_interval_ms")
             .and_then(|v| v.as_u64());
+        let flush_threshold_bytes = body
+            .pointer("/settings/flush_threshold_bytes")
+            .and_then(|v| v.as_u64());
 
         let cluster_state = self.cluster_manager.get_state();
 
@@ -1458,6 +1508,9 @@ impl InternalTransport for TransportService {
 
         if let Some(ms) = refresh_interval_ms {
             metadata.settings.refresh_interval_ms = Some(ms);
+        }
+        if let Some(bytes) = flush_threshold_bytes {
+            metadata.settings.flush_threshold_bytes = Some(bytes);
         }
 
         // Parse field mappings
@@ -1563,7 +1616,11 @@ impl InternalTransport for TransportService {
             .map_err(|e| Status::internal(format!("Raft write failed: {}", e)))?;
 
         // Close local shard engines and delete data on this (leader) node
-        if let Err(e) = self.shard_manager.close_index_shards(index_name) {
+        if let Err(e) = self
+            .shard_manager
+            .close_index_shards_blocking(index_name.clone())
+            .await
+        {
             tracing::error!("Failed to close shards for index '{}': {}", index_name, e);
         }
 
@@ -1836,7 +1893,27 @@ where
 
 impl TransportService {
     #[allow(clippy::result_large_err)]
-    fn get_or_open_shard(
+    fn ensure_authoritative_shard_uuid(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        metadata: &crate::cluster::state::IndexMetadata,
+    ) -> Result<std::path::PathBuf, Status> {
+        if !metadata.has_uuid() {
+            return Err(Status::failed_precondition(format!(
+                "Shard [{index_name}][{shard_id}] has no authoritative UUID in cluster state"
+            )));
+        }
+
+        Ok(self
+            .shard_manager
+            .data_dir()
+            .join(&metadata.uuid)
+            .join(format!("shard_{}", shard_id)))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn get_or_open_shard(
         &self,
         index_name: &str,
         shard_id: u32,
@@ -1855,19 +1932,21 @@ impl TransportService {
                 "Shard [{index_name}][{shard_id}] not found on this node"
             )));
         }
+        let _ = self.ensure_authoritative_shard_uuid(index_name, shard_id, metadata)?;
         self.shard_manager
-            .open_shard_with_settings(
-                index_name,
+            .open_shard_with_settings_blocking(
+                index_name.to_string(),
                 shard_id,
-                &metadata.mappings,
-                &metadata.settings,
-                &metadata.uuid,
+                metadata.mappings.clone(),
+                metadata.settings.clone(),
+                metadata.uuid.clone(),
             )
+            .await
             .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
     }
 
     #[allow(clippy::result_large_err)]
-    fn get_or_open_search_shard(
+    async fn get_or_open_search_shard(
         &self,
         index_name: &str,
         shard_id: u32,
@@ -1883,15 +1962,23 @@ impl TransportService {
                     "Shard [{index_name}][{shard_id}] not found on this node"
                 )));
             }
+            let shard_dir = self.ensure_authoritative_shard_uuid(index_name, shard_id, metadata)?;
+            if !shard_dir.exists() {
+                return Err(Status::failed_precondition(format!(
+                    "Shard [{index_name}][{shard_id}] is assigned here but {:?} is missing; refusing to create a fresh shard on a read path",
+                    shard_dir
+                )));
+            }
             return self
                 .shard_manager
-                .open_shard_with_settings(
-                    index_name,
+                .open_shard_with_settings_blocking(
+                    index_name.to_string(),
                     shard_id,
-                    &metadata.mappings,
-                    &metadata.settings,
-                    &metadata.uuid,
+                    metadata.mappings.clone(),
+                    metadata.settings.clone(),
+                    metadata.uuid.clone(),
                 )
+                .await
                 .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)));
         }
 
@@ -2090,6 +2177,7 @@ mod tests {
             mappings,
             settings: crate::cluster::state::IndexSettings {
                 refresh_interval_ms: Some(1500),
+                flush_threshold_bytes: Some(65_536),
             },
         });
         cs.version = 42; // reset again after add_index
@@ -2161,6 +2249,7 @@ mod tests {
         let idx = restored.indices.get("products").unwrap();
         assert_eq!(idx.uuid, "products-uuid");
         assert_eq!(idx.settings.refresh_interval_ms, Some(1500));
+        assert_eq!(idx.settings.flush_threshold_bytes, Some(65_536));
         assert_eq!(idx.mappings["title"].field_type, FieldType::Text);
         assert_eq!(idx.mappings["embedding"].field_type, FieldType::KnnVector);
         assert_eq!(idx.mappings["embedding"].dimension, Some(384));
@@ -2349,6 +2438,7 @@ mod tests {
 
         let engine = service
             .get_or_open_search_shard("restart-idx", 0)
+            .await
             .expect("persisted shard should reopen via metadata");
         let hits = engine.search("rust").unwrap();
         assert_eq!(hits.len(), 1);
@@ -2445,8 +2535,8 @@ mod tests {
         assert_eq!(response.shards[0].shard_id, 0);
     }
 
-    #[test]
-    fn get_or_open_search_shard_returns_not_found_for_unknown_shard() {
+    #[tokio::test]
+    async fn get_or_open_search_shard_returns_not_found_for_unknown_shard() {
         let dir = tempfile::tempdir().unwrap();
         let service = TransportService {
             cluster_manager: Arc::new(ClusterManager::new("missing-unit".into())),
@@ -2458,7 +2548,7 @@ mod tests {
             join_lock: new_join_lock(),
         };
 
-        let err = match service.get_or_open_search_shard("missing-idx", 99) {
+        let err = match service.get_or_open_search_shard("missing-idx", 99).await {
             Ok(_) => panic!("unknown shard should not be opened"),
             Err(err) => err,
         };
@@ -2466,8 +2556,8 @@ mod tests {
         assert!(err.message().contains("not found"));
     }
 
-    #[test]
-    fn get_or_open_shard_returns_not_found_for_unknown_shard() {
+    #[tokio::test]
+    async fn get_or_open_shard_returns_not_found_for_unknown_shard() {
         let dir = tempfile::tempdir().unwrap();
         let service = TransportService {
             cluster_manager: Arc::new(ClusterManager::new("missing-unit".into())),
@@ -2479,7 +2569,7 @@ mod tests {
             join_lock: new_join_lock(),
         };
 
-        let err = match service.get_or_open_shard("missing-idx", 99) {
+        let err = match service.get_or_open_shard("missing-idx", 99).await {
             Ok(_) => panic!("unknown write shard should not be opened"),
             Err(err) => err,
         };

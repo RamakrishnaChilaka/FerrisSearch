@@ -56,6 +56,13 @@ pub struct Node {
 4. Replay recovered operations using the seq_no carried by the primary so the replica WAL stays in the shared shard seq space
 5. Retry `JoinCluster` whenever the authoritative cluster state does not contain the local node, even if local Raft state is already initialized from disk
 
+### Async Scheduling Rule
+- The lifecycle loop itself stays on Tokio because it coordinates Raft/control-plane work, but shard reopen and orphan cleanup perform blocking filesystem/Tantivy recovery work.
+- On Tokio call sites, use `open_local_assigned_shards_blocking()` and `cleanup_orphaned_data_if_authoritative_blocking()` so the actual shard-manager work runs on Tokio's blocking pool.
+- Do NOT move Raft heartbeats or master pings onto rayon; keep control-plane futures on Tokio and offload only the blocking shard work.
+- Recovered-node startup assignments must fail closed when the authoritative shard UUID path is missing: do not create a fresh shard directory during restart reconciliation, and do not run orphan cleanup while locally assigned UUID paths are missing.
+- Later shard assignments may create their UUID directories during the lifecycle loop so new primaries/replicas can come online after startup.
+
 ## Recovery Invariant
 - `apply_recovery_ops()` must use the explicit-seq engine write methods for both index and delete operations
 - Recovery replay must not allocate fresh local WAL seq_nos on the recovering replica

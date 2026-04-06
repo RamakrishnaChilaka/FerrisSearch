@@ -106,6 +106,11 @@ pub struct IndexSettings {
     /// Refresh interval in milliseconds. `None` = use cluster default (5000ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_interval_ms: Option<u64>,
+    /// Translog flush threshold in bytes. When the translog file exceeds this
+    /// size, the engine automatically flushes (commit + truncate WAL) during
+    /// the background refresh tick. `None` = use default (512 MB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_threshold_bytes: Option<u64>,
     // ── Future: shardless engine settings ────────────────────────────
     // When switching to a Quickwit-style engine, add fields here:
     //   pub split_max_merge_factor: Option<u32>,
@@ -120,7 +125,7 @@ pub struct IndexMetadata {
     /// Unique identifier for this index instance.
     /// Used as the on-disk directory name so that delete + re-create with the same
     /// index name never collides with stale data from the previous incarnation.
-    #[serde(default = "generate_index_uuid")]
+    #[serde(default)]
     pub uuid: String,
     pub number_of_shards: u32,
     pub number_of_replicas: u32,
@@ -141,6 +146,10 @@ fn generate_index_uuid() -> String {
 }
 
 impl IndexMetadata {
+    pub fn has_uuid(&self) -> bool {
+        !self.uuid.is_empty()
+    }
+
     /// Build shard routing for a new index, distributing primaries and replicas
     /// round-robin across the given data nodes. Guarantees that a shard's primary
     /// and replicas are never assigned to the same node.
@@ -1168,6 +1177,7 @@ mod tests {
     fn index_settings_serde_roundtrip_with_value() {
         let s = IndexSettings {
             refresh_interval_ms: Some(2000),
+            ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: IndexSettings = serde_json::from_str(&json).unwrap();
@@ -1178,6 +1188,7 @@ mod tests {
     fn index_settings_serde_roundtrip_none_skips_field() {
         let s = IndexSettings {
             refresh_interval_ms: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("refresh_interval_ms"));
@@ -1195,15 +1206,34 @@ mod tests {
     fn index_settings_equality() {
         let a = IndexSettings {
             refresh_interval_ms: Some(1000),
+            ..Default::default()
         };
         let b = IndexSettings {
             refresh_interval_ms: Some(1000),
+            ..Default::default()
         };
         let c = IndexSettings {
             refresh_interval_ms: Some(2000),
+            ..Default::default()
         };
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn index_metadata_missing_uuid_deserializes_empty_instead_of_generating_one() {
+        let metadata: IndexMetadata = serde_json::from_value(serde_json::json!({
+            "name": "idx",
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+            "shard_routing": {},
+            "mappings": {},
+            "settings": {}
+        }))
+        .unwrap();
+
+        assert!(metadata.uuid.is_empty());
+        assert!(!metadata.has_uuid());
     }
 
     // ── update_number_of_replicas ───────────────────────────────────
@@ -1391,6 +1421,7 @@ mod tests {
             mappings: HashMap::new(),
             settings: IndexSettings {
                 refresh_interval_ms: Some(10000),
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&meta).unwrap();
