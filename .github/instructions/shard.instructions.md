@@ -42,7 +42,7 @@ pub struct ShardManager {
 2. Create SettingsManager (one per index) with watch channels
 3. Create directory at `<data_dir>/<uuid>/shard_<id>`
 4. Start `CompositeEngine::start_refresh_loop_reactive()` — responds to setting changes
-5. Call `engine.rebuild_vectors()` — recover USearch index from persisted docs (crash recovery)
+5. Call `engine.rebuild_vectors()` only when `mappings` contains `KnnVector` fields — skip the expensive 100K-doc MatchAll query for non-vector indices to prevent OOM during multi-shard restart
 6. Handle schema mismatch by wiping orphaned directories and retrying
 
 ### Async Scheduling Rule

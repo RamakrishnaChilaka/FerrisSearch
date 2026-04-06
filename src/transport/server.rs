@@ -37,6 +37,144 @@ fn new_join_lock() -> Arc<Mutex<()>> {
     Arc::new(Mutex::new(()))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum MaintenanceDispatchOp {
+    Refresh,
+    Flush,
+}
+
+impl MaintenanceDispatchOp {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Refresh => "refresh",
+            Self::Flush => "flush",
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn get_or_open_read_shard(
+    cluster_manager: &ClusterManager,
+    shard_manager: &Arc<ShardManager>,
+    index_name: &str,
+    shard_id: u32,
+) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
+    if let Some(engine) = shard_manager.get_shard(index_name, shard_id) {
+        return Ok(engine);
+    }
+
+    let cs = cluster_manager.get_state();
+    let Some(metadata) = cs.indices.get(index_name) else {
+        return Err(Status::not_found(format!(
+            "Shard [{index_name}][{shard_id}] not found on this node"
+        )));
+    };
+    if !metadata.shard_routing.contains_key(&shard_id) {
+        return Err(Status::not_found(format!(
+            "Shard [{index_name}][{shard_id}] not found on this node"
+        )));
+    }
+    if !metadata.has_uuid() {
+        return Err(Status::failed_precondition(format!(
+            "Shard [{index_name}][{shard_id}] has no authoritative UUID in cluster state"
+        )));
+    }
+
+    let shard_dir = shard_manager
+        .data_dir()
+        .join(&metadata.uuid)
+        .join(format!("shard_{}", shard_id));
+    if !shard_dir.exists() {
+        return Err(Status::failed_precondition(format!(
+            "Shard [{index_name}][{shard_id}] is assigned here but {:?} is missing; refusing to create a fresh shard on a read path",
+            shard_dir
+        )));
+    }
+
+    Arc::clone(shard_manager)
+        .open_shard_with_settings_blocking(
+            index_name.to_string(),
+            shard_id,
+            metadata.mappings.clone(),
+            metadata.settings.clone(),
+            metadata.uuid.clone(),
+        )
+        .await
+        .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
+}
+
+pub(crate) async fn run_maintenance_on_assigned_shards_async(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    worker_pools: crate::worker::WorkerPools,
+    local_node_id: String,
+    index_name: String,
+    op: MaintenanceDispatchOp,
+) -> (u32, u32) {
+    let mut successful = 0u32;
+    let mut failed = 0u32;
+
+    let cs = cluster_manager.get_state();
+    let Some(metadata) = cs.indices.get(&index_name).cloned() else {
+        return (successful, failed);
+    };
+
+    for (shard_id, routing) in &metadata.shard_routing {
+        let assigned_here = routing.primary == local_node_id
+            || routing
+                .replicas
+                .iter()
+                .any(|node_id| node_id == &local_node_id);
+        if !assigned_here {
+            continue;
+        }
+
+        let engine = match get_or_open_read_shard(
+            cluster_manager.as_ref(),
+            &shard_manager,
+            &index_name,
+            *shard_id,
+        )
+        .await
+        {
+            Ok(engine) => engine,
+            Err(status) => {
+                tracing::error!(
+                    "Maintenance {} skipped {}/{}: {}",
+                    op.label(),
+                    index_name,
+                    shard_id,
+                    status.message()
+                );
+                continue;
+            }
+        };
+
+        let result = worker_pools
+            .spawn_write(move || match op {
+                MaintenanceDispatchOp::Refresh => engine.refresh(),
+                MaintenanceDispatchOp::Flush => engine.flush_with_global_checkpoint(),
+            })
+            .await;
+
+        match result {
+            Ok(Ok(_)) => successful += 1,
+            Ok(Err(e)) | Err(e) => {
+                tracing::error!(
+                    "Maintenance {} failed on {}/{}: {}",
+                    op.label(),
+                    index_name,
+                    shard_id,
+                    e
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    (successful, failed)
+}
+
 // ─── Conversion helpers: domain types ↔ proto types ─────────────────────────
 
 fn node_info_to_proto(n: &crate::cluster::state::NodeInfo) -> NodeInfo {
@@ -1712,22 +1850,15 @@ impl InternalTransport for TransportService {
         request: Request<IndexMaintenanceRequest>,
     ) -> Result<Response<IndexMaintenanceResponse>, Status> {
         let index_name = request.into_inner().index_name;
-        let shard_manager = self.shard_manager.clone();
-        let cluster_manager = self.cluster_manager.clone();
-        let local_node_id = self.local_node_id.clone();
-        let (successful, failed) = self
-            .worker_pools
-            .spawn_write(move || {
-                run_maintenance_sync(
-                    &cluster_manager,
-                    &shard_manager,
-                    &local_node_id,
-                    &index_name,
-                    |engine| engine.refresh(),
-                )
-            })
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let (successful, failed) = run_maintenance_on_assigned_shards_async(
+            self.cluster_manager.clone(),
+            self.shard_manager.clone(),
+            self.worker_pools.clone(),
+            self.local_node_id.clone(),
+            index_name,
+            MaintenanceDispatchOp::Refresh,
+        )
+        .await;
         Ok(Response::new(IndexMaintenanceResponse {
             successful_shards: successful,
             failed_shards: failed,
@@ -1739,22 +1870,15 @@ impl InternalTransport for TransportService {
         request: Request<IndexMaintenanceRequest>,
     ) -> Result<Response<IndexMaintenanceResponse>, Status> {
         let index_name = request.into_inner().index_name;
-        let shard_manager = self.shard_manager.clone();
-        let cluster_manager = self.cluster_manager.clone();
-        let local_node_id = self.local_node_id.clone();
-        let (successful, failed) = self
-            .worker_pools
-            .spawn_write(move || {
-                run_maintenance_sync(
-                    &cluster_manager,
-                    &shard_manager,
-                    &local_node_id,
-                    &index_name,
-                    |engine| engine.flush_with_global_checkpoint(),
-                )
-            })
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let (successful, failed) = run_maintenance_on_assigned_shards_async(
+            self.cluster_manager.clone(),
+            self.shard_manager.clone(),
+            self.worker_pools.clone(),
+            self.local_node_id.clone(),
+            index_name,
+            MaintenanceDispatchOp::Flush,
+        )
+        .await;
         Ok(Response::new(IndexMaintenanceResponse {
             successful_shards: successful,
             failed_shards: failed,
@@ -1855,42 +1979,6 @@ impl InternalTransport for TransportService {
     }
 }
 
-/// Run a maintenance operation on all locally-assigned shards (sync, for pool dispatch).
-fn run_maintenance_sync<F>(
-    cluster_manager: &ClusterManager,
-    shard_manager: &crate::shard::ShardManager,
-    local_node_id: &str,
-    index_name: &str,
-    op: F,
-) -> (u32, u32)
-where
-    F: Fn(&Arc<dyn crate::engine::SearchEngine>) -> crate::common::Result<()>,
-{
-    let mut successful = 0u32;
-    let mut failed = 0u32;
-    let cs = cluster_manager.get_state();
-    let Some(metadata) = cs.indices.get(index_name) else {
-        return (successful, failed);
-    };
-    for (shard_id, routing) in &metadata.shard_routing {
-        let assigned_here =
-            routing.primary == local_node_id || routing.replicas.iter().any(|n| n == local_node_id);
-        if !assigned_here {
-            continue;
-        }
-        if let Some(engine) = shard_manager.get_shard(index_name, *shard_id) {
-            match op(&engine) {
-                Ok(_) => successful += 1,
-                Err(e) => {
-                    tracing::error!("Maintenance on {}/{} failed: {}", index_name, shard_id, e);
-                    failed += 1;
-                }
-            }
-        }
-    }
-    (successful, failed)
-}
-
 impl TransportService {
     #[allow(clippy::result_large_err)]
     fn ensure_authoritative_shard_uuid(
@@ -1951,40 +2039,13 @@ impl TransportService {
         index_name: &str,
         shard_id: u32,
     ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
-        if let Some(engine) = self.shard_manager.get_shard(index_name, shard_id) {
-            return Ok(engine);
-        }
-
-        let cs = self.cluster_manager.get_state();
-        if let Some(metadata) = cs.indices.get(index_name) {
-            if !metadata.shard_routing.contains_key(&shard_id) {
-                return Err(Status::not_found(format!(
-                    "Shard [{index_name}][{shard_id}] not found on this node"
-                )));
-            }
-            let shard_dir = self.ensure_authoritative_shard_uuid(index_name, shard_id, metadata)?;
-            if !shard_dir.exists() {
-                return Err(Status::failed_precondition(format!(
-                    "Shard [{index_name}][{shard_id}] is assigned here but {:?} is missing; refusing to create a fresh shard on a read path",
-                    shard_dir
-                )));
-            }
-            return self
-                .shard_manager
-                .open_shard_with_settings_blocking(
-                    index_name.to_string(),
-                    shard_id,
-                    metadata.mappings.clone(),
-                    metadata.settings.clone(),
-                    metadata.uuid.clone(),
-                )
-                .await
-                .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)));
-        }
-
-        Err(Status::not_found(format!(
-            "Shard [{index_name}][{shard_id}] not found on this node"
-        )))
+        get_or_open_read_shard(
+            self.cluster_manager.as_ref(),
+            &self.shard_manager,
+            index_name,
+            shard_id,
+        )
+        .await
     }
 
     /// Compute and advance the global checkpoint for a shard.
@@ -2698,6 +2759,116 @@ mod tests {
         // Shard 0 primary + shard 1 replica = 2
         assert_eq!(successful, 2, "primary + replica assigned here");
         assert_eq!(failed, 0);
+    }
+
+    #[tokio::test]
+    async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_uuid = "test-uuid-flush";
+        {
+            let shard_dir = dir.path().join(test_uuid).join("shard_0");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+            engine
+                .add_document("d1", json!({"title": "flush reopen"}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        let mut cluster_state = DomainClusterState::new("maint-cluster".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        cluster_state.add_index(DomainIndexMetadata {
+            name: "maint-idx".into(),
+            uuid: test_uuid.into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
+        });
+
+        let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+        manager.update_state(cluster_state);
+
+        let service = TransportService {
+            cluster_manager: Arc::new(manager),
+            shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+            transport_client: crate::transport::TransportClient::new(),
+            raft: None,
+            local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
+        };
+
+        let response = service
+            .flush_index(Request::new(IndexMaintenanceRequest {
+                index_name: "maint-idx".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.successful_shards, 1);
+        assert_eq!(response.failed_shards, 0);
+        assert!(service.shard_manager.get_shard("maint-idx", 0).is_some());
+    }
+
+    #[tokio::test]
+    async fn flush_index_refuses_to_create_missing_uuid_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cluster_state = DomainClusterState::new("maint-cluster".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        cluster_state.add_index(DomainIndexMetadata {
+            name: "maint-idx".into(),
+            uuid: "missing-uuid".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: crate::cluster::state::IndexSettings::default(),
+        });
+
+        let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+        manager.update_state(cluster_state);
+
+        let service = TransportService {
+            cluster_manager: Arc::new(manager),
+            shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+            transport_client: crate::transport::TransportClient::new(),
+            raft: None,
+            local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
+        };
+
+        let response = service
+            .flush_index(Request::new(IndexMaintenanceRequest {
+                index_name: "maint-idx".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.successful_shards, 0);
+        assert_eq!(response.failed_shards, 0);
+        assert!(service.shard_manager.get_shard("maint-idx", 0).is_none());
+        assert!(!dir.path().join("missing-uuid").join("shard_0").exists());
     }
 
     #[test]

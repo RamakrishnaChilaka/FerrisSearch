@@ -393,6 +393,8 @@ curl -X POST 'http://localhost:9200/movies/_refresh'
 curl -X POST 'http://localhost:9200/movies/_flush'
 ```
 
+Refresh and flush are cluster-wide fan-out operations. The coordinator dispatches its own node in the same per-node set as remote nodes, and maintenance will not create fresh shard data when the authoritative UUID directory is missing.
+
 ## Benchmarks
 
 3-node cluster on a single machine, 3 shards, 0 replicas. Intel i5-13600K (14c/20t), 32 GB RAM, NVMe.
@@ -496,8 +498,8 @@ Dedicated rayon thread pools handle search and write engine work. Async control-
 ## Testing
 
 ```bash
-cargo test                                      # All 1050 tests
-cargo test --lib                                # Unit tests (874)
+cargo test                                      # All 1057 tests
+cargo test --lib                                # Unit tests (881)
 cargo test --bin ferris-cli                      # CLI tests (64)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (40)

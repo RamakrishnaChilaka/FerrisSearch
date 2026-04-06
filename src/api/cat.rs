@@ -7,6 +7,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Write;
 
+type ShardCopyDocCounts = HashMap<(String, String, u32), u64>;
+
 #[derive(Deserialize, Default)]
 pub struct CatParams {
     #[serde(default)]
@@ -29,22 +31,25 @@ fn wants_local(params: &CatParams) -> bool {
 /// Collect doc counts for all shards across the cluster.
 /// Fans out to ALL nodes (including self) via gRPC `GetShardStats` concurrently.
 /// This ensures consistent doc counts regardless of which node is queried.
-/// Returns a map of (index_name, shard_id) → doc_count.
-async fn collect_shard_doc_counts(state: &AppState) -> HashMap<(String, u32), u64> {
-    let mut counts: HashMap<(String, u32), u64> = HashMap::new();
+/// Returns a map of (node_id, index_name, shard_id) → doc_count.
+async fn collect_shard_doc_counts(state: &AppState) -> ShardCopyDocCounts {
+    let mut counts = ShardCopyDocCounts::new();
 
     let cs = state.cluster_manager.get_state();
     let mut handles = Vec::new();
     for node in cs.nodes.values() {
         let client = state.transport_client.clone();
         let node = node.clone();
-        handles.push(tokio::spawn(
-            async move { client.get_shard_stats(&node).await },
-        ));
+        handles.push(tokio::spawn(async move {
+            let node_id = node.id.clone();
+            (node_id, client.get_shard_stats(&node).await)
+        }));
     }
     for handle in handles {
-        if let Ok(Ok(remote_counts)) = handle.await {
-            counts.extend(remote_counts);
+        if let Ok((node_id, Ok(remote_counts))) = handle.await {
+            for ((index_name, shard_id), doc_count) in remote_counts {
+                counts.insert((node_id.clone(), index_name, shard_id), doc_count);
+            }
         }
     }
 
@@ -52,12 +57,28 @@ async fn collect_shard_doc_counts(state: &AppState) -> HashMap<(String, u32), u6
 }
 
 /// Local-only doc count lookup: returns doc count string or "-" for remote shards.
-fn local_doc_count(state: &AppState, index: &str, shard_id: u32) -> String {
+fn local_doc_count(state: &AppState, node_id: &str, index: &str, shard_id: u32) -> String {
+    if node_id != state.local_node_id {
+        return "-".into();
+    }
+
     state
         .shard_manager
         .get_shard(index, shard_id)
         .map(|e| e.doc_count().to_string())
         .unwrap_or_else(|| "-".into())
+}
+
+fn distributed_doc_count(
+    doc_counts: &ShardCopyDocCounts,
+    node_id: &str,
+    index: &str,
+    shard_id: u32,
+) -> String {
+    doc_counts
+        .get(&(node_id.to_string(), index.to_string(), shard_id))
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "0".into())
 }
 
 fn text_response(body: String) -> Response {
@@ -117,7 +138,7 @@ fn shard_display_state(
     index: &str,
     shard_id: u32,
     cs: &crate::cluster::state::ClusterState,
-    doc_counts: &Option<HashMap<(String, u32), u64>>,
+    doc_counts: &Option<ShardCopyDocCounts>,
     state: &AppState,
 ) -> &'static str {
     if !cs.nodes.contains_key(node_id) {
@@ -125,7 +146,7 @@ fn shard_display_state(
     }
     match doc_counts {
         Some(m) => {
-            if m.contains_key(&(index.to_string(), shard_id)) {
+            if m.contains_key(&(node_id.to_string(), index.to_string(), shard_id)) {
                 "STARTED"
             } else {
                 "INITIALIZING"
@@ -193,11 +214,8 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
             );
 
             let docs = match &doc_counts {
-                Some(m) => m
-                    .get(&(idx_name.clone(), shard_id))
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "0".into()),
-                None => local_doc_count(&state, idx_name, shard_id),
+                Some(m) => distributed_doc_count(m, &routing.primary, idx_name, shard_id),
+                None => local_doc_count(&state, &routing.primary, idx_name, shard_id),
             };
 
             writeln!(
@@ -223,11 +241,8 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
                     &state,
                 );
                 let replica_docs = match &doc_counts {
-                    Some(m) => m
-                        .get(&(idx_name.clone(), shard_id))
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "0".into()),
-                    None => local_doc_count(&state, idx_name, shard_id),
+                    Some(m) => distributed_doc_count(m, replica_node_id, idx_name, shard_id),
+                    None => local_doc_count(&state, replica_node_id, idx_name, shard_id),
                 };
                 writeln!(
                     out,
@@ -307,7 +322,15 @@ pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>
 
         let total_docs: u64 = match &doc_counts {
             Some(m) => (0..meta.number_of_shards)
-                .map(|sid| m.get(&(idx_name.clone(), sid)).copied().unwrap_or(0))
+                .map(|sid| {
+                    meta.shard_routing
+                        .get(&sid)
+                        .and_then(|routing| {
+                            m.get(&(routing.primary.clone(), idx_name.clone(), sid))
+                                .copied()
+                        })
+                        .unwrap_or(0)
+                })
                 .sum(),
             None => (0..meta.number_of_shards)
                 .map(|sid| {
@@ -364,6 +387,78 @@ pub async fn cat_master(State(state): State<AppState>, params: Query<CatParams>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::manager::ClusterManager;
+    use crate::cluster::state::{
+        IndexMetadata, IndexSettings, NodeInfo, NodeRole, ShardRoutingEntry,
+    };
+    use crate::shard::ShardManager;
+    use crate::transport::TransportClient;
+    use crate::worker::WorkerPools;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn make_app_state(local_node_id: &str) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        (
+            dir,
+            AppState {
+                cluster_manager: Arc::new(ClusterManager::new("test-cluster".into())),
+                shard_manager,
+                transport_client: TransportClient::new(),
+                local_node_id: local_node_id.to_string(),
+                raft: None,
+                worker_pools: WorkerPools::default_for_system(),
+                sql_group_by_scan_limit: 0,
+                sql_approximate_top_k: false,
+            },
+        )
+    }
+
+    fn make_cluster_state() -> crate::cluster::state::ClusterState {
+        let mut state = crate::cluster::state::ClusterState::new("test-cluster".into());
+        state.add_node(NodeInfo {
+            id: "node-1".into(),
+            name: "node-1".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 1,
+        });
+        state.add_node(NodeInfo {
+            id: "node-2".into(),
+            name: "node-2".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 9301,
+            http_port: 9201,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 2,
+        });
+
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec!["node-2".into()],
+                unassigned_replicas: 0,
+            },
+        );
+
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: "idx-uuid".into(),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+
+        state
+    }
 
     #[test]
     fn wants_headers_returns_true_when_v_present() {
@@ -406,5 +501,45 @@ mod tests {
         let params = CatParams::default();
         assert!(params.v.is_none());
         assert!(params.local.is_none());
+    }
+
+    #[test]
+    fn shard_display_state_requires_report_from_assigned_node() {
+        let (_dir, app_state) = make_app_state("node-1");
+        let cluster_state = make_cluster_state();
+        let mut doc_counts = ShardCopyDocCounts::new();
+        doc_counts.insert(("node-1".into(), "idx".into(), 0), 12);
+
+        assert_eq!(
+            shard_display_state(
+                "node-1",
+                "idx",
+                0,
+                &cluster_state,
+                &Some(doc_counts.clone()),
+                &app_state,
+            ),
+            "STARTED"
+        );
+        assert_eq!(
+            shard_display_state(
+                "node-2",
+                "idx",
+                0,
+                &cluster_state,
+                &Some(doc_counts),
+                &app_state,
+            ),
+            "INITIALIZING"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_doc_count_returns_dash_for_remote_rows() {
+        let (_dir, app_state) = make_app_state("node-1");
+        app_state.shard_manager.open_shard("idx", 0).unwrap();
+
+        assert_eq!(local_doc_count(&app_state, "node-1", "idx", 0), "0");
+        assert_eq!(local_doc_count(&app_state, "node-2", "idx", 0), "-");
     }
 }

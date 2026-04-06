@@ -80,7 +80,7 @@ The `_cat/shards` endpoint shows three possible shard states:
 - **`INITIALIZING`**: The shard is assigned to a live node but the shard engine isn't open yet (e.g., the shard is still being reopened from disk during startup). Other shards on the same node may already be `STARTED`.
 - **`UNASSIGNED`**: The assigned node doesn't exist in the cluster (node left or shard not yet placed).
 
-State is determined by `shard_display_state()` — a single function used for both primaries and replicas. In distributed mode (default), the state is derived from whether the shard appears in the `collect_shard_doc_counts()` fan-out results. In `?local` mode, it checks whether `shard_manager.get_shard()` returns the engine.
+State is determined by `shard_display_state()` — a single function used for both primaries and replicas. In distributed mode (default), the state is derived from whether the assigned node reported that specific shard copy in the `collect_shard_doc_counts()` fan-out results. The fan-out map is keyed by `(node_id, index, shard_id)`, not just `(index, shard_id)`, so one started copy must not make another assigned-but-unopened copy appear `STARTED`. In `?local` mode, it checks whether `shard_manager.get_shard()` returns the engine.
 
 `INITIALIZING` is a runtime observation, NOT a cluster state change. The `ShardState` enum (`Started` / `Unassigned`) represents the Raft-managed allocation intent. The display state is the intersection of allocation intent + shard engine availability.
 
@@ -89,6 +89,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 
 - **`?local`**: Falls back to local-only doc counts — shows counts for shards hosted on this node, `-` for remote shards. Useful for debugging or reducing overhead.
 - The fan-out uses concurrent `tokio::spawn` for each remote node, with graceful degradation (failed RPCs are silently skipped, showing `0`).
+- Distributed `_cat/shards` doc counts are also per copy: primary and replica rows must read from the reporting node's `(node_id, index, shard_id)` entry, not a shard-global count shared across all copies.
 ### Index Management — src/api/index.rs (Raft writes → forward to leader)
 | HTTP | Path | Handler |
 |------|------|---------|
@@ -102,7 +103,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 `create_index()`, `get_index_settings()`, and `update_index_settings()` must keep `refresh_interval_ms` and `flush_threshold_bytes` in sync end-to-end across HTTP parsing, gRPC forwarding, and Raft state updates. `GET /{index}/_settings` must return both fields when set. `flush_threshold_bytes: 0` is a valid disable value and must not be treated as "missing".
 
 ### Local Shard Reopen Rule
-- `ensure_local_index_shards_open()` is async and must be awaited by search/count/SQL/maintenance paths.
+- `ensure_local_index_shards_open()` is async and must be awaited by search/count/SQL read paths.
 - When an API handler needs to reopen local shards, use `ShardManager::open_shard_with_settings_blocking()` rather than calling the synchronous shard-open helper inline on an async task.
 - Read and maintenance paths must fail closed when the authoritative shard UUID path is missing. Do not create a fresh shard directory on `/_search`, `/_count`, SQL, or maintenance fan-out just because a local reopen is needed.
 
@@ -181,9 +182,11 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 
 ### Refresh/Flush Fan-Out
 Both `refresh_index()` and `flush_index()` fan out to ALL nodes via `fan_out_maintenance()`:
-- **Local shards**: iterated via `ensure_local_index_shards_open()` and executed directly
+- **Local node**: dispatched alongside remote nodes in the same per-node task set; do not run local maintenance inline before the rest of the fan-out is launched
+- **Per-node maintenance**: each node reopens its assigned shards with the same read-side UUID-dir guard used by transport read paths, then runs refresh/flush on the write pool
 - **Remote nodes**: concurrent `tokio::spawn` per node via gRPC `RefreshIndex`/`FlushIndex` RPCs
-- The gRPC handlers use `run_maintenance_on_assigned_shards()` which checks the routing table — only shards where this node is primary or replica are operated on (orphaned shards are skipped)
+- The maintenance helper checks the routing table — only shards where this node is primary or replica are operated on (orphaned shards are skipped)
+- Missing authoritative UUID directories on a maintenance path are logged and skipped; they must not create fresh shard data
 - Response: `{"_shards": {"total": N, "successful": M, "failed": F}}`
 
 ## RefreshParam

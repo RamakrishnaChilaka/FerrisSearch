@@ -220,7 +220,7 @@ impl Node {
             // Give servers a tiny moment to bind
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut startup_state = None;
-            let mut recovered_from_disk = false;
+            let mut recovered_guard_state = None;
 
             // ── Bootstrap or join ──────────────────────────────────────
             if let Some(ref raft) = raft {
@@ -230,7 +230,7 @@ impl Node {
                 let already_initialized = raft.is_initialized().await.unwrap_or(false);
 
                 if already_initialized {
-                    recovered_from_disk = true;
+                    recovered_guard_state = Some(manager.get_state());
                     info!("Raft already initialized (recovered from disk), rejoining cluster");
                     let joined_state =
                         try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 20)
@@ -310,11 +310,8 @@ impl Node {
 
             let has_authoritative_startup_state = startup_state.is_some();
             let state = startup_state.clone().unwrap_or_else(|| manager.get_state());
-            let guarded_missing_startup_shards = if recovered_from_disk {
-                collect_guarded_startup_shards(&state, &local_id)
-            } else {
-                std::sync::Arc::new(std::collections::HashSet::new())
-            };
+            let guarded_missing_startup_shards =
+                build_guarded_startup_shards(recovered_guard_state.as_ref(), &local_id);
             open_local_assigned_shards_blocking(
                 state.clone(),
                 local_id.clone(),
@@ -807,6 +804,15 @@ fn should_retry_cluster_join(
 
 type GuardedStartupShards = std::sync::Arc<std::collections::HashSet<(String, u32, String)>>;
 
+fn build_guarded_startup_shards(
+    recovered_state: Option<&crate::cluster::state::ClusterState>,
+    local_node_id: &str,
+) -> GuardedStartupShards {
+    recovered_state
+        .map(|state| collect_guarded_startup_shards(state, local_node_id))
+        .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashSet::new()))
+}
+
 fn collect_guarded_startup_shards(
     state: &crate::cluster::state::ClusterState,
     local_node_id: &str,
@@ -1219,6 +1225,45 @@ mod tests {
             &shard_manager,
             &std::collections::HashSet::new(),
         );
+        assert!(shard_manager.get_shard("idx", 0).is_some());
+        assert!(dir.path().join("fresh-uuid").join("shard_0").exists());
+    }
+
+    #[tokio::test]
+    async fn recovered_node_only_guards_assignments_from_local_recovered_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+
+        let recovered_state = crate::cluster::state::ClusterState::new("node-test".into());
+
+        let mut authoritative_state = crate::cluster::state::ClusterState::new("node-test".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        authoritative_state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: "fresh-uuid".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+
+        let guarded = build_guarded_startup_shards(Some(&recovered_state), "node-1");
+        open_local_assigned_shards(
+            &authoritative_state,
+            "node-1",
+            &shard_manager,
+            guarded.as_ref(),
+        );
+
         assert!(shard_manager.get_shard("idx", 0).is_some());
         assert!(dir.path().join("fresh-uuid").join("shard_0").exists());
     }

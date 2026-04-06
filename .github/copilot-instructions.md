@@ -99,7 +99,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 874 unit tests + 64 CLI tests + 33 consensus integration + 40 replication integration + 38 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 1050 total
+- 881 unit tests + 64 CLI tests + 33 consensus integration + 40 replication integration + 38 REST API integration + 1 SQL correctness harness (sqllogictest, 170 assertions) = 1057 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
@@ -321,9 +321,12 @@ if let Some(ref raft) = state.raft {
 ### Maintenance
 | HTTP | Path | Handler | Purpose |
 |------|------|---------|--------|
-| POST/GET | `/{index}/_refresh` | `refresh_index()` | Refresh all local shards |
-| POST/GET | `/{index}/_flush` | `flush_index()` | Flush shards + truncate WAL |
+| POST/GET | `/{index}/_refresh` | `refresh_index()` | Refresh all assigned shards cluster-wide |
+| POST/GET | `/{index}/_flush` | `flush_index()` | Flush assigned shards cluster-wide + truncate WAL |
 | GET | `/_metrics` | `handle_metrics()` | Prometheus metrics (text exposition format) |
+
+- `fan_out_maintenance()` must dispatch the local node alongside remote nodes in the same per-node fan-out set; do not run local refresh/flush inline before the rest of the dispatch has started.
+- Per-node maintenance handlers reopen assigned shards with the same fail-closed authoritative UUID-dir checks as read paths. Missing UUID dirs are logged and skipped, not recreated.
 
 ### Create Index Body Format
 ```json

@@ -61,7 +61,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 
 ### Shard Stats & Maintenance
 - `get_shard_stats` only reports on **already-open** shards via `all_shards()` — it does NOT reopen shards from disk
-- `refresh_index` / `flush_index` use `run_maintenance_on_assigned_shards()` which checks the routing table and only operates on shards where `primary == local_node_id` or the node is in `replicas` — orphaned shards are skipped
+- `refresh_index` / `flush_index` reopen assigned shards with the same read-side UUID-dir guard as `get_or_open_search_shard()`, then run the engine refresh/flush on the write pool; missing authoritative UUID dirs are logged and skipped rather than creating fresh shard data
+- The maintenance helper only operates on shards where `primary == local_node_id` or the node is in `replicas` — orphaned shards are skipped
 - The `local_node_id` field is required by the constructors: `create_transport_service(cm, sm, tc, local_node_id)` and `create_transport_service_with_raft(cm, sm, tc, raft, local_node_id)`
 
 ### Key Handler Patterns
@@ -143,7 +144,7 @@ All blocking engine calls in `TransportService` handlers are dispatched to dedic
 - **Search pool** (`search-N` threads): `get_doc`, `search_shard`, `search_shard_dsl`, `sql_record_batch`, `sql_record_batch_stream`, `recover_replica` (WAL I/O)
 - **Write pool** (`write-N` threads): `index_doc`, `bulk_index`, `delete_doc`, `replicate_doc`, `replicate_bulk`, `refresh_index`, `flush_index`
 - The `TransportService` struct holds `worker_pools: WorkerPools` initialized in `create_transport_service*()` constructors.
-- Shard open/close/reopen are separate from engine work: use Tokio blocking-pool wrappers for those filesystem/Tantivy recovery steps before dispatching the steady-state engine call onto rayon.
+- Shard open/close/reopen are separate from engine work: use Tokio blocking-pool wrappers for those filesystem/Tantivy recovery steps before dispatching the steady-state engine call onto rayon. This includes maintenance RPCs — reopen first, then refresh/flush on the write pool.
 
 ### Transport TLS (optional, feature-gated)
 Inter-node gRPC can be encrypted via the `transport-tls` Cargo feature flag. Disabled by default.

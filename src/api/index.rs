@@ -1,5 +1,7 @@
 use crate::api::AppState;
 use crate::cluster::state::IndexMetadata;
+use crate::transport::server::MaintenanceDispatchOp;
+use crate::transport::server::run_maintenance_on_assigned_shards_async;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -694,7 +696,7 @@ pub async fn refresh_index(
     }
 
     let (successful, failed) =
-        fan_out_maintenance(&state, &index_name, MaintenanceOp::Refresh).await;
+        fan_out_maintenance(&state, &index_name, MaintenanceDispatchOp::Refresh).await;
 
     (
         StatusCode::OK,
@@ -727,7 +729,8 @@ pub async fn flush_index(
         );
     }
 
-    let (successful, failed) = fan_out_maintenance(&state, &index_name, MaintenanceOp::Flush).await;
+    let (successful, failed) =
+        fan_out_maintenance(&state, &index_name, MaintenanceDispatchOp::Flush).await;
 
     (
         StatusCode::OK,
@@ -737,55 +740,42 @@ pub async fn flush_index(
     )
 }
 
-enum MaintenanceOp {
-    Refresh,
-    Flush,
-}
-
 /// Fan out a refresh or flush operation to all nodes in the cluster.
-/// Local shards are handled directly; remote nodes are called via gRPC.
-async fn fan_out_maintenance(state: &AppState, index_name: &str, op: MaintenanceOp) -> (u32, u32) {
-    let mut successful = 0u32;
-    let mut failed = 0u32;
-
-    // Local shards — dispatch to write pool
-    let cs = state.cluster_manager.get_state();
-    if let Some(meta) = cs.indices.get(index_name) {
-        let local_shards =
-            ensure_local_index_shards_open(state, index_name, meta, "Maintenance").await;
-        let is_flush = matches!(op, MaintenanceOp::Flush);
-        for (_, engine) in local_shards {
-            let result = state
-                .worker_pools
-                .spawn_write(move || {
-                    if is_flush {
-                        engine.flush_with_global_checkpoint()
-                    } else {
-                        engine.refresh()
-                    }
-                })
-                .await;
-            match result {
-                Ok(Ok(_)) => successful += 1,
-                Ok(Err(e)) | Err(e) => {
-                    tracing::error!("Local maintenance failed: {}", e);
-                    failed += 1;
-                }
-            }
-        }
-    }
-
-    // Remote nodes — fan out concurrently
+/// Local and remote nodes participate in the same per-node dispatch set;
+/// the local node is dispatched via the same async maintenance helper rather
+/// than being processed inline before remote nodes.
+async fn fan_out_maintenance(
+    state: &AppState,
+    index_name: &str,
+    op: MaintenanceDispatchOp,
+) -> (u32, u32) {
     let cs = state.cluster_manager.get_state();
     let mut handles = Vec::new();
+    let mut dispatched_local = false;
+
+    let spawn_local = |idx: String, dispatch_op: MaintenanceDispatchOp| {
+        let cm = state.cluster_manager.clone();
+        let sm = state.shard_manager.clone();
+        let wp = state.worker_pools.clone();
+        let nid = state.local_node_id.clone();
+        tokio::spawn(async move {
+            Ok::<(u32, u32), anyhow::Error>(
+                run_maintenance_on_assigned_shards_async(cm, sm, wp, nid, idx, dispatch_op).await,
+            )
+        })
+    };
+
     for node in cs.nodes.values() {
         if node.id == state.local_node_id {
+            dispatched_local = true;
+            handles.push(spawn_local(index_name.to_string(), op));
             continue;
         }
+
         let client = state.transport_client.clone();
         let node = node.clone();
         let idx = index_name.to_string();
-        let is_flush = matches!(op, MaintenanceOp::Flush);
+        let is_flush = matches!(op, MaintenanceDispatchOp::Flush);
         handles.push(tokio::spawn(async move {
             if is_flush {
                 client.forward_flush(&node, &idx).await
@@ -794,6 +784,15 @@ async fn fan_out_maintenance(state: &AppState, index_name: &str, op: Maintenance
             }
         }));
     }
+
+    // If this node isn't in the cluster's node list yet (e.g. still joining),
+    // still dispatch locally so locally-assigned shards get maintained.
+    if !dispatched_local {
+        handles.push(spawn_local(index_name.to_string(), op));
+    }
+
+    let mut successful = 0u32;
+    let mut failed = 0u32;
 
     for handle in handles {
         match handle.await {
@@ -2144,6 +2143,7 @@ mod tests {
     use crate::cluster::state::{
         ClusterState, IndexSettings, NodeInfo, NodeRole, ShardRoutingEntry,
     };
+    use crate::engine::{CompositeEngine, SearchEngine};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2457,6 +2457,29 @@ mod tests {
             created.indices["idx"].settings.flush_threshold_bytes,
             Some(4096)
         );
+    }
+
+    #[tokio::test]
+    async fn fan_out_maintenance_keeps_local_target_without_node_entry() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_index(make_test_metadata(Some("node-1")));
+
+        let (temp_dir, state) = make_test_app_state(cluster_state);
+        let shard_dir = temp_dir.path().join("idx-uuid").join("shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+        engine
+            .add_document("doc-1", serde_json::json!({"title": "maintenance reopen"}))
+            .unwrap();
+        engine.refresh().unwrap();
+        drop(engine);
+
+        let (successful, failed) =
+            fan_out_maintenance(&state, "idx", MaintenanceDispatchOp::Flush).await;
+
+        assert_eq!((successful, failed), (1, 0));
+        assert!(state.shard_manager.get_shard("idx", 0).is_some());
     }
 
     #[tokio::test]

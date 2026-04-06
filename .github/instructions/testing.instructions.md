@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **874 unit tests** (`cargo test --lib`)
+- **881 unit tests** (`cargo test --lib`)
 - **64 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **40 replication integration tests** (`cargo test --test replication_integration`)
 - **38 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 170 assertions across 4 files
-- **1050 total** (`cargo test`)
+- **1057 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -28,6 +28,7 @@ cargo test -- test_name                         # Single test by name
 - For WAL auto-flush or replay changes, add regressions for disabled thresholds (`flush_threshold_bytes = 0`), zero global checkpoint safety (no auto-truncate), and stale `translog.committed` checkpoints that force a replayed suffix after a prior batch commit.
 - For auto-flush concurrency changes, add regressions proving maintenance ticks defer instead of blocking when the text flush path or vector persistence path is already busy.
 - For maintenance scheduling changes, add a `#[tokio::test(flavor = "current_thread")]` regression that blocks the Tantivy writer lock from another thread and proves the async runtime still makes progress while the maintenance tick waits.
+- For refresh/flush fan-out changes, add one regression that the coordinator still dispatches its local node through the per-node maintenance path, plus a transport regression that maintenance reopens persisted assigned shards but refuses to create missing UUID directories.
 - For async scheduling changes around shard open/close, orphan cleanup, translog fsync, redb-backed Raft storage, or other blocking wrappers, add a `#[tokio::test(flavor = "current_thread")]` regression that holds the relevant lock or resource from another thread and proves the runtime still advances while the wrapper waits.
 - For index UUID / orphan-cleanup fixes, add a regression that an auto-created index opens its local shard with the same UUID stored in cluster state, plus a restart-path regression that missing expected UUID directories cause cleanup to bail out instead of deleting unknown shard data.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
@@ -46,6 +47,7 @@ cargo test -- test_name                         # Single test by name
 - For JoinCluster or cluster-state transport fixes, add one roundtrip regression that proves `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` survive proto conversion, one regression that unknown field types fail snapshot decoding instead of being coerced, plus concurrent gRPC regressions for duplicate `raft_node_id` rejection and full voter-set preservation across overlapping joins.
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
 - For distributed hit-merge changes, add unit coverage for `merge_sorted_hit_lists()` and a multi-node REST regression where only one shard returns hits but the coordinator still must apply a custom sort.
+- For `_cat/shards` state fixes, add a regression that a live shard copy on one node does not make a different assigned copy on another node appear `STARTED`; display state must be per copy, not per shard ID.
 - For node startup/rejoin cleanup changes, add tempdir regressions that prove empty pre-catch-up state does not delete live UUID directories, and that authoritative UUID sets still remove true orphaned directories.
 
 ## Integration Test Infrastructure
