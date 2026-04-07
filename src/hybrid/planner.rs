@@ -719,12 +719,46 @@ pub struct SqlGroupColumn {
     pub output_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+/// A small expression tree for post-aggregate scalar computation.
+/// Built by the planner when SELECT items wrap or combine aggregates
+/// (e.g. `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)`).  Evaluated after
+/// cross-shard merge using resolved metric values.
+pub enum ResidualExpr {
+    /// Reference a merged metric by its output_name.
+    MetricRef(String),
+    /// A numeric literal.
+    Literal(f64),
+    /// ROUND(expr, precision)
+    Round(Box<ResidualExpr>, i32),
+    /// CAST(expr AS FLOAT) — identity for f64 values.
+    CastFloat(Box<ResidualExpr>),
+    /// CAST(expr AS INTEGER) — truncate to i64.
+    CastInt(Box<ResidualExpr>),
+    /// Arithmetic: +, -, *, /
+    BinaryOp(Box<ResidualExpr>, ResidualBinOp, Box<ResidualExpr>),
+    /// Unary negation.
+    Negate(Box<ResidualExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqlGroupedMetric {
     pub output_name: String,
     pub function: SqlGroupedMetricFunction,
     pub field: Option<String>,
     pub projected: bool,
+    /// When the SELECT item is not a bare aggregate, this holds the scalar
+    /// expression tree to evaluate after merge.  `None` means the metric
+    /// value is used directly (the common case).
+    pub residual_expr: Option<ResidualExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -801,6 +835,12 @@ pub struct QueryPlan {
     /// aggregates, residual predicates). These queries MUST see all matching
     /// docs for correct results — the default 100K TopDocs cap is wrong here.
     pub has_group_by_fallback: bool,
+    /// True when the SQL SELECT contains aggregate functions (AVG, SUM, etc.)
+    /// but there is no GROUP BY AND `grouped_sql` is None (e.g. the aggregate
+    /// is wrapped in ROUND/CAST/other expressions the grouped-partials parser
+    /// does not handle).  Like `has_group_by_fallback`, these queries need ALL
+    /// matching docs for correct results.
+    pub has_ungrouped_aggregate_fallback: bool,
 }
 
 impl QueryPlan {
@@ -863,6 +903,9 @@ impl QueryPlan {
             let metrics = grouped_sql
                 .metrics
                 .iter()
+                // Metrics with a residual_expr are computed after merge from
+                // other metrics — they have no real field to aggregate on.
+                .filter(|metric| metric.residual_expr.is_none())
                 .map(|metric| crate::search::GroupedMetricAgg {
                     output_name: metric.output_name.clone(),
                     function: metric.function.to_search_function(),
@@ -886,10 +929,9 @@ impl QueryPlan {
                 && grouped_sql.order_by.len() == 1
                 && let Some(first_order) = grouped_sql.order_by.first()
             {
-                let matching_metric = grouped_sql
-                    .metrics
-                    .iter()
-                    .find(|m| m.output_name == first_order.output_name);
+                let matching_metric = grouped_sql.metrics.iter().find(|m| {
+                    m.output_name == first_order.output_name && m.residual_expr.is_none()
+                });
                 if let Some(metric) = matching_metric {
                     let needed = self.offset.unwrap_or(0) + self.limit.unwrap_or(0);
                     Some(crate::search::ShardTopK {
@@ -925,6 +967,11 @@ impl QueryPlan {
         } else if self.limit_pushed_down {
             let size = self.limit.unwrap_or(SQL_MATCH_LIMIT) + self.offset.unwrap_or(0);
             (size, HashMap::new())
+        } else if self.has_ungrouped_aggregate_fallback {
+            // Ungrouped aggregates (e.g. ROUND(AVG(...))) MUST scan all matching
+            // docs.  Use usize::MAX here; the API layer will clamp to the
+            // configured sql_group_by_scan_limit just like GROUP BY fallback.
+            (usize::MAX, HashMap::new())
         } else {
             (SQL_MATCH_LIMIT, HashMap::new())
         };
@@ -1242,6 +1289,14 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
     let has_group_by_fallback =
         (!group_by_columns.is_empty() || has_expression_group_by) && grouped_sql.is_none();
 
+    // Ungrouped aggregate fallback: SELECT AVG(...), ROUND(AVG(...)), etc.
+    // without GROUP BY but grouped_sql failed to parse the expressions.
+    // These queries MUST scan all matching docs for correct results.
+    let has_ungrouped_aggregate_fallback = group_by_columns.is_empty()
+        && !has_expression_group_by
+        && grouped_sql.is_none()
+        && select_contains_aggregate(select);
+
     Ok(QueryPlan {
         index_name: index_name.to_string(),
         original_sql: sql.to_string(),
@@ -1261,6 +1316,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
         needs_score,
         sort_pushdown,
         has_group_by_fallback,
+        has_ungrouped_aggregate_fallback,
     })
 }
 
@@ -1298,7 +1354,7 @@ fn extract_grouped_sql_plan(
                     continue;
                 }
 
-                if let Some(metric) = parse_grouped_metric(expr, None)? {
+                if let Some(metric) = extract_projected_metric(expr, None, &mut metrics)? {
                     ensure_grouped_metric(&mut metrics, metric, true);
                     continue;
                 }
@@ -1315,7 +1371,9 @@ fn extract_grouped_sql_plan(
                     continue;
                 }
 
-                if let Some(metric) = parse_grouped_metric(expr, Some(alias.value.clone()))? {
+                if let Some(metric) =
+                    extract_projected_metric(expr, Some(alias.value.clone()), &mut metrics)?
+                {
                     ensure_grouped_metric(&mut metrics, metric, true);
                     continue;
                 }
@@ -1351,7 +1409,7 @@ fn extract_grouped_sql_plan(
             OrderByKind::Expressions(exprs) => {
                 for expr in exprs {
                     let Some(output_name) =
-                        resolve_grouped_output_name(&expr.expr, &valid_names, &metrics)
+                        resolve_or_register_residual(&expr.expr, &valid_names, &mut metrics)
                     else {
                         return Ok(None);
                     };
@@ -1368,7 +1426,7 @@ fn extract_grouped_sql_plan(
     // Parse HAVING clause into post-merge filters
     let mut having_filters = Vec::new();
     if let Some(having_expr) = &select.having
-        && !parse_having_filters(having_expr, &valid_names, &metrics, &mut having_filters)
+        && !parse_having_filters(having_expr, &valid_names, &mut metrics, &mut having_filters)
     {
         return Ok(None);
     }
@@ -1408,7 +1466,7 @@ fn extract_grouped_sql_plan(
 fn parse_having_filters(
     expr: &Expr,
     valid_names: &HashMap<String, String>,
-    metrics: &[SqlGroupedMetric],
+    metrics: &mut Vec<SqlGroupedMetric>,
     filters: &mut Vec<HavingFilter>,
 ) -> bool {
     match expr {
@@ -1431,7 +1489,7 @@ fn parse_having_filters(
             };
             // Try field/aggregate op value
             if let (Some(name), Some(val)) = (
-                resolve_grouped_output_name(left, valid_names, metrics),
+                resolve_or_register_residual(left, valid_names, metrics),
                 expr_to_f64(right),
             ) {
                 filters.push(HavingFilter {
@@ -1444,7 +1502,7 @@ fn parse_having_filters(
             // Try value op field/aggregate (flipped)
             if let (Some(val), Some(name)) = (
                 expr_to_f64(left),
-                resolve_grouped_output_name(right, valid_names, metrics),
+                resolve_or_register_residual(right, valid_names, metrics),
             ) {
                 let flipped_op = match having_op {
                     HavingOp::Gt => HavingOp::Lt,
@@ -1467,8 +1525,40 @@ fn parse_having_filters(
     }
 }
 
+/// Try to resolve an expression to an existing metric output name.
+/// If resolution fails but the expression can be built as a residual tree,
+/// register it as a hidden metric and return that name.
+/// Used by both ORDER BY and HAVING resolution.
+fn resolve_or_register_residual(
+    expr: &Expr,
+    valid_names: &HashMap<String, String>,
+    metrics: &mut Vec<SqlGroupedMetric>,
+) -> Option<String> {
+    // Fast path: identifier, bare aggregate, or existing residual match.
+    if let Some(name) = resolve_grouped_output_name(expr, valid_names, metrics) {
+        return Some(name);
+    }
+    // Build a residual expression and register it as a hidden metric.
+    if let Ok(Some(residual)) = try_build_residual_expr(expr, metrics) {
+        if !residual_contains_metric(&residual) {
+            return None;
+        }
+        let hidden_name = format!("__hidden_having_residual_{}", metrics.len());
+        metrics.push(SqlGroupedMetric {
+            output_name: hidden_name.clone(),
+            function: SqlGroupedMetricFunction::Avg, // placeholder
+            field: None,
+            projected: false,
+            residual_expr: Some(residual),
+        });
+        return Some(hidden_name);
+    }
+    None
+}
+
 /// Resolve a grouped-query reference to its output name.
-/// Tries identifier lookup first, then aggregate function matching.
+/// Tries identifier lookup first, then bare aggregate function matching,
+/// then residual expression matching against existing metrics.
 fn resolve_grouped_output_name(
     expr: &Expr,
     valid_names: &HashMap<String, String>,
@@ -1485,6 +1575,21 @@ fn resolve_grouped_output_name(
         for metric in metrics {
             if metric.function == parsed.function && metric.field == parsed.field {
                 return Some(metric.output_name.clone());
+            }
+        }
+    }
+    // 3. Try matching the expression as a residual tree against existing metrics.
+    //    This handles ORDER BY ROUND(AVG(price), 1) when the SELECT has the same
+    //    expression — we build a temporary residual tree and compare structurally.
+    {
+        let mut scratch = metrics.to_vec();
+        if let Ok(Some(residual)) = try_build_residual_expr(expr, &mut scratch) {
+            for metric in metrics {
+                if let Some(ref existing) = metric.residual_expr
+                    && *existing == residual
+                {
+                    return Some(metric.output_name.clone());
+                }
             }
         }
     }
@@ -1506,6 +1611,172 @@ fn expr_to_f64(expr: &Expr) -> Option<f64> {
 }
 
 fn parse_grouped_metric(expr: &Expr, alias: Option<String>) -> Result<Option<SqlGroupedMetric>> {
+    // Simple aggregate detection — used by HAVING/ORDER BY resolution.
+    try_parse_direct_aggregate(expr, alias)
+}
+
+/// Try to extract a projected metric from a SELECT expression.
+/// Handles bare aggregates, scalar wrappers (ROUND, CAST), and arbitrary
+/// arithmetic combining multiple aggregates (AVG(x) + AVG(y)).
+///
+/// Any inner aggregates are registered as hidden metrics in `metrics`.
+/// Returns a single projected metric with an optional `residual_expr`
+/// tree that references those hidden metrics.
+fn extract_projected_metric(
+    expr: &Expr,
+    alias: Option<String>,
+    metrics: &mut Vec<SqlGroupedMetric>,
+) -> Result<Option<SqlGroupedMetric>> {
+    // Fast path: bare aggregate like AVG(x)
+    if let Some(metric) = try_parse_direct_aggregate(expr, alias.clone())? {
+        return Ok(Some(metric));
+    }
+
+    // Build a ResidualExpr tree, extracting aggregates as hidden metrics.
+    if let Some(residual) = try_build_residual_expr(expr, metrics)? {
+        let output_name = alias.unwrap_or_else(|| format!("__expr_{}", metrics.len()));
+        Ok(Some(SqlGroupedMetric {
+            output_name,
+            function: SqlGroupedMetricFunction::Avg, // placeholder, not used when residual_expr is Some
+            field: None,
+            projected: true,
+            residual_expr: Some(residual),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Recursively build a `ResidualExpr` from a SQL expression.
+/// Aggregates (COUNT/SUM/AVG/MIN/MAX) are extracted into `metrics` and
+/// referenced via `ResidualExpr::MetricRef`.
+fn try_build_residual_expr(
+    expr: &Expr,
+    metrics: &mut Vec<SqlGroupedMetric>,
+) -> Result<Option<ResidualExpr>> {
+    match expr {
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            let args = match &f.args {
+                FunctionArguments::List(list) => &list.args,
+                _ => return Ok(None),
+            };
+            match name.as_str() {
+                "round" => {
+                    if args.len() != 2 {
+                        return Ok(None);
+                    }
+                    let inner = match &args[0] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                        _ => return Ok(None),
+                    };
+                    let precision = match &args[1] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            expr_to_f64(e).map(|v| v as i32)
+                        }
+                        _ => None,
+                    };
+                    let Some(precision) = precision else {
+                        return Ok(None);
+                    };
+                    let inner_expr = try_build_residual_expr(inner, metrics)?;
+                    Ok(inner_expr.map(|e| ResidualExpr::Round(Box::new(e), precision)))
+                }
+                "count" | "sum" | "avg" | "min" | "max" => {
+                    if let Some(metric) = try_parse_direct_aggregate(expr, None)? {
+                        let ref_name = ensure_grouped_metric(metrics, metric, false);
+                        Ok(Some(ResidualExpr::MetricRef(ref_name)))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                _ => Ok(None),
+            }
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            use sqlparser::ast::DataType;
+            let inner_r = try_build_residual_expr(inner, metrics)?;
+            let Some(inner_r) = inner_r else {
+                return Ok(None);
+            };
+            match data_type {
+                DataType::Float(_)
+                | DataType::Float4
+                | DataType::Float8
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Double(..)
+                | DataType::DoublePrecision
+                | DataType::Real
+                | DataType::Numeric(_)
+                | DataType::Decimal(_)
+                | DataType::Dec(_) => Ok(Some(ResidualExpr::CastFloat(Box::new(inner_r)))),
+                DataType::Integer(_)
+                | DataType::Int(_)
+                | DataType::Int2(_)
+                | DataType::Int4(_)
+                | DataType::Int8(_)
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Int128
+                | DataType::Int256
+                | DataType::BigInt(_)
+                | DataType::SmallInt(_)
+                | DataType::TinyInt(_) => Ok(Some(ResidualExpr::CastInt(Box::new(inner_r)))),
+                _ => Ok(None),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let bin_op = match op {
+                BinaryOperator::Plus => ResidualBinOp::Add,
+                BinaryOperator::Minus => ResidualBinOp::Sub,
+                BinaryOperator::Multiply => ResidualBinOp::Mul,
+                BinaryOperator::Divide => ResidualBinOp::Div,
+                _ => return Ok(None),
+            };
+            let left_r = try_build_residual_expr(left, metrics)?;
+            let right_r = try_build_residual_expr(right, metrics)?;
+            match (left_r, right_r) {
+                (Some(l), Some(r)) => Ok(Some(ResidualExpr::BinaryOp(
+                    Box::new(l),
+                    bin_op,
+                    Box::new(r),
+                ))),
+                _ => Ok(None),
+            }
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => {
+            let inner_r = try_build_residual_expr(inner, metrics)?;
+            Ok(inner_r.map(|e| ResidualExpr::Negate(Box::new(e))))
+        }
+        Expr::Value(v) => {
+            if let Some(val) = match &v.value {
+                SqlValue::Number(n, _) => n.parse::<f64>().ok(),
+                _ => None,
+            } {
+                Ok(Some(ResidualExpr::Literal(val)))
+            } else {
+                Ok(None)
+            }
+        }
+        Expr::Nested(inner) => try_build_residual_expr(inner, metrics),
+        _ => Ok(None),
+    }
+}
+
+/// Parse a bare aggregate function: COUNT/SUM/AVG/MIN/MAX.
+fn try_parse_direct_aggregate(
+    expr: &Expr,
+    alias: Option<String>,
+) -> Result<Option<SqlGroupedMetric>> {
     let Expr::Function(function) = expr else {
         return Ok(None);
     };
@@ -1547,10 +1818,10 @@ fn parse_grouped_metric(expr: &Expr, alias: Option<String>) -> Result<Option<Sql
                 return Ok(None);
             }
             let field = match &args[0] {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr_to_field_name(expr),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => aggregate_arg_to_field(expr),
                 FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
                     if let FunctionArgExpr::Expr(expr) = arg {
-                        expr_to_field_name(expr)
+                        aggregate_arg_to_field(expr)
                     } else {
                         None
                     }
@@ -1581,7 +1852,18 @@ fn parse_grouped_metric(expr: &Expr, alias: Option<String>) -> Result<Option<Sql
         function,
         field,
         projected: true,
+        residual_expr: None,
     }))
+}
+
+/// Resolve the field name for an aggregate argument, seeing through CAST.
+/// `AVG(CAST("tips" AS FLOAT))` → `"tips"`, `AVG(price)` → `"price"`.
+fn aggregate_arg_to_field(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => expr_to_field_name(expr),
+        Expr::Cast { expr: inner, .. } => aggregate_arg_to_field(inner),
+        _ => None,
+    }
 }
 
 fn ensure_grouped_metric(
@@ -1589,15 +1871,44 @@ fn ensure_grouped_metric(
     parsed: SqlGroupedMetric,
     projected: bool,
 ) -> String {
-    if let Some(existing) = metrics
-        .iter_mut()
-        .find(|metric| metric.function == parsed.function && metric.field == parsed.field)
+    // Residual projected metrics are synthetic containers with placeholder
+    // (function, field) values.  Skip dedup so different residual expressions
+    // don't collide on the same placeholder key.
+    if parsed.residual_expr.is_none()
+        && let Some(idx) = metrics
+            .iter()
+            .position(|metric| metric.function == parsed.function && metric.field == parsed.field)
     {
         if projected {
-            existing.projected = true;
-            existing.output_name = parsed.output_name.clone();
+            if !metrics[idx].projected {
+                let old_name = metrics[idx].output_name.clone();
+                metrics[idx].projected = true;
+                metrics[idx].output_name = parsed.output_name.clone();
+                metrics[idx].residual_expr = parsed.residual_expr;
+
+                // Cascade the rename to all MetricRef references in existing
+                // residual expression trees so they don't point at a stale name.
+                let new_name = metrics[idx].output_name.clone();
+                if old_name != new_name {
+                    for m in metrics.iter_mut() {
+                        if let Some(ref mut expr) = m.residual_expr {
+                            rename_metric_refs(expr, &old_name, &new_name);
+                        }
+                    }
+                }
+            } else if metrics[idx].output_name != parsed.output_name {
+                let canonical_name = metrics[idx].output_name.clone();
+                metrics.push(SqlGroupedMetric {
+                    output_name: parsed.output_name.clone(),
+                    function: parsed.function,
+                    field: None,
+                    projected: true,
+                    residual_expr: Some(ResidualExpr::MetricRef(canonical_name)),
+                });
+                return parsed.output_name;
+            }
         }
-        return existing.output_name.clone();
+        return metrics[idx].output_name.clone();
     }
 
     let output_name = if projected {
@@ -1610,8 +1921,44 @@ fn ensure_grouped_metric(
         function: parsed.function,
         field: parsed.field,
         projected,
+        residual_expr: parsed.residual_expr,
     });
     output_name
+}
+
+/// Recursively update MetricRef names in a ResidualExpr tree after a metric
+/// is renamed (e.g. when a hidden metric is promoted to a user-visible alias).
+fn rename_metric_refs(expr: &mut ResidualExpr, old_name: &str, new_name: &str) {
+    match expr {
+        ResidualExpr::MetricRef(name) => {
+            if name.as_str() == old_name {
+                *name = new_name.to_string();
+            }
+        }
+        ResidualExpr::Round(inner, _)
+        | ResidualExpr::CastFloat(inner)
+        | ResidualExpr::CastInt(inner)
+        | ResidualExpr::Negate(inner) => rename_metric_refs(inner, old_name, new_name),
+        ResidualExpr::BinaryOp(left, _, right) => {
+            rename_metric_refs(left, old_name, new_name);
+            rename_metric_refs(right, old_name, new_name);
+        }
+        ResidualExpr::Literal(_) => {}
+    }
+}
+
+fn residual_contains_metric(expr: &ResidualExpr) -> bool {
+    match expr {
+        ResidualExpr::MetricRef(_) => true,
+        ResidualExpr::Round(inner, _)
+        | ResidualExpr::CastFloat(inner)
+        | ResidualExpr::CastInt(inner)
+        | ResidualExpr::Negate(inner) => residual_contains_metric(inner),
+        ResidualExpr::BinaryOp(left, _, right) => {
+            residual_contains_metric(left) || residual_contains_metric(right)
+        }
+        ResidualExpr::Literal(_) => false,
+    }
 }
 
 fn register_hidden_grouped_metrics_from_order_by(
@@ -1652,9 +1999,14 @@ fn register_hidden_grouped_metrics_from_having(
 }
 
 fn register_hidden_grouped_metric(expr: &Expr, metrics: &mut Vec<SqlGroupedMetric>) -> Result<()> {
+    // First try a bare aggregate: COUNT(*), AVG(x), etc.
     if let Some(metric) = parse_grouped_metric(expr, None)? {
         ensure_grouped_metric(metrics, metric, false);
+        return Ok(());
     }
+    // Then try building a residual tree — any inner aggregates get registered
+    // as hidden metrics via try_build_residual_expr → ensure_grouped_metric.
+    let _ = try_build_residual_expr(expr, metrics)?;
     Ok(())
 }
 
@@ -2804,6 +3156,89 @@ fn extract_comparison_parts(
     Ok(None)
 }
 
+/// Returns true if the SELECT clause contains any SQL aggregate function
+/// (COUNT, SUM, AVG, MIN, MAX) at any nesting depth.  Used to detect
+/// ungrouped-aggregate fallback where the 100K TopDocs cap would silently
+/// produce wrong results.  Does NOT need to parse the full expression —
+/// just finding one aggregate anywhere is sufficient.
+fn select_contains_aggregate(select: &Select) -> bool {
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => continue,
+        };
+        if expr_contains_aggregate(expr) {
+            return true;
+        }
+    }
+    false
+}
+
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            if matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+                return true;
+            }
+            // Check inside function arguments for nested aggregates
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = arg
+                        && expr_contains_aggregate(inner)
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        Expr::Nested(inner) => expr_contains_aggregate(inner),
+        Expr::UnaryOp { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Cast { expr, .. } => expr_contains_aggregate(expr),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand
+                && expr_contains_aggregate(op)
+            {
+                return true;
+            }
+            for cond in conditions {
+                let sqlparser::ast::CaseWhen { condition, result } = cond;
+                if expr_contains_aggregate(condition) || expr_contains_aggregate(result) {
+                    return true;
+                }
+            }
+            if let Some(e) = else_result
+                && expr_contains_aggregate(e)
+            {
+                return true;
+            }
+            false
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_contains_aggregate(inner),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_contains_aggregate(e)
+                || expr_contains_aggregate(low)
+                || expr_contains_aggregate(high)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            expr_contains_aggregate(e) || list.iter().any(expr_contains_aggregate)
+        }
+        _ => false,
+    }
+}
+
 fn expr_to_field_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -3415,28 +3850,26 @@ mod tests {
     }
 
     #[test]
-    fn computed_expression_falls_to_fast_fields() {
-        // SUM(upvotes) * 1.0 / COUNT(*) is a computed expression, not a simple aggregate.
-        // The grouped partials path cannot handle it — falls to tantivy_fast_fields + DataFusion.
+    fn computed_expression_uses_grouped_partials() {
+        // SUM(upvotes) * 1.0 / COUNT(*) is extracted into hidden metrics
+        // with a residual expression tree evaluated after merge.
         let plan = plan_sql(
             "hackernews",
             "SELECT author, COUNT(*) AS posts, SUM(upvotes) * 1.0 / COUNT(*) AS upvotes_per_post FROM hackernews GROUP BY author HAVING posts >= 100 ORDER BY upvotes_per_post DESC LIMIT 20",
         ).unwrap();
-        assert!(!plan.uses_grouped_partials());
-        assert!(!plan.selects_all_columns);
-        assert!(plan.required_columns.contains(&"author".to_string()));
-        assert!(plan.required_columns.contains(&"upvotes".to_string()));
+        assert!(plan.uses_grouped_partials());
+        assert!(!plan.limit_pushed_down);
     }
 
     #[test]
     fn computed_expression_with_group_by_no_limit_pushdown() {
         // GROUP BY + computed aggregate + LIMIT must NOT push LIMIT to Tantivy.
-        // DataFusion needs all matching docs to compute correct GROUP BY results.
+        // Grouped partials handle ORDER BY + LIMIT natively.
         let plan = plan_sql(
             "idx",
             "SELECT author, SUM(price) * 1.0 / COUNT(*) AS avg_p FROM idx GROUP BY author ORDER BY avg_p DESC LIMIT 5",
         ).unwrap();
-        assert!(!plan.uses_grouped_partials());
+        assert!(plan.uses_grouped_partials());
         assert!(!plan.limit_pushed_down);
         assert_eq!(plan.limit, Some(5));
         assert!(!plan.group_by_columns.is_empty());
@@ -3451,14 +3884,13 @@ mod tests {
     }
 
     #[test]
-    fn max_minus_min_group_by_no_limit_pushdown() {
-        // max(x) - min(x) is a computed expression with GROUP BY.
-        // Must NOT push LIMIT down.
+    fn max_minus_min_group_by_uses_grouped_partials() {
+        // MAX(x) - MIN(x) is extracted into hidden metrics with a residual.
         let plan = plan_sql(
             "idx",
             "SELECT author, MAX(price) - MIN(price) AS spread FROM idx GROUP BY author ORDER BY spread DESC LIMIT 3",
         ).unwrap();
-        assert!(!plan.uses_grouped_partials());
+        assert!(plan.uses_grouped_partials());
         assert!(!plan.limit_pushed_down);
         assert_eq!(plan.limit, Some(3));
     }
@@ -4323,5 +4755,411 @@ mod tests {
         assert_eq!(grouped.metrics[0].output_name, "cnt");
         assert_eq!(grouped.having.len(), 1);
         assert_eq!(grouped.order_by.len(), 1);
+    }
+
+    #[test]
+    fn wrapped_aggregate_uses_grouped_partials_with_residual() {
+        // ROUND(AVG(CAST(price AS FLOAT)), 2) — the inner AVG(CAST(price...))
+        // is extracted as a hidden metric; the ROUND is a residual expression.
+        let plan = plan_sql(
+            "idx",
+            "SELECT ROUND(AVG(CAST(price AS FLOAT)), 2) AS avg_price FROM idx",
+        )
+        .unwrap();
+        assert!(
+            plan.uses_grouped_partials(),
+            "wrapped aggregate should use grouped partials"
+        );
+        assert!(!plan.has_group_by_fallback);
+        assert!(!plan.has_ungrouped_aggregate_fallback);
+        let grouped = plan.grouped_sql.unwrap();
+        // The projected metric should have a residual_expr
+        let projected: Vec<_> = grouped.metrics.iter().filter(|m| m.projected).collect();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].output_name, "avg_price");
+        assert!(projected[0].residual_expr.is_some());
+    }
+
+    #[test]
+    fn direct_ungrouped_aggregate_uses_grouped_partials_not_fallback() {
+        let plan = plan_sql("idx", "SELECT AVG(price) AS avg_price FROM idx").unwrap();
+        assert!(
+            plan.uses_grouped_partials(),
+            "direct AVG should use grouped partials"
+        );
+        assert!(!plan.has_ungrouped_aggregate_fallback);
+        let grouped = plan.grouped_sql.unwrap();
+        assert!(grouped.metrics[0].residual_expr.is_none());
+    }
+
+    #[test]
+    fn non_aggregate_query_does_not_trigger_fallback() {
+        let plan = plan_sql("idx", "SELECT price, title FROM idx LIMIT 10").unwrap();
+        assert!(!plan.has_ungrouped_aggregate_fallback);
+        assert!(!plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn cast_avg_as_int_uses_grouped_partials_with_residual_expr() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT CAST(AVG(price) AS INTEGER) AS avg_int FROM idx",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+        let projected: Vec<_> = grouped.metrics.iter().filter(|m| m.projected).collect();
+        assert_eq!(projected[0].output_name, "avg_int");
+        assert!(projected[0].residual_expr.is_some());
+    }
+
+    #[test]
+    fn cast_to_float_around_avg_is_residual_expr() {
+        let plan = plan_sql("idx", "SELECT CAST(AVG(price) AS FLOAT) AS avg_f FROM idx").unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+        let projected: Vec<_> = grouped.metrics.iter().filter(|m| m.projected).collect();
+        assert!(projected[0].residual_expr.is_some());
+    }
+
+    #[test]
+    fn grouped_partials_with_round_on_group_by() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT category, ROUND(AVG(price), 1) AS avg_p FROM idx GROUP BY category",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+        assert_eq!(grouped.group_columns.len(), 1);
+        let projected: Vec<_> = grouped.metrics.iter().filter(|m| m.projected).collect();
+        assert_eq!(projected[0].output_name, "avg_p");
+        assert!(projected[0].residual_expr.is_some());
+    }
+
+    #[test]
+    fn avg_plus_avg_uses_grouped_partials_with_binary_residual() {
+        let plan = plan_sql("idx", "SELECT AVG(price) + AVG(cost) AS spread FROM idx").unwrap();
+        assert!(
+            plan.uses_grouped_partials(),
+            "AVG(x) + AVG(y) should use grouped partials"
+        );
+        let grouped = plan.grouped_sql.unwrap();
+        let projected: Vec<_> = grouped.metrics.iter().filter(|m| m.projected).collect();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].output_name, "spread");
+        assert!(projected[0].residual_expr.is_some());
+        // There should be hidden metrics for AVG(price) and AVG(cost)
+        let hidden: Vec<_> = grouped.metrics.iter().filter(|m| !m.projected).collect();
+        assert_eq!(hidden.len(), 2);
+    }
+
+    #[test]
+    fn sum_divided_by_count_uses_grouped_partials() {
+        let plan = plan_sql("idx", "SELECT SUM(total) / COUNT(*) AS manual_avg FROM idx").unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+        let projected: Vec<_> = grouped.metrics.iter().filter(|m| m.projected).collect();
+        assert_eq!(projected[0].output_name, "manual_avg");
+        assert!(projected[0].residual_expr.is_some());
+    }
+
+    #[test]
+    fn round_avg_plus_avg_uses_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT ROUND(AVG(price) + AVG(cost), 2) AS spread FROM idx",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+    }
+
+    // ── Residual expression correctness regressions ────────────────────
+
+    #[test]
+    fn residual_metric_ref_survives_promotion_to_projected() {
+        // SELECT ROUND(AVG(price), 2) AS rounded, AVG(price) AS avg_price
+        // Processing order: ROUND creates a hidden metric for AVG(price), then
+        // the bare AVG(price) AS avg_price promotes it with a new name.
+        // The MetricRef inside ROUND must track the rename.
+        let plan = plan_sql(
+            "idx",
+            "SELECT ROUND(AVG(price), 2) AS rounded, AVG(price) AS avg_price FROM idx",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+
+        let rounded = grouped
+            .metrics
+            .iter()
+            .find(|m| m.output_name == "rounded")
+            .expect("rounded metric must exist");
+        assert!(rounded.residual_expr.is_some());
+
+        // Collect all MetricRef names from the residual expression tree.
+        fn collect_refs(expr: &ResidualExpr, out: &mut Vec<String>) {
+            match expr {
+                ResidualExpr::MetricRef(name) => out.push(name.clone()),
+                ResidualExpr::Round(inner, _)
+                | ResidualExpr::CastFloat(inner)
+                | ResidualExpr::CastInt(inner)
+                | ResidualExpr::Negate(inner) => collect_refs(inner, out),
+                ResidualExpr::BinaryOp(l, _, r) => {
+                    collect_refs(l, out);
+                    collect_refs(r, out);
+                }
+                ResidualExpr::Literal(_) => {}
+            }
+        }
+        let mut refs = Vec::new();
+        collect_refs(rounded.residual_expr.as_ref().unwrap(), &mut refs);
+        for r in &refs {
+            assert!(
+                grouped.metrics.iter().any(|m| &m.output_name == r),
+                "MetricRef('{}') must reference an existing metric, found: {:?}",
+                r,
+                grouped
+                    .metrics
+                    .iter()
+                    .map(|m| &m.output_name)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_residual_projections_do_not_collide() {
+        // Two different residual expressions must produce distinct projected metrics.
+        let plan = plan_sql(
+            "idx",
+            "SELECT AVG(price) + 1 AS a, AVG(cost) + 1 AS b FROM idx",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+        let projected: Vec<_> = grouped.metrics.iter().filter(|m| m.projected).collect();
+        assert_eq!(
+            projected.len(),
+            2,
+            "both residual projections must be distinct"
+        );
+        assert!(projected.iter().any(|m| m.output_name == "a"));
+        assert!(projected.iter().any(|m| m.output_name == "b"));
+    }
+
+    #[test]
+    fn same_aggregate_in_two_residual_expressions() {
+        // SELECT AVG(price) + 1 AS a, AVG(price) * 2 AS b
+        // Both reference the same AVG(price) hidden metric — only one hidden entry.
+        let plan = plan_sql(
+            "idx",
+            "SELECT AVG(price) + 1 AS a, AVG(price) * 2 AS b FROM idx",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+        let projected: Vec<_> = grouped.metrics.iter().filter(|m| m.projected).collect();
+        assert_eq!(projected.len(), 2);
+        assert!(projected.iter().any(|m| m.output_name == "a"));
+        assert!(projected.iter().any(|m| m.output_name == "b"));
+        // Only one hidden metric for AVG(price) — deduped correctly.
+        let hidden: Vec<_> = grouped.metrics.iter().filter(|m| !m.projected).collect();
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].function, SqlGroupedMetricFunction::Avg);
+        assert_eq!(hidden[0].field.as_deref(), Some("price"));
+    }
+
+    #[test]
+    fn grouped_order_by_ordinal_falls_back() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, COUNT(*) AS posts FROM idx GROUP BY author ORDER BY 1 DESC",
+        )
+        .unwrap();
+        assert!(
+            !plan.uses_grouped_partials(),
+            "ORDER BY ordinal should not be misparsed as a constant grouped residual"
+        );
+        assert!(plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn shard_top_k_disabled_for_residual_order_by() {
+        // ORDER BY on a residual metric alias must not enable shard-level top-K
+        // pruning, which can't evaluate post-merge expressions per shard.
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, SUM(price) / COUNT(*) AS avg_p FROM idx \
+             GROUP BY author ORDER BY avg_p DESC LIMIT 10",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+
+        let req = plan.to_search_request(true);
+        let agg_entry = req.aggs.values().next().expect("Expected grouped agg");
+        if let crate::search::AggregationRequest::GroupedMetrics(params) = agg_entry {
+            assert!(
+                params.shard_top_k.is_none(),
+                "shard_top_k must be None when ORDER BY targets a residual metric"
+            );
+        } else {
+            panic!("Expected GroupedMetrics aggregation");
+        }
+    }
+
+    #[test]
+    fn shard_top_k_still_works_for_bare_metric_order_by() {
+        // ORDER BY on a bare metric should still build ShardTopK when enabled.
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, COUNT(*) AS posts FROM idx \
+             GROUP BY author ORDER BY posts DESC LIMIT 10",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+        let req = plan.to_search_request(true);
+        let agg_entry = req.aggs.values().next().expect("Expected grouped agg");
+        if let crate::search::AggregationRequest::GroupedMetrics(params) = agg_entry {
+            assert!(
+                params.shard_top_k.is_some(),
+                "shard_top_k should be Some for bare metric ORDER BY"
+            );
+        } else {
+            panic!("Expected GroupedMetrics aggregation");
+        }
+    }
+
+    #[test]
+    fn fallback_detector_catches_aggregate_in_is_null() {
+        // AVG(price) IS NULL wraps an aggregate in a shape that grouped partials
+        // can't handle. The safety net must still detect the aggregate.
+        let plan = plan_sql("idx", "SELECT AVG(price) IS NULL AS is_null FROM idx").unwrap();
+        assert!(
+            !plan.uses_grouped_partials(),
+            "IS NULL wrapper should not pass grouped partials"
+        );
+        assert!(
+            plan.has_ungrouped_aggregate_fallback,
+            "aggregate in IS NULL must be detected by the safety net"
+        );
+    }
+
+    #[test]
+    fn fallback_detector_catches_aggregate_in_between() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT AVG(price) BETWEEN 0 AND 100 AS in_range FROM idx",
+        )
+        .unwrap();
+        assert!(!plan.uses_grouped_partials());
+        assert!(
+            plan.has_ungrouped_aggregate_fallback,
+            "aggregate in BETWEEN must be detected by the safety net"
+        );
+    }
+
+    // ── Aliasless residual ORDER BY / HAVING resolution ────────────────
+
+    #[test]
+    fn aliasless_residual_order_by_stays_on_grouped_partials() {
+        // ORDER BY ROUND(AVG(price), 1) without an alias — the planner must
+        // match the ORDER BY expression against the projected residual metric.
+        let plan = plan_sql(
+            "idx",
+            "SELECT category, ROUND(AVG(price), 1) FROM idx \
+             GROUP BY category ORDER BY ROUND(AVG(price), 1) DESC",
+        )
+        .unwrap();
+        assert!(
+            plan.uses_grouped_partials(),
+            "aliasless residual ORDER BY must stay on grouped partials"
+        );
+        let grouped = plan.grouped_sql.unwrap();
+        assert!(!grouped.order_by.is_empty(), "ORDER BY must be resolved");
+    }
+
+    #[test]
+    fn non_projected_residual_order_by_stays_on_grouped_partials() {
+        // ORDER BY ROUND(AVG(price), 1) when the SELECT does NOT project it.
+        // The planner must register a hidden residual metric for the ORDER BY.
+        let plan = plan_sql(
+            "idx",
+            "SELECT category FROM idx \
+             GROUP BY category ORDER BY ROUND(AVG(price), 1) DESC",
+        )
+        .unwrap();
+        assert!(
+            plan.uses_grouped_partials(),
+            "non-projected residual ORDER BY must stay on grouped partials"
+        );
+        let grouped = plan.grouped_sql.unwrap();
+        assert!(!grouped.order_by.is_empty(), "ORDER BY must be resolved");
+        // The hidden residual metric must exist but not be projected
+        let hidden_residuals: Vec<_> = grouped
+            .metrics
+            .iter()
+            .filter(|m| !m.projected && m.residual_expr.is_some())
+            .collect();
+        assert!(
+            !hidden_residuals.is_empty(),
+            "must have a hidden residual metric for ORDER BY"
+        );
+    }
+
+    #[test]
+    fn aliasless_residual_order_by_with_alias_also_works() {
+        // Same but with an alias — must still work (regression guard).
+        let plan = plan_sql(
+            "idx",
+            "SELECT category, ROUND(AVG(price), 1) AS avg_p FROM idx \
+             GROUP BY category ORDER BY avg_p DESC",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+    }
+
+    #[test]
+    fn non_projected_residual_having_stays_on_grouped_partials() {
+        // HAVING ROUND(AVG(price), 1) > 10 when the SELECT does NOT project it.
+        // The planner must register a hidden residual metric for the HAVING filter.
+        let plan = plan_sql(
+            "idx",
+            "SELECT category FROM idx \
+             GROUP BY category HAVING ROUND(AVG(price), 1) > 10",
+        )
+        .unwrap();
+        assert!(
+            plan.uses_grouped_partials(),
+            "non-projected residual HAVING must stay on grouped partials"
+        );
+        let grouped = plan.grouped_sql.unwrap();
+        assert!(!grouped.having.is_empty(), "HAVING must be resolved");
+        let hidden_residuals: Vec<_> = grouped
+            .metrics
+            .iter()
+            .filter(|m| !m.projected && m.residual_expr.is_some())
+            .collect();
+        assert!(
+            !hidden_residuals.is_empty(),
+            "must have a hidden residual metric for HAVING"
+        );
+    }
+
+    #[test]
+    fn having_with_arithmetic_residual_stays_on_grouped_partials() {
+        // HAVING AVG(price) + 1 > 10 — arithmetic on an aggregate in HAVING.
+        let plan = plan_sql(
+            "idx",
+            "SELECT category, COUNT(*) AS cnt FROM idx \
+             GROUP BY category HAVING AVG(price) + 1 > 10",
+        )
+        .unwrap();
+        assert!(
+            plan.uses_grouped_partials(),
+            "arithmetic residual HAVING must stay on grouped partials"
+        );
+        let grouped = plan.grouped_sql.unwrap();
+        assert!(!grouped.having.is_empty());
     }
 }

@@ -122,6 +122,7 @@ pub fn execute_grouped_partial_sql(
         metrics: grouped_sql
             .metrics
             .iter()
+            .filter(|metric| metric.residual_expr.is_none())
             .map(|metric| crate::search::GroupedMetricAgg {
                 output_name: metric.output_name.clone(),
                 function: metric.function.to_search_function(),
@@ -239,7 +240,12 @@ pub fn execute_grouped_partial_sql(
                 }
                 row.insert(
                     metric.output_name.clone(),
-                    grouped_metric_value(bucket.metrics.get(&metric.output_name), metric),
+                    grouped_metric_value(
+                        bucket.metrics.get(&metric.output_name),
+                        metric,
+                        &bucket,
+                        grouped_sql,
+                    ),
                 );
             }
             serde_json::Value::Object(row)
@@ -271,8 +277,25 @@ fn empty_grouped_metric_partial(
 fn grouped_metric_value(
     partial: Option<&crate::search::GroupedMetricPartial>,
     metric: &planner::SqlGroupedMetric,
+    all_partials: &crate::search::GroupedMetricsBucket,
+    grouped_sql: &planner::GroupedSqlPlan,
 ) -> serde_json::Value {
-    match (partial, &metric.function) {
+    // If this metric has a residual expression tree, evaluate it using
+    // resolved values from all metrics in the bucket.
+    if let Some(ref residual) = metric.residual_expr {
+        return eval_residual_expr(residual, all_partials, grouped_sql);
+    }
+
+    // Direct metric value (no wrapping expression).
+    raw_metric_value(partial, &metric.function)
+}
+
+/// Compute the raw numeric value for a merged metric partial.
+fn raw_metric_value(
+    partial: Option<&crate::search::GroupedMetricPartial>,
+    function: &planner::SqlGroupedMetricFunction,
+) -> serde_json::Value {
+    match (partial, function) {
         (
             Some(crate::search::GroupedMetricPartial::Count { count }),
             planner::SqlGroupedMetricFunction::Count,
@@ -326,6 +349,111 @@ fn grouped_metric_value(
     }
 }
 
+/// Evaluate a residual expression tree against the resolved metrics in a bucket.
+fn eval_residual_expr(
+    expr: &planner::ResidualExpr,
+    bucket: &crate::search::GroupedMetricsBucket,
+    grouped_sql: &planner::GroupedSqlPlan,
+) -> serde_json::Value {
+    match eval_residual_f64(expr, bucket, grouped_sql) {
+        Some(v) => {
+            // Preserve integer representation when the value has no fractional part
+            // and the expression didn't go through a float-producing operation.
+            if v.fract() == 0.0
+                && v.abs() < i64::MAX as f64
+                && !residual_produces_float_for(expr, grouped_sql)
+            {
+                serde_json::json!(v as i64)
+            } else {
+                serde_json::json!(v)
+            }
+        }
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Returns true when the expression tree contains operations that force
+/// a floating-point result (ROUND, CAST-float, division, AVG, or SUM on
+/// any field since SUM of integers is shipped as f64).
+fn residual_produces_float_for(
+    expr: &planner::ResidualExpr,
+    grouped_sql: &planner::GroupedSqlPlan,
+) -> bool {
+    match expr {
+        planner::ResidualExpr::Round(..) | planner::ResidualExpr::CastFloat(_) => true,
+        planner::ResidualExpr::Literal(_) => false,
+        planner::ResidualExpr::CastInt(_) => false,
+        planner::ResidualExpr::MetricRef(name) => grouped_sql
+            .metrics
+            .iter()
+            .find(|m| &m.output_name == name)
+            .is_some_and(|m| {
+                // AVG always divides, producing a float.  SUM is stored as
+                // f64 in Stats, and bare SUM(x) already serializes as float
+                // via raw_metric_value — so residual expressions over SUM
+                // must stay consistent and also produce float.
+                matches!(
+                    m.function,
+                    planner::SqlGroupedMetricFunction::Avg | planner::SqlGroupedMetricFunction::Sum
+                )
+            }),
+        planner::ResidualExpr::Negate(inner) => residual_produces_float_for(inner, grouped_sql),
+        planner::ResidualExpr::BinaryOp(l, op, r) => {
+            matches!(op, planner::ResidualBinOp::Div)
+                || residual_produces_float_for(l, grouped_sql)
+                || residual_produces_float_for(r, grouped_sql)
+        }
+    }
+}
+
+fn eval_residual_f64(
+    expr: &planner::ResidualExpr,
+    bucket: &crate::search::GroupedMetricsBucket,
+    grouped_sql: &planner::GroupedSqlPlan,
+) -> Option<f64> {
+    match expr {
+        planner::ResidualExpr::MetricRef(name) => {
+            // Find the metric definition to get its function type
+            let metric_def = grouped_sql
+                .metrics
+                .iter()
+                .find(|m| &m.output_name == name)?;
+            let partial = bucket.metrics.get(name);
+            let val = raw_metric_value(partial, &metric_def.function);
+            val.as_f64().or_else(|| val.as_u64().map(|n| n as f64))
+        }
+        planner::ResidualExpr::Literal(v) => Some(*v),
+        planner::ResidualExpr::Round(inner, precision) => {
+            let v = eval_residual_f64(inner, bucket, grouped_sql)?;
+            let factor = 10f64.powi(*precision);
+            Some((v * factor).round() / factor)
+        }
+        planner::ResidualExpr::CastFloat(inner) => eval_residual_f64(inner, bucket, grouped_sql),
+        planner::ResidualExpr::CastInt(inner) => {
+            let v = eval_residual_f64(inner, bucket, grouped_sql)?;
+            Some(v.trunc())
+        }
+        planner::ResidualExpr::BinaryOp(left, op, right) => {
+            let l = eval_residual_f64(left, bucket, grouped_sql)?;
+            let r = eval_residual_f64(right, bucket, grouped_sql)?;
+            Some(match op {
+                planner::ResidualBinOp::Add => l + r,
+                planner::ResidualBinOp::Sub => l - r,
+                planner::ResidualBinOp::Mul => l * r,
+                planner::ResidualBinOp::Div => {
+                    if r == 0.0 {
+                        return None;
+                    }
+                    l / r
+                }
+            })
+        }
+        planner::ResidualExpr::Negate(inner) => {
+            eval_residual_f64(inner, bucket, grouped_sql).map(|v| -v)
+        }
+    }
+}
+
 /// Extract a metric's f64 value from a native GroupedMetricsBucket.
 /// Used for HAVING filters and ORDER BY on native buckets without JSON conversion.
 fn bucket_metric_f64(
@@ -344,6 +472,12 @@ fn bucket_metric_f64(
         .metrics
         .iter()
         .find(|m| m.output_name == output_name)?;
+
+    // Residual-expr metrics are computed from other metrics, not stored directly.
+    if let Some(ref residual) = metric.residual_expr {
+        return eval_residual_f64(residual, bucket, grouped_sql);
+    }
+
     let partial = bucket.metrics.get(output_name)?;
     match (partial, &metric.function) {
         (crate::search::GroupedMetricPartial::Count { count }, _) => Some(*count as f64),
@@ -1721,6 +1855,61 @@ mod tests {
     }
 
     #[test]
+    fn grouped_partial_sql_preserves_duplicate_aggregate_aliases() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT AVG(price) AS avg_price, AVG(price) AS avg_price_copy FROM idx",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        let projected: Vec<_> = grouped
+            .metrics
+            .iter()
+            .filter(|metric| metric.projected)
+            .collect();
+        assert_eq!(projected.len(), 2);
+        assert!(
+            projected
+                .iter()
+                .any(|metric| metric.output_name == "avg_price")
+        );
+        assert!(
+            projected
+                .iter()
+                .any(|metric| metric.output_name == "avg_price_copy")
+        );
+
+        let mut partial_map = HashMap::new();
+        let buckets = vec![GroupedMetricsBucket {
+            group_values: vec![],
+            metrics: HashMap::from([(
+                "avg_price".to_string(),
+                GroupedMetricPartial::Stats {
+                    count: 2,
+                    sum: 10.0,
+                    min: 4.0,
+                    max: 6.0,
+                },
+            )]),
+        }];
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        assert_eq!(result.columns, vec!["avg_price", "avg_price_copy"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0]["avg_price"], json!(5.0));
+        assert_eq!(result.rows[0]["avg_price_copy"], json!(5.0));
+    }
+
+    #[test]
     fn grouped_partial_sql_having_with_limit() {
         use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
         use std::collections::HashMap;
@@ -1877,5 +2066,204 @@ mod tests {
         .unwrap();
         let grouped3 = plan3.grouped_sql.as_ref().unwrap();
         assert!(!grouped3.uses_top_k(plan3.limit));
+    }
+
+    /// Helper: create a single-bucket result with given metrics for testing eval.
+    fn test_bucket(
+        metrics: Vec<(&str, crate::search::GroupedMetricPartial)>,
+    ) -> crate::search::GroupedMetricsBucket {
+        crate::search::GroupedMetricsBucket {
+            group_values: vec![],
+            metrics: metrics
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+
+    fn stats_partial(count: u64, sum: f64) -> crate::search::GroupedMetricPartial {
+        crate::search::GroupedMetricPartial::Stats {
+            count,
+            sum,
+            min: 0.0,
+            max: 0.0,
+        }
+    }
+
+    #[test]
+    fn eval_residual_round_produces_correct_precision() {
+        let bucket = test_bucket(vec![("avg_x", stats_partial(10, 10.5432))]);
+        let grouped = planner::GroupedSqlPlan {
+            group_columns: vec![],
+            metrics: vec![planner::SqlGroupedMetric {
+                output_name: "avg_x".into(),
+                function: planner::SqlGroupedMetricFunction::Avg,
+                field: Some("x".into()),
+                projected: false,
+                residual_expr: None,
+            }],
+            order_by: vec![],
+            having: vec![],
+        };
+        let expr = planner::ResidualExpr::Round(
+            Box::new(planner::ResidualExpr::MetricRef("avg_x".into())),
+            2,
+        );
+        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        assert_eq!(val, json!(1.05));
+    }
+
+    #[test]
+    fn eval_residual_binary_add() {
+        let bucket = test_bucket(vec![
+            ("avg_a", stats_partial(1, 1.5)),
+            ("avg_b", stats_partial(1, 2.5)),
+        ]);
+        let grouped = planner::GroupedSqlPlan {
+            group_columns: vec![],
+            metrics: vec![
+                planner::SqlGroupedMetric {
+                    output_name: "avg_a".into(),
+                    function: planner::SqlGroupedMetricFunction::Avg,
+                    field: Some("a".into()),
+                    projected: false,
+                    residual_expr: None,
+                },
+                planner::SqlGroupedMetric {
+                    output_name: "avg_b".into(),
+                    function: planner::SqlGroupedMetricFunction::Avg,
+                    field: Some("b".into()),
+                    projected: false,
+                    residual_expr: None,
+                },
+            ],
+            order_by: vec![],
+            having: vec![],
+        };
+        let expr = planner::ResidualExpr::BinaryOp(
+            Box::new(planner::ResidualExpr::MetricRef("avg_a".into())),
+            planner::ResidualBinOp::Add,
+            Box::new(planner::ResidualExpr::MetricRef("avg_b".into())),
+        );
+        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        assert_eq!(val, json!(4.0));
+    }
+
+    #[test]
+    fn eval_residual_division_by_zero_returns_null() {
+        let bucket = test_bucket(vec![("sum_x", stats_partial(1, 100.0))]);
+        let grouped = planner::GroupedSqlPlan {
+            group_columns: vec![],
+            metrics: vec![planner::SqlGroupedMetric {
+                output_name: "sum_x".into(),
+                function: planner::SqlGroupedMetricFunction::Sum,
+                field: Some("x".into()),
+                projected: false,
+                residual_expr: None,
+            }],
+            order_by: vec![],
+            having: vec![],
+        };
+        let expr = planner::ResidualExpr::BinaryOp(
+            Box::new(planner::ResidualExpr::MetricRef("sum_x".into())),
+            planner::ResidualBinOp::Div,
+            Box::new(planner::ResidualExpr::Literal(0.0)),
+        );
+        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        assert!(val.is_null());
+    }
+
+    #[test]
+    fn eval_residual_cast_int_truncates() {
+        let bucket = test_bucket(vec![("avg_p", stats_partial(1, 3.99))]);
+        let grouped = planner::GroupedSqlPlan {
+            group_columns: vec![],
+            metrics: vec![planner::SqlGroupedMetric {
+                output_name: "avg_p".into(),
+                function: planner::SqlGroupedMetricFunction::Avg,
+                field: Some("p".into()),
+                projected: false,
+                residual_expr: None,
+            }],
+            order_by: vec![],
+            having: vec![],
+        };
+        let expr = planner::ResidualExpr::CastInt(Box::new(planner::ResidualExpr::MetricRef(
+            "avg_p".into(),
+        )));
+        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        assert_eq!(val, json!(3));
+    }
+
+    #[test]
+    fn eval_residual_resolves_renamed_hidden_metric() {
+        // Simulates the scenario where a hidden metric (__hidden_0) is renamed
+        // to "avg_price" when a bare AVG(price) AS avg_price is projected.
+        // The residual ROUND must reference the renamed name.
+        let bucket = test_bucket(vec![("avg_price", stats_partial(10, 105.432))]);
+        let grouped = planner::GroupedSqlPlan {
+            group_columns: vec![],
+            metrics: vec![
+                planner::SqlGroupedMetric {
+                    output_name: "avg_price".into(),
+                    function: planner::SqlGroupedMetricFunction::Avg,
+                    field: Some("price".into()),
+                    projected: true,
+                    residual_expr: None,
+                },
+                planner::SqlGroupedMetric {
+                    output_name: "rounded".into(),
+                    function: planner::SqlGroupedMetricFunction::Avg,
+                    field: None,
+                    projected: true,
+                    residual_expr: Some(planner::ResidualExpr::Round(
+                        Box::new(planner::ResidualExpr::MetricRef("avg_price".into())),
+                        2,
+                    )),
+                },
+            ],
+            order_by: vec![],
+            having: vec![],
+        };
+        // The ROUND metric should resolve through avg_price.
+        // AVG = 105.432 / 10 = 10.5432, ROUND(10.5432, 2) = 10.54
+        let val = eval_residual_expr(
+            grouped.metrics[1].residual_expr.as_ref().unwrap(),
+            &bucket,
+            &grouped,
+        );
+        assert_eq!(val, json!(10.54));
+    }
+
+    #[test]
+    fn eval_residual_sum_plus_literal_produces_float() {
+        // SUM stores f64 in Stats and bare SUM(x) already serializes as float,
+        // so residual expressions over SUM must be consistent: always float.
+        let bucket = test_bucket(vec![("sum_up", stats_partial(10, 3750.0))]);
+        let grouped = planner::GroupedSqlPlan {
+            group_columns: vec![],
+            metrics: vec![planner::SqlGroupedMetric {
+                output_name: "sum_up".into(),
+                function: planner::SqlGroupedMetricFunction::Sum,
+                field: Some("upvotes".into()),
+                projected: false,
+                residual_expr: None,
+            }],
+            order_by: vec![],
+            having: vec![],
+        };
+        let expr = planner::ResidualExpr::BinaryOp(
+            Box::new(planner::ResidualExpr::MetricRef("sum_up".into())),
+            planner::ResidualBinOp::Add,
+            Box::new(planner::ResidualExpr::Literal(1.0)),
+        );
+        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        // SUM stores f64 in Stats and bare SUM(x) already serializes as float,
+        // so residual expressions over SUM must be consistent: always float.
+        assert_eq!(val, json!(3751.0));
+        assert!(
+            val.is_f64(),
+            "SUM+1 must serialize as float for type consistency"
+        );
     }
 }

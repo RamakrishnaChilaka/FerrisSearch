@@ -89,7 +89,7 @@ impl FerrisDB {
 
         cluster_state.add_index(IndexMetadata {
             name: index_name.to_string(),
-            uuid: String::new(),
+            uuid: format!("{}-uuid", index_name),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -119,7 +119,13 @@ impl FerrisDB {
         let metadata = cluster_state.indices.get(index_name).unwrap();
         state
             .shard_manager
-            .open_shard_with_settings(index_name, 0, &metadata.mappings, &metadata.settings, "")
+            .open_shard_with_settings(
+                index_name,
+                0,
+                &metadata.mappings,
+                &metadata.settings,
+                &metadata.uuid,
+            )
             .expect("open shard");
 
         let shard = state.shard_manager.get_shard(index_name, 0).unwrap();
