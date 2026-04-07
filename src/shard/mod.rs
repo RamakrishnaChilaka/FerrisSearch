@@ -9,7 +9,7 @@ use crate::wal::TranslogDurability;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 /// Key uniquely identifying a shard: (index_name, shard_id)
@@ -158,6 +158,9 @@ pub struct ShardManager {
     settings_managers: RwLock<HashMap<String, Arc<SettingsManager>>>,
     /// Maps index_name → index UUID (used for on-disk directory names).
     index_uuids: RwLock<HashMap<String, String>>,
+    /// Serializes concurrent open attempts for the same shard key so only
+    /// one thread performs the expensive CompositeEngine creation at a time.
+    open_locks: Mutex<HashMap<ShardKey, Arc<Mutex<()>>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
     pub isr_tracker: IsrTracker,
     /// Translog durability mode for new shards.
@@ -193,6 +196,7 @@ impl ShardManager {
             shards: RwLock::new(HashMap::new()),
             settings_managers: RwLock::new(HashMap::new()),
             index_uuids: RwLock::new(HashMap::new()),
+            open_locks: Mutex::new(HashMap::new()),
             isr_tracker: IsrTracker::new(1000),
             durability,
             column_cache,
@@ -268,6 +272,26 @@ impl ShardManager {
         index_uuid: &str,
     ) -> Result<Arc<dyn SearchEngine>> {
         let key = ShardKey::new(index, shard_id);
+
+        // Fast path: shard already open.
+        {
+            let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(engine) = shards.get(&key) {
+                return Ok(engine.clone());
+            }
+        }
+
+        // Serialize concurrent open attempts for the same shard key.
+        // This prevents two threads from both creating a CompositeEngine
+        // on the same directory (which causes a Tantivy LockBusy error).
+        let per_shard_lock = {
+            let mut locks = self.open_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.entry(key.clone()).or_default().clone()
+        };
+        let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Re-check after acquiring the per-shard lock — a concurrent caller
+        // may have finished opening this shard while we were waiting.
         {
             let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
             if let Some(engine) = shards.get(&key) {
