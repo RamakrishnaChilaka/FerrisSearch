@@ -235,7 +235,7 @@ fn setup_single_node_cluster_state(cm: &ClusterManager, index_name: &str) {
     );
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: String::new(),
+        uuid: format!("{}-uuid", index_name),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -272,7 +272,7 @@ fn setup_multi_shard_single_node_cluster_state(cm: &ClusterManager, index_name: 
     }
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: String::new(),
+        uuid: format!("{}-uuid", index_name),
         number_of_shards: shards,
         number_of_replicas: 0,
         shard_routing,
@@ -320,7 +320,7 @@ fn setup_two_node_cluster_state(
     );
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: String::new(),
+        uuid: format!("{}-uuid", index_name),
         number_of_shards: 1,
         number_of_replicas: 1,
         shard_routing,
@@ -726,7 +726,7 @@ async fn publish_state_updates_cluster_and_closes_deleted_indices() {
         );
         initial_state.add_index(IndexMetadata {
             name: "old-index".into(),
-            uuid: String::new(),
+            uuid: "old-index-uuid".into(),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1485,7 +1485,7 @@ async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
     let mut cs = cm.get_state();
     cs.add_index(IndexMetadata {
         name: "agg-idx".into(),
-        uuid: String::new(),
+        uuid: "agg-idx-uuid".into(),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -1612,7 +1612,7 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
     });
     cs.add_index(IndexMetadata {
         name: "sql-stream-idx".into(),
-        uuid: String::new(),
+        uuid: "sql-stream-idx-uuid".into(),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,

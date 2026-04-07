@@ -498,8 +498,8 @@ Dedicated rayon thread pools handle search and write engine work. Async control-
 ## Testing
 
 ```bash
-cargo test                                      # All 1057 tests
-cargo test --lib                                # Unit tests (881)
+cargo test                                      # All 1086 tests
+cargo test --lib                                # Unit tests (910)
 cargo test --bin ferris-cli                      # CLI tests (64)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (40)

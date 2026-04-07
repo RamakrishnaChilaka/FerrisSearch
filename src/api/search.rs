@@ -620,7 +620,7 @@ async fn collect_direct_sql_batches(
     let mut total_hits = 0usize;
     let mut collected_hits = 0usize;
     let mut successful_shards = 0u32;
-    let use_streaming = plan.has_group_by_fallback;
+    let use_streaming = plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback;
     let mut used_streaming = false;
 
     let sql_futures: Vec<_> = local_shards
@@ -795,7 +795,7 @@ async fn collect_direct_sql_partitions(
     // Gate streaming on has_group_by_fallback to match collect_direct_sql_batches.
     // Non-GROUP-BY queries go straight to TopDocs — avoids a wasted
     // sql_streaming_batches() call that will return None for scored/LIMIT queries.
-    let use_streaming = plan.has_group_by_fallback;
+    let use_streaming = plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback;
 
     let local_futures: Vec<_> = local_shards
         .iter()
@@ -1662,7 +1662,7 @@ async fn execute_sql_query_with_plan(
         apply_semijoin_filter(&mut search_req, semijoin, &key_values);
     }
 
-    if plan.has_group_by_fallback {
+    if plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback {
         search_req.size = if state.sql_group_by_scan_limit == 0 {
             usize::MAX
         } else {
@@ -1921,12 +1921,12 @@ async fn execute_sql_query_with_plan(
     // for score-free queries whose requested columns stay fully fast-field-backed.
     // Any shard that still needs score or stored-doc fallback remains capped, so
     // the guard keys off whether we actually collected fewer rows than matched.
-    if truncated && plan.has_group_by_fallback {
+    if truncated && (plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback) {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "group_by_scan_limit_exceeded",
             format!(
-                "GROUP BY query matched {} docs but only {} were collected. \
+                "Aggregate query matched {} docs but only {} were collected. \
                  Results would be incorrect. Narrow the query with filters, \
                  rewrite to use simple GROUP BY columns with count/sum/avg/min/max \
                  for the grouped_partials path, or increase sql_group_by_scan_limit \
@@ -2171,7 +2171,7 @@ async fn execute_sql_stream_query(
     let plan = canonicalize_sql_plan_fields(plan, &metadata.mappings)?;
 
     let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
-    if plan.has_group_by_fallback {
+    if plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback {
         search_req.size = if state.sql_group_by_scan_limit == 0 {
             usize::MAX
         } else {
@@ -2216,12 +2216,12 @@ async fn execute_sql_stream_query(
         && plan.limit.is_none()
         && direct_sql.collected_hits < direct_sql.total_hits;
 
-    if truncated && plan.has_group_by_fallback {
+    if truncated && (plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback) {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "group_by_scan_limit_exceeded",
             format!(
-                "GROUP BY query matched {} docs but only {} were collected. \
+                "Aggregate query matched {} docs but only {} were collected. \
                  Results would be incorrect. Narrow the query with filters, \
                  rewrite to use simple GROUP BY columns with count/sum/avg/min/max \
                  for the grouped_partials path, or increase sql_group_by_scan_limit \

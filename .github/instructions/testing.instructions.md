@@ -1,13 +1,13 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **881 unit tests** (`cargo test --lib`)
+- **910 unit tests** (`cargo test --lib`)
 - **64 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **40 replication integration tests** (`cargo test --test replication_integration`)
 - **38 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 170 assertions across 4 files
-- **1057 total** (`cargo test`)
+- **1086 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -109,6 +109,7 @@ cargo test -- test_name                         # Single test by name
 - **Bound-column IR migrations**: When the small planner binder lands, add unit tests that resolve the same identifier name across clauses to different semantic kinds: source field vs output alias vs synthetic `_id` / `_score`. Cover at least WHERE alias residual behavior, HAVING/ORDER BY output-space binding, aggregate-argument source-field binding under alias shadowing, GROUP BY source-only eligibility, and real `score` vs synthetic `_score` separation.
 - **Truncation flag**: Assert `truncated=false` for explicit LIMIT queries. Assert `truncated=true` only for flat fast-field queries when `matched_hits` exceeds the internal 100K ceiling without an explicit LIMIT. GROUP BY fallback queries should error via `group_by_scan_limit_exceeded` instead of returning `truncated=true`.
 - **GROUP BY scan limit**: Expression GROUP BY and unsupported-aggregate GROUP BY fall to `tantivy_fast_fields` with a raised scan limit (`sql_group_by_scan_limit`, default 1M). Test that: (1) `has_group_by_fallback` is true for expression GROUP BY / unsupported aggs, false for plain GROUP BY and flat queries, (2) the `group_by_scan_limit_exceeded` error fires when a capped fallback path collects fewer rows than it matched (unit test with `sql_group_by_scan_limit: 1` and a text/source-fallback GROUP BY), (3) a fully fast-field-backed local expression GROUP BY can stream past that tiny limit and still succeed, and (4) fallback queries that reference text/source-fallback columns or `_score` stay correct instead of being forced onto the bitset streaming path.
+- **Residual expression tree**: Queries like `ROUND(AVG(x), 2)`, `AVG(x) + AVG(y)`, `SUM(a) / COUNT(*)`, `MAX(x) - MIN(x)` must use `tantivy_grouped_partials` with `residual_expr`. Test that: (1) hidden metrics are extracted for each inner aggregate, (2) the projected metric has `residual_expr: Some(...)`, (3) ROUND/CAST/arithmetic are correctly represented in the tree, (4) `eval_residual_expr` produces correct values including integer preservation for `MAX - MIN` on integer fields, and (5) ORDER BY on residual-expr metrics works correctly.
 - Live tests should inspect the `planner`, `execution_mode`, `streaming_used`, and `truncated` fields, not just the returned rows.
 - Add regression tests when planner or execution changes accidentally widen the fallback path for queries that should stay search-aware.
 

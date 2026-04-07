@@ -40,6 +40,17 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 ## Ungrouped Aggregate Pushdown
 - SQL queries with only aggregate functions (no GROUP BY) now use the `tantivy_grouped_partials` execution path with zero group-by columns.
 
+## Residual Expression Tree (ResidualExpr)
+- SELECT items that wrap or combine aggregates (e.g. `ROUND(AVG(x), 2)`, `AVG(x) + AVG(y)`, `SUM(a) / COUNT(*)`) are pushed down to `tantivy_grouped_partials` by extracting each inner aggregate as a hidden metric and building a `ResidualExpr` tree for post-merge evaluation.
+- `ResidualExpr` variants: `MetricRef(name)`, `Literal(f64)`, `Round(expr, precision)`, `CastFloat(expr)`, `CastInt(expr)`, `BinaryOp(left, op, right)`, `Negate(expr)`.
+- `ResidualBinOp`: `Add`, `Sub`, `Mul`, `Div`.
+- `extract_projected_metric()` is the entry point: tries bare aggregate first, then calls `try_build_residual_expr()` which recursively walks the SQL AST extracting aggregates and building the expression tree.
+- Metrics with `residual_expr: Some(...)` are filtered out of the Tantivy `GroupedMetricAgg` parameters — they have no real field to aggregate on.
+- `eval_residual_expr()` / `eval_residual_f64()` evaluates the tree against resolved metric values in a merged bucket.
+- `bucket_metric_f64()` also evaluates residual expressions for ORDER BY and HAVING comparisons.
+- Integer type preservation: when the result has no fractional part and the expression tree doesn't contain float-producing operations (ROUND, CastFloat, division, AVG, SUM), the value is returned as `i64` rather than `f64`.
+- `has_ungrouped_aggregate_fallback` is a safety net for truly unparseable aggregate expressions that the residual extractor cannot handle. It forces the scan limit to `sql_group_by_scan_limit` and errors on truncation.
+
 ## Scan Limits and GROUP BY Correctness
 - **Flat `tantivy_fast_fields` queries** (no GROUP BY): `SQL_MATCH_LIMIT = 100_000` caps `TopDocs` collection unless `LIMIT` pushdown applies. Truncation only affects completeness — individual rows are correct. The response includes `truncated: true`. The CLI renders a `⚠ TRUNCATED` warning.
 - **GROUP BY on grouped_partials path**: No scan limit. Aggregation collectors process ALL matched docs per shard.
@@ -126,6 +137,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - `_score` and `_id` fields are never pushed (`_score` is computed by Tantivy, `_id` is a doc identifier).
 - **GROUP BY expressions** (e.g., `GROUP BY LOWER(author)`, `GROUP BY year / 10`) are NOT eligible for the grouped partials path. Only plain column references in GROUP BY enable `tantivy_grouped_partials`. Expression-based GROUP BY falls through to `tantivy_fast_fields` + DataFusion. When the fallback query is `_score`-free and fully fast-field-backed, the runtime may use bitset streaming internally; responses expose this separately as `streaming_used: true`. Mixed GROUP BY (plain columns + expressions, e.g., `GROUP BY author, LOWER(category)`) also bails — `collect_group_by_columns` returns `has_expression_group_by = true` which gates `extract_grouped_sql_plan`.
 - **GROUP BY fallback scan limit**: When a GROUP BY query falls to `tantivy_fast_fields` (expression GROUP BY, unsupported aggregates like `STDDEV_POP`, residual predicates), the planner sets `has_group_by_fallback = true`. The API layer overrides `SearchRequest.size` from the default 100K to `sql_group_by_scan_limit` (default: 1M, configurable, 0 = unlimited). If any shard still returns fewer rows than it matched on the capped fallback paths, the query returns a `group_by_scan_limit_exceeded` error instead of silently wrong aggregates. The default 100K `SQL_MATCH_LIMIT` remains for flat (non-GROUP BY) queries where truncation only affects completeness, not correctness.
+- **Ungrouped aggregate fallback**: When a SELECT contains aggregate functions but `grouped_sql` is `None` and there is no GROUP BY, `has_ungrouped_aggregate_fallback = true` applies the same scan limit override and truncation error as GROUP BY fallback. This catches expressions the residual expression extractor cannot handle.
 - `collect_expr_columns` handles `Cast`, `Case` (with `CaseWhen` arms), and `Like`/`ILike` expressions to ensure all referenced columns are read from fast fields.
 - **SELECT aliases are never pushed down.** If a WHERE predicate references a SELECT alias (e.g., `WHERE posts > 10` when `posts` is `count(*) AS posts`), it stays as a residual predicate for DataFusion. This prevents pushing filters on nonexistent Tantivy fields, which silently fall back to the `body` catch-all field and match nearly everything.
 - **Alias shadowing and required columns**: `collect_required_columns()` must use alias-aware walkers for WHERE/HAVING/ORDER BY so bare alias references do not leak into `required_columns`, while real source fields still survive through wrapped aggregate expressions like `COALESCE(AVG(price), 0)` or `CAST(AVG(price) AS FLOAT)` when a SELECT alias shadows that field name.

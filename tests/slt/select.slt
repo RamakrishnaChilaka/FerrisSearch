@@ -247,10 +247,10 @@ SELECT count(upvotes) FROM stories
 ----
 10
 
-# ── Computed aggregate expressions (DataFusion fallback) ─────────────
-# These are NOT simple aggregates — they contain arithmetic over aggregates.
-# The grouped partials path can't handle them, so they fall to
-# tantivy_fast_fields + DataFusion, which evaluates the expressions.
+# ── Computed aggregate expressions (grouped_partials with residual) ──
+# Arithmetic over aggregates is pushed down via the grouped_partials path.
+# Each aggregate is extracted as a hidden metric, and the surrounding
+# scalar expression (ROUND, CAST, +, -, *, /) is evaluated after merge.
 
 # Simple arithmetic on aggregates (ungrouped)
 query R nosort
@@ -279,6 +279,40 @@ SELECT author, max(upvotes) - min(upvotes) AS spread FROM stories GROUP BY autho
 carol 600
 bob 200
 alice 130
+
+# ROUND(AVG(...)) — previously fell through to fast_fields, now grouped_partials
+query R nosort
+SELECT ROUND(AVG(CAST(upvotes AS FLOAT)), 2) AS avg_votes FROM stories
+----
+375.0
+
+# CAST(AVG(...) AS INTEGER)
+query I nosort
+SELECT CAST(AVG(upvotes) AS INTEGER) AS avg_int FROM stories
+----
+375
+
+# AVG(x) + AVG(y) — multiple aggregates combined with arithmetic
+query R nosort
+SELECT AVG(upvotes) + AVG(comments) AS combined FROM stories
+----
+550.2
+
+# ROUND(SUM(x) / COUNT(*), 1)
+query R nosort
+SELECT ROUND(SUM(upvotes) * 1.0 / COUNT(*), 1) AS avg_rounded FROM stories
+----
+375.0
+
+# Grouped ROUND on aggregate
+query TR nosort
+SELECT category, ROUND(AVG(CAST(upvotes AS FLOAT)), 1) AS avg_cat FROM stories GROUP BY category ORDER BY avg_cat DESC
+----
+culture 800.0
+ml 700.0
+python 400.0
+rust 175.0
+startup 50.0
 
 # ── Case-insensitive unquoted column resolution ─────────────────────
 
