@@ -1370,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_auto_flush_uses_checkpoint_aware_truncation() {
+    fn maybe_auto_flush_rolls_then_prunes_checkpointed_generations() {
         let dir = tempfile::tempdir().unwrap();
         let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
         engine.add_document("d1", json!({"x": 1})).unwrap();
@@ -1380,11 +1380,22 @@ mod tests {
 
         let before = engine.text.translog_size_bytes();
         let flushed = engine.maybe_auto_flush(1).unwrap();
-        let after = engine.text.translog_size_bytes();
+        let after_first = engine.text.translog_size_bytes();
 
         assert!(flushed);
-        assert!(after > 0);
-        assert!(after < before);
+        assert!(after_first > 0);
+        assert!(after_first >= before);
+
+        engine.add_document("d4", json!({"x": 4})).unwrap();
+        engine.update_global_checkpoint(2);
+
+        let before_second = engine.text.translog_size_bytes();
+        let flushed_second = engine.maybe_auto_flush(1).unwrap();
+        let after_second = engine.text.translog_size_bytes();
+
+        assert!(flushed_second);
+        assert!(after_second > 0);
+        assert!(after_second < before_second);
     }
 
     #[test]

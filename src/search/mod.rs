@@ -252,6 +252,43 @@ pub struct ShardTopK {
     pub descending: bool,
 }
 
+pub(crate) const DERIVED_GROUP_KEY_PREFIX: &str = "__derived_group_key__:";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DerivedGroupBucket {
+    pub lower: String,
+    pub lower_inclusive: bool,
+    pub upper: String,
+    pub upper_inclusive: bool,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DerivedGroupKey {
+    pub source_field: String,
+    pub buckets: Vec<DerivedGroupBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub else_label: Option<String>,
+}
+
+pub fn encode_derived_group_key(spec: &DerivedGroupKey) -> String {
+    format!(
+        "{}{}",
+        DERIVED_GROUP_KEY_PREFIX,
+        serde_json::to_string(spec).expect("derived group key spec should serialize")
+    )
+}
+
+pub fn decode_derived_group_key(value: &str) -> Option<DerivedGroupKey> {
+    value
+        .strip_prefix(DERIVED_GROUP_KEY_PREFIX)
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
+pub fn is_derived_group_key(value: &str) -> bool {
+    value.starts_with(DERIVED_GROUP_KEY_PREFIX)
+}
+
 /// Internal grouped metrics request for SQL `GROUP BY` execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupedMetricsAggParams {

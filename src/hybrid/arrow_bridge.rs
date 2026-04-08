@@ -2,9 +2,9 @@ use super::column_store::ColumnStore;
 use anyhow::{Result, bail};
 use datafusion::arrow::array::{
     ArrayRef, BooleanBuilder, Float32Array, Float64Array, Float64Builder, Int64Array, Int64Builder,
-    StringBuilder,
+    StringBuilder, TimestampMillisecondArray,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub enum ColumnKind {
     Float64,
     Int64,
+    TimestampMillis,
     Boolean,
     Utf8,
 }
@@ -24,6 +25,10 @@ impl ColumnKind {
         match self {
             ColumnKind::Float64 => datafusion::arrow::datatypes::DataType::Float64,
             ColumnKind::Int64 => datafusion::arrow::datatypes::DataType::Int64,
+            ColumnKind::TimestampMillis => datafusion::arrow::datatypes::DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Millisecond,
+                Some("UTC".into()),
+            ),
             ColumnKind::Boolean => datafusion::arrow::datatypes::DataType::Boolean,
             ColumnKind::Utf8 => datafusion::arrow::datatypes::DataType::Utf8,
         }
@@ -60,12 +65,38 @@ pub fn build_int64_array(values: &[Value]) -> Result<Int64Array> {
     Ok(builder.finish())
 }
 
+pub fn build_timestamp_millis_array(values: &[Value]) -> Result<TimestampMillisecondArray> {
+    let mut millis = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            Value::String(text) => {
+                let parsed =
+                    crate::common::date::parse_iso8601_to_epoch_millis(text).ok_or_else(|| {
+                        anyhow::anyhow!("Invalid ISO 8601 value in date column: {}", text)
+                    })?;
+                millis.push(Some(parsed));
+            }
+            Value::Number(number) => {
+                let parsed = number.as_i64().ok_or_else(|| {
+                    anyhow::anyhow!("Non-integer numeric value found in date column")
+                })?;
+                millis.push(Some(parsed));
+            }
+            Value::Null => millis.push(None),
+            _ => bail!("Non-date value found in timestamp column"),
+        }
+    }
+
+    Ok(TimestampMillisecondArray::from(millis).with_timezone("UTC".to_string()))
+}
+
 /// Derive Arrow column type from the index field mapping.
 /// This ensures both fast-field and fallback paths agree on column types.
 pub fn column_kind_from_field_type(ft: &crate::cluster::state::FieldType) -> ColumnKind {
     match ft {
         crate::cluster::state::FieldType::Float => ColumnKind::Float64,
         crate::cluster::state::FieldType::Integer => ColumnKind::Int64,
+        crate::cluster::state::FieldType::Date => ColumnKind::TimestampMillis,
         crate::cluster::state::FieldType::Boolean => ColumnKind::Boolean,
         _ => ColumnKind::Utf8,
     }
@@ -160,6 +191,9 @@ fn data_type_for(kind: ColumnKind) -> DataType {
     match kind {
         ColumnKind::Float64 => DataType::Float64,
         ColumnKind::Int64 => DataType::Int64,
+        ColumnKind::TimestampMillis => {
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+        }
         ColumnKind::Boolean => DataType::Boolean,
         ColumnKind::Utf8 => DataType::Utf8,
     }
@@ -169,6 +203,7 @@ fn build_array(values: &[Value], kind: ColumnKind) -> Result<ArrayRef> {
     match kind {
         ColumnKind::Float64 => Ok(Arc::new(build_float64_array(values)?)),
         ColumnKind::Int64 => Ok(Arc::new(build_int64_array(values)?)),
+        ColumnKind::TimestampMillis => Ok(Arc::new(build_timestamp_millis_array(values)?)),
         ColumnKind::Boolean => {
             let mut builder = BooleanBuilder::with_capacity(values.len());
             for value in values {
@@ -387,6 +422,10 @@ mod tests {
             ColumnKind::Int64
         );
         assert_eq!(
+            column_kind_from_field_type(&FieldType::Date),
+            ColumnKind::TimestampMillis
+        );
+        assert_eq!(
             column_kind_from_field_type(&FieldType::Float),
             ColumnKind::Float64
         );
@@ -431,5 +470,39 @@ mod tests {
             .unwrap();
         assert_eq!(array.value(0), 25);
         assert_eq!(array.value(1), 30);
+    }
+
+    #[test]
+    fn timestamp_hint_produces_timestamp_arrow_column() {
+        let ids = vec!["a".to_string()];
+        let scores = vec![0.0f32];
+        let mut cols = BTreeMap::new();
+        cols.insert(
+            "created_at".to_string(),
+            vec![Value::String("2025-01-05T08:15:00+05:30".to_string())],
+        );
+        let store = ColumnStore::new(ids, scores, cols);
+
+        let mut hints = HashMap::new();
+        hints.insert("created_at".to_string(), ColumnKind::TimestampMillis);
+        let batch = build_record_batch_with_hints(&store, &hints).unwrap();
+
+        let schema = batch.schema();
+        let field = schema.field_with_name("created_at").unwrap().clone();
+        assert_eq!(
+            *field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+        );
+
+        let array = batch
+            .column_by_name("created_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(
+            crate::common::date::epoch_millis_to_iso8601(array.value(0)),
+            "2025-01-05T02:45:00Z"
+        );
     }
 }

@@ -12,6 +12,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+pub const SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX: &str = "api_delete_index";
+pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_delete_index_rpc";
+pub const SHARD_DATA_REMOVE_REASON_LEGACY_PUBLISH_STATE: &str =
+    "legacy_publish_state_removed_index";
+pub const SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP: &str = "orphan_cleanup_unknown_uuid";
+
 /// Key uniquely identifying a shard: (index_name, shard_id)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ShardKey {
@@ -447,6 +453,13 @@ impl ShardManager {
     /// Close and remove all shard engines for an index, then delete the data directory.
     /// Uses the stored UUID mapping to find the correct on-disk directory.
     pub fn close_index_shards(&self, index: &str) -> Result<()> {
+        self.close_index_shards_with_reason(index, "unspecified")
+    }
+
+    /// Close and remove all shard engines for an index, then delete the data directory.
+    /// `reason` is logged with any on-disk removal so destructive paths can be
+    /// distinguished in restart diagnostics.
+    pub fn close_index_shards_with_reason(&self, index: &str, reason: &'static str) -> Result<()> {
         let mut shards = self.shards.write().unwrap_or_else(|e| e.into_inner());
         let keys_to_remove: Vec<ShardKey> = shards
             .keys()
@@ -479,12 +492,20 @@ impl ShardManager {
         if let Some(uuid) = uuid {
             let index_dir = self.data_dir.join(&uuid);
             if index_dir.exists() {
+                tracing::warn!(
+                    reason = reason,
+                    index = index,
+                    uuid = uuid.as_str(),
+                    path = ?index_dir,
+                    "Removing shard data directory"
+                );
                 Self::remove_dir_all_with_retry(&index_dir)?;
                 tracing::info!(
-                    "Removed shard data for index '{}' (uuid={}) at {:?}",
-                    index,
-                    uuid,
-                    index_dir
+                    reason = reason,
+                    index = index,
+                    uuid = uuid.as_str(),
+                    path = ?index_dir,
+                    "Removed shard data directory"
                 );
             }
         }
@@ -493,10 +514,22 @@ impl ShardManager {
 
     /// Async wrapper for shard shutdown + directory deletion on Tokio call sites.
     pub async fn close_index_shards_blocking(self: &Arc<Self>, index: String) -> Result<()> {
-        let shard_manager = self.clone();
-        tokio::task::spawn_blocking(move || shard_manager.close_index_shards(&index))
+        self.close_index_shards_blocking_with_reason(index, "unspecified")
             .await
-            .map_err(|e| anyhow::anyhow!("blocking shard close task failed: {}", e))?
+    }
+
+    /// Async wrapper for shard shutdown + directory deletion on Tokio call sites.
+    pub async fn close_index_shards_blocking_with_reason(
+        self: &Arc<Self>,
+        index: String,
+        reason: &'static str,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            shard_manager.close_index_shards_with_reason(&index, reason)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking shard close task failed: {}", e))?
     }
 
     fn remove_dir_all_with_retry(path: &std::path::Path) -> Result<()> {
@@ -596,12 +629,20 @@ impl ShardManager {
                 continue;
             }
             if !known_uuids.contains(&dir_name) {
-                tracing::info!(
-                    "Removing orphaned data directory: {:?} (not in known UUIDs)",
-                    path
+                tracing::warn!(
+                    reason = SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP,
+                    uuid = dir_name.as_str(),
+                    path = ?path,
+                    "Removing orphaned data directory because it is not present in authoritative known UUIDs"
                 );
                 if let Err(e) = Self::remove_dir_all_with_retry(&path) {
-                    tracing::warn!("Failed to remove orphaned directory {:?}: {}", path, e);
+                    tracing::warn!(
+                        reason = SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP,
+                        uuid = dir_name.as_str(),
+                        path = ?path,
+                        error = %e,
+                        "Failed to remove orphaned data directory"
+                    );
                 }
             }
         }

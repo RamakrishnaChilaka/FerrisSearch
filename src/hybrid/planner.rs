@@ -309,7 +309,9 @@ fn bind_group_by(
     exprs
         .iter()
         .map(|expr| {
-            if let Some(name) = expr_to_field_name(expr) {
+            if let Some(name) =
+                extract_supported_group_key(expr).or_else(|| expr_to_field_name(expr))
+            {
                 if SyntheticColumn::parse(&name).is_some()
                     || alias_blocks_source_name(&name, aliases, identity_source_aliases)
                 {
@@ -330,6 +332,166 @@ fn alias_blocks_source_name(
     identity_source_aliases: &BTreeSet<String>,
 ) -> bool {
     aliases.contains(name) && !identity_source_aliases.contains(name)
+}
+
+fn extract_supported_group_key(expr: &Expr) -> Option<String> {
+    let Expr::Case {
+        operand: None,
+        conditions,
+        else_result,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+
+    if conditions.is_empty() {
+        return None;
+    }
+
+    let mut source_field = None;
+    let mut buckets = Vec::with_capacity(conditions.len());
+
+    for case_when in conditions {
+        let (field_name, bucket) = parse_case_bucket(case_when)?;
+        match &source_field {
+            Some(existing) if existing != &field_name => return None,
+            None => source_field = Some(field_name),
+            _ => {}
+        }
+        buckets.push(bucket);
+    }
+
+    let else_label = match else_result.as_ref() {
+        Some(expr) => Some(expr_to_string_literal(expr.as_ref())?),
+        None => None,
+    };
+    Some(crate::search::encode_derived_group_key(
+        &crate::search::DerivedGroupKey {
+            source_field: source_field?,
+            buckets,
+            else_label,
+        },
+    ))
+}
+
+fn parse_case_bucket(
+    case_when: &sqlparser::ast::CaseWhen,
+) -> Option<(String, crate::search::DerivedGroupBucket)> {
+    let mut field_name = None;
+    let mut lower = None;
+    let mut upper = None;
+
+    collect_case_bucket_bounds(
+        &case_when.condition,
+        &mut field_name,
+        &mut lower,
+        &mut upper,
+    )?;
+
+    Some((
+        field_name?,
+        crate::search::DerivedGroupBucket {
+            lower: lower.as_ref()?.0.clone(),
+            lower_inclusive: lower?.1,
+            upper: upper.as_ref()?.0.clone(),
+            upper_inclusive: upper?.1,
+            label: expr_to_string_literal(&case_when.result)?,
+        },
+    ))
+}
+
+fn collect_case_bucket_bounds(
+    expr: &Expr,
+    field_name: &mut Option<String>,
+    lower: &mut Option<(String, bool)>,
+    upper: &mut Option<(String, bool)>,
+) -> Option<()> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_case_bucket_bounds(left, field_name, lower, upper)?;
+            collect_case_bucket_bounds(right, field_name, lower, upper)?;
+            Some(())
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let left_field = expr_to_field_name(left);
+            let right_field = expr_to_field_name(right);
+            let left_literal = expr_to_string_literal(left);
+            let right_literal = expr_to_string_literal(right);
+
+            match (left_field, right_literal) {
+                (Some(name), Some(bound)) => {
+                    assign_case_bucket_bound(field_name, lower, upper, name, op, bound, true)
+                }
+                _ => match (left_literal, right_field) {
+                    (Some(bound), Some(name)) => {
+                        assign_case_bucket_bound(field_name, lower, upper, name, op, bound, false)
+                    }
+                    _ => None,
+                },
+            }
+        }
+        _ => None,
+    }
+}
+
+fn assign_case_bucket_bound(
+    field_name: &mut Option<String>,
+    lower: &mut Option<(String, bool)>,
+    upper: &mut Option<(String, bool)>,
+    name: String,
+    op: &BinaryOperator,
+    bound: String,
+    field_on_left: bool,
+) -> Option<()> {
+    match field_name {
+        Some(existing) if existing != &name => return None,
+        None => *field_name = Some(name),
+        _ => {}
+    }
+
+    match (field_on_left, op) {
+        (true, BinaryOperator::Gt) => set_bound(lower, bound, false),
+        (true, BinaryOperator::GtEq) => set_bound(lower, bound, true),
+        (true, BinaryOperator::Lt) => set_bound(upper, bound, false),
+        (true, BinaryOperator::LtEq) => set_bound(upper, bound, true),
+        (false, BinaryOperator::Lt) => set_bound(lower, bound, false),
+        (false, BinaryOperator::LtEq) => set_bound(lower, bound, true),
+        (false, BinaryOperator::Gt) => set_bound(upper, bound, false),
+        (false, BinaryOperator::GtEq) => set_bound(upper, bound, true),
+        _ => None,
+    }
+}
+
+fn set_bound(slot: &mut Option<(String, bool)>, value: String, inclusive: bool) -> Option<()> {
+    match slot {
+        Some((existing, existing_inclusive))
+            if existing != &value || *existing_inclusive != inclusive =>
+        {
+            None
+        }
+        Some(_) => Some(()),
+        None => {
+            *slot = Some((value, inclusive));
+            Some(())
+        }
+    }
+}
+
+fn expr_to_string_literal(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlValue::SingleQuotedString(text) | SqlValue::DoubleQuotedString(text) => {
+                Some(text.clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Walk an expression and collect all source field names (non-synthetic).
@@ -1344,6 +1506,16 @@ fn extract_grouped_sql_plan(
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) => {
+                if let Some(source_name) = extract_supported_group_key(expr)
+                    && group_by_columns.iter().any(|column| column == &source_name)
+                {
+                    group_columns.push(SqlGroupColumn {
+                        source_name,
+                        output_name: expr.to_string(),
+                    });
+                    continue;
+                }
+
                 if let Some(source_name) = expr_to_field_name(expr)
                     && group_by_columns.iter().any(|column| column == &source_name)
                 {
@@ -1361,6 +1533,16 @@ fn extract_grouped_sql_plan(
                 return Ok(None);
             }
             SelectItem::ExprWithAlias { expr, alias } => {
+                if let Some(source_name) = extract_supported_group_key(expr)
+                    && group_by_columns.iter().any(|column| column == &source_name)
+                {
+                    group_columns.push(SqlGroupColumn {
+                        source_name,
+                        output_name: alias.value.clone(),
+                    });
+                    continue;
+                }
+
                 if let Some(source_name) = expr_to_field_name(expr)
                     && group_by_columns.iter().any(|column| column == &source_name)
                 {
@@ -1566,6 +1748,14 @@ fn resolve_grouped_output_name(
 ) -> Option<String> {
     // 1. Try simple identifier: HAVING posts > 10
     if let Some(name) = expr_to_field_name(expr)
+        && let Some(output_name) = valid_names.get(&name)
+    {
+        return Some(output_name.clone());
+    }
+    // 1b. Try the supported searched-CASE group key encoding so unnamed
+    // CASE GROUP BY columns can still be referenced by the same expression
+    // in ORDER BY / HAVING without leaking the internal encoded key.
+    if let Some(name) = extract_supported_group_key(expr)
         && let Some(output_name) = valid_names.get(&name)
     {
         return Some(output_name.clone());
@@ -2991,10 +3181,54 @@ fn collect_or_branches<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+fn collect_and_branches<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_and_branches(left, out);
+            collect_and_branches(right, out);
+        }
+        Expr::Nested(inner) => collect_and_branches(inner, out),
+        other => out.push(other),
+    }
+}
+
 fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryClause>> {
     // Unwrap parenthesized expressions
     if let Expr::Nested(inner) = expr {
         return parse_pushdown_predicate(inner);
+    }
+
+    // Nested AND conjunction inside an OR branch: push if every branch is individually pushable.
+    if matches!(
+        expr,
+        Expr::BinaryOp {
+            op: BinaryOperator::And,
+            ..
+        }
+    ) {
+        let mut branches = Vec::new();
+        collect_and_branches(expr, &mut branches);
+        let mut clauses = Vec::new();
+        for branch in branches {
+            if let Some(clause) = parse_pushdown_predicate(branch)? {
+                clauses.push(clause);
+            } else {
+                return Ok(None);
+            }
+        }
+        if clauses.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(crate::search::QueryClause::Bool(
+            crate::search::BoolQuery {
+                filter: clauses,
+                ..Default::default()
+            },
+        )));
     }
 
     // OR disjunction: push down if ALL branches are individually pushable.
@@ -4740,6 +4974,200 @@ mod tests {
             "expected ambiguous column error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn searched_case_hour_bucket_uses_grouped_partials() {
+        let sql = "SELECT CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                WHEN pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00' THEN '12'
+                WHEN pickup_datetime >= '2025-01-05T17:00:00' AND pickup_datetime < '2025-01-05T18:00:00' THEN '17'
+            END AS hour_bucket,
+            count(*) AS rides,
+            avg(driver_pay) AS avg_driver_pay
+        FROM idx
+        WHERE airport_fee = 0
+            AND (
+                (pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00')
+                OR (pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00')
+                OR (pickup_datetime >= '2025-01-05T17:00:00' AND pickup_datetime < '2025-01-05T18:00:00')
+            )
+        GROUP BY CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                WHEN pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00' THEN '12'
+                WHEN pickup_datetime >= '2025-01-05T17:00:00' AND pickup_datetime < '2025-01-05T18:00:00' THEN '17'
+            END
+        ORDER BY hour_bucket";
+
+        let plan = plan_sql("idx", sql).unwrap();
+        assert!(plan.uses_grouped_partials());
+        assert!(!plan.has_group_by_fallback);
+        assert!(!plan.has_residual_predicates);
+        assert_eq!(plan.pushed_filters.len(), 2);
+        let grouped = plan.grouped_sql.expect("grouped sql plan");
+        assert_eq!(grouped.group_columns.len(), 1);
+        assert_eq!(grouped.group_columns[0].output_name, "hour_bucket");
+        assert!(crate::search::is_derived_group_key(
+            &grouped.group_columns[0].source_name
+        ));
+    }
+
+    #[test]
+    fn searched_case_with_non_literal_else_falls_back() {
+        let sql = "SELECT CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                ELSE pickup_datetime
+            END AS hour_bucket,
+            count(*) AS rides
+        FROM idx
+        GROUP BY CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                ELSE pickup_datetime
+            END
+        ORDER BY hour_bucket";
+
+        let plan = plan_sql("idx", sql).unwrap();
+        assert!(!plan.uses_grouped_partials());
+        assert!(plan.has_group_by_fallback);
+    }
+
+    #[test]
+    fn unaliased_searched_case_group_column_uses_sql_name() {
+        let sql = "SELECT CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                WHEN pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00' THEN '12'
+            END,
+            count(*) AS rides
+        FROM idx
+        GROUP BY CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                WHEN pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00' THEN '12'
+            END
+        ORDER BY CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                WHEN pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00' THEN '12'
+            END";
+
+        let plan = plan_sql("idx", sql).unwrap();
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.unwrap();
+        assert_eq!(grouped.group_columns.len(), 1);
+        assert_eq!(grouped.order_by.len(), 1);
+        assert!(!crate::search::is_derived_group_key(
+            &grouped.group_columns[0].output_name
+        ));
+        let output_name = grouped.group_columns[0].output_name.to_ascii_lowercase();
+        assert!(output_name.contains("case"));
+        assert!(output_name.contains("pickup_datetime"));
+        assert_eq!(
+            grouped.order_by[0].output_name,
+            grouped.group_columns[0].output_name
+        );
+    }
+
+    #[test]
+    fn searched_case_with_literal_else_stays_on_grouped_partials() {
+        let sql = "SELECT CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                WHEN pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00' THEN '12'
+                ELSE 'other'
+            END AS hour_bucket,
+            count(*) AS rides
+        FROM idx
+        GROUP BY CASE
+                WHEN pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00' THEN '08'
+                WHEN pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00' THEN '12'
+                ELSE 'other'
+            END
+        ORDER BY hour_bucket";
+
+        let plan = plan_sql("idx", sql).unwrap();
+        assert!(
+            plan.uses_grouped_partials(),
+            "literal ELSE should keep the query on grouped partials"
+        );
+        assert!(!plan.has_group_by_fallback);
+        let grouped = plan.grouped_sql.unwrap();
+        assert_eq!(grouped.group_columns[0].output_name, "hour_bucket");
+        let spec = crate::search::decode_derived_group_key(&grouped.group_columns[0].source_name)
+            .expect("should decode derived key");
+        assert_eq!(spec.else_label.as_deref(), Some("other"));
+        assert_eq!(spec.buckets.len(), 2);
+    }
+
+    #[test]
+    fn searched_case_with_parenthesized_condition_falls_back() {
+        // Parser may wrap the AND in Nested parens depending on SQL formatting.
+        // collect_case_bucket_bounds does not handle Expr::Nested, so this
+        // should cleanly fall back instead of panicking.
+        let sql = "SELECT CASE
+                WHEN (pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00') THEN '08'
+            END AS bucket,
+            count(*) AS rides
+        FROM idx
+        GROUP BY CASE
+                WHEN (pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00') THEN '08'
+            END";
+
+        let plan = plan_sql("idx", sql).unwrap();
+        // The parser may or may not strip the parens depending on sqlparser version.
+        // If it keeps the Nested wrapper, this falls back cleanly.
+        // If it strips them, it stays on grouped partials — both are correct.
+        // The key assertion: no panic, and if it uses grouped partials the output name is sane.
+        if plan.uses_grouped_partials() {
+            let grouped = plan.grouped_sql.unwrap();
+            assert!(!crate::search::is_derived_group_key(
+                &grouped.group_columns[0].output_name
+            ));
+        } else {
+            assert!(plan.has_group_by_fallback);
+        }
+    }
+
+    #[test]
+    fn and_inside_or_branches_pushed_as_nested_bool_filter() {
+        // WHERE (x >= '08' AND x < '09') OR (x >= '12' AND x < '13')
+        // Each OR branch is an AND conjunction that should push down as
+        // Bool { filter: [Range, Range] }, wrapped in Bool { should: [...] }.
+        let plan = plan_sql(
+            "idx",
+            "SELECT pickup_datetime FROM idx WHERE \
+             (pickup_datetime >= '2025-01-05T08:00:00' AND pickup_datetime < '2025-01-05T09:00:00') \
+             OR (pickup_datetime >= '2025-01-05T12:00:00' AND pickup_datetime < '2025-01-05T13:00:00')",
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.pushed_filters.len(),
+            1,
+            "should produce one Bool{{should}} filter"
+        );
+        assert!(!plan.has_residual_predicates);
+        match &plan.pushed_filters[0] {
+            crate::search::QueryClause::Bool(bq) => {
+                assert_eq!(bq.should.len(), 2, "two OR branches");
+                // Each branch should be a Bool { filter: [Range, Range] }
+                for branch in &bq.should {
+                    match branch {
+                        crate::search::QueryClause::Bool(inner) => {
+                            assert_eq!(
+                                inner.filter.len(),
+                                2,
+                                "each AND branch has two range filters"
+                            );
+                            for f in &inner.filter {
+                                assert!(
+                                    matches!(f, crate::search::QueryClause::Range(_)),
+                                    "expected Range filter, got: {f:?}"
+                                );
+                            }
+                        }
+                        other => panic!("expected inner Bool filter, got: {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected outer Bool should, got: {other:?}"),
+        }
     }
 
     #[test]

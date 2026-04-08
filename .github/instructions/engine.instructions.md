@@ -131,14 +131,14 @@ for agg-only `size=0` requests. When no aggs are requested, `None` adds zero ove
 - Direct access patterns already expected in this module:
     - numeric columns: `segment_reader.fast_fields().f64(name)` / `.i64(name)`
     - keyword columns: open `StringFastFieldReader` (`StrColumn` + ordinal `Column<u64>`) and use `first()` / `first_vals()` on the ordinal column, then `ord_to_str()`
-- `sql_record_batch(req, columns, needs_id, needs_score)` is the reference pattern for projecting matched docs from fast fields into Arrow without `_source` materialization. It builds `type_hints` from `SqlFieldReader` variants (F64/I64 → `ColumnKind::Float64`, Str → `ColumnKind::Utf8`) and passes them to `build_record_batch_with_hints()` so that zero-result queries still produce correctly-typed Arrow columns instead of defaulting to Utf8.
+- `sql_record_batch(req, columns, needs_id, needs_score)` is the reference pattern for projecting matched docs from fast fields into Arrow without `_source` materialization. It builds `type_hints` from `SqlFieldReader` variants (F64/I64 → `ColumnKind::Float64`, DateMillis → `ColumnKind::TimestampMillis`, Str → `ColumnKind::Utf8`) and passes them to `build_record_batch_with_hints()` so that zero-result queries still produce correctly-typed Arrow columns instead of defaulting to Utf8.
 - In the flat fast-field path, `_id` should reuse the same per-segment array/take/reorder flow as other string fast fields. Do not keep a separate top-doc-order decode/clone loop for `_id` unless profiling proves the shared path regressed.
 - `sql_streaming_batch_handle(req, columns, needs_id, needs_score, batch_size)` is the primary streaming API for score-free explicit-column SQL. It must return `total_hits` and `collected_rows` up front plus a lazy `next_batch()` closure so the coordinator can register local `StreamingTable` partitions without first building a `Vec<RecordBatch>`.
 - `sql_streaming_batches(req, columns, needs_id, needs_score, batch_size)` is now the eager compatibility wrapper that drains the lazy handle into memory for tests, buffered compatibility paths, and transport code that has not yet been converted to the handle.
 - `sql_streaming_batch_handle()` is only valid for `_score`-free queries whose requested columns are fast-field-backed on every segment. If any column resolves to `SourceFallback` or the SQL query needs `_score`, return `None` and let the caller stay on `sql_record_batch()` or the broader fallback path.
 - **`can_stream_sql_batches(columns, needs_score)`** is the eligibility guard on `HotEngine`. Returns `false` if `needs_score` is true or any column on any segment resolves to `SqlFieldReader::SourceFallback`. Called by the `SearchEngine::sql_streaming_batch_handle` impl before delegating to the inner method.
 - **`BitSetCollector`** is a custom `tantivy::collector::Collector` that collects ALL matched doc IDs as a `Vec<SegmentBitSet>`. Each `SegmentBitSet` is a `Vec<u64>` manual bitset (1 bit per doc, ~500KB for 4M docs). `SegmentBitSetCursor` iterates those words lazily, and `StreamingBatchState` / `StreamingSegmentState` use the cursor plus fast-field readers to produce Arrow `RecordBatch`es of `STREAMING_BATCH_SIZE` (8192) rows each.
-- **`ColumnBuilder`** is an enum (`F64`/`I64`/`Str`/`Null`) that wraps Arrow builders and appends values from `SqlFieldReader`s. The string variant keeps a reusable scratch buffer so streaming string columns do not allocate a fresh `String` per doc. Catch-all arms use `unreachable!()` to fail loud on type mismatches instead of silently skipping rows.
+- **`ColumnBuilder`** is an enum (`F64`/`I64`/`TimestampMillis`/`Str`/`Null`) that wraps Arrow builders and appends values from `SqlFieldReader`s. The string variant keeps a reusable scratch buffer so streaming string columns do not allocate a fresh `String` per doc. Catch-all arms use `unreachable!()` to fail loud on type mismatches instead of silently skipping rows.
 - If you touch SQL string fast-field reads (`_id`, keyword projections, selective arrays, or streaming batches), do not reintroduce per-doc `term_ords()` iterators in the hot path; use the shared ordinal reader instead.
 - When `needs_id` is false, `_id` fast-field reads are skipped and the Arrow `_id` column is filled with empty strings.
 - When `needs_score` is false, score collection is skipped and the Arrow `_score` column is filled with zeros.
@@ -215,13 +215,15 @@ adding numeric values:
 // For a Number value on a mapped field:
 match schema.get_field_entry(field).field_type() {
     FieldType::F64(_) => doc.add_f64(field, ...),  // float fields always get f64
-    FieldType::I64(_) => doc.add_i64(field, ...),  // integer fields always get i64
+    FieldType::I64(_) => doc.add_i64(field, ...),  // integer/date fields always get i64
     FieldType::U64(_) => doc.add_u64(field, ...),
     _ => {}
 }
+// For a String value on an i64 field (Date):
+// Parses ISO 8601 → epoch millis via common::date::parse_iso8601_to_epoch_millis()
 ```
 This prevents JSON integer `99` being stored as `i64` in an `f64` field (which would make it
-unsearchable by float range queries).
+unsearchable by float range queries). Date fields accept both ISO 8601 strings and epoch millis integers, and mapped Date fields canonicalize `_source` to UTC ISO 8601 on ingest so GET/search/SQL paths do not leak raw epoch millis or original offsets.
 
 ## VectorIndex (src/engine/vector.rs)
 - USearch HNSW wrapper (connectivity=16, expansion_add=128, expansion_search=64)
