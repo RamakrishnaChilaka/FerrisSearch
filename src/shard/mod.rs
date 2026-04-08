@@ -14,8 +14,6 @@ use std::time::Duration;
 
 pub const SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX: &str = "api_delete_index";
 pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_delete_index_rpc";
-pub const SHARD_DATA_REMOVE_REASON_LEGACY_PUBLISH_STATE: &str =
-    "legacy_publish_state_removed_index";
 pub const SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP: &str = "orphan_cleanup_unknown_uuid";
 
 /// Key uniquely identifying a shard: (index_name, shard_id)

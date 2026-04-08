@@ -10,7 +10,7 @@ use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::{
     PingRequest, internal_transport_client::InternalTransportClient,
 };
-use ferrissearch::transport::server::create_transport_service;
+use ferrissearch::transport::server::create_transport_service_with_raft;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -52,6 +52,48 @@ struct PendingMultiNodeRestNode {
     transport_addr: std::net::SocketAddr,
 }
 
+async fn make_test_raft(
+    node_id: u64,
+    cluster_name: &str,
+    bootstrap_addr: Option<String>,
+) -> (
+    std::sync::Arc<ferrissearch::consensus::types::RaftInstance>,
+    std::sync::Arc<std::sync::RwLock<ClusterState>>,
+) {
+    let (raft, shared_state) =
+        ferrissearch::consensus::create_raft_instance_mem(node_id, cluster_name.into())
+            .await
+            .unwrap();
+    if let Some(addr) = bootstrap_addr {
+        ferrissearch::consensus::bootstrap_single_node(&raft, node_id, addr)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if raft.current_leader().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    (raft, shared_state)
+}
+
+async fn post_json_to_base_url(
+    client: &Client,
+    base_url: &str,
+    path: &str,
+    body: Value,
+) -> Result<(StatusCode, Value)> {
+    let response = client
+        .post(format!("{}{}", base_url, path))
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let value = response.json().await?;
+    Ok((status, value))
+}
+
 impl RestTestHarness {
     async fn start() -> Result<Self> {
         let temp_dir = tempfile::tempdir()?;
@@ -67,14 +109,20 @@ impl RestTestHarness {
             transport_port: transport_addr.port(),
             http_port: http_addr.port(),
             roles: vec![NodeRole::Master, NodeRole::Data],
-            raft_node_id: 0,
+            raft_node_id: 1,
         };
 
         let mut cluster_state = ClusterState::new("test-cluster".into());
         cluster_state.add_node(local_node);
         cluster_state.master_node = Some("node-1".into());
 
-        let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+        let (raft, shared_state) = make_test_raft(
+            1,
+            "test-cluster",
+            Some(format!("127.0.0.1:{}", transport_addr.port())),
+        )
+        .await;
+        let manager = ClusterManager::with_shared_state(shared_state);
         manager.update_state(cluster_state);
 
         let shard_manager = Arc::new(ShardManager::new(temp_dir.path(), Duration::from_secs(60)));
@@ -85,16 +133,17 @@ impl RestTestHarness {
             shard_manager: shard_manager.clone(),
             transport_client: transport_client.clone(),
             local_node_id: "node-1".into(),
-            raft: None,
+            raft: Some(raft.clone()),
             worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
         };
 
-        let transport_service = create_transport_service(
+        let transport_service = create_transport_service_with_raft(
             cluster_manager,
             shard_manager,
             transport_client,
+            raft,
             "node-1".into(),
         );
         let transport_handle = tokio::spawn(async move {
@@ -287,21 +336,26 @@ impl MultiNodeRestHarness {
                 } else {
                     vec![NodeRole::Data]
                 },
-                raft_node_id: 0,
+                raft_node_id: (index + 1) as u64,
             })
             .collect();
 
         let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
         let mut nodes = Vec::new();
 
-        for pending in pending_nodes {
+        for (idx, pending) in pending_nodes.into_iter().enumerate() {
             let mut cluster_state = ClusterState::new("test-cluster".into());
             for node in &all_nodes {
                 cluster_state.add_node(node.clone());
             }
             cluster_state.master_node = Some("node-1".into());
 
-            let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+            let raft_id = (idx + 1) as u64;
+            let bootstrap_addr =
+                (idx == 0).then(|| format!("127.0.0.1:{}", pending.transport_addr.port()));
+            let (raft, shared_state) =
+                make_test_raft(raft_id, "test-cluster", bootstrap_addr).await;
+            let manager = ClusterManager::with_shared_state(shared_state);
             manager.update_state(cluster_state);
 
             let cluster_manager = Arc::new(manager);
@@ -315,16 +369,17 @@ impl MultiNodeRestHarness {
                 shard_manager: shard_manager.clone(),
                 transport_client: transport_client.clone(),
                 local_node_id: pending.node_id.clone(),
-                raft: None,
+                raft: Some(raft.clone()),
                 worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             };
 
-            let transport_service = create_transport_service(
+            let transport_service = create_transport_service_with_raft(
                 cluster_manager,
                 shard_manager,
                 transport_client,
+                raft,
                 pending.node_id.clone(),
             );
             let transport_handle = tokio::spawn(async move {
@@ -400,18 +455,6 @@ impl MultiNodeRestHarness {
             }
         }
         Ok(())
-    }
-
-    async fn post_json(&self, path: &str, body: Value) -> Result<(StatusCode, Value)> {
-        let response = self
-            .client
-            .post(format!("{}{}", self.nodes[0].base_url, path))
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let value = response.json().await?;
-        Ok((status, value))
     }
 }
 
@@ -843,10 +886,11 @@ async fn rest_root_and_cluster_health_work() -> Result<()> {
     let (transfer_status, transfer_body) = harness
         .post_json("/_cluster/transfer_master", json!({ "node_id": "node-1" }))
         .await?;
-    assert_eq!(transfer_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(transfer_status, StatusCode::OK);
+    assert_eq!(transfer_body["acknowledged"], json!(true));
     assert_eq!(
-        transfer_body["error"]["type"],
-        json!("raft_not_enabled_exception")
+        transfer_body["message"],
+        json!("Leadership transfer initiated to node 'node-1'")
     );
 
     Ok(())
@@ -2223,17 +2267,18 @@ async fn rest_distributed_search_applies_custom_sort_when_one_shard_matches() ->
     let harness = MultiNodeRestHarness::start_three_nodes().await?;
     create_distributed_stories_index_and_docs(&harness).await?;
 
-    let (status, body) = harness
-        .post_json(
-            "/stories/_search",
-            json!({
-                "query": { "wildcard": { "title": "story-0-*" } },
-                "sort": [{ "title": "desc" }],
-                "size": 10,
-                "from": 0
-            }),
-        )
-        .await?;
+    let (status, body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
+        "/stories/_search",
+        json!({
+            "query": { "wildcard": { "title": "story-0-*" } },
+            "sort": [{ "title": "desc" }],
+            "size": 10,
+            "from": 0
+        }),
+    )
+    .await?;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hits"]["total"]["value"], json!(3));
@@ -2261,8 +2306,9 @@ async fn rest_sql_distributed_grouped_partials_merge_numeric_keys_across_shards(
     let harness = MultiNodeRestHarness::start_three_nodes().await?;
     create_distributed_stories_index_and_docs(&harness).await?;
 
-    let (status, body) = harness
-        .post_json(
+    let (status, body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
             "/stories/_sql",
             json!({
                 "query": "SELECT upvotes, count(*) AS cnt FROM stories GROUP BY upvotes ORDER BY upvotes ASC LIMIT 10"
@@ -2302,8 +2348,9 @@ async fn rest_sql_distributed_semijoin_merges_inner_groups_across_shards() -> Re
     let harness = MultiNodeRestHarness::start_three_nodes().await?;
     create_distributed_stories_index_and_docs(&harness).await?;
 
-    let (status, body) = harness
-        .post_json(
+    let (status, body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
             "/stories/_sql",
             json!({
                 "query": "SELECT title, author FROM stories WHERE author IN (SELECT author FROM stories GROUP BY author HAVING COUNT(*) > 2) ORDER BY title ASC"

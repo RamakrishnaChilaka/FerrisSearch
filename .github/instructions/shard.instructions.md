@@ -37,7 +37,7 @@ pub struct ShardManager {
 - `open_shard_with_settings()` must reject empty `index_uuid` values; only `open_shard()` / `open_shard_with_mappings()` synthesize test/local UUIDs, and those helpers must keep one stable generated UUID per index
 - `close_index_shards()` looks up the stored UUID to find and delete the correct directory
 - `cleanup_orphaned_data(known_uuids)` is called on startup only after authoritative index UUIDs are available; empty pre-catch-up state or missing expected UUID directories must skip cleanup to avoid deleting live shard data
-- Destructive delete paths must log an explicit reason so operators can distinguish API delete-index, transport delete-index, legacy non-Raft `PublishState`, and orphan-cleanup removals in logs
+- Destructive delete paths must log an explicit reason so operators can distinguish API delete-index, transport delete-index, and orphan-cleanup removals in logs
 - **NEVER** construct shard paths using the index name — always go through UUID
 
 ### Shard Opening Sequence

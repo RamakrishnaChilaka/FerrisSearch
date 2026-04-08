@@ -1,14 +1,14 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **954 unit tests** (`cargo test --lib`)
+- **957 unit tests** (`cargo test --lib`)
 - **64 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
-- **41 replication integration tests** (`cargo test --test replication_integration`)
+- **39 replication integration tests** (`cargo test --test replication_integration`)
 - **39 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 175 assertions across 4 files
-- **1133 total** (`cargo test`)
+- **1134 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -27,7 +27,8 @@ cargo test -- test_name                         # Single test by name
 - Use `#[tokio::test]` for async tests
 - Use `tempfile::TempDir` for isolated data directories
 - Test every code path: happy path, edge cases, error conditions, empty inputs
-- For in-process REST integration harnesses, wait for both the HTTP listener and the gRPC transport listener before issuing the first request; even single-node non-Raft paths publish cluster state over transport during index and settings operations.
+- For in-process REST integration harnesses, wait for both the HTTP listener and the gRPC transport listener before issuing the first request; Raft-backed index/settings handlers may still forward through transport before the harness is usable.
+- Multi-node REST harnesses that claim coordinator coverage must preserve real `raft_node_id` values in cluster state and route at least one request through a non-master node; otherwise follower-forwarding regressions can hide behind leader-only traffic.
 - For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
 - For WAL auto-flush or replay changes, add regressions for disabled thresholds (`flush_threshold_bytes = 0`), zero global checkpoint safety (no auto-truncate), and stale `translog.committed` checkpoints that force a replayed suffix after a prior batch commit.
 - For auto-flush concurrency changes, add regressions proving maintenance ticks defer instead of blocking when the text flush path or vector persistence path is already busy.
@@ -51,7 +52,6 @@ cargo test -- test_name                         # Single test by name
 - For streamed shard SQL transport changes, add a real gRPC integration test that forces multiple Arrow batches from `forward_sql_batch_stream_to_shard()` / `SqlRecordBatchStream`, not just unit tests around IPC decoding.
 - For streamed SQL transport metadata changes, add coverage for `total_hits`, `collected_rows`, and actual `streaming_used`, plus at least one `/_sql/stream` regression where the streamed endpoint must keep `streaming_used=false` because the shard falls back to `sql_record_batch()`.
 - For JoinCluster or cluster-state transport fixes, add one roundtrip regression that proves `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` survive proto conversion, one regression that unknown field types fail snapshot decoding instead of being coerced, plus concurrent gRPC regressions for duplicate `raft_node_id` rejection and full voter-set preservation across overlapping joins.
-- For legacy `PublishState` transport fixes, keep the existing non-Raft regression that a full snapshot closes deleted indices, and add a Raft-backed regression that the same RPC is ignored before it can overwrite authoritative state or delete shard data.
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
 - For distributed hit-merge changes, add unit coverage for `merge_sorted_hit_lists()` and a multi-node REST regression where only one shard returns hits but the coordinator still must apply a custom sort.
 - For `_cat/shards` state fixes, add a regression that a live shard copy on one node does not make a different assigned copy on another node appear `STARTED`; display state must be per copy, not per shard ID.

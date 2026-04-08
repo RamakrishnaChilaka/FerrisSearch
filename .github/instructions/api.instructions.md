@@ -101,6 +101,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | POST | `/_cluster/transfer_master` | `transfer_master()` — forwarded |
 
 `create_index()`, `get_index_settings()`, and `update_index_settings()` must keep `refresh_interval_ms` and `flush_threshold_bytes` in sync end-to-end across HTTP parsing, gRPC forwarding, and Raft state updates. `GET /{index}/_settings` must return both fields when set. `flush_threshold_bytes: 0` is a valid disable value and must not be treated as "missing".
+`create_index()`, `update_index_settings()`, `delete_index()`, and `auto_create_index()` must fail fast with `raft_not_enabled_exception` when `AppState.raft` is absent. Do not silently skip the Raft metadata write path.
 
 ### Local Shard Reopen Rule
 - `ensure_local_index_shards_open()` is async and must be awaited by search/count/SQL read paths.

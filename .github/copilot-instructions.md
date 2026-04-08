@@ -101,7 +101,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 954 unit tests + 64 CLI tests + 33 consensus integration + 41 replication integration + 39 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1133 total
+- 957 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 39 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1134 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -127,7 +127,6 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 ## Important Design Decisions
 - **Coordinator pattern**: see dedicated section below — NEVER return "not the leader" or "send to master" errors
 - `ClusterManager::update_state()` is a full overwrite — never use it to replace Raft-managed state
-- Legacy transport `PublishState` snapshots are for non-Raft services only; Raft-backed nodes must ignore them before shard cleanup or state overwrite can run
 - `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft. Populated by `add_node()` and `ping_node()`
 - New leader gets a 20s grace period (`leader_since`) before scanning for dead nodes to avoid false positives
 - Dead node handling: leader removes node from Raft + cluster only after successful membership change, promotes best ISR replica for orphaned primary shards (highest checkpoint wins), increments `unassigned_replicas` for lost replica slots, and refuses removals that would empty the voter set
@@ -552,7 +551,7 @@ ClusterStateMachine { state: Arc<RwLock<ClusterState>>, last_applied: Option<Log
 ```
 // Cluster coordination
 JoinCluster(JoinRequest) → JoinResponse
-PublishState(PublishStateRequest) → Empty  // legacy-only when Raft is disabled
+PublishState(PublishStateRequest) → Empty  // returns UNIMPLEMENTED; Raft manages cluster state
 Ping(PingRequest) → Empty
 
 // Shard document operations

@@ -59,7 +59,7 @@ pub struct ClusterManager { state: Arc<RwLock<ClusterState>> }
 - `get_state() -> ClusterState` — cloned snapshot (read lock)
 - `add_node(node)`, `ping_node(node_id)`
 - `update_state(new_state)` — full overwrite, preserves `last_seen`
-- **WARNING**: `update_state()` should never replace Raft-managed state. Legacy transport `PublishState` snapshots must be ignored whenever Raft is enabled.
+- **WARNING**: `update_state()` should never replace Raft-managed state.
 
 ## SettingsManager (src/cluster/settings.rs)
 ```rust

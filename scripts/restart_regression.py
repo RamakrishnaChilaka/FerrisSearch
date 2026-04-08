@@ -38,7 +38,6 @@ DOC_BODY = (
     "restart regression payload restart regression payload"
 )
 DELETE_REASONS = (
-    "reason=legacy_publish_state_removed_index",
     "reason=api_delete_index",
     "reason=transport_delete_index_rpc",
     "reason=orphan_cleanup_unknown_uuid",
