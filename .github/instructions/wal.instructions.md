@@ -36,7 +36,7 @@ pub trait WriteAheadLog: Send + Sync {
 }
 ```
 
-## HotTranslog (Binary Implementation)
+## HotTranslog (Generation-Based Binary Implementation)
 ### Wire Format
 `[u32 LE: payload_len][bincode(WireEntry { seq_no, op, payload_json })]`
 - Length-prefixed frames for efficient sequential reading
@@ -44,7 +44,8 @@ pub trait WriteAheadLog: Send + Sync {
 - Seq numbers are monotonically increasing, persisted in `.seqno` sidecar file
 
 ### Files on Disk (per shard)
-- `{data_dir}/{index_uuid}/shard_{id}/translog.bin` — the WAL file
+- `{data_dir}/{index_uuid}/shard_{id}/translog-<generation>.bin` — ordered WAL generation files (`00000000000000000000`, `00000000000000000001`, ...)
+- `{data_dir}/{index_uuid}/shard_{id}/translog.manifest` — authoritative generation metadata (active generation, next generation id, seq ranges, sizes)
 - `{data_dir}/{index_uuid}/shard_{id}/translog.seqno` — last assigned sequence number
 - `{data_dir}/{index_uuid}/shard_{id}/translog.committed` — exclusive committed seq_no used to skip already committed entries on restart
 
@@ -52,14 +53,15 @@ pub trait WriteAheadLog: Send + Sync {
 - `append()` returns the assigned seq_no in the TranslogEntry
 - `append_with_seq()` persists a caller-supplied seq_no and advances the local allocator past it
 - `write_bulk_with_start_seq()` persists contiguous caller-supplied seq_nos for replica/recovery bulk apply
-- `read_from(seq_no)` reads all entries with seq_no > the given value (used for replica recovery)
+- `read_from(seq_no)` scans all generations in order and returns entries with seq_no > the given value (used for replica recovery)
 - `for_each_from(seq_no, callback)` streams entries with seq_no >= the given value without loading the whole WAL into memory (used by startup replay)
-- `size_bytes()` returns the current WAL file size so the engine can trigger checkpoint-aware auto-flush
-- `truncate_below(global_checkpoint)` removes entries ≤ global_checkpoint, keeps entries above for replica recovery
-- `truncate()` clears entire log (used on full flush)
+- `size_bytes()` returns the summed size of all retained generations so the engine can trigger checkpoint-aware auto-flush
+- `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only generations whose max seq_no is ≤ the checkpoint; it does NOT rewrite mixed generations in place
+- `truncate()` rolls to a new empty generation and deletes all older generations
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths
 - Async durability: background task fsyncs every `sync_interval_ms` via Tokio's blocking pool — never call `File::sync_data()` inline on an async worker
-- `scan_max_seq_no_from_path()` must be used on reopen to find the allocator high-water mark without loading every WAL payload into memory
+- Reopen requires `translog.manifest`; it trusts persisted metadata for old generations, removes stray generation files not listed in the manifest, ignores unrelated non-generation side files, and scans only the active generation file to recover the allocator high-water mark
+- Persist the manifest before deleting obsolete generation files during `truncate()` / `truncate_below()` so crashes never leave startup without authoritative generation metadata
 - `translog.committed` should be persisted after each intermediate replay batch commit so replay remains idempotent across repeated crash recovery
 
 ## Seq Ownership Invariant

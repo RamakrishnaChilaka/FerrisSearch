@@ -21,7 +21,9 @@ pub struct ShardManager {
 - `get_index_shards(index) -> Vec<(u32, Arc<dyn SearchEngine>)>`
 - `all_shards() -> Vec<(ShardKey, Arc<dyn SearchEngine>)>`
 - `close_index_shards(index)` — remove engines, clean ISR, delete UUID-based directory
+- `close_index_shards_with_reason(index, reason)` — same as above, but emits the delete reason in logs for destructive paths
 - `close_index_shards_blocking(index)` — async-safe Tokio wrapper for shard shutdown + directory deletion
+- `close_index_shards_blocking_with_reason(index, reason)` — async-safe Tokio wrapper for reason-tagged destructive delete paths
 - `apply_settings(index, new_settings)` — push to SettingsManager watch channels
 - `register_index_uuid(index, uuid)` — store the UUID mapping for an index
 - `index_uuid(index) -> Option<String>` — get registered UUID
@@ -35,6 +37,7 @@ pub struct ShardManager {
 - `open_shard_with_settings()` must reject empty `index_uuid` values; only `open_shard()` / `open_shard_with_mappings()` synthesize test/local UUIDs, and those helpers must keep one stable generated UUID per index
 - `close_index_shards()` looks up the stored UUID to find and delete the correct directory
 - `cleanup_orphaned_data(known_uuids)` is called on startup only after authoritative index UUIDs are available; empty pre-catch-up state or missing expected UUID directories must skip cleanup to avoid deleting live shard data
+- Destructive delete paths must log an explicit reason so operators can distinguish API delete-index, transport delete-index, legacy non-Raft `PublishState`, and orphan-cleanup removals in logs
 - **NEVER** construct shard paths using the index name — always go through UUID
 
 ### Shard Opening Sequence

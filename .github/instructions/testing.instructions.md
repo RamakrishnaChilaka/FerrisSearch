@@ -1,13 +1,14 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **910 unit tests** (`cargo test --lib`)
+- **954 unit tests** (`cargo test --lib`)
 - **64 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
-- **40 replication integration tests** (`cargo test --test replication_integration`)
-- **38 REST API integration tests** (`cargo test --test rest_api_integration`)
-- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 170 assertions across 4 files
-- **1086 total** (`cargo test`)
+- **41 replication integration tests** (`cargo test --test replication_integration`)
+- **39 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **1 restart regression integration test** (`cargo test --test restart_regression`)
+- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 175 assertions across 4 files
+- **1133 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -17,6 +18,7 @@ cargo test --test consensus_integration         # Raft consensus tests
 cargo test --test replication_integration       # Replication tests
 cargo test --test replication_integration --features transport-tls  # Replication tests with encrypted gRPC transport
 cargo test --test rest_api_integration          # REST API integration tests
+cargo test --test restart_regression            # Real restart/rejoin regression
 cargo test -- test_name                         # Single test by name
 ```
 
@@ -25,12 +27,16 @@ cargo test -- test_name                         # Single test by name
 - Use `#[tokio::test]` for async tests
 - Use `tempfile::TempDir` for isolated data directories
 - Test every code path: happy path, edge cases, error conditions, empty inputs
+- For in-process REST integration harnesses, wait for both the HTTP listener and the gRPC transport listener before issuing the first request; even single-node non-Raft paths publish cluster state over transport during index and settings operations.
+- For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
 - For WAL auto-flush or replay changes, add regressions for disabled thresholds (`flush_threshold_bytes = 0`), zero global checkpoint safety (no auto-truncate), and stale `translog.committed` checkpoints that force a replayed suffix after a prior batch commit.
 - For auto-flush concurrency changes, add regressions proving maintenance ticks defer instead of blocking when the text flush path or vector persistence path is already busy.
 - For maintenance scheduling changes, add a `#[tokio::test(flavor = "current_thread")]` regression that blocks the Tantivy writer lock from another thread and proves the async runtime still makes progress while the maintenance tick waits.
 - For refresh/flush fan-out changes, add one regression that the coordinator still dispatches its local node through the per-node maintenance path, plus a transport regression that maintenance reopens persisted assigned shards but refuses to create missing UUID directories.
 - For async scheduling changes around shard open/close, orphan cleanup, translog fsync, redb-backed Raft storage, or other blocking wrappers, add a `#[tokio::test(flavor = "current_thread")]` regression that holds the relevant lock or resource from another thread and proves the runtime still advances while the wrapper waits.
 - For index UUID / orphan-cleanup fixes, add a regression that an auto-created index opens its local shard with the same UUID stored in cluster state, plus a restart-path regression that missing expected UUID directories cause cleanup to bail out instead of deleting unknown shard data.
+- For recovered-node startup guard changes, add a two-restart regression that proves a missing startup UUID dir never gets recreated on the first restart and therefore can never make the old UUID dir look orphaned on the second restart.
+- For restart/rejoin data-loss fixes that depend on real process startup order, add or extend a process-backed `restart_regression` test that runs real `ferrissearch` binaries through create -> ingest -> flush -> restart -> verify count/UUID-dir invariants.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For SQL identifier case-sensitivity fixes, add helper-level canonicalization coverage plus REST regressions for both buffered and streamed SQL endpoints using real mixed-case mapping fields, and cover both unquoted source references and quoted exact-identifier preservation on the residual/DataFusion path.
@@ -45,6 +51,7 @@ cargo test -- test_name                         # Single test by name
 - For streamed shard SQL transport changes, add a real gRPC integration test that forces multiple Arrow batches from `forward_sql_batch_stream_to_shard()` / `SqlRecordBatchStream`, not just unit tests around IPC decoding.
 - For streamed SQL transport metadata changes, add coverage for `total_hits`, `collected_rows`, and actual `streaming_used`, plus at least one `/_sql/stream` regression where the streamed endpoint must keep `streaming_used=false` because the shard falls back to `sql_record_batch()`.
 - For JoinCluster or cluster-state transport fixes, add one roundtrip regression that proves `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` survive proto conversion, one regression that unknown field types fail snapshot decoding instead of being coerced, plus concurrent gRPC regressions for duplicate `raft_node_id` rejection and full voter-set preservation across overlapping joins.
+- For legacy `PublishState` transport fixes, keep the existing non-Raft regression that a full snapshot closes deleted indices, and add a Raft-backed regression that the same RPC is ignored before it can overwrite authoritative state or delete shard data.
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
 - For distributed hit-merge changes, add unit coverage for `merge_sorted_hit_lists()` and a multi-node REST regression where only one shard returns hits but the coordinator still must apply a custom sort.
 - For `_cat/shards` state fixes, add a regression that a live shard copy on one node does not make a different assigned copy on another node appear `STARTED`; display state must be per copy, not per shard ID.
@@ -64,6 +71,12 @@ cargo test -- test_name                         # Single test by name
 - Test checkpoint tracking, ISR behavior
 - Uses actual `TransportClient` + `TransportService` over localhost
 - Seed `ClusterManager` with node/index/shard metadata before gRPC write, replication, or search calls; transport now rejects unknown shards instead of implicitly creating them from empty metadata
+
+### Restart Regression (tests/restart_regression.rs)
+- Spawns real `ferrissearch` processes via `CARGO_BIN_EXE_ferrissearch`
+- Builds a real 3-node Raft cluster with isolated tempdirs and log files
+- Exercises create -> bulk index -> flush -> restart-all -> verify count and UUID-backed shard directories
+- Asserts destructive delete reasons do not appear in logs during the preserved-data workflow
 
 ## Test Helper Patterns
 - `tokio::time::timeout()` to prevent hung tests
@@ -109,6 +122,7 @@ cargo test -- test_name                         # Single test by name
 - **Bound-column IR migrations**: When the small planner binder lands, add unit tests that resolve the same identifier name across clauses to different semantic kinds: source field vs output alias vs synthetic `_id` / `_score`. Cover at least WHERE alias residual behavior, HAVING/ORDER BY output-space binding, aggregate-argument source-field binding under alias shadowing, GROUP BY source-only eligibility, and real `score` vs synthetic `_score` separation.
 - **Truncation flag**: Assert `truncated=false` for explicit LIMIT queries. Assert `truncated=true` only for flat fast-field queries when `matched_hits` exceeds the internal 100K ceiling without an explicit LIMIT. GROUP BY fallback queries should error via `group_by_scan_limit_exceeded` instead of returning `truncated=true`.
 - **GROUP BY scan limit**: Expression GROUP BY and unsupported-aggregate GROUP BY fall to `tantivy_fast_fields` with a raised scan limit (`sql_group_by_scan_limit`, default 1M). Test that: (1) `has_group_by_fallback` is true for expression GROUP BY / unsupported aggs, false for plain GROUP BY and flat queries, (2) the `group_by_scan_limit_exceeded` error fires when a capped fallback path collects fewer rows than it matched (unit test with `sql_group_by_scan_limit: 1` and a text/source-fallback GROUP BY), (3) a fully fast-field-backed local expression GROUP BY can stream past that tiny limit and still succeed, and (4) fallback queries that reference text/source-fallback columns or `_score` stay correct instead of being forced onto the bitset streaming path.
+- **Searched CASE bucket grouping**: Add planner coverage for the supported searched-`CASE` bucket shape (`CASE WHEN field >= ... AND field < ... THEN 'bucket' ... END`) staying on `tantivy_grouped_partials`, plus a runtime regression for the derived bucket assignment itself. Also keep neighboring negative tests proving non-literal `ELSE` branches fall back, non-string-backed source fields fall back before execution, and unrelated expression GROUP BY shapes (for example `LOWER(field)`) still fall back.
 - **Residual expression tree**: Queries like `ROUND(AVG(x), 2)`, `AVG(x) + AVG(y)`, `SUM(a) / COUNT(*)`, `MAX(x) - MIN(x)` must use `tantivy_grouped_partials` with `residual_expr`. Test that: (1) hidden metrics are extracted for each inner aggregate, (2) the projected metric has `residual_expr: Some(...)`, (3) ROUND/CAST/arithmetic are correctly represented in the tree, (4) `eval_residual_expr` produces correct values including integer preservation for `MAX - MIN` on integer fields, and (5) ORDER BY on residual-expr metrics works correctly.
 - Live tests should inspect the `planner`, `execution_mode`, `streaming_used`, and `truncated` fields, not just the returned rows.
 - Add regression tests when planner or execution changes accidentally widen the fallback path for queries that should stay search-aware.
@@ -140,7 +154,7 @@ The industry standard for SQL engine correctness testing is [sqllogictest](https
 - **Runner**: `tests/sql_correctness.rs` — implements sync `DB` trait via `FerrisDB` adapter that calls `execute_sql_for_testing()` with `block_in_place` + `Handle::current()` bridge
 - **Test files**: `tests/slt/*.slt` — automatically discovered and run
 - **Dataset**: 10 HN-style docs with known values (5 authors, 5 categories, deterministic upvotes/comments)
-- **Coverage**: 170 assertions across 4 `.slt` files covering `count(*)`, `GROUP BY`, `HAVING`, same-index semijoins, case-insensitive unquoted columns, `LIMIT`, `OFFSET`, single and multiple top-level `text_match` predicates, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY, and CASE-based grouped aggregates
+- **Coverage**: 175 assertions across 4 `.slt` files covering `count(*)`, `GROUP BY`, `HAVING`, same-index semijoins, case-insensitive unquoted columns, `LIMIT`, `OFFSET`, single and multiple top-level `text_match` predicates, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY, and CASE-based grouped aggregates
 - **HAVING coverage rule**: Always test HAVING with **both** alias-based (`HAVING cnt > 1`) and aggregate-expression (`HAVING COUNT(*) > 1`) forms. These take different code paths in the planner — alias goes through `expr_to_field_name`, aggregate expression goes through `resolve_having_name` → `parse_grouped_metric`. Missing one form caused a regression where HAVING with aggregate expressions silently fell to the wrong execution path.
 - **Adding tests**: Create new `.slt` files in `tests/slt/` — the runner picks them up automatically
 - **Tie-breaking**: Always use secondary sort (e.g., `ORDER BY posts DESC, author ASC`) in `.slt` tests to avoid non-deterministic ordering

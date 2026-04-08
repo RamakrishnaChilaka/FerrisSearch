@@ -2111,6 +2111,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bincode-next",
+ "chrono",
  "clap",
  "colored",
  "comfy-table",

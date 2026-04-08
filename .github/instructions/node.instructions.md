@@ -62,6 +62,7 @@ pub struct Node {
 - Do NOT move Raft heartbeats or master pings onto rayon; keep control-plane futures on Tokio and offload only the blocking shard work.
 - Recovered-node startup assignments must fail closed when the authoritative shard UUID path is missing: do not create a fresh shard directory during restart reconciliation, and do not run orphan cleanup while locally assigned UUID paths are missing.
 - The guarded startup-assignment set must come from the node's pre-join recovered state, not the later authoritative join snapshot. Otherwise fresh assignments learned during rejoin can be permanently misclassified as guarded startup shards and stay stuck in `INITIALIZING`.
+- Do not clear the recovered startup-assignment guard after bootstrap or rejoin. Authoritative cluster state confirms shard ownership, not the continued existence of the local shard data; only assignments that were never part of the recovered local state may create fresh UUID directories later in the lifecycle loop.
 - Later shard assignments may create their UUID directories during the lifecycle loop so new primaries/replicas can come online after startup.
 
 ## Recovery Invariant

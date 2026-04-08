@@ -8,6 +8,7 @@ default-run = "ferrissearch"
 anyhow = "1.0.102"
 axum = "0.8.8"
 bincode-next = { version = "3.0.0-rc.5", features = ["serde"] }
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 colored = "3"
 comfy-table = "7"

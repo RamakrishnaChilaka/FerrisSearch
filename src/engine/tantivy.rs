@@ -21,6 +21,11 @@ struct FieldRegistry {
     source_field: Field,
     /// Named text fields created dynamically from document keys
     fields: HashMap<String, Field>,
+    /// Logical field mappings so Date remains distinct from Integer even
+    /// though both are stored as Tantivy i64 fast fields.
+    field_types: HashMap<String, crate::cluster::state::FieldType>,
+    /// Mapped Date field names for targeted source normalization on ingest/read.
+    date_fields: Vec<String>,
 }
 
 /// Hot engine — Tantivy-backed search engine where all data lives in
@@ -75,6 +80,9 @@ impl HotEngine {
 
         // Create typed fields from mappings
         let mut mapped_fields: HashMap<String, Field> = HashMap::new();
+        let mut mapped_field_types: HashMap<String, crate::cluster::state::FieldType> =
+            HashMap::new();
+        let mut mapped_date_fields = Vec::new();
         let mut mapping_names: Vec<_> = mappings.keys().cloned().collect();
         mapping_names.sort();
         for name in mapping_names {
@@ -93,8 +101,14 @@ impl HotEngine {
                     FieldType::Boolean => {
                         schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
                     }
+                    FieldType::Date => schema_builder
+                        .add_i64_field(&name, tantivy::schema::INDEXED | STORED | FAST),
                     FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
                 };
+            if matches!(mapping.field_type, FieldType::Date) {
+                mapped_date_fields.push(name.clone());
+            }
+            mapped_field_types.insert(name.clone(), mapping.field_type.clone());
             mapped_fields.insert(name, field);
         }
 
@@ -136,6 +150,8 @@ impl HotEngine {
             id_field,
             source_field,
             fields,
+            field_types: mapped_field_types,
+            date_fields: mapped_date_fields,
         };
 
         let committed_seq_no_path = data_dir.join("translog.committed");
@@ -172,6 +188,56 @@ impl HotEngine {
         *registry.fields.get("body").expect("body field must exist")
     }
 
+    fn logical_field_type_for_field(
+        &self,
+        field: Field,
+    ) -> Option<crate::cluster::state::FieldType> {
+        let field_name = self
+            .index
+            .schema()
+            .get_field_entry(field)
+            .name()
+            .to_string();
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.field_types.get(&field_name).cloned()
+    }
+
+    fn normalize_result_source_with_registry(
+        registry: &FieldRegistry,
+        value: &mut serde_json::Value,
+    ) {
+        if registry.date_fields.is_empty() {
+            return;
+        }
+
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+
+        for field_name in &registry.date_fields {
+            let Some(field_value) = object.get_mut(field_name) else {
+                continue;
+            };
+            if let Some(normalized) = crate::common::date::normalize_json_date_value(field_value) {
+                *field_value = normalized;
+            }
+        }
+    }
+
+    fn decode_stored_source_with_registry(
+        registry: &FieldRegistry,
+        text: &str,
+    ) -> Option<serde_json::Value> {
+        let mut json_val = serde_json::from_str::<serde_json::Value>(text).ok()?;
+        // Mixed-version compatibility: older segments may still store mapped
+        // Date values as offsets or raw epoch millis in _source.
+        Self::normalize_result_source_with_registry(registry, &mut json_val);
+        Some(json_val)
+    }
+
     /// Create a Tantivy Term that matches the schema type of the target field.
     /// This prevents type mismatches (e.g., i64 term on an f64 field) that cause
     /// silent 0-hit results.
@@ -179,8 +245,33 @@ impl HotEngine {
         use tantivy::schema::FieldType;
         let schema = self.index.schema();
         let field_type = schema.get_field_entry(field).field_type();
+        let logical_field_type = self.logical_field_type_for_field(field);
         match value {
-            serde_json::Value::String(s) => Term::from_field_text(field, s),
+            serde_json::Value::String(s) => match logical_field_type {
+                Some(crate::cluster::state::FieldType::Date)
+                    if matches!(field_type, FieldType::I64(_)) =>
+                {
+                    crate::common::date::parse_iso8601_to_epoch_millis(s)
+                        .or_else(|| s.parse::<i64>().ok())
+                        .map(|millis| Term::from_field_i64(field, millis))
+                        .unwrap_or_else(|| Term::from_field_text(field, s))
+                }
+                Some(crate::cluster::state::FieldType::Integer)
+                    if matches!(field_type, FieldType::I64(_)) =>
+                {
+                    s.parse::<i64>()
+                        .map(|value| Term::from_field_i64(field, value))
+                        .unwrap_or_else(|_| Term::from_field_text(field, s))
+                }
+                Some(crate::cluster::state::FieldType::Float)
+                    if matches!(field_type, FieldType::F64(_)) =>
+                {
+                    s.parse::<f64>()
+                        .map(|value| Term::from_field_f64(field, value))
+                        .unwrap_or_else(|_| Term::from_field_text(field, s))
+                }
+                _ => Term::from_field_text(field, s),
+            },
             serde_json::Value::Number(n) => match field_type {
                 FieldType::I64(_) => {
                     let i = n.as_i64().unwrap_or(n.as_f64().unwrap_or(0.0) as i64);
@@ -269,7 +360,12 @@ impl HotEngine {
             let fast_fields = segment_reader.fast_fields();
             let mut segment_fields = Vec::with_capacity(columns.len());
             for column in columns {
-                let reader = open_sql_field_reader(&schema, fast_fields, column);
+                let reader = open_sql_field_reader(
+                    &schema,
+                    fast_fields,
+                    column,
+                    registry.field_types.get(column),
+                );
                 if matches!(reader, SqlFieldReader::SourceFallback) {
                     needs_stored_doc = true;
                 }
@@ -385,7 +481,8 @@ impl HotEngine {
                     segment_arrays.iter().map(|a| a.as_ref()).collect();
                 let concatenated = if refs.is_empty() {
                     // Empty result — build typed empty array from schema
-                    let kind = type_hint_from_schema(&schema, column);
+                    let kind =
+                        column_kind_for_column(&schema, registry.field_types.get(column), column);
                     empty_typed_array(kind)
                 } else {
                     datafusion::arrow::compute::concat(&refs)?
@@ -532,6 +629,15 @@ impl HotEngine {
                         .first(doc_id)
                         .map(serde_json::Value::from)
                         .unwrap_or(serde_json::Value::Null),
+                    SqlFieldReader::DateMillis(reader) => {
+                        // Emits raw i64 epoch millis intentionally — the ColumnStore
+                        // path uses build_timestamp_millis_array() which handles
+                        // Value::Number correctly via the TimestampMillis type hint.
+                        reader
+                            .first(doc_id)
+                            .map(serde_json::Value::from)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
                     SqlFieldReader::Str(reader) => {
                         let mut text = String::new();
                         if reader.first_text(doc_id, &mut text) {
@@ -579,6 +685,9 @@ impl HotEngine {
                 let kind = match &first_segment[i] {
                     SqlFieldReader::F64(_) => crate::hybrid::arrow_bridge::ColumnKind::Float64,
                     SqlFieldReader::I64(_) => crate::hybrid::arrow_bridge::ColumnKind::Int64,
+                    SqlFieldReader::DateMillis(_) => {
+                        crate::hybrid::arrow_bridge::ColumnKind::TimestampMillis
+                    }
                     SqlFieldReader::Str(_) => crate::hybrid::arrow_bridge::ColumnKind::Utf8,
                     SqlFieldReader::SourceFallback => continue,
                 };
@@ -587,21 +696,10 @@ impl HotEngine {
         } else {
             // No segments — derive types from the Tantivy schema directly
             for column in columns {
-                if let Ok(field) = schema.get_field(column) {
-                    let kind = match schema.get_field_entry(field).field_type() {
-                        tantivy::schema::FieldType::F64(_) => {
-                            crate::hybrid::arrow_bridge::ColumnKind::Float64
-                        }
-                        tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::U64(_) => {
-                            crate::hybrid::arrow_bridge::ColumnKind::Int64
-                        }
-                        tantivy::schema::FieldType::Bool(_) => {
-                            crate::hybrid::arrow_bridge::ColumnKind::Boolean
-                        }
-                        _ => crate::hybrid::arrow_bridge::ColumnKind::Utf8,
-                    };
-                    type_hints.insert(column.clone(), kind);
-                }
+                type_hints.insert(
+                    column.clone(),
+                    column_kind_for_column(&schema, registry.field_types.get(column), column),
+                );
             }
         }
         let batch =
@@ -634,8 +732,24 @@ impl HotEngine {
         // Store the document ID
         doc.add_text(registry.id_field, doc_id);
 
-        // Store the raw JSON in _source (serde_json::to_string is faster than Display)
-        if let Ok(json_str) = serde_json::to_string(payload) {
+        // Canonicalize mapped Date fields before persisting _source so every read path
+        // sees the same UTC ISO 8601 representation.
+        let normalized_source = payload.as_object().and_then(|object| {
+            if registry
+                .date_fields
+                .iter()
+                .any(|field_name| object.contains_key(field_name))
+            {
+                let mut value = payload.clone();
+                Self::normalize_result_source_with_registry(registry, &mut value);
+                Some(value)
+            } else {
+                None
+            }
+        });
+        let source_value = normalized_source.as_ref().unwrap_or(payload);
+
+        if let Ok(json_str) = serde_json::to_string(source_value) {
             doc.add_text(registry.source_field, json_str);
         }
 
@@ -650,10 +764,35 @@ impl HotEngine {
                 if let Some(&field) = registry.fields.get(key.as_str())
                     && field != body_field
                 {
+                    let logical_field_type = registry.field_types.get(key.as_str());
                     match value {
-                        serde_json::Value::String(s) => {
-                            doc.add_text(field, s);
-                        }
+                        serde_json::Value::String(s) => match logical_field_type {
+                            Some(crate::cluster::state::FieldType::Date) => {
+                                if let Some(millis) =
+                                    crate::common::date::parse_iso8601_to_epoch_millis(s)
+                                        .or_else(|| s.parse::<i64>().ok())
+                                {
+                                    doc.add_i64(field, millis);
+                                }
+                            }
+                            Some(crate::cluster::state::FieldType::Integer) => {
+                                if let Ok(value) = s.parse::<i64>() {
+                                    doc.add_i64(field, value);
+                                }
+                            }
+                            Some(crate::cluster::state::FieldType::Float) => {
+                                if let Ok(value) = s.parse::<f64>() {
+                                    doc.add_f64(field, value);
+                                }
+                            }
+                            _ => {
+                                use tantivy::schema::FieldType;
+                                match schema.get_field_entry(field).field_type() {
+                                    FieldType::I64(_) | FieldType::F64(_) | FieldType::U64(_) => {}
+                                    _ => doc.add_text(field, s),
+                                }
+                            }
+                        },
                         serde_json::Value::Number(n) => {
                             use tantivy::schema::FieldType;
                             match schema.get_field_entry(field).field_type() {
@@ -864,10 +1003,10 @@ impl HotEngine {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            // Get _source
             for value in retrieved_doc.get_all(registry.source_field) {
                 if let Some(text) = value.as_str()
-                    && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text)
+                    && let Some(json_val) =
+                        Self::decode_stored_source_with_registry(&registry, text)
                 {
                     results.push(serde_json::json!({
                         "_id": doc_id,
@@ -1214,7 +1353,8 @@ impl HotEngine {
                 .to_string();
             for value in retrieved_doc.get_all(registry.source_field) {
                 if let Some(text) = value.as_str()
-                    && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text)
+                    && let Some(json_val) =
+                        Self::decode_stored_source_with_registry(&registry, text)
                 {
                     results.push(serde_json::json!({
                         "_id": doc_id,
@@ -1318,7 +1458,7 @@ impl HotEngine {
                                                 None => GroupedMetricSource::CountAll,
                                                 Some(field_name) => {
                                                     let reader = open_sql_field_reader(
-                                                        schema, ff, field_name,
+                                                        schema, ff, field_name, None,
                                                     );
                                                     if matches!(
                                                         reader,
@@ -1646,6 +1786,7 @@ impl StringFastFieldReader {
 enum SqlFieldReader {
     F64(tantivy::columnar::Column<f64>),
     I64(tantivy::columnar::Column<i64>),
+    DateMillis(tantivy::columnar::Column<i64>),
     Str(StringFastFieldReader),
     SourceFallback,
 }
@@ -1655,6 +1796,7 @@ impl SqlFieldReader {
         match self {
             SqlFieldReader::F64(_) => "F64",
             SqlFieldReader::I64(_) => "I64",
+            SqlFieldReader::DateMillis(_) => "DateMillis",
             SqlFieldReader::Str(_) => "Str",
             SqlFieldReader::SourceFallback => "SourceFallback",
         }
@@ -1671,6 +1813,11 @@ impl SqlFieldReader {
             SqlFieldReader::I64(reader) => reader
                 .first(doc)
                 .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+            SqlFieldReader::DateMillis(reader) => reader
+                .first(doc)
+                .map(crate::common::date::epoch_millis_to_iso8601)
+                .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
             SqlFieldReader::Str(reader) => {
                 let mut text = String::new();
@@ -1689,11 +1836,21 @@ fn open_sql_field_reader(
     schema: &Schema,
     fast_fields: &tantivy::fastfield::FastFieldReaders,
     field_name: &str,
+    logical_field_type: Option<&crate::cluster::state::FieldType>,
 ) -> SqlFieldReader {
     let Ok(field) = schema.get_field(field_name) else {
         return SqlFieldReader::SourceFallback;
     };
     let entry = schema.get_field_entry(field);
+    if matches!(
+        logical_field_type,
+        Some(crate::cluster::state::FieldType::Date)
+    ) {
+        return fast_fields
+            .i64(entry.name())
+            .map(SqlFieldReader::DateMillis)
+            .unwrap_or(SqlFieldReader::SourceFallback);
+    }
     match entry.field_type() {
         tantivy::schema::FieldType::F64(_) => fast_fields
             .f64(entry.name())
@@ -1707,6 +1864,13 @@ fn open_sql_field_reader(
             .map(SqlFieldReader::Str)
             .unwrap_or(SqlFieldReader::SourceFallback),
     }
+}
+
+fn timestamp_array_from_values(
+    values: Vec<Option<i64>>,
+) -> datafusion::arrow::array::TimestampMillisecondArray {
+    datafusion::arrow::array::TimestampMillisecondArray::from(values)
+        .with_timezone("UTC".to_string())
 }
 
 /// Build a full-segment Arrow array from a fast-field reader.
@@ -1739,6 +1903,13 @@ fn build_full_segment_array(
             }
             Arc::new(builder.finish())
         }
+        SqlFieldReader::DateMillis(col) => {
+            let mut values = Vec::with_capacity(max_doc as usize);
+            for doc in 0..max_doc {
+                values.push(col.first(doc));
+            }
+            Arc::new(timestamp_array_from_values(values))
+        }
         SqlFieldReader::Str(col) => {
             let mut builder = StringBuilder::with_capacity(max_doc as usize, 0);
             let mut buf = String::new();
@@ -1767,9 +1938,11 @@ fn estimate_full_segment_array_bytes(reader: &SqlFieldReader, max_doc: u32) -> u
     let null_bitmap_bytes = doc_count.saturating_add(7) / 8;
 
     match reader {
-        SqlFieldReader::F64(_) | SqlFieldReader::I64(_) => doc_count
-            .saturating_mul(std::mem::size_of::<f64>() as u64)
-            .saturating_add(null_bitmap_bytes),
+        SqlFieldReader::F64(_) | SqlFieldReader::I64(_) | SqlFieldReader::DateMillis(_) => {
+            doc_count
+                .saturating_mul(std::mem::size_of::<f64>() as u64)
+                .saturating_add(null_bitmap_bytes)
+        }
         SqlFieldReader::Str(col) => {
             let offset_bytes = doc_count
                 .saturating_add(1)
@@ -1848,6 +2021,13 @@ fn build_selective_array(
             }
             Arc::new(builder.finish())
         }
+        SqlFieldReader::DateMillis(col) => {
+            let mut values = Vec::with_capacity(docs.len());
+            for (doc_id, _) in docs {
+                values.push(col.first(*doc_id));
+            }
+            Arc::new(timestamp_array_from_values(values))
+        }
         SqlFieldReader::Str(col) => {
             let mut builder = StringBuilder::with_capacity(docs.len(), docs.len() * 16);
             let doc_ids: Vec<tantivy::DocId> = docs.iter().map(|(doc_id, _)| *doc_id).collect();
@@ -1907,8 +2087,18 @@ fn build_projected_fast_field_array(
     Ok(build_selective_array(reader, docs))
 }
 
-/// Determine column type from Tantivy schema (for building typed empty arrays).
-fn type_hint_from_schema(schema: &Schema, column: &str) -> crate::hybrid::arrow_bridge::ColumnKind {
+fn column_kind_for_column(
+    schema: &Schema,
+    logical_field_type: Option<&crate::cluster::state::FieldType>,
+    column: &str,
+) -> crate::hybrid::arrow_bridge::ColumnKind {
+    if matches!(
+        logical_field_type,
+        Some(crate::cluster::state::FieldType::Date)
+    ) {
+        return crate::hybrid::arrow_bridge::ColumnKind::TimestampMillis;
+    }
+
     if let Ok(field) = schema.get_field(column) {
         match schema.get_field_entry(field).field_type() {
             tantivy::schema::FieldType::F64(_) => crate::hybrid::arrow_bridge::ColumnKind::Float64,
@@ -1934,6 +2124,9 @@ fn empty_typed_array(
         crate::hybrid::arrow_bridge::ColumnKind::Int64 => {
             Arc::new(datafusion::arrow::array::Int64Array::from(Vec::<i64>::new()))
         }
+        crate::hybrid::arrow_bridge::ColumnKind::TimestampMillis => {
+            Arc::new(timestamp_array_from_values(Vec::new()))
+        }
         crate::hybrid::arrow_bridge::ColumnKind::Boolean => Arc::new(
             datafusion::arrow::array::BooleanArray::from(Vec::<bool>::new()),
         ),
@@ -1948,6 +2141,13 @@ fn open_group_key_reader(
     fast_fields: &tantivy::fastfield::FastFieldReaders,
     field_name: &str,
 ) -> Option<GroupKeyReader> {
+    if let Some(spec) = crate::search::decode_derived_group_key(field_name) {
+        let base = StringFastFieldReader::open(fast_fields, &spec.source_field)?;
+        return Some(GroupKeyReader::DerivedStr(DerivedStringBucketReader::new(
+            base, spec,
+        )));
+    }
+
     let field = schema.get_field(field_name).ok()?;
     let entry = schema.get_field_entry(field);
     match entry.field_type() {
@@ -1989,12 +2189,95 @@ struct GroupedMetricEntry {
     source: GroupedMetricSource,
 }
 
+struct DerivedStringBucketReader {
+    base: StringFastFieldReader,
+    spec: crate::search::DerivedGroupKey,
+    ord_cache: std::cell::RefCell<std::collections::HashMap<u64, u64>>,
+}
+
+impl DerivedStringBucketReader {
+    fn new(base: StringFastFieldReader, spec: crate::search::DerivedGroupKey) -> Self {
+        Self {
+            base,
+            spec,
+            ord_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn keys_batch(&self, docs: &[tantivy::DocId], output: &mut [Option<u64>]) {
+        let mut ords = vec![None; docs.len()];
+        self.base.first_ords_batch(docs, &mut ords);
+        for (index, ord) in ords.into_iter().enumerate() {
+            output[index] = ord.map(|value| self.bucket_key_for_ord(value));
+        }
+    }
+
+    fn bucket_key_for_ord(&self, ord: u64) -> u64 {
+        if let Some(bucket_key) = self.ord_cache.borrow().get(&ord).copied() {
+            return bucket_key;
+        }
+
+        let mut text = String::new();
+        let bucket_key = if self.base.ord_to_str(ord, &mut text) {
+            self.matching_bucket_key(&text).unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
+        self.ord_cache.borrow_mut().insert(ord, bucket_key);
+        bucket_key
+    }
+
+    fn matching_bucket_key(&self, value: &str) -> Option<u64> {
+        derived_bucket_key_for_value(&self.spec, value)
+    }
+
+    fn num_terms(&self) -> usize {
+        self.spec.buckets.len() + usize::from(self.spec.else_label.is_some())
+    }
+
+    fn resolve(&self, key: u64) -> serde_json::Value {
+        if key == u64::MAX {
+            return serde_json::Value::Null;
+        }
+        if let Some(bucket) = self.spec.buckets.get(key as usize) {
+            return serde_json::Value::String(bucket.label.clone());
+        }
+        if key == self.spec.buckets.len() as u64
+            && let Some(label) = &self.spec.else_label
+        {
+            return serde_json::Value::String(label.clone());
+        }
+        serde_json::Value::Null
+    }
+}
+
+fn derived_bucket_key_for_value(spec: &crate::search::DerivedGroupKey, value: &str) -> Option<u64> {
+    for (index, bucket) in spec.buckets.iter().enumerate() {
+        let lower_ok = if bucket.lower_inclusive {
+            value >= bucket.lower.as_str()
+        } else {
+            value > bucket.lower.as_str()
+        };
+        let upper_ok = if bucket.upper_inclusive {
+            value <= bucket.upper.as_str()
+        } else {
+            value < bucket.upper.as_str()
+        };
+        if lower_ok && upper_ok {
+            return Some(index as u64);
+        }
+    }
+
+    spec.else_label.as_ref().map(|_| spec.buckets.len() as u64)
+}
+
 /// Compact per-doc key reader. Extracts a u64 ordinal per group-by column
 /// without allocating Strings or serde_json::Values in the hot path.
 enum GroupKeyReader {
     /// String column — reads ordinals from the underlying Column<u64> directly,
     /// bypassing the iterator-based `term_ords()` path.
     Str(StringFastFieldReader),
+    DerivedStr(DerivedStringBucketReader),
     I64(tantivy::columnar::Column<i64>),
     F64(tantivy::columnar::Column<f64>),
 }
@@ -2007,6 +2290,9 @@ impl GroupKeyReader {
         match self {
             GroupKeyReader::Str(reader) => {
                 reader.first_ords_batch(docs, output);
+            }
+            GroupKeyReader::DerivedStr(reader) => {
+                reader.keys_batch(docs, output);
             }
             GroupKeyReader::I64(reader) => {
                 // Reinterpret: read i64s into a temp buffer, convert to u64
@@ -2030,6 +2316,7 @@ impl GroupKeyReader {
     fn num_terms(&self) -> usize {
         match self {
             GroupKeyReader::Str(reader) => reader.num_terms(),
+            GroupKeyReader::DerivedStr(reader) => reader.num_terms(),
             _ => 256,
         }
     }
@@ -2048,6 +2335,7 @@ impl GroupKeyReader {
                     serde_json::Value::Null
                 }
             }
+            GroupKeyReader::DerivedStr(reader) => reader.resolve(key),
             GroupKeyReader::I64(_) => serde_json::Value::from(key as i64),
             GroupKeyReader::F64(_) => serde_json::Value::from(f64::from_bits(key)),
         }
@@ -2197,7 +2485,7 @@ impl tantivy::collector::Collector for GroupedAggCollector {
                     crate::search::GroupedMetricFunction::Count => match &metric.field_name {
                         None => GroupedMetricSource::CountAll,
                         Some(field_name) => {
-                            let reader = open_sql_field_reader(&self.schema, ff, field_name);
+                            let reader = open_sql_field_reader(&self.schema, ff, field_name, None);
                             if matches!(reader, SqlFieldReader::SourceFallback) {
                                 unsupported = true;
                                 break;
@@ -3724,7 +4012,8 @@ impl super::SearchEngine for HotEngine {
             let retrieved_doc = searcher.doc::<TantivyDocument>(*doc_address)?;
             for value in retrieved_doc.get_all(registry.source_field) {
                 if let Some(text) = value.as_str()
-                    && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text)
+                    && let Some(json_val) =
+                        Self::decode_stored_source_with_registry(&registry, text)
                 {
                     return Ok(Some(json_val));
                 }
@@ -4085,6 +4374,7 @@ struct StreamingBatchState {
     searcher: tantivy::Searcher,
     schema: tantivy::schema::Schema,
     columns: Vec<String>,
+    field_types: HashMap<String, crate::cluster::state::FieldType>,
     arrow_schema: std::sync::Arc<datafusion::arrow::datatypes::Schema>,
     batch_size: usize,
     needs_id: bool,
@@ -4109,7 +4399,14 @@ impl StreamingBatchState {
             let field_readers = self
                 .columns
                 .iter()
-                .map(|col_name| open_sql_field_reader(&self.schema, fast_fields, col_name))
+                .map(|col_name| {
+                    open_sql_field_reader(
+                        &self.schema,
+                        fast_fields,
+                        col_name,
+                        self.field_types.get(col_name),
+                    )
+                })
                 .collect();
             let id_reader = if self.needs_id {
                 StringFastFieldReader::open(fast_fields, "_id")
@@ -4211,12 +4508,21 @@ impl HotEngine {
 
         let searcher = self.reader.searcher();
         let schema = self.index.schema();
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
 
         searcher.segment_readers().iter().all(|segment_reader| {
             let fast_fields = segment_reader.fast_fields();
             columns.iter().all(|column| {
                 !matches!(
-                    open_sql_field_reader(&schema, fast_fields, column),
+                    open_sql_field_reader(
+                        &schema,
+                        fast_fields,
+                        column,
+                        registry.field_types.get(column),
+                    ),
                     SqlFieldReader::SourceFallback
                 )
             })
@@ -4240,6 +4546,10 @@ impl HotEngine {
         let (segment_bitsets, total_hits) = searcher.search(&*query, &(BitSetCollector, Count))?;
 
         let schema = self.index.schema();
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Build the Arrow schema: _id, _score, then user columns
         let mut arrow_fields = Vec::with_capacity(columns.len() + 2);
@@ -4254,7 +4564,8 @@ impl HotEngine {
             false,
         ));
         for col_name in columns {
-            let dt = type_hint_from_schema(&schema, col_name).to_arrow_type();
+            let dt = column_kind_for_column(&schema, registry.field_types.get(col_name), col_name)
+                .to_arrow_type();
             arrow_fields.push(datafusion::arrow::datatypes::Field::new(col_name, dt, true));
         }
         let arrow_schema =
@@ -4270,6 +4581,7 @@ impl HotEngine {
             searcher,
             schema,
             columns: columns.to_vec(),
+            field_types: registry.field_types.clone(),
             arrow_schema,
             batch_size,
             needs_id,
@@ -4334,6 +4646,7 @@ impl HotEngine {
 enum ColumnBuilder {
     F64(datafusion::arrow::array::Float64Builder),
     I64(datafusion::arrow::array::Int64Builder),
+    TimestampMillis(datafusion::arrow::array::TimestampMillisecondBuilder),
     Str {
         builder: datafusion::arrow::array::StringBuilder,
         scratch: String,
@@ -4349,6 +4662,10 @@ impl ColumnBuilder {
             ),
             SqlFieldReader::I64(_) => ColumnBuilder::I64(
                 datafusion::arrow::array::Int64Builder::with_capacity(capacity),
+            ),
+            SqlFieldReader::DateMillis(_) => ColumnBuilder::TimestampMillis(
+                datafusion::arrow::array::TimestampMillisecondBuilder::with_capacity(capacity)
+                    .with_timezone("UTC".to_string()),
             ),
             SqlFieldReader::Str(_) => ColumnBuilder::Str {
                 builder: datafusion::arrow::array::StringBuilder::with_capacity(
@@ -4373,6 +4690,12 @@ impl ColumnBuilder {
                 Some(v) => b.append_value(v),
                 None => b.append_null(),
             },
+            (ColumnBuilder::TimestampMillis(b), SqlFieldReader::DateMillis(col)) => {
+                match col.first(doc_id) {
+                    Some(v) => b.append_value(v),
+                    None => b.append_null(),
+                }
+            }
             (ColumnBuilder::Str { builder, scratch }, SqlFieldReader::Str(col)) => {
                 if col.first_text(doc_id, scratch) {
                     builder.append_value(scratch.as_str());
@@ -4406,6 +4729,7 @@ impl ColumnBuilder {
         match self {
             ColumnBuilder::F64(b) => Arc::new(b.finish()),
             ColumnBuilder::I64(b) => Arc::new(b.finish()),
+            ColumnBuilder::TimestampMillis(b) => Arc::new(b.finish()),
             ColumnBuilder::Str { builder, .. } => Arc::new(builder.finish()),
             ColumnBuilder::Null(b) => Arc::new(b.finish()),
         }
@@ -4415,6 +4739,7 @@ impl ColumnBuilder {
         match self {
             ColumnBuilder::F64(_) => "F64",
             ColumnBuilder::I64(_) => "I64",
+            ColumnBuilder::TimestampMillis(_) => "TimestampMillis",
             ColumnBuilder::Str { .. } => "Str",
             ColumnBuilder::Null(_) => "Null",
         }
@@ -6220,6 +6545,418 @@ mod tests {
         let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d2"));
         assert!(ids.contains(&"d3"));
+    }
+
+    #[test]
+    fn mapped_date_field_indexes_and_queries_with_iso8601() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "created_at".to_string(),
+            FieldMapping {
+                field_type: FieldType::Date,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "morning", "created_at": "2025-01-05T08:00:00"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "noon", "created_at": "2025-01-05T12:00:00"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d3",
+                json!({"title": "evening", "created_at": "2025-01-05T18:00:00"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // Range query: created_at >= '2025-01-05T10:00:00' should match d2 and d3
+        let req = SearchRequest {
+            query: QueryClause::Range({
+                let mut m = HashMap::new();
+                m.insert(
+                    "created_at".to_string(),
+                    crate::search::RangeCondition {
+                        gte: Some(json!("2025-01-05T10:00:00")),
+                        lt: None,
+                        lte: None,
+                        gt: None,
+                    },
+                );
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, _, _) = engine.search_query(&req).unwrap();
+        assert_eq!(hits.len(), 2, "created_at >= 10:00 should match d2 and d3");
+        let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d2"));
+        assert!(ids.contains(&"d3"));
+
+        // Range query with both bounds: 10:00 <= created_at < 15:00 → only d2
+        let req2 = SearchRequest {
+            query: QueryClause::Range({
+                let mut m = HashMap::new();
+                m.insert(
+                    "created_at".to_string(),
+                    crate::search::RangeCondition {
+                        gte: Some(json!("2025-01-05T10:00:00")),
+                        lt: Some(json!("2025-01-05T15:00:00")),
+                        lte: None,
+                        gt: None,
+                    },
+                );
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits2, _, _) = engine.search_query(&req2).unwrap();
+        assert_eq!(
+            hits2.len(),
+            1,
+            "10:00 <= created_at < 15:00 should match only d2"
+        );
+        assert_eq!(hits2[0]["_id"], "d2");
+
+        // get_document normalizes stored date values to a UTC ISO 8601 string
+        let doc = engine.get_document("d1").unwrap().unwrap();
+        assert_eq!(doc["created_at"], "2025-01-05T08:00:00Z");
+    }
+
+    #[test]
+    fn mapped_date_field_accepts_epoch_millis_number() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "ts".to_string(),
+            FieldMapping {
+                field_type: FieldType::Date,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        // Index with epoch millis directly (2025-01-05T08:00:00Z = 1736064000000)
+        engine
+            .add_document("d1", json!({"title": "epoch", "ts": 1736064000000_i64}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        // Range query with ISO 8601 string should match the epoch-indexed doc
+        let req = SearchRequest {
+            query: QueryClause::Range({
+                let mut m = HashMap::new();
+                m.insert(
+                    "ts".to_string(),
+                    crate::search::RangeCondition {
+                        gte: Some(json!("2025-01-05T07:00:00")),
+                        lt: Some(json!("2025-01-05T09:00:00")),
+                        lte: None,
+                        gt: None,
+                    },
+                );
+                m
+            }),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, _, _) = engine.search_query(&req).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "d1");
+        assert_eq!(hits[0]["_source"]["ts"], "2025-01-05T08:00:00Z");
+
+        let doc = engine.get_document("d1").unwrap().unwrap();
+        assert_eq!(doc["ts"], "2025-01-05T08:00:00Z");
+    }
+
+    #[test]
+    fn legacy_stored_date_source_is_normalized_on_all_read_paths() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::{SortClause, SortDirection, SortOrder};
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "created_at".to_string(),
+            FieldMapping {
+                field_type: FieldType::Date,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        let registry = engine
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let created_at = *registry.fields.get("created_at").unwrap();
+
+        let mut doc = TantivyDocument::new();
+        doc.add_text(registry.id_field, "legacy");
+        doc.add_text(
+            registry.source_field,
+            json!({
+                "title": "legacy",
+                "created_at": "2025-01-05T08:15:00+05:30"
+            })
+            .to_string(),
+        );
+        doc.add_i64(
+            created_at,
+            crate::common::date::parse_iso8601_to_epoch_millis("2025-01-05T08:15:00+05:30")
+                .unwrap(),
+        );
+        drop(registry);
+
+        {
+            let mut writer = engine.writer.write().unwrap_or_else(|e| e.into_inner());
+            writer.add_document(doc).unwrap();
+            writer.commit().unwrap();
+        }
+        engine.reader.reload().unwrap();
+
+        let doc = engine.get_document("legacy").unwrap().unwrap();
+        assert_eq!(doc["created_at"], json!("2025-01-05T02:45:00Z"));
+
+        let base_req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::new(),
+        };
+        let (hits, _, _) = engine.search_query(&base_req).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0]["_source"]["created_at"],
+            json!("2025-01-05T02:45:00Z")
+        );
+
+        let sorted_req = SearchRequest {
+            sort: vec![SortClause::Field(HashMap::from([(
+                "created_at".to_string(),
+                SortOrder::Direction(SortDirection::Asc),
+            )]))],
+            ..base_req
+        };
+        let (sorted_hits, _, _) = engine.search_query(&sorted_req).unwrap();
+        assert_eq!(sorted_hits.len(), 1);
+        assert_eq!(
+            sorted_hits[0]["_source"]["created_at"],
+            json!("2025-01-05T02:45:00Z")
+        );
+    }
+
+    #[test]
+    fn mapped_integer_field_does_not_parse_iso_string_query_as_date() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "counter".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document("d1", json!({"counter": 1_736_064_900_000_i64}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Term(HashMap::from([(
+                "counter".to_string(),
+                json!("2025-01-05T08:15:00Z"),
+            )])),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::new(),
+        };
+
+        let (hits, _, _) = engine.search_query(&req).unwrap();
+        assert!(
+            hits.is_empty(),
+            "integer fields must not reinterpret ISO date strings as epoch millis"
+        );
+    }
+
+    #[test]
+    fn mapped_date_field_sql_batch_uses_timestamp_schema_and_iso_rows() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use datafusion::arrow::array::TimestampMillisecondArray;
+        use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "created_at".to_string(),
+            FieldMapping {
+                field_type: FieldType::Date,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "morning", "created_at": "2025-01-05T08:15:00+05:30"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::new(),
+        };
+        let result = engine
+            .sql_record_batch(&req, &["created_at".to_string()], false, false)
+            .unwrap();
+
+        let schema = result.batch.schema();
+        let field = schema.field_with_name("created_at").unwrap().clone();
+        assert_eq!(
+            *field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+        );
+
+        let array = result
+            .batch
+            .column_by_name("created_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(
+            crate::common::date::epoch_millis_to_iso8601(array.value(0)),
+            "2025-01-05T02:45:00Z"
+        );
+
+        let (_, rows) = crate::hybrid::merge::record_batches_to_json_rows(&[result.batch]).unwrap();
+        assert_eq!(rows[0]["created_at"], json!("2025-01-05T02:45:00Z"));
+    }
+
+    #[test]
+    fn mapped_date_field_streaming_batch_uses_timestamp_type() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use datafusion::arrow::array::TimestampMillisecondArray;
+        use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "created_at".to_string(),
+            FieldMapping {
+                field_type: FieldType::Date,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine
+            .add_document(
+                "d1",
+                json!({"title": "morning", "created_at": "2025-01-05T08:15:00+05:30"}),
+            )
+            .unwrap();
+        engine
+            .add_document(
+                "d2",
+                json!({"title": "noon", "created_at": "2025-01-05T12:00:00Z"}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        assert!(
+            engine.can_stream_sql_batches(&["created_at".into(), "title".into()], false),
+            "Date + Keyword columns should be streamable"
+        );
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::new(),
+        };
+
+        let streaming = engine
+            .sql_streaming_batches(
+                &req,
+                &["created_at".into(), "title".into()],
+                true,
+                false,
+                8192,
+            )
+            .unwrap();
+
+        assert!(!streaming.batches.is_empty());
+
+        // Verify the Arrow schema uses Timestamp, not Int64
+        let schema = streaming.batches[0].schema();
+        let field = schema.field_with_name("created_at").unwrap();
+        assert_eq!(
+            *field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+        );
+
+        // Collect values across all batches (docs may span multiple segments)
+        let mut millis = Vec::new();
+        for batch in &streaming.batches {
+            let ts_col = batch
+                .column_by_name("created_at")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            for i in 0..ts_col.len() {
+                millis.push(ts_col.value(i));
+            }
+        }
+        millis.sort();
+        assert_eq!(
+            millis
+                .iter()
+                .map(|m| crate::common::date::epoch_millis_to_iso8601(*m))
+                .collect::<Vec<_>>(),
+            vec!["2025-01-05T02:45:00Z", "2025-01-05T12:00:00Z"]
+        );
     }
 
     #[test]
@@ -8650,6 +9387,54 @@ mod tests {
         let idx = arena.push("test_value");
         let json = arena.to_json_value(idx);
         assert_eq!(json, serde_json::Value::String("test_value".into()));
+    }
+
+    #[test]
+    fn derived_bucket_key_for_value_maps_hour_ranges() {
+        let spec = crate::search::DerivedGroupKey {
+            source_field: "pickup_datetime".to_string(),
+            buckets: vec![
+                crate::search::DerivedGroupBucket {
+                    lower: "2025-01-05T08:00:00".to_string(),
+                    lower_inclusive: true,
+                    upper: "2025-01-05T09:00:00".to_string(),
+                    upper_inclusive: false,
+                    label: "08".to_string(),
+                },
+                crate::search::DerivedGroupBucket {
+                    lower: "2025-01-05T12:00:00".to_string(),
+                    lower_inclusive: true,
+                    upper: "2025-01-05T13:00:00".to_string(),
+                    upper_inclusive: false,
+                    label: "12".to_string(),
+                },
+                crate::search::DerivedGroupBucket {
+                    lower: "2025-01-05T17:00:00".to_string(),
+                    lower_inclusive: true,
+                    upper: "2025-01-05T18:00:00".to_string(),
+                    upper_inclusive: false,
+                    label: "17".to_string(),
+                },
+            ],
+            else_label: None,
+        };
+
+        assert_eq!(
+            derived_bucket_key_for_value(&spec, "2025-01-05T08:15:00"),
+            Some(0)
+        );
+        assert_eq!(
+            derived_bucket_key_for_value(&spec, "2025-01-05T12:30:00"),
+            Some(1)
+        );
+        assert_eq!(
+            derived_bucket_key_for_value(&spec, "2025-01-05T17:45:00"),
+            Some(2)
+        );
+        assert_eq!(
+            derived_bucket_key_for_value(&spec, "2025-01-05T10:00:00"),
+            None
+        );
     }
 
     // ── Shard top-K pruning tests ──────────────────────────────────

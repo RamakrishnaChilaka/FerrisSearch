@@ -1204,6 +1204,44 @@ fn canonicalize_sql_field_list(
     Ok(())
 }
 
+fn canonicalize_group_key_name(
+    field_name: &str,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    if let Some(mut derived) = crate::search::decode_derived_group_key(field_name) {
+        derived.source_field = canonicalize_sql_source_field_name(&derived.source_field, mappings)?;
+        Ok(crate::search::encode_derived_group_key(&derived))
+    } else {
+        canonicalize_sql_source_field_name(field_name, mappings)
+    }
+}
+
+fn grouped_column_mapping_name(source_name: &str) -> String {
+    crate::search::decode_derived_group_key(source_name)
+        .map(|derived| derived.source_field)
+        .unwrap_or_else(|| source_name.to_string())
+}
+
+fn derived_group_key_requires_group_by_fallback(
+    source_name: &str,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> bool {
+    let Some(derived) = crate::search::decode_derived_group_key(source_name) else {
+        return false;
+    };
+
+    match mappings
+        .get(&derived.source_field)
+        .map(|mapping| &mapping.field_type)
+    {
+        Some(crate::cluster::state::FieldType::Keyword)
+        | Some(crate::cluster::state::FieldType::Boolean)
+        | Some(crate::cluster::state::FieldType::Text) => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
 fn canonicalize_sql_plan_fields(
     mut plan: crate::hybrid::QueryPlan,
     mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
@@ -1217,7 +1255,11 @@ fn canonicalize_sql_plan_fields(
     }
 
     canonicalize_sql_field_list(&mut plan.required_columns, mappings)?;
-    canonicalize_sql_field_list(&mut plan.group_by_columns, mappings)?;
+    let mut canonical_group_by = Vec::with_capacity(plan.group_by_columns.len());
+    for field_name in plan.group_by_columns.drain(..) {
+        canonical_group_by.push(canonicalize_group_key_name(&field_name, mappings)?);
+    }
+    plan.group_by_columns = canonical_group_by;
 
     if let Some((field_name, _)) = &mut plan.sort_pushdown {
         *field_name = canonicalize_sql_source_field_name(field_name, mappings)?;
@@ -1225,13 +1267,23 @@ fn canonicalize_sql_plan_fields(
 
     if let Some(grouped_sql) = &mut plan.grouped_sql {
         for column in &mut grouped_sql.group_columns {
-            column.source_name = canonicalize_sql_source_field_name(&column.source_name, mappings)?;
+            column.source_name = canonicalize_group_key_name(&column.source_name, mappings)?;
         }
         for metric in &mut grouped_sql.metrics {
             if let Some(field_name) = &mut metric.field {
                 *field_name = canonicalize_sql_source_field_name(field_name, mappings)?;
             }
         }
+    }
+
+    if plan.grouped_sql.as_ref().is_some_and(|grouped_sql| {
+        grouped_sql.group_columns.iter().any(|column| {
+            derived_group_key_requires_group_by_fallback(&column.source_name, mappings)
+        })
+    }) {
+        plan.grouped_sql = None;
+        plan.has_group_by_fallback = true;
+        plan.limit_pushed_down = false;
     }
 
     if let Some(semijoin) = &mut plan.semijoin {
@@ -1730,7 +1782,8 @@ async fn execute_sql_query_with_plan(
         // Text fields are analyzed/tokenized and don't have fast-field columnar storage.
         if let Some(grouped) = &plan.grouped_sql {
             for col in &grouped.group_columns {
-                if let Some(mapping) = metadata.mappings.get(&col.source_name)
+                let mapping_name = grouped_column_mapping_name(&col.source_name);
+                if let Some(mapping) = metadata.mappings.get(&mapping_name)
                     && matches!(mapping.field_type, crate::cluster::state::FieldType::Text)
                 {
                     return Err(crate::api::error_response(
@@ -1738,7 +1791,7 @@ async fn execute_sql_query_with_plan(
                         "group_by_text_field_exception",
                         format!(
                             "Cannot GROUP BY field '{}': text fields are tokenized and don't support grouping. Use a 'keyword' type field instead.",
-                            col.source_name
+                            mapping_name
                         ),
                     ));
                 }
@@ -2554,6 +2607,7 @@ async fn handle_describe(state: &AppState, index_name: &str) -> (StatusCode, Jso
                 crate::cluster::state::FieldType::Integer => "integer",
                 crate::cluster::state::FieldType::Float => "float",
                 crate::cluster::state::FieldType::Boolean => "boolean",
+                crate::cluster::state::FieldType::Date => "date",
                 crate::cluster::state::FieldType::KnnVector => "knn_vector",
             };
             let mut row = serde_json::json!({
@@ -2606,6 +2660,7 @@ async fn handle_show_create_table(state: &AppState, index_name: &str) -> (Status
             crate::cluster::state::FieldType::Integer => "integer",
             crate::cluster::state::FieldType::Float => "float",
             crate::cluster::state::FieldType::Boolean => "boolean",
+            crate::cluster::state::FieldType::Date => "date",
             crate::cluster::state::FieldType::KnnVector => "knn_vector",
         };
         let mut field_def = serde_json::json!({"type": type_str});
@@ -3369,6 +3424,38 @@ mod tests {
             }
             other => panic!("expected range filter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn canonicalize_sql_plan_fields_disables_derived_grouped_partials_for_numeric_source() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let mappings = HashMap::from([(
+            "PULocationID".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        )]);
+
+        let sql = "SELECT CASE
+                WHEN PULocationID >= '100' AND PULocationID < '200' THEN '100s'
+                WHEN PULocationID >= '200' AND PULocationID < '300' THEN '200s'
+            END AS bucket,
+            count(*) AS rides
+        FROM rides
+        GROUP BY CASE
+                WHEN PULocationID >= '100' AND PULocationID < '200' THEN '100s'
+                WHEN PULocationID >= '200' AND PULocationID < '300' THEN '200s'
+            END
+        ORDER BY bucket";
+
+        let plan = crate::hybrid::planner::plan_sql("rides", sql).unwrap();
+        assert!(plan.uses_grouped_partials());
+
+        let plan = super::canonicalize_sql_plan_fields(plan, &mappings).unwrap();
+        assert!(!plan.uses_grouped_partials());
+        assert!(plan.has_group_by_fallback);
     }
 
     #[test]

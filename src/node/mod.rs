@@ -232,12 +232,23 @@ impl Node {
                 if already_initialized {
                     recovered_guard_state = Some(manager.get_state());
                     info!("Raft already initialized (recovered from disk), rejoining cluster");
-                    let joined_state =
-                        try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 20)
-                            .await;
+                    let joined_state = try_join_cluster(
+                        &client,
+                        &remote_seeds,
+                        &local_node,
+                        raft_node_id,
+                        20,
+                        Some(Arc::clone(raft)),
+                    )
+                    .await;
                     if joined_state.is_some() {
                         info!("Recovered node re-registered with the cluster leader");
                         startup_state = joined_state;
+                    } else if raft.is_leader() {
+                        // We became leader during join attempts — use the local
+                        // state machine as the authoritative startup state.
+                        info!("Node became Raft leader — using local state for startup");
+                        startup_state = Some(manager.get_state());
                     } else if !remote_seeds.is_empty() {
                         tracing::warn!(
                             "Recovered node could not re-register via seed hosts yet; will retry in lifecycle loop"
@@ -248,7 +259,8 @@ impl Node {
                     // Other nodes may not be ready yet — retry a few times
                     // before falling back to single-node bootstrap.
                     let joined_state = if !remote_seeds.is_empty() {
-                        try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 5).await
+                        try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 5, None)
+                            .await
                     } else {
                         None
                     };
@@ -312,6 +324,16 @@ impl Node {
             let state = startup_state.clone().unwrap_or_else(|| manager.get_state());
             let guarded_missing_startup_shards =
                 build_guarded_startup_shards(recovered_guard_state.as_ref(), &local_id);
+            // Keep the recovered-startup guard in place even after we obtain
+            // authoritative cluster state. The join/bootstrap snapshot tells us
+            // where shards belong, but it does not prove the local shard data
+            // still exists. New assignments learned after rejoin are not part
+            // of the guard set and may still create fresh directories later.
+            // Snapshot which UUID directories exist on disk BEFORE we open
+            // any shards. This prevents orphan cleanup from treating
+            // freshly-created (empty) shard dirs as evidence that the
+            // authoritative data is present.
+            let pre_existing_uuid_dirs = snapshot_uuid_dirs(manager_clone.data_dir());
             open_local_assigned_shards_blocking(
                 state.clone(),
                 local_id.clone(),
@@ -325,6 +347,7 @@ impl Node {
                 local_id.clone(),
                 manager_clone.clone(),
                 has_authoritative_startup_state,
+                pre_existing_uuid_dirs.clone(),
             )
             .await;
 
@@ -349,6 +372,7 @@ impl Node {
                         local_id.clone(),
                         manager_clone.clone(),
                         false,
+                        pre_existing_uuid_dirs.clone(),
                     )
                     .await;
                 }
@@ -566,8 +590,15 @@ impl Node {
                         // include us. Recovered nodes are already initialized/voters, so
                         // gating on those flags prevents the promised retry path.
                         let joined_state = if should_retry_cluster_join(&state, &local_id) {
-                            try_join_cluster(&client, &remote_seeds, &local_node, raft_node_id, 1)
-                                .await
+                            try_join_cluster(
+                                &client,
+                                &remote_seeds,
+                                &local_node,
+                                raft_node_id,
+                                1,
+                                None,
+                            )
+                            .await
                         } else {
                             None
                         };
@@ -576,6 +607,9 @@ impl Node {
                                 "Recovered follower {} re-registered with leader",
                                 local_id
                             );
+                            // Snapshot UUID dirs before opening shards to prevent
+                            // cleanup from deleting old data based on freshly-created dirs.
+                            let join_pre_existing = snapshot_uuid_dirs(manager_clone.data_dir());
                             open_local_assigned_shards_blocking(
                                 joined_state.clone(),
                                 local_id.clone(),
@@ -590,6 +624,7 @@ impl Node {
                                         local_id.clone(),
                                         manager_clone.clone(),
                                         true,
+                                        join_pre_existing,
                                     )
                                     .await;
                             }
@@ -672,11 +707,38 @@ impl Node {
     }
 }
 
+/// Snapshot which directories exist in the data dir right now.
+/// Used to distinguish pre-existing shard data from directories freshly
+/// created by `open_local_assigned_shards` in the current startup.
+fn snapshot_uuid_dirs(data_dir: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut dirs = std::collections::HashSet::new();
+    match std::fs::read_dir(data_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if entry.path().is_dir()
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    dirs.insert(name.to_string());
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to snapshot pre-existing UUID directories under {:?}: {}",
+                data_dir,
+                e
+            );
+        }
+    }
+    dirs
+}
+
 async fn cleanup_orphaned_data_if_authoritative_blocking(
     state: Option<crate::cluster::state::ClusterState>,
     local_node_id: String,
     shard_manager: Arc<ShardManager>,
     allow_empty_indices: bool,
+    pre_existing_uuid_dirs: std::collections::HashSet<String>,
 ) -> bool {
     let Some(state) = state else {
         return false;
@@ -705,6 +767,19 @@ async fn cleanup_orphaned_data_if_authoritative_blocking(
                     .any(|node_id| node_id == &local_node_id);
             if !assigned_here {
                 continue;
+            }
+
+            // Check that the UUID directory existed on disk BEFORE we
+            // opened any shards in this startup.  A directory that was just
+            // created by `open_local_assigned_shards` is empty and must not
+            // be treated as proof that the authoritative data is present.
+            if !pre_existing_uuid_dirs.contains(&metadata.uuid) {
+                tracing::warn!(
+                    "Skipping orphaned data cleanup because UUID directory for {}/{} was not present before shard opening — it was freshly created and deleting unknown UUID directories could discard live data",
+                    index_name,
+                    shard_id
+                );
+                return false;
             }
 
             let shard_dir = shard_manager
@@ -743,6 +818,7 @@ fn cleanup_orphaned_data_if_authoritative(
     local_node_id: &str,
     shard_manager: &ShardManager,
     allow_empty_indices: bool,
+    pre_existing_uuid_dirs: &std::collections::HashSet<String>,
 ) -> bool {
     let Some(state) = state else {
         return false;
@@ -771,6 +847,15 @@ fn cleanup_orphaned_data_if_authoritative(
                     .any(|node_id| node_id == local_node_id);
             if !assigned_here {
                 continue;
+            }
+
+            if !pre_existing_uuid_dirs.contains(&metadata.uuid) {
+                tracing::warn!(
+                    "Skipping orphaned data cleanup because UUID directory for {}/{} was not present before shard opening — it was freshly created and deleting unknown UUID directories could discard live data",
+                    index_name,
+                    shard_id
+                );
+                return false;
             }
 
             let shard_dir = shard_manager
@@ -802,21 +887,23 @@ fn should_retry_cluster_join(
     !state.nodes.contains_key(local_node_id)
 }
 
-type GuardedStartupShards = std::sync::Arc<std::collections::HashSet<(String, u32, String)>>;
+type GuardedStartupShards =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, u32, String)>>>;
 
 fn build_guarded_startup_shards(
     recovered_state: Option<&crate::cluster::state::ClusterState>,
     local_node_id: &str,
 ) -> GuardedStartupShards {
-    recovered_state
+    let set = recovered_state
         .map(|state| collect_guarded_startup_shards(state, local_node_id))
-        .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashSet::new()))
+        .unwrap_or_default();
+    std::sync::Arc::new(std::sync::Mutex::new(set))
 }
 
 fn collect_guarded_startup_shards(
     state: &crate::cluster::state::ClusterState,
     local_node_id: &str,
-) -> GuardedStartupShards {
+) -> std::collections::HashSet<(String, u32, String)> {
     let mut guarded = std::collections::HashSet::new();
     for (index_name, metadata) in &state.indices {
         if !metadata.has_uuid() {
@@ -834,7 +921,7 @@ fn collect_guarded_startup_shards(
             }
         }
     }
-    std::sync::Arc::new(guarded)
+    guarded
 }
 
 async fn open_local_assigned_shards_blocking(
@@ -864,8 +951,14 @@ fn open_local_assigned_shards(
     state: &crate::cluster::state::ClusterState,
     local_node_id: &str,
     shard_manager: &ShardManager,
-    guarded_missing_startup_shards: &std::collections::HashSet<(String, u32, String)>,
+    guarded_missing_startup_shards: &std::sync::Mutex<
+        std::collections::HashSet<(String, u32, String)>,
+    >,
 ) {
+    let guard_set = guarded_missing_startup_shards
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     for (index_name, metadata) in &state.indices {
         for (shard_id, routing) in &metadata.shard_routing {
             let assigned_here = routing.primary == local_node_id
@@ -891,11 +984,7 @@ fn open_local_assigned_shards(
                 .join(&metadata.uuid)
                 .join(format!("shard_{}", shard_id));
             if !shard_dir.exists()
-                && guarded_missing_startup_shards.contains(&(
-                    index_name.clone(),
-                    *shard_id,
-                    metadata.uuid.clone(),
-                ))
+                && guard_set.contains(&(index_name.clone(), *shard_id, metadata.uuid.clone()))
             {
                 tracing::warn!(
                     "Skipping lifecycle reopen for {}/{} because {:?} is missing on a recovered node; refusing to create a fresh shard directory for a startup assignment",
@@ -944,12 +1033,26 @@ async fn try_join_cluster(
     local_node: &NodeInfo,
     raft_node_id: u64,
     attempts: usize,
+    raft: Option<Arc<RaftInstance>>,
 ) -> Option<crate::cluster::state::ClusterState> {
     if remote_seeds.is_empty() {
         return None;
     }
 
     for attempt in 0..attempts {
+        // If this node became the Raft leader, it doesn't need to join
+        // via seeds — the lifecycle loop handles SetMaster and other
+        // leader duties.  Short-circuiting here avoids dozens of futile
+        // join retries that block the lifecycle loop from starting.
+        if let Some(ref raft) = raft
+            && raft.is_leader()
+        {
+            tracing::info!(
+                "Became Raft leader during join attempts — skipping remaining seed-based join"
+            );
+            return None;
+        }
+
         if let Some(state) = client
             .join_cluster(remote_seeds, local_node, raft_node_id)
             .await
@@ -1158,7 +1261,7 @@ mod tests {
             &state,
             "node-1",
             &shard_manager,
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(std::collections::HashSet::new()),
         );
         assert!(shard_manager.get_shard("idx", 0).is_some());
     }
@@ -1189,7 +1292,12 @@ mod tests {
         });
 
         let guarded = collect_guarded_startup_shards(&state, "node-1");
-        open_local_assigned_shards(&state, "node-1", &shard_manager, guarded.as_ref());
+        open_local_assigned_shards(
+            &state,
+            "node-1",
+            &shard_manager,
+            &std::sync::Mutex::new(guarded),
+        );
         assert!(shard_manager.get_shard("idx", 0).is_none());
         assert!(!dir.path().join("expected-uuid").exists());
     }
@@ -1223,7 +1331,7 @@ mod tests {
             &state,
             "node-1",
             &shard_manager,
-            &std::collections::HashSet::new(),
+            &std::sync::Mutex::new(std::collections::HashSet::new()),
         );
         assert!(shard_manager.get_shard("idx", 0).is_some());
         assert!(dir.path().join("fresh-uuid").join("shard_0").exists());
@@ -1257,15 +1365,59 @@ mod tests {
         });
 
         let guarded = build_guarded_startup_shards(Some(&recovered_state), "node-1");
-        open_local_assigned_shards(
-            &authoritative_state,
-            "node-1",
-            &shard_manager,
-            guarded.as_ref(),
-        );
+        open_local_assigned_shards(&authoritative_state, "node-1", &shard_manager, &guarded);
 
         assert!(shard_manager.get_shard("idx", 0).is_some());
         assert!(dir.path().join("fresh-uuid").join("shard_0").exists());
+    }
+
+    #[tokio::test]
+    async fn recovered_startup_shards_remain_guarded_across_reopen_attempts() {
+        // Simulate a recovered node whose authoritative startup state still
+        // assigns shard 0 locally, but the expected UUID directory is gone.
+        // Reconciliation must keep refusing to create a fresh shard dir for
+        // that recovered startup assignment, even on later lifecycle ticks.
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+
+        let mut state = crate::cluster::state::ClusterState::new("guard-clear-test".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: "my-uuid".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+
+        // Directory does NOT exist on disk — guard should block every reopen attempt.
+        let guarded = build_guarded_startup_shards(Some(&state), "node-1");
+        open_local_assigned_shards(&state, "node-1", &shard_manager, &guarded);
+        assert!(
+            shard_manager.get_shard("idx", 0).is_none(),
+            "guard should prevent opening a shard with missing dir"
+        );
+        assert!(!dir.path().join("my-uuid").join("shard_0").exists());
+
+        // Simulate a later lifecycle reconciliation with the same
+        // authoritative assignment. The recovered-startup guard must still
+        // prevent recreating an empty shard directory.
+        open_local_assigned_shards(&state, "node-1", &shard_manager, &guarded);
+        assert!(
+            shard_manager.get_shard("idx", 0).is_none(),
+            "recovered startup assignments must remain guarded until real local data exists"
+        );
+        assert!(!dir.path().join("my-uuid").join("shard_0").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1303,7 +1455,7 @@ mod tests {
                 state,
                 "node-1".into(),
                 manager,
-                std::sync::Arc::new(std::collections::HashSet::new()),
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             )
             .await;
         });
@@ -1335,6 +1487,7 @@ mod tests {
             "node-1",
             &shard_manager,
             false,
+            &snapshot_uuid_dirs(dir.path()),
         ));
         assert!(dir.path().join(live_uuid).exists());
     }
@@ -1353,6 +1506,7 @@ mod tests {
             "node-1",
             &shard_manager,
             true,
+            &snapshot_uuid_dirs(dir.path()),
         ));
         assert!(!dir.path().join(orphan_uuid).exists());
     }
@@ -1392,6 +1546,7 @@ mod tests {
             "node-1",
             &shard_manager,
             true,
+            &snapshot_uuid_dirs(dir.path()),
         ));
         assert!(dir.path().join(known_uuid).exists());
         assert!(!dir.path().join(orphan_uuid).exists());
@@ -1429,8 +1584,200 @@ mod tests {
             "node-1",
             &shard_manager,
             true,
+            &snapshot_uuid_dirs(dir.path()),
         ));
         assert!(dir.path().join("old-live-uuid").exists());
+    }
+
+    #[test]
+    fn cleanup_skips_when_uuid_dir_was_freshly_created() {
+        // Simulates the unsafe sequence that caused data loss:
+        // 1. Old data lives under UUID "old-data-uuid"
+        // 2. Raft state says shards belong under "new-raft-uuid"
+        // 3. An unsafe reopen path creates "new-raft-uuid" before cleanup runs
+        // 4. Orphan cleanup must NOT delete "old-data-uuid" because
+        //    "new-raft-uuid" was freshly created (not pre-existing).
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+
+        // Old data on disk (from a previous index creation)
+        std::fs::create_dir_all(dir.path().join("old-data-uuid").join("shard_0")).unwrap();
+
+        // Snapshot BEFORE opening shards — only old-data-uuid exists
+        let pre_existing = snapshot_uuid_dirs(dir.path());
+        assert!(pre_existing.contains("old-data-uuid"));
+        assert!(!pre_existing.contains("new-raft-uuid"));
+
+        // Simulate guard cleared + shard opened: create the new UUID dir
+        std::fs::create_dir_all(dir.path().join("new-raft-uuid").join("shard_0")).unwrap();
+
+        // Cluster state says shards are under new-raft-uuid
+        let mut state = crate::cluster::state::ClusterState::new("guard-clear-test".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: "new-raft-uuid".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+
+        // Cleanup must SKIP because new-raft-uuid was not pre-existing
+        assert!(!cleanup_orphaned_data_if_authoritative(
+            Some(&state),
+            "node-1",
+            &shard_manager,
+            true,
+            &pre_existing,
+        ));
+
+        // old-data-uuid must survive — it has the real data!
+        assert!(
+            dir.path().join("old-data-uuid").exists(),
+            "old data directory must NOT be deleted when the expected UUID dir was freshly created"
+        );
+    }
+
+    #[test]
+    fn cleanup_runs_when_uuid_dir_was_pre_existing() {
+        // On a subsequent restart, the UUID dir IS pre-existing → cleanup allowed.
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+
+        // Both dirs exist on disk
+        std::fs::create_dir_all(dir.path().join("current-uuid").join("shard_0")).unwrap();
+        std::fs::create_dir_all(dir.path().join("stale-orphan").join("shard_0")).unwrap();
+
+        let pre_existing = snapshot_uuid_dirs(dir.path());
+        assert!(pre_existing.contains("current-uuid"));
+
+        let mut state = crate::cluster::state::ClusterState::new("restart-test".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: "current-uuid".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+
+        // Cleanup should proceed and remove stale-orphan
+        assert!(cleanup_orphaned_data_if_authoritative(
+            Some(&state),
+            "node-1",
+            &shard_manager,
+            true,
+            &pre_existing,
+        ));
+        assert!(dir.path().join("current-uuid").exists());
+        assert!(
+            !dir.path().join("stale-orphan").exists(),
+            "stale orphan should be cleaned up when expected UUID was pre-existing"
+        );
+    }
+
+    #[test]
+    fn two_restart_recovery_sequence_preserves_old_data_and_never_creates_fresh_uuid_dir() {
+        // This models the exact node-1 failure mode across two restarts:
+        // 1. Old shard data exists only under an old UUID directory.
+        // 2. Authoritative cluster state points at a different UUID.
+        // 3. Startup reconciliation must refuse to create the new UUID dir.
+        // 4. A second restart must still preserve the old data and avoid
+        //    turning it into an orphan eligible for cleanup.
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(dir.path().join("old-data-uuid").join("shard_0")).unwrap();
+
+        let mut state = crate::cluster::state::ClusterState::new("two-restart-test".into());
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: "new-raft-uuid".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+
+        // First restart: startup guard must keep the missing authoritative
+        // UUID dir fail-closed and prevent orphan cleanup from touching old data.
+        {
+            let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+            let guard = build_guarded_startup_shards(Some(&state), "node-1");
+            let pre_existing = snapshot_uuid_dirs(dir.path());
+
+            assert!(pre_existing.contains("old-data-uuid"));
+            assert!(!pre_existing.contains("new-raft-uuid"));
+
+            open_local_assigned_shards(&state, "node-1", &shard_manager, &guard);
+            assert!(shard_manager.get_shard("idx", 0).is_none());
+            assert!(!dir.path().join("new-raft-uuid").exists());
+
+            assert!(!cleanup_orphaned_data_if_authoritative(
+                Some(&state),
+                "node-1",
+                &shard_manager,
+                true,
+                &pre_existing,
+            ));
+            assert!(dir.path().join("old-data-uuid").exists());
+            assert!(!dir.path().join("new-raft-uuid").exists());
+        }
+
+        // Second restart: if the first restart had recreated the new UUID dir,
+        // it would now appear pre-existing and cleanup could delete old-data-uuid.
+        // The invariant is that the new dir never appears in the first place.
+        {
+            let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+            let guard = build_guarded_startup_shards(Some(&state), "node-1");
+            let pre_existing = snapshot_uuid_dirs(dir.path());
+
+            assert!(pre_existing.contains("old-data-uuid"));
+            assert!(!pre_existing.contains("new-raft-uuid"));
+
+            open_local_assigned_shards(&state, "node-1", &shard_manager, &guard);
+            assert!(shard_manager.get_shard("idx", 0).is_none());
+            assert!(!dir.path().join("new-raft-uuid").exists());
+
+            assert!(!cleanup_orphaned_data_if_authoritative(
+                Some(&state),
+                "node-1",
+                &shard_manager,
+                true,
+                &pre_existing,
+            ));
+            assert!(dir.path().join("old-data-uuid").exists());
+            assert!(!dir.path().join("new-raft-uuid").exists());
+        }
     }
 
     #[test]
@@ -1569,5 +1916,70 @@ mod tests {
         assert_eq!(tls.ca, "/tmp/ca.pem");
         assert_eq!(tls.cert, "/tmp/node.pem");
         assert_eq!(tls.key, "/tmp/node-key.pem");
+    }
+
+    #[tokio::test]
+    async fn try_join_cluster_short_circuits_when_raft_leader() {
+        // Bootstrap a single-node Raft so it becomes leader immediately.
+        let (raft, _state) =
+            crate::consensus::create_raft_instance_mem(1, "leader-skip-test".into())
+                .await
+                .unwrap();
+        crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19399".into())
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if raft.current_leader().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(raft.is_leader(), "node must be leader for this test");
+
+        // Seed list points to unreachable addresses — without the leadership
+        // short-circuit, this would block for the full 20 attempts with
+        // connection timeouts (~100s).
+        let seeds = vec!["127.0.0.1:19777".to_string(), "127.0.0.1:19778".to_string()];
+        let node = NodeInfo {
+            id: "leader-node".into(),
+            name: "leader-node".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 19399,
+            http_port: 19200,
+            roles: vec![NodeRole::Master, NodeRole::Data],
+            raft_node_id: 1,
+        };
+        let client = TransportClient::new();
+        let start = Instant::now();
+        let result = try_join_cluster(&client, &seeds, &node, 1, 20, Some(Arc::clone(&raft))).await;
+        let elapsed = start.elapsed();
+
+        // Should return None (leader doesn't need seed-based join) within
+        // milliseconds, not the ~100s it would take without the check.
+        assert!(result.is_none());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "leadership short-circuit should return immediately, but took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn try_join_cluster_no_short_circuit_without_raft() {
+        // With raft=None, the function should try all attempts normally.
+        // Using empty seeds so it returns immediately.
+        let seeds: Vec<String> = vec![];
+        let node = NodeInfo {
+            id: "test-node".into(),
+            name: "test-node".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 19399,
+            http_port: 19200,
+            roles: vec![NodeRole::Master, NodeRole::Data],
+            raft_node_id: 1,
+        };
+        let client = TransportClient::new();
+        let result = try_join_cluster(&client, &seeds, &node, 1, 5, None).await;
+        assert!(result.is_none(), "empty seeds should return None");
     }
 }

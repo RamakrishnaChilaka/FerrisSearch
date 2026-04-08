@@ -1,9 +1,10 @@
 use anyhow::Result;
 use datafusion::arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
-    StringArray, UInt32Array, UInt64Array,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use serde_json::{Map, Value};
 
@@ -95,6 +96,40 @@ fn array_value_to_json(array: &dyn Array, data_type: &DataType, row_idx: usize) 
             let array = downcast_array::<BooleanArray>(array, data_type, "BooleanArray")?;
             serde_json::json!(array.value(row_idx))
         }
+        DataType::Timestamp(unit, _) => Value::String(match unit {
+            TimeUnit::Second => {
+                let array = downcast_array::<TimestampSecondArray>(
+                    array,
+                    data_type,
+                    "TimestampSecondArray",
+                )?;
+                crate::common::date::epoch_millis_to_iso8601(array.value(row_idx) * 1_000)
+            }
+            TimeUnit::Millisecond => {
+                let array = downcast_array::<TimestampMillisecondArray>(
+                    array,
+                    data_type,
+                    "TimestampMillisecondArray",
+                )?;
+                crate::common::date::epoch_millis_to_iso8601(array.value(row_idx))
+            }
+            TimeUnit::Microsecond => {
+                let array = downcast_array::<TimestampMicrosecondArray>(
+                    array,
+                    data_type,
+                    "TimestampMicrosecondArray",
+                )?;
+                crate::common::date::epoch_millis_to_iso8601(array.value(row_idx) / 1_000)
+            }
+            TimeUnit::Nanosecond => {
+                let array = downcast_array::<TimestampNanosecondArray>(
+                    array,
+                    data_type,
+                    "TimestampNanosecondArray",
+                )?;
+                crate::common::date::epoch_millis_to_iso8601(array.value(row_idx) / 1_000_000)
+            }
+        }),
         _ => Value::String(format!("{:?}", data_type)),
     };
 
@@ -104,8 +139,8 @@ fn array_value_to_json(array: &dyn Array, data_type: &DataType, row_idx: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
-    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMillisecondArray};
+    use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
     use datafusion::arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
@@ -139,5 +174,28 @@ mod tests {
 
         assert!(err.to_string().contains("failed to downcast Arrow array"));
         assert!(err.to_string().contains("Utf8"));
+    }
+
+    #[test]
+    fn record_batches_to_json_rows_serializes_timestamp_columns_as_iso_strings() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                TimestampMillisecondArray::from(vec![Some(1_736_064_900_123_i64)])
+                    .with_timezone("UTC".to_string()),
+            ) as ArrayRef],
+        )
+        .unwrap();
+
+        let (_, rows) = record_batches_to_json_rows(&[batch]).unwrap();
+        assert_eq!(
+            rows[0]["created_at"],
+            Value::String("2025-01-05T08:15:00.123Z".into())
+        );
     }
 }

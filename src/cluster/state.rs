@@ -69,6 +69,9 @@ pub enum FieldType {
     Float,
     /// Boolean.
     Boolean,
+    /// Date/timestamp stored as epoch milliseconds (i64 fast field).
+    /// Accepts ISO 8601 strings at ingest, returns ISO 8601 in results.
+    Date,
     /// k-NN vector field (stored in USearch, not in Tantivy).
     KnnVector,
 }
@@ -828,25 +831,18 @@ mod tests {
 
     #[test]
     fn all_field_types_deserialize() {
-        for type_str in &[
-            "text",
-            "keyword",
-            "integer",
-            "float",
-            "boolean",
-            "knn_vector",
+        for (type_str, expected) in [
+            ("text", FieldType::Text),
+            ("keyword", FieldType::Keyword),
+            ("integer", FieldType::Integer),
+            ("float", FieldType::Float),
+            ("boolean", FieldType::Boolean),
+            ("date", FieldType::Date),
+            ("knn_vector", FieldType::KnnVector),
         ] {
             let json = format!(r#"{{"type":"{}"}}"#, type_str);
             let fm: FieldMapping = serde_json::from_str(&json).unwrap();
-            assert!(matches!(
-                fm.field_type,
-                FieldType::Text
-                    | FieldType::Keyword
-                    | FieldType::Integer
-                    | FieldType::Float
-                    | FieldType::Boolean
-                    | FieldType::KnnVector
-            ));
+            assert_eq!(fm.field_type, expected);
         }
     }
 

@@ -184,7 +184,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 Both `refresh_index()` and `flush_index()` fan out to ALL nodes via `fan_out_maintenance()`:
 - **Local node**: dispatched alongside remote nodes in the same per-node task set; do not run local maintenance inline before the rest of the fan-out is launched
 - **Per-node maintenance**: each node reopens its assigned shards with the same read-side UUID-dir guard used by transport read paths, then runs refresh/flush on the write pool
-- **Remote nodes**: concurrent `tokio::spawn` per node via gRPC `RefreshIndex`/`FlushIndex` RPCs
+- **Remote fan-out**: refresh and flush both dispatch remote nodes concurrently; localhost and remote targets must go through the same per-node fan-out behavior
 - The maintenance helper checks the routing table — only shards where this node is primary or replica are operated on (orphaned shards are skipped)
 - Missing authoritative UUID directories on a maintenance path are logged and skipped; they must not create fresh shard data
 - Response: `{"_shards": {"total": N, "successful": M, "failed": F}}`

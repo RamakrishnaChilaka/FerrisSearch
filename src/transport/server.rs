@@ -225,6 +225,7 @@ fn field_type_to_proto(field_type: &crate::cluster::state::FieldType) -> String 
         crate::cluster::state::FieldType::Integer => "integer",
         crate::cluster::state::FieldType::Float => "float",
         crate::cluster::state::FieldType::Boolean => "boolean",
+        crate::cluster::state::FieldType::Date => "date",
         crate::cluster::state::FieldType::KnnVector => "knn_vector",
     }
     .to_string()
@@ -238,6 +239,7 @@ fn proto_to_field_type(field_type: &str) -> Result<crate::cluster::state::FieldT
         "integer" | "long" => Ok(crate::cluster::state::FieldType::Integer),
         "float" | "double" => Ok(crate::cluster::state::FieldType::Float),
         "boolean" => Ok(crate::cluster::state::FieldType::Boolean),
+        "date" | "datetime" | "timestamp" => Ok(crate::cluster::state::FieldType::Date),
         "knn_vector" => Ok(crate::cluster::state::FieldType::KnnVector),
         other => Err(Status::invalid_argument(format!(
             "unknown field type in cluster state snapshot: {}",
@@ -560,6 +562,15 @@ impl InternalTransport for TransportService {
             .state
             .ok_or_else(|| Status::invalid_argument("missing state"))?;
         let new_state = proto_to_cluster_state(&proto_state)?;
+
+        if self.raft.is_some() {
+            tracing::warn!(
+                "Ignoring legacy PublishState RPC on Raft-backed node (incoming version {})",
+                new_state.version
+            );
+            return Ok(Response::new(Empty {}));
+        }
+
         info!("gRPC: cluster state update, version {}", new_state.version);
 
         // Detect indices that were removed and close their local shards + delete data
@@ -567,12 +578,15 @@ impl InternalTransport for TransportService {
         for old_index in old_state.indices.keys() {
             if !new_state.indices.contains_key(old_index) {
                 info!(
-                    "Index '{}' removed from cluster state — closing local shards",
-                    old_index
+                    reason = crate::shard::SHARD_DATA_REMOVE_REASON_LEGACY_PUBLISH_STATE,
+                    "Index '{}' removed from cluster state — closing local shards", old_index
                 );
                 if let Err(e) = self
                     .shard_manager
-                    .close_index_shards_blocking(old_index.clone())
+                    .close_index_shards_blocking_with_reason(
+                        old_index.clone(),
+                        crate::shard::SHARD_DATA_REMOVE_REASON_LEGACY_PUBLISH_STATE,
+                    )
                     .await
                 {
                     tracing::error!(
@@ -1756,7 +1770,10 @@ impl InternalTransport for TransportService {
         // Close local shard engines and delete data on this (leader) node
         if let Err(e) = self
             .shard_manager
-            .close_index_shards_blocking(index_name.clone())
+            .close_index_shards_blocking_with_reason(
+                index_name.clone(),
+                crate::shard::SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX,
+            )
             .await
         {
             tracing::error!("Failed to close shards for index '{}': {}", index_name, e);
@@ -2377,6 +2394,72 @@ mod tests {
 
         let node = restored.nodes.get("coord").unwrap();
         assert_eq!(node.roles, vec![NodeRole::Client]);
+    }
+
+    #[tokio::test]
+    async fn publish_state_ignores_legacy_snapshots_when_raft_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raft, state_handle) =
+            crate::consensus::create_raft_instance_mem(1, "raft-publish-test".into())
+                .await
+                .unwrap();
+        let manager = Arc::new(ClusterManager::with_shared_state(state_handle));
+        let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let mappings = HashMap::new();
+        let settings = crate::cluster::state::IndexSettings::default();
+
+        shard_manager
+            .open_shard_with_settings("old-index", 0, &mappings, &settings, "old-index-uuid")
+            .unwrap();
+
+        let mut shard_routing = HashMap::new();
+        shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+
+        let mut initial_state = manager.get_state();
+        initial_state.add_index(DomainIndexMetadata {
+            name: "old-index".into(),
+            uuid: "old-index-uuid".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing,
+            mappings,
+            settings,
+        });
+        initial_state.version = 7;
+        manager.update_state(initial_state);
+
+        let service = TransportService {
+            cluster_manager: manager.clone(),
+            shard_manager: shard_manager.clone(),
+            transport_client: crate::transport::TransportClient::new(),
+            raft: Some(raft),
+            local_node_id: "node-1".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+            join_lock: new_join_lock(),
+        };
+
+        let mut stale_state = DomainClusterState::new("raft-publish-test".into());
+        stale_state.version = 99;
+
+        service
+            .publish_state(Request::new(PublishStateRequest {
+                state: Some(cluster_state_to_proto(&stale_state)),
+            }))
+            .await
+            .unwrap();
+
+        let current_state = manager.get_state();
+        assert_eq!(current_state.version, 7);
+        assert!(current_state.indices.contains_key("old-index"));
+        assert!(shard_manager.get_shard("old-index", 0).is_some());
+        assert!(dir.path().join("old-index-uuid").exists());
     }
 
     // ── advance_global_checkpoint tests ────────────────────────────────

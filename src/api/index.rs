@@ -8,8 +8,11 @@ use axum::{
     http::StatusCode,
 };
 use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub(crate) struct DistributedDslSearchResult {
@@ -371,6 +374,12 @@ pub async fn create_index(
                         field_type: crate::cluster::state::FieldType::Boolean,
                         dimension: None,
                     }),
+                    "date" | "datetime" | "timestamp" => {
+                        Some(crate::cluster::state::FieldMapping {
+                            field_type: crate::cluster::state::FieldType::Date,
+                            dimension: None,
+                        })
+                    }
                     "knn_vector" => {
                         let dim = field_def
                             .get("dimension")
@@ -744,13 +753,30 @@ pub async fn flush_index(
 /// Local and remote nodes participate in the same per-node dispatch set;
 /// the local node is dispatched via the same async maintenance helper rather
 /// than being processed inline before remote nodes.
+type MaintenanceJob = Pin<Box<dyn Future<Output = Result<(u32, u32), anyhow::Error>> + Send>>;
+
+fn spawn_maintenance_job<F>(job: F) -> MaintenanceJob
+where
+    F: Future<Output = Result<(u32, u32), anyhow::Error>> + Send + 'static,
+{
+    Box::pin(async move {
+        tokio::spawn(job)
+            .await
+            .map_err(|e| anyhow::anyhow!("maintenance task panicked: {}", e))?
+    })
+}
+
+fn maintenance_fanout_concurrency(targets: usize) -> usize {
+    targets.max(1)
+}
+
 async fn fan_out_maintenance(
     state: &AppState,
     index_name: &str,
     op: MaintenanceDispatchOp,
 ) -> (u32, u32) {
     let cs = state.cluster_manager.get_state();
-    let mut handles = Vec::new();
+    let mut jobs: Vec<MaintenanceJob> = Vec::new();
     let mut dispatched_local = false;
 
     let spawn_local = |idx: String, dispatch_op: MaintenanceDispatchOp| {
@@ -758,7 +784,7 @@ async fn fan_out_maintenance(
         let sm = state.shard_manager.clone();
         let wp = state.worker_pools.clone();
         let nid = state.local_node_id.clone();
-        tokio::spawn(async move {
+        spawn_maintenance_job(async move {
             Ok::<(u32, u32), anyhow::Error>(
                 run_maintenance_on_assigned_shards_async(cm, sm, wp, nid, idx, dispatch_op).await,
             )
@@ -768,7 +794,7 @@ async fn fan_out_maintenance(
     for node in cs.nodes.values() {
         if node.id == state.local_node_id {
             dispatched_local = true;
-            handles.push(spawn_local(index_name.to_string(), op));
+            jobs.push(spawn_local(index_name.to_string(), op));
             continue;
         }
 
@@ -776,7 +802,7 @@ async fn fan_out_maintenance(
         let node = node.clone();
         let idx = index_name.to_string();
         let is_flush = matches!(op, MaintenanceDispatchOp::Flush);
-        handles.push(tokio::spawn(async move {
+        jobs.push(spawn_maintenance_job(async move {
             if is_flush {
                 client.forward_flush(&node, &idx).await
             } else {
@@ -788,24 +814,23 @@ async fn fan_out_maintenance(
     // If this node isn't in the cluster's node list yet (e.g. still joining),
     // still dispatch locally so locally-assigned shards get maintained.
     if !dispatched_local {
-        handles.push(spawn_local(index_name.to_string(), op));
+        jobs.push(spawn_local(index_name.to_string(), op));
     }
 
     let mut successful = 0u32;
     let mut failed = 0u32;
+    let concurrency = maintenance_fanout_concurrency(jobs.len());
 
-    for handle in handles {
-        match handle.await {
-            Ok(Ok((s, f))) => {
+    let mut results = stream::iter(jobs).buffer_unordered(concurrency);
+
+    while let Some(result) = results.next().await {
+        match result {
+            Ok((s, f)) => {
                 successful += s;
                 failed += f;
             }
-            Ok(Err(e)) => {
-                tracing::error!("Remote maintenance RPC failed: {}", e);
-                failed += 1;
-            }
             Err(e) => {
-                tracing::error!("Remote maintenance task panicked: {}", e);
+                tracing::error!("Maintenance fan-out job failed: {}", e);
                 failed += 1;
             }
         }
@@ -2123,7 +2148,10 @@ pub async fn delete_index(
     // Close local shard engines and delete data
     if let Err(e) = state
         .shard_manager
-        .close_index_shards_blocking(index_name.clone())
+        .close_index_shards_blocking_with_reason(
+            index_name.clone(),
+            crate::shard::SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX,
+        )
         .await
     {
         tracing::error!("Failed to close shards for index '{}': {}", index_name, e);
@@ -2480,6 +2508,32 @@ mod tests {
 
         assert_eq!((successful, failed), (1, 0));
         assert!(state.shard_manager.get_shard("idx", 0).is_some());
+    }
+
+    #[test]
+    fn maintenance_fanout_concurrency_keeps_flush_parallel() {
+        assert_eq!(maintenance_fanout_concurrency(3), 3);
+        assert_eq!(maintenance_fanout_concurrency(1), 1);
+    }
+
+    #[test]
+    fn maintenance_fanout_concurrency_uses_target_count_floor() {
+        assert_eq!(maintenance_fanout_concurrency(3), 3);
+        assert_eq!(maintenance_fanout_concurrency(0), 1);
+    }
+
+    #[tokio::test]
+    async fn maintenance_job_catches_panics() {
+        let err = spawn_maintenance_job(async move {
+            panic!("boom");
+            #[allow(unreachable_code)]
+            Ok::<(u32, u32), anyhow::Error>((0, 0))
+        })
+        .await
+        .err()
+        .unwrap();
+
+        assert!(err.to_string().contains("panicked"));
     }
 
     #[tokio::test]

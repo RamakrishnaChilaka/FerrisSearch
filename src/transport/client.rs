@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tonic::transport::Channel;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone)]
 pub struct TransportClient {
@@ -233,7 +233,7 @@ impl TransportClient {
             }
         }
 
-        error!("Could not join cluster; no seed hosts responded affirmatively.");
+        warn!("Could not join cluster; no seed hosts responded affirmatively.");
         None
     }
 

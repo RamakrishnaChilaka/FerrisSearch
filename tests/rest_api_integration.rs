@@ -7,6 +7,9 @@ use ferrissearch::cluster::state::{
 };
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
+use ferrissearch::transport::proto::{
+    PingRequest, internal_transport_client::InternalTransportClient,
+};
 use ferrissearch::transport::server::create_transport_service;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, StatusCode};
@@ -21,6 +24,7 @@ struct RestTestHarness {
     _temp_dir: TempDir,
     client: Client,
     base_url: String,
+    transport_addr: std::net::SocketAddr,
     http_handle: JoinHandle<()>,
     transport_handle: JoinHandle<()>,
 }
@@ -34,6 +38,7 @@ struct MultiNodeRestNode {
     _temp_dir: TempDir,
     app_state: AppState,
     base_url: String,
+    transport_addr: std::net::SocketAddr,
     http_handle: JoinHandle<()>,
     transport_handle: JoinHandle<()>,
 }
@@ -114,6 +119,7 @@ impl RestTestHarness {
             _temp_dir: temp_dir,
             client: Client::builder().timeout(Duration::from_secs(10)).build()?,
             base_url: format!("http://{}", http_addr),
+            transport_addr,
             http_handle,
             transport_handle,
         };
@@ -124,14 +130,35 @@ impl RestTestHarness {
 
     async fn wait_until_ready(&self) -> Result<()> {
         for _ in 0..50 {
-            if let Ok(response) = self.client.get(format!("{}/", self.base_url)).send().await
-                && response.status() == StatusCode::OK
+            let http_ready =
+                if let Ok(response) = self.client.get(format!("{}/", self.base_url)).send().await {
+                    response.status() == StatusCode::OK
+                } else {
+                    false
+                };
+            let transport_ready = if let Ok(mut client) =
+                InternalTransportClient::connect(format!("http://{}", self.transport_addr)).await
             {
+                client
+                    .ping(tonic::Request::new(PingRequest {
+                        source_node_id: "rest-test-ready".into(),
+                    }))
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+
+            if http_ready && transport_ready {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        anyhow::bail!("test HTTP server did not become ready in time");
+        anyhow::bail!(
+            "test servers did not become ready in time (http={}, transport={})",
+            self.base_url,
+            self.transport_addr
+        );
     }
 
     async fn put_json(&self, path: &str, body: Value) -> Result<(StatusCode, Value)> {
@@ -322,6 +349,7 @@ impl MultiNodeRestHarness {
                 _temp_dir: pending.temp_dir,
                 app_state,
                 base_url: format!("http://{}", pending.http_addr),
+                transport_addr: pending.transport_addr,
                 http_handle,
                 transport_handle,
             });
@@ -336,9 +364,28 @@ impl MultiNodeRestHarness {
         for node in &self.nodes {
             let mut ready = false;
             for _ in 0..50 {
-                if let Ok(response) = self.client.get(format!("{}/", node.base_url)).send().await
-                    && response.status() == StatusCode::OK
+                let http_ready = if let Ok(response) =
+                    self.client.get(format!("{}/", node.base_url)).send().await
                 {
+                    response.status() == StatusCode::OK
+                } else {
+                    false
+                };
+                let transport_ready = if let Ok(mut client) =
+                    InternalTransportClient::connect(format!("http://{}", node.transport_addr))
+                        .await
+                {
+                    client
+                        .ping(tonic::Request::new(PingRequest {
+                            source_node_id: "multi-rest-test-ready".into(),
+                        }))
+                        .await
+                        .is_ok()
+                } else {
+                    false
+                };
+
+                if http_ready && transport_ready {
                     ready = true;
                     break;
                 }
@@ -346,8 +393,9 @@ impl MultiNodeRestHarness {
             }
             if !ready {
                 anyhow::bail!(
-                    "multi-node test HTTP server {} did not become ready in time",
-                    node.base_url
+                    "multi-node test servers did not become ready in time (http={}, transport={})",
+                    node.base_url,
+                    node.transport_addr
                 );
             }
         }
@@ -551,6 +599,55 @@ async fn index_product_docs_named(harness: &RestTestHarness, index_name: &str) -
 async fn create_products_index_and_docs(harness: &RestTestHarness) -> Result<()> {
     create_products_index(harness).await?;
     index_product_docs(harness).await
+}
+
+async fn create_events_index_and_docs(harness: &RestTestHarness) -> Result<()> {
+    let (status, body) = harness
+        .put_json(
+            "/events",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 100
+                },
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "keyword" },
+                        "created_at": { "type": "date" }
+                    }
+                }
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["acknowledged"], json!(true));
+
+    for (doc_id, payload) in [
+        (
+            "1",
+            json!({
+                "title": "offset",
+                "created_at": "2025-01-05T08:15:00+05:30"
+            }),
+        ),
+        (
+            "2",
+            json!({
+                "title": "utc",
+                "created_at": "2025-01-05T08:00:00Z"
+            }),
+        ),
+    ] {
+        let (status, body) = harness
+            .put_json(&format!("/events/_doc/{}?refresh=true", doc_id), payload)
+            .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["_id"], json!(doc_id));
+    }
+
+    Ok(())
 }
 
 async fn create_products_index_and_docs_named(
@@ -992,6 +1089,63 @@ async fn rest_can_create_index_index_get_and_search_documents() -> Result<()> {
     assert_eq!(
         search_body["hits"]["hits"].as_array().map(Vec::len),
         Some(3)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_date_fields_normalize_in_doc_search_and_sql_results() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_events_index_and_docs(&harness).await?;
+
+    let (doc_status, doc_body) = harness.get_json("/events/_doc/1").await?;
+    assert_eq!(doc_status, StatusCode::OK);
+    assert_eq!(
+        doc_body["_source"]["created_at"],
+        json!("2025-01-05T02:45:00Z")
+    );
+
+    let (search_status, search_body) = harness
+        .post_json(
+            "/events/_search",
+            json!({
+                "query": {
+                    "range": {
+                        "created_at": {
+                            "gte": "2025-01-05T02:00:00Z",
+                            "lt": "2025-01-05T03:00:00Z"
+                        }
+                    }
+                },
+                "sort": [{ "created_at": "asc" }]
+            }),
+        )
+        .await?;
+    assert_eq!(search_status, StatusCode::OK);
+    assert_eq!(search_body["hits"]["total"]["value"], json!(1));
+    assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("1"));
+    assert_eq!(
+        search_body["hits"]["hits"][0]["_source"]["created_at"],
+        json!("2025-01-05T02:45:00Z")
+    );
+
+    let (sql_status, sql_body) = harness
+        .post_json(
+            "/events/_sql",
+            json!({
+                "query": "SELECT created_at FROM events ORDER BY created_at ASC"
+            }),
+        )
+        .await?;
+    assert_eq!(sql_status, StatusCode::OK);
+    assert_eq!(sql_body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(
+        sql_body["rows"],
+        json!([
+            { "created_at": "2025-01-05T02:45:00Z" },
+            { "created_at": "2025-01-05T08:00:00Z" }
+        ])
     );
 
     Ok(())

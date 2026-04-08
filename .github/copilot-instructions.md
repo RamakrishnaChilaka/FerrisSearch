@@ -34,10 +34,10 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing)
 - `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
 - `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
-- `src/wal/` — HotTranslog (binary length-prefixed WAL), TranslogDurability, WriteAheadLog trait
+- `src/wal/` — HotTranslog (generation-based binary WAL), TranslogDurability, WriteAheadLog trait
 - `src/worker.rs` — WorkerPools: dedicated rayon thread pools for search/write isolation
 - `src/replication/` — replicate_write, replicate_bulk (sync to ISR replicas)
-- `src/common/` — `Result<T>` type alias (anyhow), `validate_index_name()`
+- `src/common/` — `Result<T>` type alias (anyhow), `validate_index_name()`, ISO 8601 date parse/format (`date.rs`)
 - `src/config/` — AppConfig (YAML + env var loading)
 - `src/storage/` — StorageManager placeholder (future: blob storage abstraction)
 - `proto/transport.proto` — gRPC service definition, all message types
@@ -51,7 +51,8 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 
 ## Tantivy Field Schema Flags
 - `_id` field uses `(STRING | STORED).set_fast(None)` — enables fast-field columnar access for SQL queries without loading stored docs
-- Numeric fields (Integer, Float) use INDEXED | STORED | FAST (mirrors OpenSearch default doc_values: true)
+- Numeric fields (Integer, Float, Date) use INDEXED | STORED | FAST (mirrors OpenSearch default doc_values: true)
+- Date fields store epoch milliseconds as i64; ISO 8601 strings are parsed at ingest via `common::date::parse_iso8601_to_epoch_millis()`, `typed_term()` auto-parses string range values against logical Date fields, and mapped Date values surface back out as UTC ISO 8601 strings in `_source`, hits, and SQL rows
 - Keyword and Boolean fields use STRING | STORED + set_fast(None) for dictionary-encoded columnar
 - FAST enables columnar storage - critical for range queries, sorting, and aggregations
 - Without FAST, range queries scan the inverted index (orders of magnitude slower on high-cardinality fields)
@@ -76,7 +77,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 ## Arrow Bridge Type Safety
 - `build_record_batch_with_hints(column_store, type_hints)` uses schema-derived type hints to set correct Arrow column types
 - Without type hints, `infer_column_kind()` scans data values and defaults to `Utf8` for empty/all-null columns — this breaks aggregation functions like `avg()`, `sum()` on zero-result queries
-- The fast-field path (`sql_record_batch`) MUST populate `type_hints` from `SqlFieldReader` variants (F64/I64 → Float64, Str → Utf8) or the Tantivy schema when no segments exist
+- The fast-field path (`sql_record_batch`) MUST populate `type_hints` from `SqlFieldReader` variants (F64/I64 → Float64, DateMillis → TimestampMillis, Str → Utf8) or the Tantivy schema when no segments exist
 - The fast-field path skips `searcher.doc()` entirely when all requested columns have fast-field readers — reads `_id` from its fast-field column instead of loading stored docs
 - String fast-field SQL paths use a shared `StringFastFieldReader` (`StrColumn` + ordinal `Column<u64>`) so `_id`, selective arrays, and streaming batches read ordinals directly instead of per-doc `term_ords()` iterators
 - In the flat `sql_record_batch()` fast path, `_id` now uses the same per-segment array/take/reorder flow as other string fast fields instead of a separate top-doc-order decode/clone loop
@@ -100,9 +101,10 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 910 unit tests + 64 CLI tests + 33 consensus integration + 40 replication integration + 38 REST API integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1086 total
+- 954 unit tests + 64 CLI tests + 33 consensus integration + 41 replication integration + 39 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1133 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
+- Real flush/restart regression: `cargo test --test restart_regression`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 - SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, history, and NDJSON `/_sql/stream` consumption) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
 
@@ -118,13 +120,14 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
 - Joining node: sends JoinCluster gRPC (with raft_node_id) → leader serializes concurrent joins, validates identity, does `add_learner` for non-voters, applies `AddNode`, then recomputes the latest voter set for `change_membership` (rolling back `AddNode` if promotion fails)
 - Joining node does NOT call `update_state` — Raft log replication propagates state, but `JoinCluster` returns an authoritative snapshot for initial shard reopen/cleanup decisions
-- Nodes reopen locally assigned shards after startup using the authoritative bootstrap/join snapshot when available, keep recovered-node startup assignments fail-closed when their expected UUID dirs are missing, allow later assignments to create their shard dirs in the lifecycle loop, and skip orphan cleanup until index UUIDs are known and the expected local shard UUID paths exist
+- Nodes reopen locally assigned shards after startup using the authoritative bootstrap/join snapshot when available, keep recovered-node startup assignments fail-closed when their expected UUID dirs are missing, never clear that recovered-startup guard just because authoritative state arrived, allow later assignments to create their shard dirs in the lifecycle loop, and skip orphan cleanup until index UUIDs are known and the expected local shard UUID paths exist
 - Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader), shard failover (promote best ISR replica to primary for orphaned shards)
 - Follower lifecycle loop: pings the master for liveness
 
 ## Important Design Decisions
 - **Coordinator pattern**: see dedicated section below — NEVER return "not the leader" or "send to master" errors
 - `ClusterManager::update_state()` is a full overwrite — never use it to replace Raft-managed state
+- Legacy transport `PublishState` snapshots are for non-Raft services only; Raft-backed nodes must ignore them before shard cleanup or state overwrite can run
 - `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft. Populated by `add_node()` and `ping_node()`
 - New leader gets a 20s grace period (`leader_since`) before scanning for dead nodes to avoid false positives
 - Dead node handling: leader removes node from Raft + cluster only after successful membership change, promotes best ISR replica for orphaned primary shards (highest checkpoint wins), increments `unassigned_replicas` for lost replica slots, and refuses removals that would empty the voter set
@@ -164,7 +167,7 @@ pub struct AppState {
 ### Enums
 - `NodeRole` — `Master`, `Data`, `Client`
 - `ShardState` — `Started` (active), `Unassigned` (needs a node)
-- `FieldType` — `Text`, `Keyword`, `Integer`, `Float`, `Boolean`, `KnnVector`
+- `FieldType` — `Text`, `Keyword`, `Integer`, `Float`, `Boolean`, `Date`, `KnnVector`
 
 ### Structs
 ```
@@ -500,10 +503,14 @@ trait WriteAheadLog: Send + Sync {
 }
 ```
 
-### HotTranslog (Binary Format)
+### HotTranslog (Generation-Based Binary Format)
 - Length-prefixed: `[u32 LE: payload_len][bincode(WireEntry { seq_no, op, payload_json })]`
-- Seq numbers are monotonically increasing, survive truncation (persisted in `.seqno` file)
+- Seq numbers are monotonically increasing, survive generation rolls (persisted in `.seqno` file)
+- On-disk files are `translog-<generation>.bin` plus `translog.manifest`; reopen requires the manifest, trusts it for retained generation metadata, scans only the active generation file, and ignores unrelated non-generation side files
+- `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only fully obsolete generations whose max seq_no is at or below the checkpoint; mixed generations are retained for replica recovery instead of being rewritten in place
+- `truncate()` rolls to a new empty generation and deletes all older generations
 - `translog.committed` stores the exclusive committed seq_no so restart replay skips already committed entries; replay persists this checkpoint after each intermediate batch commit to stay idempotent across repeated crash recovery
+- Persist the manifest before deleting pruned generation files so crashes never strand retained generations without authoritative metadata
 - Handles partial writes at EOF gracefully (skips/truncates)
 
 ## Replication Protocol (src/replication/mod.rs)
@@ -545,7 +552,7 @@ ClusterStateMachine { state: Arc<RwLock<ClusterState>>, last_applied: Option<Log
 ```
 // Cluster coordination
 JoinCluster(JoinRequest) → JoinResponse
-PublishState(PublishStateRequest) → Empty
+PublishState(PublishStateRequest) → Empty  // legacy-only when Raft is disabled
 Ping(PingRequest) → Empty
 
 // Shard document operations
@@ -639,6 +646,7 @@ If you add a hybrid execution path that mixes full-text search with SQL-style pr
 - Ranking and hit collection
 - Fast-field reads for numeric and keyword columns
 - Search-native shard-local partial aggregation over matched docs
+- Searched `CASE` bucket GROUP BY on a single string-backed source field may stay on shard-local partials when every `WHEN` is a literal bounded range on that same field with a literal bucket label; if `ELSE` is present it must also be a literal label. Do not silently widen this to arbitrary expression GROUP BY or to non-string-backed fields that need fallback execution.
 - Compact per-shard partial state production for distributed grouped analytics
 
 ### What Stays In DataFusion
