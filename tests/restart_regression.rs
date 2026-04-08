@@ -56,7 +56,7 @@ impl NodeProcess {
             }
         }
 
-        cmd.current_dir("/home/rchilaka/ROpenSearch")
+        cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
             .env("RUST_LOG", "info")
             .env("FERRISSEARCH_NODE_NAME", &config.name)
             .env("FERRISSEARCH_CLUSTER_NAME", CLUSTER_NAME)
@@ -417,7 +417,6 @@ impl RestartClusterHarness {
         for node in &self.nodes {
             let log_text = fs::read_to_string(&node.config.log_path).unwrap_or_default();
             for forbidden in [
-                "reason=legacy_publish_state_removed_index",
                 "reason=api_delete_index",
                 "reason=transport_delete_index_rpc",
                 "reason=orphan_cleanup_unknown_uuid",

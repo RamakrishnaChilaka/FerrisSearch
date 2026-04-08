@@ -113,6 +113,14 @@ async fn wait_for_index_metadata(state: &AppState, index_name: &str) -> Option<I
     None
 }
 
+fn raft_not_enabled_response(operation: &str) -> (StatusCode, Json<Value>) {
+    crate::api::error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "raft_not_enabled_exception",
+        format!("Raft consensus is required to {}", operation),
+    )
+}
+
 /// Auto-create an index with 1 shard, respecting the coordinator pattern.
 /// If Raft is active and this node is NOT the leader, forwards to the master.
 async fn auto_create_index(
@@ -211,11 +219,7 @@ async fn auto_create_index(
                 .unwrap_or_else(|| m.clone())
         }
     } else {
-        let mut new_state = cluster_state.clone();
-        new_state.add_index(m.clone());
-        state.cluster_manager.update_state(new_state.clone());
-        state.transport_client.publish_state(&new_state).await;
-        m.clone()
+        return Err(raft_not_enabled_response("auto-create indices"));
     };
 
     if let Some(routing) = created_metadata.shard_routing.get(&0)
@@ -411,61 +415,59 @@ pub async fn create_index(
     let index_settings = metadata.settings.clone();
     let index_uuid = metadata.uuid.clone();
 
-    // Write through Raft if available, otherwise fallback
-    if let Some(ref raft) = state.raft {
-        if !raft.is_leader() {
-            // Forward to the master via gRPC — this node acts as coordinator
-            let cluster_state_for_fwd = state.cluster_manager.get_state();
-            let master_id = match cluster_state_for_fwd.master_node.as_ref() {
-                Some(id) => id,
-                None => {
-                    return crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        "No master node available to forward index creation",
-                    );
-                }
-            };
-            let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
-                Some(n) => n.clone(),
-                None => {
-                    return crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        "Master node info not found in cluster state",
-                    );
-                }
-            };
-            match state
-                .transport_client
-                .forward_create_index(&master_node, &index_name, &body)
-                .await
-            {
-                Ok(resp) => {
-                    return (StatusCode::OK, Json(resp));
-                }
-                Err(e) => {
-                    return crate::api::error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "forward_exception",
-                        format!("Failed to forward index creation to master: {}", e),
-                    );
-                }
+    let raft = match state.raft.as_ref() {
+        Some(raft) => raft,
+        None => return raft_not_enabled_response("create indices"),
+    };
+
+    // Write through Raft
+    if !raft.is_leader() {
+        // Forward to the master via gRPC — this node acts as coordinator
+        let cluster_state_for_fwd = state.cluster_manager.get_state();
+        let master_id = match cluster_state_for_fwd.master_node.as_ref() {
+            Some(id) => id,
+            None => {
+                return crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "No master node available to forward index creation",
+                );
+            }
+        };
+        let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
+            Some(n) => n.clone(),
+            None => {
+                return crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "Master node info not found in cluster state",
+                );
+            }
+        };
+        match state
+            .transport_client
+            .forward_create_index(&master_node, &index_name, &body)
+            .await
+        {
+            Ok(resp) => {
+                return (StatusCode::OK, Json(resp));
+            }
+            Err(e) => {
+                return crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "forward_exception",
+                    format!("Failed to forward index creation to master: {}", e),
+                );
             }
         }
-        let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
-        if let Err(e) = raft.client_write(cmd).await {
-            return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "raft_write_exception",
-                format!("Raft write failed: {}", e),
-            );
-        }
-    } else {
-        let mut new_state = cluster_state.clone();
-        new_state.add_index(metadata);
-        state.cluster_manager.update_state(new_state.clone());
-        state.transport_client.publish_state(&new_state).await;
+    }
+    let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
+    if let Err(e) = raft.client_write(cmd).await {
+        return crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "raft_write_exception",
+            format!("Raft write failed: {}", e),
+        );
     }
 
     // Open local shard engines for shards assigned to this node (primary or replica)
@@ -1990,65 +1992,60 @@ pub async fn update_index_settings(
         );
     }
 
+    let raft = match state.raft.as_ref() {
+        Some(raft) => raft,
+        None => return raft_not_enabled_response("update index settings"),
+    };
+
     // Persist via Raft
-    if let Some(ref raft) = state.raft {
-        if !raft.is_leader() {
-            // Forward to the master via gRPC
-            let cluster_state_for_fwd = state.cluster_manager.get_state();
-            let master_id = match cluster_state_for_fwd.master_node.as_ref() {
-                Some(id) => id,
-                None => {
-                    return crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        "No master node available to forward settings update",
-                    );
-                }
-            };
-            let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
-                Some(n) => n.clone(),
-                None => {
-                    return crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        "Master node info not found in cluster state",
-                    );
-                }
-            };
-            match state
-                .transport_client
-                .forward_update_settings(&master_node, &index_name, &body)
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    return crate::api::error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "forward_exception",
-                        format!("Failed to forward settings update to master: {}", e),
-                    );
-                }
+    if !raft.is_leader() {
+        // Forward to the master via gRPC
+        let cluster_state_for_fwd = state.cluster_manager.get_state();
+        let master_id = match cluster_state_for_fwd.master_node.as_ref() {
+            Some(id) => id,
+            None => {
+                return crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "No master node available to forward settings update",
+                );
             }
-        } else {
-            let cmd = crate::consensus::types::ClusterCommand::UpdateIndex {
-                metadata: metadata.clone(),
-            };
-            if let Err(e) = raft.client_write(cmd).await {
+        };
+        let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
+            Some(n) => n.clone(),
+            None => {
+                return crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "Master node info not found in cluster state",
+                );
+            }
+        };
+        match state
+            .transport_client
+            .forward_update_settings(&master_node, &index_name, &body)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) => {
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "raft_write_exception",
-                    format!("Raft write failed: {}", e),
+                    "forward_exception",
+                    format!("Failed to forward settings update to master: {}", e),
                 );
             }
         }
     } else {
-        let mut new_state = cluster_state.clone();
-        new_state
-            .indices
-            .insert(index_name.clone(), metadata.clone());
-        new_state.version += 1;
-        state.cluster_manager.update_state(new_state.clone());
-        state.transport_client.publish_state(&new_state).await;
+        let cmd = crate::consensus::types::ClusterCommand::UpdateIndex {
+            metadata: metadata.clone(),
+        };
+        if let Err(e) = raft.client_write(cmd).await {
+            return crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "raft_write_exception",
+                format!("Raft write failed: {}", e),
+            );
+        }
     }
 
     // Apply settings to live engines on this node via watch channels
@@ -2086,63 +2083,60 @@ pub async fn delete_index(
         );
     }
 
-    // Remove from cluster state via Raft if available, otherwise fallback
-    if let Some(ref raft) = state.raft {
-        if !raft.is_leader() {
-            // Forward to the master via gRPC — this node acts as coordinator
-            let cluster_state_for_fwd = state.cluster_manager.get_state();
-            let master_id = match cluster_state_for_fwd.master_node.as_ref() {
-                Some(id) => id,
-                None => {
-                    return crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        "No master node available to forward index deletion",
-                    );
-                }
-            };
-            let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
-                Some(n) => n.clone(),
-                None => {
-                    return crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        "Master node info not found in cluster state",
-                    );
-                }
-            };
-            match state
-                .transport_client
-                .forward_delete_index(&master_node, &index_name)
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    return crate::api::error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "forward_exception",
-                        format!("Failed to forward index deletion to master: {}", e),
-                    );
-                }
+    let raft = match state.raft.as_ref() {
+        Some(raft) => raft,
+        None => return raft_not_enabled_response("delete indices"),
+    };
+
+    // Remove from cluster state via Raft
+    if !raft.is_leader() {
+        // Forward to the master via gRPC — this node acts as coordinator
+        let cluster_state_for_fwd = state.cluster_manager.get_state();
+        let master_id = match cluster_state_for_fwd.master_node.as_ref() {
+            Some(id) => id,
+            None => {
+                return crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "No master node available to forward index deletion",
+                );
             }
-        } else {
-            let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
-                index_name: index_name.clone(),
-            };
-            if let Err(e) = raft.client_write(cmd).await {
+        };
+        let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
+            Some(n) => n.clone(),
+            None => {
+                return crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "Master node info not found in cluster state",
+                );
+            }
+        };
+        match state
+            .transport_client
+            .forward_delete_index(&master_node, &index_name)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) => {
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "raft_write_exception",
-                    format!("Raft write failed: {}", e),
+                    "forward_exception",
+                    format!("Failed to forward index deletion to master: {}", e),
                 );
             }
         }
     } else {
-        let mut new_state = cluster_state.clone();
-        new_state.indices.remove(&index_name);
-        new_state.version += 1;
-        state.cluster_manager.update_state(new_state.clone());
-        state.transport_client.publish_state(&new_state).await;
+        let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
+            index_name: index_name.clone(),
+        };
+        if let Err(e) = raft.client_write(cmd).await {
+            return crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "raft_write_exception",
+                format!("Raft write failed: {}", e),
+            );
+        }
     }
 
     // Close local shard engines and delete data
@@ -2344,7 +2338,43 @@ mod tests {
         }
     }
 
-    fn make_test_app_state(cluster_state: ClusterState) -> (tempfile::TempDir, AppState) {
+    async fn make_test_app_state(cluster_state: ClusterState) -> (tempfile::TempDir, AppState) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (raft, shared_state) =
+            crate::consensus::create_raft_instance_mem(1, cluster_state.cluster_name.clone())
+                .await
+                .unwrap();
+        crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19300".into())
+            .await
+            .unwrap();
+        // Wait for leader election
+        for _ in 0..50 {
+            if raft.current_leader().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let manager = crate::cluster::ClusterManager::with_shared_state(shared_state);
+        manager.update_state(cluster_state);
+        let state = AppState {
+            cluster_manager: Arc::new(manager),
+            shard_manager: Arc::new(crate::shard::ShardManager::new(
+                temp_dir.path(),
+                Duration::from_secs(60),
+            )),
+            transport_client: crate::transport::TransportClient::new(),
+            local_node_id: "node-1".into(),
+            raft: Some(raft),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+            sql_group_by_scan_limit: 1_000_000,
+            sql_approximate_top_k: false,
+        };
+        (temp_dir, state)
+    }
+
+    fn make_test_app_state_without_raft(
+        cluster_state: ClusterState,
+    ) -> (tempfile::TempDir, AppState) {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = crate::cluster::ClusterManager::new(cluster_state.cluster_name.clone());
         manager.update_state(cluster_state);
@@ -2392,7 +2422,7 @@ mod tests {
         cluster_state.add_node(make_test_node("node-1"));
         cluster_state.add_index(make_test_metadata(Some("missing-node")));
 
-        let (_tmp, state) = make_test_app_state(cluster_state);
+        let (_tmp, state) = make_test_app_state(cluster_state).await;
         let input = axum::body::Bytes::from("{\"index\":{\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n");
 
         let (status, Json(body)) = bulk_index(
@@ -2418,7 +2448,7 @@ mod tests {
         let mut cluster_state = ClusterState::new("test-cluster".into());
         cluster_state.add_node(make_test_node("node-1"));
 
-        let (_tmp, state) = make_test_app_state(cluster_state);
+        let (_tmp, state) = make_test_app_state(cluster_state).await;
         let input = axum::body::Bytes::from("{\"index\":{\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n");
 
         let (status, Json(body)) =
@@ -2464,7 +2494,7 @@ mod tests {
     async fn create_index_applies_flush_threshold_setting() {
         let mut cluster_state = ClusterState::new("test-cluster".into());
         cluster_state.add_node(make_test_node("node-1"));
-        let (_tmp, state) = make_test_app_state(cluster_state);
+        let (_tmp, state) = make_test_app_state(cluster_state).await;
 
         let body = axum::body::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -2488,11 +2518,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_index_requires_raft() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        let (_tmp, state) = make_test_app_state_without_raft(cluster_state);
+
+        let body = axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }))
+            .unwrap(),
+        );
+
+        let (status, Json(body)) =
+            create_index(State(state.clone()), Path("idx".to_string()), body).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "raft_not_enabled_exception");
+        assert!(
+            !state
+                .cluster_manager
+                .get_state()
+                .indices
+                .contains_key("idx")
+        );
+    }
+
+    #[tokio::test]
     async fn fan_out_maintenance_keeps_local_target_without_node_entry() {
         let mut cluster_state = ClusterState::new("test-cluster".into());
         cluster_state.add_index(make_test_metadata(Some("node-1")));
 
-        let (temp_dir, state) = make_test_app_state(cluster_state);
+        let (temp_dir, state) = make_test_app_state(cluster_state).await;
         let shard_dir = temp_dir.path().join("idx-uuid").join("shard_0");
         std::fs::create_dir_all(&shard_dir).unwrap();
 
@@ -2540,7 +2600,7 @@ mod tests {
     async fn auto_create_index_opens_local_shard_with_cluster_uuid() {
         let mut cluster_state = ClusterState::new("test-cluster".into());
         cluster_state.add_node(make_test_node("node-1"));
-        let (_tmp, state) = make_test_app_state(cluster_state.clone());
+        let (_tmp, state) = make_test_app_state(cluster_state.clone()).await;
 
         let metadata = auto_create_index(&state, "auto-idx", &cluster_state)
             .await
@@ -2554,6 +2614,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_create_index_requires_raft() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        let (_tmp, state) = make_test_app_state_without_raft(cluster_state.clone());
+
+        let err = auto_create_index(&state, "auto-idx", &cluster_state)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1.0["error"]["type"], "raft_not_enabled_exception");
+        assert!(state.shard_manager.get_shard("auto-idx", 0).is_none());
+    }
+
+    #[tokio::test]
     async fn get_index_settings_includes_flush_threshold_setting() {
         let mut cluster_state = ClusterState::new("test-cluster".into());
         cluster_state.add_node(make_test_node("node-1"));
@@ -2561,7 +2636,7 @@ mod tests {
         metadata.settings.flush_threshold_bytes = Some(8192);
         cluster_state.add_index(metadata);
 
-        let (_tmp, state) = make_test_app_state(cluster_state);
+        let (_tmp, state) = make_test_app_state(cluster_state).await;
         let (status, Json(body)) = get_index_settings(State(state), Path("idx".to_string())).await;
 
         assert_eq!(status, StatusCode::OK);
@@ -2577,7 +2652,7 @@ mod tests {
         cluster_state.add_node(make_test_node("node-1"));
         cluster_state.add_index(make_test_metadata(Some("node-1")));
 
-        let (_tmp, state) = make_test_app_state(cluster_state);
+        let (_tmp, state) = make_test_app_state(cluster_state).await;
         let (status, Json(body)) = update_index_settings(
             State(state.clone()),
             Path("idx".to_string()),
@@ -2595,6 +2670,55 @@ mod tests {
         assert_eq!(
             updated.indices["idx"].settings.flush_threshold_bytes,
             Some(16384)
+        );
+    }
+
+    #[tokio::test]
+    async fn update_index_settings_requires_raft() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        cluster_state.add_index(make_test_metadata(Some("node-1")));
+
+        let (_tmp, state) = make_test_app_state_without_raft(cluster_state);
+        let (status, Json(body)) = update_index_settings(
+            State(state.clone()),
+            Path("idx".to_string()),
+            Json(serde_json::json!({
+                "index": {
+                    "flush_threshold_bytes": 16384
+                }
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "raft_not_enabled_exception");
+        assert_eq!(
+            state.cluster_manager.get_state().indices["idx"]
+                .settings
+                .flush_threshold_bytes,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_index_requires_raft() {
+        let mut cluster_state = ClusterState::new("test-cluster".into());
+        cluster_state.add_node(make_test_node("node-1"));
+        cluster_state.add_index(make_test_metadata(Some("node-1")));
+
+        let (_tmp, state) = make_test_app_state_without_raft(cluster_state);
+        let (status, Json(body)) =
+            delete_index(State(state.clone()), Path("idx".to_string())).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "raft_not_enabled_exception");
+        assert!(
+            state
+                .cluster_manager
+                .get_state()
+                .indices
+                .contains_key("idx")
         );
     }
 }

@@ -8,7 +8,6 @@ use ferrissearch::cluster::manager::ClusterManager;
 use ferrissearch::cluster::state::{
     FieldMapping, FieldType, IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
 };
-use ferrissearch::consensus;
 use ferrissearch::engine::{CompositeEngine, SearchEngine};
 use ferrissearch::search::{QueryClause, SearchRequest};
 use ferrissearch::shard::ShardManager;
@@ -17,13 +16,11 @@ use ferrissearch::transport::TonicTlsConnector;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
 use ferrissearch::transport::proto::{
-    self, JoinRequest, PublishStateRequest, ReplicateBulkRequest, ReplicateDocRequest,
-    ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest, ShardSearchDslRequest,
+    self, JoinRequest, ReplicateBulkRequest, ReplicateDocRequest, ShardBulkRequest,
+    ShardDeleteRequest, ShardDocRequest, ShardGetRequest, ShardSearchDslRequest,
     ShardSearchRequest,
 };
-use ferrissearch::transport::server::{
-    create_transport_service, create_transport_service_with_raft,
-};
+use ferrissearch::transport::server::create_transport_service;
 use ferrissearch::wal::{HotTranslog, WriteAheadLog};
 use futures::TryStreamExt;
 
@@ -140,36 +137,6 @@ async fn start_grpc_server(
     });
 
     // Give the server a moment to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    addr
-}
-
-async fn start_grpc_server_with_raft(
-    cluster_manager: Arc<ClusterManager>,
-    shard_manager: Arc<ShardManager>,
-    raft: Arc<consensus::types::RaftInstance>,
-) -> std::net::SocketAddr {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let transport_client = TransportClient::new();
-    let service = create_transport_service_with_raft(
-        cluster_manager,
-        shard_manager,
-        transport_client,
-        raft,
-        "node-1".into(),
-    );
-
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(service)
-            .serve_with_incoming(incoming)
-            .await
-            .unwrap();
-    });
-
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
@@ -735,128 +702,6 @@ async fn join_cluster_and_publish_state_via_grpc() {
     // Verify cluster manager has the node
     let cs = cm.get_state();
     assert!(cs.nodes.contains_key("joining-node"));
-}
-
-#[tokio::test]
-async fn publish_state_updates_cluster_and_closes_deleted_indices() {
-    let dir = tempfile::tempdir().unwrap();
-    let cm = Arc::new(ClusterManager::new("pub-test".into()));
-    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-
-    // Pre-create an index so we can test deletion
-    sm.open_shard("old-index", 0).unwrap();
-    assert!(sm.get_shard("old-index", 0).is_some());
-
-    {
-        let mut initial_state = cm.get_state();
-        let mut shard_routing = HashMap::new();
-        shard_routing.insert(
-            0,
-            ShardRoutingEntry {
-                primary: "local".into(),
-                replicas: vec![],
-                unassigned_replicas: 0,
-            },
-        );
-        initial_state.add_index(IndexMetadata {
-            name: "old-index".into(),
-            uuid: "old-index-uuid".into(),
-            number_of_shards: 1,
-            number_of_replicas: 0,
-            shard_routing,
-            mappings: std::collections::HashMap::new(),
-            settings: ferrissearch::cluster::state::IndexSettings::default(),
-        });
-        cm.update_state(initial_state);
-    }
-
-    let addr = start_grpc_server(cm.clone(), sm.clone()).await;
-    let mut client = connect_client(addr).await;
-
-    // Publish a new state that does NOT contain "old-index" → should close it
-    let new_state = proto::ClusterState {
-        cluster_name: "pub-test".into(),
-        version: 99,
-        master_node: Some("master-1".into()),
-        nodes: vec![],
-        indices: vec![],
-    };
-
-    client
-        .publish_state(tonic::Request::new(PublishStateRequest {
-            state: Some(new_state),
-        }))
-        .await
-        .unwrap();
-
-    let cs = cm.get_state();
-    assert_eq!(cs.version, 99);
-    assert!(!cs.indices.contains_key("old-index"));
-    // Shard should be closed
-    assert!(sm.get_shard("old-index", 0).is_none());
-}
-
-#[tokio::test]
-async fn publish_state_is_ignored_on_raft_backed_transport() {
-    let dir = tempfile::tempdir().unwrap();
-    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "raft-pub-test".into())
-        .await
-        .unwrap();
-    let cm = Arc::new(ClusterManager::with_shared_state(state_handle));
-    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    let mappings = HashMap::new();
-    let settings = ferrissearch::cluster::state::IndexSettings::default();
-
-    sm.open_shard_with_settings("old-index", 0, &mappings, &settings, "old-index-uuid")
-        .unwrap();
-    assert!(sm.get_shard("old-index", 0).is_some());
-
-    let mut shard_routing = HashMap::new();
-    shard_routing.insert(
-        0,
-        ShardRoutingEntry {
-            primary: "node-1".into(),
-            replicas: vec![],
-            unassigned_replicas: 0,
-        },
-    );
-
-    let mut initial_state = cm.get_state();
-    initial_state.add_index(IndexMetadata {
-        name: "old-index".into(),
-        uuid: "old-index-uuid".into(),
-        number_of_shards: 1,
-        number_of_replicas: 0,
-        shard_routing,
-        mappings,
-        settings,
-    });
-    initial_state.version = 7;
-    cm.update_state(initial_state);
-
-    let addr = start_grpc_server_with_raft(cm.clone(), sm.clone(), raft).await;
-    let mut client = connect_client(addr).await;
-
-    let new_state = proto::ClusterState {
-        cluster_name: "raft-pub-test".into(),
-        version: 99,
-        master_node: Some("master-1".into()),
-        nodes: vec![],
-        indices: vec![],
-    };
-
-    client
-        .publish_state(tonic::Request::new(PublishStateRequest {
-            state: Some(new_state),
-        }))
-        .await
-        .unwrap();
-
-    let cs = cm.get_state();
-    assert_eq!(cs.version, 7);
-    assert!(cs.indices.contains_key("old-index"));
-    assert!(sm.get_shard("old-index", 0).is_some());
-    assert!(dir.path().join("old-index-uuid").exists());
 }
 
 // ─── Two-node integration tests: primary → replica replication ──────────────

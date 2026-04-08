@@ -3,7 +3,7 @@
 use crate::cluster::state::{ClusterState, NodeInfo};
 use crate::transport::proto::internal_transport_client::InternalTransportClient;
 use crate::transport::proto::*;
-use crate::transport::server::{cluster_state_to_proto, proto_to_cluster_state};
+use crate::transport::server::proto_to_cluster_state;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use std::collections::HashMap;
@@ -235,27 +235,6 @@ impl TransportClient {
 
         warn!("Could not join cluster; no seed hosts responded affirmatively.");
         None
-    }
-
-    /// (Master Only) Broadcasts state to all active nodes
-    pub async fn publish_state(&self, state: &ClusterState) {
-        let proto_state = cluster_state_to_proto(state);
-        for node in state.nodes.values() {
-            match self.connect(&node.host, node.transport_port).await {
-                Ok(mut client) => {
-                    let request = tonic::Request::new(PublishStateRequest {
-                        state: Some(proto_state.clone()),
-                    });
-                    if let Err(e) = client.publish_state(request).await {
-                        error!("Failed to publish state to node {}: {}", node.id, e);
-                    }
-                }
-                Err(e) => error!(
-                    "Failed to connect to node {} for state publish: {}",
-                    node.id, e
-                ),
-            }
-        }
     }
 
     /// Forward a single document to a specific shard on a node

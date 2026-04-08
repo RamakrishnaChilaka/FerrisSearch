@@ -6,7 +6,7 @@
 ```
 // Cluster coordination
 JoinCluster(JoinRequest) → JoinResponse
-PublishState(PublishStateRequest) → Empty  // legacy-only when Raft is disabled
+PublishState(PublishStateRequest) → Empty  // returns UNIMPLEMENTED; Raft manages cluster state
 Ping(PingRequest) → Empty
 
 // Document operations (routed to shard primary)
@@ -67,7 +67,7 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 
 ### Key Handler Patterns
 - **join_cluster**: If leader → serialize concurrent joins, validate `node_id` / `raft_node_id`, register the transport address with `add_learner()` for non-voters, apply `AddNode`, then recompute the latest full voter set before `change_membership()`. If promotion fails, roll back the `AddNode`. If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
-- **publish_state**: Legacy full-snapshot gossip path for non-Raft services only. If `self.raft.is_some()`, ignore the RPC before shard cleanup or `update_state()` runs. Raft-backed nodes must never accept a `PublishState` overwrite.
+- **publish_state**: Returns `UNIMPLEMENTED`. Cluster state is exclusively managed via Raft consensus; the legacy gossip-based state broadcast path has been removed.
 - **index_doc / bulk_index / delete_doc**: Look up shard in ShardManager, execute engine operation, replicate to all replicas. **Returns `success: false` if replication fails** — write is only acknowledged after all ISR replicas confirm (synchronous replication contract).
 - **replicate_doc / replicate_bulk**: Apply to local replica engine using the seq_no supplied by the primary, persist that same seq_no in the replica WAL, return checkpoint
 - **recover_replica**: Read WAL entries via `read_from()`, return operations
