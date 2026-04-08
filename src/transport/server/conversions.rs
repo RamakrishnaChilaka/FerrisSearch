@@ -23,25 +23,30 @@ pub(super) fn node_info_to_proto(n: &crate::cluster::state::NodeInfo) -> NodeInf
     }
 }
 
-pub(super) fn proto_to_node_info(p: &NodeInfo) -> crate::cluster::state::NodeInfo {
-    crate::cluster::state::NodeInfo {
+#[allow(clippy::result_large_err)]
+pub(super) fn proto_to_node_info(p: &NodeInfo) -> Result<crate::cluster::state::NodeInfo, Status> {
+    let roles = p
+        .roles
+        .iter()
+        .map(|r| match r.as_str() {
+            "master" => Ok(crate::cluster::state::NodeRole::Master),
+            "data" => Ok(crate::cluster::state::NodeRole::Data),
+            "client" => Ok(crate::cluster::state::NodeRole::Client),
+            other => Err(Status::invalid_argument(format!(
+                "unknown node role '{}' for node '{}'",
+                other, p.id
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::cluster::state::NodeInfo {
         id: p.id.clone(),
         name: p.name.clone(),
         host: p.host.clone(),
         transport_port: p.transport_port as u16,
         http_port: p.http_port as u16,
-        roles: p
-            .roles
-            .iter()
-            .map(|r| match r.as_str() {
-                "master" => crate::cluster::state::NodeRole::Master,
-                "data" => crate::cluster::state::NodeRole::Data,
-                "client" => crate::cluster::state::NodeRole::Client,
-                _ => crate::cluster::state::NodeRole::Data,
-            })
-            .collect(),
+        roles,
         raft_node_id: p.raft_node_id,
-    }
+    })
 }
 
 pub(super) fn field_type_to_proto(field_type: &crate::cluster::state::FieldType) -> String {
@@ -176,7 +181,7 @@ pub fn proto_to_cluster_state(
     state.version = p.version;
     state.master_node = p.master_node.clone();
     for node in &p.nodes {
-        let ni = proto_to_node_info(node);
+        let ni = proto_to_node_info(node)?;
         state.nodes.insert(ni.id.clone(), ni);
     }
     for idx in &p.indices {

@@ -3854,7 +3854,7 @@ impl super::SearchEngine for HotEngine {
                 "_doc_id": doc_id,
                 "_source": payload
             });
-            tl.append("index", wal_entry)?;
+            tl.append(crate::wal::WalOperation::Index, wal_entry)?;
 
             // 2. Delete any existing doc with same _id (upsert semantics)
             let id_field = self
@@ -3885,7 +3885,7 @@ impl super::SearchEngine for HotEngine {
                 "_doc_id": doc_id,
                 "_source": payload
             });
-            tl.append_with_seq(seq_no, "index", wal_entry)?;
+            tl.append_with_seq(seq_no, crate::wal::WalOperation::Index, wal_entry)?;
 
             let id_field = self
                 .field_registry
@@ -3904,9 +3904,14 @@ impl super::SearchEngine for HotEngine {
 
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
         // Keep WAL persistence and writer mutation serialized with refresh/flush.
-        let ops: Vec<(&str, serde_json::Value)> = docs
+        let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
             .iter()
-            .map(|(id, p)| ("index", serde_json::json!({ "_doc_id": id, "_source": p })))
+            .map(|(id, p)| {
+                (
+                    crate::wal::WalOperation::Index,
+                    serde_json::json!({ "_doc_id": id, "_source": p }),
+                )
+            })
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
         {
@@ -3937,9 +3942,14 @@ impl super::SearchEngine for HotEngine {
         docs: Vec<(String, serde_json::Value)>,
         start_seq_no: u64,
     ) -> Result<Vec<String>> {
-        let ops: Vec<(&str, serde_json::Value)> = docs
+        let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
             .iter()
-            .map(|(id, p)| ("index", serde_json::json!({ "_doc_id": id, "_source": p })))
+            .map(|(id, p)| {
+                (
+                    crate::wal::WalOperation::Index,
+                    serde_json::json!({ "_doc_id": id, "_source": p }),
+                )
+            })
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
         {
@@ -3966,7 +3976,10 @@ impl super::SearchEngine for HotEngine {
     fn delete_document(&self, doc_id: &str) -> Result<u64> {
         {
             let tl = self.translog.lock().unwrap();
-            tl.append("delete", serde_json::json!({ "_doc_id": doc_id }))?;
+            tl.append(
+                crate::wal::WalOperation::Delete,
+                serde_json::json!({ "_doc_id": doc_id }),
+            )?;
 
             // 2. Delete from Tantivy
             let id_field = self
@@ -3985,7 +3998,11 @@ impl super::SearchEngine for HotEngine {
     fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
         {
             let tl = self.translog.lock().unwrap();
-            tl.append_with_seq(seq_no, "delete", serde_json::json!({ "_doc_id": doc_id }))?;
+            tl.append_with_seq(
+                seq_no,
+                crate::wal::WalOperation::Delete,
+                serde_json::json!({ "_doc_id": doc_id }),
+            )?;
 
             let id_field = self
                 .field_registry

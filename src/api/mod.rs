@@ -7,6 +7,7 @@ pub mod index;
 pub mod search;
 
 use crate::cluster::ClusterManager;
+use crate::cluster::state::NodeId;
 use crate::consensus::types::RaftInstance;
 use crate::shard::ShardManager;
 use crate::transport::TransportClient;
@@ -46,7 +47,7 @@ pub struct AppState {
     pub shard_manager: Arc<ShardManager>,
     pub transport_client: TransportClient,
     /// The local node ID — needed for routing decisions
-    pub local_node_id: String,
+    pub local_node_id: NodeId,
     /// Raft consensus instance — always present, cluster state is Raft-managed
     pub raft: Arc<RaftInstance>,
     /// Dedicated thread pools for search and write workloads

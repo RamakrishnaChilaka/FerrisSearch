@@ -127,7 +127,7 @@ fn default_sql_group_by_scan_limit() -> usize {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            node_name: "node-1".into(),
+            node_name: generate_node_name(),
             cluster_name: "ferrissearch".into(),
             http_port: 9200,
             transport_port: 9300,
@@ -170,6 +170,35 @@ impl AppConfig {
 
         Ok(app_config)
     }
+}
+
+/// Generate a random node name in the format "adjective-noun" (e.g. "rusty-falcon").
+/// Similar to Elasticsearch's random node naming convention.
+fn generate_node_name() -> String {
+    use std::time::SystemTime;
+
+    const ADJECTIVES: &[&str] = &[
+        "amber", "bold", "bright", "calm", "clever", "crimson", "daring", "eager", "fast",
+        "fierce", "gentle", "golden", "happy", "iron", "keen", "lively", "mighty", "noble",
+        "proud", "quick", "rapid", "rusty", "sharp", "silent", "sleek", "smooth", "solid",
+        "steady", "strong", "swift", "tidal", "valiant", "vivid", "warm", "wild", "wise", "young",
+        "zealous",
+    ];
+    const NOUNS: &[&str] = &[
+        "badger", "bear", "condor", "crane", "eagle", "falcon", "ferret", "fox", "hawk", "heron",
+        "horse", "jaguar", "kestrel", "lemur", "lion", "lynx", "moose", "orca", "osprey", "otter",
+        "owl", "panda", "panther", "parrot", "puma", "raven", "salmon", "shark", "sparrow",
+        "stork", "tiger", "viper", "whale", "wolf", "wren",
+    ];
+
+    // Simple seed from system time nanos — no external RNG dependency needed.
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as usize;
+    let adj = ADJECTIVES[seed % ADJECTIVES.len()];
+    let noun = NOUNS[(seed / ADJECTIVES.len()) % NOUNS.len()];
+    format!("{adj}-{noun}")
 }
 
 #[cfg(test)]

@@ -25,7 +25,7 @@ pub struct TransportService {
     /// Optional Raft consensus instance. When present, Raft RPCs are forwarded here.
     pub raft: Option<Arc<RaftInstance>>,
     /// This node's identifier — used to filter locally-assigned shards.
-    pub local_node_id: String,
+    pub local_node_id: crate::cluster::state::NodeId,
     /// Dedicated thread pools for search and write workloads.
     pub worker_pools: crate::worker::WorkerPools,
     /// Serializes leader-side JoinCluster handling so concurrent joins cannot
@@ -221,7 +221,7 @@ impl InternalTransport for TransportService {
         let node_info = req
             .node_info
             .ok_or_else(|| Status::invalid_argument("missing node_info"))?;
-        let mut ni = proto_to_node_info(&node_info);
+        let mut ni = proto_to_node_info(&node_info)?;
         let joining_raft_id = req.raft_node_id;
         debug!(
             "gRPC: join request from node {} (raft_id={})",
@@ -1221,7 +1221,7 @@ impl InternalTransport for TransportService {
                     .to_string();
                 Ok::<RecoverReplicaOp, serde_json::Error>(RecoverReplicaOp {
                     seq_no: e.seq_no,
-                    op: e.op.clone(),
+                    op: e.op.as_str().to_string(),
                     doc_id,
                     payload_json: serde_json::to_vec(&e.payload)?,
                 })
