@@ -46,7 +46,7 @@ fn make_index(name: &str) -> IndexMetadata {
     );
     IndexMetadata {
         name: name.into(),
-        uuid: String::new(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new("test-uuid"),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,

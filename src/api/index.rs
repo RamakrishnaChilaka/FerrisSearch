@@ -45,16 +45,6 @@ pub(crate) async fn ensure_local_index_shards_open(
             continue;
         }
 
-        if !metadata.has_uuid() {
-            tracing::error!(
-                "{}: refusing to reopen shard {}/{} without an authoritative index UUID",
-                context,
-                index_name,
-                shard_id
-            );
-            continue;
-        }
-
         let expected_dir = state
             .shard_manager
             .data_dir()
@@ -113,16 +103,8 @@ async fn wait_for_index_metadata(state: &AppState, index_name: &str) -> Option<I
     None
 }
 
-fn raft_not_enabled_response(operation: &str) -> (StatusCode, Json<Value>) {
-    crate::api::error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "raft_not_enabled_exception",
-        format!("Raft consensus is required to {}", operation),
-    )
-}
-
 /// Auto-create an index with 1 shard, respecting the coordinator pattern.
-/// If Raft is active and this node is NOT the leader, forwards to the master.
+/// If this node is NOT the Raft leader, forwards to the master.
 async fn auto_create_index(
     state: &AppState,
     index_name: &str,
@@ -143,83 +125,80 @@ async fn auto_create_index(
     );
     let m = IndexMetadata {
         name: index_name.to_string(),
-        uuid: uuid::Uuid::new_v4().to_string(),
+        uuid: crate::cluster::state::IndexUuid::new_random(),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
         settings: crate::cluster::state::IndexSettings::default(),
     };
-    let created_metadata = if let Some(ref raft) = state.raft {
-        if !raft.is_leader() {
-            // Forward auto-create to the leader via gRPC
-            let master_id = match cluster_state.master_node.as_ref() {
-                Some(id) => id,
-                None => {
-                    return Err(crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        "No master node available to forward auto-create index",
-                    ));
-                }
-            };
-            let master_node = match cluster_state.nodes.get(master_id) {
-                Some(n) => n.clone(),
-                None => {
-                    return Err(crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        "Master node info not found in cluster state",
-                    ));
-                }
-            };
-            let body = serde_json::json!({
-                "settings": { "number_of_shards": 1, "number_of_replicas": 0 }
-            });
-            let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
-            match state
-                .transport_client
-                .forward_create_index(&master_node, index_name, &body_bytes)
-                .await
-            {
-                Ok(_) => match wait_for_index_metadata(state, index_name).await {
-                    Some(metadata) => metadata,
-                    None => {
-                        return Err(crate::api::error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "master_not_discovered_exception",
-                            format!(
-                                "Index [{}] was created by the leader but the local cluster state has not caught up yet",
-                                index_name
-                            ),
-                        ));
-                    }
-                },
-                Err(e) => {
-                    return Err(crate::api::error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "forward_exception",
-                        format!("Auto-create index forward to master failed: {}", e),
-                    ));
-                }
-            }
-        } else {
-            let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
-                metadata: m.clone(),
-            };
-            if let Err(e) = raft.client_write(cmd).await {
+    let raft = &state.raft;
+    let created_metadata = if !raft.is_leader() {
+        // Forward auto-create to the leader via gRPC
+        let master_id = match cluster_state.master_node.as_ref() {
+            Some(id) => id,
+            None => {
                 return Err(crate::api::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "raft_write_exception",
-                    format!("Auto-create index via Raft failed: {}", e),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "No master node available to forward auto-create index",
                 ));
             }
-            wait_for_index_metadata(state, index_name)
-                .await
-                .unwrap_or_else(|| m.clone())
+        };
+        let master_node = match cluster_state.nodes.get(master_id) {
+            Some(n) => n.clone(),
+            None => {
+                return Err(crate::api::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "master_not_discovered_exception",
+                    "Master node info not found in cluster state",
+                ));
+            }
+        };
+        let body = serde_json::json!({
+            "settings": { "number_of_shards": 1, "number_of_replicas": 0 }
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+        match state
+            .transport_client
+            .forward_create_index(&master_node, index_name, &body_bytes)
+            .await
+        {
+            Ok(_) => match wait_for_index_metadata(state, index_name).await {
+                Some(metadata) => metadata,
+                None => {
+                    return Err(crate::api::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "master_not_discovered_exception",
+                        format!(
+                            "Index [{}] was created by the leader but the local cluster state has not caught up yet",
+                            index_name
+                        ),
+                    ));
+                }
+            },
+            Err(e) => {
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "forward_exception",
+                    format!("Auto-create index forward to master failed: {}", e),
+                ));
+            }
         }
     } else {
-        return Err(raft_not_enabled_response("auto-create indices"));
+        let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
+            metadata: m.clone(),
+        };
+        if let Err(e) = raft.client_write(cmd).await {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "raft_write_exception",
+                format!("Auto-create index via Raft failed: {}", e),
+            ));
+        }
+        wait_for_index_metadata(state, index_name)
+            .await
+            .unwrap_or_else(|| m.clone())
     };
 
     if let Some(routing) = created_metadata.shard_routing.get(&0)
@@ -415,10 +394,7 @@ pub async fn create_index(
     let index_settings = metadata.settings.clone();
     let index_uuid = metadata.uuid.clone();
 
-    let raft = match state.raft.as_ref() {
-        Some(raft) => raft,
-        None => return raft_not_enabled_response("create indices"),
-    };
+    let raft = &state.raft;
 
     // Write through Raft
     if !raft.is_leader() {
@@ -1992,10 +1968,7 @@ pub async fn update_index_settings(
         );
     }
 
-    let raft = match state.raft.as_ref() {
-        Some(raft) => raft,
-        None => return raft_not_enabled_response("update index settings"),
-    };
+    let raft = &state.raft;
 
     // Persist via Raft
     if !raft.is_leader() {
@@ -2083,10 +2056,7 @@ pub async fn delete_index(
         );
     }
 
-    let raft = match state.raft.as_ref() {
-        Some(raft) => raft,
-        None => return raft_not_enabled_response("delete indices"),
-    };
+    let raft = &state.raft;
 
     // Remove from cluster state via Raft
     if !raft.is_leader() {
@@ -2329,7 +2299,7 @@ mod tests {
         }
         IndexMetadata {
             name: "idx".into(),
-            uuid: "idx-uuid".into(),
+            uuid: crate::cluster::state::IndexUuid::new("idx-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -2364,29 +2334,7 @@ mod tests {
             )),
             transport_client: crate::transport::TransportClient::new(),
             local_node_id: "node-1".into(),
-            raft: Some(raft),
-            worker_pools: crate::worker::WorkerPools::new(2, 2),
-            sql_group_by_scan_limit: 1_000_000,
-            sql_approximate_top_k: false,
-        };
-        (temp_dir, state)
-    }
-
-    fn make_test_app_state_without_raft(
-        cluster_state: ClusterState,
-    ) -> (tempfile::TempDir, AppState) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manager = crate::cluster::ClusterManager::new(cluster_state.cluster_name.clone());
-        manager.update_state(cluster_state);
-        let state = AppState {
-            cluster_manager: Arc::new(manager),
-            shard_manager: Arc::new(crate::shard::ShardManager::new(
-                temp_dir.path(),
-                Duration::from_secs(60),
-            )),
-            transport_client: crate::transport::TransportClient::new(),
-            local_node_id: "node-1".into(),
-            raft: None,
+            raft,
             worker_pools: crate::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
@@ -2518,36 +2466,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_index_requires_raft() {
-        let mut cluster_state = ClusterState::new("test-cluster".into());
-        cluster_state.add_node(make_test_node("node-1"));
-        let (_tmp, state) = make_test_app_state_without_raft(cluster_state);
-
-        let body = axum::body::Bytes::from(
-            serde_json::to_vec(&serde_json::json!({
-                "settings": {
-                    "number_of_shards": 1,
-                    "number_of_replicas": 0
-                }
-            }))
-            .unwrap(),
-        );
-
-        let (status, Json(body)) =
-            create_index(State(state.clone()), Path("idx".to_string()), body).await;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["type"], "raft_not_enabled_exception");
-        assert!(
-            !state
-                .cluster_manager
-                .get_state()
-                .indices
-                .contains_key("idx")
-        );
-    }
-
-    #[tokio::test]
     async fn fan_out_maintenance_keeps_local_target_without_node_entry() {
         let mut cluster_state = ClusterState::new("test-cluster".into());
         cluster_state.add_index(make_test_metadata(Some("node-1")));
@@ -2608,24 +2526,9 @@ mod tests {
 
         assert_eq!(
             state.shard_manager.index_uuid("auto-idx"),
-            Some(metadata.uuid.clone())
+            Some(metadata.uuid.to_string())
         );
         assert!(state.shard_manager.get_shard("auto-idx", 0).is_some());
-    }
-
-    #[tokio::test]
-    async fn auto_create_index_requires_raft() {
-        let mut cluster_state = ClusterState::new("test-cluster".into());
-        cluster_state.add_node(make_test_node("node-1"));
-        let (_tmp, state) = make_test_app_state_without_raft(cluster_state.clone());
-
-        let err = auto_create_index(&state, "auto-idx", &cluster_state)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(err.1.0["error"]["type"], "raft_not_enabled_exception");
-        assert!(state.shard_manager.get_shard("auto-idx", 0).is_none());
     }
 
     #[tokio::test]
@@ -2670,55 +2573,6 @@ mod tests {
         assert_eq!(
             updated.indices["idx"].settings.flush_threshold_bytes,
             Some(16384)
-        );
-    }
-
-    #[tokio::test]
-    async fn update_index_settings_requires_raft() {
-        let mut cluster_state = ClusterState::new("test-cluster".into());
-        cluster_state.add_node(make_test_node("node-1"));
-        cluster_state.add_index(make_test_metadata(Some("node-1")));
-
-        let (_tmp, state) = make_test_app_state_without_raft(cluster_state);
-        let (status, Json(body)) = update_index_settings(
-            State(state.clone()),
-            Path("idx".to_string()),
-            Json(serde_json::json!({
-                "index": {
-                    "flush_threshold_bytes": 16384
-                }
-            })),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["type"], "raft_not_enabled_exception");
-        assert_eq!(
-            state.cluster_manager.get_state().indices["idx"]
-                .settings
-                .flush_threshold_bytes,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_index_requires_raft() {
-        let mut cluster_state = ClusterState::new("test-cluster".into());
-        cluster_state.add_node(make_test_node("node-1"));
-        cluster_state.add_index(make_test_metadata(Some("node-1")));
-
-        let (_tmp, state) = make_test_app_state_without_raft(cluster_state);
-        let (status, Json(body)) =
-            delete_index(State(state.clone()), Path("idx".to_string())).await;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["type"], "raft_not_enabled_exception");
-        assert!(
-            state
-                .cluster_manager
-                .get_state()
-                .indices
-                .contains_key("idx")
         );
     }
 }

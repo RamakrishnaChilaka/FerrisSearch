@@ -104,16 +104,7 @@ pub async fn transfer_master(
     State(state): State<AppState>,
     Json(req): Json<TransferMasterRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let raft = match state.raft {
-        Some(ref r) => r,
-        None => {
-            return crate::api::error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "raft_not_enabled_exception",
-                "Raft consensus is not enabled on this node",
-            );
-        }
-    };
+    let raft = &state.raft;
 
     if !raft.is_leader() {
         // Forward to the master via gRPC — this node acts as coordinator

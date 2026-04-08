@@ -303,15 +303,6 @@ impl ShardManager {
             }
         }
 
-        if index_uuid.is_empty() {
-            return Err(anyhow::anyhow!(
-                "missing authoritative UUID for index '{}' — refusing to open shard {}/{}",
-                index,
-                index,
-                shard_id
-            ));
-        }
-
         self.register_index_uuid(index, index_uuid);
         let uuid = index_uuid.to_string();
 
@@ -401,17 +392,13 @@ impl ShardManager {
         shard_id: u32,
         mappings: HashMap<String, crate::cluster::state::FieldMapping>,
         settings: IndexSettings,
-        index_uuid: String,
+        index_uuid: impl Into<String> + Send + 'static,
     ) -> Result<Arc<dyn SearchEngine>> {
         let shard_manager = self.clone();
+        let uuid_str = index_uuid.into();
         tokio::task::spawn_blocking(move || {
-            shard_manager.open_shard_with_settings(
-                &index,
-                shard_id,
-                &mappings,
-                &settings,
-                &index_uuid,
-            )
+            shard_manager
+                .open_shard_with_settings(&index, shard_id, &mappings, &settings, &uuid_str)
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking shard open task failed: {}", e))?
@@ -1072,14 +1059,9 @@ mod tests {
     }
 
     #[test]
-    fn open_shard_with_settings_rejects_missing_uuid() {
-        let (_dir, mgr) = create_shard_manager();
-        let err = mgr
-            .open_shard_with_settings("idx", 0, &HashMap::new(), &IndexSettings::default(), "")
-            .err()
-            .unwrap();
-
-        assert!(err.to_string().contains("missing authoritative UUID"));
+    #[should_panic(expected = "IndexUuid must not be empty")]
+    fn index_uuid_rejects_empty_construction() {
+        crate::cluster::state::IndexUuid::new("");
     }
 
     #[tokio::test]

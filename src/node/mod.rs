@@ -20,7 +20,7 @@ pub struct Node {
     pub cluster_manager: Arc<ClusterManager>,
     pub transport_client: TransportClient,
     pub shard_manager: Arc<ShardManager>,
-    pub raft: Option<Arc<RaftInstance>>,
+    pub raft: Arc<RaftInstance>,
 }
 
 #[derive(Debug)]
@@ -117,7 +117,7 @@ impl Node {
             cluster_manager,
             transport_client,
             shard_manager,
-            raft: Some(raft),
+            raft,
         })
     }
 
@@ -151,22 +151,13 @@ impl Node {
         };
 
         // 1. Start internal gRPC Transport Server (Port 9300)
-        let transport_service = if let Some(ref raft) = self.raft {
-            crate::transport::server::create_transport_service_with_raft(
-                self.cluster_manager.clone(),
-                self.shard_manager.clone(),
-                self.transport_client.clone(),
-                raft.clone(),
-                self.config.node_name.clone(),
-            )
-        } else {
-            crate::transport::server::create_transport_service(
-                self.cluster_manager.clone(),
-                self.shard_manager.clone(),
-                self.transport_client.clone(),
-                self.config.node_name.clone(),
-            )
-        };
+        let transport_service = crate::transport::server::create_transport_service_with_raft(
+            self.cluster_manager.clone(),
+            self.shard_manager.clone(),
+            self.transport_client.clone(),
+            self.raft.clone(),
+            self.config.node_name.clone(),
+        );
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));
         info!("gRPC Transport listening on {}", transport_addr);
         let transport_tls = resolve_transport_tls_paths(&self.config)?;
@@ -223,7 +214,8 @@ impl Node {
             let mut recovered_guard_state = None;
 
             // ── Bootstrap or join ──────────────────────────────────────
-            if let Some(ref raft) = raft {
+            {
+                let raft = &raft;
                 // If Raft is already initialized (recovered from disk), skip
                 // bootstrap, but still re-register with the leader so its
                 // recovered cluster state contains this node again.
@@ -377,7 +369,8 @@ impl Node {
                     .await;
                 }
 
-                if let Some(ref raft) = raft {
+                {
+                    let raft = &raft;
                     if raft.is_leader() {
                         // Track when we became leader for grace period
                         let now = Instant::now();
@@ -751,13 +744,6 @@ async fn cleanup_orphaned_data_if_authoritative_blocking(
         return false;
     }
 
-    if state.indices.values().any(|metadata| !metadata.has_uuid()) {
-        tracing::warn!(
-            "Skipping orphaned data cleanup because the cluster state still has indices without authoritative UUIDs"
-        );
-        return false;
-    }
-
     for (index_name, metadata) in &state.indices {
         for (shard_id, routing) in &metadata.shard_routing {
             let assigned_here = routing.primary == local_node_id
@@ -773,7 +759,7 @@ async fn cleanup_orphaned_data_if_authoritative_blocking(
             // opened any shards in this startup.  A directory that was just
             // created by `open_local_assigned_shards` is empty and must not
             // be treated as proof that the authoritative data is present.
-            if !pre_existing_uuid_dirs.contains(&metadata.uuid) {
+            if !pre_existing_uuid_dirs.contains(metadata.uuid.as_str()) {
                 tracing::warn!(
                     "Skipping orphaned data cleanup because UUID directory for {}/{} was not present before shard opening — it was freshly created and deleting unknown UUID directories could discard live data",
                     index_name,
@@ -801,7 +787,7 @@ async fn cleanup_orphaned_data_if_authoritative_blocking(
     let known_uuids: std::collections::HashSet<String> = state
         .indices
         .values()
-        .map(|metadata| metadata.uuid.clone())
+        .map(|metadata| metadata.uuid.to_string())
         .collect();
     if let Err(e) = shard_manager
         .cleanup_orphaned_data_blocking(known_uuids)
@@ -831,13 +817,6 @@ fn cleanup_orphaned_data_if_authoritative(
         return false;
     }
 
-    if state.indices.values().any(|metadata| !metadata.has_uuid()) {
-        tracing::warn!(
-            "Skipping orphaned data cleanup because the cluster state still has indices without authoritative UUIDs"
-        );
-        return false;
-    }
-
     for (index_name, metadata) in &state.indices {
         for (shard_id, routing) in &metadata.shard_routing {
             let assigned_here = routing.primary == local_node_id
@@ -849,7 +828,7 @@ fn cleanup_orphaned_data_if_authoritative(
                 continue;
             }
 
-            if !pre_existing_uuid_dirs.contains(&metadata.uuid) {
+            if !pre_existing_uuid_dirs.contains(metadata.uuid.as_str()) {
                 tracing::warn!(
                     "Skipping orphaned data cleanup because UUID directory for {}/{} was not present before shard opening — it was freshly created and deleting unknown UUID directories could discard live data",
                     index_name,
@@ -875,7 +854,7 @@ fn cleanup_orphaned_data_if_authoritative(
     }
 
     let known_uuids: std::collections::HashSet<String> =
-        state.indices.values().map(|m| m.uuid.clone()).collect();
+        state.indices.values().map(|m| m.uuid.to_string()).collect();
     shard_manager.cleanup_orphaned_data(&known_uuids);
     true
 }
@@ -906,10 +885,6 @@ fn collect_guarded_startup_shards(
 ) -> std::collections::HashSet<(String, u32, String)> {
     let mut guarded = std::collections::HashSet::new();
     for (index_name, metadata) in &state.indices {
-        if !metadata.has_uuid() {
-            continue;
-        }
-
         for (shard_id, routing) in &metadata.shard_routing {
             let assigned_here = routing.primary == local_node_id
                 || routing
@@ -917,7 +892,7 @@ fn collect_guarded_startup_shards(
                     .iter()
                     .any(|node_id| node_id == local_node_id);
             if assigned_here {
-                guarded.insert((index_name.clone(), *shard_id, metadata.uuid.clone()));
+                guarded.insert((index_name.clone(), *shard_id, metadata.uuid.to_string()));
             }
         }
     }
@@ -970,21 +945,12 @@ fn open_local_assigned_shards(
                 continue;
             }
 
-            if !metadata.has_uuid() {
-                tracing::warn!(
-                    "Refusing to reopen local shard {}/{} without an authoritative UUID",
-                    index_name,
-                    shard_id
-                );
-                continue;
-            }
-
             let shard_dir = shard_manager
                 .data_dir()
                 .join(&metadata.uuid)
                 .join(format!("shard_{}", shard_id));
             if !shard_dir.exists()
-                && guard_set.contains(&(index_name.clone(), *shard_id, metadata.uuid.clone()))
+                && guard_set.contains(&(index_name.clone(), *shard_id, metadata.uuid.to_string()))
             {
                 tracing::warn!(
                     "Skipping lifecycle reopen for {}/{} because {:?} is missing on a recovered node; refusing to create a fresh shard directory for a startup assignment",
@@ -1099,7 +1065,7 @@ fn apply_recovery_ops(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::state::{IndexMetadata, IndexSettings, ShardRoutingEntry};
+    use crate::cluster::state::{IndexMetadata, IndexSettings, IndexUuid, ShardRoutingEntry};
     use crate::engine::CompositeEngine;
     use crate::transport::proto::RecoverReplicaOp;
     use std::collections::HashMap;
@@ -1246,7 +1212,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "idx-uuid".into(),
+            uuid: IndexUuid::new("idx-uuid"),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing,
@@ -1283,7 +1249,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "expected-uuid".into(),
+            uuid: IndexUuid::new("expected-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1319,7 +1285,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "fresh-uuid".into(),
+            uuid: IndexUuid::new("fresh-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1356,7 +1322,7 @@ mod tests {
         );
         authoritative_state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "fresh-uuid".into(),
+            uuid: IndexUuid::new("fresh-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1392,7 +1358,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "my-uuid".into(),
+            uuid: IndexUuid::new("my-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1437,7 +1403,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "idx-uuid".into(),
+            uuid: IndexUuid::new("idx-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1533,7 +1499,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: known_uuid.into(),
+            uuid: IndexUuid::new(known_uuid),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1571,7 +1537,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "expected-uuid".into(),
+            uuid: IndexUuid::new("expected-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1624,7 +1590,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "new-raft-uuid".into(),
+            uuid: IndexUuid::new("new-raft-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1673,7 +1639,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "current-uuid".into(),
+            uuid: IndexUuid::new("current-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1720,7 +1686,7 @@ mod tests {
         );
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "new-raft-uuid".into(),
+            uuid: IndexUuid::new("new-raft-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,

@@ -74,11 +74,6 @@ async fn get_or_open_read_shard(
             "Shard [{index_name}][{shard_id}] not found on this node"
         )));
     }
-    if !metadata.has_uuid() {
-        return Err(Status::failed_precondition(format!(
-            "Shard [{index_name}][{shard_id}] has no authoritative UUID in cluster state"
-        )));
-    }
 
     let shard_dir = shard_manager
         .data_dir()
@@ -310,7 +305,7 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
             .values()
             .map(|idx| IndexMetadata {
                 name: idx.name.clone(),
-                uuid: idx.uuid.clone(),
+                uuid: idx.uuid.to_string(),
                 number_of_shards: idx.number_of_shards,
                 number_of_replicas: idx.number_of_replicas,
                 shards: idx
@@ -377,11 +372,19 @@ pub fn proto_to_cluster_state(
                 },
             );
         }
+        let index_uuid = if idx.uuid.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "Index '{}' has no UUID in cluster state snapshot",
+                idx.name
+            )));
+        } else {
+            crate::cluster::state::IndexUuid::new(idx.uuid.clone())
+        };
         state.indices.insert(
             idx.name.clone(),
             crate::cluster::state::IndexMetadata {
                 name: idx.name.clone(),
-                uuid: idx.uuid.clone(),
+                uuid: index_uuid,
                 number_of_shards: idx.number_of_shards,
                 number_of_replicas: idx.number_of_replicas,
                 shard_routing,
@@ -1960,16 +1963,10 @@ impl TransportService {
     #[allow(clippy::result_large_err)]
     fn ensure_authoritative_shard_uuid(
         &self,
-        index_name: &str,
+        _index_name: &str,
         shard_id: u32,
         metadata: &crate::cluster::state::IndexMetadata,
     ) -> Result<std::path::PathBuf, Status> {
-        if !metadata.has_uuid() {
-            return Err(Status::failed_precondition(format!(
-                "Shard [{index_name}][{shard_id}] has no authoritative UUID in cluster state"
-            )));
-        }
-
         Ok(self
             .shard_manager
             .data_dir()
@@ -2087,8 +2084,9 @@ impl TransportService {
     }
 }
 
-/// Create the gRPC transport server (tonic)
-pub fn create_transport_service(
+/// Create a gRPC transport server **without Raft** for shard-level integration tests.
+/// Production code must use [`create_transport_service_with_raft`].
+pub fn create_transport_service_for_test(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
     transport_client: crate::transport::TransportClient,
@@ -2108,7 +2106,7 @@ pub fn create_transport_service(
         .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
 }
 
-/// Create the gRPC transport server with Raft consensus enabled.
+/// Create the gRPC transport server with Raft consensus.
 pub fn create_transport_service_with_raft(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
@@ -2208,7 +2206,7 @@ mod tests {
 
         cs.add_index(DomainIndexMetadata {
             name: "products".into(),
-            uuid: "products-uuid".into(),
+            uuid: crate::cluster::state::IndexUuid::new("products-uuid"),
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing,
@@ -2285,7 +2283,7 @@ mod tests {
         let restored = proto_to_cluster_state(&proto).unwrap();
 
         let idx = restored.indices.get("products").unwrap();
-        assert_eq!(idx.uuid, "products-uuid");
+        assert_eq!(idx.uuid.as_str(), "products-uuid");
         assert_eq!(idx.settings.refresh_interval_ms, Some(1500));
         assert_eq!(idx.settings.flush_threshold_bytes, Some(65_536));
         assert_eq!(idx.mappings["title"].field_type, FieldType::Text);
@@ -2320,7 +2318,7 @@ mod tests {
         );
         cs.add_index(DomainIndexMetadata {
             name: "logs".into(),
-            uuid: String::new(),
+            uuid: crate::cluster::state::IndexUuid::new("test-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -2454,7 +2452,7 @@ mod tests {
         );
         cluster_state.add_index(DomainIndexMetadata {
             name: "restart-idx".into(),
-            uuid: test_uuid.into(),
+            uuid: crate::cluster::state::IndexUuid::new(test_uuid),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -2509,7 +2507,7 @@ mod tests {
         );
         cluster_state.add_index(DomainIndexMetadata {
             name: "restart-idx".into(),
-            uuid: test_uuid.into(),
+            uuid: crate::cluster::state::IndexUuid::new(test_uuid),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -2652,7 +2650,7 @@ mod tests {
         );
         cluster_state.add_index(DomainIndexMetadata {
             name: "maint-idx".into(),
-            uuid: String::new(),
+            uuid: crate::cluster::state::IndexUuid::new("test-uuid"),
             number_of_shards: 3,
             number_of_replicas: 0,
             shard_routing,
@@ -2710,7 +2708,7 @@ mod tests {
         );
         cluster_state.add_index(DomainIndexMetadata {
             name: "rep-idx".into(),
-            uuid: String::new(),
+            uuid: crate::cluster::state::IndexUuid::new("test-uuid"),
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing,
@@ -2764,7 +2762,7 @@ mod tests {
         );
         cluster_state.add_index(DomainIndexMetadata {
             name: "maint-idx".into(),
-            uuid: test_uuid.into(),
+            uuid: crate::cluster::state::IndexUuid::new(test_uuid),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -2813,7 +2811,7 @@ mod tests {
         );
         cluster_state.add_index(DomainIndexMetadata {
             name: "maint-idx".into(),
-            uuid: "missing-uuid".into(),
+            uuid: crate::cluster::state::IndexUuid::new("missing-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,

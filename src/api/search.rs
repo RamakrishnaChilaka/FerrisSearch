@@ -2790,7 +2790,7 @@ mod tests {
 
         IndexMetadata {
             name: index.to_string(),
-            uuid: format!("{}-uuid", index),
+            uuid: crate::cluster::state::IndexUuid::new(format!("{}-uuid", index)),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -2799,13 +2799,26 @@ mod tests {
         }
     }
 
-    fn make_test_app_state(index_name: &str) -> (tempfile::TempDir, AppState) {
+    async fn make_test_app_state(index_name: &str) -> (tempfile::TempDir, AppState) {
         let mut cluster_state = ClusterState::new("test-cluster".into());
         cluster_state.add_node(make_test_node("node-1"));
         cluster_state.add_index(make_sql_metadata(index_name));
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let manager = crate::cluster::ClusterManager::new(cluster_state.cluster_name.clone());
+        let (raft, shared_state) =
+            crate::consensus::create_raft_instance_mem(1, cluster_state.cluster_name.clone())
+                .await
+                .unwrap();
+        crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19300".into())
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if raft.current_leader().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let manager = crate::cluster::ClusterManager::with_shared_state(shared_state);
         manager.update_state(cluster_state.clone());
         let state = AppState {
             cluster_manager: Arc::new(manager),
@@ -2815,7 +2828,7 @@ mod tests {
             )),
             transport_client: crate::transport::TransportClient::new(),
             local_node_id: "node-1".into(),
-            raft: None,
+            raft,
             worker_pools: crate::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
@@ -2861,7 +2874,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_sql_uses_tantivy_fast_fields_for_local_non_wildcard_query() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = search_sql(
             State(state),
@@ -2882,7 +2895,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_sql_uses_materialized_hits_fallback_for_select_star() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = search_sql(
             State(state),
@@ -2902,7 +2915,7 @@ mod tests {
 
     #[tokio::test]
     async fn explain_sql_returns_plan_without_executing() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = explain_sql(
             State(state),
@@ -2938,7 +2951,7 @@ mod tests {
 
     #[tokio::test]
     async fn explain_sql_returns_error_for_invalid_sql() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = explain_sql(
             State(state),
@@ -2956,7 +2969,7 @@ mod tests {
 
     #[tokio::test]
     async fn explain_sql_returns_error_for_nonexistent_index() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = explain_sql(
             State(state),
@@ -2974,7 +2987,7 @@ mod tests {
 
     #[tokio::test]
     async fn explain_sql_shows_materialized_fallback_for_select_star() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = explain_sql(
             State(state),
@@ -2996,7 +3009,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_sql_marks_expression_group_by_fast_field_streaming() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = search_sql(
             State(state),
@@ -3023,7 +3036,7 @@ mod tests {
 
     #[tokio::test]
     async fn explain_analyze_returns_timings_and_rows() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = explain_sql(
             State(state),
@@ -3055,7 +3068,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_sql_semijoin_inner_hidden_order_by_metric_executes() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = search_sql(
             State(state),
@@ -3102,7 +3115,7 @@ mod tests {
 
     #[tokio::test]
     async fn explain_without_analyze_has_no_timings_or_rows() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = explain_sql(
             State(state),
@@ -3124,7 +3137,7 @@ mod tests {
 
     #[tokio::test]
     async fn explain_analyze_fast_fields_returns_timings() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = explain_sql(
             State(state),
@@ -3148,7 +3161,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_sql_order_by_aggregate_expr_without_alias_uses_grouped_partials() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = search_sql(
             State(state),
@@ -3242,7 +3255,7 @@ mod tests {
 
     #[tokio::test]
     async fn canonicalize_sql_plan_fields_rewrites_case_insensitive_columns() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let cluster_state = state.cluster_manager.get_state();
         let mappings = &cluster_state.indices.get("products").unwrap().mappings;
 
@@ -3401,7 +3414,7 @@ mod tests {
 
     #[tokio::test]
     async fn canonicalize_sql_plan_fields_rewrites_semijoin_keys_case_insensitively() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let cluster_state = state.cluster_manager.get_state();
         let mappings = &cluster_state.indices.get("products").unwrap().mappings;
 
@@ -3493,7 +3506,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_sql_show_tables_returns_index_list() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let req = SqlQueryRequest {
             query: "SHOW TABLES".to_string(),
             analyze: false,
@@ -3510,7 +3523,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_sql_show_tables_case_insensitive() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let req = SqlQueryRequest {
             query: "show tables;".to_string(),
             analyze: false,
@@ -3521,7 +3534,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_sql_describe_returns_field_mappings() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let req = SqlQueryRequest {
             query: "DESCRIBE products".to_string(),
             analyze: false,
@@ -3542,7 +3555,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_sql_describe_nonexistent_index_returns_404() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let req = SqlQueryRequest {
             query: "DESCRIBE nonexistent".to_string(),
             analyze: false,
@@ -3553,7 +3566,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_sql_show_create_table_returns_index_json() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let req = SqlQueryRequest {
             query: "SHOW CREATE TABLE products".to_string(),
             analyze: false,
@@ -3570,7 +3583,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_sql_select_routes_to_correct_index() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let req = SqlQueryRequest {
             query: r#"SELECT count(*) AS total FROM "products""#.to_string(),
             analyze: false,
@@ -3583,7 +3596,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_sql_invalid_query_returns_error() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
         let req = SqlQueryRequest {
             query: "THIS IS NOT SQL".to_string(),
             analyze: false,
@@ -3626,7 +3639,7 @@ mod tests {
 
         cluster_state.add_index(IndexMetadata {
             name: "texttest".to_string(),
-            uuid: "texttest-uuid".to_string(),
+            uuid: crate::cluster::state::IndexUuid::new("texttest-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -3635,7 +3648,20 @@ mod tests {
         });
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let manager = crate::cluster::ClusterManager::new(cluster_state.cluster_name.clone());
+        let (raft, shared_state) =
+            crate::consensus::create_raft_instance_mem(1, cluster_state.cluster_name.clone())
+                .await
+                .unwrap();
+        crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19300".into())
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if raft.current_leader().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let manager = crate::cluster::ClusterManager::with_shared_state(shared_state);
         manager.update_state(cluster_state.clone());
         let state = AppState {
             cluster_manager: Arc::new(manager),
@@ -3645,7 +3671,7 @@ mod tests {
             )),
             transport_client: crate::transport::TransportClient::new(),
             local_node_id: "node-1".into(),
-            raft: None,
+            raft,
             worker_pools: crate::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
@@ -3687,7 +3713,7 @@ mod tests {
     #[tokio::test]
     async fn non_streamable_expression_group_by_with_tiny_scan_limit_returns_error() {
         // Set sql_group_by_scan_limit to 1 so even 3 docs triggers the error.
-        let (_tmp, mut state) = make_test_app_state("products");
+        let (_tmp, mut state) = make_test_app_state("products").await;
         state.sql_group_by_scan_limit = 1;
 
         let (status, Json(body)) = search_sql(
@@ -3715,7 +3741,7 @@ mod tests {
 
     #[tokio::test]
     async fn streamable_expression_group_by_ignores_tiny_scan_limit() {
-        let (_tmp, mut state) = make_test_app_state("products");
+        let (_tmp, mut state) = make_test_app_state("products").await;
         state.sql_group_by_scan_limit = 1;
 
         let (status, Json(body)) = search_sql(
@@ -3744,7 +3770,7 @@ mod tests {
 
     #[tokio::test]
     async fn having_aggregate_source_field_survives_alias_shadowing() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = search_sql(
             State(state),
@@ -3769,7 +3795,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrapped_having_aggregate_source_field_survives_alias_shadowing() {
-        let (_tmp, state) = make_test_app_state("products");
+        let (_tmp, state) = make_test_app_state("products").await;
 
         let (status, Json(body)) = search_sql(
             State(state),

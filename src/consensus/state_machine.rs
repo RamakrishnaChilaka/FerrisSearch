@@ -223,7 +223,7 @@ mod tests {
         );
         IndexMetadata {
             name: name.into(),
-            uuid: String::new(),
+            uuid: crate::cluster::state::IndexUuid::new("test-uuid"),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,

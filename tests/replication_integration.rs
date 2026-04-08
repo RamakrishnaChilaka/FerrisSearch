@@ -20,7 +20,7 @@ use ferrissearch::transport::proto::{
     ShardDeleteRequest, ShardDocRequest, ShardGetRequest, ShardSearchDslRequest,
     ShardSearchRequest,
 };
-use ferrissearch::transport::server::create_transport_service;
+use ferrissearch::transport::server::create_transport_service_for_test;
 use ferrissearch::wal::{HotTranslog, WriteAheadLog};
 use futures::TryStreamExt;
 
@@ -121,7 +121,7 @@ async fn start_grpc_server(
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
     let transport_client = TransportClient::new();
-    let service = create_transport_service(
+    let service = create_transport_service_for_test(
         cluster_manager,
         shard_manager,
         transport_client,
@@ -152,7 +152,7 @@ async fn start_grpc_server_with_tls(
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
     let transport_client = TransportClient::new();
-    let service = create_transport_service(
+    let service = create_transport_service_for_test(
         cluster_manager,
         shard_manager,
         transport_client,
@@ -235,7 +235,7 @@ fn setup_single_node_cluster_state(cm: &ClusterManager, index_name: &str) {
     );
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: format!("{}-uuid", index_name),
+        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{}-uuid", index_name)),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -272,7 +272,7 @@ fn setup_multi_shard_single_node_cluster_state(cm: &ClusterManager, index_name: 
     }
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: format!("{}-uuid", index_name),
+        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{}-uuid", index_name)),
         number_of_shards: shards,
         number_of_replicas: 0,
         shard_routing,
@@ -320,7 +320,7 @@ fn setup_two_node_cluster_state(
     );
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: format!("{}-uuid", index_name),
+        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{}-uuid", index_name)),
         number_of_shards: 1,
         number_of_replicas: 1,
         shard_routing,
@@ -999,7 +999,7 @@ async fn search_shard_reopens_persisted_shard_after_restart() {
         );
         cs.add_index(IndexMetadata {
             name: "restart-idx".into(),
-            uuid: test_uuid.into(),
+            uuid: ferrissearch::cluster::state::IndexUuid::new(test_uuid),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1126,7 +1126,7 @@ async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
         );
         cs.add_index(IndexMetadata {
             name: "restart-dsl-idx".into(),
-            uuid: test_uuid.into(),
+            uuid: ferrissearch::cluster::state::IndexUuid::new(test_uuid),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1230,7 +1230,7 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
     let mut cs = cm.get_state();
     cs.add_index(IndexMetadata {
         name: "restart-mapped-idx".into(),
-        uuid: test_uuid.into(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new(test_uuid),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -1307,7 +1307,7 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
         );
         cs.add_index(IndexMetadata {
             name: "restart-replay-idx".into(),
-            uuid: test_uuid.into(),
+            uuid: ferrissearch::cluster::state::IndexUuid::new(test_uuid),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -1428,7 +1428,7 @@ async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
     let mut cs = cm.get_state();
     cs.add_index(IndexMetadata {
         name: "agg-idx".into(),
-        uuid: "agg-idx-uuid".into(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new("agg-idx-uuid"),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -1555,7 +1555,7 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
     });
     cs.add_index(IndexMetadata {
         name: "sql-stream-idx".into(),
-        uuid: "sql-stream-idx-uuid".into(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new("sql-stream-idx-uuid"),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,

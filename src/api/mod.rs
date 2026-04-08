@@ -47,8 +47,8 @@ pub struct AppState {
     pub transport_client: TransportClient,
     /// The local node ID — needed for routing decisions
     pub local_node_id: String,
-    /// Raft consensus instance (if enabled)
-    pub raft: Option<Arc<RaftInstance>>,
+    /// Raft consensus instance — always present, cluster state is Raft-managed
+    pub raft: Arc<RaftInstance>,
     /// Dedicated thread pools for search and write workloads
     pub worker_pools: WorkerPools,
     /// Max docs to scan for GROUP BY queries on the fast-fields fallback path.
