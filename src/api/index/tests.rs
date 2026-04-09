@@ -240,7 +240,7 @@ async fn bulk_index_reports_missing_primary_node_as_item_error() {
 
     let (status, Json(body)) = bulk_index(
         State(state),
-        Path("idx".to_string()),
+        Path(crate::common::IndexName::new("idx").unwrap()),
         Query(RefreshParam { refresh: None }),
         input,
     )
@@ -320,7 +320,12 @@ async fn create_index_applies_flush_threshold_setting() {
         .unwrap(),
     );
 
-    let (status, _) = create_index(State(state.clone()), Path("idx".to_string()), body).await;
+    let (status, _) = create_index(
+        State(state.clone()),
+        Path(crate::common::IndexName::new("idx").unwrap()),
+        body,
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     let created = state.cluster_manager.get_state();
@@ -405,7 +410,11 @@ async fn get_index_settings_includes_flush_threshold_setting() {
     cluster_state.add_index(metadata);
 
     let (_tmp, state) = make_test_app_state(cluster_state).await;
-    let (status, Json(body)) = get_index_settings(State(state), Path("idx".to_string())).await;
+    let (status, Json(body)) = get_index_settings(
+        State(state),
+        Path(crate::common::IndexName::new("idx").unwrap()),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -423,7 +432,7 @@ async fn update_index_settings_updates_flush_threshold_setting() {
     let (_tmp, state) = make_test_app_state(cluster_state).await;
     let (status, Json(body)) = update_index_settings(
         State(state.clone()),
-        Path("idx".to_string()),
+        Path(crate::common::IndexName::new("idx").unwrap()),
         Json(serde_json::json!({
             "index": {
                 "flush_threshold_bytes": 16384

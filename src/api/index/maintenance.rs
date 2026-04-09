@@ -6,18 +6,12 @@ use crate::transport::server::run_maintenance_on_assigned_shards_async;
 
 pub async fn refresh_index(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
-    if !cluster_state.indices.contains_key(&index_name) {
+    if !cluster_state.indices.contains_key(index_name.as_str()) {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
@@ -40,18 +34,12 @@ pub async fn refresh_index(
 /// Fans out to remote nodes via gRPC concurrently.
 pub async fn flush_index(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
-    if !cluster_state.indices.contains_key(&index_name) {
+    if !cluster_state.indices.contains_key(index_name.as_str()) {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",

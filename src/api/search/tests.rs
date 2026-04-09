@@ -183,7 +183,7 @@ async fn search_sql_uses_tantivy_fast_fields_for_local_non_wildcard_query() {
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') AND price > 500 GROUP BY brand ORDER BY total DESC, brand ASC".to_string(),
             ..Default::default()
@@ -204,7 +204,7 @@ async fn search_sql_uses_materialized_hits_fallback_for_select_star() {
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT * FROM products WHERE text_match(description, 'iphone')".to_string(),
             ..Default::default()
@@ -224,7 +224,7 @@ async fn explain_sql_returns_plan_without_executing() {
 
     let (status, Json(body)) = explain_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') AND price > 500 GROUP BY brand ORDER BY total DESC".to_string(),
             ..Default::default()
@@ -260,7 +260,7 @@ async fn explain_sql_returns_error_for_invalid_sql() {
 
     let (status, Json(body)) = explain_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "NOT A VALID SQL".to_string(),
             ..Default::default()
@@ -278,7 +278,7 @@ async fn explain_sql_returns_error_for_nonexistent_index() {
 
     let (status, Json(body)) = explain_sql(
         State(state),
-        Path("nonexistent".to_string()),
+        Path(crate::common::IndexName::new("nonexistent").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT * FROM nonexistent".to_string(),
             ..Default::default()
@@ -296,7 +296,7 @@ async fn explain_sql_shows_materialized_fallback_for_select_star() {
 
     let (status, Json(body)) = explain_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT * FROM products WHERE text_match(description, 'iphone')".to_string(),
             ..Default::default()
@@ -318,7 +318,7 @@ async fn search_sql_marks_expression_group_by_fast_field_streaming() {
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT LOWER(brand) AS brand_bucket, COUNT(*) AS total FROM products WHERE text_match(description, 'iphone') GROUP BY LOWER(brand) ORDER BY brand_bucket ASC".to_string(),
             ..Default::default()
@@ -345,7 +345,7 @@ async fn explain_analyze_returns_timings_and_rows() {
 
     let (status, Json(body)) = explain_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT brand, count(*) AS total FROM products WHERE text_match(description, 'iphone') GROUP BY brand".to_string(),
             analyze: true,
@@ -377,7 +377,7 @@ async fn search_sql_semijoin_inner_hidden_order_by_metric_executes() {
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT title, brand FROM products WHERE brand IN (SELECT brand FROM products GROUP BY brand ORDER BY SUM(price) DESC LIMIT 1) ORDER BY title ASC".to_string(),
             ..Default::default()
@@ -424,7 +424,7 @@ async fn explain_without_analyze_has_no_timings_or_rows() {
 
     let (status, Json(body)) = explain_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT brand FROM products WHERE text_match(description, 'iphone')".to_string(),
             ..Default::default()
@@ -445,7 +445,7 @@ async fn explain_analyze_fast_fields_returns_timings() {
 
     let (status, Json(body)) = explain_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT brand, price FROM products WHERE text_match(description, 'iphone')"
                 .to_string(),
@@ -469,7 +469,7 @@ async fn search_sql_order_by_aggregate_expr_without_alias_uses_grouped_partials(
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT brand, SUM(price) FROM products WHERE text_match(description, 'iphone') GROUP BY brand ORDER BY SUM(price) DESC LIMIT 2".to_string(),
             ..Default::default()
@@ -980,7 +980,7 @@ async fn group_by_text_field_returns_error() {
     // GROUP BY on text field should return error
     let (status, Json(body)) = search_sql(
         State(state.clone()),
-        Path("texttest".to_string()),
+        Path(crate::common::IndexName::new("texttest").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT description, count(*) AS cnt FROM texttest GROUP BY description"
                 .to_string(),
@@ -998,7 +998,7 @@ async fn group_by_text_field_returns_error() {
     // GROUP BY on keyword field should succeed (not error)
     let (status2, _) = search_sql(
         State(state),
-        Path("texttest".to_string()),
+        Path(crate::common::IndexName::new("texttest").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT category, count(*) AS cnt FROM texttest GROUP BY category".to_string(),
             ..Default::default()
@@ -1017,7 +1017,7 @@ async fn non_streamable_expression_group_by_with_tiny_scan_limit_returns_error()
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT LOWER(description) AS d, count(*) AS cnt FROM products GROUP BY LOWER(description)"
                 .to_string(),
@@ -1045,7 +1045,7 @@ async fn streamable_expression_group_by_ignores_tiny_scan_limit() {
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT LOWER(brand) AS b, count(*) AS cnt FROM products GROUP BY LOWER(brand) ORDER BY b"
                 .to_string(),
@@ -1073,7 +1073,7 @@ async fn having_aggregate_source_field_survives_alias_shadowing() {
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT brand, count(*) AS price FROM products GROUP BY brand HAVING AVG(price) > 850 ORDER BY brand"
                 .to_string(),
@@ -1098,7 +1098,7 @@ async fn wrapped_having_aggregate_source_field_survives_alias_shadowing() {
 
     let (status, Json(body)) = search_sql(
         State(state),
-        Path("products".to_string()),
+        Path(crate::common::IndexName::new("products").unwrap()),
         Json(SqlQueryRequest {
             query: "SELECT brand, count(*) AS price FROM products GROUP BY brand HAVING COALESCE(AVG(price), 0) > 850 ORDER BY brand"
                 .to_string(),
