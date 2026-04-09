@@ -1,5 +1,5 @@
 use crate::api::AppState;
-use crate::cluster::state::IndexMetadata;
+use crate::cluster::state::{IndexMetadata, NodeInfo};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -12,6 +12,49 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+/// If this node is the Raft leader, returns `None`.
+/// If not, resolves the master node for forwarding and returns `Some(master)`.
+/// Returns an error response if no master is available.
+fn resolve_leader_or_master(
+    state: &AppState,
+    operation: &str,
+) -> Result<Option<NodeInfo>, (StatusCode, Json<Value>)> {
+    if state.raft.is_leader() {
+        return Ok(None);
+    }
+    let cs = state.cluster_manager.get_state();
+    let master_id = cs.master_node.as_ref().ok_or_else(|| {
+        crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "master_not_discovered_exception",
+            format!("No master node available to forward {}", operation),
+        )
+    })?;
+    let master_node = cs.nodes.get(master_id).cloned().ok_or_else(|| {
+        crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "master_not_discovered_exception",
+            "Master node info not found in cluster state",
+        )
+    })?;
+    Ok(Some(master_node))
+}
+
+/// Write a command through Raft and return a standard error response on failure.
+async fn raft_write(
+    state: &AppState,
+    cmd: crate::consensus::types::ClusterCommand,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    state.raft.client_write(cmd).await.map_err(|e| {
+        crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "raft_write_exception",
+            format!("Raft write failed: {}", e),
+        )
+    })?;
+    Ok(())
+}
 
 mod bulk;
 mod maintenance;
@@ -119,7 +162,7 @@ async fn wait_for_index_metadata(state: &AppState, index_name: &str) -> Option<I
 async fn auto_create_index(
     state: &AppState,
     index_name: &str,
-    cluster_state: &crate::cluster::state::ClusterState,
+    _cluster_state: &crate::cluster::state::ClusterState,
 ) -> Result<IndexMetadata, (StatusCode, Json<Value>)> {
     tracing::warn!(
         "Index '{}' not found, auto-creating with 1 shard",
@@ -143,36 +186,17 @@ async fn auto_create_index(
         mappings: HashMap::new(),
         settings: crate::cluster::state::IndexSettings::default(),
     };
-    let raft = &state.raft;
-    let created_metadata = if !raft.is_leader() {
+    let created_metadata = if let Some(master) =
+        resolve_leader_or_master(state, "auto-create index")?
+    {
         // Forward auto-create to the leader via gRPC
-        let master_id = match cluster_state.master_node.as_ref() {
-            Some(id) => id,
-            None => {
-                return Err(crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "No master node available to forward auto-create index",
-                ));
-            }
-        };
-        let master_node = match cluster_state.nodes.get(master_id) {
-            Some(n) => n.clone(),
-            None => {
-                return Err(crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "Master node info not found in cluster state",
-                ));
-            }
-        };
         let body = serde_json::json!({
             "settings": { "number_of_shards": 1, "number_of_replicas": 0 }
         });
         let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
         match state
             .transport_client
-            .forward_create_index(&master_node, index_name, &body_bytes)
+            .forward_create_index(&master, index_name, &body_bytes)
             .await
         {
             Ok(_) => match wait_for_index_metadata(state, index_name).await {
@@ -200,13 +224,7 @@ async fn auto_create_index(
         let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
             metadata: m.clone(),
         };
-        if let Err(e) = raft.client_write(cmd).await {
-            return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "raft_write_exception",
-                format!("Auto-create index via Raft failed: {}", e),
-            ));
-        }
+        raft_write(state, cmd).await?;
         wait_for_index_metadata(state, index_name)
             .await
             .unwrap_or_else(|| m.clone())
@@ -262,10 +280,10 @@ impl RefreshParam {
 /// HEAD /{index} — Check if an index exists.
 pub async fn index_exists(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
 ) -> StatusCode {
     let cluster_state = state.cluster_manager.get_state();
-    if cluster_state.indices.contains_key(&index_name) {
+    if cluster_state.indices.contains_key(index_name.as_str()) {
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND
@@ -276,16 +294,10 @@ pub async fn index_exists(
 /// Body: `{ "settings": { "number_of_shards": 3, "number_of_replicas": 1 } }`
 pub async fn create_index(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let settings: Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
     let num_shards = settings
@@ -305,7 +317,7 @@ pub async fn create_index(
 
     let cluster_state = state.cluster_manager.get_state();
 
-    if cluster_state.indices.contains_key(&index_name) {
+    if cluster_state.indices.contains_key(index_name.as_str()) {
         return crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "resource_already_exists_exception",
@@ -405,40 +417,17 @@ pub async fn create_index(
     let index_settings = metadata.settings.clone();
     let index_uuid = metadata.uuid.clone();
 
-    let raft = &state.raft;
-
-    // Write through Raft
-    if !raft.is_leader() {
-        // Forward to the master via gRPC — this node acts as coordinator
-        let cluster_state_for_fwd = state.cluster_manager.get_state();
-        let master_id = match cluster_state_for_fwd.master_node.as_ref() {
-            Some(id) => id,
-            None => {
-                return crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "No master node available to forward index creation",
-                );
-            }
-        };
-        let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
-            Some(n) => n.clone(),
-            None => {
-                return crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "Master node info not found in cluster state",
-                );
-            }
-        };
+    // Coordinator: forward to leader or write locally via Raft
+    if let Some(master) = match resolve_leader_or_master(&state, "index creation") {
+        Ok(m) => m,
+        Err(e) => return e,
+    } {
         match state
             .transport_client
-            .forward_create_index(&master_node, &index_name, &body)
+            .forward_create_index(&master, &index_name, &body)
             .await
         {
-            Ok(resp) => {
-                return (StatusCode::OK, Json(resp));
-            }
+            Ok(resp) => return (StatusCode::OK, Json(resp)),
             Err(e) => {
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -449,12 +438,8 @@ pub async fn create_index(
         }
     }
     let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
-    if let Err(e) = raft.client_write(cmd).await {
-        return crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "raft_write_exception",
-            format!("Raft write failed: {}", e),
-        );
+    if let Err(e) = raft_write(&state, cmd).await {
+        return e;
     }
 
     // Open local shard engines for shards assigned to this node (primary or replica)
@@ -464,7 +449,7 @@ pub async fn create_index(
             && let Err(e) = state
                 .shard_manager
                 .open_shard_with_settings_blocking(
-                    index_name.clone(),
+                    index_name.to_string(),
                     *shard_id,
                     index_mappings.clone(),
                     index_settings.clone(),
@@ -501,19 +486,13 @@ pub async fn create_index(
 /// POST /{index}/_doc — Index a single document with shard routing.
 pub async fn index_document(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     Query(refresh_param): Query<RefreshParam>,
     Json(mut payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
 
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     // Extract or generate _id, then strip it from the document body
     let doc_id = if let Some(id) = payload.get("_id").and_then(|v| v.as_str()) {
@@ -529,7 +508,7 @@ pub async fn index_document(
     let cluster_state = state.cluster_manager.get_state();
 
     // Auto-create index with 1 shard if it doesn't exist (like OpenSearch)
-    let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
+    let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
         m.clone()
     } else {
         match auto_create_index(&state, &index_name, &cluster_state).await {
@@ -590,19 +569,13 @@ pub async fn index_document(
 /// PUT /{index}/_doc/{id} — Index a single document with an explicit ID.
 pub async fn index_document_with_id(
     State(state): State<AppState>,
-    Path((index_name, doc_id)): Path<(String, String)>,
+    Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
     Query(refresh_param): Query<RefreshParam>,
     Json(mut payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
 
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     // Remove _id from stored payload if present — it's metadata, not document source
     if let Some(obj) = payload.as_object_mut() {
@@ -612,7 +585,7 @@ pub async fn index_document_with_id(
     let cluster_state = state.cluster_manager.get_state();
 
     // Auto-create index with 1 shard if it doesn't exist (like OpenSearch)
-    let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
+    let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
         m.clone()
     } else {
         match auto_create_index(&state, &index_name, &cluster_state).await {
@@ -675,13 +648,7 @@ pub(crate) async fn execute_distributed_dsl_search(
     index_name: &str,
     search_req: &crate::search::SearchRequest,
 ) -> Result<DistributedDslSearchResult, (StatusCode, Json<Value>)> {
-    if let Err(msg) = crate::common::validate_index_name(index_name) {
-        return Err(crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        ));
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(index_name) {
@@ -894,7 +861,7 @@ pub(crate) async fn execute_distributed_dsl_search(
 
 pub async fn search_documents_dsl(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     Json(req): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::SEARCH_LATENCY_SECONDS.start_timer();
@@ -945,18 +912,12 @@ pub async fn search_documents_dsl(
 /// GET /{index}/_doc/{id} — Retrieve a document by its ID.
 pub async fn get_document(
     State(state): State<AppState>,
-    Path((index_name, doc_id)): Path<(String, String)>,
+    Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(&index_name) {
+    let metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m.clone(),
         None => {
             return crate::api::error_response(
@@ -1020,16 +981,10 @@ pub async fn get_document(
 /// Fetches the existing document, merges the provided fields, and re-indexes.
 pub async fn update_document(
     State(state): State<AppState>,
-    Path((index_name, doc_id)): Path<(String, String)>,
+    Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let partial = match body.get("doc") {
         Some(d) if d.is_object() => d.clone(),
@@ -1043,7 +998,7 @@ pub async fn update_document(
     };
 
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(&index_name) {
+    let metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m.clone(),
         None => {
             return crate::api::error_response(
@@ -1135,18 +1090,12 @@ pub async fn update_document(
 /// DELETE /{index}/_doc/{id} — Delete a document by its ID.
 pub async fn delete_document(
     State(state): State<AppState>,
-    Path((index_name, doc_id)): Path<(String, String)>,
+    Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(&index_name) {
+    let metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m.clone(),
         None => {
             return crate::api::error_response(
@@ -1198,18 +1147,12 @@ pub async fn delete_document(
 /// GET /{index}/_settings — Get the current index settings.
 pub async fn get_index_settings(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(&index_name) {
+    let metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m,
         None => {
             return crate::api::error_response(
@@ -1223,7 +1166,7 @@ pub async fn get_index_settings(
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            index_name.clone(): {
+            index_name.to_string(): {
                 "settings": {
                     "index": {
                         "number_of_shards": metadata.number_of_shards,
@@ -1259,16 +1202,10 @@ pub async fn get_index_settings(
 /// ```
 pub async fn update_index_settings(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     // Reject static settings
     if body.pointer("/index/number_of_shards").is_some() {
@@ -1280,7 +1217,7 @@ pub async fn update_index_settings(
     }
 
     let cluster_state = state.cluster_manager.get_state();
-    let mut metadata = match cluster_state.indices.get(&index_name) {
+    let mut metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m.clone(),
         None => {
             return crate::api::error_response(
@@ -1342,35 +1279,14 @@ pub async fn update_index_settings(
         );
     }
 
-    let raft = &state.raft;
-
-    // Persist via Raft
-    if !raft.is_leader() {
-        // Forward to the master via gRPC
-        let cluster_state_for_fwd = state.cluster_manager.get_state();
-        let master_id = match cluster_state_for_fwd.master_node.as_ref() {
-            Some(id) => id,
-            None => {
-                return crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "No master node available to forward settings update",
-                );
-            }
-        };
-        let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
-            Some(n) => n.clone(),
-            None => {
-                return crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "Master node info not found in cluster state",
-                );
-            }
-        };
+    // Coordinator: forward to leader or write locally via Raft
+    if let Some(master) = match resolve_leader_or_master(&state, "settings update") {
+        Ok(m) => m,
+        Err(e) => return e,
+    } {
         match state
             .transport_client
-            .forward_update_settings(&master_node, &index_name, &body)
+            .forward_update_settings(&master, &index_name, &body)
             .await
         {
             Ok(()) => {}
@@ -1386,12 +1302,8 @@ pub async fn update_index_settings(
         let cmd = crate::consensus::types::ClusterCommand::UpdateIndex {
             metadata: metadata.clone(),
         };
-        if let Err(e) = raft.client_write(cmd).await {
-            return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "raft_write_exception",
-                format!("Raft write failed: {}", e),
-            );
+        if let Err(e) = raft_write(&state, cmd).await {
+            return e;
         }
     }
 
@@ -1410,19 +1322,13 @@ pub async fn update_index_settings(
 
 pub async fn delete_index(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
 
-    if !cluster_state.indices.contains_key(&index_name) {
+    if !cluster_state.indices.contains_key(index_name.as_str()) {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
@@ -1430,35 +1336,14 @@ pub async fn delete_index(
         );
     }
 
-    let raft = &state.raft;
-
-    // Remove from cluster state via Raft
-    if !raft.is_leader() {
-        // Forward to the master via gRPC — this node acts as coordinator
-        let cluster_state_for_fwd = state.cluster_manager.get_state();
-        let master_id = match cluster_state_for_fwd.master_node.as_ref() {
-            Some(id) => id,
-            None => {
-                return crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "No master node available to forward index deletion",
-                );
-            }
-        };
-        let master_node = match cluster_state_for_fwd.nodes.get(master_id) {
-            Some(n) => n.clone(),
-            None => {
-                return crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "Master node info not found in cluster state",
-                );
-            }
-        };
+    // Coordinator: forward to leader or write locally via Raft
+    if let Some(master) = match resolve_leader_or_master(&state, "index deletion") {
+        Ok(m) => m,
+        Err(e) => return e,
+    } {
         match state
             .transport_client
-            .forward_delete_index(&master_node, &index_name)
+            .forward_delete_index(&master, &index_name)
             .await
         {
             Ok(()) => {}
@@ -1472,14 +1357,10 @@ pub async fn delete_index(
         }
     } else {
         let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
-            index_name: index_name.clone(),
+            index_name: index_name.to_string(),
         };
-        if let Err(e) = raft.client_write(cmd).await {
-            return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "raft_write_exception",
-                format!("Raft write failed: {}", e),
-            );
+        if let Err(e) = raft_write(&state, cmd).await {
+            return e;
         }
     }
 
@@ -1487,7 +1368,7 @@ pub async fn delete_index(
     if let Err(e) = state
         .shard_manager
         .close_index_shards_blocking_with_reason(
-            index_name.clone(),
+            index_name.to_string(),
             crate::shard::SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX,
         )
         .await

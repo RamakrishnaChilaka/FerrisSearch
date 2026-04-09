@@ -110,7 +110,11 @@ async fn forward_bulk_batches(
     let mut shard_batches: HashMap<BulkTargetKey, Vec<(String, Value)>> = HashMap::new();
     for doc in routed_docs {
         shard_batches
-            .entry((doc.index_name.clone(), doc.node_id.clone(), doc.shard_id))
+            .entry((
+                doc.index_name.to_string(),
+                doc.node_id.clone(),
+                doc.shard_id,
+            ))
             .or_default()
             .push((doc.doc_id.clone(), doc.payload.clone()));
     }
@@ -123,7 +127,7 @@ async fn forward_bulk_batches(
         if let Some(node_info) = cluster_state.nodes.get(&node_id) {
             let client = state.transport_client.clone();
             let node_info = node_info.clone();
-            let batch_index = index_name.clone();
+            let batch_index = index_name.to_string();
             futures.push(tokio::spawn(async move {
                 client
                     .forward_bulk_to_shard(&node_info, &batch_index, shard_id, &batch)
@@ -160,7 +164,11 @@ pub(super) fn finalize_bulk_items(
     failed_targets: &HashMap<BulkTargetKey, String>,
 ) -> Vec<Value> {
     for doc in routed_docs {
-        let target = (doc.index_name.clone(), doc.node_id.clone(), doc.shard_id);
+        let target = (
+            doc.index_name.to_string(),
+            doc.node_id.clone(),
+            doc.shard_id,
+        );
         let item = if let Some(reason) = failed_targets.get(&target) {
             bulk_error_item(
                 Some(&doc.index_name),
@@ -305,7 +313,7 @@ pub async fn bulk_index_global(
 
     let mut routed_docs = Vec::new();
     for (index_name, batch) in by_index {
-        let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
+        let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
             m.clone()
         } else {
             match auto_create_index(&state, &index_name, &cluster_state).await {
@@ -329,7 +337,7 @@ pub async fn bulk_index_global(
         for (position, doc_id, payload) in batch {
             match route_bulk_doc(
                 position,
-                index_name.clone(),
+                index_name.to_string(),
                 doc_id,
                 payload,
                 &metadata,
@@ -353,7 +361,7 @@ pub async fn bulk_index_global(
     if refresh_param.should_refresh() {
         let affected_indices: std::collections::HashSet<String> = routed_docs
             .iter()
-            .map(|doc| doc.index_name.clone())
+            .map(|doc| doc.index_name.to_string())
             .collect();
         for index_name in affected_indices {
             for (_, engine) in state.shard_manager.get_index_shards(&index_name) {
@@ -380,20 +388,14 @@ pub async fn bulk_index_global(
 /// POST /{index}/_bulk — Parse NDJSON, route each doc to the correct shard node.
 pub async fn bulk_index(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     Query(refresh_param): Query<RefreshParam>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
     crate::metrics::BULK_REQUESTS_TOTAL.inc();
 
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let text = match std::str::from_utf8(&body) {
         Ok(t) => t,
@@ -422,7 +424,7 @@ pub async fn bulk_index(
     let cluster_state = state.cluster_manager.get_state();
 
     // Auto-create index if it doesn't exist
-    let metadata = if let Some(m) = cluster_state.indices.get(&index_name) {
+    let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
         m.clone()
     } else {
         match auto_create_index(&state, &index_name, &cluster_state).await {
@@ -438,7 +440,7 @@ pub async fn bulk_index(
     for (position, (doc_id, payload)) in docs.into_iter().enumerate() {
         match route_bulk_doc(
             position,
-            index_name.clone(),
+            index_name.to_string(),
             doc_id,
             payload,
             &metadata,

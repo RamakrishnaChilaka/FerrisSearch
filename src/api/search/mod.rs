@@ -29,16 +29,10 @@ use canonicalization::*;
 /// and `GetShardStats` from remote nodes — no search execution at all.
 pub async fn count_documents(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     body: Option<Json<Value>>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let query = match &body {
         Some(Json(req)) => match serde_json::from_value::<CountRequest>(req.clone()) {
@@ -236,21 +230,15 @@ pub struct SqlQueryRequest {
 /// GET /{index}/_search?q=... — query-string search across all shards (local + remote) for this index.
 pub async fn search_documents(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     Query(params): Query<SearchParams>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::SEARCH_LATENCY_SECONDS.start_timer();
 
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(&index_name) {
+    let metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m.clone(),
         None => {
             return crate::api::error_response(
@@ -321,7 +309,7 @@ pub async fn search_documents(
         if let Some(node_info) = cluster_state.nodes.get(&routing.primary) {
             let client = state.transport_client.clone();
             let node_info = node_info.clone();
-            let index = index_name.clone();
+            let index = index_name.to_string();
             let sid = *shard_id;
             let query = params.q.clone();
             remote_futures.push(tokio::spawn(async move {
@@ -401,19 +389,13 @@ pub async fn search_documents(
 /// With `"analyze": true`: executes the query and returns plan + per-stage timings + result rows.
 pub async fn explain_sql(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     Json(req): Json<SqlQueryRequest>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
-    if !cluster_state.indices.contains_key(&index_name) {
+    if !cluster_state.indices.contains_key(index_name.as_str()) {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
@@ -429,7 +411,11 @@ pub async fn explain_sql(
                 return crate::api::error_response(StatusCode::BAD_REQUEST, "parsing_exception", e);
             }
         };
-        let mappings = &cluster_state.indices.get(&index_name).unwrap().mappings;
+        let mappings = &cluster_state
+            .indices
+            .get(index_name.as_str())
+            .unwrap()
+            .mappings;
         let plan = match canonicalize_sql_plan_fields(plan, mappings) {
             Ok(plan) => plan,
             Err(err) => return err,
@@ -1769,18 +1755,9 @@ async fn execute_sql_stream_query(
 /// POST /{index}/_sql/stream — NDJSON stream of SQL results.
 pub async fn search_sql_stream(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     Json(req): Json<SqlQueryRequest>,
 ) -> Response {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        )
-        .into_response();
-    }
-
     match execute_sql_stream_query(&state, &index_name, &req.query).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
@@ -1837,14 +1814,17 @@ pub async fn global_sql_stream(
         }
     };
 
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        )
-        .into_response();
-    }
+    let index_name = match crate::common::IndexName::new(&index_name) {
+        Ok(name) => name,
+        Err(msg) => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_index_name_exception",
+                msg,
+            )
+            .into_response();
+        }
+    };
 
     match execute_sql_stream_query(&state, &index_name, &req.query).await {
         Ok(response) => response,
@@ -1855,16 +1835,10 @@ pub async fn global_sql_stream(
 /// POST /{index}/_sql — SQL projection/aggregation over distributed search hits.
 pub async fn search_sql(
     State(state): State<AppState>,
-    Path(index_name): Path<String>,
+    Path(index_name): Path<crate::common::IndexName>,
     Json(req): Json<SqlQueryRequest>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    // IndexName is validated at extraction time
 
     let result = match execute_sql_query(&state, &index_name, &req.query).await {
         Ok(result) => result,
@@ -1914,13 +1888,16 @@ pub async fn global_sql(
         }
     };
 
-    if let Err(msg) = crate::common::validate_index_name(&index_name) {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_index_name_exception",
-            msg,
-        );
-    }
+    let index_name = match crate::common::IndexName::new(&index_name) {
+        Ok(name) => name,
+        Err(msg) => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_index_name_exception",
+                msg,
+            );
+        }
+    };
 
     let result = match execute_sql_query(&state, &index_name, &req.query).await {
         Ok(result) => result,
