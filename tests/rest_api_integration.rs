@@ -133,7 +133,7 @@ impl RestTestHarness {
             shard_manager: shard_manager.clone(),
             transport_client: transport_client.clone(),
             local_node_id: "node-1".into(),
-            raft: Some(raft.clone()),
+            raft: raft.clone(),
             worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
@@ -369,7 +369,7 @@ impl MultiNodeRestHarness {
                 shard_manager: shard_manager.clone(),
                 transport_client: transport_client.clone(),
                 local_node_id: pending.node_id.clone(),
-                raft: Some(raft.clone()),
+                raft: raft.clone(),
                 worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
@@ -503,7 +503,7 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
 
     let metadata = IndexMetadata {
         name: "stories".into(),
-        uuid: uuid::Uuid::new_v4().to_string(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new_random(),
         number_of_shards: 3,
         number_of_replicas: 0,
         shard_routing,

@@ -28,6 +28,8 @@ impl FerrisDB {
     fn new_with_hackernews_sample() -> Self {
         let index_name = "stories";
 
+        let handle = tokio::runtime::Handle::current();
+
         // Build cluster state
         let mut cluster_state = ClusterState::new("slt-cluster".into());
         cluster_state.add_node(NodeInfo {
@@ -89,7 +91,7 @@ impl FerrisDB {
 
         cluster_state.add_index(IndexMetadata {
             name: index_name.to_string(),
-            uuid: format!("{}-uuid", index_name),
+            uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{}-uuid", index_name)),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -98,8 +100,27 @@ impl FerrisDB {
         });
 
         let tmp = tempfile::tempdir().unwrap();
-        let manager =
-            ferrissearch::cluster::ClusterManager::new(cluster_state.cluster_name.clone());
+        let (raft, shared_state) = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let (r, s) = ferrissearch::consensus::create_raft_instance_mem(
+                    1,
+                    cluster_state.cluster_name.clone(),
+                )
+                .await
+                .unwrap();
+                ferrissearch::consensus::bootstrap_single_node(&r, 1, "127.0.0.1:19300".into())
+                    .await
+                    .unwrap();
+                for _ in 0..50 {
+                    if r.current_leader().await.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                (r, s)
+            })
+        });
+        let manager = ferrissearch::cluster::ClusterManager::with_shared_state(shared_state);
         manager.update_state(cluster_state.clone());
         let state = AppState {
             cluster_manager: Arc::new(manager),
@@ -109,7 +130,7 @@ impl FerrisDB {
             )),
             transport_client: ferrissearch::transport::TransportClient::new(),
             local_node_id: "node-1".into(),
-            raft: None,
+            raft,
             worker_pools: WorkerPools::new(2, 2),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,

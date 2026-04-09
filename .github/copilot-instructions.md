@@ -101,7 +101,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 957 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 39 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1134 total
+- 954 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 39 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1131 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -125,8 +125,9 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Follower lifecycle loop: pings the master for liveness
 
 ## Important Design Decisions
+- **Raft is mandatory**: `AppState.raft` is `Arc<RaftInstance>`, not `Option`. All cluster-state mutations go through Raft. There is no non-Raft fallback path.
 - **Coordinator pattern**: see dedicated section below — NEVER return "not the leader" or "send to master" errors
-- `ClusterManager::update_state()` is a full overwrite — never use it to replace Raft-managed state
+- `ClusterManager::update_state()` is a full overwrite — only the Raft state machine should call it in production; test harnesses may use it for setup
 - `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft. Populated by `add_node()` and `ping_node()`
 - New leader gets a 20s grace period (`leader_since`) before scanning for dead nodes to avoid false positives
 - Dead node handling: leader removes node from Raft + cluster only after successful membership change, promotes best ISR replica for orphaned primary shards (highest checkpoint wins), increments `unassigned_replicas` for lost replica slots, and refuses removals that would empty the voter set
@@ -155,7 +156,7 @@ pub struct AppState {
     pub shard_manager: Arc<ShardManager>,
     pub transport_client: TransportClient,
     pub local_node_id: String,
-    pub raft: Option<Arc<RaftInstance>>,
+    pub raft: Arc<RaftInstance>,
     pub worker_pools: WorkerPools,
     pub sql_group_by_scan_limit: usize,
 }

@@ -389,7 +389,7 @@ mod tests {
     use super::*;
     use crate::cluster::manager::ClusterManager;
     use crate::cluster::state::{
-        IndexMetadata, IndexSettings, NodeInfo, NodeRole, ShardRoutingEntry,
+        IndexMetadata, IndexSettings, IndexUuid, NodeInfo, NodeRole, ShardRoutingEntry,
     };
     use crate::shard::ShardManager;
     use crate::transport::TransportClient;
@@ -398,17 +398,31 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    fn make_app_state(local_node_id: &str) -> (tempfile::TempDir, AppState) {
+    async fn make_app_state(local_node_id: &str) -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
         let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let (raft, shared_state) =
+            crate::consensus::create_raft_instance_mem(1, "test-cluster".into())
+                .await
+                .unwrap();
+        crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19300".into())
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if raft.current_leader().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let manager = ClusterManager::with_shared_state(shared_state);
         (
             dir,
             AppState {
-                cluster_manager: Arc::new(ClusterManager::new("test-cluster".into())),
+                cluster_manager: Arc::new(manager),
                 shard_manager,
                 transport_client: TransportClient::new(),
                 local_node_id: local_node_id.to_string(),
-                raft: None,
+                raft,
                 worker_pools: WorkerPools::default_for_system(),
                 sql_group_by_scan_limit: 0,
                 sql_approximate_top_k: false,
@@ -449,7 +463,7 @@ mod tests {
 
         state.add_index(IndexMetadata {
             name: "idx".into(),
-            uuid: "idx-uuid".into(),
+            uuid: IndexUuid::new("idx-uuid"),
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing,
@@ -503,9 +517,9 @@ mod tests {
         assert!(params.local.is_none());
     }
 
-    #[test]
-    fn shard_display_state_requires_report_from_assigned_node() {
-        let (_dir, app_state) = make_app_state("node-1");
+    #[tokio::test]
+    async fn shard_display_state_requires_report_from_assigned_node() {
+        let (_dir, app_state) = make_app_state("node-1").await;
         let cluster_state = make_cluster_state();
         let mut doc_counts = ShardCopyDocCounts::new();
         doc_counts.insert(("node-1".into(), "idx".into(), 0), 12);
@@ -536,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_doc_count_returns_dash_for_remote_rows() {
-        let (_dir, app_state) = make_app_state("node-1");
+        let (_dir, app_state) = make_app_state("node-1").await;
         app_state.shard_manager.open_shard("idx", 0).unwrap();
 
         assert_eq!(local_doc_count(&app_state, "node-1", "idx", 0), "0");

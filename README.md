@@ -78,7 +78,7 @@ Every SQL response tells you how the planner executed the query:
 - **Generation-based WAL** — durable writes, replica catch-up, and background auto-flush
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, and planner metadata in SQL responses
-- **Test depth** — 1134 automated tests, including a real three-node flush + restart regression
+- **Test depth** — 1131 automated tests, including a real three-node flush + restart regression
 
 ## Tech Stack
 
@@ -526,8 +526,8 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1134 tests
-cargo test --lib                                # Unit tests (957)
+cargo test                                      # All 1131 tests
+cargo test --lib                                # Unit tests (954)
 cargo test --bin ferris-cli                      # CLI tests (64)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)

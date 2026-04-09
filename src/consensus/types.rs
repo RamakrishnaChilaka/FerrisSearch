@@ -111,7 +111,7 @@ mod tests {
         let cmd = ClusterCommand::CreateIndex {
             metadata: IndexMetadata {
                 name: "test-idx".into(),
-                uuid: String::new(),
+                uuid: crate::cluster::state::IndexUuid::new("test-uuid"),
                 number_of_shards: 1,
                 number_of_replicas: 0,
                 shard_routing: HashMap::new(),
@@ -176,7 +176,7 @@ mod tests {
         let cmd = ClusterCommand::CreateIndex {
             metadata: IndexMetadata {
                 name: "routed".into(),
-                uuid: String::new(),
+                uuid: crate::cluster::state::IndexUuid::new("test-uuid"),
                 number_of_shards: 3,
                 number_of_replicas: 1,
                 shard_routing,

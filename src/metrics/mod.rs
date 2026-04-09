@@ -411,7 +411,7 @@ pub fn update_cluster_metrics(state: &crate::api::AppState) {
         .set(replica_count);
 
     // Master status
-    let is_master = state.raft.as_ref().is_some_and(|r| r.is_leader());
+    let is_master = state.raft.is_leader();
     IS_MASTER.set(if is_master { 1 } else { 0 });
 }
 

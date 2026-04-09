@@ -30,7 +30,13 @@ impl ClusterManager {
         state.add_node(node);
     }
 
-    /// Overwrite the local state entirely (used when receiving update from Master)
+    /// Overwrite the local state entirely.
+    ///
+    /// # Invariant
+    /// In production, only the Raft state machine should call this method.
+    /// Test harnesses may call it to set up initial cluster state before
+    /// exercising handlers.  API handlers must NEVER call this directly —
+    /// all cluster-state mutations go through `raft.client_write(...)`.
     pub fn update_state(&self, mut new_state: ClusterState) {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         // Preserve last_seen since it's transient and not serialized over the network

@@ -46,13 +46,53 @@ const TRANSLOG_FILE_PREFIX: &str = "translog-";
 const TRANSLOG_FILE_SUFFIX: &str = ".bin";
 const TRANSLOG_GENERATION_WIDTH: usize = 20;
 
+/// The type of WAL operation.
+///
+/// This enum replaces the previous stringly-typed `"index"` / `"delete"` convention.
+/// Serialized as a string in the binary wire format for backwards compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalOperation {
+    /// Index (create or update) a document.
+    Index,
+    /// Delete a document by ID.
+    Delete,
+}
+
+impl WalOperation {
+    /// Parse from the string representation used in the WAL wire format.
+    ///
+    /// # Panics
+    /// Panics on unknown operation types — a corrupt WAL entry.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "index" => Self::Index,
+            "delete" => Self::Delete,
+            other => panic!("unknown WAL operation type: {other}"),
+        }
+    }
+
+    /// The string representation used in the WAL wire format.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+impl std::fmt::Display for WalOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A single WAL entry, representing one indexing operation.
 #[derive(Debug, Clone)]
 pub struct TranslogEntry {
     /// Monotonically increasing sequence number for ordering
     pub seq_no: u64,
-    /// The operation type (currently only "index")
-    pub op: String,
+    /// The operation type.
+    pub op: WalOperation,
     /// The full document payload
     pub payload: serde_json::Value,
 }
@@ -72,7 +112,7 @@ impl WireEntry {
     fn from_translog(entry: &TranslogEntry) -> Result<Self> {
         Ok(Self {
             seq_no: entry.seq_no,
-            op: entry.op.clone(),
+            op: entry.op.as_str().to_string(),
             payload_json: serde_json::to_string(&entry.payload)?,
         })
     }
@@ -80,7 +120,7 @@ impl WireEntry {
     fn into_translog(self) -> Result<TranslogEntry> {
         Ok(TranslogEntry {
             seq_no: self.seq_no,
-            op: self.op,
+            op: WalOperation::parse(&self.op),
             payload: serde_json::from_str(&self.payload_json)?,
         })
     }
@@ -91,29 +131,29 @@ impl WireEntry {
 /// Future implementations could use memory-only WAL, remote WAL, etc.
 pub trait WriteAheadLog: Send + Sync {
     /// Append a single operation and fsync for durability.
-    fn append(&self, op: &str, payload: serde_json::Value) -> Result<TranslogEntry>;
+    fn append(&self, op: WalOperation, payload: serde_json::Value) -> Result<TranslogEntry>;
 
     /// Append a single operation using a caller-supplied sequence number.
     /// Used for replica/recovery paths so shard copies persist the primary's seq_no.
     fn append_with_seq(
         &self,
         seq_no: u64,
-        op: &str,
+        op: WalOperation,
         payload: serde_json::Value,
     ) -> Result<TranslogEntry>;
 
     /// Append multiple operations with a single fsync (bulk optimization).
-    fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>>;
+    fn append_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<Vec<TranslogEntry>>;
 
     /// Write multiple operations to WAL with a single fsync, without constructing
     /// return entries. Faster than `append_bulk` when the caller doesn't need the entries.
-    fn write_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<()>;
+    fn write_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<()>;
 
     /// Write multiple operations with caller-supplied contiguous sequence numbers.
     fn write_bulk_with_start_seq(
         &self,
         start_seq_no: u64,
-        ops: &[(&str, serde_json::Value)],
+        ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<()>;
 
     /// Read all pending entries (used for replay on startup).
@@ -164,10 +204,14 @@ fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
 }
 
 /// Encode directly from borrowed values — avoids cloning the payload.
-fn encode_entry_borrowed(seq_no: u64, op: &str, payload: &serde_json::Value) -> Result<Vec<u8>> {
+fn encode_entry_borrowed(
+    seq_no: u64,
+    op: WalOperation,
+    payload: &serde_json::Value,
+) -> Result<Vec<u8>> {
     let wire = WireEntry {
         seq_no,
-        op: op.to_string(),
+        op: op.as_str().to_string(),
         payload_json: serde_json::to_string(payload)?,
     };
     let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
@@ -847,7 +891,7 @@ impl HotTranslog {
 }
 
 impl WriteAheadLog for HotTranslog {
-    fn append(&self, op: &str, payload: serde_json::Value) -> Result<TranslogEntry> {
+    fn append(&self, op: WalOperation, payload: serde_json::Value) -> Result<TranslogEntry> {
         let mut state = recover_lock(&self.state, "state");
         let seq_no = state.next_seq_no;
         let frame = encode_entry_borrowed(seq_no, op, &payload)?;
@@ -862,7 +906,7 @@ impl WriteAheadLog for HotTranslog {
 
         let entry = TranslogEntry {
             seq_no,
-            op: op.to_string(),
+            op,
             payload,
         };
 
@@ -872,7 +916,7 @@ impl WriteAheadLog for HotTranslog {
     fn append_with_seq(
         &self,
         seq_no: u64,
-        op: &str,
+        op: WalOperation,
         payload: serde_json::Value,
     ) -> Result<TranslogEntry> {
         let mut state = recover_lock(&self.state, "state");
@@ -888,14 +932,14 @@ impl WriteAheadLog for HotTranslog {
 
         let entry = TranslogEntry {
             seq_no,
-            op: op.to_string(),
+            op,
             payload,
         };
 
         Ok(entry)
     }
 
-    fn append_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
+    fn append_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
         let mut state = recover_lock(&self.state, "state");
         let start_seq_no = state.next_seq_no;
         let mut entries = Vec::with_capacity(ops.len());
@@ -904,10 +948,10 @@ impl WriteAheadLog for HotTranslog {
 
         for (offset, (op, payload)) in ops.iter().enumerate() {
             let seq_no = start_seq_no + offset as u64;
-            buf.extend_from_slice(&encode_entry_borrowed(seq_no, op, payload)?);
+            buf.extend_from_slice(&encode_entry_borrowed(seq_no, *op, payload)?);
             entries.push(TranslogEntry {
                 seq_no,
-                op: op.to_string(),
+                op: *op,
                 payload: payload.clone(),
             });
             last_seq_no = Some(seq_no);
@@ -928,7 +972,7 @@ impl WriteAheadLog for HotTranslog {
         Ok(entries)
     }
 
-    fn write_bulk(&self, ops: &[(&str, serde_json::Value)]) -> Result<()> {
+    fn write_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<()> {
         let mut state = recover_lock(&self.state, "state");
         let start_seq_no = state.next_seq_no;
         let mut buf = Vec::with_capacity(ops.len() * 200);
@@ -936,7 +980,7 @@ impl WriteAheadLog for HotTranslog {
 
         for (offset, (op, payload)) in ops.iter().enumerate() {
             let seq_no = start_seq_no + offset as u64;
-            buf.extend_from_slice(&encode_entry_borrowed(seq_no, op, payload)?);
+            buf.extend_from_slice(&encode_entry_borrowed(seq_no, *op, payload)?);
             last_seq_no = Some(seq_no);
         }
 
@@ -958,7 +1002,7 @@ impl WriteAheadLog for HotTranslog {
     fn write_bulk_with_start_seq(
         &self,
         start_seq_no: u64,
-        ops: &[(&str, serde_json::Value)],
+        ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<()> {
         let mut state = recover_lock(&self.state, "state");
         let mut buf = Vec::with_capacity(ops.len() * 200);
@@ -966,7 +1010,7 @@ impl WriteAheadLog for HotTranslog {
 
         for (offset, (op, payload)) in ops.iter().enumerate() {
             let seq_no = start_seq_no + offset as u64;
-            buf.extend_from_slice(&encode_entry_borrowed(seq_no, op, payload)?);
+            buf.extend_from_slice(&encode_entry_borrowed(seq_no, *op, payload)?);
             last_seq_no = Some(seq_no);
         }
 
@@ -1170,9 +1214,11 @@ mod tests {
     #[test]
     fn append_single_entry_and_read_back() {
         let (_dir, tl) = open_translog();
-        let entry = tl.append("index", json!({"title": "hello"})).unwrap();
+        let entry = tl
+            .append(WalOperation::Index, json!({"title": "hello"}))
+            .unwrap();
         assert_eq!(entry.seq_no, 0);
-        assert_eq!(entry.op, "index");
+        assert_eq!(entry.op, WalOperation::Index);
 
         let entries = tl.read_all().unwrap();
         assert_eq!(entries.len(), 1);
@@ -1196,27 +1242,31 @@ mod tests {
     #[test]
     fn append_multiple_entries_increments_seq_no() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
-        tl.append("index", json!({"b": 2})).unwrap();
-        let e3 = tl.append("delete", json!({"_doc_id": "x"})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
+        let e3 = tl
+            .append(WalOperation::Delete, json!({"_doc_id": "x"}))
+            .unwrap();
         assert_eq!(e3.seq_no, 2);
 
         let entries = tl.read_all().unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[2].op, "delete");
+        assert_eq!(entries[2].op, WalOperation::Delete);
     }
 
     #[test]
     fn append_with_explicit_seq_preserves_provided_seq_number() {
         let (_dir, tl) = open_translog();
         let entry = tl
-            .append_with_seq(7, "index", json!({"title": "replicated"}))
+            .append_with_seq(7, WalOperation::Index, json!({"title": "replicated"}))
             .unwrap();
 
         assert_eq!(entry.seq_no, 7);
         assert_eq!(tl.next_seq_no(), 8);
 
-        let next = tl.append("index", json!({"title": "local"})).unwrap();
+        let next = tl
+            .append(WalOperation::Index, json!({"title": "local"}))
+            .unwrap();
         assert_eq!(next.seq_no, 8);
     }
 
@@ -1225,8 +1275,9 @@ mod tests {
     #[test]
     fn append_bulk_writes_atomically() {
         let (_dir, tl) = open_translog();
-        let ops: Vec<(&str, serde_json::Value)> =
-            (0..5).map(|i| ("index", json!({"doc": i}))).collect();
+        let ops: Vec<(WalOperation, serde_json::Value)> = (0..5)
+            .map(|i| (WalOperation::Index, json!({"doc": i})))
+            .collect();
         let entries = tl.append_bulk(&ops).unwrap();
         assert_eq!(entries.len(), 5);
         assert_eq!(entries[4].seq_no, 4);
@@ -1238,10 +1289,10 @@ mod tests {
     #[test]
     fn write_bulk_with_explicit_start_seq_advances_allocator() {
         let (_dir, tl) = open_translog();
-        let ops: Vec<(&str, serde_json::Value)> = vec![
-            ("index", json!({"doc": "a"})),
-            ("index", json!({"doc": "b"})),
-            ("index", json!({"doc": "c"})),
+        let ops: Vec<(WalOperation, serde_json::Value)> = vec![
+            (WalOperation::Index, json!({"doc": "a"})),
+            (WalOperation::Index, json!({"doc": "b"})),
+            (WalOperation::Index, json!({"doc": "c"})),
         ];
 
         tl.write_bulk_with_start_seq(10, &ops).unwrap();
@@ -1257,9 +1308,12 @@ mod tests {
     #[test]
     fn bulk_then_single_seq_no_continues() {
         let (_dir, tl) = open_translog();
-        tl.append_bulk(&[("index", json!({"a": 1})), ("index", json!({"b": 2}))])
-            .unwrap();
-        let e = tl.append("index", json!({"c": 3})).unwrap();
+        tl.append_bulk(&[
+            (WalOperation::Index, json!({"a": 1})),
+            (WalOperation::Index, json!({"b": 2})),
+        ])
+        .unwrap();
+        let e = tl.append(WalOperation::Index, json!({"c": 3})).unwrap();
         assert_eq!(e.seq_no, 2);
     }
 
@@ -1268,8 +1322,8 @@ mod tests {
     #[test]
     fn truncate_clears_all_entries() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"x": 1})).unwrap();
-        tl.append("index", json!({"y": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"x": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"y": 2})).unwrap();
 
         tl.truncate().unwrap();
 
@@ -1280,10 +1334,10 @@ mod tests {
     #[test]
     fn truncate_preserves_seq_no() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
         tl.truncate().unwrap();
 
-        let e = tl.append("index", json!({"b": 2})).unwrap();
+        let e = tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
         assert_eq!(
             e.seq_no, 1,
             "seq_no should continue from where it left off after truncate"
@@ -1297,8 +1351,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let tl = HotTranslog::open(dir.path()).unwrap();
-            tl.append("index", json!({"persisted": true})).unwrap();
-            tl.append("delete", json!({"_doc_id": "abc"})).unwrap();
+            tl.append(WalOperation::Index, json!({"persisted": true}))
+                .unwrap();
+            tl.append(WalOperation::Delete, json!({"_doc_id": "abc"}))
+                .unwrap();
         }
         // Reopen from the same directory
         let tl2 = HotTranslog::open(dir.path()).unwrap();
@@ -1312,11 +1368,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let tl = HotTranslog::open(dir.path()).unwrap();
-            tl.append("index", json!({"a": 1})).unwrap();
-            tl.append("index", json!({"b": 2})).unwrap();
+            tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+            tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
         }
         let tl2 = HotTranslog::open(dir.path()).unwrap();
-        let e = tl2.append("index", json!({"c": 3})).unwrap();
+        let e = tl2.append(WalOperation::Index, json!({"c": 3})).unwrap();
         assert_eq!(
             e.seq_no, 2,
             "seq_no should continue from where previous instance left off"
@@ -1329,7 +1385,7 @@ mod tests {
     fn binary_encode_decode_roundtrip() {
         let entry = TranslogEntry {
             seq_no: 42,
-            op: "index".into(),
+            op: WalOperation::Index,
             payload: json!({"field": "value", "num": 123}),
         };
         let frame = encode_entry(&entry).unwrap();
@@ -1341,7 +1397,7 @@ mod tests {
         let decoded = decode_entries(&mut reader).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].seq_no, 42);
-        assert_eq!(decoded[0].op, "index");
+        assert_eq!(decoded[0].op, WalOperation::Index);
         assert_eq!(decoded[0].payload["field"], "value");
     }
 
@@ -1349,7 +1405,7 @@ mod tests {
     fn partial_frame_at_eof_is_skipped() {
         let entry = TranslogEntry {
             seq_no: 0,
-            op: "index".into(),
+            op: WalOperation::Index,
             payload: json!({"ok": true}),
         };
         let mut frame = encode_entry(&entry).unwrap();
@@ -1379,7 +1435,8 @@ mod tests {
     fn large_payload_roundtrips() {
         let (_dir, tl) = open_translog();
         let big = "x".repeat(100_000);
-        tl.append("index", json!({"data": big})).unwrap();
+        tl.append(WalOperation::Index, json!({"data": big}))
+            .unwrap();
         let entries = tl.read_all().unwrap();
         assert_eq!(entries[0].payload["data"].as_str().unwrap().len(), 100_000);
     }
@@ -1389,9 +1446,9 @@ mod tests {
     #[test]
     fn read_from_returns_entries_after_checkpoint() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap(); // seq 0
-        tl.append("index", json!({"b": 2})).unwrap(); // seq 1
-        tl.append("index", json!({"c": 3})).unwrap(); // seq 2
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap(); // seq 0
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap(); // seq 1
+        tl.append(WalOperation::Index, json!({"c": 3})).unwrap(); // seq 2
 
         let entries = tl.read_from(0).unwrap();
         assert_eq!(entries.len(), 2);
@@ -1404,8 +1461,8 @@ mod tests {
         let (_dir, tl) = open_translog();
         // read_from(0) should return entries with seq_no > 0
         // But if we want all entries, we need to use a sentinel below first seq.
-        tl.append("index", json!({"a": 1})).unwrap(); // seq 0
-        tl.append("index", json!({"b": 2})).unwrap(); // seq 1
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap(); // seq 0
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap(); // seq 1
 
         // read_from filters > after_seq_no, so read_from(0) skips seq 0
         let entries = tl.read_from(0).unwrap();
@@ -1416,8 +1473,8 @@ mod tests {
     #[test]
     fn read_from_returns_empty_when_all_below_checkpoint() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
-        tl.append("index", json!({"b": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
 
         let entries = tl.read_from(5).unwrap();
         assert!(entries.is_empty());
@@ -1435,10 +1492,10 @@ mod tests {
     #[test]
     fn truncate_below_keeps_mixed_generation_until_future_roll() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap(); // seq 0
-        tl.append("index", json!({"b": 2})).unwrap(); // seq 1
-        tl.append("index", json!({"c": 3})).unwrap(); // seq 2
-        tl.append("index", json!({"d": 4})).unwrap(); // seq 3
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap(); // seq 0
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap(); // seq 1
+        tl.append(WalOperation::Index, json!({"c": 3})).unwrap(); // seq 2
+        tl.append(WalOperation::Index, json!({"d": 4})).unwrap(); // seq 3
 
         tl.truncate_below(1).unwrap();
 
@@ -1451,20 +1508,24 @@ mod tests {
     #[test]
     fn truncate_below_preserves_seq_no() {
         let (_dir, tl) = open_translog();
-        tl.append_with_seq(5, "index", json!({"a": 1})).unwrap();
-        tl.append_with_seq(6, "index", json!({"b": 2})).unwrap();
+        tl.append_with_seq(5, WalOperation::Index, json!({"a": 1}))
+            .unwrap();
+        tl.append_with_seq(6, WalOperation::Index, json!({"b": 2}))
+            .unwrap();
 
         tl.truncate_below(5).unwrap();
 
-        let e = tl.append("index", json!({"c": 3})).unwrap();
+        let e = tl.append(WalOperation::Index, json!({"c": 3})).unwrap();
         assert_eq!(e.seq_no, 7, "seq_no should continue after truncate_below");
     }
 
     #[test]
     fn truncate_below_at_max_clears_fully_obsolete_generations() {
         let (_dir, tl) = open_translog();
-        tl.append_with_seq(10, "index", json!({"a": 1})).unwrap();
-        tl.append_with_seq(11, "index", json!({"b": 2})).unwrap();
+        tl.append_with_seq(10, WalOperation::Index, json!({"a": 1}))
+            .unwrap();
+        tl.append_with_seq(11, WalOperation::Index, json!({"b": 2}))
+            .unwrap();
 
         tl.truncate_below(20).unwrap();
 
@@ -1477,30 +1538,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let tl = HotTranslog::open(dir.path()).unwrap();
-            tl.append_with_seq(5, "index", json!({"a": 1})).unwrap();
-            tl.append_with_seq(6, "index", json!({"b": 2})).unwrap();
+            tl.append_with_seq(5, WalOperation::Index, json!({"a": 1}))
+                .unwrap();
+            tl.append_with_seq(6, WalOperation::Index, json!({"b": 2}))
+                .unwrap();
             tl.truncate_below(5).unwrap();
-            tl.append("index", json!({"c": 3})).unwrap();
+            tl.append(WalOperation::Index, json!({"c": 3})).unwrap();
             tl.truncate_below(6).unwrap();
         }
         let tl2 = HotTranslog::open(dir.path()).unwrap();
         let entries = tl2.read_all().unwrap();
         assert_eq!(entries.len(), 1, "only seq 7 should survive reopen");
         assert_eq!(entries[0].seq_no, 7);
-        let e = tl2.append("index", json!({"d": 4})).unwrap();
+        let e = tl2.append(WalOperation::Index, json!({"d": 4})).unwrap();
         assert_eq!(e.seq_no, 8);
     }
 
     #[test]
     fn truncate_below_rolls_generation_and_prunes_obsolete_files() {
         let (dir, tl) = open_translog();
-        tl.append_with_seq(5, "index", json!({"a": 1})).unwrap();
-        tl.append_with_seq(6, "index", json!({"b": 2})).unwrap();
+        tl.append_with_seq(5, WalOperation::Index, json!({"a": 1}))
+            .unwrap();
+        tl.append_with_seq(6, WalOperation::Index, json!({"b": 2}))
+            .unwrap();
 
         tl.truncate_below(5).unwrap();
         assert_eq!(generation_file_names(dir.path()).len(), 2);
 
-        tl.append("index", json!({"c": 3})).unwrap();
+        tl.append(WalOperation::Index, json!({"c": 3})).unwrap();
         tl.truncate_below(6).unwrap();
 
         let generation_files = generation_file_names(dir.path());
@@ -1539,7 +1604,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let legacy_entry = TranslogEntry {
             seq_no: 0,
-            op: "index".into(),
+            op: WalOperation::Index,
             payload: json!({"legacy": true}),
         };
         let frame = encode_entry(&legacy_entry).unwrap();
@@ -1556,7 +1621,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entry = TranslogEntry {
             seq_no: 0,
-            op: "index".into(),
+            op: WalOperation::Index,
             payload: json!({"doc": 1}),
         };
         let frame = encode_entry(&entry).unwrap();
@@ -1573,7 +1638,7 @@ mod tests {
 
         let active_entry = TranslogEntry {
             seq_no: 7,
-            op: "index".into(),
+            op: WalOperation::Index,
             payload: json!({"active": true}),
         };
         let active_frame = encode_entry(&active_entry).unwrap();
@@ -1615,16 +1680,16 @@ mod tests {
     #[test]
     fn last_seq_no_returns_highest_written() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
-        tl.append("index", json!({"b": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
         assert_eq!(tl.last_seq_no(), 1);
     }
 
     #[test]
     fn last_seq_no_preserved_after_truncate() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
-        tl.append("index", json!({"b": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
         tl.truncate().unwrap();
         assert_eq!(
             tl.last_seq_no(),
@@ -1686,8 +1751,8 @@ mod tests {
             },
         )
         .unwrap();
-        tl.append("index", json!({"a": 1})).unwrap();
-        tl.append("index", json!({"b": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
 
         let entries = tl.read_all().unwrap();
         assert_eq!(entries.len(), 2);
@@ -1705,8 +1770,10 @@ mod tests {
             },
         )
         .unwrap();
-        let ops: Vec<(&str, serde_json::Value)> =
-            vec![("index", json!({"a": 1})), ("index", json!({"b": 2}))];
+        let ops: Vec<(WalOperation, serde_json::Value)> = vec![
+            (WalOperation::Index, json!({"a": 1})),
+            (WalOperation::Index, json!({"b": 2})),
+        ];
         let entries = tl.append_bulk(&ops).unwrap();
         assert_eq!(entries.len(), 2);
 
@@ -1724,8 +1791,10 @@ mod tests {
             },
         )
         .unwrap();
-        let ops: Vec<(&str, serde_json::Value)> =
-            vec![("index", json!({"a": 1})), ("index", json!({"b": 2}))];
+        let ops: Vec<(WalOperation, serde_json::Value)> = vec![
+            (WalOperation::Index, json!({"a": 1})),
+            (WalOperation::Index, json!({"b": 2})),
+        ];
         tl.write_bulk(&ops).unwrap();
 
         let all = tl.read_all().unwrap();
@@ -1742,7 +1811,7 @@ mod tests {
             },
         )
         .unwrap();
-        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
         // Manual sync should succeed without error
         tl.sync().unwrap();
     }
@@ -1804,15 +1873,15 @@ mod tests {
             },
         )
         .unwrap();
-        tl.append("index", json!({"a": 1})).unwrap();
-        tl.append("index", json!({"b": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
 
         tl.truncate().unwrap();
         let entries = tl.read_all().unwrap();
         assert!(entries.is_empty());
 
         // seq_no preserved
-        let e = tl.append("index", json!({"c": 3})).unwrap();
+        let e = tl.append(WalOperation::Index, json!({"c": 3})).unwrap();
         assert_eq!(e.seq_no, 2);
     }
 
@@ -1824,7 +1893,7 @@ mod tests {
         };
         {
             let tl = HotTranslog::open_with_durability(dir.path(), durability).unwrap();
-            tl.append("index", json!({"a": 1})).unwrap();
+            tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
             tl.sync().unwrap(); // ensure data is on disk
         }
         // Reopen in request mode — data should still be there
@@ -1837,7 +1906,7 @@ mod tests {
     #[test]
     fn request_mode_sync_is_noop_succeeds() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
         // sync() should succeed even in request mode (already fsynced)
         tl.sync().unwrap();
     }
@@ -1852,7 +1921,7 @@ mod tests {
         }));
 
         assert_eq!(tl.current_seq_no(), 0);
-        let entry = tl.append("index", json!({"doc": 1})).unwrap();
+        let entry = tl.append(WalOperation::Index, json!({"doc": 1})).unwrap();
         assert_eq!(entry.seq_no, 0);
         assert_eq!(tl.next_seq_no(), 1);
         let entries = tl.read_all().unwrap();
@@ -1872,11 +1941,11 @@ mod tests {
     #[test]
     fn size_bytes_grows_after_appends() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
         let s1 = tl.size_bytes().unwrap();
         assert!(s1 > 0);
 
-        tl.append("index", json!({"b": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
         let s2 = tl.size_bytes().unwrap();
         assert!(s2 > s1);
     }
@@ -1884,7 +1953,7 @@ mod tests {
     #[test]
     fn size_bytes_resets_after_truncate() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
         assert!(tl.size_bytes().unwrap() > 0);
 
         tl.truncate().unwrap();
@@ -1897,7 +1966,7 @@ mod tests {
     fn for_each_from_streams_all_entries_when_min_is_zero() {
         let (_dir, tl) = open_translog();
         for i in 0..5 {
-            tl.append("index", json!({"doc": i})).unwrap();
+            tl.append(WalOperation::Index, json!({"doc": i})).unwrap();
         }
 
         let mut collected = Vec::new();
@@ -1916,7 +1985,7 @@ mod tests {
     fn for_each_from_filters_below_min_seq() {
         let (_dir, tl) = open_translog();
         for i in 0..5 {
-            tl.append("index", json!({"doc": i})).unwrap();
+            tl.append(WalOperation::Index, json!({"doc": i})).unwrap();
         }
 
         let mut collected = Vec::new();
@@ -1941,8 +2010,8 @@ mod tests {
     #[test]
     fn for_each_from_with_min_above_all_entries_returns_zero() {
         let (_dir, tl) = open_translog();
-        tl.append("index", json!({"a": 1})).unwrap();
-        tl.append("index", json!({"b": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
 
         let count = tl.for_each_from(100, &mut |_| Ok(())).unwrap();
         assert_eq!(count, 0);
@@ -1963,9 +2032,9 @@ mod tests {
     fn scan_max_seq_no_from_path_with_entries() {
         let dir = tempfile::tempdir().unwrap();
         let tl = HotTranslog::open(dir.path()).unwrap();
-        tl.append("index", json!({"a": 1})).unwrap();
-        tl.append("index", json!({"b": 2})).unwrap();
-        tl.append("index", json!({"c": 3})).unwrap();
+        tl.append(WalOperation::Index, json!({"a": 1})).unwrap();
+        tl.append(WalOperation::Index, json!({"b": 2})).unwrap();
+        tl.append(WalOperation::Index, json!({"c": 3})).unwrap();
         drop(tl);
 
         let path = generation_path(dir.path(), 0);
@@ -1990,7 +2059,7 @@ mod tests {
         {
             let tl = HotTranslog::open(dir.path()).unwrap();
             for i in 0..100 {
-                tl.append("index", json!({"doc": i})).unwrap();
+                tl.append(WalOperation::Index, json!({"doc": i})).unwrap();
             }
         }
         // Reopen — the constructor now uses scan_max_seq_no internally
