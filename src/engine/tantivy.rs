@@ -1405,6 +1405,7 @@ impl HotEngine {
                                 output_name: m.output_name.clone(),
                                 function: m.function.clone(),
                                 field_name: m.field.clone(),
+                                field_expr: m.field_expr.clone(),
                             })
                             .collect(),
                     })
@@ -1475,16 +1476,16 @@ impl HotEngine {
                                         | crate::search::GroupedMetricFunction::Avg
                                         | crate::search::GroupedMetricFunction::Min
                                         | crate::search::GroupedMetricFunction::Max => {
-                                            let Some(field_name) = &metric.field_name else {
+                                            let Some(plan) = build_grouped_metric_plan(
+                                                schema,
+                                                ff,
+                                                metric.field_name.as_deref(),
+                                                metric.field_expr.as_ref(),
+                                            ) else {
                                                 unsupported = true;
                                                 break;
                                             };
-                                            let Some(column) = open_num_col(schema, ff, field_name)
-                                            else {
-                                                unsupported = true;
-                                                break;
-                                            };
-                                            GroupedMetricSource::Numeric(column)
+                                            GroupedMetricSource::Numeric(plan)
                                         }
                                     };
                                     if unsupported {
@@ -1545,11 +1546,14 @@ impl HotEngine {
                                         Vec::with_capacity(metric_entries.len());
                                     let mut num_numeric = 0usize;
                                     for me in &metric_entries {
-                                        if matches!(me.source, GroupedMetricSource::Numeric(_)) {
-                                            numeric_buf_map.push(Some(num_numeric));
-                                            num_numeric += 1;
-                                        } else {
-                                            numeric_buf_map.push(None);
+                                        match &me.source {
+                                            GroupedMetricSource::Numeric(plan) => {
+                                                numeric_buf_map.push(Some(num_numeric));
+                                                num_numeric += plan.leaf_count();
+                                            }
+                                            _ => {
+                                                numeric_buf_map.push(None);
+                                            }
                                         }
                                     }
                                     let mut accum_template =
@@ -1719,6 +1723,55 @@ fn open_num_col(
         tantivy::schema::FieldType::I64(_) => fast_fields.i64(entry.name()).ok().map(NumCol::I64),
         tantivy::schema::FieldType::U64(_) => fast_fields.i64(entry.name()).ok().map(NumCol::I64),
         _ => None,
+    }
+}
+
+fn build_grouped_metric_plan(
+    schema: &Schema,
+    fast_fields: &tantivy::fastfield::FastFieldReaders,
+    field_name: Option<&str>,
+    field_expr: Option<&crate::search::MetricFieldExpr>,
+) -> Option<GroupedMetricExprPlan> {
+    let expr = match (field_name, field_expr) {
+        (_, Some(expr)) => expr,
+        (Some(field_name), None) => {
+            return Some(GroupedMetricExprPlan {
+                leaves: vec![open_num_col(schema, fast_fields, field_name)?],
+                expr: MetricEvalExpr::Leaf(0),
+            });
+        }
+        (None, None) => return None,
+    };
+
+    let mut leaves = Vec::new();
+    let compiled = compile_grouped_metric_expr(schema, fast_fields, expr, &mut leaves)?;
+    Some(GroupedMetricExprPlan {
+        leaves,
+        expr: compiled,
+    })
+}
+
+fn compile_grouped_metric_expr(
+    schema: &Schema,
+    fast_fields: &tantivy::fastfield::FastFieldReaders,
+    expr: &crate::search::MetricFieldExpr,
+    leaves: &mut Vec<NumCol>,
+) -> Option<MetricEvalExpr> {
+    match expr {
+        crate::search::MetricFieldExpr::Field { name } => {
+            let index = leaves.len();
+            leaves.push(open_num_col(schema, fast_fields, name)?);
+            Some(MetricEvalExpr::Leaf(index))
+        }
+        crate::search::MetricFieldExpr::Binary { left, op, right } => {
+            let left = compile_grouped_metric_expr(schema, fast_fields, left, leaves)?;
+            let right = compile_grouped_metric_expr(schema, fast_fields, right, leaves)?;
+            Some(MetricEvalExpr::Binary {
+                left: Box::new(left),
+                op: *op,
+                right: Box::new(right),
+            })
+        }
     }
 }
 
@@ -2174,13 +2227,54 @@ struct ResolvedGroupedMetricSpec {
     output_name: String,
     function: crate::search::GroupedMetricFunction,
     field_name: Option<String>,
+    field_expr: Option<crate::search::MetricFieldExpr>,
+}
+
+enum MetricEvalExpr {
+    Leaf(usize),
+    Binary {
+        left: Box<MetricEvalExpr>,
+        op: crate::search::MetricFieldOp,
+        right: Box<MetricEvalExpr>,
+    },
+}
+
+impl MetricEvalExpr {
+    #[inline]
+    fn eval_at(&self, buffers: &[Vec<Option<f64>>], base: usize, row: usize) -> Option<f64> {
+        match self {
+            Self::Leaf(index) => buffers[base + index][row],
+            Self::Binary { left, op, right } => {
+                let left = left.eval_at(buffers, base, row)?;
+                let right = right.eval_at(buffers, base, row)?;
+                op.eval(left, right)
+            }
+        }
+    }
+}
+
+struct GroupedMetricExprPlan {
+    leaves: Vec<NumCol>,
+    expr: MetricEvalExpr,
+}
+
+impl GroupedMetricExprPlan {
+    #[inline]
+    fn leaf_count(&self) -> usize {
+        self.leaves.len()
+    }
+
+    #[inline]
+    fn eval_at(&self, buffers: &[Vec<Option<f64>>], base: usize, row: usize) -> Option<f64> {
+        self.expr.eval_at(buffers, base, row)
+    }
 }
 
 #[allow(dead_code)] // CountField reader will be used when null-aware count(field) is added
 enum GroupedMetricSource {
     CountAll,
     CountField(SqlFieldReader),
-    Numeric(NumCol),
+    Numeric(GroupedMetricExprPlan),
 }
 
 struct GroupedMetricEntry {
@@ -2384,9 +2478,9 @@ struct GroupedAggSegmentEntry {
     /// Reusable ordinal output buffer (avoids allocation per flush).
     ord_buffer: Vec<Option<u64>>,
     /// Reusable numeric value buffers — one per numeric metric (avoids per-doc reads).
-    /// Indices correspond to positions in `metric_entries` that are `Numeric`.
+    /// Indices correspond to the flattened leaf columns of each numeric metric.
     numeric_buffers: Vec<Vec<Option<f64>>>,
-    /// Maps metric_entries index → numeric_buffers index (None if not numeric).
+    /// Maps metric_entries index → first numeric buffer index (None if not numeric).
     numeric_buf_map: Vec<Option<usize>>,
 }
 
@@ -2428,6 +2522,7 @@ impl GroupedAggCollector {
                                 output_name: metric.output_name.clone(),
                                 function: metric.function.clone(),
                                 field_name: metric.field.clone(),
+                                field_expr: metric.field_expr.clone(),
                             })
                             .collect(),
                     })
@@ -2497,15 +2592,16 @@ impl tantivy::collector::Collector for GroupedAggCollector {
                     | crate::search::GroupedMetricFunction::Avg
                     | crate::search::GroupedMetricFunction::Min
                     | crate::search::GroupedMetricFunction::Max => {
-                        let Some(field_name) = &metric.field_name else {
+                        let Some(plan) = build_grouped_metric_plan(
+                            &self.schema,
+                            ff,
+                            metric.field_name.as_deref(),
+                            metric.field_expr.as_ref(),
+                        ) else {
                             unsupported = true;
                             break;
                         };
-                        let Some(column) = open_num_col(&self.schema, ff, field_name) else {
-                            unsupported = true;
-                            break;
-                        };
-                        GroupedMetricSource::Numeric(column)
+                        GroupedMetricSource::Numeric(plan)
                     }
                 };
                 let template = match &source {
@@ -2548,16 +2644,19 @@ impl tantivy::collector::Collector for GroupedAggCollector {
                 ))
             };
 
-            // Build numeric buffer mapping: for each metric entry, assign a
-            // numeric_buffers index if it's a Numeric source.
+            // Build numeric buffer mapping: for each metric entry, assign the
+            // first numeric_buffers index for that metric's leaf columns.
             let mut numeric_buf_map: Vec<Option<usize>> = Vec::with_capacity(metric_entries.len());
             let mut num_numeric = 0usize;
             for me in &metric_entries {
-                if matches!(me.source, GroupedMetricSource::Numeric(_)) {
-                    numeric_buf_map.push(Some(num_numeric));
-                    num_numeric += 1;
-                } else {
-                    numeric_buf_map.push(None);
+                match &me.source {
+                    GroupedMetricSource::Numeric(plan) => {
+                        numeric_buf_map.push(Some(num_numeric));
+                        num_numeric += plan.leaf_count();
+                    }
+                    _ => {
+                        numeric_buf_map.push(None);
+                    }
                 }
             }
             let numeric_buffers: Vec<Vec<Option<f64>>> =
@@ -2875,15 +2974,12 @@ fn flat_scan_segment(
     let mut doc_buffer: Vec<u32> = Vec::with_capacity(BATCH_SIZE);
     let mut ord_buffer: Vec<Option<u64>> = vec![None; BATCH_SIZE];
 
-    // Pre-allocate numeric batch buffers
-    let numeric_cols: Vec<Option<&NumCol>> = metric_entries
-        .iter()
-        .map(|me| match &me.source {
-            GroupedMetricSource::Numeric(col) => Some(col),
-            _ => None,
-        })
-        .collect();
-    let num_numeric = numeric_cols.iter().filter(|c| c.is_some()).count();
+    let mut num_numeric = 0usize;
+    for me in metric_entries.iter() {
+        if let GroupedMetricSource::Numeric(plan) = &me.source {
+            num_numeric += plan.leaf_count();
+        }
+    }
     let mut numeric_bufs: Vec<Vec<Option<f64>>> =
         (0..num_numeric).map(|_| vec![None; BATCH_SIZE]).collect();
     // Map: metric index → numeric_bufs index
@@ -2891,14 +2987,13 @@ fn flat_scan_segment(
         let mut idx = 0usize;
         metric_entries
             .iter()
-            .map(|me| {
-                if matches!(me.source, GroupedMetricSource::Numeric(_)) {
+            .map(|me| match &me.source {
+                GroupedMetricSource::Numeric(plan) => {
                     let i = idx;
-                    idx += 1;
+                    idx += plan.leaf_count();
                     Some(i)
-                } else {
-                    None
                 }
+                _ => None,
             })
             .collect()
     };
@@ -2911,9 +3006,9 @@ fn flat_scan_segment(
         doc_buffer.extend(start..end);
         flat_flush_batch(
             key_reader,
+            metric_entries,
             &doc_buffer,
             &mut ord_buffer,
-            &numeric_cols,
             &numeric_buf_map,
             &mut numeric_bufs,
             &mut flat_metrics,
@@ -3029,9 +3124,9 @@ enum FlatMetric {
 #[inline]
 fn flat_flush_batch(
     key_reader: &GroupKeyReader,
+    metric_entries: &[GroupedMetricEntry],
     doc_buffer: &[u32],
     ord_buffer: &mut Vec<Option<u64>>,
-    numeric_cols: &[Option<&NumCol>],
     numeric_buf_map: &[Option<usize>],
     numeric_bufs: &mut [Vec<Option<f64>>],
     flat_metrics: &mut [FlatMetric],
@@ -3048,25 +3143,17 @@ fn flat_flush_batch(
     }
     key_reader.keys_batch(doc_buffer, &mut ord_buffer[..batch_len]);
 
-    // Batch-read all numeric columns
-    for (metric_idx, maybe_col) in numeric_cols.iter().enumerate() {
-        if let Some(col) = maybe_col
-            && let Some(buf_idx) = numeric_buf_map[metric_idx]
-        {
-            let buf = &mut numeric_bufs[buf_idx];
-            if buf.len() < batch_len {
-                buf.resize(batch_len, None);
-            }
-            for slot in &mut buf[..batch_len] {
-                *slot = None;
-            }
-            col.first_vals_f64(doc_buffer, &mut buf[..batch_len]);
-        }
-    }
+    batch_read_metric_leaf_buffers(
+        metric_entries,
+        numeric_buf_map,
+        numeric_bufs,
+        doc_buffer,
+        batch_len,
+    );
 
     // Accumulate into flat arrays — direct indexed, no HashMap
-    for i in 0..batch_len {
-        let Some(ord) = ord_buffer[i] else {
+    for (i, maybe_ord) in ord_buffer.iter().enumerate().take(batch_len) {
+        let Some(ord) = *maybe_ord else {
             continue; // NULL ordinal — skip
         };
         let ord = ord as usize;
@@ -3085,9 +3172,12 @@ fn flat_flush_batch(
                     min,
                     max,
                 } => {
-                    if let Some(buf_idx) = numeric_buf_map[metric_idx]
-                        && let Some(val) = numeric_bufs[buf_idx][i]
-                    {
+                    if let Some(val) = metric_numeric_value(
+                        &metric_entries[metric_idx],
+                        numeric_buf_map[metric_idx],
+                        numeric_bufs,
+                        i,
+                    ) {
                         count[ord] += 1;
                         sum[ord] += val;
                         if val < min[ord] {
@@ -3101,6 +3191,58 @@ fn flat_flush_batch(
             }
         }
     }
+}
+
+fn batch_read_metric_leaf_buffers(
+    metric_entries: &[GroupedMetricEntry],
+    numeric_buf_map: &[Option<usize>],
+    numeric_buffers: &mut [Vec<Option<f64>>],
+    docs: &[u32],
+    batch_len: usize,
+) {
+    for (metric_idx, metric) in metric_entries.iter().enumerate() {
+        let Some(buf_idx) = numeric_buf_map[metric_idx] else {
+            continue;
+        };
+        let GroupedMetricSource::Numeric(plan) = &metric.source else {
+            continue;
+        };
+        for (leaf_idx, col) in plan.leaves.iter().enumerate() {
+            let buf = &mut numeric_buffers[buf_idx + leaf_idx];
+            if buf.len() < batch_len {
+                buf.resize(batch_len, None);
+            }
+            for slot in &mut buf[..batch_len] {
+                *slot = None;
+            }
+            col.first_vals_f64(docs, &mut buf[..batch_len]);
+        }
+    }
+}
+
+#[inline]
+fn metric_numeric_value(
+    metric: &GroupedMetricEntry,
+    buf_idx: Option<usize>,
+    numeric_buffers: &[Vec<Option<f64>>],
+    row: usize,
+) -> Option<f64> {
+    let buf_idx = buf_idx?;
+    match &metric.source {
+        GroupedMetricSource::Numeric(plan) => plan.eval_at(numeric_buffers, buf_idx, row),
+        _ => None,
+    }
+}
+
+/// Batch-read all numeric leaf columns into the entry's numeric buffers.
+fn batch_read_numeric_buffers(entry: &mut GroupedAggSegmentEntry, batch_len: usize) {
+    batch_read_metric_leaf_buffers(
+        &entry.metric_entries,
+        &entry.numeric_buf_map,
+        &mut entry.numeric_buffers,
+        &entry.doc_buffer,
+        batch_len,
+    );
 }
 
 /// Flush a batch of buffered doc IDs: batch-read ordinals AND numeric values,
@@ -3124,20 +3266,7 @@ fn flush_batch(entry: &mut GroupedAggSegmentEntry) {
     }
 
     // Batch-read all numeric columns upfront (sequential memory access).
-    for (metric_idx, metric) in entry.metric_entries.iter().enumerate() {
-        if let Some(buf_idx) = entry.numeric_buf_map[metric_idx]
-            && let GroupedMetricSource::Numeric(col) = &metric.source
-        {
-            let buf = &mut entry.numeric_buffers[buf_idx];
-            if buf.len() < batch_len {
-                buf.resize(batch_len, None);
-            }
-            for slot in &mut buf[..batch_len] {
-                *slot = None;
-            }
-            col.first_vals_f64(&entry.doc_buffer, &mut buf[..batch_len]);
-        }
-    }
+    batch_read_numeric_buffers(entry, batch_len);
 
     let GroupedBuckets::Single(map) = &mut entry.buckets else {
         entry.doc_buffer.clear();
@@ -3170,7 +3299,9 @@ fn flush_batch(entry: &mut GroupedAggSegmentEntry) {
                         | crate::search::GroupedMetricFunction::Max,
                         Some(buf_idx),
                     ) => {
-                        let Some(value) = entry.numeric_buffers[*buf_idx][i] else {
+                        let Some(value) =
+                            metric_numeric_value(metric, Some(*buf_idx), &entry.numeric_buffers, i)
+                        else {
                             continue;
                         };
                         if let CompactMetricAccum::Stats {
@@ -3227,20 +3358,7 @@ fn flush_batch_multi(entry: &mut GroupedAggSegmentEntry) {
     }
 
     // Batch-read all numeric columns upfront (sequential memory access).
-    for (metric_idx, metric) in entry.metric_entries.iter().enumerate() {
-        if let Some(buf_idx) = entry.numeric_buf_map[metric_idx]
-            && let GroupedMetricSource::Numeric(col) = &metric.source
-        {
-            let buf = &mut entry.numeric_buffers[buf_idx];
-            if buf.len() < batch_len {
-                buf.resize(batch_len, None);
-            }
-            for slot in &mut buf[..batch_len] {
-                *slot = None;
-            }
-            col.first_vals_f64(&entry.doc_buffer, &mut buf[..batch_len]);
-        }
-    }
+    batch_read_numeric_buffers(entry, batch_len);
 
     let has_numeric = !entry.numeric_buffers.is_empty();
 
@@ -3291,7 +3409,9 @@ fn flush_batch_multi(entry: &mut GroupedAggSegmentEntry) {
                         | crate::search::GroupedMetricFunction::Max,
                         Some(buf_idx),
                     ) => {
-                        let Some(value) = entry.numeric_buffers[*buf_idx][i] else {
+                        let Some(value) =
+                            metric_numeric_value(metric, Some(*buf_idx), &entry.numeric_buffers, i)
+                        else {
                             continue;
                         };
                         if let CompactMetricAccum::Stats {
@@ -4403,6 +4523,8 @@ struct StreamingSegmentState {
     score_builder: datafusion::arrow::array::Float32Builder,
     col_builders: Vec<ColumnBuilder>,
     id_text: String,
+    doc_buffer: Vec<tantivy::DocId>,
+    id_ords: Vec<Option<u64>>,
     rows_in_batch: usize,
 }
 
@@ -4429,6 +4551,8 @@ impl StreamingSegmentState {
             score_builder: datafusion::arrow::array::Float32Builder::with_capacity(batch_size),
             col_builders,
             id_text: String::new(),
+            doc_buffer: Vec::with_capacity(batch_size),
+            id_ords: vec![None; batch_size],
             rows_in_batch: 0,
         }
     }
@@ -4507,7 +4631,8 @@ impl StreamingBatchState {
                 .as_mut()
                 .expect("segment state must exist after open_next_segment");
 
-            while segment.rows_in_batch < self.batch_size {
+            segment.doc_buffer.clear();
+            while segment.doc_buffer.len() < self.batch_size {
                 let Some(doc_id) = segment.cursor.next_doc() else {
                     break;
                 };
@@ -4516,31 +4641,12 @@ impl StreamingBatchState {
                     break;
                 }
 
-                if self.needs_id {
-                    if let Some(reader) = &segment.id_reader {
-                        if reader.first_text(doc_id, &mut segment.id_text) {
-                            segment.id_builder.append_value(&segment.id_text);
-                        } else {
-                            segment.id_builder.append_value("");
-                        }
-                    } else {
-                        segment.id_builder.append_value("");
-                    }
-                } else {
-                    segment.id_builder.append_value("");
-                }
+                segment.doc_buffer.push(doc_id);
+            }
 
-                segment.score_builder.append_value(0.0);
-
-                for (builder, reader) in segment
-                    .col_builders
-                    .iter_mut()
-                    .zip(segment.field_readers.iter())
-                {
-                    builder.append(reader, doc_id);
-                }
-
-                segment.rows_in_batch += 1;
+            if !segment.doc_buffer.is_empty() {
+                HotEngine::append_streaming_batch_values(segment, self.needs_id);
+                segment.rows_in_batch = segment.doc_buffer.len();
             }
 
             if segment.rows_in_batch > 0 {
@@ -4641,6 +4747,10 @@ impl HotEngine {
             batch_size
         };
 
+        let non_empty: Vec<SegmentBitSet> = segment_bitsets
+            .into_iter()
+            .filter(|s| s.count > 0)
+            .collect();
         let mut state = StreamingBatchState {
             searcher,
             schema,
@@ -4649,7 +4759,7 @@ impl HotEngine {
             arrow_schema,
             batch_size,
             needs_id,
-            remaining_segments: segment_bitsets.into_iter(),
+            remaining_segments: non_empty.into_iter(),
             current_segment: None,
             empty_batch_pending: total_hits == 0,
         };
@@ -4688,6 +4798,56 @@ impl HotEngine {
         })
     }
 
+    fn append_streaming_batch_values(segment: &mut StreamingSegmentState, needs_id: bool) {
+        let doc_ids = segment.doc_buffer.as_slice();
+
+        if needs_id {
+            if segment.id_ords.len() < doc_ids.len() {
+                segment.id_ords.resize(doc_ids.len(), None);
+            }
+
+            if let Some(reader) = &segment.id_reader {
+                for ord in &mut segment.id_ords[..doc_ids.len()] {
+                    *ord = None;
+                }
+                reader.first_ords_batch(doc_ids, &mut segment.id_ords[..doc_ids.len()]);
+
+                for ord in &segment.id_ords[..doc_ids.len()] {
+                    if let Some(ord) = ord {
+                        segment.id_text.clear();
+                        if reader.ord_to_str(*ord, &mut segment.id_text) {
+                            segment.id_builder.append_value(&segment.id_text);
+                        } else {
+                            segment.id_builder.append_value("");
+                        }
+                    } else {
+                        segment.id_builder.append_value("");
+                    }
+                }
+            } else {
+                for _ in doc_ids {
+                    segment.id_builder.append_value("");
+                }
+            }
+        } else {
+            for _ in doc_ids {
+                segment.id_builder.append_value("");
+            }
+        }
+
+        for _ in doc_ids {
+            segment.score_builder.append_value(0.0);
+        }
+
+        for (builder, reader) in segment
+            .col_builders
+            .iter_mut()
+            .zip(segment.field_readers.iter())
+        {
+            builder.append_batch(reader, doc_ids);
+        }
+    }
+
     fn finalize_streaming_batch(
         schema: &std::sync::Arc<datafusion::arrow::datatypes::Schema>,
         id_builder: &mut datafusion::arrow::array::StringBuilder,
@@ -4708,12 +4868,22 @@ impl HotEngine {
 // ─── Column builder helpers for streaming batches ──────────────────────────
 
 enum ColumnBuilder {
-    F64(datafusion::arrow::array::Float64Builder),
-    I64(datafusion::arrow::array::Int64Builder),
-    TimestampMillis(datafusion::arrow::array::TimestampMillisecondBuilder),
+    F64 {
+        builder: datafusion::arrow::array::Float64Builder,
+        values: Vec<Option<f64>>,
+    },
+    I64 {
+        builder: datafusion::arrow::array::Int64Builder,
+        values: Vec<Option<i64>>,
+    },
+    TimestampMillis {
+        builder: datafusion::arrow::array::TimestampMillisecondBuilder,
+        values: Vec<Option<i64>>,
+    },
     Str {
         builder: datafusion::arrow::array::StringBuilder,
         scratch: String,
+        ords: Vec<Option<u64>>,
     },
     Null(datafusion::arrow::array::StringBuilder),
 }
@@ -4721,22 +4891,28 @@ enum ColumnBuilder {
 impl ColumnBuilder {
     fn new(reader: &SqlFieldReader, capacity: usize) -> Self {
         match reader {
-            SqlFieldReader::F64(_) => ColumnBuilder::F64(
-                datafusion::arrow::array::Float64Builder::with_capacity(capacity),
-            ),
-            SqlFieldReader::I64(_) => ColumnBuilder::I64(
-                datafusion::arrow::array::Int64Builder::with_capacity(capacity),
-            ),
-            SqlFieldReader::DateMillis(_) => ColumnBuilder::TimestampMillis(
-                datafusion::arrow::array::TimestampMillisecondBuilder::with_capacity(capacity)
-                    .with_timezone("UTC".to_string()),
-            ),
+            SqlFieldReader::F64(_) => ColumnBuilder::F64 {
+                builder: datafusion::arrow::array::Float64Builder::with_capacity(capacity),
+                values: vec![None; capacity],
+            },
+            SqlFieldReader::I64(_) => ColumnBuilder::I64 {
+                builder: datafusion::arrow::array::Int64Builder::with_capacity(capacity),
+                values: vec![None; capacity],
+            },
+            SqlFieldReader::DateMillis(_) => ColumnBuilder::TimestampMillis {
+                builder: datafusion::arrow::array::TimestampMillisecondBuilder::with_capacity(
+                    capacity,
+                )
+                .with_timezone("UTC".to_string()),
+                values: vec![None; capacity],
+            },
             SqlFieldReader::Str(_) => ColumnBuilder::Str {
                 builder: datafusion::arrow::array::StringBuilder::with_capacity(
                     capacity,
                     capacity * 16,
                 ),
                 scratch: String::new(),
+                ords: vec![None; capacity],
             },
             SqlFieldReader::SourceFallback => {
                 ColumnBuilder::Null(datafusion::arrow::array::StringBuilder::new())
@@ -4744,35 +4920,89 @@ impl ColumnBuilder {
         }
     }
 
-    fn append(&mut self, reader: &SqlFieldReader, doc_id: u32) {
+    fn append_batch(&mut self, reader: &SqlFieldReader, docs: &[tantivy::DocId]) {
         match (self, reader) {
-            (ColumnBuilder::F64(b), SqlFieldReader::F64(col)) => match col.first(doc_id) {
-                Some(v) => b.append_value(v),
-                None => b.append_null(),
-            },
-            (ColumnBuilder::I64(b), SqlFieldReader::I64(col)) => match col.first(doc_id) {
-                Some(v) => b.append_value(v),
-                None => b.append_null(),
-            },
-            (ColumnBuilder::TimestampMillis(b), SqlFieldReader::DateMillis(col)) => {
-                match col.first(doc_id) {
-                    Some(v) => b.append_value(v),
-                    None => b.append_null(),
+            (ColumnBuilder::F64 { builder, values }, SqlFieldReader::F64(col)) => {
+                if values.len() < docs.len() {
+                    values.resize(docs.len(), None);
+                }
+                for value in &mut values[..docs.len()] {
+                    *value = None;
+                }
+                col.first_vals(docs, &mut values[..docs.len()]);
+                for value in values[..docs.len()].iter().copied() {
+                    match value {
+                        Some(v) => builder.append_value(v),
+                        None => builder.append_null(),
+                    }
                 }
             }
-            (ColumnBuilder::Str { builder, scratch }, SqlFieldReader::Str(col)) => {
-                if col.first_text(doc_id, scratch) {
-                    builder.append_value(scratch.as_str());
-                } else {
+            (ColumnBuilder::I64 { builder, values }, SqlFieldReader::I64(col)) => {
+                if values.len() < docs.len() {
+                    values.resize(docs.len(), None);
+                }
+                for value in &mut values[..docs.len()] {
+                    *value = None;
+                }
+                col.first_vals(docs, &mut values[..docs.len()]);
+                for value in values[..docs.len()].iter().copied() {
+                    match value {
+                        Some(v) => builder.append_value(v),
+                        None => builder.append_null(),
+                    }
+                }
+            }
+            (
+                ColumnBuilder::TimestampMillis { builder, values },
+                SqlFieldReader::DateMillis(col),
+            ) => {
+                if values.len() < docs.len() {
+                    values.resize(docs.len(), None);
+                }
+                for value in &mut values[..docs.len()] {
+                    *value = None;
+                }
+                col.first_vals(docs, &mut values[..docs.len()]);
+                for value in values[..docs.len()].iter().copied() {
+                    match value {
+                        Some(v) => builder.append_value(v),
+                        None => builder.append_null(),
+                    }
+                }
+            }
+            (
+                ColumnBuilder::Str {
+                    builder,
+                    scratch,
+                    ords,
+                },
+                SqlFieldReader::Str(col),
+            ) => {
+                if ords.len() < docs.len() {
+                    ords.resize(docs.len(), None);
+                }
+                for ord in &mut ords[..docs.len()] {
+                    *ord = None;
+                }
+                col.first_ords_batch(docs, &mut ords[..docs.len()]);
+                for ord in ords[..docs.len()].iter().copied() {
+                    if let Some(ord) = ord {
+                        scratch.clear();
+                        if col.ord_to_str(ord, scratch) {
+                            builder.append_value(scratch.as_str());
+                        } else {
+                            builder.append_null();
+                        }
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            (ColumnBuilder::Null(builder), _) => {
+                for _ in docs {
                     builder.append_null();
                 }
             }
-            (ColumnBuilder::Null(b), _) => {
-                b.append_null();
-            }
-            // SourceFallback should never reach here — can_stream_sql_batches rejects it.
-            // Type mismatches should also never happen. Panic to surface bugs immediately
-            // instead of silently producing column-length mismatches that crash later.
             (_, SqlFieldReader::SourceFallback) => {
                 unreachable!(
                     "SourceFallback column should have been rejected by can_stream_sql_batches"
@@ -4791,9 +5021,9 @@ impl ColumnBuilder {
     fn finish(&mut self) -> datafusion::arrow::array::ArrayRef {
         use std::sync::Arc;
         match self {
-            ColumnBuilder::F64(b) => Arc::new(b.finish()),
-            ColumnBuilder::I64(b) => Arc::new(b.finish()),
-            ColumnBuilder::TimestampMillis(b) => Arc::new(b.finish()),
+            ColumnBuilder::F64 { builder, .. } => Arc::new(builder.finish()),
+            ColumnBuilder::I64 { builder, .. } => Arc::new(builder.finish()),
+            ColumnBuilder::TimestampMillis { builder, .. } => Arc::new(builder.finish()),
             ColumnBuilder::Str { builder, .. } => Arc::new(builder.finish()),
             ColumnBuilder::Null(b) => Arc::new(b.finish()),
         }
@@ -4801,9 +5031,9 @@ impl ColumnBuilder {
 
     fn type_name(&self) -> &'static str {
         match self {
-            ColumnBuilder::F64(_) => "F64",
-            ColumnBuilder::I64(_) => "I64",
-            ColumnBuilder::TimestampMillis(_) => "TimestampMillis",
+            ColumnBuilder::F64 { .. } => "F64",
+            ColumnBuilder::I64 { .. } => "I64",
+            ColumnBuilder::TimestampMillis { .. } => "TimestampMillis",
             ColumnBuilder::Str { .. } => "Str",
             ColumnBuilder::Null(_) => "Null",
         }
@@ -5116,11 +5346,13 @@ mod tests {
                             output_name: "total".into(),
                             function: GroupedMetricFunction::Count,
                             field: None,
+                            field_expr: None,
                         },
                         GroupedMetricAgg {
                             output_name: "avg_price".into(),
                             function: GroupedMetricFunction::Avg,
                             field: Some("price".into()),
+                            field_expr: None,
                         },
                     ],
                     shard_top_k: None,
@@ -8803,6 +9035,14 @@ mod tests {
         }
     }
 
+    /// Helper: extract avg from a GroupedMetricPartial::Stats
+    fn metric_avg(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
+        match &bucket.metrics[name] {
+            crate::search::GroupedMetricPartial::Stats { count, sum, .. } => *sum / *count as f64,
+            _ => panic!("expected Stats for {}", name),
+        }
+    }
+
     /// Helper: extract min from a GroupedMetricPartial::Stats
     fn metric_min(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
         match &bucket.metrics[name] {
@@ -8896,11 +9136,13 @@ mod tests {
                     output_name: "total".into(),
                     function: GroupedMetricFunction::Count,
                     field: None,
+                    field_expr: None,
                 },
                 GroupedMetricAgg {
                     output_name: "sum_price".into(),
                     function: GroupedMetricFunction::Sum,
                     field: Some("price".into()),
+                    field_expr: None,
                 },
             ],
         );
@@ -8965,11 +9207,13 @@ mod tests {
                     output_name: "min_price".into(),
                     function: GroupedMetricFunction::Min,
                     field: Some("price".into()),
+                    field_expr: None,
                 },
                 GroupedMetricAgg {
                     output_name: "max_price".into(),
                     function: GroupedMetricFunction::Max,
                     field: Some("price".into()),
+                    field_expr: None,
                 },
             ],
         );
@@ -9007,6 +9251,7 @@ mod tests {
                 output_name: "avg_price".into(),
                 function: GroupedMetricFunction::Avg,
                 field: Some("price".into()),
+                field_expr: None,
             }],
         );
 
@@ -9046,21 +9291,25 @@ mod tests {
                     output_name: "total".into(),
                     function: GroupedMetricFunction::Count,
                     field: None,
+                    field_expr: None,
                 },
                 GroupedMetricAgg {
                     output_name: "sum_price".into(),
                     function: GroupedMetricFunction::Sum,
                     field: Some("price".into()),
+                    field_expr: None,
                 },
                 GroupedMetricAgg {
                     output_name: "sum_qty".into(),
                     function: GroupedMetricFunction::Sum,
                     field: Some("quantity".into()),
+                    field_expr: None,
                 },
                 GroupedMetricAgg {
                     output_name: "max_qty".into(),
                     function: GroupedMetricFunction::Max,
                     field: Some("quantity".into()),
+                    field_expr: None,
                 },
             ],
         );
@@ -9099,6 +9348,7 @@ mod tests {
                 output_name: "cnt".into(),
                 function: GroupedMetricFunction::Count,
                 field: None,
+                field_expr: None,
             }],
         );
 
@@ -9120,6 +9370,118 @@ mod tests {
             .unwrap();
         assert_eq!(metric_count(apple, "cnt"), 1025);
         assert_eq!(metric_count(samsung, "cnt"), 1025);
+    }
+
+    #[test]
+    fn grouped_batch_numeric_expression_sum_correctness() {
+        use crate::search::*;
+
+        let n = 2050;
+        let (_dir, engine) = create_grouped_numeric_engine(n);
+        let req = grouped_numeric_request(
+            n,
+            vec![GroupedMetricAgg {
+                output_name: "gross".into(),
+                function: GroupedMetricFunction::Sum,
+                field: None,
+                field_expr: Some(MetricFieldExpr::binary(
+                    MetricFieldExpr::field("price"),
+                    MetricFieldOp::Add,
+                    MetricFieldExpr::field("quantity"),
+                )),
+            }],
+        );
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, n);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+
+        let apple = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Apple")
+            .unwrap();
+        let samsung = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Samsung")
+            .unwrap();
+
+        let expected_apple: f64 = (0..n)
+            .filter(|i| i % 2 == 0)
+            .map(|i| (100.0 + i as f64) + (i + 1) as f64)
+            .sum();
+        let expected_samsung: f64 = (0..n)
+            .filter(|i| i % 2 == 1)
+            .map(|i| (100.0 + i as f64) + (i + 1) as f64)
+            .sum();
+
+        assert!((metric_sum(apple, "gross") - expected_apple).abs() < 0.01);
+        assert!((metric_sum(samsung, "gross") - expected_samsung).abs() < 0.01);
+    }
+
+    #[test]
+    fn grouped_batch_nested_numeric_expression_avg_correctness() {
+        use crate::search::*;
+
+        let n = 2050;
+        let (_dir, engine) = create_grouped_numeric_engine(n);
+        let req = grouped_numeric_request(
+            n,
+            vec![GroupedMetricAgg {
+                output_name: "platform_margin".into(),
+                function: GroupedMetricFunction::Avg,
+                field: None,
+                field_expr: Some(MetricFieldExpr::binary(
+                    MetricFieldExpr::binary(
+                        MetricFieldExpr::field("price"),
+                        MetricFieldOp::Sub,
+                        MetricFieldExpr::field("quantity"),
+                    ),
+                    MetricFieldOp::Div,
+                    MetricFieldExpr::field("price"),
+                )),
+            }],
+        );
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, n);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+
+        let apple = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Apple")
+            .unwrap();
+        let samsung = buckets
+            .iter()
+            .find(|b| b.group_values[0] == "Samsung")
+            .unwrap();
+
+        let expected_apple: f64 = (0..n)
+            .filter(|i| i % 2 == 0)
+            .map(|i| {
+                let price = 100.0 + i as f64;
+                let quantity = (i + 1) as f64;
+                (price - quantity) / price
+            })
+            .sum::<f64>()
+            / (n / 2) as f64;
+        let expected_samsung: f64 = (0..n)
+            .filter(|i| i % 2 == 1)
+            .map(|i| {
+                let price = 100.0 + i as f64;
+                let quantity = (i + 1) as f64;
+                (price - quantity) / price
+            })
+            .sum::<f64>()
+            / (n / 2) as f64;
+
+        assert!((metric_avg(apple, "platform_margin") - expected_apple).abs() < 0.000001);
+        assert!((metric_avg(samsung, "platform_margin") - expected_samsung).abs() < 0.000001);
     }
 
     // ── BitSet collector + streaming batches ────────────────────────────
@@ -9492,6 +9854,106 @@ mod tests {
     }
 
     #[test]
+    fn bitset_streaming_multisegment_preserves_values_batch_for_batch() {
+        let (_dir, engine) = create_typed_engine();
+
+        for (doc_id, title, category, price) in [
+            ("doc-1", "Widget", "gadgets", 19.99),
+            ("doc-2", "Sprocket", "parts", 5.50),
+            ("doc-3", "Bolt", "parts", 1.25),
+            ("doc-4", "Cog", "gadgets", 3.75),
+        ] {
+            engine
+                .add_document(
+                    doc_id,
+                    json!({"title": title, "category": category, "price": price}),
+                )
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        let segment_count = engine.segment_infos().len();
+        assert!(
+            segment_count >= 2,
+            "expected multiple segments before streaming, got {}",
+            segment_count
+        );
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+
+        let streaming = engine
+            .sql_streaming_batches(
+                &req,
+                &["title".into(), "category".into(), "price".into()],
+                true,
+                false,
+                2,
+            )
+            .unwrap();
+
+        assert!(
+            streaming.batches.len() >= 2,
+            "expected multiple streamed batches"
+        );
+
+        let mut rows = Vec::new();
+        for batch in &streaming.batches {
+            assert!(batch.num_rows() <= 2, "batch exceeded requested batch size");
+            let id_col = batch
+                .column_by_name("_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .unwrap();
+            let title_col = batch
+                .column_by_name("title")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .unwrap();
+            let category_col = batch
+                .column_by_name("category")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .unwrap();
+            let price_col = batch
+                .column_by_name("price")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Float64Array>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    id_col.value(i).to_string(),
+                    title_col.value(i).to_string(),
+                    category_col.value(i).to_string(),
+                    price_col.value(i),
+                ));
+            }
+        }
+
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            rows,
+            vec![
+                ("doc-1".into(), "Widget".into(), "gadgets".into(), 19.99),
+                ("doc-2".into(), "Sprocket".into(), "parts".into(), 5.50),
+                ("doc-3".into(), "Bolt".into(), "parts".into(), 1.25),
+                ("doc-4".into(), "Cog".into(), "gadgets".into(), 3.75),
+            ]
+        );
+    }
+
+    #[test]
     fn bitset_streaming_rejected_for_source_fallback_columns() {
         let (_dir, engine) = create_engine();
         engine
@@ -9780,6 +10242,7 @@ mod tests {
                 output_name: "posts".into(),
                 function: crate::search::GroupedMetricFunction::Count,
                 field: None,
+                field_expr: None,
             }],
             shard_top_k: Some(crate::search::ShardTopK {
                 limit: 40,

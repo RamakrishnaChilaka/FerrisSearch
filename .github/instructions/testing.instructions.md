@@ -1,14 +1,14 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **978 unit tests** (`cargo test --lib`)
+- **985 unit tests** (`cargo test --lib`)
 - **64 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
 - **42 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
-- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 175 assertions across 4 files
-- **1158 total** (`cargo test`)
+- **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 179 assertions across 4 files
+- **1165 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -49,6 +49,8 @@ cargo test -- test_name                         # Single test by name
 - For feature-gated transport TLS changes, run both `cargo test --lib` and `cargo test --lib --features transport-tls`; enabling TLS without the feature must error instead of silently downgrading to plaintext.
 - For transport TLS end-to-end coverage, also run `cargo test --test replication_integration --features transport-tls`.
 - For SQL fast-field string changes, add regressions for both `sql_record_batch()` and `sql_streaming_batches()` that assert `_id` and keyword values survive the optimized ordinal path.
+- For streamed fast-field scan optimizations, add a value-level regression that integer and date columns survive `sql_streaming_batches()` batch-for-batch against `sql_record_batch()`, not just a schema-equality check.
+- For multi-segment streamed fast-field regressions, force multiple segments up front and assert the segment count before executing the streaming path so the test cannot pass accidentally on a single-segment index.
 - For local streamed SQL execution changes, add unit coverage that `sql_streaming_batch_handle()` matches `sql_streaming_batches()` batch-for-batch on the same query and that zero-hit handles emit exactly one empty batch before returning `None`.
 - For new `SearchRequest` / `QueryClause` variants, add a serde JSON roundtrip regression because search DSL requests cross transport boundaries as serialized JSON.
 - For streamed shard SQL transport changes, add a real gRPC integration test that forces multiple Arrow batches from `forward_sql_batch_stream_to_shard()` / `SqlRecordBatchStream`, not just unit tests around IPC decoding.
@@ -127,6 +129,7 @@ cargo test -- test_name                         # Single test by name
 - **GROUP BY scan limit**: Expression GROUP BY and unsupported-aggregate GROUP BY fall to `tantivy_fast_fields` with a raised scan limit (`sql_group_by_scan_limit`, default 1M). Test that: (1) `has_group_by_fallback` is true for expression GROUP BY / unsupported aggs, false for plain GROUP BY and flat queries, (2) the `group_by_scan_limit_exceeded` error fires when a capped fallback path collects fewer rows than it matched (unit test with `sql_group_by_scan_limit: 1` and a text/source-fallback GROUP BY), (3) a fully fast-field-backed local expression GROUP BY can stream past that tiny limit and still succeed, and (4) fallback queries that reference text/source-fallback columns or `_score` stay correct instead of being forced onto the bitset streaming path.
 - **Searched CASE bucket grouping**: Add planner coverage for the supported searched-`CASE` bucket shape (`CASE WHEN field >= ... AND field < ... THEN 'bucket' ... END`) staying on `tantivy_grouped_partials`, plus a runtime regression for the derived bucket assignment itself. Also keep neighboring negative tests proving non-literal `ELSE` branches fall back, non-string-backed source fields fall back before execution, and unrelated expression GROUP BY shapes (for example `LOWER(field)`) still fall back.
 - **Residual expression tree**: Queries like `ROUND(AVG(x), 2)`, `AVG(x) + AVG(y)`, `SUM(a) / COUNT(*)`, `MAX(x) - MIN(x)` must use `tantivy_grouped_partials` with `residual_expr`. Test that: (1) hidden metrics are extracted for each inner aggregate, (2) the projected metric has `residual_expr: Some(...)`, (3) ROUND/CAST/arithmetic are correctly represented in the tree, (4) `eval_residual_expr` produces correct values including integer preservation for `MAX - MIN` on integer fields, and (5) ORDER BY on residual-expr metrics works correctly.
+- **Nested grouped metric expressions**: Cover grouped aggregates whose argument is itself a nested per-doc arithmetic tree, for example `AVG((fare - pay) / fare)`. Add both planner coverage proving the query stays on `tantivy_grouped_partials` and engine coverage proving the batched fast-field evaluator computes the correct merged result.
 - Live tests should inspect the `planner`, `execution_mode`, `streaming_used`, and `truncated` fields, not just the returned rows.
 - Add regression tests when planner or execution changes accidentally widen the fallback path for queries that should stay search-aware.
 
@@ -157,7 +160,8 @@ The industry standard for SQL engine correctness testing is [sqllogictest](https
 - **Runner**: `tests/sql_correctness.rs` — implements sync `DB` trait via `FerrisDB` adapter that calls `execute_sql_for_testing()` with `block_in_place` + `Handle::current()` bridge
 - **Test files**: `tests/slt/*.slt` — automatically discovered and run
 - **Dataset**: 10 HN-style docs with known values (5 authors, 5 categories, deterministic upvotes/comments)
-- **Coverage**: 175 assertions across 4 `.slt` files covering `count(*)`, `GROUP BY`, `HAVING`, same-index semijoins, case-insensitive unquoted columns, `LIMIT`, `OFFSET`, single and multiple top-level `text_match` predicates, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY, and CASE-based grouped aggregates
+- **Coverage**: 179 assertions across 4 `.slt` files covering `count(*)`, `GROUP BY`, `HAVING`, same-index semijoins, case-insensitive unquoted columns, `LIMIT`, `OFFSET`, single and multiple top-level `text_match` predicates, `sum`, `avg`, `min`, `max`, alias non-pushdown, tie-breaking ORDER BY, CASE-based grouped aggregates, and exact per-row arithmetic aggregate semantics (`AVG(x / y)` vs `SUM(x) / SUM(y)`)
+- **Float presentation rule**: The sqllogictest adapter compares rounded text output. When a regression needs one-decimal user-visible output, make that rounding explicit in SQL with `ROUND(..., 1)` and keep an exact-value Rust assertion in `tests/sql_correctness.rs` for the unrounded semantics.
 - **HAVING coverage rule**: Always test HAVING with **both** alias-based (`HAVING cnt > 1`) and aggregate-expression (`HAVING COUNT(*) > 1`) forms. These take different code paths in the planner — alias goes through `expr_to_field_name`, aggregate expression goes through `resolve_having_name` → `parse_grouped_metric`. Missing one form caused a regression where HAVING with aggregate expressions silently fell to the wrong execution path.
 - **Adding tests**: Create new `.slt` files in `tests/slt/` — the runner picks them up automatically
 - **Tie-breaking**: Always use secondary sort (e.g., `ORDER BY posts DESC, author ASC`) in `.slt` tests to avoid non-deterministic ordering

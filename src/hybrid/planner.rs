@@ -132,6 +132,11 @@ impl BindContext {
                     if let Some(ref field) = metric.field {
                         columns.insert(field.clone());
                     }
+                    if let Some(ref expr) = metric.field_expr {
+                        let mut fields = Vec::new();
+                        expr.collect_fields(&mut fields);
+                        columns.extend(fields.into_iter().map(str::to_string));
+                    }
                 }
                 BoundSelectItem::Wildcard => {
                     // SELECT * — columns come from _source; no explicit columns needed
@@ -561,6 +566,11 @@ fn collect_expr_source_columns_with_flags(
                 if let Some(field) = &metric.field {
                     columns.insert(field.clone());
                 }
+                if let Some(field_expr) = &metric.field_expr {
+                    let mut fields = Vec::new();
+                    field_expr.collect_fields(&mut fields);
+                    columns.extend(fields.into_iter().map(str::to_string));
+                }
                 return;
             }
             if let FunctionArguments::List(list) = &func.args {
@@ -633,6 +643,11 @@ fn collect_expr_columns_alias_aware_into(
     if let Ok(Some(metric)) = parse_grouped_metric(expr, None) {
         if let Some(field) = metric.field {
             columns.insert(field);
+        }
+        if let Some(field_expr) = metric.field_expr {
+            let mut fields = Vec::new();
+            field_expr.collect_fields(&mut fields);
+            columns.extend(fields.into_iter().map(str::to_string));
         }
         return;
     }
@@ -916,6 +931,9 @@ pub struct SqlGroupedMetric {
     pub output_name: String,
     pub function: SqlGroupedMetricFunction,
     pub field: Option<String>,
+    /// Per-doc binary expression on two fields (e.g. `SUM(a + b)`).
+    /// When set, the collector reads both columns and computes inline.
+    pub field_expr: Option<crate::search::MetricFieldExpr>,
     pub projected: bool,
     /// When the SELECT item is not a bare aggregate, this holds the scalar
     /// expression tree to evaluate after merge.  `None` means the metric
@@ -1072,6 +1090,7 @@ impl QueryPlan {
                     output_name: metric.output_name.clone(),
                     function: metric.function.to_search_function(),
                     field: metric.field.clone(),
+                    field_expr: metric.field_expr.clone(),
                 })
                 .collect();
 
@@ -1730,6 +1749,7 @@ fn resolve_or_register_residual(
             output_name: hidden_name.clone(),
             function: SqlGroupedMetricFunction::Avg, // placeholder
             field: None,
+            field_expr: None,
             projected: false,
             residual_expr: Some(residual),
         });
@@ -1829,6 +1849,7 @@ fn extract_projected_metric(
             output_name,
             function: SqlGroupedMetricFunction::Avg, // placeholder, not used when residual_expr is Some
             field: None,
+            field_expr: None,
             projected: true,
             residual_expr: Some(residual),
         }))
@@ -2007,32 +2028,55 @@ fn try_parse_direct_aggregate(
             if args.len() != 1 {
                 return Ok(None);
             }
-            let field = match &args[0] {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => aggregate_arg_to_field(expr),
+            let inner_expr = match &args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
                 FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
                     if let FunctionArgExpr::Expr(expr) = arg {
-                        aggregate_arg_to_field(expr)
+                        expr
                     } else {
-                        None
+                        return Ok(None);
                     }
                 }
-                _ => None,
+                _ => return Ok(None),
             };
-            let Some(field) = field else {
-                return Ok(None);
-            };
-            let function = match normalized.as_str() {
-                "sum" => SqlGroupedMetricFunction::Sum,
-                "avg" => SqlGroupedMetricFunction::Avg,
-                "min" => SqlGroupedMetricFunction::Min,
-                "max" => SqlGroupedMetricFunction::Max,
-                _ => unreachable!(),
-            };
-            (
-                function,
-                Some(field.clone()),
-                format!("{}_{}", normalized, field),
-            )
+            // Try bare field first
+            if let Some(field) = aggregate_arg_to_field(inner_expr) {
+                let function = match normalized.as_str() {
+                    "sum" => SqlGroupedMetricFunction::Sum,
+                    "avg" => SqlGroupedMetricFunction::Avg,
+                    "min" => SqlGroupedMetricFunction::Min,
+                    "max" => SqlGroupedMetricFunction::Max,
+                    _ => unreachable!(),
+                };
+                return Ok(Some(SqlGroupedMetric {
+                    output_name: alias.unwrap_or_else(|| format!("{}_{}", normalized, field)),
+                    function,
+                    field: Some(field),
+                    field_expr: None,
+                    projected: true,
+                    residual_expr: None,
+                }));
+            }
+            // Try binary expression: AGG(a + b), AGG(a / b), etc.
+            if let Some(field_expr) = aggregate_arg_to_expr(inner_expr) {
+                let function = match normalized.as_str() {
+                    "sum" => SqlGroupedMetricFunction::Sum,
+                    "avg" => SqlGroupedMetricFunction::Avg,
+                    "min" => SqlGroupedMetricFunction::Min,
+                    "max" => SqlGroupedMetricFunction::Max,
+                    _ => unreachable!(),
+                };
+                let default_name = format!("{}_{}", normalized, field_expr.display_fragment());
+                return Ok(Some(SqlGroupedMetric {
+                    output_name: alias.unwrap_or(default_name),
+                    function,
+                    field: None,
+                    field_expr: Some(field_expr),
+                    projected: true,
+                    residual_expr: None,
+                }));
+            }
+            return Ok(None);
         }
         _ => return Ok(None),
     };
@@ -2041,6 +2085,7 @@ fn try_parse_direct_aggregate(
         output_name: alias.unwrap_or(default_name),
         function,
         field,
+        field_expr: None,
         projected: true,
         residual_expr: None,
     }))
@@ -2056,6 +2101,34 @@ fn aggregate_arg_to_field(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Try to parse an arithmetic expression over field references: `a + b`,
+/// `(a - b) / a`, etc. Returns a `MetricFieldExpr` when all leaves are field
+/// references (optionally through CAST / nesting) and every operator is one of
+/// `+`, `-`, `*`, `/`.
+fn aggregate_arg_to_expr(expr: &Expr) -> Option<crate::search::MetricFieldExpr> {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            aggregate_arg_to_field(expr).map(crate::search::MetricFieldExpr::field)
+        }
+        Expr::Cast { expr: inner, .. } | Expr::Nested(inner) => aggregate_arg_to_expr(inner),
+        Expr::BinaryOp { left, op, right } => {
+            let op = match op {
+                BinaryOperator::Plus => crate::search::MetricFieldOp::Add,
+                BinaryOperator::Minus => crate::search::MetricFieldOp::Sub,
+                BinaryOperator::Multiply => crate::search::MetricFieldOp::Mul,
+                BinaryOperator::Divide => crate::search::MetricFieldOp::Div,
+                _ => return None,
+            };
+            let left_expr = aggregate_arg_to_expr(left)?;
+            let right_expr = aggregate_arg_to_expr(right)?;
+            Some(crate::search::MetricFieldExpr::binary(
+                left_expr, op, right_expr,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn ensure_grouped_metric(
     metrics: &mut Vec<SqlGroupedMetric>,
     parsed: SqlGroupedMetric,
@@ -2065,9 +2138,11 @@ fn ensure_grouped_metric(
     // (function, field) values.  Skip dedup so different residual expressions
     // don't collide on the same placeholder key.
     if parsed.residual_expr.is_none()
-        && let Some(idx) = metrics
-            .iter()
-            .position(|metric| metric.function == parsed.function && metric.field == parsed.field)
+        && let Some(idx) = metrics.iter().position(|metric| {
+            metric.function == parsed.function
+                && metric.field == parsed.field
+                && metric.field_expr == parsed.field_expr
+        })
     {
         if projected {
             if !metrics[idx].projected {
@@ -2092,6 +2167,7 @@ fn ensure_grouped_metric(
                     output_name: parsed.output_name.clone(),
                     function: parsed.function,
                     field: None,
+                    field_expr: None,
                     projected: true,
                     residual_expr: Some(ResidualExpr::MetricRef(canonical_name)),
                 });
@@ -2110,6 +2186,7 @@ fn ensure_grouped_metric(
         output_name: output_name.clone(),
         function: parsed.function,
         field: parsed.field,
+        field_expr: parsed.field_expr,
         projected,
         residual_expr: parsed.residual_expr,
     });
@@ -3933,6 +4010,73 @@ mod tests {
             grouped.metrics[0].output_name
         );
         assert!(grouped.order_by[0].desc);
+    }
+
+    #[test]
+    fn grouped_expression_aggregate_preserves_field_expr_into_search_request() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT author, SUM(price + cost) AS gross FROM idx GROUP BY author ORDER BY gross DESC",
+        )
+        .unwrap();
+
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.metrics.len(), 1);
+        assert!(grouped.metrics[0].field.is_none());
+
+        let expr = grouped.metrics[0]
+            .field_expr
+            .as_ref()
+            .expect("expression aggregate must preserve field_expr");
+        assert_eq!(
+            expr,
+            &crate::search::MetricFieldExpr::binary(
+                crate::search::MetricFieldExpr::field("price"),
+                crate::search::MetricFieldOp::Add,
+                crate::search::MetricFieldExpr::field("cost"),
+            )
+        );
+
+        let req = plan.to_search_request(false);
+        let crate::search::AggregationRequest::GroupedMetrics(params) = req
+            .aggs
+            .get(INTERNAL_SQL_GROUPED_AGG)
+            .expect("grouped agg missing")
+        else {
+            panic!("expected grouped metrics request");
+        };
+        let search_expr = params.metrics[0]
+            .field_expr
+            .as_ref()
+            .expect("search request must retain field_expr");
+        assert_eq!(search_expr, expr);
+    }
+
+    #[test]
+    fn grouped_nested_expression_aggregate_stays_grouped_partials() {
+        let plan = plan_sql(
+            "idx",
+            "SELECT hvfhs_license_num, AVG((base_passenger_fare - driver_pay) / base_passenger_fare) AS platform_margin FROM idx GROUP BY hvfhs_license_num",
+        )
+        .unwrap();
+
+        assert!(plan.uses_grouped_partials());
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        assert_eq!(grouped.metrics.len(), 1);
+        assert!(grouped.metrics[0].field.is_none());
+        assert_eq!(
+            grouped.metrics[0].field_expr,
+            Some(crate::search::MetricFieldExpr::binary(
+                crate::search::MetricFieldExpr::binary(
+                    crate::search::MetricFieldExpr::field("base_passenger_fare"),
+                    crate::search::MetricFieldOp::Sub,
+                    crate::search::MetricFieldExpr::field("driver_pay"),
+                ),
+                crate::search::MetricFieldOp::Div,
+                crate::search::MetricFieldExpr::field("base_passenger_fare"),
+            ))
+        );
     }
 
     #[test]

@@ -430,6 +430,10 @@ mod tests {
         let first = manager.create_local_force_merge("node-1", "idx", 1);
         manager.finish_local_force_merge(&first, 1, 0, None);
 
+        // Ensure the second task gets a strictly later completed_at_epoch_ms so
+        // the sort tie-breaker is deterministic (same-millisecond UUIDs are random).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
         let second = manager.create_local_force_merge("node-1", "idx", 1);
         manager.finish_local_force_merge(&second, 1, 0, None);
 
@@ -447,6 +451,11 @@ mod tests {
             HashMap::from([("node-1".to_string(), "task-a".to_string())]),
             HashMap::new(),
         );
+
+        // Ensure the second task gets a strictly later created_at_epoch_ms so
+        // the sort tie-breaker is deterministic (same-millisecond UUIDs are random).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
         let second = manager.create_cluster_force_merge(
             "idx",
             1,

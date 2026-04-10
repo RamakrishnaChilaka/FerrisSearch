@@ -62,6 +62,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Aggregations run in the same Tantivy pass as hit collection via custom `AggCollector` (implements `tantivy::collector::Collector`)
 - Hit-returning queries combine collectors as `(TopDocs, Option<AggCollector>, Count)`; agg-only `size=0` queries skip `TopDocs` entirely and run `(Option<AggCollector>, Count)`
 - `AggSegmentCollector::collect(doc, score)` reads fast-field columns and accumulates stats/terms/histogram per segment; string `terms` aggs count ords per segment and resolve ord→string once in `harvest()`
+- Grouped metric aggregate arguments may be nested arithmetic trees over numeric fast fields (`SUM(a + b)`, `AVG((a - b) / a)`). The planner preserves these in `GroupedMetricAgg.field_expr`, and the Tantivy grouped collector batch-reads every leaf column before evaluating the expression per doc.
 - `merge_fruits()` merges per-segment data, returns `HashMap<String, PartialAggResult>` per shard
 - Per-shard partial results are serialized into the gRPC `partial_aggs_json` bytes field with `bincode-next`, then merged at coordinator via `merge_aggregations()`
 - O(matching_docs) with minimal memory; agg-only queries avoid hit materialization and still run in a single query execution pass
@@ -81,6 +82,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - The fast-field path (`sql_record_batch`) MUST populate `type_hints` from `SqlFieldReader` variants (F64/I64 → Float64, DateMillis → TimestampMillis, Str → Utf8) or the Tantivy schema when no segments exist
 - The fast-field path skips `searcher.doc()` entirely when all requested columns have fast-field readers — reads `_id` from its fast-field column instead of loading stored docs
 - String fast-field SQL paths use a shared `StringFastFieldReader` (`StrColumn` + ordinal `Column<u64>`) so `_id`, selective arrays, and streaming batches read ordinals directly instead of per-doc `term_ords()` iterators
+- The local bitset-streaming `tantivy_fast_fields` path batch-reads doc IDs per Arrow batch via `Column::first_vals()` / `StringFastFieldReader::first_ords_batch()`; do not fall back to per-doc `first()` / `first_text()` loops for numeric, date, `_id`, or keyword columns in streaming execution
 - In the flat `sql_record_batch()` fast path, `_id` now uses the same per-segment array/take/reorder flow as other string fast fields instead of a separate top-doc-order decode/clone loop
 - When the SQL query does not reference `_id` or `_score`, those columns are filled with empty/zero values and fast-field reads for `_id` are skipped entirely (`needs_id`/`needs_score` flags on `QueryPlan`)
 - Zero-column SQL queries such as `SELECT 1 FROM ...` keep one row per hit directly in `sql_record_batch()`; do not overload `needs_score` just to preserve batch cardinality
@@ -102,7 +104,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 978 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 42 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1158 total
+- 985 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 42 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 179 assertions) = 1165 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
