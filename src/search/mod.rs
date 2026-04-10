@@ -508,6 +508,13 @@ impl From<WireGroupedMetricsBucket> for GroupedMetricsBucket {
     }
 }
 
+/// Safer framed header for zstd-compressed partial agg payloads.
+const PARTIAL_AGGS_ZSTD_MAGIC: &[u8] = b"\0FSZ1";
+
+/// Minimum bincode payload size (in bytes) to trigger zstd compression.
+/// Below this threshold the compression overhead isn't worth it.
+const PARTIAL_AGGS_COMPRESS_THRESHOLD: usize = 4096;
+
 pub fn encode_partial_aggs(
     partials: &HashMap<String, PartialAggResult>,
 ) -> Result<Vec<u8>, bincode_next::error::EncodeError> {
@@ -515,18 +522,47 @@ pub fn encode_partial_aggs(
         .iter()
         .map(|(name, partial)| (name.clone(), WirePartialAggResult::from(partial)))
         .collect();
-    bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
+    let raw = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
+
+    if raw.len() >= PARTIAL_AGGS_COMPRESS_THRESHOLD
+        && let Ok(compressed) = zstd::bulk::compress(&raw, 1)
+        && compressed.len() + PARTIAL_AGGS_ZSTD_MAGIC.len() < raw.len()
+    {
+        let mut out = Vec::with_capacity(PARTIAL_AGGS_ZSTD_MAGIC.len() + compressed.len());
+        out.extend_from_slice(PARTIAL_AGGS_ZSTD_MAGIC);
+        out.extend_from_slice(&compressed);
+        return Ok(out);
+    }
+    Ok(raw)
 }
 
 pub fn decode_partial_aggs(
     bytes: &[u8],
 ) -> Result<HashMap<String, PartialAggResult>, bincode_next::error::DecodeError> {
+    let data = decode_partial_aggs_payload(bytes)?;
+
     let (wire, _): (HashMap<String, WirePartialAggResult>, usize) =
-        bincode_next::serde::decode_from_slice(bytes, BINCODE_CONFIG)?;
+        bincode_next::serde::decode_from_slice(&data, BINCODE_CONFIG)?;
     Ok(wire
         .into_iter()
         .map(|(name, partial)| (name, partial.into()))
         .collect())
+}
+
+fn decode_partial_aggs_payload(
+    bytes: &[u8],
+) -> Result<std::borrow::Cow<'_, [u8]>, bincode_next::error::DecodeError> {
+    if bytes.starts_with(PARTIAL_AGGS_ZSTD_MAGIC) {
+        return zstd::stream::decode_all(&bytes[PARTIAL_AGGS_ZSTD_MAGIC.len()..])
+            .map(std::borrow::Cow::Owned)
+            .map_err(|e| {
+                bincode_next::error::DecodeError::OtherString(format!(
+                    "zstd decompress failed: {e}"
+                ))
+            });
+    }
+
+    Ok(std::borrow::Cow::Borrowed(bytes))
 }
 
 /// A single bucket in a terms aggregation result.
@@ -2825,6 +2861,95 @@ mod tests {
         assert_eq!(buckets[0].group_values, vec![json!(0), json!(42)]);
         assert_eq!(buckets[0].group_values[0].as_i64(), Some(0));
         assert_eq!(buckets[0].group_values[1].as_i64(), Some(42));
+    }
+
+    #[test]
+    fn partial_agg_roundtrip_small_payload_uncompressed() {
+        // A small payload should not be compressed (below 4KB threshold).
+        let partials = HashMap::from([(
+            "stats".to_string(),
+            PartialAggResult::Stats {
+                count: 10,
+                sum: 100.0,
+                min: 1.0,
+                max: 50.0,
+            },
+        )]);
+
+        let bytes = encode_partial_aggs(&partials).unwrap();
+        // Should NOT have the zstd header prefix.
+        assert!(!bytes.starts_with(PARTIAL_AGGS_ZSTD_MAGIC));
+        assert!(bytes.len() < PARTIAL_AGGS_COMPRESS_THRESHOLD);
+
+        // Roundtrip still works.
+        let decoded = decode_partial_aggs(&bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+    }
+
+    #[test]
+    fn partial_agg_roundtrip_large_payload_compressed() {
+        // Build a large grouped-metrics payload that exceeds the compress threshold.
+        let mut buckets = Vec::new();
+        for i in 0..500 {
+            buckets.push(GroupedMetricsBucket {
+                group_values: vec![json!(format!("zone_{i}"))],
+                metrics: HashMap::from([
+                    (
+                        "count".to_string(),
+                        GroupedMetricPartial::Count {
+                            count: i as u64 * 10,
+                        },
+                    ),
+                    (
+                        "stats".to_string(),
+                        GroupedMetricPartial::Stats {
+                            count: i as u64,
+                            sum: i as f64 * 100.0,
+                            min: i as f64,
+                            max: i as f64 * 2.0,
+                        },
+                    ),
+                ]),
+            });
+        }
+        let partials = HashMap::from([(
+            "sql_grouped".to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        )]);
+
+        let bytes = encode_partial_aggs(&partials).unwrap();
+        // Should have the zstd header prefix.
+        assert_eq!(
+            &bytes[..PARTIAL_AGGS_ZSTD_MAGIC.len()],
+            PARTIAL_AGGS_ZSTD_MAGIC,
+            "large payload should be zstd-compressed"
+        );
+
+        // Roundtrip must preserve all data.
+        let decoded = decode_partial_aggs(&bytes).unwrap();
+        let PartialAggResult::GroupedMetrics {
+            buckets: decoded_buckets,
+        } = &decoded["sql_grouped"]
+        else {
+            panic!("expected grouped metrics");
+        };
+        assert_eq!(decoded_buckets.len(), 500);
+        assert_eq!(decoded_buckets[0].group_values, vec![json!("zone_0")]);
+        assert_eq!(decoded_buckets[499].group_values, vec![json!("zone_499")]);
+    }
+
+    #[test]
+    fn partial_agg_decode_payload_handles_large_zstd_frames() {
+        let raw = vec![b'x'; 16 * 1024 * 1024 + 1];
+        let compressed = zstd::bulk::compress(&raw, 1).unwrap();
+
+        let mut framed = Vec::with_capacity(PARTIAL_AGGS_ZSTD_MAGIC.len() + compressed.len());
+        framed.extend_from_slice(PARTIAL_AGGS_ZSTD_MAGIC);
+        framed.extend_from_slice(&compressed);
+
+        let decoded = decode_partial_aggs_payload(&framed).unwrap();
+        assert_eq!(decoded.len(), raw.len());
+        assert_eq!(decoded.as_ref(), raw.as_slice());
     }
 
     #[test]

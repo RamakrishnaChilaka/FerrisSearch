@@ -12,6 +12,7 @@ pub mod replication;
 pub mod search;
 pub mod shard;
 pub mod storage;
+pub mod tasks;
 pub mod transport;
 pub mod wal;
 pub mod worker;

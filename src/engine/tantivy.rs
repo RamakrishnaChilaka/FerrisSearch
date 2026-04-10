@@ -4064,6 +4064,53 @@ impl super::SearchEngine for HotEngine {
         Ok(())
     }
 
+    fn force_merge(&self, max_num_segments: usize) -> Result<()> {
+        // Commit first so all buffered docs are in segments.
+        let committed_next_seq = {
+            let tl = self.translog.lock().unwrap();
+            let next_seq = tl.next_seq_no();
+            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            writer.commit()?;
+            next_seq
+        };
+        self.persist_committed_next_seq_no(committed_next_seq)?;
+        self.reader.reload()?;
+
+        // Iteratively merge until we have at most max_num_segments.
+        loop {
+            let segment_ids = self.index.searchable_segment_ids()?;
+            if segment_ids.len() <= max_num_segments {
+                break;
+            }
+
+            let future = {
+                let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+                writer.merge(&segment_ids)
+            };
+            // Block until the merge completes (writer lock released).
+            let _: Option<tantivy::SegmentMeta> = future.wait()?;
+            self.reader.reload()?;
+        }
+
+        Ok(())
+    }
+
+    fn segment_infos(&self) -> Vec<super::SegmentInfo> {
+        self.index
+            .searchable_segments()
+            .unwrap_or_default()
+            .iter()
+            .map(|seg| {
+                let meta = seg.meta();
+                super::SegmentInfo {
+                    segment_id: meta.id().uuid_string(),
+                    num_docs: meta.num_docs(),
+                    deleted_docs: meta.num_deleted_docs(),
+                }
+            })
+            .collect()
+    }
+
     fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>> {
         let body_field = self.resolve_field("body");
         let searcher = self.reader.searcher();
@@ -7899,6 +7946,101 @@ mod tests {
         engine.refresh().unwrap();
         engine.refresh().unwrap();
         assert_eq!(engine.doc_count(), 1);
+    }
+
+    #[test]
+    fn force_merge_compacts_segments() {
+        let (_dir, engine) = create_engine();
+
+        // Create multiple segments by committing between writes.
+        for i in 0..10 {
+            engine
+                .add_document(&format!("d{i}"), json!({"x": i}))
+                .unwrap();
+            engine.refresh().unwrap(); // each refresh commits → new segment
+        }
+
+        let before = engine.index.searchable_segment_ids().unwrap().len();
+        assert!(
+            before > 1,
+            "expected multiple segments before merge, got {before}"
+        );
+
+        engine.force_merge(1).unwrap();
+
+        let after = engine.index.searchable_segment_ids().unwrap().len();
+        assert_eq!(after, 1, "expected 1 segment after force_merge(1)");
+        assert_eq!(engine.doc_count(), 10, "doc count must be preserved");
+    }
+
+    #[test]
+    fn force_merge_noop_when_already_compact() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        engine.refresh().unwrap();
+
+        // Already 1 segment — force_merge(1) should be a no-op.
+        engine.force_merge(1).unwrap();
+        assert_eq!(engine.doc_count(), 1);
+        assert_eq!(engine.index.searchable_segment_ids().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn force_merge_respects_max_num_segments() {
+        let (_dir, engine) = create_engine();
+        for i in 0..20 {
+            engine
+                .add_document(&format!("d{i}"), json!({"x": i}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        engine.force_merge(3).unwrap();
+
+        let after = engine.index.searchable_segment_ids().unwrap().len();
+        assert!(
+            after <= 3,
+            "expected at most 3 segments after force_merge(3), got {after}"
+        );
+        assert_eq!(engine.doc_count(), 20);
+    }
+
+    #[test]
+    fn force_merge_persists_committed_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        engine.refresh().unwrap();
+        engine.add_document("d2", json!({"x": 2})).unwrap();
+        engine.add_document("d3", json!({"x": 3})).unwrap();
+
+        let expected_next_seq = {
+            let tl = engine.translog.lock().unwrap();
+            tl.next_seq_no()
+        };
+        let checkpoint_path = dir.path().join("translog.committed");
+        let before_force_merge = std::fs::read_to_string(&checkpoint_path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        assert!(
+            before_force_merge < expected_next_seq,
+            "expected pending writes before force-merge checkpoint advance"
+        );
+
+        engine.force_merge(1).unwrap();
+
+        let after_force_merge = std::fs::read_to_string(&checkpoint_path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(
+            after_force_merge, expected_next_seq,
+            "force_merge must advance translog.committed to the committed next seq_no"
+        );
     }
 
     // ── Stored-fields optimization tests (fast-field _id path) ──────────

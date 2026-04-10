@@ -1,14 +1,14 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **954 unit tests** (`cargo test --lib`)
+- **978 unit tests** (`cargo test --lib`)
 - **64 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **39 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **42 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 175 assertions across 4 files
-- **1131 total** (`cargo test`)
+- **1158 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -34,6 +34,8 @@ cargo test -- test_name                         # Single test by name
 - For auto-flush concurrency changes, add regressions proving maintenance ticks defer instead of blocking when the text flush path or vector persistence path is already busy.
 - For maintenance scheduling changes, add a `#[tokio::test(flavor = "current_thread")]` regression that blocks the Tantivy writer lock from another thread and proves the async runtime still makes progress while the maintenance tick waits.
 - For refresh/flush fan-out changes, add one regression that the coordinator still dispatches its local node through the per-node maintenance path, plus a transport regression that maintenance reopens persisted assigned shards but refuses to create missing UUID directories.
+- For asynchronous `/{index}/_forcemerge` changes, add one API regression that the handler returns `202 Accepted` immediately and one transport regression that the gRPC force-merge RPC returns after enqueueing background work instead of waiting for segment compaction to finish.
+- For async maintenance task-tracking changes, add one REST/API regression that `POST /{index}/_forcemerge` returns a task id and `GET /_tasks/{task_id}` reaches a terminal state, plus one transport regression that `GetTaskStatus` returns the node-local snapshot for a queued/running/completed task.
 - For async scheduling changes around shard open/close, orphan cleanup, translog fsync, redb-backed Raft storage, or other blocking wrappers, add a `#[tokio::test(flavor = "current_thread")]` regression that holds the relevant lock or resource from another thread and proves the runtime still advances while the wrapper waits.
 - For index UUID / orphan-cleanup fixes, add a regression that an auto-created index opens its local shard with the same UUID stored in cluster state, plus a restart-path regression that missing expected UUID directories cause cleanup to bail out instead of deleting unknown shard data.
 - For recovered-node startup guard changes, add a two-restart regression that proves a missing startup UUID dir never gets recreated on the first restart and therefore can never make the old UUID dir look orphaned on the second restart.
@@ -55,6 +57,7 @@ cargo test -- test_name                         # Single test by name
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
 - For distributed hit-merge changes, add unit coverage for `merge_sorted_hit_lists()` and a multi-node REST regression where only one shard returns hits but the coordinator still must apply a custom sort.
 - For `_cat/shards` state fixes, add a regression that a live shard copy on one node does not make a different assigned copy on another node appear `STARTED`; display state must be per copy, not per shard ID.
+- For `_cat/segments` changes, add a transport regression for `GetSegmentStats` and a multi-node REST regression that compares the returned segment rows against the actual `segment_infos()` reported by all shard copies.
 - For node startup/rejoin cleanup changes, add tempdir regressions that prove empty pre-catch-up state does not delete live UUID directories, and that authoritative UUID sets still remove true orphaned directories.
 
 ## Integration Test Infrastructure

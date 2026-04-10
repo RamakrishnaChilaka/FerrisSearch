@@ -34,6 +34,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing)
 - `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
 - `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
+- `src/tasks.rs` — TaskManager for async background maintenance tracking (`_forcemerge`, `/_tasks/{task_id}`)
 - `src/wal/` — HotTranslog (generation-based binary WAL), TranslogDurability, WriteAheadLog trait
 - `src/worker.rs` — WorkerPools: dedicated rayon thread pools for search/write isolation
 - `src/replication/` — replicate_write, replicate_bulk (sync to ISR replicas)
@@ -101,7 +102,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 954 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 39 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1131 total
+- 978 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 42 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 175 assertions) = 1158 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -158,7 +159,9 @@ pub struct AppState {
     pub local_node_id: String,
     pub raft: Arc<RaftInstance>,
     pub worker_pools: WorkerPools,
+    pub task_manager: Arc<TaskManager>,
     pub sql_group_by_scan_limit: usize,
+    pub sql_approximate_top_k: bool,
 }
 ```
 
@@ -288,6 +291,8 @@ if let Some(ref raft) = state.raft {
 | GET | `/_cat/shards` | `cat_shards()` | Shard allocation (prirep=p/r, state, docs, node) |
 | GET | `/_cat/indices` | `cat_indices()` | Index listing (health, shards, docs) |
 | GET | `/_cat/master` | `cat_master()` | Current master node |
+| GET | `/_cat/segments` | `cat_segments()` | Per-segment listing across the cluster (`?local` for local-only) |
+| GET | `/_tasks/{task_id}` | `get_task()` | Background maintenance task status on the owning coordinator |
 
 ### Index Management (Raft writes → forward to leader)
 | HTTP | Path | Handler | Purpose |
@@ -327,9 +332,12 @@ if let Some(ref raft) = state.raft {
 |------|------|---------|--------|
 | POST/GET | `/{index}/_refresh` | `refresh_index()` | Refresh all assigned shards cluster-wide |
 | POST/GET | `/{index}/_flush` | `flush_index()` | Flush assigned shards cluster-wide + truncate WAL |
+| POST | `/{index}/_forcemerge` | `force_merge_index()` | Enqueue a background cluster-wide force-merge (`?max_num_segments=N`, default 1) |
 | GET | `/_metrics` | `handle_metrics()` | Prometheus metrics (text exposition format) |
 
-- `fan_out_maintenance()` must dispatch the local node alongside remote nodes in the same per-node fan-out set; do not run local refresh/flush inline before the rest of the dispatch has started.
+- `fan_out_maintenance()` must dispatch the local node alongside remote nodes in the same per-node fan-out set; do not run local refresh/flush/forcemerge inline before the rest of the dispatch has started.
+- `/{index}/_forcemerge` is asynchronous: nodes enqueue the merge and return immediately, so the REST response is `202 Accepted` with node-start counts, dispatch-failure counts, and a task id instead of final shard success counts.
+- The force-merge task response includes `task.coordinator_node`; `GET /_tasks/{task_id}` must be sent back to that coordinator node because the cluster task record is coordinator-local even though the endpoint aggregates per-node child tasks over gRPC.
 - Per-node maintenance handlers reopen assigned shards with the same fail-closed authoritative UUID-dir checks as read paths. Missing UUID dirs are logged and skipped, not recreated.
 
 ### Create Index Body Format
@@ -579,6 +587,16 @@ UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
 CreateIndex(CreateIndexRequest) → CreateIndexResponse
 DeleteIndex(DeleteIndexRequest) → DeleteIndexResponse
 TransferMaster(TransferMasterRequest) → TransferMasterResponse
+
+// Shard stats (for _cat endpoints)
+GetShardStats(ShardStatsRequest) → ShardStatsResponse
+GetSegmentStats(SegmentStatsRequest) → SegmentStatsResponse
+
+// Index maintenance (fan-out from coordinator)
+RefreshIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
+FlushIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
+ForceMergeIndex(ForceMergeRequest) → ForceMergeResponse
+GetTaskStatus(GetTaskStatusRequest) → GetTaskStatusResponse
 
 // Raft consensus (opaque JSON)
 RaftVote(RaftRequest) → RaftReply

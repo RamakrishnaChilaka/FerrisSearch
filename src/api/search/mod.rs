@@ -1242,17 +1242,20 @@ async fn execute_sql_query_with_plan(
         let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         let merge_start = Instant::now();
-        let sql_result =
-            match crate::hybrid::execute_grouped_partial_sql(&plan, &distributed.partial_aggs) {
-                Ok(result) => result,
-                Err(error) => {
-                    return Err(crate::api::error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "sql_execution_exception",
-                        error,
-                    ));
-                }
-            };
+        let sql_result = match crate::hybrid::execute_grouped_partial_sql(
+            &plan,
+            &distributed.partial_aggs,
+            &metadata.mappings,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sql_execution_exception",
+                    error,
+                ));
+            }
+        };
         let merge_ms = merge_start.elapsed().as_secs_f64() * 1000.0;
 
         if record_metrics {

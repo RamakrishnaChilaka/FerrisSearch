@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 type ShardCopyDocCounts = HashMap<(String, String, u32), u64>;
+type ShardCopySegments = HashMap<(String, String, u32), Vec<crate::engine::SegmentInfo>>;
 
 #[derive(Deserialize, Default)]
 pub struct CatParams {
@@ -54,6 +55,40 @@ async fn collect_shard_doc_counts(state: &AppState) -> ShardCopyDocCounts {
     }
 
     counts
+}
+
+/// Collect segment lists for all shard copies across the cluster.
+/// Fans out to ALL nodes (including self) via gRPC `GetSegmentStats` concurrently.
+/// Returns a map of (node_id, index_name, shard_id) -> segment list.
+async fn collect_shard_segments(state: &AppState) -> ShardCopySegments {
+    let mut segments = ShardCopySegments::new();
+
+    let cs = state.cluster_manager.get_state();
+    let mut handles = Vec::new();
+    for node in cs.nodes.values() {
+        let client = state.transport_client.clone();
+        let node = node.clone();
+        handles.push(tokio::spawn(async move {
+            let node_id = node.id.clone();
+            (node_id, client.get_segment_stats(&node).await)
+        }));
+    }
+    for handle in handles {
+        if let Ok((node_id, Ok(remote_segments))) = handle.await {
+            for (index_name, shard_id, segment_info) in remote_segments {
+                segments
+                    .entry((node_id.clone(), index_name, shard_id))
+                    .or_default()
+                    .push(segment_info);
+            }
+        }
+    }
+
+    for shard_segments in segments.values_mut() {
+        shard_segments.sort_by(|left, right| left.segment_id.cmp(&right.segment_id));
+    }
+
+    segments
 }
 
 /// Local-only doc count lookup: returns doc count string or "-" for remote shards.
@@ -384,6 +419,84 @@ pub async fn cat_master(State(state): State<AppState>, params: Query<CatParams>)
     text_response(out)
 }
 
+/// GET /_cat/segments — tabular listing of per-shard segments.
+/// By default, fans out to all nodes and lists segments for every started shard
+/// copy in the cluster. Pass `?local` to show only segments from this node.
+pub async fn cat_segments(State(state): State<AppState>, params: Query<CatParams>) -> Response {
+    let cs = state.cluster_manager.get_state();
+    let local_only = wants_local(&params);
+    let shard_segments = if local_only {
+        None
+    } else {
+        Some(collect_shard_segments(&state).await)
+    };
+
+    let mut out = String::new();
+    if wants_headers(&params) {
+        writeln!(
+            out,
+            "{:<25} {:<8} {:<36} {:<12} {:<12}",
+            "index", "shard", "segment", "num_docs", "deleted_docs"
+        )
+        .unwrap();
+    }
+
+    let mut index_names: Vec<&String> = cs.indices.keys().collect();
+    index_names.sort();
+
+    for idx_name in index_names {
+        let meta = &cs.indices[idx_name];
+        let mut shard_ids: Vec<u32> = meta.shard_routing.keys().copied().collect();
+        shard_ids.sort();
+
+        for shard_id in shard_ids {
+            let routing = &meta.shard_routing[&shard_id];
+            let mut copy_node_ids = Vec::with_capacity(1 + routing.replicas.len());
+            copy_node_ids.push(routing.primary.clone());
+            copy_node_ids.extend(routing.replicas.iter().cloned());
+
+            for node_id in copy_node_ids {
+                if local_only {
+                    if node_id != state.local_node_id {
+                        continue;
+                    }
+
+                    let Some(engine) = state.shard_manager.get_shard(idx_name, shard_id) else {
+                        continue;
+                    };
+
+                    for seg in engine.segment_infos() {
+                        writeln!(
+                            out,
+                            "{:<25} {:<8} {:<36} {:<12} {:<12}",
+                            idx_name, shard_id, seg.segment_id, seg.num_docs, seg.deleted_docs
+                        )
+                        .unwrap();
+                    }
+                    continue;
+                }
+
+                let Some(segments) = shard_segments.as_ref().and_then(|segments| {
+                    segments.get(&(node_id.clone(), idx_name.clone(), shard_id))
+                }) else {
+                    continue;
+                };
+
+                for seg in segments {
+                    writeln!(
+                        out,
+                        "{:<25} {:<8} {:<36} {:<12} {:<12}",
+                        idx_name, shard_id, seg.segment_id, seg.num_docs, seg.deleted_docs
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    text_response(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +537,7 @@ mod tests {
                 local_node_id: local_node_id.to_string(),
                 raft,
                 worker_pools: WorkerPools::default_for_system(),
+                task_manager: Arc::new(crate::tasks::TaskManager::new()),
                 sql_group_by_scan_limit: 0,
                 sql_approximate_top_k: false,
             },
@@ -555,5 +669,68 @@ mod tests {
 
         assert_eq!(local_doc_count(&app_state, "node-1", "idx", 0), "0");
         assert_eq!(local_doc_count(&app_state, "node-2", "idx", 0), "-");
+    }
+
+    #[tokio::test]
+    async fn cat_segments_local_only_skips_remote_shards() {
+        let (_dir, app_state) = make_app_state("node-1").await;
+        let mut cluster_state = make_cluster_state();
+        cluster_state.add_index(IndexMetadata {
+            name: "segments".into(),
+            uuid: IndexUuid::new("segments-uuid"),
+            number_of_shards: 2,
+            number_of_replicas: 0,
+            shard_routing: HashMap::from([
+                (
+                    0,
+                    ShardRoutingEntry {
+                        primary: "node-1".into(),
+                        replicas: vec![],
+                        unassigned_replicas: 0,
+                    },
+                ),
+                (
+                    1,
+                    ShardRoutingEntry {
+                        primary: "node-2".into(),
+                        replicas: vec![],
+                        unassigned_replicas: 0,
+                    },
+                ),
+            ]),
+            mappings: HashMap::new(),
+            settings: IndexSettings::default(),
+        });
+        app_state.cluster_manager.update_state(cluster_state);
+
+        app_state.shard_manager.open_shard("segments", 0).unwrap();
+        let engine = app_state
+            .shard_manager
+            .get_shard("segments", 0)
+            .expect("local shard should be open");
+        engine
+            .add_document("doc-1", serde_json::json!({"title": "local segment"}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let response = cat_segments(
+            State(app_state),
+            Query(CatParams {
+                v: Some(String::new()),
+                local: Some(String::new()),
+            }),
+        )
+        .await;
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let fields: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(fields[0], "segments");
+        assert_eq!(fields[1], "0");
     }
 }

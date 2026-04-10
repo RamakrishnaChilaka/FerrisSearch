@@ -47,6 +47,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - `extract_projected_metric()` is the entry point: tries bare aggregate first, then calls `try_build_residual_expr()` which recursively walks the SQL AST extracting aggregates and building the expression tree.
 - Metrics with `residual_expr: Some(...)` are filtered out of the Tantivy `GroupedMetricAgg` parameters — they have no real field to aggregate on.
 - `eval_residual_expr()` / `eval_residual_f64()` evaluates the tree against resolved metric values in a merged bucket.
+- Bare `MetricRef` aliases for date-backed `MIN` / `MAX` metrics must preserve the canonical metric's ISO 8601 final-row formatting. Do not route duplicate projected aliases back through numeric-only rendering.
 - `bucket_metric_f64()` also evaluates residual expressions for ORDER BY and HAVING comparisons.
 - Integer type preservation: when the result has no fractional part and the expression tree doesn't contain float-producing operations (ROUND, CastFloat, division, AVG, SUM), the value is returned as `i64` rather than `f64`.
 - `has_ungrouped_aggregate_fallback` is a safety net for truly unparseable aggregate expressions that the residual extractor cannot handle. It forces the scan limit to `sql_group_by_scan_limit` and errors on truncation.

@@ -881,7 +881,9 @@ async fn start_raft_grpc_server(
     let dir = tempfile::tempdir().unwrap();
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     let tc = TransportClient::new();
-    let service = create_transport_service_with_raft(cm, sm, tc, raft, "node-1".into());
+    let task_manager = Arc::new(ferrissearch::tasks::TaskManager::new());
+    let service =
+        create_transport_service_with_raft(cm, sm, tc, raft, task_manager, "node-1".into());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -909,7 +911,9 @@ async fn start_raft_follower_grpc_server(
     let dir = tempfile::tempdir().unwrap();
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     let tc = TransportClient::new();
-    let service = create_transport_service_with_raft(cm, sm, tc, raft, local_node_id.into());
+    let task_manager = Arc::new(ferrissearch::tasks::TaskManager::new());
+    let service =
+        create_transport_service_with_raft(cm, sm, tc, raft, task_manager, local_node_id.into());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

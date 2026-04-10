@@ -107,6 +107,7 @@ pub fn one_shot_partition_stream(
 pub fn execute_grouped_partial_sql(
     plan: &QueryPlan,
     partials: &[std::collections::HashMap<String, crate::search::PartialAggResult>],
+    mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
 ) -> Result<SqlQueryResult> {
     let grouped_sql = plan
         .grouped_sql
@@ -245,6 +246,7 @@ pub fn execute_grouped_partial_sql(
                         metric,
                         &bucket,
                         grouped_sql,
+                        mappings,
                     ),
                 );
             }
@@ -279,21 +281,42 @@ fn grouped_metric_value(
     metric: &planner::SqlGroupedMetric,
     all_partials: &crate::search::GroupedMetricsBucket,
     grouped_sql: &planner::GroupedSqlPlan,
+    mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
 ) -> serde_json::Value {
     // If this metric has a residual expression tree, evaluate it using
     // resolved values from all metrics in the bucket.
     if let Some(ref residual) = metric.residual_expr {
-        return eval_residual_expr(residual, all_partials, grouped_sql);
+        return eval_residual_expr(residual, all_partials, grouped_sql, mappings);
     }
 
-    // Direct metric value (no wrapping expression).
-    raw_metric_value(partial, &metric.function)
+    raw_metric_value(
+        partial,
+        &metric.function,
+        metric_formats_as_date(metric, mappings),
+    )
+}
+
+fn metric_formats_as_date(
+    metric: &planner::SqlGroupedMetric,
+    mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+) -> bool {
+    matches!(
+        metric.function,
+        planner::SqlGroupedMetricFunction::Min | planner::SqlGroupedMetricFunction::Max
+    ) && metric
+        .field
+        .as_ref()
+        .and_then(|field_name| mappings.get(field_name))
+        .is_some_and(|mapping| mapping.field_type == crate::cluster::state::FieldType::Date)
 }
 
 /// Compute the raw numeric value for a merged metric partial.
+/// When `is_date` is true, min/max values are formatted as ISO-8601 strings
+/// instead of raw epoch millis.
 fn raw_metric_value(
     partial: Option<&crate::search::GroupedMetricPartial>,
     function: &planner::SqlGroupedMetricFunction,
+    is_date: bool,
 ) -> serde_json::Value {
     match (partial, function) {
         (
@@ -330,7 +353,13 @@ fn raw_metric_value(
             planner::SqlGroupedMetricFunction::Min,
         ) => {
             if *count > 0 {
-                serde_json::json!(min)
+                if is_date {
+                    serde_json::Value::String(crate::common::date::epoch_millis_to_iso8601(
+                        *min as i64,
+                    ))
+                } else {
+                    serde_json::json!(min)
+                }
             } else {
                 serde_json::Value::Null
             }
@@ -340,7 +369,13 @@ fn raw_metric_value(
             planner::SqlGroupedMetricFunction::Max,
         ) => {
             if *count > 0 {
-                serde_json::json!(max)
+                if is_date {
+                    serde_json::Value::String(crate::common::date::epoch_millis_to_iso8601(
+                        *max as i64,
+                    ))
+                } else {
+                    serde_json::json!(max)
+                }
             } else {
                 serde_json::Value::Null
             }
@@ -354,7 +389,24 @@ fn eval_residual_expr(
     expr: &planner::ResidualExpr,
     bucket: &crate::search::GroupedMetricsBucket,
     grouped_sql: &planner::GroupedSqlPlan,
+    mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
 ) -> serde_json::Value {
+    if let planner::ResidualExpr::MetricRef(name) = expr {
+        let Some(metric_def) = grouped_sql.metrics.iter().find(|m| &m.output_name == name) else {
+            return serde_json::Value::Null;
+        };
+
+        if let Some(ref residual) = metric_def.residual_expr {
+            return eval_residual_expr(residual, bucket, grouped_sql, mappings);
+        }
+
+        return raw_metric_value(
+            bucket.metrics.get(name),
+            &metric_def.function,
+            metric_formats_as_date(metric_def, mappings),
+        );
+    }
+
     match eval_residual_f64(expr, bucket, grouped_sql) {
         Some(v) => {
             // Preserve integer representation when the value has no fractional part
@@ -419,7 +471,7 @@ fn eval_residual_f64(
                 .iter()
                 .find(|m| &m.output_name == name)?;
             let partial = bucket.metrics.get(name);
-            let val = raw_metric_value(partial, &metric_def.function);
+            let val = raw_metric_value(partial, &metric_def.function, false);
             val.as_f64().or_else(|| val.as_u64().map(|n| n as f64))
         }
         planner::ResidualExpr::Literal(v) => Some(*v),
@@ -1051,7 +1103,9 @@ mod tests {
             )]),
         ];
 
-        let result = execute_grouped_partial_sql(&plan, &partials).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &partials, &std::collections::HashMap::new())
+                .unwrap();
         assert_eq!(result.columns, vec!["brand", "total", "avg_price"]);
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0]["brand"], "Apple");
@@ -1603,7 +1657,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = execute_grouped_partial_sql(&plan, &[]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[], &std::collections::HashMap::new()).unwrap();
         assert_eq!(result.columns, vec!["cnt", "avg_price"]);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0]["cnt"], json!(0));
@@ -1696,7 +1751,9 @@ mod tests {
             PartialAggResult::GroupedMetrics { buckets },
         );
 
-        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[partial_map], &std::collections::HashMap::new())
+                .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0]["author"], "alice");
         assert_eq!(result.rows[0]["posts"], 100);
@@ -1754,7 +1811,9 @@ mod tests {
             PartialAggResult::GroupedMetrics { buckets },
         );
 
-        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[partial_map], &std::collections::HashMap::new())
+                .unwrap();
         // OFFSET 1 skips alice, LIMIT 2 takes bob and carol
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0]["author"], "bob");
@@ -1798,7 +1857,9 @@ mod tests {
             PartialAggResult::GroupedMetrics { buckets },
         );
 
-        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[partial_map], &std::collections::HashMap::new())
+                .unwrap();
         assert_eq!(result.rows.len(), 2);
     }
 
@@ -1845,7 +1906,9 @@ mod tests {
             PartialAggResult::GroupedMetrics { buckets },
         );
 
-        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[partial_map], &std::collections::HashMap::new())
+                .unwrap();
         // bob (20) filtered out by HAVING posts > 30
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0]["author"], "alice");
@@ -1902,11 +1965,97 @@ mod tests {
             PartialAggResult::GroupedMetrics { buckets },
         );
 
-        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[partial_map], &std::collections::HashMap::new())
+                .unwrap();
         assert_eq!(result.columns, vec!["avg_price", "avg_price_copy"]);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0]["avg_price"], json!(5.0));
         assert_eq!(result.rows[0]["avg_price_copy"], json!(5.0));
+    }
+
+    #[test]
+    fn grouped_partial_sql_formats_duplicate_date_min_max_aliases_as_iso8601() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = planner::plan_sql(
+            "idx",
+            "SELECT MIN(pickup_datetime) AS first_pickup, MIN(pickup_datetime) AS first_pickup_copy, MAX(pickup_datetime) AS last_pickup, MAX(pickup_datetime) AS last_pickup_copy FROM idx",
+        )
+        .unwrap();
+        assert!(plan.uses_grouped_partials());
+
+        let grouped = plan.grouped_sql.as_ref().unwrap();
+        let projected: Vec<_> = grouped
+            .metrics
+            .iter()
+            .filter(|metric| metric.projected)
+            .collect();
+        assert_eq!(projected.len(), 4);
+
+        let mut partial_map = HashMap::new();
+        let buckets = vec![GroupedMetricsBucket {
+            group_values: vec![],
+            metrics: HashMap::from([
+                (
+                    "first_pickup".to_string(),
+                    GroupedMetricPartial::Stats {
+                        count: 2,
+                        sum: 0.0,
+                        min: 1_735_689_600_000.0,
+                        max: 1_735_776_000_000.0,
+                    },
+                ),
+                (
+                    "last_pickup".to_string(),
+                    GroupedMetricPartial::Stats {
+                        count: 2,
+                        sum: 0.0,
+                        min: 1_735_689_600_000.0,
+                        max: 1_735_776_000_000.0,
+                    },
+                ),
+            ]),
+        }];
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics { buckets },
+        );
+
+        let mappings = HashMap::from([(
+            "pickup_datetime".to_string(),
+            FieldMapping {
+                field_type: FieldType::Date,
+                dimension: None,
+            },
+        )]);
+
+        let result = execute_grouped_partial_sql(&plan, &[partial_map], &mappings).unwrap();
+        assert_eq!(
+            result.columns,
+            vec![
+                "first_pickup",
+                "first_pickup_copy",
+                "last_pickup",
+                "last_pickup_copy",
+            ]
+        );
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0]["first_pickup"],
+            json!("2025-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            result.rows[0]["first_pickup_copy"],
+            json!("2025-01-01T00:00:00Z")
+        );
+        assert_eq!(result.rows[0]["last_pickup"], json!("2025-01-02T00:00:00Z"));
+        assert_eq!(
+            result.rows[0]["last_pickup_copy"],
+            json!("2025-01-02T00:00:00Z")
+        );
     }
 
     #[test]
@@ -1951,7 +2100,9 @@ mod tests {
             PartialAggResult::GroupedMetrics { buckets },
         );
 
-        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[partial_map], &std::collections::HashMap::new())
+                .unwrap();
         // HAVING filters carol (10), LIMIT 1 takes only alice (100)
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0]["author"], "alice");
@@ -1990,7 +2141,9 @@ mod tests {
             PartialAggResult::GroupedMetrics { buckets },
         );
 
-        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[partial_map], &std::collections::HashMap::new())
+                .unwrap();
         // Top 3 by posts DESC should be author_99 (100), author_98 (99), author_97 (98)
         assert_eq!(result.rows.len(), 3);
         assert_eq!(result.rows[0]["author"], "author_99");
@@ -2030,7 +2183,9 @@ mod tests {
             PartialAggResult::GroupedMetrics { buckets },
         );
 
-        let result = execute_grouped_partial_sql(&plan, &[partial_map]).unwrap();
+        let result =
+            execute_grouped_partial_sql(&plan, &[partial_map], &std::collections::HashMap::new())
+                .unwrap();
         // OFFSET 2 skips author_49 and author_48, gives author_47 and author_46
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0]["author"], "author_47");
@@ -2109,7 +2264,7 @@ mod tests {
             Box::new(planner::ResidualExpr::MetricRef("avg_x".into())),
             2,
         );
-        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        let val = eval_residual_expr(&expr, &bucket, &grouped, &std::collections::HashMap::new());
         assert_eq!(val, json!(1.05));
     }
 
@@ -2145,7 +2300,7 @@ mod tests {
             planner::ResidualBinOp::Add,
             Box::new(planner::ResidualExpr::MetricRef("avg_b".into())),
         );
-        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        let val = eval_residual_expr(&expr, &bucket, &grouped, &std::collections::HashMap::new());
         assert_eq!(val, json!(4.0));
     }
 
@@ -2169,7 +2324,7 @@ mod tests {
             planner::ResidualBinOp::Div,
             Box::new(planner::ResidualExpr::Literal(0.0)),
         );
-        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        let val = eval_residual_expr(&expr, &bucket, &grouped, &std::collections::HashMap::new());
         assert!(val.is_null());
     }
 
@@ -2191,7 +2346,7 @@ mod tests {
         let expr = planner::ResidualExpr::CastInt(Box::new(planner::ResidualExpr::MetricRef(
             "avg_p".into(),
         )));
-        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        let val = eval_residual_expr(&expr, &bucket, &grouped, &std::collections::HashMap::new());
         assert_eq!(val, json!(3));
     }
 
@@ -2231,6 +2386,7 @@ mod tests {
             grouped.metrics[1].residual_expr.as_ref().unwrap(),
             &bucket,
             &grouped,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(val, json!(10.54));
     }
@@ -2257,7 +2413,7 @@ mod tests {
             planner::ResidualBinOp::Add,
             Box::new(planner::ResidualExpr::Literal(1.0)),
         );
-        let val = eval_residual_expr(&expr, &bucket, &grouped);
+        let val = eval_residual_expr(&expr, &bucket, &grouped, &std::collections::HashMap::new());
         // SUM stores f64 in Stats and bare SUM(x) already serializes as float,
         // so residual expressions over SUM must be consistent: always float.
         assert_eq!(val, json!(3751.0));

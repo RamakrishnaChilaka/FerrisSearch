@@ -759,6 +759,38 @@ impl TransportClient {
         Ok(map)
     }
 
+    /// Fetch per-segment stats from a remote node.
+    /// Returns a list of (index_name, shard_id, segment_info) tuples.
+    pub async fn get_segment_stats(
+        &self,
+        node: &NodeInfo,
+    ) -> Result<Vec<(String, u32, crate::engine::SegmentInfo)>, anyhow::Error> {
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
+        let resp = client
+            .get_segment_stats(tonic::Request::new(SegmentStatsRequest {}))
+            .await
+            .map_err(|e| anyhow::anyhow!("GetSegmentStats RPC to {}: {}", node.id, e))?;
+        let inner = resp.into_inner();
+        Ok(inner
+            .segments
+            .into_iter()
+            .map(|segment| {
+                (
+                    segment.index_name,
+                    segment.shard_id,
+                    crate::engine::SegmentInfo {
+                        segment_id: segment.segment_id,
+                        num_docs: segment.num_docs as u32,
+                        deleted_docs: segment.deleted_docs as u32,
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Fan out a refresh request to a remote node for a specific index.
     pub async fn forward_refresh(
         &self,
@@ -797,6 +829,66 @@ impl TransportClient {
             .map_err(|e| anyhow::anyhow!("FlushIndex RPC to {}: {}", node.id, e))?;
         let inner = resp.into_inner();
         Ok((inner.successful_shards, inner.failed_shards))
+    }
+
+    /// Fan out a force-merge request to a remote node for a specific index.
+    pub async fn forward_force_merge(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        max_num_segments: u32,
+    ) -> Result<String, anyhow::Error> {
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
+        let resp = client
+            .force_merge_index(tonic::Request::new(ForceMergeRequest {
+                index_name: index_name.to_string(),
+                max_num_segments,
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("ForceMergeIndex RPC to {}: {}", node.id, e))?;
+        Ok(resp.into_inner().task_id)
+    }
+
+    pub async fn get_task_status(
+        &self,
+        node: &NodeInfo,
+        task_id: &str,
+    ) -> Result<Option<crate::tasks::LocalForceMergeTaskSnapshot>, anyhow::Error> {
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
+        let response = client
+            .get_task_status(tonic::Request::new(GetTaskStatusRequest {
+                task_id: task_id.to_string(),
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("GetTaskStatus RPC to {}: {}", node.id, e))?
+            .into_inner();
+
+        if !response.found {
+            return Ok(None);
+        }
+
+        Ok(Some(crate::tasks::LocalForceMergeTaskSnapshot {
+            task_id: response.task_id,
+            action: response.action,
+            node_id: response.node_id,
+            index_name: response.index_name,
+            max_num_segments: response.max_num_segments as usize,
+            status: crate::tasks::TaskStatus::from_wire(&response.status),
+            created_at_epoch_ms: response.created_at_epoch_ms,
+            started_at_epoch_ms: (response.started_at_epoch_ms != 0)
+                .then_some(response.started_at_epoch_ms),
+            completed_at_epoch_ms: (response.completed_at_epoch_ms != 0)
+                .then_some(response.completed_at_epoch_ms),
+            successful_shards: response.successful_shards,
+            failed_shards: response.failed_shards,
+            error: (!response.error.is_empty()).then_some(response.error),
+        }))
     }
 }
 

@@ -10,6 +10,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 pub use self::composite::CompositeEngine;
 pub use self::tantivy::HotEngine;
 
+/// Per-segment metadata for diagnostics and monitoring.
+pub struct SegmentInfo {
+    pub segment_id: String,
+    pub num_docs: u32,
+    pub deleted_docs: u32,
+}
+
 pub struct SqlBatchResult {
     pub batch: RecordBatch,
     pub total_hits: usize,
@@ -105,6 +112,15 @@ pub trait SearchEngine: Send + Sync {
     /// for replica recovery.
     fn flush_with_global_checkpoint(&self) -> Result<()> {
         self.flush()
+    }
+
+    /// Force-merge segments down to at most `max_num_segments`.
+    /// Commits first to ensure all buffered docs are on disk, then merges.
+    fn force_merge(&self, max_num_segments: usize) -> Result<()>;
+
+    /// Returns per-segment metadata for diagnostics/monitoring.
+    fn segment_infos(&self) -> Vec<SegmentInfo> {
+        vec![]
     }
 
     /// Search using a simple query string (e.g. `?q=...`).

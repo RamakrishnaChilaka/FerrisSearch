@@ -1,5 +1,5 @@
 use crate::api::AppState;
-use crate::cluster::state::{IndexMetadata, NodeInfo};
+use crate::cluster::state::IndexMetadata;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -13,61 +13,23 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// If this node is the Raft leader, returns `None`.
-/// If not, resolves the master node for forwarding and returns `Some(master)`.
-/// Returns an error response if no master is available.
-fn resolve_leader_or_master(
-    state: &AppState,
-    operation: &str,
-) -> Result<Option<NodeInfo>, (StatusCode, Json<Value>)> {
-    if state.raft.is_leader() {
-        return Ok(None);
-    }
-    let cs = state.cluster_manager.get_state();
-    let master_id = cs.master_node.as_ref().ok_or_else(|| {
-        crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "master_not_discovered_exception",
-            format!("No master node available to forward {}", operation),
-        )
-    })?;
-    let master_node = cs.nodes.get(master_id).cloned().ok_or_else(|| {
-        crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "master_not_discovered_exception",
-            "Master node info not found in cluster state",
-        )
-    })?;
-    Ok(Some(master_node))
-}
-
-/// Write a command through Raft and return a standard error response on failure.
-async fn raft_write(
-    state: &AppState,
-    cmd: crate::consensus::types::ClusterCommand,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    state.raft.client_write(cmd).await.map_err(|e| {
-        crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "raft_write_exception",
-            format!("Raft write failed: {}", e),
-        )
-    })?;
-    Ok(())
-}
+use crate::api::{raft_write, resolve_leader_or_master};
 
 mod bulk;
 mod maintenance;
 
 pub use bulk::{bulk_index, bulk_index_global};
-pub use maintenance::{flush_index, refresh_index};
+pub use maintenance::{flush_index, force_merge_index, refresh_index};
 
 #[cfg(test)]
 use crate::transport::server::MaintenanceDispatchOp;
 #[cfg(test)]
 use bulk::{RoutedBulkDoc, finalize_bulk_items, parse_bulk_ndjson, route_bulk_doc};
 #[cfg(test)]
-use maintenance::{fan_out_maintenance, maintenance_fanout_concurrency, spawn_maintenance_job};
+use maintenance::{
+    enqueue_force_merge_tasks, fan_out_maintenance, maintenance_fanout_concurrency,
+    spawn_maintenance_job,
+};
 
 pub(crate) struct DistributedDslSearchResult {
     pub all_hits: Vec<Value>,

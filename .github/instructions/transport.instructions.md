@@ -36,10 +36,13 @@ TransferMaster(TransferMasterRequest) → TransferMasterResponse
 
 // Shard stats (for _cat endpoints)
 GetShardStats(ShardStatsRequest) → ShardStatsResponse
+GetSegmentStats(SegmentStatsRequest) → SegmentStatsResponse
 
 // Index maintenance (fan-out from coordinator)
 RefreshIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
 FlushIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
+ForceMergeIndex(ForceMergeRequest) → ForceMergeResponse
+GetTaskStatus(GetTaskStatusRequest) → GetTaskStatusResponse
 
 // Raft consensus (opaque JSON payloads)
 RaftVote(RaftRequest) → RaftReply
@@ -61,6 +64,7 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 
 ### Shard Stats & Maintenance
 - `get_shard_stats` only reports on **already-open** shards via `all_shards()` — it does NOT reopen shards from disk
+- `get_segment_stats` only reports on **already-open** shards via `all_shards()` and returns every segment row from `segment_infos()` for each local shard copy
 - `refresh_index` / `flush_index` reopen assigned shards with the same read-side UUID-dir guard as `get_or_open_search_shard()`, then run the engine refresh/flush on the write pool; missing authoritative UUID dirs are logged and skipped rather than creating fresh shard data
 - The maintenance helper only operates on shards where `primary == local_node_id` or the node is in `replicas` — orphaned shards are skipped
 - The `local_node_id` field is required by the constructors: `create_transport_service(cm, sm, tc, local_node_id)` and `create_transport_service_with_raft(cm, sm, tc, raft, local_node_id)`
@@ -115,8 +119,11 @@ pub struct TransportClient {
 | `open_sql_batch_stream_to_shard()` | Open a live remote SQL batch stream, eagerly decode only the first batch + metadata, then keep the remaining gRPC stream live for `StreamingTable` partitions |
 | `forward_sql_batch_stream_to_shard()` | Stream multiple SQL RecordBatches from a remote shard (Arrow IPC) and report whether the shard actually used streaming |
 | `get_shard_stats()` | Collect shard doc counts from remote node |
+| `get_segment_stats()` | Collect per-segment rows from remote node |
 | `forward_refresh()` | Fan out refresh to remote node |
 | `forward_flush()` | Fan out flush to remote node |
+| `forward_force_merge()` | Enqueue async force-merge work on a remote node |
+| `get_task_status()` | Fetch the node-local async force-merge task snapshot |
 | `replicate_to_shard()` | Primary → replica single write |
 | `replicate_bulk_to_shard()` | Primary → replica batch write |
 | `recover_replica()` | Request missed ops from primary's WAL |

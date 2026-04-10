@@ -8,7 +8,7 @@ use crate::transport::proto::internal_transport_server::{
 };
 use crate::transport::proto::*;
 use crate::wal::WriteAheadLog;
-use futures::{Stream, stream};
+use futures::{FutureExt, Stream, stream};
 use openraft::type_config::async_runtime::WatchReceiver;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,6 +28,8 @@ pub struct TransportService {
     pub local_node_id: crate::cluster::state::NodeId,
     /// Dedicated thread pools for search and write workloads.
     pub worker_pools: crate::worker::WorkerPools,
+    /// Tracks asynchronous background tasks running on this node.
+    pub task_manager: Arc<crate::tasks::TaskManager>,
     /// Serializes leader-side JoinCluster handling so concurrent joins cannot
     /// race identity validation or submit stale full voter sets.
     join_lock: Arc<Mutex<()>>,
@@ -41,15 +43,77 @@ fn new_join_lock() -> Arc<Mutex<()>> {
 pub(crate) enum MaintenanceDispatchOp {
     Refresh,
     Flush,
+    ForceMerge(usize),
 }
 
 impl MaintenanceDispatchOp {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Refresh => "refresh",
             Self::Flush => "flush",
+            Self::ForceMerge(_) => "forcemerge",
         }
     }
+}
+
+pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    task_manager: Arc<crate::tasks::TaskManager>,
+    worker_pools: crate::worker::WorkerPools,
+    local_node_id: String,
+    index_name: String,
+    max_num_segments: usize,
+) -> String {
+    let task_id =
+        task_manager.create_local_force_merge(&local_node_id, &index_name, max_num_segments);
+    let task_id_for_job = task_id.clone();
+    tokio::spawn(async move {
+        task_manager.mark_running(&task_id_for_job);
+        let result = std::panic::AssertUnwindSafe(run_maintenance_on_assigned_shards_async(
+            cluster_manager,
+            shard_manager,
+            worker_pools,
+            local_node_id,
+            index_name.clone(),
+            MaintenanceDispatchOp::ForceMerge(max_num_segments),
+        ))
+        .catch_unwind()
+        .await;
+
+        match result {
+            Ok((successful, failed)) => {
+                task_manager.finish_local_force_merge(&task_id_for_job, successful, failed, None);
+
+                if failed > 0 {
+                    tracing::error!(
+                        "Background maintenance forcemerge finished for {} with {} successful shards and {} failures",
+                        index_name,
+                        successful,
+                        failed
+                    );
+                } else {
+                    tracing::info!(
+                        "Background maintenance forcemerge finished for {} with {} successful shards",
+                        index_name,
+                        successful
+                    );
+                }
+            }
+            Err(_) => {
+                task_manager.fail_local_force_merge(
+                    &task_id_for_job,
+                    "background forcemerge task panicked",
+                );
+                tracing::error!(
+                    "Background maintenance forcemerge panicked for {}",
+                    index_name
+                );
+            }
+        }
+    });
+
+    task_id
 }
 
 #[allow(clippy::result_large_err)]
@@ -141,6 +205,9 @@ pub(crate) async fn run_maintenance_on_assigned_shards_async(
                     shard_id,
                     status.message()
                 );
+                if matches!(op, MaintenanceDispatchOp::ForceMerge(_)) {
+                    failed += 1;
+                }
                 continue;
             }
         };
@@ -149,6 +216,7 @@ pub(crate) async fn run_maintenance_on_assigned_shards_async(
             .spawn_write(move || match op {
                 MaintenanceDispatchOp::Refresh => engine.refresh(),
                 MaintenanceDispatchOp::Flush => engine.flush_with_global_checkpoint(),
+                MaintenanceDispatchOp::ForceMerge(max_segments) => engine.force_merge(max_segments),
             })
             .await;
 
@@ -1604,6 +1672,26 @@ impl InternalTransport for TransportService {
         Ok(Response::new(ShardStatsResponse { shards }))
     }
 
+    async fn get_segment_stats(
+        &self,
+        _request: Request<SegmentStatsRequest>,
+    ) -> Result<Response<SegmentStatsResponse>, Status> {
+        let all = self.shard_manager.all_shards();
+        let mut segments = Vec::new();
+        for (key, engine) in &all {
+            for segment in engine.segment_infos() {
+                segments.push(SegmentStat {
+                    index_name: key.index.clone(),
+                    shard_id: key.shard_id,
+                    segment_id: segment.segment_id,
+                    num_docs: segment.num_docs as u64,
+                    deleted_docs: segment.deleted_docs as u64,
+                });
+            }
+        }
+        Ok(Response::new(SegmentStatsResponse { segments }))
+    }
+
     // ─── Index Maintenance RPCs ───────────────────────────────────────────────
 
     async fn refresh_index(
@@ -1643,6 +1731,64 @@ impl InternalTransport for TransportService {
         Ok(Response::new(IndexMaintenanceResponse {
             successful_shards: successful,
             failed_shards: failed,
+        }))
+    }
+
+    async fn force_merge_index(
+        &self,
+        request: Request<ForceMergeRequest>,
+    ) -> Result<Response<ForceMergeResponse>, Status> {
+        let inner = request.into_inner();
+        let max_segments = (inner.max_num_segments as usize).max(1);
+        let task_id = enqueue_force_merge_task_on_assigned_shards(
+            self.cluster_manager.clone(),
+            self.shard_manager.clone(),
+            self.task_manager.clone(),
+            self.worker_pools.clone(),
+            self.local_node_id.clone(),
+            inner.index_name,
+            max_segments,
+        );
+        Ok(Response::new(ForceMergeResponse { task_id }))
+    }
+
+    async fn get_task_status(
+        &self,
+        request: Request<GetTaskStatusRequest>,
+    ) -> Result<Response<GetTaskStatusResponse>, Status> {
+        let task_id = request.into_inner().task_id;
+        let Some(task) = self.task_manager.get_local_force_merge(&task_id) else {
+            return Ok(Response::new(GetTaskStatusResponse {
+                found: false,
+                task_id,
+                action: String::new(),
+                status: String::new(),
+                node_id: String::new(),
+                index_name: String::new(),
+                max_num_segments: 0,
+                successful_shards: 0,
+                failed_shards: 0,
+                created_at_epoch_ms: 0,
+                started_at_epoch_ms: 0,
+                completed_at_epoch_ms: 0,
+                error: String::new(),
+            }));
+        };
+
+        Ok(Response::new(GetTaskStatusResponse {
+            found: true,
+            task_id: task.task_id,
+            action: task.action,
+            status: task.status.as_str().to_string(),
+            node_id: task.node_id,
+            index_name: task.index_name,
+            max_num_segments: task.max_num_segments as u32,
+            successful_shards: task.successful_shards,
+            failed_shards: task.failed_shards,
+            created_at_epoch_ms: task.created_at_epoch_ms,
+            started_at_epoch_ms: task.started_at_epoch_ms.unwrap_or(0),
+            completed_at_epoch_ms: task.completed_at_epoch_ms.unwrap_or(0),
+            error: task.error.unwrap_or_default(),
         }))
     }
 
@@ -1871,6 +2017,7 @@ pub fn create_transport_service_for_test(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
     transport_client: crate::transport::TransportClient,
+    task_manager: Arc<crate::tasks::TaskManager>,
     local_node_id: String,
 ) -> InternalTransportServer<TransportService> {
     let service = TransportService {
@@ -1880,6 +2027,7 @@ pub fn create_transport_service_for_test(
         raft: None,
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),
+        task_manager,
         join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)
@@ -1893,6 +2041,7 @@ pub fn create_transport_service_with_raft(
     shard_manager: Arc<ShardManager>,
     transport_client: crate::transport::TransportClient,
     raft: Arc<RaftInstance>,
+    task_manager: Arc<crate::tasks::TaskManager>,
     local_node_id: String,
 ) -> InternalTransportServer<TransportService> {
     let service = TransportService {
@@ -1902,6 +2051,7 @@ pub fn create_transport_service_with_raft(
         raft: Some(raft),
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),
+        task_manager,
         join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)

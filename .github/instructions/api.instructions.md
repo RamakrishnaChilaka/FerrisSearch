@@ -61,7 +61,7 @@ pub fn error_response(
 
 ## API Handlers
 
-### Cluster & Catalog — src/api/cat.rs, src/api/cluster.rs (read-only, serve locally)
+### Cluster & Catalog — src/api/cat.rs, src/api/cluster.rs (read-only coordinator endpoints)
 | HTTP | Path | Handler | Purpose |
 |------|------|---------|---------|
 | GET | `/` | `handle_root()` | Node info |
@@ -71,6 +71,8 @@ pub fn error_response(
 | GET | `/_cat/shards` | `cat_shards()` | Shard allocation (prirep=p/r, state, docs, node) |
 | GET | `/_cat/indices` | `cat_indices()` | Index listing (health, shards, docs) |
 | GET | `/_cat/master` | `cat_master()` | Current master node |
+| GET | `/_cat/segments` | `cat_segments()` | Per-segment listing across the cluster (`?local` for local-only) |
+| GET | `/_tasks/{task_id}` | `get_task()` | Background task status for async maintenance |
 
 `handle_root()` must source its `version` field from `env!("CARGO_PKG_VERSION")` so the root REST response stays in sync with `Cargo.toml` during releases.
 
@@ -84,12 +86,13 @@ State is determined by `shard_display_state()` — a single function used for bo
 
 `INITIALIZING` is a runtime observation, NOT a cluster state change. The `ShardState` enum (`Started` / `Unassigned`) represents the Raft-managed allocation intent. The display state is the intersection of allocation intent + shard engine availability.
 
-### Cat Endpoint Doc Count Collection
-By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `GetShardStats` to collect real doc counts (mirrors OpenSearch behavior). This ensures every shard row shows accurate doc counts regardless of which node is queried.
+### Cat Endpoint Fan-Out Collection
+By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `GetShardStats` to collect real doc counts (mirrors OpenSearch behavior). `_cat/segments` also fans out to all nodes via `GetSegmentStats` and must list every segment row reported by each started shard copy in the cluster.
 
 - **`?local`**: Falls back to local-only doc counts — shows counts for shards hosted on this node, `-` for remote shards. Useful for debugging or reducing overhead.
 - The fan-out uses concurrent `tokio::spawn` for each remote node, with graceful degradation (failed RPCs are silently skipped, showing `0`).
 - Distributed `_cat/shards` doc counts are also per copy: primary and replica rows must read from the reporting node's `(node_id, index, shard_id)` entry, not a shard-global count shared across all copies.
+- `_cat/segments?local` must skip remote shard copies entirely and only inspect locally open engines. The default distributed path must preserve segment-level granularity rather than collapsing one row per shard.
 ### Index Management — src/api/index.rs (Raft writes → forward to leader)
 | HTTP | Path | Handler |
 |------|------|---------|
@@ -180,6 +183,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 |------|------|---------|
 | POST/GET | `/{index}/_refresh` | `refresh_index()` — fans out to all nodes |
 | POST/GET | `/{index}/_flush` | `flush_index()` — fans out to all nodes |
+| POST | `/{index}/_forcemerge` | `force_merge_index()` — enqueues a background cluster-wide force-merge |
 
 ### Refresh/Flush Fan-Out
 Both `refresh_index()` and `flush_index()` fan out to ALL nodes via `fan_out_maintenance()`:
@@ -189,6 +193,16 @@ Both `refresh_index()` and `flush_index()` fan out to ALL nodes via `fan_out_mai
 - The maintenance helper checks the routing table — only shards where this node is primary or replica are operated on (orphaned shards are skipped)
 - Missing authoritative UUID directories on a maintenance path are logged and skipped; they must not create fresh shard data
 - Response: `{"_shards": {"total": N, "successful": M, "failed": F}}`
+
+`force_merge_index()` is intentionally asynchronous because large merges can exceed the gRPC request timeout. The coordinator enqueues force-merge work on every node, each node returns immediately after spawning the background task, and the REST handler responds with `202 Accepted` plus `_nodes.total/_nodes.started`, `_nodes.failed`, and a `task` object instead of shard success counts.
+
+- Async `/_forcemerge` is a **cluster-wide fan-out** just like refresh/flush: the coordinator must enqueue its local node alongside all remote nodes instead of running only local work.
+
+### Async Force-Merge Task Tracking
+- `POST /{index}/_forcemerge` returns a coordinator-local cluster task id under `task.id`, plus `task.coordinator_node` so clients know which node owns the task record.
+- `GET /_tasks/{task_id}` aggregates node-local force-merge task state for that coordinator-owned task and returns per-node child status in `nodes[]` plus summary counts in `_nodes`.
+- Coordinator-local task ids are not Raft-replicated. Until a true cluster-global task registry exists, task status lookups must hit the same coordinator node that returned `task.id`.
+- Transport `GetTaskStatus` is node-local and only exposes locally tracked task state; the HTTP task endpoint performs the cluster fan-out/aggregation step.
 
 ## RefreshParam
 ```rust

@@ -201,6 +201,7 @@ async fn make_test_app_state(cluster_state: ClusterState) -> (tempfile::TempDir,
         local_node_id: "node-1".into(),
         raft,
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };
@@ -356,6 +357,66 @@ async fn fan_out_maintenance_keeps_local_target_without_node_entry() {
 
     assert_eq!((successful, failed), (1, 0));
     assert!(state.shard_manager.get_shard("idx", 0).is_some());
+}
+
+#[tokio::test]
+async fn enqueue_force_merge_tasks_keeps_local_target_without_node_entry() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_index(make_test_metadata(Some("node-1")));
+
+    let (temp_dir, state) = make_test_app_state(cluster_state).await;
+    let shard_dir = temp_dir.path().join("idx-uuid").join("shard_0");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+
+    let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+    engine
+        .add_document("doc-1", serde_json::json!({"title": "maintenance reopen"}))
+        .unwrap();
+    engine.refresh().unwrap();
+    drop(engine);
+
+    let dispatch = enqueue_force_merge_tasks(&state, "idx", 1).await;
+
+    assert_eq!(dispatch.total_nodes, 1);
+    assert_eq!(dispatch.node_tasks.len(), 1);
+    assert!(dispatch.dispatch_failures.is_empty());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if state.shard_manager.get_shard("idx", 0).is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background force-merge should reopen the local shard");
+}
+
+#[tokio::test]
+async fn force_merge_http_returns_accepted_response() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_index(make_test_metadata(Some("node-1")));
+
+    let (_tmp, state) = make_test_app_state(cluster_state).await;
+    let (status, Json(body)) = force_merge_index(
+        State(state),
+        Path(crate::common::IndexName::new("idx").unwrap()),
+        Query(HashMap::from([(
+            "max_num_segments".to_string(),
+            "3".to_string(),
+        )])),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["acknowledged"], true);
+    assert_eq!(body["index"], "idx");
+    assert_eq!(body["max_num_segments"], 3);
+    assert_eq!(body["task"]["action"], "indices:admin/forcemerge");
+    assert!(body["task"]["id"].as_str().is_some());
+    assert_eq!(body["_nodes"]["total"], 1);
+    assert_eq!(body["_nodes"]["started"], 1);
+    assert_eq!(body["_nodes"]["failed"], 0);
 }
 
 #[test]
