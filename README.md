@@ -78,7 +78,7 @@ Every SQL response tells you how the planner executed the query:
 - **Generation-based WAL** — durable writes, replica catch-up, and background auto-flush
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, and planner metadata in SQL responses
-- **Test depth** — 1158 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
+- **Test depth** — 1165 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
 
 ## Tech Stack
 
@@ -208,6 +208,7 @@ Scan limits are mode-specific. Flat `tantivy_fast_fields` queries keep their int
 - `text_match(field, 'query')` — full-text search pushed into Tantivy; multiple top-level `AND`ed `text_match(...)` predicates become multiple search `must` clauses
 - `=`, `>`, `>=`, `<`, `<=`, `BETWEEN`, `IN` — structured filter pushdown
 - `GROUP BY` with `count(*)`, `sum()`, `avg()`, `min()`, `max()`
+- nested per-doc arithmetic inside grouped aggregates when all leaves are numeric fast fields, for example `SUM(a + b)` or `AVG((a - b) / a)`
 - same-index semijoin subqueries: top-level `expr IN (SELECT key FROM same_index ...)` with uncorrelated inner queries
 - `HAVING` — post-merge filtering on grouped results
 - `ORDER BY` with `LIMIT` and `OFFSET`

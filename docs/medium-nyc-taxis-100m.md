@@ -104,7 +104,7 @@ The fee stacks are similar, but Uber's higher base fare means fees are a smaller
 
 ## Tipping: A 20% Ceiling
 
-Among riders who tip, the top pickup zones all converge on a consistent **20% tip rate** — almost exactly the standard restaurant gratuity. The top 15 tipping zones all cluster between 19.9% and 20.1%.
+Among riders who tip, the highest-volume pickup zones converge on an approximately **20% tip rate** — almost exactly the standard restaurant gratuity. The top 15 high-volume tipping zones sit in a narrow band just under 20%.
 
 This is remarkably uniform. It suggests riders who choose to tip are anchored to a default percentage, likely the app's suggested tip option, regardless of fare amount or zone.
 
@@ -213,6 +213,8 @@ WAV drivers earn a 10-percentage-point payout premium on **every ride**, not jus
 
 Representative latencies from the full 243.6M-row dataset (3 nodes, 12 shards, 1 segment per shard post-force-merge, i5-13600K, warm cache, best of 3 runs):
 
+These timings come from the benchmark build used for the original draft. Current builds keep more of the appendix queries on `tantivy_grouped_partials`, including the carrier margin-gap query.
+
 | Query | Hits Scanned | Execution Mode | Latency |
 |-------|-------------|----------------|--------|
 | `SELECT count(*) FROM "nyc-taxis"` | 243.6M | count_star_fast | **2ms** |
@@ -228,9 +230,294 @@ Representative latencies from the full 243.6M-row dataset (3 nodes, 12 shards, 1
 **Notes:**
 - All grouped analytics use either `tantivy_grouped_partials` (shard-local fast-field partial aggregation with coordinator merge) or `tantivy_fast_fields` (expression-based fallback with bitset streaming). No row materialization.
 - The `count_star_fast` path skips search entirely and reads segment metadata — 2ms across 243.6M docs.
-- `tantivy_grouped_partials` handles simple GROUP BY shapes at sub-second latency even on 243M rows (506ms for carrier market share). Queries with expressions like `ROUND(AVG(x/y), 2)` fall to `tantivy_fast_fields` which streams all matched columns through DataFusion — these scale linearly with doc count.
+- `tantivy_grouped_partials` handles simple GROUP BY shapes at sub-second latency even on 243M rows (506ms for carrier market share). At the time of these measurements, several ratio-heavy grouped queries still fell to `tantivy_fast_fields`; current builds keep plain grouped ratio queries like `AVG(base_passenger_fare / trip_miles)` on `tantivy_grouped_partials`, and only unsupported residual shapes fall back.
 - Filtered queries (WHERE on keyword + range) narrow to sub-million hit sets before aggregation; these complete in **under 200ms** regardless of execution mode.
 - Force-merging to 1 segment per shard is critical for performance — eliminates per-segment overhead on 20M-doc shards.
+
+### Current Rerun vs Draft
+
+On Apr 10 2026, the benchmark set above was re-run against the current post-force-merge cluster using the archived shell query set from the benchmark notes, sent to `POST /nyc-taxis/_sql`, and taking the best wall-clock time from 3 runs per query.
+
+| Query | Published Draft | Current Rerun | Current Mode |
+|-------|-----------------|---------------|--------------|
+| `SELECT count(*) FROM "nyc-taxis"` | 2ms | 1.9ms | `count_star_fast` |
+| Carrier market share | 506ms | 696ms | `tantivy_grouped_partials` |
+| Fee stack by carrier | 1.65s | 2.97s | `tantivy_grouped_partials` |
+| Top 5 pickup zones | 9.6s | 2.66s | `tantivy_grouped_partials` |
+| Top 10 routes | 9.6s | 14.39s | `tantivy_grouped_partials` |
+| Margin gap | 21.0s | 3.44s | `tantivy_grouped_partials` |
+| Airport corridor | 170ms | 302ms | `tantivy_grouped_partials` |
+| WAV headline | 176ms | 88ms | `tantivy_grouped_partials` |
+| WAV short trips | 170ms | 161ms | `tantivy_grouped_partials` |
+
+### Why `Top 10 Routes` Is Still ~15s
+
+This query is still the worst-case shape in the appendix: a full-scan `GROUP BY (PULocationID, DOLocationID)` over the entire 243.6M-row corpus, ordered by ride count, with only the top 10 rows returned at the end. The current `EXPLAIN` plan for the exact archived query keeps it on `tantivy_grouped_partials`, but still shows `limit_pushed_down: false` and applies `top_k_selection` only in the final SQL-shaping stage after shard partials have already been collected and merged.
+
+Approximate shard-level top-K pruning exists for exactly this kind of query, but it is opt-in and the current config still uses the default `sql_approximate_top_k: false`. That means each shard keeps the full route-bucket map and ships it to the coordinator before the top 10 is selected. The pickup-zone query only has 265 groups, so it stays relatively cheap; the route query has far higher bucket cardinality, so it remains expensive even after force-merge.
+
+---
+
+## Exact Benchmark SQL
+
+The 9 queries below are the exact SQL strings used for the Apr 10 2026 rerun and the side-by-side table above. These match the archived benchmark helper queries, including their rounding and filter thresholds.
+
+### 1. Count
+
+```sql
+SELECT count(*) AS total_rides
+FROM "nyc-taxis";
+```
+
+### 2. Carrier Market Share
+
+```sql
+SELECT hvfhs_license_num,
+			 count(*) AS rides,
+			 ROUND(SUM(base_passenger_fare), 0) AS revenue
+FROM "nyc-taxis"
+GROUP BY hvfhs_license_num
+ORDER BY rides DESC;
+```
+
+### 3. Fee Stack By Carrier
+
+```sql
+SELECT hvfhs_license_num,
+			 ROUND(AVG(base_passenger_fare), 2) AS avg_fare,
+			 ROUND(AVG(sales_tax), 2) AS avg_tax,
+			 ROUND(AVG(tolls), 2) AS avg_tolls,
+			 ROUND(AVG(congestion_surcharge), 2) AS avg_congestion,
+			 ROUND(AVG(bcf), 2) AS avg_bcf,
+			 ROUND(AVG(airport_fee), 2) AS avg_airport
+FROM "nyc-taxis"
+GROUP BY hvfhs_license_num
+ORDER BY hvfhs_license_num;
+```
+
+### 4. Top 5 Pickup Zones
+
+```sql
+SELECT "PULocationID",
+			 count(*) AS rides,
+			 ROUND(SUM(base_passenger_fare + tips), 0) AS gross_revenue,
+			 ROUND(AVG(base_passenger_fare), 2) AS avg_fare,
+			 ROUND(SUM(tips) / SUM(base_passenger_fare) * 100, 0) AS tip_rate
+FROM "nyc-taxis"
+GROUP BY "PULocationID"
+ORDER BY gross_revenue DESC
+LIMIT 5;
+```
+
+### 5. Top 10 Routes
+
+```sql
+SELECT "PULocationID",
+			 "DOLocationID",
+			 count(*) AS rides,
+			 ROUND(SUM(base_passenger_fare + tips), 0) AS gross_revenue,
+			 ROUND(AVG(trip_miles), 1) AS avg_miles
+FROM "nyc-taxis"
+GROUP BY "PULocationID", "DOLocationID"
+ORDER BY rides DESC
+LIMIT 10;
+```
+
+### 6. Margin Gap
+
+```sql
+SELECT hvfhs_license_num,
+			 ROUND(AVG(base_passenger_fare / trip_miles), 2) AS fare_per_mile,
+			 ROUND(AVG(driver_pay / base_passenger_fare) * 100, 0) AS payout_pct,
+			 ROUND(AVG(tips / base_passenger_fare) * 100, 0) AS tip_rate_pct
+FROM "nyc-taxis"
+WHERE trip_miles > 0.1
+	AND base_passenger_fare > 1
+GROUP BY hvfhs_license_num
+ORDER BY hvfhs_license_num;
+```
+
+### 7. Airport Corridor
+
+```sql
+SELECT hvfhs_license_num,
+			 PULocationID,
+			 count(*) AS rides,
+			 ROUND(AVG(trip_miles), 1) AS avg_miles,
+			 ROUND(AVG(base_passenger_fare / trip_miles), 2) AS fare_per_mile,
+			 ROUND(AVG(driver_pay / base_passenger_fare) * 100, 0) AS payout_pct,
+			 ROUND(SUM(tips) / SUM(base_passenger_fare) * 100, 0) AS tip_rate
+FROM "nyc-taxis"
+WHERE DOLocationID = 265
+	AND (PULocationID = 132 OR PULocationID = 138)
+	AND trip_miles > 0.1
+	AND base_passenger_fare > 1
+GROUP BY hvfhs_license_num, PULocationID
+ORDER BY PULocationID, hvfhs_license_num;
+```
+
+### 8. WAV Headline
+
+```sql
+SELECT hvfhs_license_num,
+			 count(*) AS rides,
+			 ROUND(AVG(base_passenger_fare), 2) AS avg_fare,
+			 ROUND(AVG(driver_pay), 2) AS avg_pay,
+			 ROUND(AVG(driver_pay / base_passenger_fare) * 100, 0) AS payout_pct,
+			 ROUND(SUM(driver_pay - base_passenger_fare), 0) AS total_premium
+FROM "nyc-taxis"
+WHERE wav_request_flag = 'Y'
+	AND wav_match_flag = 'Y'
+	AND base_passenger_fare > 0
+GROUP BY hvfhs_license_num
+ORDER BY hvfhs_license_num;
+```
+
+### 9. WAV Short Trips
+
+```sql
+SELECT hvfhs_license_num,
+			 count(*) AS rides,
+			 ROUND(AVG(driver_pay - base_passenger_fare), 2) AS avg_premium
+FROM "nyc-taxis"
+WHERE wav_request_flag = 'Y'
+	AND wav_match_flag = 'Y'
+	AND base_passenger_fare > 0
+	AND trip_miles < 5
+GROUP BY hvfhs_license_num
+ORDER BY hvfhs_license_num;
+```
+
+## Supporting Story SQL
+
+### Tipping Zones
+
+```sql
+SELECT PULocationID,
+			 count(*) AS tipped_rides,
+			 sum(tips) / sum(base_passenger_fare) AS tip_rate,
+			 avg(base_passenger_fare) AS avg_fare
+FROM "nyc-taxis"
+WHERE tips > 0
+	AND base_passenger_fare > 0
+GROUP BY PULocationID
+HAVING count(*) > 500000
+ORDER BY tip_rate DESC
+LIMIT 15;
+```
+
+### Trip Segments
+
+```sql
+SELECT CASE
+				 WHEN trip_miles <= 3 THEN 'Short (<=3 mi)'
+				 WHEN trip_miles <= 10 THEN 'Medium (3-10 mi)'
+				 ELSE 'Long (10+ mi)'
+			 END AS segment,
+			 CASE
+				 WHEN trip_miles <= 3 THEN 1
+				 WHEN trip_miles <= 10 THEN 2
+				 ELSE 3
+			 END AS bucket_order,
+			 count(*) AS rides,
+			 count(*) * 100.0 / 243589684 AS share_pct,
+			 avg(base_passenger_fare) AS avg_fare,
+			 sum(base_passenger_fare) AS total_revenue,
+			 sum(tips) / sum(base_passenger_fare) AS tip_rate
+FROM "nyc-taxis"
+WHERE trip_miles > 0
+GROUP BY CASE
+					 WHEN trip_miles <= 3 THEN 'Short (<=3 mi)'
+					 WHEN trip_miles <= 10 THEN 'Medium (3-10 mi)'
+					 ELSE 'Long (10+ mi)'
+				 END,
+				 CASE
+					 WHEN trip_miles <= 3 THEN 1
+					 WHEN trip_miles <= 10 THEN 2
+					 ELSE 3
+				 END
+ORDER BY bucket_order;
+```
+
+### Shared-Ride Discount
+
+```sql
+SELECT shared_request_flag,
+			 shared_match_flag,
+			 count(*) AS rides,
+			 ROUND(AVG(base_passenger_fare), 2) AS avg_fare,
+			 ROUND(AVG(driver_pay / base_passenger_fare) * 100, 0) AS payout_pct
+FROM "nyc-taxis"
+WHERE hvfhs_license_num = 'HV0003'
+	AND base_passenger_fare > 0
+GROUP BY shared_request_flag, shared_match_flag
+ORDER BY rides DESC;
+```
+
+### WAV Headline
+
+```sql
+SELECT hvfhs_license_num,
+			 count(*) AS rides,
+			 ROUND(AVG(base_passenger_fare), 2) AS avg_fare,
+			 ROUND(AVG(driver_pay), 2) AS avg_pay,
+			 ROUND(AVG(driver_pay / base_passenger_fare) * 100, 0) AS payout_pct,
+			 ROUND(SUM(driver_pay - base_passenger_fare), 0) AS total_premium
+FROM "nyc-taxis"
+WHERE wav_request_flag = 'Y'
+	AND wav_match_flag = 'Y'
+	AND base_passenger_fare > 0
+GROUP BY hvfhs_license_num
+ORDER BY hvfhs_license_num;
+```
+
+### WAV Distance Buckets
+
+```sql
+SELECT CASE
+				 WHEN trip_miles < 5 THEN 'Short (<5 mi)'
+				 WHEN trip_miles < 15 THEN 'Medium (5-15 mi)'
+				 ELSE 'Long (15+ mi)'
+			 END AS distance_bucket,
+			 CASE
+				 WHEN trip_miles < 5 THEN 1
+				 WHEN trip_miles < 15 THEN 2
+				 ELSE 3
+			 END AS bucket_order,
+			 hvfhs_license_num,
+			 count(*) AS rides,
+			 avg(driver_pay - base_passenger_fare) AS premium
+FROM "nyc-taxis"
+WHERE wav_request_flag = 'Y'
+	AND wav_match_flag = 'Y'
+	AND base_passenger_fare > 0
+	AND trip_miles > 0
+GROUP BY CASE
+					 WHEN trip_miles < 5 THEN 'Short (<5 mi)'
+					 WHEN trip_miles < 15 THEN 'Medium (5-15 mi)'
+					 ELSE 'Long (15+ mi)'
+				 END,
+				 CASE
+					 WHEN trip_miles < 5 THEN 1
+					 WHEN trip_miles < 15 THEN 2
+					 ELSE 3
+				 END,
+				 hvfhs_license_num
+ORDER BY bucket_order, hvfhs_license_num;
+```
+
+### WAV Fleet Effect
+
+```sql
+SELECT wav_match_flag,
+			 count(*) AS rides,
+			 ROUND(AVG(base_passenger_fare), 2) AS avg_fare,
+			 ROUND(AVG(driver_pay / base_passenger_fare) * 100, 0) AS payout_pct
+FROM "nyc-taxis"
+WHERE base_passenger_fare > 0
+GROUP BY wav_match_flag
+ORDER BY wav_match_flag;
+```
 
 ---
 

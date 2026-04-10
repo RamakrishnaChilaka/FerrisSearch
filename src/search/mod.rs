@@ -307,6 +307,100 @@ pub struct GroupedMetricAgg {
     pub function: GroupedMetricFunction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
+    /// Per-doc arithmetic expression over numeric fast-field columns.
+    /// When set, the collector batch-reads the leaf columns and computes the
+    /// expression inline during grouped-partials accumulation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_expr: Option<MetricFieldExpr>,
+}
+
+/// A per-doc arithmetic expression on numeric fast-field columns.
+/// Used to keep `SUM(a + b)`, `AVG(a / b)`, `AVG((a - b) / a)` etc. on the
+/// grouped-partials path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MetricFieldExpr {
+    Field {
+        name: String,
+    },
+    Binary {
+        left: Box<MetricFieldExpr>,
+        op: MetricFieldOp,
+        right: Box<MetricFieldExpr>,
+    },
+}
+
+impl MetricFieldExpr {
+    pub fn field(name: impl Into<String>) -> Self {
+        Self::Field { name: name.into() }
+    }
+
+    pub fn binary(left: Self, op: MetricFieldOp, right: Self) -> Self {
+        Self::Binary {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    }
+
+    pub fn collect_fields<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Self::Field { name } => out.push(name.as_str()),
+            Self::Binary { left, right, .. } => {
+                left.collect_fields(out);
+                right.collect_fields(out);
+            }
+        }
+    }
+
+    pub fn display_fragment(&self) -> String {
+        match self {
+            Self::Field { name } => name.clone(),
+            Self::Binary { left, op, right } => format!(
+                "{}_{}_{}",
+                left.display_fragment(),
+                op.name_fragment(),
+                right.display_fragment()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricFieldOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl MetricFieldOp {
+    #[inline]
+    pub fn name_fragment(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Sub => "sub",
+            Self::Mul => "mul",
+            Self::Div => "div",
+        }
+    }
+
+    #[inline]
+    pub fn eval(self, a: f64, b: f64) -> Option<f64> {
+        match self {
+            Self::Add => Some(a + b),
+            Self::Sub => Some(a - b),
+            Self::Mul => Some(a * b),
+            Self::Div => {
+                if b == 0.0 {
+                    None
+                } else {
+                    Some(a / b)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2961,11 +3055,13 @@ mod tests {
                     output_name: "total".into(),
                     function: GroupedMetricFunction::Count,
                     field: None,
+                    field_expr: None,
                 },
                 GroupedMetricAgg {
                     output_name: "avg_price".into(),
                     function: GroupedMetricFunction::Avg,
                     field: Some("price".into()),
+                    field_expr: None,
                 },
             ],
             shard_top_k: None,
@@ -3043,6 +3139,7 @@ mod tests {
                 output_name: "count".into(),
                 function: GroupedMetricFunction::Count,
                 field: None,
+                field_expr: None,
             }],
             shard_top_k: None,
         };

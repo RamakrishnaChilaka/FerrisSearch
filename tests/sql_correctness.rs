@@ -9,6 +9,7 @@ use ferrissearch::cluster::state::*;
 use ferrissearch::worker::WorkerPools;
 use serde_json::json;
 use sqllogictest::{DBOutput, DefaultColumnType};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +24,90 @@ struct FerrisDB {
 #[derive(thiserror::Error, Debug, PartialEq, Eq, Clone)]
 #[error("{0}")]
 struct FerrisError(String);
+
+#[derive(Clone, Copy)]
+struct SampleStory {
+    title: &'static str,
+    author: &'static str,
+    upvotes: i64,
+    comments: i64,
+    category: &'static str,
+}
+
+fn sample_story_docs() -> [SampleStory; 10] {
+    [
+        SampleStory {
+            title: "Show HN: Rust search engine",
+            author: "alice",
+            upvotes: 250,
+            comments: 45,
+            category: "rust",
+        },
+        SampleStory {
+            title: "Rust vs Go performance",
+            author: "alice",
+            upvotes: 180,
+            comments: 92,
+            category: "rust",
+        },
+        SampleStory {
+            title: "Why Rust is great for systems",
+            author: "alice",
+            upvotes: 120,
+            comments: 30,
+            category: "rust",
+        },
+        SampleStory {
+            title: "Python 4.0 released",
+            author: "bob",
+            upvotes: 500,
+            comments: 200,
+            category: "python",
+        },
+        SampleStory {
+            title: "Machine learning with Python",
+            author: "bob",
+            upvotes: 300,
+            comments: 150,
+            category: "python",
+        },
+        SampleStory {
+            title: "Deep learning frameworks compared",
+            author: "carol",
+            upvotes: 400,
+            comments: 80,
+            category: "ml",
+        },
+        SampleStory {
+            title: "GPT-5 announcement",
+            author: "carol",
+            upvotes: 1000,
+            comments: 500,
+            category: "ml",
+        },
+        SampleStory {
+            title: "Startup funding trends 2026",
+            author: "dave",
+            upvotes: 50,
+            comments: 20,
+            category: "startup",
+        },
+        SampleStory {
+            title: "Building a startup in Rust",
+            author: "dave",
+            upvotes: 150,
+            comments: 35,
+            category: "rust",
+        },
+        SampleStory {
+            title: "Remote work is dead",
+            author: "eve",
+            upvotes: 800,
+            comments: 600,
+            category: "culture",
+        },
+    ]
+}
 
 impl FerrisDB {
     fn new_with_hackernews_sample() -> Self {
@@ -153,22 +238,18 @@ impl FerrisDB {
         let shard = state.shard_manager.get_shard(index_name, 0).unwrap();
 
         // Sample data: 10 HN-style posts
-        let docs = vec![
-            json!({"title": "Show HN: Rust search engine", "author": "alice", "upvotes": 250, "comments": 45, "category": "rust"}),
-            json!({"title": "Rust vs Go performance", "author": "alice", "upvotes": 180, "comments": 92, "category": "rust"}),
-            json!({"title": "Why Rust is great for systems", "author": "alice", "upvotes": 120, "comments": 30, "category": "rust"}),
-            json!({"title": "Python 4.0 released", "author": "bob", "upvotes": 500, "comments": 200, "category": "python"}),
-            json!({"title": "Machine learning with Python", "author": "bob", "upvotes": 300, "comments": 150, "category": "python"}),
-            json!({"title": "Deep learning frameworks compared", "author": "carol", "upvotes": 400, "comments": 80, "category": "ml"}),
-            json!({"title": "GPT-5 announcement", "author": "carol", "upvotes": 1000, "comments": 500, "category": "ml"}),
-            json!({"title": "Startup funding trends 2026", "author": "dave", "upvotes": 50, "comments": 20, "category": "startup"}),
-            json!({"title": "Building a startup in Rust", "author": "dave", "upvotes": 150, "comments": 35, "category": "rust"}),
-            json!({"title": "Remote work is dead", "author": "eve", "upvotes": 800, "comments": 600, "category": "culture"}),
-        ];
-
-        for (i, doc) in docs.iter().enumerate() {
+        for (i, doc) in sample_story_docs().iter().enumerate() {
             shard
-                .add_document(&format!("doc-{}", i + 1), doc.clone())
+                .add_document(
+                    &format!("doc-{}", i + 1),
+                    json!({
+                        "title": doc.title,
+                        "author": doc.author,
+                        "upvotes": doc.upvotes,
+                        "comments": doc.comments,
+                        "category": doc.category,
+                    }),
+                )
                 .unwrap();
         }
         shard.refresh().unwrap();
@@ -237,6 +318,120 @@ impl sqllogictest::DB for FerrisDB {
     }
 }
 
+fn json_number(row: &serde_json::Value, column: &str) -> f64 {
+    row.get(column)
+        .and_then(|value| value.as_f64().or_else(|| value.as_i64().map(|n| n as f64)))
+        .unwrap_or_else(|| panic!("expected numeric column {} in row {:?}", column, row))
+}
+
+fn expected_average_by_author<F>(docs: &[SampleStory], value_fn: F) -> BTreeMap<&'static str, f64>
+where
+    F: Fn(&SampleStory) -> f64,
+{
+    let mut totals: BTreeMap<&'static str, (f64, usize)> = BTreeMap::new();
+    for doc in docs {
+        let entry = totals.entry(doc.author).or_insert((0.0, 0));
+        entry.0 += value_fn(doc);
+        entry.1 += 1;
+    }
+
+    totals
+        .into_iter()
+        .map(|(author, (sum, count))| (author, sum / count as f64))
+        .collect()
+}
+
+fn assert_grouped_numeric_results(
+    rows: &[serde_json::Value],
+    key_column: &str,
+    value_column: &str,
+    expected_by_key: &BTreeMap<&'static str, f64>,
+) {
+    assert_eq!(rows.len(), expected_by_key.len());
+    for row in rows {
+        let key = row
+            .get(key_column)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{} column should be present", key_column));
+        let value = json_number(row, value_column);
+        let expected = expected_by_key
+            .get(key)
+            .unwrap_or_else(|| panic!("unexpected key {} in grouped rows", key));
+        assert!(
+            (value - expected).abs() < 1e-9,
+            "{} {}: got {}, expected {}",
+            key_column,
+            key,
+            value,
+            expected
+        );
+    }
+}
+
+async fn assert_exact_expression_numeric_results() {
+    let db = FerrisDB::new_with_hackernews_sample();
+    let docs = sample_story_docs();
+
+    let overall = ferrissearch::api::search::execute_sql_for_testing(
+        &db.state,
+        &db.index_name,
+        "SELECT AVG(CAST(upvotes AS FLOAT) / comments) AS avg_ratio, SUM(upvotes) * 1.0 / SUM(comments) AS weighted_ratio FROM stories WHERE comments > 0",
+    )
+    .await
+    .expect("overall ratio query should succeed");
+
+    assert_eq!(overall.rows.len(), 1);
+    let overall_row = &overall.rows[0];
+    let avg_ratio = json_number(overall_row, "avg_ratio");
+    let weighted_ratio = json_number(overall_row, "weighted_ratio");
+
+    let expected_avg_ratio = docs
+        .iter()
+        .map(|doc| doc.upvotes as f64 / doc.comments as f64)
+        .sum::<f64>()
+        / docs.len() as f64;
+    let expected_weighted_ratio = docs.iter().map(|doc| doc.upvotes as f64).sum::<f64>()
+        / docs.iter().map(|doc| doc.comments as f64).sum::<f64>();
+
+    assert!((avg_ratio - expected_avg_ratio).abs() < 1e-9);
+    assert!((weighted_ratio - expected_weighted_ratio).abs() < 1e-9);
+
+    let grouped_ratio = ferrissearch::api::search::execute_sql_for_testing(
+        &db.state,
+        &db.index_name,
+        "SELECT author, AVG(CAST(upvotes AS FLOAT) / comments) AS avg_ratio FROM stories WHERE comments > 0 GROUP BY author ORDER BY author",
+    )
+    .await
+    .expect("grouped ratio query should succeed");
+
+    let expected_ratio_by_author =
+        expected_average_by_author(&docs, |doc| doc.upvotes as f64 / doc.comments as f64);
+    assert_grouped_numeric_results(
+        &grouped_ratio.rows,
+        "author",
+        "avg_ratio",
+        &expected_ratio_by_author,
+    );
+
+    let grouped = ferrissearch::api::search::execute_sql_for_testing(
+        &db.state,
+        &db.index_name,
+        "SELECT author, AVG((CAST(upvotes AS FLOAT) - comments) / upvotes) AS margin FROM stories WHERE comments > 0 GROUP BY author ORDER BY author",
+    )
+    .await
+    .expect("grouped nested expression query should succeed");
+
+    let expected_margin_by_author = expected_average_by_author(&docs, |doc| {
+        (doc.upvotes as f64 - doc.comments as f64) / doc.upvotes as f64
+    });
+    assert_grouped_numeric_results(
+        &grouped.rows,
+        "author",
+        "margin",
+        &expected_margin_by_author,
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sql_correctness_basic() {
     let slt_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/slt");
@@ -252,4 +447,9 @@ async fn sql_correctness_basic() {
                 .unwrap_or_else(|e| panic!("SLT test {} failed: {}", path.display(), e));
         }
     }
+
+    // The SLT file rounds user-visible arithmetic results explicitly in SQL.
+    // Keep exact-value regressions here so grouped arithmetic semantics do not
+    // drift behind that presentation layer.
+    assert_exact_expression_numeric_results().await;
 }

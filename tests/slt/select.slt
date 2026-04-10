@@ -258,6 +258,48 @@ SELECT sum(upvotes) * 1.0 / count(*) FROM stories
 ----
 375.0
 
+# Per-doc arithmetic inside AVG must use the per-row ratio, not a weighted ratio.
+# Round in SQL so the expectation is not coupled to the harness formatter.
+query R nosort
+SELECT ROUND(AVG(CAST(upvotes AS FLOAT) / comments), 1) FROM stories WHERE comments > 0
+----
+3.1
+
+query R nosort
+SELECT ROUND(SUM(upvotes) * 1.0 / SUM(comments), 1) FROM stories WHERE comments > 0
+----
+2.1
+
+# Grouped per-row ratio inside AVG must preserve per-row semantics after grouping.
+# Round in SQL so the expectation is explicit instead of formatter-dependent.
+query TR nosort
+SELECT author, ROUND(AVG(CAST(upvotes AS FLOAT) / comments), 1) AS avg_ratio
+FROM stories
+WHERE comments > 0
+GROUP BY author
+ORDER BY author
+----
+alice 3.8
+bob 2.3
+carol 3.5
+dave 3.4
+eve 1.3
+
+# Nested per-doc arithmetic inside AVG must stay exact after grouping.
+# Round in SQL so the one-decimal output is deliberate.
+query TR nosort
+SELECT author, ROUND(AVG((CAST(upvotes AS FLOAT) - comments) / upvotes), 1) AS margin
+FROM stories
+WHERE comments > 0
+GROUP BY author
+ORDER BY author
+----
+alice 0.7
+bob 0.6
+carol 0.7
+dave 0.7
+eve 0.3
+
 # count(*) * constant / avg()
 query R nosort
 SELECT count(*) * 10.0 / avg(upvotes) FROM stories
