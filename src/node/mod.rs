@@ -40,6 +40,7 @@ pub struct Node {
     pub transport_client: TransportClient,
     pub shard_manager: Arc<ShardManager>,
     pub raft: Arc<RaftInstance>,
+    pub task_manager: Arc<crate::tasks::TaskManager>,
 }
 
 #[derive(Debug)]
@@ -130,6 +131,7 @@ impl Node {
                 config.column_cache_populate_threshold,
             )),
         ));
+        let task_manager = Arc::new(crate::tasks::TaskManager::new());
 
         Ok(Self {
             config,
@@ -137,6 +139,7 @@ impl Node {
             transport_client,
             shard_manager,
             raft,
+            task_manager,
         })
     }
 
@@ -165,6 +168,7 @@ impl Node {
             local_node_id: self.config.node_name.clone(),
             raft: self.raft.clone(),
             worker_pools: crate::worker::WorkerPools::default_for_system(),
+            task_manager: self.task_manager.clone(),
             sql_group_by_scan_limit: self.config.sql_group_by_scan_limit,
             sql_approximate_top_k: self.config.sql_approximate_top_k,
         };
@@ -175,6 +179,7 @@ impl Node {
             self.shard_manager.clone(),
             self.transport_client.clone(),
             self.raft.clone(),
+            self.task_manager.clone(),
             self.config.node_name.clone(),
         );
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));

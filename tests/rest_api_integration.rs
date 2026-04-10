@@ -128,6 +128,7 @@ impl RestTestHarness {
         let shard_manager = Arc::new(ShardManager::new(temp_dir.path(), Duration::from_secs(60)));
         let cluster_manager = Arc::new(manager);
         let transport_client = TransportClient::new();
+        let task_manager = Arc::new(ferrissearch::tasks::TaskManager::new());
         let app_state = AppState {
             cluster_manager: cluster_manager.clone(),
             shard_manager: shard_manager.clone(),
@@ -135,6 +136,7 @@ impl RestTestHarness {
             local_node_id: "node-1".into(),
             raft: raft.clone(),
             worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
+            task_manager: task_manager.clone(),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
         };
@@ -144,6 +146,7 @@ impl RestTestHarness {
             shard_manager,
             transport_client,
             raft,
+            task_manager,
             "node-1".into(),
         );
         let transport_handle = tokio::spawn(async move {
@@ -364,6 +367,7 @@ impl MultiNodeRestHarness {
                 Duration::from_secs(60),
             ));
             let transport_client = TransportClient::new();
+            let task_manager = Arc::new(ferrissearch::tasks::TaskManager::new());
             let app_state = AppState {
                 cluster_manager: cluster_manager.clone(),
                 shard_manager: shard_manager.clone(),
@@ -371,6 +375,7 @@ impl MultiNodeRestHarness {
                 local_node_id: pending.node_id.clone(),
                 raft: raft.clone(),
                 worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
+                task_manager: task_manager.clone(),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             };
@@ -380,6 +385,7 @@ impl MultiNodeRestHarness {
                 shard_manager,
                 transport_client,
                 raft,
+                task_manager,
                 pending.node_id.clone(),
             );
             let transport_handle = tokio::spawn(async move {
@@ -1059,6 +1065,104 @@ async fn rest_can_index_get_update_delete_and_refresh_flush_documents() -> Resul
         .await?;
     assert_eq!(auto_doc_status, StatusCode::OK);
     assert_eq!(auto_doc_body["_source"]["brand"], json!("Google"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_forcemerge_returns_task_and_task_endpoint_reports_completion() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index(&harness).await?;
+
+    let (force_merge_status, force_merge_body) = harness
+        .post_json("/products/_forcemerge?max_num_segments=1", json!({}))
+        .await?;
+    assert_eq!(force_merge_status, StatusCode::ACCEPTED);
+    assert_eq!(
+        force_merge_body["task"]["action"],
+        "indices:admin/forcemerge"
+    );
+    assert_eq!(force_merge_body["task"]["coordinator_node"], "node-1");
+    let task_id = force_merge_body["task"]["id"]
+        .as_str()
+        .expect("force-merge should return a task id")
+        .to_string();
+
+    let task_body = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (status, body) = harness.get_json(&format!("/_tasks/{}", task_id)).await?;
+            if status == StatusCode::OK && body["task"]["status"] == "completed" {
+                break Ok::<Value, anyhow::Error>(body);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+
+    assert_eq!(task_body["task"]["id"], task_id);
+    assert_eq!(task_body["task"]["status"], "completed");
+    assert_eq!(task_body["task"]["coordinator_node"], "node-1");
+    assert_eq!(task_body["_nodes"]["total"], 1);
+    assert_eq!(task_body["_nodes"]["completed"], 1);
+    assert_eq!(task_body["nodes"][0]["status"], "completed");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_distributed_forcemerge_is_async_and_tracks_all_nodes() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+
+    let (force_merge_status, force_merge_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
+        "/stories/_forcemerge?max_num_segments=1",
+        json!({}),
+    )
+    .await?;
+    assert_eq!(force_merge_status, StatusCode::ACCEPTED);
+    assert_eq!(
+        force_merge_body["task"]["action"],
+        "indices:admin/forcemerge"
+    );
+    assert_eq!(force_merge_body["task"]["coordinator_node"], "node-2");
+    assert_eq!(force_merge_body["_nodes"]["total"], 3);
+    assert_eq!(force_merge_body["_nodes"]["started"], 3);
+    assert_eq!(force_merge_body["_nodes"]["failed"], 0);
+    let task_id = force_merge_body["task"]["id"]
+        .as_str()
+        .expect("force-merge should return a task id")
+        .to_string();
+
+    let task_body = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = harness
+                .client
+                .get(format!("{}/_tasks/{}", harness.nodes[1].base_url, task_id))
+                .send()
+                .await?;
+            let status = response.status();
+            let body: Value = response.json().await?;
+            if status == StatusCode::OK && body["task"]["status"] == "completed" {
+                break Ok::<Value, anyhow::Error>(body);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+
+    assert_eq!(task_body["task"]["coordinator_node"], "node-2");
+    assert_eq!(task_body["_nodes"]["total"], 3);
+    assert_eq!(task_body["_nodes"]["completed"], 3);
+    assert_eq!(task_body["nodes"].as_array().unwrap().len(), 3);
+    assert!(
+        task_body["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["status"] == "completed")
+    );
 
     Ok(())
 }
@@ -2297,6 +2401,53 @@ async fn rest_distributed_search_applies_custom_sort_when_one_shard_matches() ->
         })
         .collect();
     assert_eq!(titles, vec!["story-0-2", "story-0-1", "story-0-0"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_cat_segments_lists_cluster_segments_by_default() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+
+    let expected_segment_rows: usize = harness
+        .nodes
+        .iter()
+        .map(|node| {
+            node.app_state
+                .shard_manager
+                .all_shards()
+                .into_iter()
+                .map(|(_, engine)| engine.segment_infos().len())
+                .sum::<usize>()
+        })
+        .sum();
+
+    let response = harness
+        .client
+        .get(format!("{}/_cat/segments?v", harness.nodes[1].base_url))
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.len(),
+        expected_segment_rows + 1,
+        "expected header plus every started segment row: {text}"
+    );
+
+    let mut shard_ids = Vec::new();
+    for line in lines.iter().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(fields[0], "stories");
+        shard_ids.push(fields[1].parse::<u32>()?);
+    }
+    shard_ids.sort_unstable();
+    shard_ids.dedup();
+    assert_eq!(shard_ids, vec![0, 1, 2]);
 
     Ok(())
 }

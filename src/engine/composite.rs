@@ -505,6 +505,14 @@ impl SearchEngine for CompositeEngine {
         Ok(())
     }
 
+    fn force_merge(&self, max_num_segments: usize) -> Result<()> {
+        self.text.force_merge(max_num_segments)
+    }
+
+    fn segment_infos(&self) -> Vec<super::SegmentInfo> {
+        self.text.segment_infos()
+    }
+
     fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>> {
         self.text.search(query_str)
     }

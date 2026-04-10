@@ -5,6 +5,7 @@ pub mod cat;
 pub mod cluster;
 pub mod index;
 pub mod search;
+pub mod tasks;
 
 use crate::cluster::ClusterManager;
 use crate::cluster::state::NodeId;
@@ -52,6 +53,8 @@ pub struct AppState {
     pub raft: Arc<RaftInstance>,
     /// Dedicated thread pools for search and write workloads
     pub worker_pools: WorkerPools,
+    /// Tracks background maintenance and other asynchronous node-local tasks.
+    pub task_manager: Arc<crate::tasks::TaskManager>,
     /// Max docs to scan for GROUP BY queries on the fast-fields fallback path.
     /// 0 = unlimited.
     pub sql_group_by_scan_limit: usize,
@@ -76,6 +79,49 @@ pub fn error_response(
             "status": status.as_u16()
         })),
     )
+}
+
+/// If this node is the Raft leader, returns `None`.
+/// If not, resolves the master node for forwarding and returns `Some(master)`.
+/// Returns an error response if no master is available.
+pub(crate) fn resolve_leader_or_master(
+    state: &AppState,
+    operation: &str,
+) -> Result<Option<crate::cluster::state::NodeInfo>, (StatusCode, Json<serde_json::Value>)> {
+    if state.raft.is_leader() {
+        return Ok(None);
+    }
+    let cs = state.cluster_manager.get_state();
+    let master_id = cs.master_node.as_ref().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "master_not_discovered_exception",
+            format!("No master node available to forward {}", operation),
+        )
+    })?;
+    let master_node = cs.nodes.get(master_id).cloned().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "master_not_discovered_exception",
+            "Master node info not found in cluster state",
+        )
+    })?;
+    Ok(Some(master_node))
+}
+
+/// Write a command through Raft and return a standard error response on failure.
+pub(crate) async fn raft_write(
+    state: &AppState,
+    cmd: crate::consensus::types::ClusterCommand,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    state.raft.client_write(cmd).await.map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "raft_write_exception",
+            format!("Raft write failed: {}", e),
+        )
+    })?;
+    Ok(())
 }
 
 /// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.
@@ -153,6 +199,7 @@ fn normalize_metrics_path(path: &str) -> String {
     match segments.as_slice() {
         // Root and system endpoints — keep as-is
         ["", ""] => "/".to_string(),
+        ["", "_tasks", _] => "/_tasks/{task_id}".to_string(),
         ["", p] if p.starts_with('_') => format!("/{p}"),
         ["", p, s] if p.starts_with('_') => format!("/{p}/{s}"),
         // /{index}/_doc/{id}
@@ -211,6 +258,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/_cat/shards", get(cat::cat_shards))
         .route("/_cat/indices", get(cat::cat_indices))
         .route("/_cat/master", get(cat::cat_master))
+        .route("/_cat/segments", get(cat::cat_segments))
+        .route("/_tasks/{task_id}", get(tasks::get_task))
         // Index management
         .route("/{index}", head(index::index_exists))
         .route("/{index}", put(index::create_index))
@@ -240,6 +289,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_refresh", get(index::refresh_index))
         .route("/{index}/_flush", post(index::flush_index))
         .route("/{index}/_flush", get(index::flush_index))
+        .route("/{index}/_forcemerge", post(index::force_merge_index))
         .layer(middleware::from_fn(pretty_json_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
@@ -271,6 +321,10 @@ mod tests {
         assert_eq!(normalize_metrics_path("/_metrics"), "/_metrics");
         assert_eq!(normalize_metrics_path("/_bulk"), "/_bulk");
         assert_eq!(normalize_metrics_path("/_sql"), "/_sql");
+        assert_eq!(
+            normalize_metrics_path("/_tasks/abc123"),
+            "/_tasks/{task_id}"
+        );
     }
 
     #[test]

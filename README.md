@@ -69,7 +69,7 @@ Every SQL response tells you how the planner executed the query:
 
 ## Highlights
 
-- **OpenSearch-compatible REST API** — `PUT /{index}`, `POST /_doc`, `GET /_search`, `POST /_bulk`
+- **OpenSearch-compatible REST API** — `PUT /{index}`, `POST /_doc`, `GET /_search`, `POST /_bulk`, async `POST /{index}/_forcemerge`, `GET /_tasks/{task_id}`
 - **Search-aware SQL planner** — `text_match()` with `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and same-index semijoin support
 - **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, and `materialized_hits_fallback`, with `streaming_used` reported whenever the fast-field path streams locally or over gRPC
 - **Raft-backed coordination** — leader election, shard routing, and failover for a multi-node cluster
@@ -78,7 +78,7 @@ Every SQL response tells you how the planner executed the query:
 - **Generation-based WAL** — durable writes, replica catch-up, and background auto-flush
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, and planner metadata in SQL responses
-- **Test depth** — 1131 automated tests, including a real three-node flush + restart regression
+- **Test depth** — 1158 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
 
 ## Tech Stack
 
@@ -417,9 +417,13 @@ Append `?pretty` to any endpoint for formatted JSON.
 ```bash
 curl -X POST 'http://localhost:9200/movies/_refresh'
 curl -X POST 'http://localhost:9200/movies/_flush'
+curl -X POST 'http://localhost:9200/movies/_forcemerge?max_num_segments=1'
+curl 'http://localhost:9200/_tasks/<task_id>'
 ```
 
 Refresh and flush are cluster-wide fan-out operations. The coordinator dispatches its own node in the same per-node set as remote nodes, and maintenance will not create fresh shard data when the authoritative UUID directory is missing.
+
+Force merge is asynchronous and cluster-wide. `POST /{index}/_forcemerge` returns `202 Accepted` after the coordinator enqueues work on every node, along with a task id and `task.coordinator_node`. Query `GET /_tasks/{task_id}` on that same coordinator node to watch the background merge reach `completed` or `failed`.
 
 ## Benchmarks
 
@@ -526,13 +530,13 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1131 tests
-cargo test --lib                                # Unit tests (954)
+cargo test                                      # All 1158 tests
+cargo test --lib                                # Unit tests (978)
 cargo test --bin ferris-cli                      # CLI tests (64)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (39)
+cargo test --test rest_api_integration           # REST API (42)
 cargo test --test restart_regression             # Real 3-node flush + restart regression (1)
 cargo test --test sql_correctness                # SQL correctness (1 test, 175 sqllogictest assertions)
 ```

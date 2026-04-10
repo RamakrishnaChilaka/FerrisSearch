@@ -7,8 +7,9 @@ PYTHON_VENV="$ROOT_DIR/.venv"
 PYTHON_BIN="$PYTHON_VENV/bin/python"
 PIP_BIN="$PYTHON_VENV/bin/pip"
 
-TARGET_ROWS=100000000
-DATA_YEAR=2025
+TARGET_ROWS=999999999999
+START_YEAR=2025
+END_YEAR=2025
 START_MONTH=1
 END_MONTH=12
 HTTP_HOST="127.0.0.1"
@@ -45,18 +46,19 @@ trap cleanup EXIT
 
 usage() {
     cat <<'EOF'
-Usage: bash scripts/load_nyc_taxis_100m.sh [options]
+Usage: bash scripts/load_nyc_taxis.sh [options]
 
 End-to-end workflow for a home machine:
 1. Build the release binary if needed
 2. Start or reuse a 3-node local FerrisSearch cluster
-3. Download enough NYC TLC FHVHV monthly parquet files to reach 100M rows
-4. Ingest exactly 100M rows into the nyc-taxis index
+3. Download enough NYC TLC FHVHV monthly parquet files to reach the target row count
+4. Ingest the selected rows into the nyc-taxis index
 5. Run the NYC taxi SQL benchmark queries
 
 Options:
-  --target-rows N           Rows to ingest (default: 100000000)
-  --year YYYY               TLC year to download from first (default: 2025)
+    --target-rows N           Rows to ingest (default: all available rows in the selected range)
+    --start-year YYYY         First TLC year to download (default: 2025)
+  --end-year YYYY           Last TLC year to download (default: 2025)
   --start-month M           First month to consider, 1-12 (default: 1)
   --end-month M             Last month to consider, 1-12 (default: 12)
   --workers N               Bulk worker threads (default: min(nproc, 16))
@@ -91,8 +93,12 @@ while [[ $# -gt 0 ]]; do
             TARGET_ROWS="$2"
             shift 2
             ;;
-        --year)
-            DATA_YEAR="$2"
+        --start-year)
+            START_YEAR="$2"
+            shift 2
+            ;;
+        --end-year)
+            END_YEAR="$2"
             shift 2
             ;;
         --start-month)
@@ -300,32 +306,52 @@ download_parquets() {
     local cumulative_rows=0
     PARQUET_FILES=()
 
-    for month in $(seq -w "$START_MONTH" "$END_MONTH"); do
-        local file_name="fhvhv_tripdata_${DATA_YEAR}-${month}.parquet"
-        local local_path="$DATASET_DIR/$file_name"
-        local remote_url="https://d37ci6vzurychx.cloudfront.net/trip-data/$file_name"
-
-        if [[ "$FORCE_DOWNLOAD" -eq 1 || ! -f "$local_path" ]]; then
-            log "Downloading $file_name"
-            curl -fL "$remote_url" -o "$local_path.tmp"
-            mv "$local_path.tmp" "$local_path"
-        else
-            log "Using cached $file_name"
+    for year in $(seq "$START_YEAR" "$END_YEAR"); do
+        local m_start=1
+        local m_end=12
+        if [[ "$year" -eq "$START_YEAR" ]]; then
+            m_start="$START_MONTH"
+        fi
+        if [[ "$year" -eq "$END_YEAR" ]]; then
+            m_end="$END_MONTH"
         fi
 
-        local row_count
-        row_count="$(parquet_rows "$local_path")"
-        cumulative_rows=$((cumulative_rows + row_count))
-        PARQUET_FILES+=("$local_path")
-        log "$file_name -> ${row_count} rows (cumulative: ${cumulative_rows})"
+        for month in $(seq -w "$m_start" "$m_end"); do
+            local file_name="fhvhv_tripdata_${year}-${month}.parquet"
+            local local_path="$DATASET_DIR/$file_name"
+            local remote_url="https://d37ci6vzurychx.cloudfront.net/trip-data/$file_name"
 
-        if (( cumulative_rows >= TARGET_ROWS )); then
-            break
-        fi
+            if [[ "$FORCE_DOWNLOAD" -eq 1 || ! -f "$local_path" ]]; then
+                log "Downloading $file_name"
+                if ! curl -fL "$remote_url" -o "$local_path.tmp"; then
+                    log "WARNING: $file_name not available, skipping"
+                    rm -f "$local_path.tmp"
+                    continue
+                fi
+                mv "$local_path.tmp" "$local_path"
+            else
+                log "Using cached $file_name"
+            fi
+
+            local row_count
+            row_count="$(parquet_rows "$local_path")"
+            cumulative_rows=$((cumulative_rows + row_count))
+            PARQUET_FILES+=("$local_path")
+            log "$file_name -> ${row_count} rows (cumulative: ${cumulative_rows})"
+
+            if (( cumulative_rows >= TARGET_ROWS )); then
+                break 2
+            fi
+        done
     done
 
+    if (( cumulative_rows == 0 )); then
+        die "No parquet files found for ${START_YEAR}-${START_MONTH}..${END_YEAR}-${END_MONTH}"
+    fi
+
     if (( cumulative_rows < TARGET_ROWS )); then
-        die "Only found ${cumulative_rows} rows from ${DATA_YEAR}-${START_MONTH}..${DATA_YEAR}-${END_MONTH}; need ${TARGET_ROWS}"
+        log "Found ${cumulative_rows} rows (fewer than target ${TARGET_ROWS}); ingesting all available rows"
+        TARGET_ROWS="$cumulative_rows"
     fi
 }
 
@@ -359,10 +385,10 @@ MAPPINGS = {
         "hvfhs_license_num": {"type": "keyword"},
         "dispatching_base_num": {"type": "keyword"},
         "originating_base_num": {"type": "keyword"},
-        "request_datetime": {"type": "keyword"},
-        "on_scene_datetime": {"type": "keyword"},
-        "pickup_datetime": {"type": "keyword"},
-        "dropoff_datetime": {"type": "keyword"},
+        "request_datetime": {"type": "date"},
+        "on_scene_datetime": {"type": "date"},
+        "pickup_datetime": {"type": "date"},
+        "dropoff_datetime": {"type": "date"},
         "PULocationID": {"type": "integer"},
         "DOLocationID": {"type": "integer"},
         "trip_miles": {"type": "float"},

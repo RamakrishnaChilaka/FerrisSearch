@@ -135,6 +135,7 @@ async fn make_test_app_state(index_name: &str) -> (tempfile::TempDir, AppState) 
         local_node_id: "node-1".into(),
         raft,
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };
@@ -973,6 +974,7 @@ async fn group_by_text_field_returns_error() {
         local_node_id: "node-1".into(),
         raft,
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };

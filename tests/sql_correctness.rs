@@ -132,6 +132,7 @@ impl FerrisDB {
             local_node_id: "node-1".into(),
             raft,
             worker_pools: WorkerPools::new(2, 2),
+            task_manager: Arc::new(ferrissearch::tasks::TaskManager::new()),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
         };

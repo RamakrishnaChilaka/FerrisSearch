@@ -336,6 +336,7 @@ async fn get_or_open_search_shard_reopens_persisted_shard_via_metadata() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 
@@ -391,6 +392,7 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 
@@ -423,6 +425,7 @@ async fn get_shard_stats_only_reports_open_shards() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 
@@ -439,6 +442,42 @@ async fn get_shard_stats_only_reports_open_shards() {
 }
 
 #[tokio::test]
+async fn get_segment_stats_only_reports_open_shard_segments() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    sm.open_shard("open-idx", 0).unwrap();
+    let engine = sm.get_shard("open-idx", 0).expect("open shard");
+    engine
+        .add_document("d1", json!({"title": "segment row"}))
+        .unwrap();
+    engine.refresh().unwrap();
+
+    let service = TransportService {
+        cluster_manager: Arc::new(ClusterManager::new("segment-stats-cluster".into())),
+        shard_manager: sm,
+        transport_client: crate::transport::TransportClient::new(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+
+    let response = service
+        .get_segment_stats(Request::new(SegmentStatsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.segments.len(), 1);
+    assert_eq!(response.segments[0].index_name, "open-idx");
+    assert_eq!(response.segments[0].shard_id, 0);
+    assert_eq!(response.segments[0].num_docs, 1);
+    assert_eq!(response.segments[0].deleted_docs, 0);
+}
+
+#[tokio::test]
 async fn get_or_open_search_shard_returns_not_found_for_unknown_shard() {
     let dir = tempfile::tempdir().unwrap();
     let service = TransportService {
@@ -448,6 +487,7 @@ async fn get_or_open_search_shard_returns_not_found_for_unknown_shard() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 
@@ -469,6 +509,7 @@ async fn get_or_open_shard_returns_not_found_for_unknown_shard() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 
@@ -535,6 +576,7 @@ async fn maintenance_skips_orphaned_shards() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 
@@ -593,6 +635,7 @@ async fn maintenance_includes_replica_shards() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 
@@ -647,6 +690,7 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 
@@ -661,6 +705,160 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
     assert_eq!(response.successful_shards, 1);
     assert_eq!(response.failed_shards, 0);
     assert!(service.shard_manager.get_shard("maint-idx", 0).is_some());
+}
+
+#[tokio::test]
+async fn force_merge_rpc_returns_immediately_after_enqueue() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster_state = DomainClusterState::new("force-merge-cluster".into());
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    cluster_state.add_index(DomainIndexMetadata {
+        name: "force-merge-idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("force-merge-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings: HashMap::new(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+
+    let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+    manager.update_state(cluster_state);
+
+    let service = TransportService {
+        cluster_manager: Arc::new(manager),
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+        transport_client: crate::transport::TransportClient::new(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+
+    let response = service
+        .force_merge_index(Request::new(ForceMergeRequest {
+            index_name: "force-merge-idx".into(),
+            max_num_segments: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!response.task_id.is_empty());
+    assert!(
+        service
+            .task_manager
+            .get_local_force_merge(&response.task_id)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn get_task_status_rpc_returns_local_force_merge_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = TransportService {
+        cluster_manager: Arc::new(ClusterManager::new("task-status-cluster".into())),
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+        transport_client: crate::transport::TransportClient::new(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+    let task_id = service
+        .task_manager
+        .create_local_force_merge("node-1", "idx", 1);
+    service.task_manager.mark_running(&task_id);
+
+    let response = service
+        .get_task_status(Request::new(GetTaskStatusRequest { task_id }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.found);
+    assert_eq!(response.status, "running");
+    assert_eq!(response.node_id, "node-1");
+    assert_eq!(response.index_name, "idx");
+}
+
+#[tokio::test]
+async fn force_merge_task_counts_missing_assigned_shard_as_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster_state = DomainClusterState::new("force-merge-cluster".into());
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    cluster_state.add_index(DomainIndexMetadata {
+        name: "force-merge-idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("missing-force-merge-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings: HashMap::new(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+
+    let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+    manager.update_state(cluster_state);
+
+    let service = TransportService {
+        cluster_manager: Arc::new(manager),
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+        transport_client: crate::transport::TransportClient::new(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+
+    let response = service
+        .force_merge_index(Request::new(ForceMergeRequest {
+            index_name: "force-merge-idx".into(),
+            max_num_segments: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let task = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(task) = service
+                .task_manager
+                .get_local_force_merge(&response.task_id)
+                && matches!(
+                    task.status,
+                    crate::tasks::TaskStatus::Completed | crate::tasks::TaskStatus::Failed
+                )
+            {
+                break task;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("force-merge task should reach a terminal state");
+
+    assert_eq!(task.status, crate::tasks::TaskStatus::Failed);
+    assert_eq!(task.successful_shards, 0);
+    assert_eq!(task.failed_shards, 1);
 }
 
 #[tokio::test]
@@ -696,6 +894,7 @@ async fn flush_index_refuses_to_create_missing_uuid_dir() {
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
 

@@ -40,6 +40,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 usearch = "2.24.0"
 tikv-jemallocator = "0.6.1"
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
+zstd = "0.13"
 
 [features]
 default = []

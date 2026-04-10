@@ -268,6 +268,20 @@ message ShardStatsResponse {
     repeated ShardStat shards = 1;
 }
 
+message SegmentStatsRequest {}
+
+message SegmentStat {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    string segment_id = 3;
+    uint64 num_docs = 4;
+    uint64 deleted_docs = 5;
+}
+
+message SegmentStatsResponse {
+    repeated SegmentStat segments = 1;
+}
+
 // ─── Distributed SQL (Arrow IPC over gRPC) ──────────────────────────────────
 
 message SqlRecordBatchRequest {
@@ -298,6 +312,35 @@ message IndexMaintenanceRequest {
 message IndexMaintenanceResponse {
     uint32 successful_shards = 1;
     uint32 failed_shards = 2;
+}
+
+message ForceMergeRequest {
+    string index_name = 1;
+    uint32 max_num_segments = 2;
+}
+
+message ForceMergeResponse {
+    string task_id = 1;
+}
+
+message GetTaskStatusRequest {
+    string task_id = 1;
+}
+
+message GetTaskStatusResponse {
+    bool found = 1;
+    string task_id = 2;
+    string action = 3;
+    string status = 4;
+    string node_id = 5;
+    string index_name = 6;
+    uint32 max_num_segments = 7;
+    uint32 successful_shards = 8;
+    uint32 failed_shards = 9;
+    uint64 created_at_epoch_ms = 10;
+    uint64 started_at_epoch_ms = 11;
+    uint64 completed_at_epoch_ms = 12;
+    string error = 13;
 }
 
 // ─── Service Definition ─────────────────────────────────────────────────────
@@ -341,10 +384,13 @@ service InternalTransport {
 
     // Shard stats (for _cat endpoints)
     rpc GetShardStats(ShardStatsRequest) returns (ShardStatsResponse);
+    rpc GetSegmentStats(SegmentStatsRequest) returns (SegmentStatsResponse);
 
     // Index maintenance (coordinator fans out to all nodes)
     rpc RefreshIndex(IndexMaintenanceRequest) returns (IndexMaintenanceResponse);
     rpc FlushIndex(IndexMaintenanceRequest) returns (IndexMaintenanceResponse);
+    rpc ForceMergeIndex(ForceMergeRequest) returns (ForceMergeResponse);
+    rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
 
     // Raft consensus RPCs
     rpc RaftVote(RaftRequest) returns (RaftReply);

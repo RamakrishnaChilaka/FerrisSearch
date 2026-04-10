@@ -104,34 +104,14 @@ pub async fn transfer_master(
     State(state): State<AppState>,
     Json(req): Json<TransferMasterRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let raft = &state.raft;
-
-    if !raft.is_leader() {
-        // Forward to the master via gRPC — this node acts as coordinator
-        let cs = state.cluster_manager.get_state();
-        let master_id = match cs.master_node.as_ref() {
-            Some(id) => id,
-            None => {
-                return crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "No master node available to forward transfer request",
-                );
-            }
-        };
-        let master_node = match cs.nodes.get(master_id) {
-            Some(n) => n.clone(),
-            None => {
-                return crate::api::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "master_not_discovered_exception",
-                    "Master node info not found in cluster state",
-                );
-            }
-        };
+    // Coordinator: forward to leader if not master
+    if let Some(master) = match crate::api::resolve_leader_or_master(&state, "transfer request") {
+        Ok(m) => m,
+        Err(e) => return e,
+    } {
         match state
             .transport_client
-            .forward_transfer_master(&master_node, &req.node_id)
+            .forward_transfer_master(&master, &req.node_id)
             .await
         {
             Ok(()) => {
@@ -176,19 +156,19 @@ pub async fn transfer_master(
 
     // Get current vote from metrics
     let vote = {
-        let m = raft.metrics();
+        let m = state.raft.metrics();
         m.borrow_watched().vote
     };
 
     let last_log_id = {
-        let m = raft.metrics();
+        let m = state.raft.metrics();
         m.borrow_watched().last_applied
     };
 
     let transfer_req =
         openraft::raft::TransferLeaderRequest::new(vote, target_info.raft_node_id, last_log_id);
 
-    if let Err(e) = raft.handle_transfer_leader(transfer_req).await {
+    if let Err(e) = state.raft.handle_transfer_leader(transfer_req).await {
         return crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "raft_transfer_exception",

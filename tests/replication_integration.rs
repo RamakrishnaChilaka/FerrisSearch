@@ -125,6 +125,7 @@ async fn start_grpc_server(
         cluster_manager,
         shard_manager,
         transport_client,
+        Arc::new(ferrissearch::tasks::TaskManager::new()),
         "node-1".into(),
     );
 
@@ -156,6 +157,7 @@ async fn start_grpc_server_with_tls(
         cluster_manager,
         shard_manager,
         transport_client,
+        Arc::new(ferrissearch::tasks::TaskManager::new()),
         "node-1".into(),
     );
     let tls_config = ferrissearch::transport::load_server_tls_config(
