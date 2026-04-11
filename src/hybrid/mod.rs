@@ -101,6 +101,22 @@ pub async fn execute_planned_sql_partition_streams(
     datafusion_exec::execute_sql_partition_streams(plan, schema, partitions).await
 }
 
+pub async fn execute_planned_sql_partitions(
+    plan: &QueryPlan,
+    schema: std::sync::Arc<datafusion::arrow::datatypes::Schema>,
+    partitions: Vec<std::sync::Arc<dyn datafusion::physical_plan::streaming::PartitionStream>>,
+) -> Result<SqlQueryResult> {
+    let (columns, mut stream) =
+        datafusion_exec::execute_sql_partition_streams(plan, schema, partitions).await?;
+    let mut result_batches = Vec::new();
+    while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+        result_batches.push(batch?);
+    }
+    let (_, rows) = merge::record_batches_to_json_rows(&result_batches)?;
+
+    Ok(SqlQueryResult { columns, rows })
+}
+
 pub fn direct_sql_input_schema(
     plan: &QueryPlan,
     mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
@@ -1763,6 +1779,51 @@ mod tests {
         assert!(result.timings.partial_merge_ms >= 0.0);
         assert!(result.timings.top_k_ms >= 0.0);
         assert!(result.timings.row_build_ms >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn execute_planned_sql_partitions_collects_rows() {
+        use datafusion::arrow::array::{Float64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use std::sync::Arc;
+
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT brand, price FROM products ORDER BY price DESC LIMIT 2",
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("brand", DataType::Utf8, true),
+            Field::new("price", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["Apple", "Samsung", "Apple"])),
+                Arc::new(Float64Array::from(vec![999.0, 799.0, 899.0])),
+            ],
+        )
+        .unwrap();
+        let stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![
+                Ok::<RecordBatch, datafusion::common::DataFusionError>(batch),
+            ]),
+        );
+        let partitions = vec![one_shot_partition_stream(schema.clone(), Box::pin(stream))];
+
+        let result = execute_planned_sql_partitions(&plan, schema, partitions)
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns, vec!["brand", "price"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0]["brand"], json!("Apple"));
+        assert_eq!(result.rows[0]["price"], json!(999.0));
+        assert_eq!(result.rows[1]["brand"], json!("Apple"));
+        assert_eq!(result.rows[1]["price"], json!(899.0));
     }
 
     #[test]
