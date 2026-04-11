@@ -16,6 +16,7 @@ use crate::worker::WorkerPools;
 use axum::{
     Json, Router,
     body::Body,
+    extract::DefaultBodyLimit,
     extract::State,
     http::{Request, StatusCode, header},
     middleware::{self, Next},
@@ -246,6 +247,14 @@ async fn handle_metrics(State(state): State<AppState>) -> Response {
 }
 
 pub fn create_router(state: AppState) -> Router {
+    let bulk_router = Router::new()
+        .route("/_bulk", post(index::bulk_index_global))
+        .route("/{index}/_bulk", post(index::bulk_index))
+        // Bulk ingestion intentionally accepts large NDJSON bodies.
+        // The default Axum buffered-body limit rejects benchmark-sized requests
+        // before they ever reach the handler.
+        .layer(DefaultBodyLimit::disable());
+
     Router::new()
         .route("/", get(handle_root))
         .route("/_cluster/health", get(cluster::get_health))
@@ -272,10 +281,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_doc/{id}", get(index::get_document))
         .route("/{index}/_doc/{id}", delete(index::delete_document))
         .route("/{index}/_update/{id}", post(index::update_document))
-        .route("/_bulk", post(index::bulk_index_global))
         .route("/_sql", post(search::global_sql))
         .route("/_sql/stream", post(search::global_sql_stream))
-        .route("/{index}/_bulk", post(index::bulk_index))
         // Search
         .route("/{index}/_search", get(search::search_documents))
         .route("/{index}/_search", post(index::search_documents_dsl))
@@ -290,6 +297,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_flush", post(index::flush_index))
         .route("/{index}/_flush", get(index::flush_index))
         .route("/{index}/_forcemerge", post(index::force_merge_index))
+        .merge(bulk_router)
         .layer(middleware::from_fn(pretty_json_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
@@ -298,6 +306,10 @@ pub fn create_router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::bootstrap_single_node;
+    use crate::tasks::TaskManager;
+    use std::time::Duration;
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn handle_root_uses_package_version() {
@@ -374,5 +386,61 @@ mod tests {
             normalize_metrics_path("/totally-unknown/path"),
             "/{unknown}"
         );
+    }
+
+    async fn make_test_state() -> (tempfile::TempDir, AppState) {
+        let cluster_state = crate::cluster::state::ClusterState::new("api-test-cluster".into());
+        let (raft, shared_state) =
+            crate::consensus::create_raft_instance_mem(1, "api-test-cluster".into())
+                .await
+                .unwrap();
+        bootstrap_single_node(&raft, 1, "127.0.0.1:19300".into())
+            .await
+            .unwrap();
+        let manager = crate::cluster::ClusterManager::with_shared_state(shared_state);
+        manager.update_state(cluster_state);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+
+        (
+            temp_dir,
+            AppState {
+                cluster_manager: std::sync::Arc::new(manager),
+                shard_manager: std::sync::Arc::new(crate::shard::ShardManager::new(
+                    &data_dir,
+                    Duration::from_secs(60),
+                )),
+                transport_client: crate::transport::TransportClient::new(),
+                local_node_id: "node-1".into(),
+                raft,
+                worker_pools: crate::worker::WorkerPools::new(2, 2),
+                task_manager: std::sync::Arc::new(TaskManager::new()),
+                sql_group_by_scan_limit: 1_000_000,
+                sql_approximate_top_k: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn bulk_routes_accept_large_request_bodies() {
+        let (_temp_dir, state) = make_test_state().await;
+        let app = create_router(state);
+        let oversized_invalid_body = vec![0xFF; 3 * 1024 * 1024];
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_bulk")
+                    .header(header::CONTENT_TYPE, "application/x-ndjson")
+                    .body(Body::from(oversized_invalid_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The route should reach the handler and fail on UTF-8 parsing, not on Axum's
+        // default buffered-body limit.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

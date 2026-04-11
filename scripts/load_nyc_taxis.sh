@@ -29,6 +29,10 @@ FORCE_BUILD=0
 FORCE_DOWNLOAD=0
 START_CLUSTER=1
 CLUSTER_STARTED_BY_US=0
+TRANSLOG_DURABILITY="async"
+TRANSLOG_SYNC_INTERVAL_MS="5000"
+REFRESH_INTERVAL_MS="60000"
+FLUSH_THRESHOLD_BYTES="4294967296"
 
 cleanup() {
     local exit_code=$?
@@ -71,6 +75,11 @@ Options:
   --log-dir PATH            Log directory for cluster node logs
   --http-base-port PORT     Base HTTP port for node-1 (default: 9200)
   --transport-base-port P   Base transport port for node-1 (default: 9300)
+    --translog-durability M   `request` or `async` (default: async for benchmark loads)
+    --translog-sync-interval-ms N
+                                                        Sync interval in ms when translog durability is async (default: 5000)
+    --refresh-interval-ms N   Index refresh interval in ms during ingest (default: 60000)
+    --flush-threshold-bytes N Auto-flush threshold during ingest (default: 4294967296)
   --skip-bench              Load data but skip the benchmark query script
     --bench-script PATH       Benchmark script to run after ingest (default: scripts/nyc_taxi_hybrid_benchmark.sh)
   --no-start-cluster        Reuse an already-running cluster instead of starting one
@@ -147,6 +156,22 @@ while [[ $# -gt 0 ]]; do
             TRANSPORT_BASE_PORT="$2"
             shift 2
             ;;
+        --translog-durability)
+            TRANSLOG_DURABILITY="$2"
+            shift 2
+            ;;
+        --translog-sync-interval-ms)
+            TRANSLOG_SYNC_INTERVAL_MS="$2"
+            shift 2
+            ;;
+        --refresh-interval-ms)
+            REFRESH_INTERVAL_MS="$2"
+            shift 2
+            ;;
+        --flush-threshold-bytes)
+            FLUSH_THRESHOLD_BYTES="$2"
+            shift 2
+            ;;
         --skip-bench)
             SKIP_BENCH=1
             shift
@@ -192,8 +217,31 @@ fi
 
 BASE_URL="http://${HTTP_HOST}:${HTTP_BASE_PORT}"
 PID_FILE="$LOG_DIR/pids.txt"
+CHUNKS_PER_PARQUET_BATCH=$(( (PARQUET_BATCH + BATCH_SIZE - 1) / BATCH_SIZE ))
 
 mkdir -p "$DATASET_DIR" "$CLUSTER_DATA_DIR" "$LOG_DIR"
+
+case "$TRANSLOG_DURABILITY" in
+    request|async)
+        ;;
+    *)
+        die "Unsupported --translog-durability value: $TRANSLOG_DURABILITY"
+        ;;
+esac
+
+log "Configuration: host=$HTTP_HOST http_base_port=$HTTP_BASE_PORT transport_base_port=$TRANSPORT_BASE_PORT nodes=$NODES"
+log "Data paths: dataset_dir=$DATASET_DIR cluster_data_dir=$CLUSTER_DATA_DIR log_dir=$LOG_DIR"
+log "Ingest tuning: shards=$SHARDS workers=${WORKERS:-auto} batch_size=$BATCH_SIZE parquet_batch=$PARQUET_BATCH target_rows=$TARGET_ROWS"
+log "Durability: translog=$TRANSLOG_DURABILITY sync_interval_ms=${TRANSLOG_SYNC_INTERVAL_MS:-default} refresh_interval_ms=${REFRESH_INTERVAL_MS:-default} flush_threshold_bytes=${FLUSH_THRESHOLD_BYTES:-default}"
+log "Producer parallelism: parquet_batch yields up to $CHUNKS_PER_PARQUET_BATCH bulk chunks per parquet read"
+if (( CHUNKS_PER_PARQUET_BATCH < WORKERS / 2 )); then
+    log "Hint: parquet_batch=$PARQUET_BATCH underfeeds workers=$WORKERS; consider --parquet-batch $((BATCH_SIZE * WORKERS)) or fewer workers"
+fi
+if [[ "$TARGET_ROWS" == "999999999999" ]]; then
+    log "Row selection: ingest all available rows in the selected date range"
+else
+    log "Row selection: cap ingest at $TARGET_ROWS rows"
+fi
 
 ensure_python_env() {
     if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -234,6 +282,21 @@ cluster_is_healthy() {
     curl -sSf "$BASE_URL/_cluster/state" >/dev/null 2>&1
 }
 
+print_cluster_debug() {
+    local node_id
+    log "Cluster startup debug information:"
+    if [[ -f "$PID_FILE" ]]; then
+        log "PIDs: $(tr '\n' ' ' < "$PID_FILE")"
+    fi
+    for node_id in $(seq 1 "$NODES"); do
+        local log_file="$LOG_DIR/node-$node_id.log"
+        if [[ -f "$log_file" ]]; then
+            log "Last 20 lines of $log_file"
+            tail -n 20 "$log_file" || true
+        fi
+    done
+}
+
 wait_for_cluster() {
     local attempts=0
     while (( attempts < 120 )); do
@@ -267,8 +330,11 @@ print(len(state.get("nodes", {})))
 
 start_cluster_if_needed() {
     if cluster_is_healthy; then
-        log "Reusing existing cluster at $BASE_URL"
-        return 0
+        if [[ "$START_CLUSTER" -eq 0 ]]; then
+            log "Reusing existing cluster at $BASE_URL"
+            return 0
+        fi
+        die "A cluster is already running at $BASE_URL. Stop it first, choose different ports, or rerun with --no-start-cluster to reuse it intentionally"
     fi
 
     if [[ "$START_CLUSTER" -ne 1 ]]; then
@@ -294,6 +360,8 @@ start_cluster_if_needed() {
             FERRISSEARCH_DATA_DIR="$node_data_dir" \
             FERRISSEARCH_RAFT_NODE_ID="$node_id" \
             FERRISSEARCH_SEED_HOSTS="${HTTP_HOST}:${TRANSPORT_BASE_PORT},${HTTP_HOST}:$((TRANSPORT_BASE_PORT + 1)),${HTTP_HOST}:$((TRANSPORT_BASE_PORT + 2))" \
+            FERRISSEARCH_TRANSLOG_DURABILITY="$TRANSLOG_DURABILITY" \
+            FERRISSEARCH_TRANSLOG_SYNC_INTERVAL_MS="$TRANSLOG_SYNC_INTERVAL_MS" \
             ./target/release/ferrissearch > "$LOG_DIR/node-$node_id.log" 2>&1 &
             echo $! >> "$PID_FILE"
         )
@@ -305,7 +373,10 @@ start_cluster_if_needed() {
     done
 
     log "Waiting for $NODES-node cluster to become healthy"
-    wait_for_cluster || die "Cluster did not become healthy; check logs under $LOG_DIR"
+    wait_for_cluster || {
+        print_cluster_debug
+        die "Cluster did not become healthy; check logs under $LOG_DIR"
+    }
 }
 
 parquet_rows() {
@@ -377,11 +448,14 @@ run_ingest() {
     log "Ingesting ${TARGET_ROWS} NYC taxi rows into nyc-taxis"
     NYC_TAXI_HOST="$HTTP_HOST" \
     NYC_TAXI_PORT="$HTTP_BASE_PORT" \
+    NYC_TAXI_NODES="$NODES" \
     NYC_TAXI_TARGET_ROWS="$TARGET_ROWS" \
     NYC_TAXI_WORKERS="$WORKERS" \
     NYC_TAXI_BATCH_SIZE="$BATCH_SIZE" \
     NYC_TAXI_PARQUET_BATCH="$PARQUET_BATCH" \
     NYC_TAXI_SHARDS="$SHARDS" \
+    NYC_TAXI_REFRESH_INTERVAL_MS="$REFRESH_INTERVAL_MS" \
+    NYC_TAXI_FLUSH_THRESHOLD_BYTES="$FLUSH_THRESHOLD_BYTES" \
     "$PYTHON_BIN" - "${PARQUET_FILES[@]}" <<'PY'
 import os
 import queue
@@ -395,6 +469,7 @@ import pyarrow.parquet as pq
 from opensearchpy import OpenSearch, helpers
 
 INDEX_NAME = "nyc-taxis"
+MAX_BULK_REQUEST_BYTES = 32 * 1024 * 1024
 TIMESTAMP_COLS = {
     "request_datetime", "on_scene_datetime", "pickup_datetime", "dropoff_datetime"
 }
@@ -429,13 +504,17 @@ MAPPINGS = {
 }
 
 host = os.environ["NYC_TAXI_HOST"]
-port = int(os.environ["NYC_TAXI_PORT"])
+base_port = int(os.environ["NYC_TAXI_PORT"])
+node_count = int(os.environ["NYC_TAXI_NODES"])
 target_rows = int(os.environ["NYC_TAXI_TARGET_ROWS"])
 workers = int(os.environ["NYC_TAXI_WORKERS"])
 batch_size = int(os.environ["NYC_TAXI_BATCH_SIZE"])
 parquet_batch = int(os.environ["NYC_TAXI_PARQUET_BATCH"])
 shards = int(os.environ["NYC_TAXI_SHARDS"])
+refresh_interval_ms = int(os.environ["NYC_TAXI_REFRESH_INTERVAL_MS"])
+flush_threshold_bytes = int(os.environ["NYC_TAXI_FLUSH_THRESHOLD_BYTES"])
 parquet_files = sys.argv[1:]
+ports = [base_port + offset for offset in range(node_count)]
 
 
 def batch_to_bulk_actions(table, start_id):
@@ -489,7 +568,8 @@ class IngestStats:
             return self.ingested, self.errors
 
 
-def worker_fn(work_queue, stats):
+def worker_fn(work_queue, stats, worker_id):
+    port = ports[worker_id % len(ports)]
     client = OpenSearch(
         hosts=[{"host": host, "port": port}],
         use_ssl=False,
@@ -505,7 +585,16 @@ def worker_fn(work_queue, stats):
             break
         start = time.perf_counter()
         try:
-            success, errs = helpers.bulk(client, item, raise_on_error=False)
+            actions = item
+            success, errs = helpers.bulk(
+                client,
+                actions,
+                raise_on_error=False,
+                raise_on_exception=False,
+                chunk_size=len(actions),
+                max_chunk_bytes=MAX_BULK_REQUEST_BYTES,
+                request_timeout=120,
+            )
             err_count = len(errs) if isinstance(errs, list) else errs
             stats.add(success, err_count, (time.perf_counter() - start) * 1000)
             if isinstance(errs, list) and errs:
@@ -515,7 +604,7 @@ def worker_fn(work_queue, stats):
                     for err in errs[:3]:
                         print(json.dumps(err, indent=2, default=str))
         except Exception:
-            stats.add(0, len(item), (time.perf_counter() - start) * 1000)
+            stats.add(0, len(actions), (time.perf_counter() - start) * 1000)
             sample_no = stats.should_log_exception()
             if sample_no is not None:
                 exc_type, exc, _ = sys.exc_info()
@@ -525,7 +614,7 @@ def worker_fn(work_queue, stats):
 
 
 client = OpenSearch(
-    hosts=[{"host": host, "port": port}],
+    hosts=[{"host": host, "port": ports[0]}],
     use_ssl=False,
     verify_certs=False,
     timeout=120,
@@ -544,6 +633,11 @@ total_rows = min(available_rows, target_rows)
 print(f"Parquet files: {len(file_infos)}")
 print(f"Rows available: {available_rows:,}; ingesting {total_rows:,}")
 print(f"Config: workers={workers}, batch_size={batch_size}, parquet_batch={parquet_batch}, shards={shards}")
+print(f"Coordinator ports: {ports}")
+print(
+    f"Index settings: refresh_interval_ms={refresh_interval_ms}, "
+    f"flush_threshold_bytes={flush_threshold_bytes}"
+)
 
 if client.indices.exists(index=INDEX_NAME):
     print(f"Index '{INDEX_NAME}' already exists, deleting...")
@@ -552,16 +646,21 @@ if client.indices.exists(index=INDEX_NAME):
 client.indices.create(
     index=INDEX_NAME,
     body={
-        "settings": {"number_of_shards": shards, "number_of_replicas": 0},
+        "settings": {
+            "number_of_shards": shards,
+            "number_of_replicas": 0,
+            "refresh_interval_ms": refresh_interval_ms,
+            "flush_threshold_bytes": flush_threshold_bytes,
+        },
         "mappings": MAPPINGS,
     },
 )
 
 stats = IngestStats()
-work_queue = queue.Queue(maxsize=workers * 2)
+work_queue = queue.Queue(maxsize=max(workers * 8, 64))
 threads = []
-for _ in range(workers):
-    thread = threading.Thread(target=worker_fn, args=(work_queue, stats), daemon=True)
+for worker_id in range(workers):
+    thread = threading.Thread(target=worker_fn, args=(work_queue, stats, worker_id), daemon=True)
     thread.start()
     threads.append(thread)
 
@@ -584,13 +683,18 @@ for file_index, (path, row_count) in enumerate(file_infos, start=1):
         take = min(batch_table.num_rows, remaining)
         if take < batch_table.num_rows:
             batch_table = batch_table.slice(0, take)
-        actions = batch_to_bulk_actions(batch_table, doc_id)
-        doc_id += len(actions)
-        produced += len(actions)
-        file_produced += len(actions)
 
-        for offset in range(0, len(actions), batch_size):
-            work_queue.put(actions[offset:offset + batch_size])
+        batch_rows = batch_table.num_rows
+        batch_offset = 0
+        while batch_offset < batch_rows:
+            chunk_rows = min(batch_size, batch_rows - batch_offset)
+            chunk_table = batch_table.slice(batch_offset, chunk_rows)
+            actions = batch_to_bulk_actions(chunk_table, doc_id)
+            work_queue.put(actions)
+            doc_id += len(actions)
+            produced += len(actions)
+            file_produced += len(actions)
+            batch_offset += chunk_rows
 
         ingested, errors = stats.snapshot()
         elapsed = time.time() - start

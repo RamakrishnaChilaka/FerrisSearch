@@ -122,6 +122,8 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | POST | `/_bulk` | `bulk_index_global()` |
 | POST | `/{index}/_bulk` | `bulk_index()` |
 
+Bulk routes intentionally disable Axum's default buffered request-body limit so benchmark-sized NDJSON payloads reach the handler. When changing router composition or middleware layering, preserve large-body support on `POST /_bulk` and `POST /{index}/_bulk` or benchmark loaders will fail with `413 Failed to buffer the request body` before any item-level handling occurs.
+
 ### Search — src/api/search.rs
 | HTTP | Path | Handler |
 |------|------|---------|

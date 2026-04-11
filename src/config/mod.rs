@@ -60,7 +60,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub translog_sync_interval_ms: Option<u64>,
     /// Percentage of system memory to use for the column cache (0-100).
-    /// Caches Arrow arrays built from Tantivy fast-field columns for SQL analytics.
+    /// Caches both Arrow arrays for SQL fast-field reads and grouped-partials
+    /// decoded full-segment columns.
     /// Default: 10. Set to 0 to disable.
     #[serde(default = "default_column_cache_size_percent")]
     pub column_cache_size_percent: u8,

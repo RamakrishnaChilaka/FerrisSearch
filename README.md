@@ -79,7 +79,7 @@ Every SQL response tells you how the planner executed the query:
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1185 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
+- **Test depth** — 1194 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, and a bulk-body regression guarding benchmark-sized uploads
 
 ## Tech Stack
 
@@ -534,13 +534,13 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1185 tests
-cargo test --lib                                # Unit tests (1003)
-cargo test --bin ferris-cli                      # CLI tests (65)
+cargo test                                      # All 1194 tests
+cargo test --lib                                # Unit tests (1008)
+cargo test --bin ferris-cli                      # CLI tests (68)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (43)
+cargo test --test rest_api_integration           # REST API (44)
 cargo test --test restart_regression             # Real 3-node flush + restart regression (1)
 cargo test --test sql_correctness                # SQL correctness (1 test, 180 sqllogictest assertions)
 ```
@@ -599,7 +599,7 @@ scripts/           Ingestion and benchmark scripts
 - [x] Interactive SQL console with EXPLAIN visualization, `Tab` completion, and `\watch`
 - [x] Global `/_sql` with `SHOW TABLES`, `DESCRIBE`, `SHOW CREATE TABLE`, and streamed SQL output
 - [x] sqllogictest correctness suite
-- [x] Prometheus metrics and column cache for repeated fast-field queries
+- [x] Prometheus metrics and shared column cache for repeated fast-field and grouped-partials queries
 - [x] Restart and rejoin safety guardrails for UUID-based shard data
 - [x] Inter-node gRPC TLS (`--features transport-tls`)
 

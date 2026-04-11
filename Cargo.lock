@@ -2143,6 +2143,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tonic-types",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "usearch",

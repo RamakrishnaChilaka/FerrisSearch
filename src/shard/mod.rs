@@ -169,7 +169,8 @@ pub struct ShardManager {
     pub isr_tracker: IsrTracker,
     /// Translog durability mode for new shards.
     durability: TranslogDurability,
-    /// Shared column cache for SQL fast-field Arrow arrays.
+    /// Shared column cache for SQL fast-field Arrow arrays and grouped-partials
+    /// full-segment decoded columns.
     column_cache: Arc<crate::engine::column_cache::ColumnCache>,
 }
 
@@ -210,6 +211,11 @@ impl ShardManager {
     /// Get the base data directory.
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
+    }
+
+    /// Number of live entries in the shared column cache.
+    pub fn column_cache_entry_count(&self) -> u64 {
+        self.column_cache.entry_count()
     }
 
     /// Open or create the engine for a specific shard.

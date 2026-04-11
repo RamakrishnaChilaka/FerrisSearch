@@ -541,6 +541,26 @@ fn metadata_collector_label(body: &Value) -> Option<&'static str> {
     }
 }
 
+fn approximate_top_k_used(body: &Value) -> Option<bool> {
+    body.get("approximate_top_k").and_then(|v| v.as_bool())
+}
+
+fn metadata_approximate_top_k_label(body: &Value) -> Option<&'static str> {
+    match approximate_top_k_used(body) {
+        Some(true) => Some("approx top-k: on"),
+        Some(false) => Some("approx top-k: off"),
+        None => None,
+    }
+}
+
+fn explain_approximate_top_k_status(body: &Value) -> Option<&'static str> {
+    match approximate_top_k_used(body) {
+        Some(true) => Some("enabled"),
+        Some(false) => Some("disabled"),
+        None => None,
+    }
+}
+
 fn metadata_hits_label(body: &Value) -> &'static str {
     if body.get("execution_mode").is_some() {
         "search hits"
@@ -600,6 +620,10 @@ fn render_metadata(body: &Value, client_ms: f64) {
 
     if metadata_collector_label(body).is_some() {
         parts.push(format!("collector: {}", "bitset".bright_cyan()));
+    }
+
+    if let Some(label) = metadata_approximate_top_k_label(body) {
+        parts.push(label.to_string());
     }
 
     // Matched hits
@@ -693,6 +717,15 @@ fn render_explain(body: &Value, client_ms: f64) {
     // Strategy reason
     if let Some(reason) = body.get("strategy_reason").and_then(|v| v.as_str()) {
         println!(" {}  {}", "Strategy:".bright_white(), reason.dimmed());
+    }
+
+    if let Some(status) = explain_approximate_top_k_status(body) {
+        let colored = match status {
+            "enabled" => status.bright_cyan().bold().to_string(),
+            "disabled" => status.dimmed().to_string(),
+            _ => status.to_string(),
+        };
+        println!(" {} {}", "Approx Top-K:".bright_white(), colored);
     }
 
     // Matched hits
@@ -1927,6 +1960,45 @@ mod tests {
 
         assert!(!uses_bitset_collector(&body));
         assert_eq!(metadata_collector_label(&body), None);
+    }
+
+    #[test]
+    fn approximate_top_k_used_reads_bool_field() {
+        assert_eq!(
+            approximate_top_k_used(&serde_json::json!({ "approximate_top_k": true })),
+            Some(true)
+        );
+        assert_eq!(
+            approximate_top_k_used(&serde_json::json!({ "approximate_top_k": false })),
+            Some(false)
+        );
+        assert_eq!(approximate_top_k_used(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn metadata_approximate_top_k_label_reports_state() {
+        assert_eq!(
+            metadata_approximate_top_k_label(&serde_json::json!({ "approximate_top_k": true })),
+            Some("approx top-k: on")
+        );
+        assert_eq!(
+            metadata_approximate_top_k_label(&serde_json::json!({ "approximate_top_k": false })),
+            Some("approx top-k: off")
+        );
+        assert_eq!(metadata_approximate_top_k_label(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn explain_approximate_top_k_status_reports_state() {
+        assert_eq!(
+            explain_approximate_top_k_status(&serde_json::json!({ "approximate_top_k": true })),
+            Some("enabled")
+        );
+        assert_eq!(
+            explain_approximate_top_k_status(&serde_json::json!({ "approximate_top_k": false })),
+            Some("disabled")
+        );
+        assert_eq!(explain_approximate_top_k_status(&serde_json::json!({})), None);
     }
 
     #[test]

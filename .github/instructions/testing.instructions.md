@@ -1,14 +1,14 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **1003 unit tests** (`cargo test --lib`)
-- **65 CLI tests** (`cargo test --bin ferris-cli`)
+- **1008 unit tests** (`cargo test --lib`)
+- **68 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **43 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **44 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 180 assertions across 4 files
-- **1185 total** (`cargo test`)
+- **1194 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -27,6 +27,7 @@ cargo test -- test_name                         # Single test by name
 - Use `#[tokio::test]` for async tests
 - Use `tempfile::TempDir` for isolated data directories
 - Test every code path: happy path, edge cases, error conditions, empty inputs
+- For large bulk-ingest changes, add a router-level regression proving `POST /_bulk` accepts a body larger than Axum's default 2MB limit and reaches the handler instead of failing with `413` at the framework layer.
 - For in-process REST integration harnesses, wait for both the HTTP listener and the gRPC transport listener before issuing the first request; Raft-backed index/settings handlers may still forward through transport before the harness is usable, and any readiness `Ping` must use a registered `source_node_id` because transport rejects unknown nodes.
 - Multi-node REST harnesses that claim coordinator coverage must preserve real `raft_node_id` values in cluster state and route at least one request through a non-master node; otherwise follower-forwarding regressions can hide behind leader-only traffic.
 - For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
@@ -44,7 +45,7 @@ cargo test -- test_name                         # Single test by name
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For SQL identifier case-sensitivity fixes, add helper-level canonicalization coverage plus REST regressions for both buffered and streamed SQL endpoints using real mixed-case mapping fields, and cover both unquoted source references and quoted exact-identifier preservation on the residual/DataFusion path.
 - For `ferris-cli` interactive features, test command parsing and completion token boundaries in pure helpers; keep watch-mode behavior factored so the logic is covered without relying on terminal I/O in tests.
-- For `ferris-cli` SQL metadata/footer changes, keep search-stage counts distinct from final SQL row counts and add pure helper coverage for the displayed labels so `matched_hits` is not presented as returned rows.
+- For `ferris-cli` SQL metadata/footer changes, keep search-stage counts distinct from final SQL row counts, surface the actual `approximate_top_k` state from API metadata when present, and add pure helper coverage for the displayed labels so `matched_hits` is not presented as returned rows.
 - For `ferris-cli` grouped timing display changes, add pure helper coverage for nested `timings.grouped_merge` extraction and a `POST /_sql/stream` regression proving the NDJSON `meta` frame preserves timings when the streamed endpoint re-frames buffered grouped-partials results.
 - For streamed `ferris-cli` SQL changes, add pure chunk-boundary NDJSON parsing tests and at least one REST integration test covering the global `POST /_sql/stream` route the console uses.
 - For feature-gated transport TLS changes, run both `cargo test --lib` and `cargo test --lib --features transport-tls`; enabling TLS without the feature must error instead of silently downgrading to plaintext.
@@ -61,6 +62,7 @@ cargo test -- test_name                         # Single test by name
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
 - For distributed hit-merge changes, add unit coverage for `merge_sorted_hit_lists()` and a multi-node REST regression where only one shard returns hits but the coordinator still must apply a custom sort.
 - For grouped-partials timing changes, add API or unit coverage that `EXPLAIN ANALYZE` exposes the nested grouped-merge breakdown (`partial_merge_ms`, `having_ms`, `top_k_ms`, `row_build_ms`) and bucket counts for grouped SQL queries.
+- For grouped column-cache changes, add unit coverage that match-all grouped direct scans populate per-segment grouped cache entries and that filtered grouped readers reuse warm entries without populating cold partial scans, plus a `POST /_sql` regression showing repeated grouped-partials queries keep cache occupancy stable.
 - For width-2 grouped-key hot-path changes, keep a direct grouped-pair regression on the packed-key path and add a focused map-key regression when the pair-hasher implementation changes.
 - For grouped-key encoding changes, add regressions that distinguish SQL `NULL` buckets from signed integer payloads such as `-1` across single-key, width-2 packed-key, and multi-key grouped execution paths.
 - For `_cat/shards` state fixes, add a regression that a live shard copy on one node does not make a different assigned copy on another node appear `STARTED`; display state must be per copy, not per shard ID.

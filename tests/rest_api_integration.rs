@@ -22,6 +22,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 
 struct RestTestHarness {
     _temp_dir: TempDir,
+    app_state: AppState,
     client: Client,
     base_url: String,
     transport_addr: std::net::SocketAddr,
@@ -96,6 +97,13 @@ async fn post_json_to_base_url(
 
 impl RestTestHarness {
     async fn start() -> Result<Self> {
+        Self::start_with_column_cache(0, 0).await
+    }
+
+    async fn start_with_column_cache(
+        column_cache_bytes: u64,
+        populate_threshold_percent: u8,
+    ) -> Result<Self> {
         let temp_dir = tempfile::tempdir()?;
         let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let http_addr = http_listener.local_addr()?;
@@ -125,7 +133,15 @@ impl RestTestHarness {
         let manager = ClusterManager::with_shared_state(shared_state);
         manager.update_state(cluster_state);
 
-        let shard_manager = Arc::new(ShardManager::new(temp_dir.path(), Duration::from_secs(60)));
+        let column_cache = Arc::new(ferrissearch::engine::column_cache::ColumnCache::new(
+            column_cache_bytes,
+            populate_threshold_percent,
+        ));
+        let shard_manager = Arc::new(ShardManager::new_full(
+            temp_dir.path(),
+            ferrissearch::wal::TranslogDurability::Request,
+            column_cache,
+        ));
         let cluster_manager = Arc::new(manager);
         let transport_client = TransportClient::new();
         let task_manager = Arc::new(ferrissearch::tasks::TaskManager::new());
@@ -160,7 +176,7 @@ impl RestTestHarness {
             }
         });
 
-        let app = create_router(app_state);
+        let app = create_router(app_state.clone());
         let http_handle = tokio::spawn(async move {
             if let Err(error) = axum::serve(http_listener, app).await {
                 tracing::error!("Test HTTP server failed: {}", error);
@@ -169,6 +185,7 @@ impl RestTestHarness {
 
         let harness = Self {
             _temp_dir: temp_dir,
+            app_state,
             client: Client::builder().timeout(Duration::from_secs(10)).build()?,
             base_url: format!("http://{}", http_addr),
             transport_addr,
@@ -1317,6 +1334,48 @@ async fn rest_sql_uses_tantivy_fast_fields_for_supported_query() -> Result<()> {
     assert_eq!(body["execution_mode"], json!("tantivy_grouped_partials"));
     assert_eq!(body["planner"]["group_by_columns"], json!(["brand"]));
     assert_eq!(body["matched_hits"], json!(3));
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_sql_grouped_partials_populates_grouped_cache_once() -> Result<()> {
+    let harness = RestTestHarness::start_with_column_cache(1024 * 1024, 0).await?;
+    create_products_index_and_docs(&harness).await?;
+
+    assert_eq!(
+        harness.app_state.shard_manager.column_cache_entry_count(),
+        0
+    );
+
+    let query = json!({
+        "query": "SELECT brand, AVG(price) AS avg_price FROM products GROUP BY brand ORDER BY brand ASC"
+    });
+
+    let (first_status, first_body) = harness.post_json("/products/_sql", query.clone()).await?;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(
+        first_body["execution_mode"],
+        json!("tantivy_grouped_partials")
+    );
+
+    let cached_entries = harness.app_state.shard_manager.column_cache_entry_count();
+    assert!(
+        cached_entries >= 2,
+        "expected grouped-partials direct scan to populate grouped cache entries"
+    );
+
+    let (second_status, second_body) = harness.post_json("/products/_sql", query).await?;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(
+        second_body["execution_mode"],
+        json!("tantivy_grouped_partials")
+    );
+    assert_eq!(second_body["rows"], first_body["rows"]);
+    assert_eq!(
+        harness.app_state.shard_manager.column_cache_entry_count(),
+        cached_entries
+    );
+
     Ok(())
 }
 
