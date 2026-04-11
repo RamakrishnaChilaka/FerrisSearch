@@ -480,15 +480,6 @@ struct SqlExecutionResult {
     timings: crate::hybrid::SqlTimings,
 }
 
-struct DirectSqlBatches {
-    batches: Vec<RecordBatch>,
-    total_hits: usize,
-    collected_hits: usize,
-    streaming_used: bool,
-    successful_shards: u32,
-    failed_shards: u32,
-}
-
 struct DirectSqlPartitions {
     schema: Arc<datafusion::arrow::datatypes::Schema>,
     partitions: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>>,
@@ -608,174 +599,6 @@ fn direct_sql_partition_from_local_handle(
     direct_sql_partition_from_stream(target_schema, plan, rx)
 }
 
-async fn collect_direct_sql_batches(
-    state: &AppState,
-    index_name: &str,
-    metadata: &crate::cluster::state::IndexMetadata,
-    plan: &crate::hybrid::QueryPlan,
-    search_req: &crate::search::SearchRequest,
-    local_shards: &[(u32, Arc<dyn crate::engine::SearchEngine>)],
-    local_shard_ids: &HashSet<u32>,
-) -> anyhow::Result<DirectSqlBatches> {
-    let mut batches = Vec::new();
-    let mut total_hits = 0usize;
-    let mut collected_hits = 0usize;
-    let mut successful_shards = 0u32;
-    let use_streaming = plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback;
-    let mut used_streaming = false;
-
-    let sql_futures: Vec<_> = local_shards
-        .iter()
-        .map(|(_shard_id, engine)| {
-            let engine = engine.clone();
-            let req = search_req.clone();
-            let columns = plan.required_columns.clone();
-            let needs_id = plan.needs_id;
-            let needs_score = plan.needs_score;
-            let pools = state.worker_pools.clone();
-            if use_streaming {
-                async move {
-                    pools
-                        .spawn_search(move || {
-                            match engine.sql_streaming_batches(
-                                &req,
-                                &columns,
-                                needs_id,
-                                needs_score,
-                                0,
-                            )? {
-                                Some(result) => Ok(Some((result.batches, result.total_hits, true))),
-                                None => engine
-                                    .sql_record_batch(&req, &columns, needs_id, needs_score)
-                                    .map(|opt| opt.map(|r| (vec![r.batch], r.total_hits, false))),
-                            }
-                        })
-                        .await
-                }
-                .boxed()
-            } else {
-                async move {
-                    pools
-                        .spawn_search(move || {
-                            engine
-                                .sql_record_batch(&req, &columns, needs_id, needs_score)
-                                .map(|opt| opt.map(|r| (vec![r.batch], r.total_hits, false)))
-                        })
-                        .await
-                }
-                .boxed()
-            }
-        })
-        .collect();
-    let sql_results = join_all(sql_futures).await;
-
-    for batch_result in sql_results {
-        match batch_result {
-            Ok(Ok(Some((shard_batches, hits, streamed)))) => {
-                successful_shards += 1;
-                total_hits += hits;
-                collected_hits += shard_batches
-                    .iter()
-                    .map(|batch| batch.num_rows())
-                    .sum::<usize>();
-                if streamed {
-                    used_streaming = true;
-                }
-                batches.extend(shard_batches);
-            }
-            Ok(Ok(None)) => {
-                return Err(anyhow::anyhow!(
-                    "local shard does not support direct SQL batches"
-                ));
-            }
-            Ok(Err(error)) | Err(error) => return Err(error),
-        }
-    }
-
-    let cluster_state = state.cluster_manager.get_state();
-    let mut remote_futures = Vec::new();
-
-    for (shard_id, routing) in &metadata.shard_routing {
-        if local_shard_ids.contains(shard_id) {
-            continue;
-        }
-
-        let primary_node_id = &routing.primary;
-        if let Some(node) = cluster_state.nodes.get(primary_node_id) {
-            let client = state.transport_client.clone();
-            let node = node.clone();
-            let index_name = index_name.to_string();
-            let shard_id = *shard_id;
-            let req = search_req.clone();
-            let columns = plan.required_columns.clone();
-            let needs_id = plan.needs_id;
-            let needs_score = plan.needs_score;
-            remote_futures.push(tokio::spawn(async move {
-                if use_streaming {
-                    client
-                        .forward_sql_batch_stream_to_shard(
-                            &node,
-                            &index_name,
-                            shard_id,
-                            &req,
-                            &columns,
-                            needs_id,
-                            needs_score,
-                            0,
-                        )
-                        .await
-                } else {
-                    client
-                        .forward_sql_batch_to_shard(
-                            &node,
-                            &index_name,
-                            shard_id,
-                            &req,
-                            &columns,
-                            needs_id,
-                            needs_score,
-                        )
-                        .await
-                        .map(|(batch, hits)| (vec![batch], hits, false))
-                }
-            }));
-        }
-    }
-
-    let remote_results = join_all(remote_futures).await;
-    for result in remote_results {
-        match result {
-            Ok(Ok((shard_batches, hits, streamed))) => {
-                successful_shards += 1;
-                total_hits += hits;
-                collected_hits += shard_batches
-                    .iter()
-                    .map(|batch| batch.num_rows())
-                    .sum::<usize>();
-                if streamed {
-                    used_streaming = true;
-                }
-                batches.extend(shard_batches);
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(error) => {
-                return Err(anyhow::anyhow!("remote shard task failed: {}", error));
-            }
-        }
-    }
-
-    Ok(DirectSqlBatches {
-        batches,
-        total_hits,
-        collected_hits,
-        streaming_used: used_streaming,
-        successful_shards,
-        // This direct fast-field path is all-or-nothing today: any local or remote
-        // shard error aborts the query before we return a partial result.
-        failed_shards: 0,
-    })
-}
-
 async fn collect_direct_sql_partitions(
     state: &AppState,
     index_name: &str,
@@ -793,9 +616,11 @@ async fn collect_direct_sql_partitions(
     let mut successful_shards = 0u32;
     let mut used_streaming = false;
 
-    // Gate streaming on has_group_by_fallback to match collect_direct_sql_batches.
-    // Non-GROUP-BY queries go straight to TopDocs — avoids a wasted
-    // sql_streaming_batches() call that will return None for scored/LIMIT queries.
+    // Only fallback aggregate queries are allowed to scan beyond the default
+    // TopDocs ceiling, so keep lazy shard streaming reserved for those paths.
+    // Ordinary tantivy_fast_fields queries still use sql_record_batch() here,
+    // but the coordinator now feeds the per-shard results through partition
+    // streams instead of staging every batch into one MemTable first.
     let use_streaming = plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback;
 
     let local_futures: Vec<_> = local_shards
@@ -1320,10 +1145,10 @@ async fn execute_sql_query_with_plan(
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
 
-    // Fast-field path: collect Arrow batches from local + remote shards
+    // Fast-field path: collect direct SQL partitions from local + remote shards
     let search_start = Instant::now();
     let direct_sql = if !plan.selects_all_columns {
-        match collect_direct_sql_batches(
+        match collect_direct_sql_partitions(
             state,
             &plan.index_name,
             &metadata,
@@ -1360,17 +1185,22 @@ async fn execute_sql_query_with_plan(
         failed_shards,
         execution_mode,
     ) = if let Some(direct_sql) = direct_sql {
-        let sql_result =
-            match crate::hybrid::execute_planned_sql_batches(&plan, direct_sql.batches).await {
-                Ok(result) => result,
-                Err(e) => {
-                    return Err(crate::api::error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "sql_execution_exception",
-                        e,
-                    ));
-                }
-            };
+        let sql_result = match crate::hybrid::execute_planned_sql_partitions(
+            &plan,
+            direct_sql.schema,
+            direct_sql.partitions,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sql_execution_exception",
+                    e,
+                ));
+            }
+        };
         (
             sql_result,
             direct_sql.total_hits,

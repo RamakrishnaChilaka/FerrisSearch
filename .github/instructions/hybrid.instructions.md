@@ -82,7 +82,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 
 ## Distributed Fast-Field SQL
 - The `tantivy_fast_fields` path now works across multi-node clusters.
-- For buffered non-`SELECT *` queries, the coordinator can still scatter unary `SqlRecordBatch` gRPC RPCs to remote shards in parallel.
+- Buffered non-`SELECT *` queries should execute through the same `StreamingTable` partition pipeline as the streamed endpoint. Unary `SqlRecordBatch` shard results are still allowed, but the coordinator should wrap each shard batch as a one-shot partition instead of first concatenating every shard batch into one coordinator-side `MemTable` input.
 - For streamed explicit-column SQL (`POST /_sql/stream` or `POST /{index}/_sql/stream`), the coordinator opens `SqlRecordBatchStream` gRPC streams to remote shards and keeps those shard streams live.
 - Local explicit-column fallback queries should also keep shard batches lazy: build a metadata-bearing batch handle up front, then drain it on the search pool as DataFusion pulls from the local `StreamingTable` partition instead of prebuilding a `Vec<RecordBatch>` first.
 - The engine-level local streaming contract is `sql_streaming_batch_handle()`: it returns `total_hits`, `collected_rows`, and a lazy `next_batch()` closure. `sql_streaming_batches()` is now the eager compatibility wrapper that drains that handle for tests and older callers.

@@ -79,7 +79,7 @@ Every SQL response tells you how the planner executed the query:
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1184 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
+- **Test depth** — 1185 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
 
 ## Tech Stack
 
@@ -534,8 +534,8 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1184 tests
-cargo test --lib                                # Unit tests (1002)
+cargo test                                      # All 1185 tests
+cargo test --lib                                # Unit tests (1003)
 cargo test --bin ferris-cli                      # CLI tests (65)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
