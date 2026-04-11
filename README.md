@@ -78,7 +78,7 @@ Every SQL response tells you how the planner executed the query:
 - **Generation-based WAL** — durable writes, replica catch-up, and background auto-flush
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, and planner metadata in SQL responses
-- **Test depth** — 1165 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
+- **Test depth** — 1170 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
 
 ## Tech Stack
 
@@ -172,12 +172,14 @@ Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variable
 | `translog_durability` | `request` | WAL fsync mode: `request` (per-write) or `async` (timer) |
 | `translog_sync_interval_ms` | (unset) | Background fsync interval when durability is `async` |
 | `sql_group_by_scan_limit` | `1000000` | Max docs scanned for `GROUP BY` fallback queries on the `tantivy_fast_fields` path (`0` = unlimited). Flat non-grouped fast-field queries keep their own internal 100K ceiling unless `LIMIT` pushdown applies. |
+| `sql_approximate_top_k` | `true` | Enables shard-level approximate top-K pruning for eligible grouped-partials `GROUP BY ... ORDER BY metric LIMIT N` queries. Set to `false` if you want exact coordinator-side merge behavior instead. |
 | `transport_tls_enabled` | `false` | Enable inter-node gRPC TLS (requires building with `--features transport-tls`) |
 | `transport_tls_cert_file` | (unset) | PEM certificate for the gRPC transport server when TLS is enabled |
 | `transport_tls_key_file` | (unset) | PEM private key for the gRPC transport server when TLS is enabled |
 | `transport_tls_ca_file` | (unset) | PEM CA certificate used by transport clients to verify peers |
 
 If `transport_tls_enabled: true` is set without compiling `--features transport-tls`, node startup fails instead of silently falling back to plaintext transport.
+  "approximate_top_k": false,
 
 ## SQL Over Search Results
 
@@ -602,6 +604,7 @@ scripts/           Ingestion and benchmark scripts
 
 ### Next
 
+- [ ] Adaptive shard top-K auto mode for grouped analytics — replace the static `sql_approximate_top_k` boolean with `off | auto | force`, runtime activation thresholds, and EXPLAIN visibility for why shard pruning was or was not applied; design in [docs/adaptive-top-k-auto-mode.md](docs/adaptive-top-k-auto-mode.md)
 - [ ] Time functions for mapped `date` fields — support SQL temporal functions such as `date_trunc`, `extract`, `now()`, and timezone-aware bucketing/filtering without forcing queries onto the generic fallback path
 - [ ] Branch-aware boolean lowering for `text_match()` inside `OR` / complex expressions — today `text_match()` must remain a top-level `AND` predicate because residual SQL/DataFusion cannot evaluate it; future support must lower the full boolean subtree into Tantivy instead of leaving residual `text_match()` work behind
 - [ ] Streaming fast-field TableProvider — custom DataFusion `TableProvider` reading Tantivy fast fields as streaming Arrow batches (8K rows/batch), eliminating the GROUP BY scan limit entirely

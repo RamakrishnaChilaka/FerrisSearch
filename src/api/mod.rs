@@ -62,7 +62,7 @@ pub struct AppState {
     /// When true, each shard keeps only (offset + limit) * 3 + 10 buckets before
     /// shipping to the coordinator.  Reduces latency on high-cardinality GROUP BY
     /// with LIMIT, but results are approximate (not standard SQL semantics).
-    /// Default: false.
+    /// Default: true. Set to false to force exact coordinator-side merge.
     pub sql_approximate_top_k: bool,
 }
 

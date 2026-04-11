@@ -82,8 +82,8 @@ pub struct AppConfig {
     /// before shipping to the coordinator.  This is NOT standard SQL semantics
     /// (a bucket below every shard's cutoff can still be in the exact global
     /// top-K), but reduces latency dramatically on high-cardinality GROUP BY.
-    /// Default: false.
-    #[serde(default)]
+    /// Default: true. Set to false to force exact coordinator-side merge.
+    #[serde(default = "default_sql_approximate_top_k")]
     pub sql_approximate_top_k: bool,
     /// Enable TLS for gRPC inter-node transport. Requires `transport-tls` feature.
     /// Default: false.
@@ -124,6 +124,10 @@ fn default_sql_group_by_scan_limit() -> usize {
     1_000_000
 }
 
+fn default_sql_approximate_top_k() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -139,7 +143,7 @@ impl Default for AppConfig {
             column_cache_size_percent: 10,
             column_cache_populate_threshold: 5,
             sql_group_by_scan_limit: 1_000_000,
-            sql_approximate_top_k: false,
+            sql_approximate_top_k: true,
             transport_tls_enabled: false,
             transport_tls_cert_file: None,
             transport_tls_key_file: None,
@@ -425,5 +429,23 @@ mod tests {
         }"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.sql_group_by_scan_limit, 0);
+    }
+
+    #[test]
+    fn sql_approximate_top_k_defaults_to_true() {
+        let config = AppConfig::default();
+        assert!(config.sql_approximate_top_k);
+    }
+
+    #[test]
+    fn sql_approximate_top_k_can_be_disabled() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "sql_approximate_top_k": false
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.sql_approximate_top_k);
     }
 }

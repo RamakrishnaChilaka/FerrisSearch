@@ -420,7 +420,12 @@ pub async fn explain_sql(
             Ok(plan) => plan,
             Err(err) => return err,
         };
-        return (StatusCode::OK, Json(plan.to_explain_json()));
+        let approximate_top_k = search_request_uses_approximate_top_k(
+            &plan.to_search_request(state.sql_approximate_top_k),
+        );
+        let mut explain = plan.to_explain_json();
+        explain["approximate_top_k"] = serde_json::json!(approximate_top_k);
+        return (StatusCode::OK, Json(explain));
     }
 
     // EXPLAIN ANALYZE: execute the query and merge plan + timings + rows
@@ -439,6 +444,7 @@ pub async fn explain_sql(
             };
             explain["timings"] = timings;
             explain["execution_mode"] = serde_json::json!(result.execution_mode);
+            explain["approximate_top_k"] = serde_json::json!(result.approximate_top_k);
             explain["streaming_used"] = serde_json::json!(result.streaming_used);
             explain["matched_hits"] = serde_json::json!(result.matched_hits);
             explain["row_count"] = serde_json::json!(result.sql_result.rows.len());
@@ -467,6 +473,7 @@ struct SqlExecutionResult {
     successful_shards: u32,
     failed_shards: u32,
     execution_mode: &'static str,
+    approximate_top_k: bool,
     streaming_used: bool,
     truncated: bool,
     semijoin_key_count: Option<usize>,
@@ -494,6 +501,7 @@ struct DirectSqlPartitions {
 
 struct SqlStreamMeta {
     execution_mode: &'static str,
+    approximate_top_k: bool,
     streaming_used: bool,
     truncated: bool,
     matched_hits: usize,
@@ -516,6 +524,16 @@ enum LocalSqlPartitionResult {
         batch: RecordBatch,
         total_hits: usize,
     },
+}
+
+fn search_request_uses_approximate_top_k(search_req: &crate::search::SearchRequest) -> bool {
+    search_req.aggs.values().any(|agg| {
+        matches!(
+            agg,
+            crate::search::AggregationRequest::GroupedMetrics(params)
+                if params.shard_top_k.is_some()
+        )
+    })
 }
 
 fn direct_sql_partition_from_stream<S>(
@@ -1151,6 +1169,7 @@ async fn execute_sql_query_with_plan(
             state.sql_group_by_scan_limit
         };
     }
+    let approximate_top_k = search_request_uses_approximate_top_k(&search_req);
 
     // count(*) fast path: answer from doc_count() metadata without scanning docs
     if plan.is_count_star_only() {
@@ -1191,6 +1210,7 @@ async fn execute_sql_query_with_plan(
             successful_shards,
             failed_shards,
             execution_mode: "count_star_fast",
+            approximate_top_k,
             streaming_used: false,
             truncated: false,
             semijoin_key_count,
@@ -1271,6 +1291,7 @@ async fn execute_sql_query_with_plan(
             successful_shards: distributed.successful_shards,
             failed_shards: distributed.failed_shards,
             execution_mode: "tantivy_grouped_partials",
+            approximate_top_k,
             streaming_used: false,
             truncated: false,
             semijoin_key_count,
@@ -1435,6 +1456,7 @@ async fn execute_sql_query_with_plan(
         successful_shards,
         failed_shards,
         execution_mode,
+        approximate_top_k,
         streaming_used,
         truncated,
         semijoin_key_count,
@@ -1500,6 +1522,7 @@ fn planner_metadata_json(plan: &crate::hybrid::planner::QueryPlan) -> Value {
 fn sql_response_body(result: &SqlExecutionResult) -> Value {
     serde_json::json!({
         "execution_mode": result.execution_mode,
+        "approximate_top_k": result.approximate_top_k,
         "streaming_used": result.streaming_used,
         "truncated": result.truncated,
         "planner": planner_metadata_json(&result.plan),
@@ -1517,6 +1540,7 @@ fn sql_response_body(result: &SqlExecutionResult) -> Value {
 fn sql_stream_meta_json(plan: &crate::hybrid::QueryPlan, meta: SqlStreamMeta) -> Value {
     serde_json::json!({
         "execution_mode": meta.execution_mode,
+        "approximate_top_k": meta.approximate_top_k,
         "streaming_used": meta.streaming_used,
         "truncated": meta.truncated,
         "planner": planner_metadata_json(plan),
@@ -1664,6 +1688,7 @@ async fn execute_sql_stream_query(
             state.sql_group_by_scan_limit
         };
     }
+    let approximate_top_k = search_request_uses_approximate_top_k(&search_req);
 
     let local_shards = crate::api::index::ensure_local_index_shards_open(
         state,
@@ -1743,6 +1768,7 @@ async fn execute_sql_stream_query(
             &plan,
             SqlStreamMeta {
                 execution_mode: "tantivy_fast_fields",
+                approximate_top_k,
                 streaming_used: direct_sql.streaming_used,
                 truncated,
                 matched_hits: direct_sql.total_hits,
