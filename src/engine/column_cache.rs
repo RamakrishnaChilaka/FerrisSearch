@@ -1,25 +1,67 @@
-//! Column cache — lazy-loaded, segment-aware Arrow array cache for SQL analytics.
+//! Column cache — lazy-loaded, segment-aware cache for SQL analytics and
+//! grouped-partials execution.
 //!
-//! Caches pre-built Arrow arrays from Tantivy fast-field columns, keyed by
-//! `(SegmentId, column_name)`. Tantivy segments are immutable once committed,
-//! so cached data never goes stale — entries are evicted only by size pressure.
+//! Caches either pre-built Arrow arrays or grouped-partials decoded full-segment
+//! columns, keyed by `(SegmentId, column_name, format)`. Tantivy segments are
+//! immutable once committed, so cached data never goes stale — entries are
+//! evicted only by size pressure.
 
 use datafusion::arrow::array::ArrayRef;
+use std::sync::Arc;
 use tantivy::index::SegmentId;
 
-/// Cache key: (segment UUID, column name).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CacheFormat {
+    Arrow,
+    Grouped,
+}
+
+/// Cache key: (segment UUID, column name, cache format).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheKey {
     segment_id: SegmentId,
     column: String,
+    format: CacheFormat,
+}
+
+/// Cached full-segment values used by grouped-partials readers.
+///
+/// Numeric metrics want direct typed access by doc ID, while keyword/string
+/// group keys want dictionary ordinals rather than expanded strings.
+#[derive(Clone)]
+pub(crate) enum GroupedColumnCache {
+    F64(Arc<[Option<f64>]>),
+    I64(Arc<[Option<i64>]>),
+    StrOrds(Arc<[Option<u64>]>),
+}
+
+impl GroupedColumnCache {
+    fn weight_bytes(&self) -> u64 {
+        match self {
+            Self::F64(values) => values.len() as u64 * std::mem::size_of::<Option<f64>>() as u64,
+            Self::I64(values) => values.len() as u64 * std::mem::size_of::<Option<i64>>() as u64,
+            Self::StrOrds(values) => {
+                values.len() as u64 * std::mem::size_of::<Option<u64>>() as u64
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum CacheValue {
+    Arrow(ArrayRef),
+    Grouped(GroupedColumnCache),
 }
 
 /// A lazily-populated, size-bounded column cache backed by `moka`.
 ///
-/// Each entry is an Arrow `ArrayRef` covering all docs in a segment for one column.
-/// Queries extract matching rows via `arrow::compute::take()`.
+/// Entries are either:
+/// - Arrow `ArrayRef`s covering all docs in a segment for one SQL column, or
+/// - grouped-partials decoded full-segment values keyed by doc ID.
+///
+/// The same shared capacity budget covers both formats.
 pub struct ColumnCache {
-    inner: moka::sync::Cache<CacheKey, ArrayRef>,
+    inner: moka::sync::Cache<CacheKey, CacheValue>,
     /// Selectivity threshold (0.0–1.0). On a cache miss, the full-segment array
     /// is only built when `matched_docs / max_doc >= threshold`. Below this,
     /// only matching docs are read directly without populating the cache.
@@ -33,10 +75,12 @@ impl ColumnCache {
     /// Pass 0 for threshold_percent to always eagerly populate on miss.
     pub fn new(max_bytes: u64, populate_threshold_percent: u8) -> Self {
         let inner = moka::sync::Cache::builder()
-            .weigher(|_key: &CacheKey, value: &ArrayRef| {
-                // Weight = Arrow array memory size. Capped at u32::MAX per moka API.
-                let bytes = value.get_array_memory_size();
-                bytes.min(u32::MAX as usize) as u32
+            .weigher(|_key: &CacheKey, value: &CacheValue| {
+                let bytes = match value {
+                    CacheValue::Arrow(array) => array.get_array_memory_size() as u64,
+                    CacheValue::Grouped(column) => column.weight_bytes(),
+                };
+                bytes.min(u32::MAX as u64) as u32
             })
             .max_capacity(max_bytes)
             .build();
@@ -63,8 +107,12 @@ impl ColumnCache {
         let key = CacheKey {
             segment_id,
             column: column.to_string(),
+            format: CacheFormat::Arrow,
         };
-        self.inner.get(&key)
+        match self.inner.get(&key) {
+            Some(CacheValue::Arrow(array)) => Some(array),
+            _ => None,
+        }
     }
 
     /// Insert a column array into the cache.
@@ -72,15 +120,53 @@ impl ColumnCache {
     /// (avoids building a full-segment array that would be immediately evicted).
     pub fn insert(&self, segment_id: SegmentId, column: &str, array: ArrayRef) {
         let array_bytes = array.get_array_memory_size() as u64;
-        let max = self.inner.policy().max_capacity().unwrap_or(0);
-        if max > 0 && array_bytes > max / 4 {
-            return; // too large — would thrash the cache
-        }
         let key = CacheKey {
             segment_id,
             column: column.to_string(),
+            format: CacheFormat::Arrow,
         };
-        self.inner.insert(key, array);
+        self.insert_value(key, CacheValue::Arrow(array), array_bytes);
+    }
+
+    /// Try to get a grouped-partials decoded full-segment column.
+    pub(crate) fn get_grouped(
+        &self,
+        segment_id: SegmentId,
+        column: &str,
+    ) -> Option<GroupedColumnCache> {
+        let key = CacheKey {
+            segment_id,
+            column: column.to_string(),
+            format: CacheFormat::Grouped,
+        };
+        match self.inner.get(&key) {
+            Some(CacheValue::Grouped(column)) => Some(column),
+            _ => None,
+        }
+    }
+
+    /// Insert a grouped-partials decoded full-segment column into the cache.
+    pub(crate) fn insert_grouped(
+        &self,
+        segment_id: SegmentId,
+        column: &str,
+        values: GroupedColumnCache,
+    ) {
+        let value_bytes = values.weight_bytes();
+        let key = CacheKey {
+            segment_id,
+            column: column.to_string(),
+            format: CacheFormat::Grouped,
+        };
+        self.insert_value(key, CacheValue::Grouped(values), value_bytes);
+    }
+
+    fn insert_value(&self, key: CacheKey, value: CacheValue, value_bytes: u64) {
+        let max = self.inner.policy().max_capacity().unwrap_or(0);
+        if max > 0 && value_bytes > max / 4 {
+            return; // too large — would thrash the cache
+        }
+        self.inner.insert(key, value);
     }
 
     /// Maximum cache capacity in bytes.
@@ -90,6 +176,7 @@ impl ColumnCache {
 
     /// Number of entries currently in the cache.
     pub fn entry_count(&self) -> u64 {
+        self.inner.run_pending_tasks();
         self.inner.entry_count()
     }
 
@@ -130,7 +217,6 @@ fn system_memory_bytes() -> u64 {
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
-    use std::sync::Arc;
 
     fn make_segment_id() -> SegmentId {
         SegmentId::from_uuid_string("00000000-0000-0001-0000-000000000001").unwrap()
@@ -188,6 +274,43 @@ mod tests {
         assert_eq!(cache.entry_count(), 2);
         assert!(cache.get(seg, "price").is_some());
         assert!(cache.get(seg, "name").is_some());
+    }
+
+    #[test]
+    fn grouped_cache_hit_after_insert() {
+        let cache = ColumnCache::new(1024 * 1024, 0);
+        let seg = make_segment_id();
+        let ords: Arc<[Option<u64>]> = vec![Some(3), None, Some(8)].into();
+
+        cache.insert_grouped(seg, "brand", GroupedColumnCache::StrOrds(ords.clone()));
+
+        match cache.get_grouped(seg, "brand") {
+            Some(GroupedColumnCache::StrOrds(cached)) => {
+                assert_eq!(cached.len(), 3);
+                assert_eq!(cached[0], Some(3));
+                assert_eq!(cached[1], None);
+                assert_eq!(cached[2], Some(8));
+            }
+            Some(_) => panic!("expected cached string ordinals"),
+            None => panic!("expected grouped cache entry"),
+        }
+    }
+
+    #[test]
+    fn arrow_and_grouped_entries_use_distinct_keys() {
+        let cache = ColumnCache::new(1024 * 1024, 0);
+        let seg = make_segment_id();
+
+        let prices: ArrayRef = Arc::new(Float64Array::from(vec![9.99, 19.99]));
+        let numeric: Arc<[Option<f64>]> = vec![Some(9.99), Some(19.99)].into();
+
+        cache.insert(seg, "price", prices);
+        cache.insert_grouped(seg, "price", GroupedColumnCache::F64(numeric));
+        cache.inner.run_pending_tasks();
+
+        assert!(cache.get(seg, "price").is_some());
+        assert!(cache.get_grouped(seg, "price").is_some());
+        assert_eq!(cache.entry_count(), 2);
     }
 
     #[test]

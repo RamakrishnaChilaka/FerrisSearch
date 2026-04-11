@@ -238,10 +238,11 @@ unsearchable by float range queries). Date fields accept both ISO 8601 strings a
 ## Column Cache (src/engine/column_cache.rs)
 
 ### Architecture
-Segment-aware, lazy-loaded Arrow array cache backed by `moka`. Shared across all shards on a node via `Arc<ColumnCache>`.
-- **Key**: `(SegmentId, column_name)` — Tantivy segments are immutable once committed, so cached data never goes stale.
-- **Value**: Arrow `ArrayRef` covering all docs in a segment for one column. Queries extract matching rows via `arrow::compute::take()`.
+Segment-aware, lazy-loaded column cache backed by `moka`. Shared across all shards on a node via `Arc<ColumnCache>`.
+- **Key**: `(SegmentId, column_name, format)` — Tantivy segments are immutable once committed, so cached data never goes stale.
+- **Value**: either an Arrow `ArrayRef` covering all docs in a segment for one SQL column, or grouped-partials decoded full-segment values keyed by doc ID (`f64`, `i64`, or string ordinals).
 - **Eviction**: Size-bounded (weighted by `ArrayRef::get_array_memory_size()`), LRU eviction by moka.
+- One shared capacity budget covers both SQL Arrow arrays and grouped-partials decoded columns.
 
 ### Construction Chain
 `Node::new()` → `ShardManager::new_full(data_dir, durability, column_cache)` → `CompositeEngine::new_with_mappings(..., column_cache)` → `HotEngine::new_with_mappings(..., column_cache)`.
@@ -260,6 +261,11 @@ Before building a full-segment array, `should_cache_full_segment_array(reader, m
 - If the estimate exceeds `cache_max / 4`, the segment is too large to cache and `build_selective_array()` reads only matching doc IDs directly into Arrow — no full-segment allocation.
 - The `ColumnCache::insert()` method has a secondary guard: arrays larger than 25% of capacity are silently dropped.
 - `build_full_segment_array()` for strings uses `StringBuilder::with_capacity(max_doc, 0)` — deferred string buffer allocation to avoid large upfront memory spikes.
+
+### Integration with grouped_partials
+- Match-all grouped-partials direct scans are the only grouped path that may populate new full-segment cache entries.
+- Grouped cache entries store typed numeric values or string ordinals for direct `doc_id` lookup by grouped readers.
+- Filtered grouped collectors may reuse warm grouped cache entries, but they must not populate new full-segment entries from partial scans.
 
 ### Integration with sql_record_batch
 When the fast path is eligible (`!needs_stored_doc && !columns.is_empty()`):

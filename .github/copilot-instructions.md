@@ -66,6 +66,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `merge_fruits()` merges per-segment data, returns `HashMap<String, PartialAggResult>` per shard
 - Per-shard partial results are serialized into the gRPC `partial_aggs_json` bytes field with `bincode-next`, then merged at coordinator via `merge_aggregations()`
 - O(matching_docs) with minimal memory; agg-only queries avoid hit materialization and still run in a single query execution pass
+- The shared `ColumnCache` now stores both `tantivy_fast_fields` Arrow arrays and grouped-partials decoded full-segment numeric/string-ordinal columns under one memory budget. Match-all grouped direct scans may populate these entries; filtered grouped collectors may reuse warm entries but must not populate from partial scans.
 - **Shard-level top-K pruning**: When ORDER BY + LIMIT are present on grouped partials, each shard keeps only `(offset + limit) * 3 + 10` buckets (sorted by the ORDER BY metric) before shipping to the coordinator. Uses `select_nth_unstable_by` (O(N) average) on flat-array ordinals BEFORE resolving strings, avoiding ord→string resolution for 99%+ of groups. `ShardTopK { limit, sort_by, sort_function, descending }` on `GroupedMetricsAggParams` carries the hint. This is approximate — the 3× multiplier makes missed global top-K groups extremely unlikely. Disabled when HAVING is present (pruned groups could satisfy HAVING only after cross-shard merge), when ORDER BY has multiple columns (secondary keys not evaluated during pruning), or when ORDER BY references a group column instead of a metric.
 - **StringArena**: Batch ordinal→string resolution uses a contiguous `Vec<u8>` arena instead of N individual heap-allocated Strings. Each resolved string is `(offset, len)` into the arena; only the final `serde_json::Value::String` conversion allocates per-group.
 - **Residual expression tree**: SELECT items wrapping or combining aggregates (ROUND, CAST, +, -, *, /) are pushed to grouped_partials via `ResidualExpr`. Inner aggregates become hidden metrics; the scalar expression is evaluated after cross-shard merge. Supports `ROUND(AVG(x), 2)`, `AVG(x) + AVG(y)`, `SUM(a) / COUNT(*)`, `MAX(x) - MIN(x)`, and arbitrary nesting.
@@ -104,7 +105,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1003 unit tests + 65 CLI tests + 33 consensus integration + 39 replication integration + 43 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1185 total
+- 1008 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 44 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1194 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`

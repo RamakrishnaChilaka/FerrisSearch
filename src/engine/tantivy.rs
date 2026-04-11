@@ -41,7 +41,8 @@ pub struct HotEngine {
     translog: Arc<Mutex<dyn WriteAheadLog>>,
     /// Highest committed translog seq_no, stored as the next seq_no after commit.
     committed_seq_no_path: PathBuf,
-    /// Shared column cache for fast-field Arrow arrays.
+    /// Shared column cache for fast-field Arrow arrays and grouped-partials
+    /// full-segment decoded columns.
     column_cache: Arc<super::column_cache::ColumnCache>,
 }
 
@@ -1427,6 +1428,14 @@ impl HotEngine {
                         s.spawn(move || {
                             let ff = segment_reader.fast_fields();
                             let max_doc = segment_reader.max_doc();
+                            let cache_ctx = GroupedCacheContext {
+                                column_cache: self.column_cache.as_ref(),
+                                segment_id: segment_reader.segment_id(),
+                                max_doc,
+                                // Direct full-segment scans are the natural place to
+                                // populate grouped-partials cache entries.
+                                allow_populate: true,
+                            };
 
                             let mut segment_results: Vec<(
                                 String,
@@ -1438,7 +1447,12 @@ impl HotEngine {
                                 let mut key_readers = Vec::with_capacity(spec.group_by.len());
                                 let mut unsupported = false;
                                 for field_name in &spec.group_by {
-                                    match open_group_key_reader(schema, ff, field_name) {
+                                    match open_group_key_reader(
+                                        schema,
+                                        ff,
+                                        field_name,
+                                        Some(cache_ctx),
+                                    ) {
                                         Some(reader) => key_readers.push(reader),
                                         None => {
                                             unsupported = true;
@@ -1481,6 +1495,7 @@ impl HotEngine {
                                                 ff,
                                                 metric.field_name.as_deref(),
                                                 metric.field_expr.as_ref(),
+                                                Some(cache_ctx),
                                             ) else {
                                                 unsupported = true;
                                                 break;
@@ -1713,6 +1728,8 @@ impl HotEngine {
 enum NumCol {
     F64(tantivy::columnar::Column<f64>),
     I64(tantivy::columnar::Column<i64>),
+    CachedF64(std::sync::Arc<[Option<f64>]>),
+    CachedI64(std::sync::Arc<[Option<i64>]>),
 }
 
 impl NumCol {
@@ -1721,6 +1738,12 @@ impl NumCol {
         match self {
             NumCol::F64(c) => c.first(doc),
             NumCol::I64(c) => c.first(doc).map(|v| v as f64),
+            NumCol::CachedF64(values) => values.get(doc as usize).copied().flatten(),
+            NumCol::CachedI64(values) => values
+                .get(doc as usize)
+                .copied()
+                .flatten()
+                .map(|v| v as f64),
         }
     }
 
@@ -1739,21 +1762,243 @@ impl NumCol {
                     output[i] = val.map(|v| v as f64);
                 }
             }
+            NumCol::CachedF64(values) => {
+                for (i, doc) in docs.iter().enumerate() {
+                    output[i] = values.get(*doc as usize).copied().flatten();
+                }
+            }
+            NumCol::CachedI64(values) => {
+                for (i, doc) in docs.iter().enumerate() {
+                    output[i] = values
+                        .get(*doc as usize)
+                        .copied()
+                        .flatten()
+                        .map(|value| value as f64);
+                }
+            }
         }
     }
+}
+
+const GROUPED_CACHE_BUILD_BATCH_SIZE: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct GroupedCacheContext<'a> {
+    column_cache: &'a super::column_cache::ColumnCache,
+    segment_id: tantivy::index::SegmentId,
+    max_doc: u32,
+    allow_populate: bool,
+}
+
+#[derive(Clone, Copy)]
+enum GroupedCacheKind {
+    F64,
+    I64,
+    StrOrds,
+}
+
+fn estimate_full_grouped_column_bytes(kind: GroupedCacheKind, max_doc: u32) -> u64 {
+    let doc_count = max_doc as u64;
+    match kind {
+        GroupedCacheKind::F64 => {
+            doc_count.saturating_mul(std::mem::size_of::<Option<f64>>() as u64)
+        }
+        GroupedCacheKind::I64 => {
+            doc_count.saturating_mul(std::mem::size_of::<Option<i64>>() as u64)
+        }
+        GroupedCacheKind::StrOrds => {
+            doc_count.saturating_mul(std::mem::size_of::<Option<u64>>() as u64)
+        }
+    }
+}
+
+fn should_cache_full_grouped_column(kind: GroupedCacheKind, max_doc: u32, cache_max: u64) -> bool {
+    cache_max > 0 && estimate_full_grouped_column_bytes(kind, max_doc) <= cache_max / 4
+}
+
+fn build_grouped_cached_f64_values(
+    col: &tantivy::columnar::Column<f64>,
+    max_doc: u32,
+) -> std::sync::Arc<[Option<f64>]> {
+    let mut values = vec![None; max_doc as usize];
+    let mut docs = Vec::with_capacity(GROUPED_CACHE_BUILD_BATCH_SIZE);
+    let mut start = 0u32;
+    while start < max_doc {
+        let end = (start + GROUPED_CACHE_BUILD_BATCH_SIZE as u32).min(max_doc);
+        docs.clear();
+        docs.extend(start..end);
+        col.first_vals(&docs, &mut values[start as usize..end as usize]);
+        start = end;
+    }
+    values.into()
+}
+
+fn build_grouped_cached_i64_values(
+    col: &tantivy::columnar::Column<i64>,
+    max_doc: u32,
+) -> std::sync::Arc<[Option<i64>]> {
+    let mut values = vec![None; max_doc as usize];
+    let mut docs = Vec::with_capacity(GROUPED_CACHE_BUILD_BATCH_SIZE);
+    let mut start = 0u32;
+    while start < max_doc {
+        let end = (start + GROUPED_CACHE_BUILD_BATCH_SIZE as u32).min(max_doc);
+        docs.clear();
+        docs.extend(start..end);
+        col.first_vals(&docs, &mut values[start as usize..end as usize]);
+        start = end;
+    }
+    values.into()
+}
+
+fn build_grouped_cached_string_ords(
+    reader: &StringFastFieldReader,
+    max_doc: u32,
+) -> std::sync::Arc<[Option<u64>]> {
+    let mut ords = vec![None; max_doc as usize];
+    let mut docs = Vec::with_capacity(GROUPED_CACHE_BUILD_BATCH_SIZE);
+    let mut start = 0u32;
+    while start < max_doc {
+        let end = (start + GROUPED_CACHE_BUILD_BATCH_SIZE as u32).min(max_doc);
+        docs.clear();
+        docs.extend(start..end);
+        reader.first_ords_batch(&docs, &mut ords[start as usize..end as usize]);
+        start = end;
+    }
+    ords.into()
+}
+
+fn get_or_build_cached_grouped_f64(
+    cache_ctx: Option<GroupedCacheContext<'_>>,
+    column_name: &str,
+    col: &tantivy::columnar::Column<f64>,
+) -> Option<std::sync::Arc<[Option<f64>]>> {
+    let cache_ctx = cache_ctx?;
+    if let Some(super::column_cache::GroupedColumnCache::F64(values)) = cache_ctx
+        .column_cache
+        .get_grouped(cache_ctx.segment_id, column_name)
+    {
+        return Some(values);
+    }
+    if !cache_ctx.allow_populate {
+        return None;
+    }
+    let cache_max = cache_ctx.column_cache.max_capacity();
+    if !should_cache_full_grouped_column(GroupedCacheKind::F64, cache_ctx.max_doc, cache_max)
+        || !cache_ctx
+            .column_cache
+            .should_populate(cache_ctx.max_doc as usize, cache_ctx.max_doc)
+    {
+        return None;
+    }
+
+    let values = build_grouped_cached_f64_values(col, cache_ctx.max_doc);
+    cache_ctx.column_cache.insert_grouped(
+        cache_ctx.segment_id,
+        column_name,
+        super::column_cache::GroupedColumnCache::F64(values.clone()),
+    );
+    Some(values)
+}
+
+fn get_or_build_cached_grouped_i64(
+    cache_ctx: Option<GroupedCacheContext<'_>>,
+    column_name: &str,
+    col: &tantivy::columnar::Column<i64>,
+) -> Option<std::sync::Arc<[Option<i64>]>> {
+    let cache_ctx = cache_ctx?;
+    if let Some(super::column_cache::GroupedColumnCache::I64(values)) = cache_ctx
+        .column_cache
+        .get_grouped(cache_ctx.segment_id, column_name)
+    {
+        return Some(values);
+    }
+    if !cache_ctx.allow_populate {
+        return None;
+    }
+    let cache_max = cache_ctx.column_cache.max_capacity();
+    if !should_cache_full_grouped_column(GroupedCacheKind::I64, cache_ctx.max_doc, cache_max)
+        || !cache_ctx
+            .column_cache
+            .should_populate(cache_ctx.max_doc as usize, cache_ctx.max_doc)
+    {
+        return None;
+    }
+
+    let values = build_grouped_cached_i64_values(col, cache_ctx.max_doc);
+    cache_ctx.column_cache.insert_grouped(
+        cache_ctx.segment_id,
+        column_name,
+        super::column_cache::GroupedColumnCache::I64(values.clone()),
+    );
+    Some(values)
+}
+
+fn get_or_build_cached_grouped_string_ords(
+    cache_ctx: Option<GroupedCacheContext<'_>>,
+    column_name: &str,
+    reader: &StringFastFieldReader,
+) -> Option<std::sync::Arc<[Option<u64>]>> {
+    let cache_ctx = cache_ctx?;
+    if let Some(super::column_cache::GroupedColumnCache::StrOrds(values)) = cache_ctx
+        .column_cache
+        .get_grouped(cache_ctx.segment_id, column_name)
+    {
+        return Some(values);
+    }
+    if !cache_ctx.allow_populate {
+        return None;
+    }
+    let cache_max = cache_ctx.column_cache.max_capacity();
+    if !should_cache_full_grouped_column(GroupedCacheKind::StrOrds, cache_ctx.max_doc, cache_max)
+        || !cache_ctx
+            .column_cache
+            .should_populate(cache_ctx.max_doc as usize, cache_ctx.max_doc)
+    {
+        return None;
+    }
+
+    let values = build_grouped_cached_string_ords(reader, cache_ctx.max_doc);
+    cache_ctx.column_cache.insert_grouped(
+        cache_ctx.segment_id,
+        column_name,
+        super::column_cache::GroupedColumnCache::StrOrds(values.clone()),
+    );
+    Some(values)
 }
 
 fn open_num_col(
     schema: &Schema,
     fast_fields: &tantivy::fastfield::FastFieldReaders,
     field_name: &str,
+    cache_ctx: Option<GroupedCacheContext<'_>>,
 ) -> Option<NumCol> {
     let field = schema.get_field(field_name).ok()?;
     let entry = schema.get_field_entry(field);
     match entry.field_type() {
-        tantivy::schema::FieldType::F64(_) => fast_fields.f64(entry.name()).ok().map(NumCol::F64),
-        tantivy::schema::FieldType::I64(_) => fast_fields.i64(entry.name()).ok().map(NumCol::I64),
-        tantivy::schema::FieldType::U64(_) => fast_fields.i64(entry.name()).ok().map(NumCol::I64),
+        tantivy::schema::FieldType::F64(_) => {
+            let col = fast_fields.f64(entry.name()).ok()?;
+            if let Some(values) = get_or_build_cached_grouped_f64(cache_ctx, entry.name(), &col) {
+                Some(NumCol::CachedF64(values))
+            } else {
+                Some(NumCol::F64(col))
+            }
+        }
+        tantivy::schema::FieldType::I64(_) => {
+            let col = fast_fields.i64(entry.name()).ok()?;
+            if let Some(values) = get_or_build_cached_grouped_i64(cache_ctx, entry.name(), &col) {
+                Some(NumCol::CachedI64(values))
+            } else {
+                Some(NumCol::I64(col))
+            }
+        }
+        tantivy::schema::FieldType::U64(_) => {
+            let col = fast_fields.i64(entry.name()).ok()?;
+            if let Some(values) = get_or_build_cached_grouped_i64(cache_ctx, entry.name(), &col) {
+                Some(NumCol::CachedI64(values))
+            } else {
+                Some(NumCol::I64(col))
+            }
+        }
         _ => None,
     }
 }
@@ -1763,12 +2008,13 @@ fn build_grouped_metric_plan(
     fast_fields: &tantivy::fastfield::FastFieldReaders,
     field_name: Option<&str>,
     field_expr: Option<&crate::search::MetricFieldExpr>,
+    cache_ctx: Option<GroupedCacheContext<'_>>,
 ) -> Option<GroupedMetricExprPlan> {
     let expr = match (field_name, field_expr) {
         (_, Some(expr)) => expr,
         (Some(field_name), None) => {
             return Some(GroupedMetricExprPlan {
-                leaves: vec![open_num_col(schema, fast_fields, field_name)?],
+                leaves: vec![open_num_col(schema, fast_fields, field_name, cache_ctx)?],
                 expr: MetricEvalExpr::Leaf(0),
             });
         }
@@ -1776,7 +2022,7 @@ fn build_grouped_metric_plan(
     };
 
     let mut leaves = Vec::new();
-    let compiled = compile_grouped_metric_expr(schema, fast_fields, expr, &mut leaves)?;
+    let compiled = compile_grouped_metric_expr(schema, fast_fields, expr, &mut leaves, cache_ctx)?;
     Some(GroupedMetricExprPlan {
         leaves,
         expr: compiled,
@@ -1788,16 +2034,17 @@ fn compile_grouped_metric_expr(
     fast_fields: &tantivy::fastfield::FastFieldReaders,
     expr: &crate::search::MetricFieldExpr,
     leaves: &mut Vec<NumCol>,
+    cache_ctx: Option<GroupedCacheContext<'_>>,
 ) -> Option<MetricEvalExpr> {
     match expr {
         crate::search::MetricFieldExpr::Field { name } => {
             let index = leaves.len();
-            leaves.push(open_num_col(schema, fast_fields, name)?);
+            leaves.push(open_num_col(schema, fast_fields, name, cache_ctx)?);
             Some(MetricEvalExpr::Leaf(index))
         }
         crate::search::MetricFieldExpr::Binary { left, op, right } => {
-            let left = compile_grouped_metric_expr(schema, fast_fields, left, leaves)?;
-            let right = compile_grouped_metric_expr(schema, fast_fields, right, leaves)?;
+            let left = compile_grouped_metric_expr(schema, fast_fields, left, leaves, cache_ctx)?;
+            let right = compile_grouped_metric_expr(schema, fast_fields, right, leaves, cache_ctx)?;
             Some(MetricEvalExpr::Binary {
                 left: Box::new(left),
                 op: *op,
@@ -1886,23 +2133,43 @@ fn pair_null_bucket_capacity(approx_groups: usize) -> usize {
 struct StringFastFieldReader {
     str_col: tantivy::columnar::StrColumn,
     ord_col: tantivy::columnar::Column<u64>,
+    cached_ords: Option<std::sync::Arc<[Option<u64>]>>,
 }
 
 impl StringFastFieldReader {
     fn open(fast_fields: &tantivy::fastfield::FastFieldReaders, field_name: &str) -> Option<Self> {
         let str_col = fast_fields.str(field_name).ok().flatten()?;
         let ord_col = str_col.ords().clone();
-        Some(Self { str_col, ord_col })
+        Some(Self {
+            str_col,
+            ord_col,
+            cached_ords: None,
+        })
+    }
+
+    fn with_cached_ords(mut self, cached_ords: std::sync::Arc<[Option<u64>]>) -> Self {
+        self.cached_ords = Some(cached_ords);
+        self
     }
 
     #[inline]
     fn first_ord(&self, doc: tantivy::DocId) -> Option<u64> {
-        self.ord_col.first(doc)
+        if let Some(cached) = &self.cached_ords {
+            cached.get(doc as usize).copied().flatten()
+        } else {
+            self.ord_col.first(doc)
+        }
     }
 
     #[inline]
     fn first_ords_batch(&self, docs: &[tantivy::DocId], output: &mut [Option<u64>]) {
-        self.ord_col.first_vals(docs, output);
+        if let Some(cached) = &self.cached_ords {
+            for (index, doc) in docs.iter().enumerate() {
+                output[index] = cached.get(*doc as usize).copied().flatten();
+            }
+        } else {
+            self.ord_col.first_vals(docs, output);
+        }
     }
 
     #[inline]
@@ -2281,9 +2548,17 @@ fn open_group_key_reader(
     schema: &Schema,
     fast_fields: &tantivy::fastfield::FastFieldReaders,
     field_name: &str,
+    cache_ctx: Option<GroupedCacheContext<'_>>,
 ) -> Option<GroupKeyReader> {
     if let Some(spec) = crate::search::decode_derived_group_key(field_name) {
         let base = StringFastFieldReader::open(fast_fields, &spec.source_field)?;
+        let base = if let Some(cached_ords) =
+            get_or_build_cached_grouped_string_ords(cache_ctx, &spec.source_field, &base)
+        {
+            base.with_cached_ords(cached_ords)
+        } else {
+            base
+        };
         return Some(GroupKeyReader::DerivedStr(DerivedStringBucketReader::new(
             base, spec,
         )));
@@ -2293,13 +2568,31 @@ fn open_group_key_reader(
     let entry = schema.get_field_entry(field);
     match entry.field_type() {
         tantivy::schema::FieldType::F64(_) => {
-            fast_fields.f64(entry.name()).ok().map(GroupKeyReader::F64)
+            let col = fast_fields.f64(entry.name()).ok()?;
+            if let Some(values) = get_or_build_cached_grouped_f64(cache_ctx, entry.name(), &col) {
+                Some(GroupKeyReader::CachedF64(values))
+            } else {
+                Some(GroupKeyReader::F64(col))
+            }
         }
         tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::U64(_) => {
-            fast_fields.i64(entry.name()).ok().map(GroupKeyReader::I64)
+            let col = fast_fields.i64(entry.name()).ok()?;
+            if let Some(values) = get_or_build_cached_grouped_i64(cache_ctx, entry.name(), &col) {
+                Some(GroupKeyReader::CachedI64(values))
+            } else {
+                Some(GroupKeyReader::I64(col))
+            }
         }
         tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::Bytes(_) => {
-            StringFastFieldReader::open(fast_fields, entry.name()).map(GroupKeyReader::Str)
+            let reader = StringFastFieldReader::open(fast_fields, entry.name())?;
+            let reader = if let Some(cached_ords) =
+                get_or_build_cached_grouped_string_ords(cache_ctx, entry.name(), &reader)
+            {
+                reader.with_cached_ords(cached_ords)
+            } else {
+                reader
+            };
+            Some(GroupKeyReader::Str(reader))
         }
         _ => None,
     }
@@ -2458,7 +2751,9 @@ enum GroupKeyReader {
     Str(StringFastFieldReader),
     DerivedStr(DerivedStringBucketReader),
     I64(tantivy::columnar::Column<i64>),
+    CachedI64(std::sync::Arc<[Option<i64>]>),
     F64(tantivy::columnar::Column<f64>),
+    CachedF64(std::sync::Arc<[Option<f64>]>),
 }
 
 impl GroupKeyReader {
@@ -2481,11 +2776,29 @@ impl GroupKeyReader {
                     output[i] = val.map(|v| v as u64);
                 }
             }
+            GroupKeyReader::CachedI64(values) => {
+                for (i, doc) in docs.iter().enumerate() {
+                    output[i] = values
+                        .get(*doc as usize)
+                        .copied()
+                        .flatten()
+                        .map(|v| v as u64);
+                }
+            }
             GroupKeyReader::F64(reader) => {
                 let mut f64_buf: Vec<Option<f64>> = vec![None; docs.len()];
                 reader.first_vals(docs, &mut f64_buf);
                 for (i, val) in f64_buf.iter().enumerate() {
                     output[i] = val.map(|v| v.to_bits());
+                }
+            }
+            GroupKeyReader::CachedF64(values) => {
+                for (i, doc) in docs.iter().enumerate() {
+                    output[i] = values
+                        .get(*doc as usize)
+                        .copied()
+                        .flatten()
+                        .map(|v| v.to_bits());
                 }
             }
         }
@@ -2516,7 +2829,9 @@ impl GroupKeyReader {
             }
             GroupKeyReader::DerivedStr(reader) => reader.resolve(key),
             GroupKeyReader::I64(_) => serde_json::Value::from(key as i64),
+            GroupKeyReader::CachedI64(_) => serde_json::Value::from(key as i64),
             GroupKeyReader::F64(_) => serde_json::Value::from(f64::from_bits(key)),
+            GroupKeyReader::CachedF64(_) => serde_json::Value::from(f64::from_bits(key)),
         }
     }
 }
@@ -2594,6 +2909,7 @@ pub(crate) struct GroupedAggCollector {
     specs: Vec<ResolvedGroupedAggSpec>,
     schema: Schema,
     shard_top_k: Option<crate::search::ShardTopK>,
+    column_cache: std::sync::Arc<super::column_cache::ColumnCache>,
 }
 
 pub(crate) struct GroupedAggSegmentCollector {
@@ -2621,6 +2937,7 @@ impl GroupedAggCollector {
     fn from_request(
         aggs: &std::collections::HashMap<String, crate::search::AggregationRequest>,
         schema: Schema,
+        column_cache: std::sync::Arc<super::column_cache::ColumnCache>,
     ) -> Self {
         let specs = aggs
             .iter()
@@ -2652,6 +2969,7 @@ impl GroupedAggCollector {
             specs,
             schema,
             shard_top_k,
+            column_cache,
         }
     }
 }
@@ -2666,6 +2984,14 @@ impl tantivy::collector::Collector for GroupedAggCollector {
         segment: &tantivy::SegmentReader,
     ) -> tantivy::Result<Self::Child> {
         let ff = segment.fast_fields();
+        let cache_ctx = GroupedCacheContext {
+            column_cache: self.column_cache.as_ref(),
+            segment_id: segment.segment_id(),
+            max_doc: segment.max_doc(),
+            // Filtered grouped queries reuse cache entries if already warm, but
+            // do not populate fresh full-segment cache entries from partial scans.
+            allow_populate: false,
+        };
         let mut entries = Vec::with_capacity(self.specs.len());
 
         for spec in &self.specs {
@@ -2673,7 +2999,7 @@ impl tantivy::collector::Collector for GroupedAggCollector {
             let mut key_readers = Vec::with_capacity(spec.group_by.len());
             let mut unsupported_group = false;
             for field_name in &spec.group_by {
-                match open_group_key_reader(&self.schema, ff, field_name) {
+                match open_group_key_reader(&self.schema, ff, field_name, Some(cache_ctx)) {
                     Some(reader) => key_readers.push(reader),
                     None => {
                         unsupported_group = true;
@@ -2711,6 +3037,7 @@ impl tantivy::collector::Collector for GroupedAggCollector {
                             ff,
                             metric.field_name.as_deref(),
                             metric.field_expr.as_ref(),
+                            Some(cache_ctx),
                         ) else {
                             unsupported = true;
                             break;
@@ -4020,18 +4347,20 @@ impl tantivy::collector::Collector for AggCollector {
                 | AggKind::Max
                 | AggKind::Avg
                 | AggKind::Sum
-                | AggKind::ValueCount => match open_num_col(&self.schema, ff, &spec.field_name) {
-                    Some(col) => SegmentAggEntry::NumericStats {
-                        column: col,
-                        count: 0,
-                        sum: 0.0,
-                        min: f64::INFINITY,
-                        max: f64::NEG_INFINITY,
-                    },
-                    None => SegmentAggEntry::Skip,
-                },
+                | AggKind::ValueCount => {
+                    match open_num_col(&self.schema, ff, &spec.field_name, None) {
+                        Some(col) => SegmentAggEntry::NumericStats {
+                            column: col,
+                            count: 0,
+                            sum: 0.0,
+                            min: f64::INFINITY,
+                            max: f64::NEG_INFINITY,
+                        },
+                        None => SegmentAggEntry::Skip,
+                    }
+                }
                 AggKind::Histogram { interval } => {
-                    match open_num_col(&self.schema, ff, &spec.field_name) {
+                    match open_num_col(&self.schema, ff, &spec.field_name, None) {
                         Some(col) => SegmentAggEntry::Histogram {
                             column: col,
                             interval: *interval,
@@ -4046,7 +4375,9 @@ impl tantivy::collector::Collector for AggCollector {
                             column: str_col,
                             counts: std::collections::HashMap::new(),
                         }
-                    } else if let Some(num_col) = open_num_col(&self.schema, ff, &spec.field_name) {
+                    } else if let Some(num_col) =
+                        open_num_col(&self.schema, ff, &spec.field_name, None)
+                    {
                         SegmentAggEntry::TermsNum {
                             column: num_col,
                             counts: std::collections::HashMap::new(),
@@ -4487,8 +4818,11 @@ impl super::SearchEngine for HotEngine {
                 return Ok((Vec::new(), total, partial_aggs));
             }
 
-            let grouped_collector =
-                GroupedAggCollector::from_request(&req.aggs, self.index.schema());
+            let grouped_collector = GroupedAggCollector::from_request(
+                &req.aggs,
+                self.index.schema(),
+                self.column_cache.clone(),
+            );
 
             if req.size == 0 {
                 let (partial_aggs, total) =
@@ -6920,8 +7254,9 @@ mod tests {
 
     // ── Field mappings tests ────────────────────────────────────────────
 
-    fn create_engine_with_mappings(
+    fn create_engine_with_mappings_and_cache(
         mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+        column_cache: std::sync::Arc<crate::engine::column_cache::ColumnCache>,
     ) -> (tempfile::TempDir, HotEngine) {
         let dir = tempfile::tempdir().unwrap();
         let engine = HotEngine::new_with_mappings(
@@ -6929,10 +7264,19 @@ mod tests {
             Duration::from_secs(60),
             &mappings,
             TranslogDurability::Request,
-            std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0)),
+            column_cache,
         )
         .unwrap();
         (dir, engine)
+    }
+
+    fn create_engine_with_mappings(
+        mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> (tempfile::TempDir, HotEngine) {
+        create_engine_with_mappings_and_cache(
+            mappings,
+            std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0)),
+        )
     }
 
     #[test]
@@ -9282,6 +9626,16 @@ mod tests {
     /// Helper: create an engine with brand (keyword), price (float), quantity (integer)
     /// mappings and insert `n` documents spread across two brands.
     fn create_grouped_numeric_engine(n: usize) -> (tempfile::TempDir, HotEngine) {
+        create_grouped_numeric_engine_with_cache(
+            n,
+            std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0)),
+        )
+    }
+
+    fn create_grouped_numeric_engine_with_cache(
+        n: usize,
+        column_cache: std::sync::Arc<crate::engine::column_cache::ColumnCache>,
+    ) -> (tempfile::TempDir, HotEngine) {
         use crate::cluster::state::{FieldMapping, FieldType};
         let mut mappings = HashMap::new();
         mappings.insert(
@@ -9305,7 +9659,7 @@ mod tests {
                 dimension: None,
             },
         );
-        let (_dir, engine) = create_engine_with_mappings(mappings);
+        let (_dir, engine) = create_engine_with_mappings_and_cache(mappings, column_cache);
         for i in 0..n {
             let brand = if i % 2 == 0 { "Apple" } else { "Samsung" };
             let price = 100.0 + i as f64;
@@ -9440,6 +9794,128 @@ mod tests {
                 expected_sum
             );
         }
+    }
+
+    #[test]
+    fn grouped_match_all_direct_scan_populates_grouped_cache() {
+        use crate::search::{GroupedMetricAgg, GroupedMetricFunction, PartialAggResult};
+
+        let cache = std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(
+            1024 * 1024,
+            0,
+        ));
+        let (_dir, engine) = create_grouped_numeric_engine_with_cache(4097, cache);
+
+        let req = grouped_numeric_request(
+            4097,
+            vec![GroupedMetricAgg {
+                output_name: "avg_price".into(),
+                function: GroupedMetricFunction::Avg,
+                field: Some("price".into()),
+                field_expr: None,
+            }],
+        );
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 4097);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics partial");
+        };
+        assert_eq!(buckets.len(), 2);
+
+        let searcher = engine.reader.searcher();
+        let segments = searcher.segment_readers();
+        assert!(!segments.is_empty());
+        for segment in segments {
+            let segment_id = segment.segment_id();
+            assert!(matches!(
+                engine.column_cache.get_grouped(segment_id, "brand"),
+                Some(crate::engine::column_cache::GroupedColumnCache::StrOrds(_))
+            ));
+            assert!(matches!(
+                engine.column_cache.get_grouped(segment_id, "price"),
+                Some(crate::engine::column_cache::GroupedColumnCache::F64(_))
+            ));
+        }
+        assert_eq!(
+            engine.column_cache.entry_count(),
+            searcher.segment_readers().len() as u64 * 2
+        );
+    }
+
+    #[test]
+    fn grouped_readers_only_reuse_warm_cache_entries() {
+        use crate::search::GroupedMetricAgg;
+        use crate::search::GroupedMetricFunction;
+
+        let cache = std::sync::Arc::new(crate::engine::column_cache::ColumnCache::new(
+            1024 * 1024,
+            0,
+        ));
+        let (_dir, engine) = create_grouped_numeric_engine_with_cache(64, cache);
+        let schema = engine.index.schema();
+
+        {
+            let searcher = engine.reader.searcher();
+            let segments = searcher.segment_readers();
+            assert!(!segments.is_empty());
+            let segment = &segments[0];
+            let ff = segment.fast_fields();
+            let cache_ctx = GroupedCacheContext {
+                column_cache: engine.column_cache.as_ref(),
+                segment_id: segment.segment_id(),
+                max_doc: segment.max_doc(),
+                allow_populate: false,
+            };
+
+            match open_group_key_reader(&schema, ff, "brand", Some(cache_ctx)).unwrap() {
+                GroupKeyReader::Str(reader) => assert!(reader.cached_ords.is_none()),
+                _ => panic!("expected uncached string group key reader"),
+            }
+
+            let cold_plan =
+                build_grouped_metric_plan(&schema, ff, Some("price"), None, Some(cache_ctx))
+                    .unwrap();
+            assert!(matches!(cold_plan.leaves.as_slice(), [NumCol::F64(_)]));
+            assert_eq!(engine.column_cache.entry_count(), 0);
+        }
+
+        let warm_req = grouped_numeric_request(
+            64,
+            vec![GroupedMetricAgg {
+                output_name: "avg_price".into(),
+                function: GroupedMetricFunction::Avg,
+                field: Some("price".into()),
+                field_expr: None,
+            }],
+        );
+        engine.search_query(&warm_req).unwrap();
+
+        let searcher = engine.reader.searcher();
+        let segments = searcher.segment_readers();
+        assert!(!segments.is_empty());
+        let segment = &segments[0];
+        let ff = segment.fast_fields();
+        let cache_ctx = GroupedCacheContext {
+            column_cache: engine.column_cache.as_ref(),
+            segment_id: segment.segment_id(),
+            max_doc: segment.max_doc(),
+            allow_populate: false,
+        };
+
+        match open_group_key_reader(&schema, ff, "brand", Some(cache_ctx)).unwrap() {
+            GroupKeyReader::Str(reader) => assert!(reader.cached_ords.is_some()),
+            _ => panic!("expected warm cached string group key reader"),
+        }
+
+        let warm_plan =
+            build_grouped_metric_plan(&schema, ff, Some("price"), None, Some(cache_ctx)).unwrap();
+        assert!(matches!(
+            warm_plan.leaves.as_slice(),
+            [NumCol::CachedF64(_)]
+        ));
+        assert_eq!(engine.column_cache.entry_count(), segments.len() as u64 * 2);
     }
 
     #[test]

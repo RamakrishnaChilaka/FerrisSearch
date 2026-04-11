@@ -41,6 +41,11 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - SQL queries with only aggregate functions (no GROUP BY) now use the `tantivy_grouped_partials` execution path with zero group-by columns.
 - Aggregate arguments on the grouped-partials path may be nested per-doc arithmetic trees over numeric fast fields, not just a single `a op b` pair. Shapes like `SUM(a + b)`, `AVG(a / b)`, and `AVG((a - b) / a)` should stay on `tantivy_grouped_partials` when every leaf is a fast-field-backed numeric source column.
 
+## Grouped Column Cache
+- The shared `ColumnCache` now serves both `tantivy_fast_fields` Arrow arrays and grouped-partials decoded full-segment columns under the same memory budget.
+- Match-all grouped-partials direct scans may populate grouped cache entries for numeric metric leaves and string group-key ordinals.
+- Filtered grouped collectors may reuse warm grouped cache entries, but they must not populate new full-segment cache entries from partial scans.
+
 ## Residual Expression Tree (ResidualExpr)
 - SELECT items that wrap or combine aggregates (e.g. `ROUND(AVG(x), 2)`, `AVG(x) + AVG(y)`, `SUM(a) / COUNT(*)`) are pushed down to `tantivy_grouped_partials` by extracting each inner aggregate as a hidden metric and building a `ResidualExpr` tree for post-merge evaluation.
 - `ResidualExpr` variants: `MetricRef(name)`, `Literal(f64)`, `Round(expr, precision)`, `CastFloat(expr)`, `CastInt(expr)`, `BinaryOp(left, op, right)`, `Negate(expr)`.
