@@ -53,6 +53,14 @@ dave rust 150.0
 dave startup 50.0
 eve culture 800.0
 
+# Multi-column ORDER BY metric + LIMIT should stay exact on the grouped partials path.
+query TTIR nosort
+SELECT author, category, count(*) AS cnt, avg(comments) AS avg_disc FROM stories GROUP BY author, category ORDER BY avg_disc DESC LIMIT 3
+----
+eve culture 1 600.0
+carol ml 2 290.0
+bob python 2 175.0
+
 # ── GROUP BY with ORDER BY ───────────────────────────────────────────
 
 query TI nosort

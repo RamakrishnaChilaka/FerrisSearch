@@ -121,6 +121,17 @@ struct SqlStreamAccumulator {
     rows: Vec<Value>,
 }
 
+#[derive(Debug, PartialEq)]
+struct GroupedMergeBreakdown {
+    partial_merge_ms: f64,
+    having_ms: f64,
+    top_k_ms: f64,
+    row_build_ms: f64,
+    merged_buckets: u64,
+    post_having_buckets: u64,
+    output_buckets: u64,
+}
+
 impl SqlStreamAccumulator {
     fn push_frame(&mut self, mut frame: Value) -> Result<()> {
         let Some(frame_type) = frame.get("type").and_then(|value| value.as_str()) else {
@@ -554,6 +565,19 @@ fn truncation_hits_phrase(body: &Value) -> &'static str {
     }
 }
 
+fn grouped_merge_breakdown(body: &Value) -> Option<GroupedMergeBreakdown> {
+    let grouped = body.get("timings")?.get("grouped_merge")?;
+    Some(GroupedMergeBreakdown {
+        partial_merge_ms: grouped.get("partial_merge_ms")?.as_f64()?,
+        having_ms: grouped.get("having_ms")?.as_f64()?,
+        top_k_ms: grouped.get("top_k_ms")?.as_f64()?,
+        row_build_ms: grouped.get("row_build_ms")?.as_f64()?,
+        merged_buckets: grouped.get("merged_buckets")?.as_u64()?,
+        post_having_buckets: grouped.get("post_having_buckets")?.as_u64()?,
+        output_buckets: grouped.get("output_buckets")?.as_u64()?,
+    })
+}
+
 fn render_metadata(body: &Value, client_ms: f64) {
     let mut parts = Vec::new();
 
@@ -614,6 +638,20 @@ fn render_metadata(body: &Value, client_ms: f64) {
     println!();
     println!(" {}", parts.join(" | ").dimmed());
 
+    if let Some(grouped_merge) = grouped_merge_breakdown(body) {
+        println!(
+            " {} partial {} | having {} | top-k {} | rows {} | buckets {} -> {} -> {}",
+            "grouped merge:".dimmed(),
+            format!("{:.1}ms", grouped_merge.partial_merge_ms).bright_cyan(),
+            format!("{:.1}ms", grouped_merge.having_ms).bright_cyan(),
+            format!("{:.1}ms", grouped_merge.top_k_ms).bright_cyan(),
+            format!("{:.1}ms", grouped_merge.row_build_ms).bright_cyan(),
+            format_number(grouped_merge.merged_buckets).bright_white(),
+            format_number(grouped_merge.post_having_buckets).bright_white(),
+            format_number(grouped_merge.output_buckets).bright_white(),
+        );
+    }
+
     // Truncation warning — results may be incomplete
     if body.get("truncated").and_then(|v| v.as_bool()) == Some(true)
         && let Some(hits) = body.get("matched_hits").and_then(|v| v.as_u64())
@@ -673,6 +711,7 @@ fn render_explain(body: &Value, client_ms: f64) {
 
         let stages = [
             ("planning_ms", "Planning", "░"),
+            ("semijoin_ms", "Semijoin", "░"),
             ("search_ms", "Search", "█"),
             ("collect_ms", "Collect", "▓"),
             ("merge_ms", "Merge", "▒"),
@@ -699,6 +738,28 @@ fn render_explain(body: &Value, client_ms: f64) {
             "Total".bright_white().bold(),
             total_ms
         );
+
+        if let Some(grouped_merge) = grouped_merge_breakdown(body) {
+            println!();
+            println!(" {}", "Grouped Merge:".bright_white().bold());
+            println!(
+                "   {:<12} {:>7.1}ms",
+                "Partials", grouped_merge.partial_merge_ms
+            );
+            println!("   {:<12} {:>7.1}ms", "HAVING", grouped_merge.having_ms);
+            println!("   {:<12} {:>7.1}ms", "Top-K", grouped_merge.top_k_ms);
+            println!(
+                "   {:<12} {:>7.1}ms",
+                "Row Build", grouped_merge.row_build_ms
+            );
+            println!(
+                "   {:<12} {} -> {} -> {}",
+                "Buckets",
+                format_number(grouped_merge.merged_buckets),
+                format_number(grouped_merge.post_having_buckets),
+                format_number(grouped_merge.output_buckets)
+            );
+        }
     }
 
     // Pipeline stages
@@ -1772,6 +1833,23 @@ mod tests {
                 "execution_mode": "tantivy_fast_fields",
                 "columns": ["brand"],
                 "streaming_used": true,
+                "timings": {
+                    "planning_ms": 0.2,
+                    "search_ms": 0.4,
+                    "collect_ms": 0.0,
+                    "merge_ms": 0.9,
+                    "datafusion_ms": 0.0,
+                    "total_ms": 1.5,
+                    "grouped_merge": {
+                        "partial_merge_ms": 0.3,
+                        "having_ms": 0.1,
+                        "top_k_ms": 0.2,
+                        "row_build_ms": 0.3,
+                        "merged_buckets": 4,
+                        "post_having_buckets": 3,
+                        "output_buckets": 2
+                    }
+                }
             }))
             .unwrap();
         stream
@@ -1791,6 +1869,10 @@ mod tests {
         assert_eq!(
             body["execution_mode"],
             serde_json::json!("tantivy_fast_fields")
+        );
+        assert_eq!(
+            body["timings"]["grouped_merge"]["merged_buckets"],
+            serde_json::json!(4)
         );
         assert_eq!(
             body["rows"],
@@ -1867,5 +1949,35 @@ mod tests {
         assert_eq!(metadata_hits_label(&body), "matched");
         assert_eq!(explain_hits_label(&body), "Matched Docs:");
         assert_eq!(truncation_hits_phrase(&body), "query matched");
+    }
+
+    #[test]
+    fn grouped_merge_breakdown_reads_nested_timings() {
+        let body = serde_json::json!({
+            "timings": {
+                "grouped_merge": {
+                    "partial_merge_ms": 1.2,
+                    "having_ms": 0.4,
+                    "top_k_ms": 0.3,
+                    "row_build_ms": 0.6,
+                    "merged_buckets": 120,
+                    "post_having_buckets": 48,
+                    "output_buckets": 10
+                }
+            }
+        });
+
+        assert_eq!(
+            grouped_merge_breakdown(&body),
+            Some(GroupedMergeBreakdown {
+                partial_merge_ms: 1.2,
+                having_ms: 0.4,
+                top_k_ms: 0.3,
+                row_build_ms: 0.6,
+                merged_buckets: 120,
+                post_having_buckets: 48,
+                output_buckets: 10,
+            })
+        );
     }
 }

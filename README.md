@@ -77,8 +77,9 @@ Every SQL response tells you how the planner executed the query:
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) with hybrid text + vector querying
 - **Generation-based WAL** — durable writes, replica catch-up, and background auto-flush
 - **Stable restarts** — covered by a real three-node flush + restart regression
-- **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, and planner metadata in SQL responses
-- **Test depth** — 1170 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
+- **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
+- **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
+- **Test depth** — 1184 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, and distributed `_cat/segments` coverage
 
 ## Tech Stack
 
@@ -154,7 +155,7 @@ cargo build --release --bin ferris-cli
 ./target/release/ferris-cli -c "SELECT count(*) FROM \"hackernews\""
 ```
 
-`ferris-cli` reads the global `POST /_sql/stream` endpoint, reconstructs normal table output from streamed NDJSON frames, and follows the same quoted-index and case-insensitive source-column rules as the REST API.
+`ferris-cli` reads the global `POST /_sql/stream` endpoint, reconstructs normal table output from streamed NDJSON frames, follows the same quoted-index and case-insensitive source-column rules as the REST API, and surfaces grouped-partials coordinator timings when the streamed `meta` frame carries `timings.grouped_merge`.
 
 ### Configuration
 
@@ -533,15 +534,15 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1158 tests
-cargo test --lib                                # Unit tests (978)
-cargo test --bin ferris-cli                      # CLI tests (64)
+cargo test                                      # All 1184 tests
+cargo test --lib                                # Unit tests (1002)
+cargo test --bin ferris-cli                      # CLI tests (65)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (42)
+cargo test --test rest_api_integration           # REST API (43)
 cargo test --test restart_regression             # Real 3-node flush + restart regression (1)
-cargo test --test sql_correctness                # SQL correctness (1 test, 175 sqllogictest assertions)
+cargo test --test sql_correctness                # SQL correctness (1 test, 180 sqllogictest assertions)
 ```
 
 Most integration tests run in-process with isolated temp directories. The `restart_regression` suite goes further: it spawns real `ferrissearch` processes, creates a 3-node Raft cluster, indexes data, flushes, restarts every node, and verifies both document count and UUID-backed shard directories.

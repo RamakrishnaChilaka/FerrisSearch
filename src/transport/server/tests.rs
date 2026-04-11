@@ -522,6 +522,76 @@ async fn get_or_open_shard_returns_not_found_for_unknown_shard() {
 }
 
 #[tokio::test]
+async fn ping_rejects_unregistered_source_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ClusterManager::new("ping-test".into()));
+    manager.add_node(DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9300,
+        http_port: 9200,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 1,
+    });
+    let service = TransportService {
+        cluster_manager: manager,
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+        transport_client: crate::transport::TransportClient::new(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+
+    let err = service
+        .ping(Request::new(PingRequest {
+            source_node_id: "node-2".into(),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    assert!(err.message().contains("not registered"));
+}
+
+#[tokio::test]
+async fn ping_updates_last_seen_for_registered_source_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ClusterManager::new("ping-test".into()));
+    manager.add_node(DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9300,
+        http_port: 9200,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 1,
+    });
+    let service = TransportService {
+        cluster_manager: Arc::clone(&manager),
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+        transport_client: crate::transport::TransportClient::new(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+
+    service
+        .ping(Request::new(PingRequest {
+            source_node_id: "node-1".into(),
+        }))
+        .await
+        .unwrap();
+
+    let state = manager.get_state();
+    assert!(state.last_seen.contains_key("node-1"));
+}
+
+#[tokio::test]
 async fn maintenance_skips_orphaned_shards() {
     let dir = tempfile::tempdir().unwrap();
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));

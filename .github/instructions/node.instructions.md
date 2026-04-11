@@ -55,6 +55,7 @@ pub struct Node {
 3. Request translog-based replica recovery for replica shards once opened
 4. Replay recovered operations using the seq_no carried by the primary so the replica WAL stays in the shared shard seq space
 5. Retry `JoinCluster` whenever the authoritative cluster state does not contain the local node, even if local Raft state is already initialized from disk
+6. If the master ping is rejected because the target no longer recognizes this node in cluster state, immediately retry `JoinCluster` through the seed hosts so a removed or stale follower can re-register itself. Transient ping failures (timeouts, connection errors, missing local master info) should only log and retry on the next lifecycle tick — they must not trigger a rejoin by themselves. Repeated follower-side join retries should be rate-limited so a permanently rejected or partitioned node does not issue `JoinCluster` on every 5-second lifecycle tick.
 
 ### Async Scheduling Rule
 - The lifecycle loop itself stays on Tokio because it coordinates Raft/control-plane work, but shard reopen and orphan cleanup perform blocking filesystem/Tantivy recovery work.

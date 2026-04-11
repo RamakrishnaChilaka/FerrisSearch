@@ -416,6 +416,11 @@ impl InternalTransport for TransportService {
 
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
+        if !self.cluster_manager.contains_node(&req.source_node_id) {
+            return Err(Status::not_found(
+                "source node is not registered in cluster state",
+            ));
+        }
         self.cluster_manager.ping_node(&req.source_node_id);
         Ok(Response::new(Empty {}))
     }

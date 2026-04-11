@@ -508,6 +508,7 @@ struct SqlStreamMeta {
     successful_shards: u32,
     failed_shards: u32,
     columns: Vec<String>,
+    timings: Option<crate::hybrid::SqlTimings>,
 }
 
 enum RemoteSqlPartitionResult {
@@ -1222,6 +1223,7 @@ async fn execute_sql_query_with_plan(
                 merge_ms: 0.0,
                 datafusion_ms: 0.0,
                 total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                grouped_merge: None,
             },
         });
     }
@@ -1262,7 +1264,7 @@ async fn execute_sql_query_with_plan(
         let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         let merge_start = Instant::now();
-        let sql_result = match crate::hybrid::execute_grouped_partial_sql(
+        let grouped_sql_result = match crate::hybrid::execute_grouped_partial_sql_with_timings(
             &plan,
             &distributed.partial_aggs,
             &metadata.mappings,
@@ -1286,7 +1288,7 @@ async fn execute_sql_query_with_plan(
 
         return Ok(SqlExecutionResult {
             plan,
-            sql_result,
+            sql_result: grouped_sql_result.sql_result,
             matched_hits: distributed.total_hits,
             successful_shards: distributed.successful_shards,
             failed_shards: distributed.failed_shards,
@@ -1303,6 +1305,7 @@ async fn execute_sql_query_with_plan(
                 merge_ms,
                 datafusion_ms: 0.0,
                 total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                grouped_merge: Some(grouped_sql_result.timings),
             },
         });
     }
@@ -1468,6 +1471,7 @@ async fn execute_sql_query_with_plan(
             merge_ms: 0.0,
             datafusion_ms,
             total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            grouped_merge: None,
         },
     })
 }
@@ -1537,8 +1541,34 @@ fn sql_response_body(result: &SqlExecutionResult) -> Value {
     })
 }
 
+fn sql_stream_response_body(result: &SqlExecutionResult) -> Value {
+    let mut body = sql_stream_meta_json(
+        &result.plan,
+        SqlStreamMeta {
+            execution_mode: result.execution_mode,
+            approximate_top_k: result.approximate_top_k,
+            streaming_used: result.streaming_used,
+            truncated: result.truncated,
+            matched_hits: result.matched_hits,
+            successful_shards: result.successful_shards,
+            failed_shards: result.failed_shards,
+            columns: result.sql_result.columns.clone(),
+            timings: Some(result.timings.clone()),
+        },
+    );
+
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "rows".to_string(),
+            Value::Array(result.sql_result.rows.clone()),
+        );
+    }
+
+    body
+}
+
 fn sql_stream_meta_json(plan: &crate::hybrid::QueryPlan, meta: SqlStreamMeta) -> Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "execution_mode": meta.execution_mode,
         "approximate_top_k": meta.approximate_top_k,
         "streaming_used": meta.streaming_used,
@@ -1551,7 +1581,22 @@ fn sql_stream_meta_json(plan: &crate::hybrid::QueryPlan, meta: SqlStreamMeta) ->
         },
         "matched_hits": meta.matched_hits,
         "columns": meta.columns,
-    })
+    });
+
+    if let Some(timings) = meta.timings {
+        match serde_json::to_value(timings) {
+            Ok(value) => {
+                if let Some(object) = body.as_object_mut() {
+                    object.insert("timings".to_string(), value);
+                }
+            }
+            Err(error) => {
+                tracing::error!("Failed to serialize streamed SQL timings: {}", error);
+            }
+        }
+    }
+
+    body
 }
 
 fn ndjson_bytes(frame: &Value) -> Bytes {
@@ -1664,7 +1709,7 @@ async fn execute_sql_stream_query(
 
     if plan.is_count_star_only() || plan.uses_grouped_partials() || plan.selects_all_columns {
         let result = execute_sql_query(state, index_name, query).await?;
-        return Ok(stream_json_response(sql_response_body(&result)));
+        return Ok(stream_json_response(sql_stream_response_body(&result)));
     }
 
     let cluster_state = state.cluster_manager.get_state();
@@ -1719,7 +1764,7 @@ async fn execute_sql_stream_query(
                 error
             );
             let result = execute_sql_query(state, index_name, query).await?;
-            return Ok(stream_json_response(sql_response_body(&result)));
+            return Ok(stream_json_response(sql_stream_response_body(&result)));
         }
     };
 
@@ -1775,6 +1820,7 @@ async fn execute_sql_stream_query(
                 successful_shards: direct_sql.successful_shards,
                 failed_shards: direct_sql.failed_shards,
                 columns,
+                timings: None,
             },
         ),
         batch_stream,
