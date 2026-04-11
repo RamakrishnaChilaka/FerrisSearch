@@ -89,6 +89,26 @@ fn resolve_transport_tls_paths(
     Ok(Some(paths))
 }
 
+fn ping_rejection_requires_rejoin(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == tonic::Code::NotFound)
+}
+
+fn follower_join_retry_remaining(
+    last_attempt: Option<Instant>,
+    now: Instant,
+    min_interval: Duration,
+) -> Option<Duration> {
+    let last_attempt = last_attempt?;
+    let elapsed = now.saturating_duration_since(last_attempt);
+    if elapsed < min_interval {
+        Some(min_interval - elapsed)
+    } else {
+        None
+    }
+}
+
 impl Node {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
         // Create Raft consensus instance — the state machine owns the
@@ -369,6 +389,8 @@ impl Node {
 
             // ── Lifecycle loop ─────────────────────────────────────────
             let mut leader_since: Option<Instant> = None;
+            let mut last_follower_join_retry: Option<Instant> = None;
+            let follower_join_retry_min_interval = Duration::from_secs(15);
 
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -396,6 +418,7 @@ impl Node {
                 {
                     let raft = &raft;
                     if raft.is_leader() {
+                        last_follower_join_retry = None;
                         // Track when we became leader for grace period
                         let now = Instant::now();
                         let became_leader_at = *leader_since.get_or_insert(now);
@@ -606,20 +629,106 @@ impl Node {
                         // Retry join whenever the authoritative cluster state does not
                         // include us. Recovered nodes are already initialized/voters, so
                         // gating on those flags prevents the promised retry path.
-                        let joined_state = if should_retry_cluster_join(&state, &local_id) {
-                            try_join_cluster(
-                                &client,
-                                &remote_seeds,
-                                &local_node,
-                                raft_node_id,
-                                1,
-                                None,
-                            )
-                            .await
+                        let needs_join_retry = should_retry_cluster_join(&state, &local_id);
+                        let now = Instant::now();
+                        let mut joined_state = if needs_join_retry {
+                            if let Some(remaining) = follower_join_retry_remaining(
+                                last_follower_join_retry,
+                                now,
+                                follower_join_retry_min_interval,
+                            ) {
+                                tracing::debug!(
+                                    "Local node {} is still missing from authoritative cluster state; delaying JoinCluster retry for {:?}",
+                                    local_id,
+                                    remaining
+                                );
+                                None
+                            } else {
+                                tracing::info!(
+                                    "Local node {} missing from authoritative cluster state; retrying cluster join",
+                                    local_id
+                                );
+                                last_follower_join_retry = Some(now);
+                                try_join_cluster(
+                                    &client,
+                                    &remote_seeds,
+                                    &local_node,
+                                    raft_node_id,
+                                    1,
+                                    None,
+                                )
+                                .await
+                            }
                         } else {
                             None
                         };
+                        if !needs_join_retry {
+                            match state.master_node.as_ref() {
+                                Some(master_id) => match state.nodes.get(master_id) {
+                                    Some(master_info) => {
+                                        if let Err(error) =
+                                            client.send_ping(master_info, &local_id).await
+                                        {
+                                            if ping_rejection_requires_rejoin(&error) {
+                                                if let Some(remaining) =
+                                                    follower_join_retry_remaining(
+                                                        last_follower_join_retry,
+                                                        now,
+                                                        follower_join_retry_min_interval,
+                                                    )
+                                                {
+                                                    tracing::warn!(
+                                                        "Master {} no longer recognizes {}; delaying JoinCluster retry for {:?}: {}",
+                                                        master_id,
+                                                        local_id,
+                                                        remaining,
+                                                        error
+                                                    );
+                                                } else {
+                                                    tracing::warn!(
+                                                        "Master {} no longer recognizes {}; retrying cluster join: {}",
+                                                        master_id,
+                                                        local_id,
+                                                        error
+                                                    );
+                                                    last_follower_join_retry = Some(now);
+                                                    joined_state = try_join_cluster(
+                                                        &client,
+                                                        &remote_seeds,
+                                                        &local_node,
+                                                        raft_node_id,
+                                                        1,
+                                                        None,
+                                                    )
+                                                    .await;
+                                                }
+                                            } else {
+                                                tracing::warn!(
+                                                    "Failed to ping master {}: {}",
+                                                    master_id,
+                                                    error
+                                                );
+                                            }
+                                        } else {
+                                            last_follower_join_retry = None;
+                                        }
+                                    }
+                                    None => {
+                                        tracing::debug!(
+                                            "Master {} missing from local cluster state; skipping ping until state catches up",
+                                            master_id
+                                        );
+                                    }
+                                },
+                                None => {
+                                    tracing::debug!(
+                                        "No master recorded in local cluster state; skipping master ping until leadership is known"
+                                    );
+                                }
+                            }
+                        }
                         if let Some(joined_state) = joined_state {
+                            last_follower_join_retry = None;
                             tracing::info!(
                                 "Recovered follower {} re-registered with leader",
                                 local_id
@@ -645,14 +754,6 @@ impl Node {
                                     )
                                     .await;
                             }
-                        }
-
-                        // Ping the master for health monitoring
-                        if let Some(master_id) = &state.master_node
-                            && let Some(master_info) = state.nodes.get(master_id)
-                            && let Err(e) = client.send_ping(master_info, &local_id).await
-                        {
-                            tracing::warn!("Failed to ping master {}: {}", master_id, e);
                         }
 
                         // ── Replica recovery ────────────────────────

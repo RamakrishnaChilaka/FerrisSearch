@@ -12,6 +12,17 @@ pub use planner::QueryPlan;
 
 /// Per-stage wall-clock timings for SQL execution, in fractional milliseconds.
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct GroupedMergeTimings {
+    pub partial_merge_ms: f64,
+    pub having_ms: f64,
+    pub top_k_ms: f64,
+    pub row_build_ms: f64,
+    pub merged_buckets: u64,
+    pub post_having_buckets: u64,
+    pub output_buckets: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SqlTimings {
     pub planning_ms: f64,
     pub semijoin_ms: f64,
@@ -20,12 +31,20 @@ pub struct SqlTimings {
     pub merge_ms: f64,
     pub datafusion_ms: f64,
     pub total_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grouped_merge: Option<GroupedMergeTimings>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SqlQueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupedPartialSqlResult {
+    pub sql_result: SqlQueryResult,
+    pub timings: GroupedMergeTimings,
 }
 
 pub async fn execute_planned_sql(plan: &QueryPlan, hits: &[Value]) -> Result<SqlQueryResult> {
@@ -109,6 +128,14 @@ pub fn execute_grouped_partial_sql(
     partials: &[std::collections::HashMap<String, crate::search::PartialAggResult>],
     mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
 ) -> Result<SqlQueryResult> {
+    Ok(execute_grouped_partial_sql_with_timings(plan, partials, mappings)?.sql_result)
+}
+
+pub fn execute_grouped_partial_sql_with_timings(
+    plan: &QueryPlan,
+    partials: &[std::collections::HashMap<String, crate::search::PartialAggResult>],
+    mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<GroupedPartialSqlResult> {
     let grouped_sql = plan
         .grouped_sql
         .as_ref()
@@ -135,11 +162,13 @@ pub fn execute_grouped_partial_sql(
         shard_top_k: None,
     };
 
+    let partial_merge_start = std::time::Instant::now();
     let merged = crate::search::merge_grouped_metrics_partials(
         partials,
         crate::hybrid::planner::INTERNAL_SQL_GROUPED_AGG,
         &params,
     );
+    let partial_merge_ms = partial_merge_start.elapsed().as_secs_f64() * 1000.0;
 
     let columns: Vec<String> = grouped_sql
         .group_columns
@@ -175,8 +204,10 @@ pub fn execute_grouped_partial_sql(
                 .collect(),
         });
     }
+    let merged_buckets = buckets.len() as u64;
 
     // Apply HAVING filters on native buckets
+    let having_start = std::time::Instant::now();
     if !grouped_sql.having.is_empty() {
         buckets.retain(|bucket| {
             grouped_sql.having.iter().all(|filter| {
@@ -194,8 +225,11 @@ pub fn execute_grouped_partial_sql(
             })
         });
     }
+    let having_ms = having_start.elapsed().as_secs_f64() * 1000.0;
+    let post_having_buckets = buckets.len() as u64;
 
     // Top-K selection on native buckets
+    let top_k_start = std::time::Instant::now();
     let needed = plan.offset.unwrap_or(0) + plan.limit.unwrap_or(usize::MAX);
     let has_order = !grouped_sql.order_by.is_empty();
 
@@ -220,8 +254,11 @@ pub fn execute_grouped_partial_sql(
             .unwrap_or(buckets.len());
         buckets = buckets[start..end].to_vec();
     }
+    let top_k_ms = top_k_start.elapsed().as_secs_f64() * 1000.0;
+    let output_buckets = buckets.len() as u64;
 
     // Convert only the surviving buckets to JSON rows
+    let row_build_start = std::time::Instant::now();
     let rows = buckets
         .into_iter()
         .map(|bucket| {
@@ -254,8 +291,20 @@ pub fn execute_grouped_partial_sql(
             serde_json::Value::Object(row)
         })
         .collect::<Vec<_>>();
+    let row_build_ms = row_build_start.elapsed().as_secs_f64() * 1000.0;
 
-    Ok(SqlQueryResult { columns, rows })
+    Ok(GroupedPartialSqlResult {
+        sql_result: SqlQueryResult { columns, rows },
+        timings: GroupedMergeTimings {
+            partial_merge_ms,
+            having_ms,
+            top_k_ms,
+            row_build_ms,
+            merged_buckets,
+            post_having_buckets,
+            output_buckets,
+        },
+    })
 }
 
 fn empty_grouped_metric_partial(
@@ -1664,6 +1713,56 @@ mod tests {
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0]["cnt"], json!(0));
         assert!(result.rows[0]["avg_price"].is_null());
+    }
+
+    #[test]
+    fn grouped_partial_sql_reports_merge_breakdown() {
+        use crate::search::{GroupedMetricPartial, GroupedMetricsBucket, PartialAggResult};
+        use std::collections::HashMap;
+
+        let plan = crate::hybrid::planner::plan_sql(
+            "products",
+            "SELECT brand, count(*) AS total FROM products GROUP BY brand ORDER BY total DESC LIMIT 1",
+        )
+        .unwrap();
+
+        let mut partial_map = HashMap::new();
+        partial_map.insert(
+            planner::INTERNAL_SQL_GROUPED_AGG.to_string(),
+            PartialAggResult::GroupedMetrics {
+                buckets: vec![
+                    GroupedMetricsBucket {
+                        group_values: vec![json!("Apple")],
+                        metrics: HashMap::from([(
+                            "total".to_string(),
+                            GroupedMetricPartial::Count { count: 2 },
+                        )]),
+                    },
+                    GroupedMetricsBucket {
+                        group_values: vec![json!("Samsung")],
+                        metrics: HashMap::from([(
+                            "total".to_string(),
+                            GroupedMetricPartial::Count { count: 1 },
+                        )]),
+                    },
+                ],
+            },
+        );
+
+        let result = execute_grouped_partial_sql_with_timings(
+            &plan,
+            &[partial_map],
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(result.sql_result.rows.len(), 1);
+        assert_eq!(result.timings.merged_buckets, 2);
+        assert_eq!(result.timings.post_having_buckets, 2);
+        assert_eq!(result.timings.output_buckets, 1);
+        assert!(result.timings.partial_merge_ms >= 0.0);
+        assert!(result.timings.top_k_ms >= 0.0);
+        assert!(result.timings.row_build_ms >= 0.0);
     }
 
     #[test]

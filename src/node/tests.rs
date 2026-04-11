@@ -681,6 +681,37 @@ fn two_restart_recovery_sequence_preserves_old_data_and_never_creates_fresh_uuid
 }
 
 #[test]
+fn ping_rejection_requires_rejoin_only_for_not_found_status() {
+    let rejected = anyhow::Error::from(tonic::Status::not_found("unknown node"));
+    let unavailable = anyhow::Error::from(tonic::Status::unavailable("master down"));
+    let transport = anyhow::anyhow!("transport connect failed");
+
+    assert!(ping_rejection_requires_rejoin(&rejected));
+    assert!(!ping_rejection_requires_rejoin(&unavailable));
+    assert!(!ping_rejection_requires_rejoin(&transport));
+}
+
+#[test]
+fn follower_join_retry_remaining_enforces_backoff_window() {
+    let now = Instant::now();
+    let min_interval = Duration::from_secs(15);
+
+    assert_eq!(follower_join_retry_remaining(None, now, min_interval), None);
+
+    let recent = now.checked_sub(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        follower_join_retry_remaining(Some(recent), now, min_interval),
+        Some(Duration::from_secs(10))
+    );
+
+    let old = now.checked_sub(Duration::from_secs(20)).unwrap();
+    assert_eq!(
+        follower_join_retry_remaining(Some(old), now, min_interval),
+        None
+    );
+}
+
+#[test]
 fn should_retry_cluster_join_only_when_local_node_missing() {
     let mut state = crate::cluster::state::ClusterState::new("node-test".into());
     assert!(should_retry_cluster_join(&state, "node-1"));

@@ -193,7 +193,7 @@ impl RestTestHarness {
             {
                 client
                     .ping(tonic::Request::new(PingRequest {
-                        source_node_id: "rest-test-ready".into(),
+                        source_node_id: "node-1".into(),
                     }))
                     .await
                     .is_ok()
@@ -438,7 +438,7 @@ impl MultiNodeRestHarness {
                 {
                     client
                         .ping(tonic::Request::new(PingRequest {
-                            source_node_id: "multi-rest-test-ready".into(),
+                            source_node_id: node.app_state.local_node_id.clone(),
                         }))
                         .await
                         .is_ok()
@@ -2067,6 +2067,70 @@ async fn rest_global_sql_stream_endpoint_routes_select_queries() -> Result<()> {
     assert_eq!(rows[1]["price"], json!(899.0));
     assert_eq!(rows[2]["brand"], json!("Samsung"));
     assert_eq!(rows[2]["price"], json!(799.0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_global_sql_stream_grouped_partials_meta_includes_grouped_merge_timings() -> Result<()>
+{
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+
+    let (status, body) = harness
+        .post_json_text(
+            "/_sql/stream",
+            json!({
+                "query": "SELECT brand, count(*) AS total FROM \"products\" WHERE text_match(description, 'iphone') GROUP BY brand ORDER BY total DESC, brand ASC"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let frames: Vec<Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<_, _>>()?;
+
+    assert!(!frames.is_empty(), "expected at least one NDJSON frame");
+    assert_eq!(frames[0]["type"], json!("meta"));
+    assert_eq!(
+        frames[0]["execution_mode"],
+        json!("tantivy_grouped_partials")
+    );
+    assert!(frames[0]["timings"]["total_ms"].as_f64().unwrap() > 0.0);
+    assert!(
+        frames[0]["timings"]["grouped_merge"]["partial_merge_ms"]
+            .as_f64()
+            .unwrap()
+            >= 0.0
+    );
+    assert!(
+        frames[0]["timings"]["grouped_merge"]["merged_buckets"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+
+    let rows: Vec<Value> = frames
+        .iter()
+        .skip(1)
+        .flat_map(|frame| {
+            frame["rows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .collect();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["brand"], json!("Apple"));
+    assert_eq!(rows[0]["total"], json!(2));
+    assert_eq!(rows[1]["brand"], json!("Samsung"));
+    assert_eq!(rows[1]["total"], json!(1));
 
     Ok(())
 }

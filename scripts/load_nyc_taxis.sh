@@ -24,6 +24,7 @@ DATASET_DIR="$ROOT_DIR/test_workload_data/nyc_taxis_100m"
 CLUSTER_DATA_DIR="$ROOT_DIR/data/nyc_taxis_100m_cluster"
 LOG_DIR="$ROOT_DIR/logs/nyc_taxis_100m"
 SKIP_BENCH=0
+BENCH_SCRIPT="$ROOT_DIR/scripts/nyc_taxi_hybrid_benchmark.sh"
 FORCE_BUILD=0
 FORCE_DOWNLOAD=0
 START_CLUSTER=1
@@ -71,6 +72,7 @@ Options:
   --http-base-port PORT     Base HTTP port for node-1 (default: 9200)
   --transport-base-port P   Base transport port for node-1 (default: 9300)
   --skip-bench              Load data but skip the benchmark query script
+    --bench-script PATH       Benchmark script to run after ingest (default: scripts/nyc_taxi_hybrid_benchmark.sh)
   --no-start-cluster        Reuse an already-running cluster instead of starting one
   --force-build             Rebuild the release binary even if it already exists
   --force-download          Re-download parquet files even if cached locally
@@ -148,6 +150,10 @@ while [[ $# -gt 0 ]]; do
         --skip-bench)
             SKIP_BENCH=1
             shift
+            ;;
+        --bench-script)
+            BENCH_SCRIPT="$2"
+            shift 2
             ;;
         --no-start-cluster)
             START_CLUSTER=0
@@ -233,12 +239,22 @@ wait_for_cluster() {
     while (( attempts < 120 )); do
         if cluster_is_healthy; then
             local node_count
-            node_count="$(curl -s "$BASE_URL/_cluster/state" | "$PYTHON_BIN" - <<'PY'
+            node_count="$(curl -s "$BASE_URL/_cluster/state" | "$PYTHON_BIN" -c '
 import json, sys
-state = json.load(sys.stdin)
+
+payload = sys.stdin.read().strip()
+if not payload:
+    print(0)
+    raise SystemExit(0)
+
+try:
+    state = json.loads(payload)
+except Exception:
+    print(0)
+    raise SystemExit(0)
+
 print(len(state.get("nodes", {})))
-PY
-)"
+')"
             if [[ "$node_count" -ge "$NODES" ]]; then
                 return 0
             fi
@@ -316,8 +332,10 @@ download_parquets() {
             m_end="$END_MONTH"
         fi
 
-        for month in $(seq -w "$m_start" "$m_end"); do
-            local file_name="fhvhv_tripdata_${year}-${month}.parquet"
+        for month in $(seq "$m_start" "$m_end"); do
+            local month_padded
+            month_padded="$(printf '%02d' "$month")"
+            local file_name="fhvhv_tripdata_${year}-${month_padded}.parquet"
             local local_path="$DATASET_DIR/$file_name"
             local remote_url="https://d37ci6vzurychx.cloudfront.net/trip-data/$file_name"
 
@@ -630,8 +648,12 @@ run_benchmarks() {
         return 0
     fi
 
-    log "Running NYC taxi benchmark queries"
-    (cd "$ROOT_DIR" && bash scripts/nyc_taxi_queries.sh "$BASE_URL")
+    if [[ ! -f "$BENCH_SCRIPT" ]]; then
+        die "Benchmark script not found: $BENCH_SCRIPT"
+    fi
+
+    log "Running benchmark queries via $BENCH_SCRIPT"
+    (cd "$ROOT_DIR" && bash "$BENCH_SCRIPT" "$BASE_URL")
 }
 
 print_final_summary() {

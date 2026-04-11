@@ -162,6 +162,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - Multiple HAVING conditions (ANDed) are supported.
 - Complex HAVING expressions (OR, subqueries, expressions not matching a known metric) cause fallback to the DataFusion path.
 - The pipeline order in grouped partials is: merge → HAVING → top-K selection → LIMIT/OFFSET.
+- `EXPLAIN ANALYZE` / SQL timings for `tantivy_grouped_partials` should expose the nested coordinator breakdown under `timings.grouped_merge`: `partial_merge_ms`, `having_ms`, `top_k_ms`, `row_build_ms`, plus bucket counts before HAVING and after LIMIT/OFFSET. Keep the top-level `merge_ms` as the overall grouped merge wall time.
 - Grouped-partials may register hidden support metrics for aggregate expressions referenced only from HAVING / ORDER BY. These metrics must be collected and merged, but they must not appear in the final SQL columns or rows.
 - Ungrouped grouped-partials queries with zero matches must still synthesize the empty global bucket so `count(*)` returns `0` and other aggregates return `NULL`, rather than producing an empty result set.
 

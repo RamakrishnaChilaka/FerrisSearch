@@ -104,12 +104,12 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 990 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 42 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 179 assertions) = 1170 total
+- 1002 unit tests + 65 CLI tests + 33 consensus integration + 39 replication integration + 43 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1184 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
-- SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, history, and NDJSON `/_sql/stream` consumption) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
+- SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, history, NDJSON `/_sql/stream` consumption, and grouped-merge timing display when streamed SQL meta includes timings) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
 
 ## Same-Index Semijoin SQL
 - Supported shape: top-level `expr IN (SELECT key FROM same_index ...)` in `WHERE`
@@ -125,7 +125,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Joining node does NOT call `update_state` — Raft log replication propagates state, but `JoinCluster` returns an authoritative snapshot for initial shard reopen/cleanup decisions
 - Nodes reopen locally assigned shards after startup using the authoritative bootstrap/join snapshot when available, keep recovered-node startup assignments fail-closed when their expected UUID dirs are missing, never clear that recovered-startup guard just because authoritative state arrived, allow later assignments to create their shard dirs in the lifecycle loop, and skip orphan cleanup until index UUIDs are known and the expected local shard UUID paths exist
 - Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader), shard failover (promote best ISR replica to primary for orphaned shards)
-- Follower lifecycle loop: pings the master for liveness
+- Follower lifecycle loop: pings the master for liveness; if the ping target no longer recognizes this node in cluster state, immediately reruns `JoinCluster` so stale/removed followers can self-heal after transient partitions or leader-side removals
 
 ## Important Design Decisions
 - **Raft is mandatory**: `AppState.raft` is `Arc<RaftInstance>`, not `Option`. All cluster-state mutations go through Raft. There is no non-Raft fallback path.
@@ -653,6 +653,7 @@ If you add a hybrid execution path that mixes full-text search with SQL-style pr
 - For grouped analytics, compute shard-local partials from fast fields, ship compact partial states, and merge at the coordinator. Do not ship full matched rows unless the query needs expressions that cannot run from fast fields.
 - Runtime SQL reporting should keep `execution_mode` at the authoritative high-level path; if a local fast-field fallback uses bitset streaming internally, expose that separately via `streaming_used` instead of inventing a new execution mode.
 - Grouped-partial wire formats must preserve numeric group-key type fidelity across shards. Do not coerce integer group keys into `f64`, or coordinator merge can split logically identical buckets like `0` and `0.0` between local and remote shards.
+- Grouped key encodings must keep SQL `NULL` out-of-band. Never reuse a payload bit pattern such as `u64::MAX` as a null sentinel for signed numeric grouped keys, or real values like `-1` will alias null buckets.
 - Only introduce new storage or sidecar column formats if a required SQL feature cannot be served by Tantivy fast fields or stored fields. Planning and partial aggregation alone are not sufficient reasons.
 
 ### Responsibility Split

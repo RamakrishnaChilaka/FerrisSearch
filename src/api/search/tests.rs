@@ -86,6 +86,13 @@ fn make_sql_metadata(index: &str) -> IndexMetadata {
         },
     );
     mappings.insert(
+        "segment".to_string(),
+        FieldMapping {
+            field_type: FieldType::Keyword,
+            dimension: None,
+        },
+    );
+    mappings.insert(
         "price".to_string(),
         FieldMapping {
             field_type: FieldType::Float,
@@ -158,19 +165,19 @@ async fn make_test_app_state(index_name: &str) -> (tempfile::TempDir, AppState) 
     shard
         .add_document(
             "1",
-            json!({"title": "iPhone Pro", "description": "iphone flagship", "brand": "Apple", "price": 999.0}),
+            json!({"title": "iPhone Pro", "description": "iphone flagship", "brand": "Apple", "segment": "premium", "price": 999.0}),
         )
         .unwrap();
     shard
         .add_document(
             "2",
-            json!({"title": "iPhone", "description": "iphone standard", "brand": "Apple", "price": 899.0}),
+            json!({"title": "iPhone", "description": "iphone standard", "brand": "Apple", "segment": "standard", "price": 899.0}),
         )
         .unwrap();
     shard
         .add_document(
             "3",
-            json!({"title": "Galaxy", "description": "iphone competitor", "brand": "Samsung", "price": 799.0}),
+            json!({"title": "Galaxy", "description": "iphone competitor", "brand": "Samsung", "segment": "standard", "price": 799.0}),
         )
         .unwrap();
     shard.refresh().unwrap();
@@ -366,6 +373,13 @@ async fn explain_analyze_returns_timings_and_rows() {
     assert!(timings["planning_ms"].as_f64().unwrap() >= 0.0);
     assert!(timings["search_ms"].as_f64().unwrap() >= 0.0);
     assert!(timings["total_ms"].as_f64().unwrap() > 0.0);
+    assert!(
+        timings["grouped_merge"]["partial_merge_ms"]
+            .as_f64()
+            .unwrap()
+            >= 0.0
+    );
+    assert!(timings["grouped_merge"]["merged_buckets"].as_u64().unwrap() >= 1);
 
     assert_eq!(body["matched_hits"], 3);
     assert!(body["row_count"].as_u64().unwrap() > 0);
@@ -514,6 +528,47 @@ async fn explain_analyze_reports_approximate_top_k_when_enabled() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["execution_mode"], "tantivy_grouped_partials");
     assert_eq!(body["approximate_top_k"], json!(true));
+}
+
+#[tokio::test]
+async fn search_sql_two_column_group_by_reports_approximate_top_k() {
+    let (_tmp, mut state) = make_test_app_state("products").await;
+    state.sql_approximate_top_k = true;
+
+    let (status, Json(body)) = search_sql(
+        State(state),
+        Path(crate::common::IndexName::new("products").unwrap()),
+        Json(SqlQueryRequest {
+            query: "SELECT brand, segment, SUM(price) AS revenue FROM products WHERE text_match(description, 'iphone') GROUP BY brand, segment ORDER BY revenue DESC LIMIT 3".to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], "tantivy_grouped_partials");
+    assert_eq!(body["approximate_top_k"], json!(true));
+    assert_eq!(
+        body["planner"]["group_by_columns"],
+        json!(["brand", "segment"])
+    );
+    assert_eq!(body["columns"], json!(["brand", "segment", "revenue"]));
+    assert_eq!(body["matched_hits"], json!(3));
+
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[0],
+        json!({"brand": "Apple", "segment": "premium", "revenue": 999.0})
+    );
+    assert_eq!(
+        rows[1],
+        json!({"brand": "Apple", "segment": "standard", "revenue": 899.0})
+    );
+    assert_eq!(
+        rows[2],
+        json!({"brand": "Samsung", "segment": "standard", "revenue": 799.0})
+    );
 }
 
 // -------- Tests for global SQL helper functions --------

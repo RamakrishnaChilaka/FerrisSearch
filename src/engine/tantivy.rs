@@ -1529,20 +1529,35 @@ impl HotEngine {
                                     let buckets = if key_readers.is_empty() {
                                         GroupedBuckets::Global(None)
                                     } else if key_readers.len() == 2 {
-                                        GroupedBuckets::Pair(
-                                            std::collections::HashMap::with_capacity(approx_groups),
-                                        )
+                                        let null_capacity =
+                                            pair_null_bucket_capacity(approx_groups);
+                                        GroupedBuckets::Pair(PairGroupedBuckets {
+                                            values: PairHashMap::with_capacity_and_hasher(
+                                                approx_groups,
+                                                PairBuildHasher::default(),
+                                            ),
+                                            first_null: OrdHashMap::with_capacity_and_hasher(
+                                                null_capacity,
+                                                OrdBuildHasher::default(),
+                                            ),
+                                            second_null: OrdHashMap::with_capacity_and_hasher(
+                                                null_capacity,
+                                                OrdBuildHasher::default(),
+                                            ),
+                                            both_null: None,
+                                        })
                                     } else if key_readers.len() > 2 {
                                         GroupedBuckets::Multi(
                                             std::collections::HashMap::with_capacity(approx_groups),
                                         )
                                     } else {
-                                        GroupedBuckets::Single(
-                                            OrdHashMap::with_capacity_and_hasher(
+                                        GroupedBuckets::Single(SingleGroupedBuckets {
+                                            values: OrdHashMap::with_capacity_and_hasher(
                                                 approx_groups,
                                                 OrdBuildHasher::default(),
                                             ),
-                                        )
+                                            null_bucket: None,
+                                        })
                                     };
 
                                     let mut numeric_buf_map: Vec<Option<usize>> =
@@ -1810,6 +1825,62 @@ impl std::hash::Hasher for OrdHasher {
 
 type OrdBuildHasher = std::hash::BuildHasherDefault<OrdHasher>;
 type OrdHashMap<V> = std::collections::HashMap<u64, V, OrdBuildHasher>;
+
+#[inline]
+fn mix_pair_hash_value(value: u128) -> u64 {
+    let hi = (value >> 64) as u64;
+    let lo = value as u64;
+    let mut mixed = 0x9E37_79B9_7F4A_7C15u64;
+    mixed ^= hi.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    mixed = mixed.rotate_left(32);
+    mixed ^= lo.wrapping_mul(0x1656_67B1_9E37_79F9);
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    mixed ^= mixed >> 33;
+    mixed
+}
+
+/// Cheap hasher for packed `(u64, u64)` keys used by the width-2 GROUP BY path.
+/// Route-like workloads have structured pairs, so we still mix the halves, but
+/// avoid the default SipHash cost in the per-doc hot path.
+#[derive(Default)]
+struct PairHasher(u64);
+
+impl std::hash::Hasher for PairHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() <= 16 {
+            let mut chunk = [0u8; 16];
+            chunk[..bytes.len()].copy_from_slice(bytes);
+            self.0 = mix_pair_hash_value(u128::from_le_bytes(chunk) ^ (bytes.len() as u128));
+            return;
+        }
+
+        // The hot path hashes packed u128 keys via `write_u128()`. Fall back to
+        // a complete byte hash here so unexpected callers do not silently ignore
+        // bytes beyond the first 16.
+        let mut fallback = std::hash::DefaultHasher::new();
+        fallback.write(bytes);
+        self.0 = fallback.finish();
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.0 = mix_pair_hash_value(value);
+    }
+}
+
+type PairBuildHasher = std::hash::BuildHasherDefault<PairHasher>;
+type PairHashMap<V> = std::collections::HashMap<u128, V, PairBuildHasher>;
+
+#[inline]
+fn pair_null_bucket_capacity(approx_groups: usize) -> usize {
+    approx_groups.min(16)
+}
 
 #[derive(Clone)]
 struct StringFastFieldReader {
@@ -2303,7 +2374,7 @@ struct GroupedMetricEntry {
 struct DerivedStringBucketReader {
     base: StringFastFieldReader,
     spec: crate::search::DerivedGroupKey,
-    ord_cache: std::cell::RefCell<std::collections::HashMap<u64, u64>>,
+    ord_cache: std::cell::RefCell<std::collections::HashMap<u64, Option<u64>>>,
 }
 
 impl DerivedStringBucketReader {
@@ -2319,20 +2390,20 @@ impl DerivedStringBucketReader {
         let mut ords = vec![None; docs.len()];
         self.base.first_ords_batch(docs, &mut ords);
         for (index, ord) in ords.into_iter().enumerate() {
-            output[index] = ord.map(|value| self.bucket_key_for_ord(value));
+            output[index] = ord.and_then(|value| self.bucket_key_for_ord(value));
         }
     }
 
-    fn bucket_key_for_ord(&self, ord: u64) -> u64 {
-        if let Some(bucket_key) = self.ord_cache.borrow().get(&ord).copied() {
+    fn bucket_key_for_ord(&self, ord: u64) -> Option<u64> {
+        if let Some(bucket_key) = self.ord_cache.borrow().get(&ord).cloned() {
             return bucket_key;
         }
 
         let mut text = String::new();
         let bucket_key = if self.base.ord_to_str(ord, &mut text) {
-            self.matching_bucket_key(&text).unwrap_or(u64::MAX)
+            self.matching_bucket_key(&text)
         } else {
-            u64::MAX
+            None
         };
         self.ord_cache.borrow_mut().insert(ord, bucket_key);
         bucket_key
@@ -2347,9 +2418,6 @@ impl DerivedStringBucketReader {
     }
 
     fn resolve(&self, key: u64) -> serde_json::Value {
-        if key == u64::MAX {
-            return serde_json::Value::Null;
-        }
         if let Some(bucket) = self.spec.buckets.get(key as usize) {
             return serde_json::Value::String(bucket.label.clone());
         }
@@ -2382,8 +2450,8 @@ fn derived_bucket_key_for_value(spec: &crate::search::DerivedGroupKey, value: &s
     spec.else_label.as_ref().map(|_| spec.buckets.len() as u64)
 }
 
-/// Compact per-doc key reader. Extracts a u64 ordinal per group-by column
-/// without allocating Strings or serde_json::Values in the hot path.
+/// Compact per-doc key reader. Extracts an optional u64 carrier per group-by
+/// column without allocating Strings or serde_json::Values in the hot path.
 enum GroupKeyReader {
     /// String column — reads ordinals from the underlying Column<u64> directly,
     /// bypassing the iterator-based `term_ords()` path.
@@ -2432,11 +2500,11 @@ impl GroupKeyReader {
         }
     }
 
-    /// Resolve an ordinal key back to a serde_json::Value (called once per unique group).
-    fn resolve(&self, key: u64) -> serde_json::Value {
-        if key == u64::MAX {
+    /// Resolve a compact key back to a serde_json::Value (called once per unique group).
+    fn resolve(&self, key: Option<u64>) -> serde_json::Value {
+        let Some(key) = key else {
             return serde_json::Value::Null;
-        }
+        };
         match self {
             GroupKeyReader::Str(reader) => {
                 let mut text = String::new();
@@ -2467,8 +2535,8 @@ enum CompactMetricAccum {
 }
 
 struct OrdGroupedBucket {
-    /// Ordinal keys for each group-by column.
-    ord_keys: Vec<u64>,
+    /// Compact keys for each group-by column. `None` represents SQL null.
+    ord_keys: Vec<Option<u64>>,
     /// One accumulator per metric, indexed by position.
     accums: Vec<CompactMetricAccum>,
 }
@@ -2478,15 +2546,27 @@ struct PairGroupedBucket {
     accums: Vec<CompactMetricAccum>,
 }
 
-/// Multi-column GROUP BY uses Vec<u64> as the key (collision-free).
+struct SingleGroupedBuckets {
+    values: OrdHashMap<OrdGroupedBucket>,
+    null_bucket: Option<OrdGroupedBucket>,
+}
+
+struct PairGroupedBuckets {
+    values: PairHashMap<PairGroupedBucket>,
+    first_null: OrdHashMap<PairGroupedBucket>,
+    second_null: OrdHashMap<PairGroupedBucket>,
+    both_null: Option<PairGroupedBucket>,
+}
+
+/// Multi-column GROUP BY uses Vec<Option<u64>> as the key (collision-free).
 /// Single-column uses u64 directly via OrdHashMap (identity hasher).
 enum GroupedBuckets {
-    /// Single group-by column: u64 ordinal key, identity hasher, zero collisions.
-    Single(OrdHashMap<OrdGroupedBucket>),
-    /// Two-column group-by: packed (u64, u64) key in a fixed-width hash map.
-    Pair(std::collections::HashMap<u128, PairGroupedBucket>),
-    /// Multi-column group-by: Vec<u64> composite key, standard hasher, zero collisions.
-    Multi(std::collections::HashMap<Vec<u64>, OrdGroupedBucket>),
+    /// Single group-by column: non-null ordinals in the fast map plus a dedicated null bucket.
+    Single(SingleGroupedBuckets),
+    /// Two-column group-by: packed non-null pairs plus dedicated null-mask buckets.
+    Pair(PairGroupedBuckets),
+    /// Multi-column group-by: explicit optional keys, standard hasher, zero collisions.
+    Multi(std::collections::HashMap<Vec<Option<u64>>, OrdGroupedBucket>),
     /// No group-by columns (ungrouped aggregate): single global bucket.
     Global(Option<OrdGroupedBucket>),
 }
@@ -2668,14 +2748,32 @@ impl tantivy::collector::Collector for GroupedAggCollector {
             let buckets = if key_readers.is_empty() {
                 GroupedBuckets::Global(None)
             } else if key_readers.len() == 2 {
-                GroupedBuckets::Pair(std::collections::HashMap::with_capacity(approx_groups))
+                let null_capacity = pair_null_bucket_capacity(approx_groups);
+                GroupedBuckets::Pair(PairGroupedBuckets {
+                    values: PairHashMap::with_capacity_and_hasher(
+                        approx_groups,
+                        PairBuildHasher::default(),
+                    ),
+                    first_null: OrdHashMap::with_capacity_and_hasher(
+                        null_capacity,
+                        OrdBuildHasher::default(),
+                    ),
+                    second_null: OrdHashMap::with_capacity_and_hasher(
+                        null_capacity,
+                        OrdBuildHasher::default(),
+                    ),
+                    both_null: None,
+                })
             } else if key_readers.len() > 2 {
                 GroupedBuckets::Multi(std::collections::HashMap::with_capacity(approx_groups))
             } else {
-                GroupedBuckets::Single(OrdHashMap::with_capacity_and_hasher(
-                    approx_groups,
-                    OrdBuildHasher::default(),
-                ))
+                GroupedBuckets::Single(SingleGroupedBuckets {
+                    values: OrdHashMap::with_capacity_and_hasher(
+                        approx_groups,
+                        OrdBuildHasher::default(),
+                    ),
+                    null_bucket: None,
+                })
             };
 
             // Build numeric buffer mapping: for each metric entry, assign the
@@ -3113,7 +3211,7 @@ fn flat_scan_segment(
         let group_value = if is_str_key {
             arena.to_json_value(pos as u32)
         } else {
-            key_reader.resolve(ord as u64)
+            key_reader.resolve(Some(ord as u64))
         };
 
         let mut metrics = std::collections::HashMap::new();
@@ -3363,18 +3461,25 @@ fn flush_batch(entry: &mut GroupedAggSegmentEntry) {
     // Batch-read all numeric columns upfront (sequential memory access).
     batch_read_numeric_buffers(entry, batch_len);
 
-    let GroupedBuckets::Single(map) = &mut entry.buckets else {
+    let GroupedBuckets::Single(single) = &mut entry.buckets else {
         entry.doc_buffer.clear();
         return;
     };
 
     for i in 0..batch_len {
-        let ord = entry.ord_buffer[i].unwrap_or(u64::MAX);
-
-        let bucket = map.entry(ord).or_insert_with(|| OrdGroupedBucket {
-            ord_keys: vec![ord],
-            accums: entry.accum_template.clone(),
-        });
+        let bucket = match entry.ord_buffer[i] {
+            Some(ord) => single
+                .values
+                .entry(ord)
+                .or_insert_with(|| OrdGroupedBucket {
+                    ord_keys: vec![Some(ord)],
+                    accums: entry.accum_template.clone(),
+                }),
+            None => single.null_bucket.get_or_insert_with(|| OrdGroupedBucket {
+                ord_keys: vec![None],
+                accums: entry.accum_template.clone(),
+            }),
+        };
 
         accumulate_grouped_bucket_metrics(
             &mut bucket.accums,
@@ -3405,19 +3510,37 @@ fn flush_batch_pair(entry: &mut GroupedAggSegmentEntry) {
 
     batch_read_numeric_buffers(entry, batch_len);
 
-    let GroupedBuckets::Pair(map) = &mut entry.buckets else {
+    let GroupedBuckets::Pair(pair) = &mut entry.buckets else {
         entry.doc_buffer.clear();
         return;
     };
 
     for i in 0..batch_len {
-        let packed = pack_pair_group_key(
-            first_keys[i].unwrap_or(u64::MAX),
-            second_keys[i].unwrap_or(u64::MAX),
-        );
-        let bucket = map.entry(packed).or_insert_with(|| PairGroupedBucket {
-            accums: entry.accum_template.clone(),
-        });
+        let bucket = match (first_keys[i], second_keys[i]) {
+            (Some(first), Some(second)) => pair
+                .values
+                .entry(pack_pair_group_key(first, second))
+                .or_insert_with(|| PairGroupedBucket {
+                    accums: entry.accum_template.clone(),
+                }),
+            (None, Some(second)) => {
+                pair.first_null
+                    .entry(second)
+                    .or_insert_with(|| PairGroupedBucket {
+                        accums: entry.accum_template.clone(),
+                    })
+            }
+            (Some(first), None) => {
+                pair.second_null
+                    .entry(first)
+                    .or_insert_with(|| PairGroupedBucket {
+                        accums: entry.accum_template.clone(),
+                    })
+            }
+            (None, None) => pair.both_null.get_or_insert_with(|| PairGroupedBucket {
+                accums: entry.accum_template.clone(),
+            }),
+        };
 
         accumulate_grouped_bucket_metrics(
             &mut bucket.accums,
@@ -3455,23 +3578,16 @@ fn flush_batch_multi(entry: &mut GroupedAggSegmentEntry) {
     batch_read_numeric_buffers(entry, batch_len);
 
     // Reusable ord_keys buffer — avoids per-doc Vec allocation.
-    let mut ord_keys = vec![0u64; num_keys];
+    let mut ord_keys = vec![None; num_keys];
 
     for i in 0..batch_len {
         // Build composite key from batch-read ordinals (no per-doc fast-field read).
         for (k, buf) in ord_bufs.iter().enumerate() {
-            ord_keys[k] = buf[i].unwrap_or(u64::MAX);
+            ord_keys[k] = buf[i];
         }
 
         let template = &entry.accum_template;
         let bucket = match &mut entry.buckets {
-            GroupedBuckets::Single(map) => {
-                let key = ord_keys[0];
-                map.entry(key).or_insert_with(|| OrdGroupedBucket {
-                    ord_keys: ord_keys.clone(),
-                    accums: template.clone(),
-                })
-            }
             GroupedBuckets::Multi(map) => {
                 map.entry(ord_keys.clone())
                     .or_insert_with(|| OrdGroupedBucket {
@@ -3483,6 +3599,7 @@ fn flush_batch_multi(entry: &mut GroupedAggSegmentEntry) {
                 ord_keys: vec![],
                 accums: template.clone(),
             }),
+            GroupedBuckets::Single(_) => unreachable!("single buckets should use flush_batch"),
             GroupedBuckets::Pair(_) => unreachable!("pair buckets should use flush_batch_pair"),
         };
 
@@ -3500,17 +3617,51 @@ fn flush_batch_multi(entry: &mut GroupedAggSegmentEntry) {
 
 fn grouped_buckets_into_raw(buckets: GroupedBuckets) -> Vec<OrdGroupedBucket> {
     match buckets {
-        GroupedBuckets::Single(map) => map.into_values().collect(),
-        GroupedBuckets::Pair(map) => map
-            .into_iter()
-            .map(|(packed, bucket)| {
+        GroupedBuckets::Single(single) => {
+            let mut raw: Vec<OrdGroupedBucket> = single.values.into_values().collect();
+            if let Some(bucket) = single.null_bucket {
+                raw.push(bucket);
+            }
+            raw
+        }
+        GroupedBuckets::Pair(pair) => {
+            let mut raw = Vec::with_capacity(
+                pair.values.len()
+                    + pair.first_null.len()
+                    + pair.second_null.len()
+                    + usize::from(pair.both_null.is_some()),
+            );
+            raw.extend(pair.values.into_iter().map(|(packed, bucket)| {
                 let (first, second) = unpack_pair_group_key(packed);
                 OrdGroupedBucket {
-                    ord_keys: vec![first, second],
+                    ord_keys: vec![Some(first), Some(second)],
                     accums: bucket.accums,
                 }
-            })
-            .collect(),
+            }));
+            raw.extend(
+                pair.first_null
+                    .into_iter()
+                    .map(|(second, bucket)| OrdGroupedBucket {
+                        ord_keys: vec![None, Some(second)],
+                        accums: bucket.accums,
+                    }),
+            );
+            raw.extend(
+                pair.second_null
+                    .into_iter()
+                    .map(|(first, bucket)| OrdGroupedBucket {
+                        ord_keys: vec![Some(first), None],
+                        accums: bucket.accums,
+                    }),
+            );
+            if let Some(bucket) = pair.both_null {
+                raw.push(OrdGroupedBucket {
+                    ord_keys: vec![None, None],
+                    accums: bucket.accums,
+                });
+            }
+            raw
+        }
         GroupedBuckets::Multi(map) => map.into_values().collect(),
         GroupedBuckets::Global(opt) => opt.into_iter().collect(),
     }
@@ -3526,7 +3677,7 @@ fn resolve_bucket(
         .ord_keys
         .iter()
         .zip(key_readers.iter())
-        .map(|(&ord, reader)| reader.resolve(ord))
+        .map(|(ord, reader)| reader.resolve(*ord))
         .collect();
 
     let mut metrics = std::collections::HashMap::new();
@@ -9359,6 +9510,308 @@ mod tests {
 
         let expected = expected_pair_group_metrics(n);
         assert_pair_grouped_metrics(buckets, &expected);
+    }
+
+    #[test]
+    fn pair_hash_map_keeps_swapped_keys_distinct() {
+        let mut buckets = PairHashMap::with_capacity_and_hasher(4, PairBuildHasher::default());
+        buckets.insert(
+            pack_pair_group_key(7, 11),
+            PairGroupedBucket {
+                accums: vec![CompactMetricAccum::Count(1)],
+            },
+        );
+        buckets.insert(
+            pack_pair_group_key(11, 7),
+            PairGroupedBucket {
+                accums: vec![CompactMetricAccum::Count(2)],
+            },
+        );
+
+        assert_eq!(buckets.len(), 2);
+        assert!(buckets.contains_key(&pack_pair_group_key(7, 11)));
+        assert!(buckets.contains_key(&pack_pair_group_key(11, 7)));
+    }
+
+    #[test]
+    fn pair_hasher_write_fallback_respects_full_input() {
+        use std::hash::Hasher;
+
+        let mut first = PairHasher::default();
+        let mut second = PairHasher::default();
+        let left = [0u8; 24];
+        let mut right = [0u8; 24];
+        right[23] = 1;
+
+        first.write(&left);
+        second.write(&right);
+
+        assert_ne!(first.finish(), second.finish());
+    }
+
+    #[test]
+    fn grouped_integer_group_by_distinguishes_negative_one_from_null() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::{
+            AggregationRequest, GroupedMetricAgg, GroupedMetricFunction, GroupedMetricsAggParams,
+            PartialAggResult, QueryClause, SearchRequest,
+        };
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "zone".into(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        for (doc_id, payload) in [
+            ("neg-1-a", json!({"zone": -1, "body": "phone"})),
+            ("neg-1-b", json!({"zone": -1, "body": "phone"})),
+            ("null-a", json!({"zone": null, "body": "phone"})),
+            ("null-b", json!({"body": "phone"})),
+            ("zero", json!({"zone": 0, "body": "phone"})),
+        ] {
+            engine.add_document(doc_id, payload).unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::from([(
+                "sql_grouped".into(),
+                AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
+                    group_by: vec!["zone".into()],
+                    metrics: vec![GroupedMetricAgg {
+                        output_name: "cnt".into(),
+                        function: GroupedMetricFunction::Count,
+                        field: None,
+                        field_expr: None,
+                    }],
+                    shard_top_k: None,
+                }),
+            )]),
+        };
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 5);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+
+        let mut actual = HashMap::new();
+        for bucket in buckets {
+            actual.insert(bucket.group_values[0].as_i64(), metric_count(bucket, "cnt"));
+        }
+
+        let expected = HashMap::from([(Some(-1), 2), (None, 2), (Some(0), 1)]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn grouped_pair_group_by_distinguishes_negative_one_from_null() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::{
+            AggregationRequest, GroupedMetricAgg, GroupedMetricFunction, GroupedMetricsAggParams,
+            PartialAggResult, QueryClause, SearchRequest,
+        };
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "brand".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "zone".into(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        for (doc_id, payload) in [
+            (
+                "apple-neg-a",
+                json!({"brand": "Apple", "zone": -1, "body": "phone"}),
+            ),
+            (
+                "apple-neg-b",
+                json!({"brand": "Apple", "zone": -1, "body": "phone"}),
+            ),
+            (
+                "apple-null",
+                json!({"brand": "Apple", "zone": null, "body": "phone"}),
+            ),
+            ("samsung-null", json!({"brand": "Samsung", "body": "phone"})),
+            (
+                "samsung-zero",
+                json!({"brand": "Samsung", "zone": 0, "body": "phone"}),
+            ),
+        ] {
+            engine.add_document(doc_id, payload).unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Match(HashMap::from([("body".to_string(), json!("phone"))])),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::from([(
+                "sql_grouped".into(),
+                AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
+                    group_by: vec!["brand".into(), "zone".into()],
+                    metrics: vec![GroupedMetricAgg {
+                        output_name: "cnt".into(),
+                        function: GroupedMetricFunction::Count,
+                        field: None,
+                        field_expr: None,
+                    }],
+                    shard_top_k: None,
+                }),
+            )]),
+        };
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 5);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+
+        let mut actual = HashMap::new();
+        for bucket in buckets {
+            let brand = bucket.group_values[0].as_str().unwrap().to_string();
+            actual.insert(
+                (brand, bucket.group_values[1].as_i64()),
+                metric_count(bucket, "cnt"),
+            );
+        }
+
+        let expected = HashMap::from([
+            (("Apple".to_string(), Some(-1)), 2),
+            (("Apple".to_string(), None), 1),
+            (("Samsung".to_string(), None), 1),
+            (("Samsung".to_string(), Some(0)), 1),
+        ]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn grouped_multi_group_by_distinguishes_negative_one_from_null() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::{
+            AggregationRequest, GroupedMetricAgg, GroupedMetricFunction, GroupedMetricsAggParams,
+            PartialAggResult, QueryClause, SearchRequest,
+        };
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "brand".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "zone".into(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "shelf".into(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        for (doc_id, payload) in [
+            (
+                "apple-neg-top-a",
+                json!({"brand": "Apple", "zone": -1, "shelf": "top", "body": "phone"}),
+            ),
+            (
+                "apple-neg-top-b",
+                json!({"brand": "Apple", "zone": -1, "shelf": "top", "body": "phone"}),
+            ),
+            (
+                "apple-null-top",
+                json!({"brand": "Apple", "zone": null, "shelf": "top", "body": "phone"}),
+            ),
+            (
+                "apple-null-bottom",
+                json!({"brand": "Apple", "shelf": "bottom", "body": "phone"}),
+            ),
+            (
+                "samsung-zero-bottom",
+                json!({"brand": "Samsung", "zone": 0, "shelf": "bottom", "body": "phone"}),
+            ),
+        ] {
+            engine.add_document(doc_id, payload).unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: HashMap::from([(
+                "sql_grouped".into(),
+                AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
+                    group_by: vec!["brand".into(), "zone".into(), "shelf".into()],
+                    metrics: vec![GroupedMetricAgg {
+                        output_name: "cnt".into(),
+                        function: GroupedMetricFunction::Count,
+                        field: None,
+                        field_expr: None,
+                    }],
+                    shard_top_k: None,
+                }),
+            )]),
+        };
+
+        let (_, total, partial_aggs) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 5);
+
+        let PartialAggResult::GroupedMetrics { buckets } = &partial_aggs["sql_grouped"] else {
+            panic!("expected grouped metrics");
+        };
+
+        let mut actual = HashMap::new();
+        for bucket in buckets {
+            let brand = bucket.group_values[0].as_str().unwrap().to_string();
+            let shelf = bucket.group_values[2].as_str().unwrap().to_string();
+            actual.insert(
+                (brand, bucket.group_values[1].as_i64(), shelf),
+                metric_count(bucket, "cnt"),
+            );
+        }
+
+        let expected = HashMap::from([
+            (("Apple".to_string(), Some(-1), "top".to_string()), 2),
+            (("Apple".to_string(), None, "top".to_string()), 1),
+            (("Apple".to_string(), None, "bottom".to_string()), 1),
+            (("Samsung".to_string(), Some(0), "bottom".to_string()), 1),
+        ]);
+        assert_eq!(actual, expected);
     }
 
     #[test]

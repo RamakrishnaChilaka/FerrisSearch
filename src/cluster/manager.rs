@@ -49,6 +49,15 @@ impl ClusterManager {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.ping_node(&node_id.to_string());
     }
+
+    /// Returns true when the cluster state currently contains the node.
+    pub fn contains_node(&self, node_id: &str) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .nodes
+            .contains_key(node_id)
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +137,14 @@ mod tests {
         assert!(state.nodes.contains_key("raft-node"));
         assert_eq!(state.nodes["raft-node"].raft_node_id, 42);
         assert_eq!(state.master_node, Some("raft-node".into()));
+    }
+
+    #[test]
+    fn contains_node_reads_without_cloning_state() {
+        let cm = ClusterManager::new("test".into());
+        cm.add_node(make_node("n1", 1));
+
+        assert!(cm.contains_node("n1"));
+        assert!(!cm.contains_node("missing"));
     }
 }
