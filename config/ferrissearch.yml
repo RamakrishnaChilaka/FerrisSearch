@@ -6,5 +6,10 @@ cluster_name: "ferrissearch-local"
 http_port: 9200
 transport_port: 9300
 
+# SQL analytics
+# Default is true. Set to false if you want exact coordinator-side merge
+# instead of approximate shard-level top-K pruning for eligible GROUP BY queries.
+# sql_approximate_top_k: false
+
 # Storage
 # data_dir: "./data/ferrissearch-dev-1"

@@ -254,7 +254,7 @@ On Apr 10 2026, the benchmark set above was re-run against the current post-forc
 
 This query is still the worst-case shape in the appendix: a full-scan `GROUP BY (PULocationID, DOLocationID)` over the entire 243.6M-row corpus, ordered by ride count, with only the top 10 rows returned at the end. The current `EXPLAIN` plan for the exact archived query keeps it on `tantivy_grouped_partials`, but still shows `limit_pushed_down: false` and applies `top_k_selection` only in the final SQL-shaping stage after shard partials have already been collected and merged.
 
-Approximate shard-level top-K pruning exists for exactly this kind of query, but it is opt-in and the current config still uses the default `sql_approximate_top_k: false`. That means each shard keeps the full route-bucket map and ships it to the coordinator before the top 10 is selected. The pickup-zone query only has 265 groups, so it stays relatively cheap; the route query has far higher bucket cardinality, so it remains expensive even after force-merge.
+Approximate shard-level top-K pruning exists for exactly this kind of query. At the time of this rerun, it was still disabled for the measured cluster, so each shard kept the full route-bucket map and shipped it to the coordinator before the top 10 was selected. The pickup-zone query only has 265 groups, so it stays relatively cheap; the route query has far higher bucket cardinality, so it remains expensive even after force-merge.
 
 ---
 

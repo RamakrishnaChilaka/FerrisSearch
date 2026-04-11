@@ -242,6 +242,7 @@ async fn explain_sql_returns_plan_without_executing() {
     );
     assert_eq!(body["pushdown_summary"]["pushed_filter_count"], 1);
     assert_eq!(body["columns"]["group_by"], json!(["brand"]));
+    assert_eq!(body["approximate_top_k"], json!(false));
 
     let pipeline = body["pipeline"].as_array().unwrap();
     assert_eq!(pipeline.len(), 4);
@@ -466,7 +467,8 @@ async fn explain_analyze_fast_fields_returns_timings() {
 
 #[tokio::test]
 async fn search_sql_order_by_aggregate_expr_without_alias_uses_grouped_partials() {
-    let (_tmp, state) = make_test_app_state("products").await;
+    let (_tmp, mut state) = make_test_app_state("products").await;
+    state.sql_approximate_top_k = true;
 
     let (status, Json(body)) = search_sql(
         State(state),
@@ -480,6 +482,7 @@ async fn search_sql_order_by_aggregate_expr_without_alias_uses_grouped_partials(
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["execution_mode"], "tantivy_grouped_partials");
+    assert_eq!(body["approximate_top_k"], json!(true));
     assert_eq!(body["matched_hits"], 3);
 
     let columns = body["columns"].as_array().unwrap();
@@ -491,6 +494,26 @@ async fn search_sql_order_by_aggregate_expr_without_alias_uses_grouped_partials(
     assert_eq!(rows[0].get(&metric_column), Some(&json!(1898.0)));
     assert_eq!(rows[1]["brand"], json!("Samsung"));
     assert_eq!(rows[1].get(&metric_column), Some(&json!(799.0)));
+}
+
+#[tokio::test]
+async fn explain_analyze_reports_approximate_top_k_when_enabled() {
+    let (_tmp, mut state) = make_test_app_state("products").await;
+    state.sql_approximate_top_k = true;
+
+    let (status, Json(body)) = explain_sql(
+        State(state),
+        Path(crate::common::IndexName::new("products").unwrap()),
+        Json(SqlQueryRequest {
+            query: "SELECT brand, COUNT(*) AS posts FROM products GROUP BY brand ORDER BY posts DESC LIMIT 2".to_string(),
+            analyze: true,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["execution_mode"], "tantivy_grouped_partials");
+    assert_eq!(body["approximate_top_k"], json!(true));
 }
 
 // -------- Tests for global SQL helper functions --------

@@ -1094,10 +1094,11 @@ impl QueryPlan {
                 })
                 .collect();
 
-            // Shard-level top-K pruning is opt-in via `sql_approximate_top_k: true`
-            // in ferrissearch.yml.  Standard SQL engines compute exact GROUP BY
-            // results; this approximation trades correctness for latency on
-            // high-cardinality full-scan GROUP BY with ORDER BY + LIMIT.
+            // Shard-level top-K pruning is controlled by `sql_approximate_top_k`
+            // in ferrissearch.yml and defaults to enabled. Standard SQL engines
+            // compute exact GROUP BY results; this approximation trades some
+            // correctness for latency on high-cardinality full-scan GROUP BY
+            // with ORDER BY + LIMIT.
             //
             // Safety guards (when enabled):
             // - Disabled when HAVING is present (pruned groups could satisfy

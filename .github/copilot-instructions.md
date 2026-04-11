@@ -104,7 +104,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 985 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 42 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 179 assertions) = 1165 total
+- 990 unit tests + 64 CLI tests + 33 consensus integration + 39 replication integration + 42 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 179 assertions) = 1170 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -166,6 +166,7 @@ pub struct AppState {
     pub sql_approximate_top_k: bool,
 }
 ```
+- `sql_approximate_top_k` currently defaults to `true`; eligible grouped-partials `GROUP BY ... ORDER BY metric LIMIT N` queries use shard-level approximate top-K pruning unless the user disables it in config
 
 ## Core Data Structures (src/cluster/state.rs)
 
