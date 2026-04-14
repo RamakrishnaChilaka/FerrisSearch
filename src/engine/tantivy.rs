@@ -1,5 +1,6 @@
 use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -48,6 +49,31 @@ pub struct HotEngine {
 
 const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 10_000;
 const TANTIVY_WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn join_scoped_handles<'scope, T>(
+    handles: Vec<std::thread::ScopedJoinHandle<'scope, T>>,
+    context: &'static str,
+) -> Result<Vec<T>> {
+    handles
+        .into_iter()
+        .map(|handle| {
+            handle.join().map_err(|panic| {
+                let message = panic_payload_message(panic.as_ref());
+                anyhow::anyhow!("{context} thread panicked: {message}")
+            })
+        })
+        .collect()
+}
 
 impl HotEngine {
     pub fn new<P: AsRef<Path>>(data_dir: P, refresh_interval: Duration) -> Result<Self> {
@@ -172,6 +198,36 @@ impl HotEngine {
         engine.replay_translog()?;
 
         Ok(engine)
+    }
+
+    fn with_translog<T>(
+        &self,
+        context: &'static str,
+        f: impl FnOnce(&dyn WriteAheadLog) -> Result<T>,
+    ) -> Result<T> {
+        let tl = self
+            .translog
+            .lock()
+            .map_err(|_| anyhow::anyhow!("translog lock poisoned during {}", context))?;
+        f(&*tl)
+    }
+
+    fn with_translog_recover<T>(
+        &self,
+        context: &'static str,
+        f: impl FnOnce(&dyn WriteAheadLog) -> T,
+    ) -> T {
+        let tl = match self.translog.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    operation = context,
+                    "translog lock poisoned; continuing with inner state"
+                );
+                poisoned.into_inner()
+            }
+        };
+        f(&*tl)
     }
 
     /// Get (or lazily register) a field by name.
@@ -870,8 +926,7 @@ impl HotEngine {
             .unwrap_or_else(|e| e.into_inner())
             .id_field;
 
-        {
-            let tl = self.translog.lock().unwrap();
+        self.with_translog("startup translog replay", |tl| {
             let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
 
             tl.for_each_from(committed_next_seq, &mut |entry| {
@@ -915,7 +970,8 @@ impl HotEngine {
             if batch_count > 0 {
                 writer.commit()?;
             }
-        }
+            Ok(())
+        })?;
 
         if replayed > 0 {
             self.reader.reload()?;
@@ -1219,14 +1275,12 @@ impl HotEngine {
     /// are retained for replica recovery via translog replay.
     /// Returns the highest seq_no written to the WAL.
     pub fn last_seq_no(&self) -> u64 {
-        let tl = self.translog.lock().unwrap();
-        tl.last_seq_no()
+        self.with_translog_recover("last_seq_no", |tl| tl.last_seq_no())
     }
 
     /// Return the current on-disk size of the translog in bytes.
     pub fn translog_size_bytes(&self) -> u64 {
-        let tl = self.translog.lock().unwrap();
-        tl.size_bytes().unwrap_or(0)
+        self.with_translog_recover("translog_size_bytes", |tl| tl.size_bytes().unwrap_or(0))
     }
 
     /// Best-effort checkpoint-aware flush used by background auto-flush.
@@ -1236,9 +1290,14 @@ impl HotEngine {
         let tl = match self.translog.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                anyhow::bail!("translog lock poisoned during checkpoint-aware flush")
+            }
         };
         let committed_next_seq = tl.next_seq_no();
+        // Keep the existing writer-lock recovery policy here. A poisoned
+        // translog lock makes the WAL retention boundary ambiguous; a poisoned
+        // writer lock does not.
         let mut writer = match self.writer.try_write() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
@@ -1257,19 +1316,20 @@ impl HotEngine {
     }
 
     pub fn flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<()> {
-        let tl = self.translog.lock().unwrap();
-        let committed_next_seq = tl.next_seq_no();
-        let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        writer.commit()?;
-        drop(writer);
-        self.reader.reload()?;
-        self.persist_committed_next_seq_no(committed_next_seq)?;
-        if global_checkpoint > 0 {
-            tl.truncate_below(global_checkpoint)?;
-        } else {
-            tl.truncate()?;
-        }
-        Ok(())
+        self.with_translog("checkpoint-aware flush", |tl| {
+            let committed_next_seq = tl.next_seq_no();
+            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            writer.commit()?;
+            drop(writer);
+            self.reader.reload()?;
+            self.persist_committed_next_seq_no(committed_next_seq)?;
+            if global_checkpoint > 0 {
+                tl.truncate_below(global_checkpoint)?;
+            } else {
+                tl.truncate()?;
+            }
+            Ok(())
+        })
     }
 
     /// Extract the primary sort field and direction from a SearchRequest,
@@ -1671,11 +1731,8 @@ impl HotEngine {
                         })
                     })
                     .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("segment scan thread panicked"))
-                    .collect()
-            });
+                join_scoped_handles(handles, "segment scan")
+            })?;
 
         // Merge across segments
         let mut merged: std::collections::HashMap<
@@ -4519,8 +4576,7 @@ impl super::SearchEngine for HotEngine {
         // Keep WAL append and the corresponding writer mutation in one critical
         // section so refresh/flush cannot commit past a translog entry that has
         // not yet been applied to the Tantivy writer.
-        {
-            let tl = self.translog.lock().unwrap();
+        self.with_translog("document indexing", |tl| {
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
                 "_source": payload
@@ -4539,7 +4595,8 @@ impl super::SearchEngine for HotEngine {
             // 3. Write to Tantivy in-memory buffer
             let doc = self.build_tantivy_doc(doc_id, &payload);
             writer.add_document(doc)?;
-        }
+            Ok(())
+        })?;
 
         Ok(doc_id.to_string())
     }
@@ -4550,8 +4607,7 @@ impl super::SearchEngine for HotEngine {
         payload: serde_json::Value,
         seq_no: u64,
     ) -> Result<String> {
-        {
-            let tl = self.translog.lock().unwrap();
+        self.with_translog("replica document indexing", |tl| {
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
                 "_source": payload
@@ -4568,7 +4624,8 @@ impl super::SearchEngine for HotEngine {
 
             let doc = self.build_tantivy_doc(doc_id, &payload);
             writer.add_document(doc)?;
-        }
+            Ok(())
+        })?;
 
         Ok(doc_id.to_string())
     }
@@ -4585,8 +4642,7 @@ impl super::SearchEngine for HotEngine {
             })
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
-        {
-            let tl = self.translog.lock().unwrap();
+        self.with_translog("bulk indexing", |tl| {
             tl.write_bulk(&ops)?;
 
             // 2. Write all docs to Tantivy in-memory buffer under one lock
@@ -4603,7 +4659,8 @@ impl super::SearchEngine for HotEngine {
                 writer.add_document(doc)?;
                 doc_ids.push(doc_id.clone());
             }
-        }
+            Ok(())
+        })?;
 
         Ok(doc_ids)
     }
@@ -4623,8 +4680,7 @@ impl super::SearchEngine for HotEngine {
             })
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
-        {
-            let tl = self.translog.lock().unwrap();
+        self.with_translog("replica bulk indexing", |tl| {
             tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
 
             let registry = self
@@ -4639,14 +4695,14 @@ impl super::SearchEngine for HotEngine {
                 writer.add_document(doc)?;
                 doc_ids.push(doc_id.clone());
             }
-        }
+            Ok(())
+        })?;
 
         Ok(doc_ids)
     }
 
     fn delete_document(&self, doc_id: &str) -> Result<u64> {
-        {
-            let tl = self.translog.lock().unwrap();
+        self.with_translog("document delete", |tl| {
             tl.append(
                 crate::wal::WalOperation::Delete,
                 serde_json::json!({ "_doc_id": doc_id }),
@@ -4662,13 +4718,13 @@ impl super::SearchEngine for HotEngine {
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             // delete_term returns an OpStamp, not a count — we report 1 optimistically
             let _ = opstamp;
-        }
+            Ok(())
+        })?;
         Ok(1)
     }
 
     fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
-        {
-            let tl = self.translog.lock().unwrap();
+        self.with_translog("replica document delete", |tl| {
             tl.append_with_seq(
                 seq_no,
                 crate::wal::WalOperation::Delete,
@@ -4683,7 +4739,8 @@ impl super::SearchEngine for HotEngine {
             let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             let _ = opstamp;
-        }
+            Ok(())
+        })?;
         Ok(1)
     }
 
@@ -4711,39 +4768,38 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn refresh(&self) -> Result<()> {
-        let committed_next_seq = {
-            let tl = self.translog.lock().unwrap();
+        let committed_next_seq = self.with_translog("refresh", |tl| {
             let next_seq = tl.next_seq_no();
             let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
             writer.commit()?;
-            next_seq
-        };
+            Ok(next_seq)
+        })?;
         self.persist_committed_next_seq_no(committed_next_seq)?;
         self.reader.reload()?;
         Ok(())
     }
 
     fn flush(&self) -> Result<()> {
-        let tl = self.translog.lock().unwrap();
-        let committed_next_seq = tl.next_seq_no();
-        let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-        writer.commit()?;
-        drop(writer); // release lock before reader reload
-        self.reader.reload()?;
-        self.persist_committed_next_seq_no(committed_next_seq)?;
-        tl.truncate()?;
-        Ok(())
+        self.with_translog("flush", |tl| {
+            let committed_next_seq = tl.next_seq_no();
+            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            writer.commit()?;
+            drop(writer); // release lock before reader reload
+            self.reader.reload()?;
+            self.persist_committed_next_seq_no(committed_next_seq)?;
+            tl.truncate()?;
+            Ok(())
+        })
     }
 
     fn force_merge(&self, max_num_segments: usize) -> Result<()> {
         // Commit first so all buffered docs are in segments.
-        let committed_next_seq = {
-            let tl = self.translog.lock().unwrap();
+        let committed_next_seq = self.with_translog("force merge", |tl| {
             let next_seq = tl.next_seq_no();
             let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
             writer.commit()?;
-            next_seq
-        };
+            Ok(next_seq)
+        })?;
         self.persist_committed_next_seq_no(committed_next_seq)?;
         self.reader.reload()?;
 
@@ -5600,6 +5656,7 @@ mod tests {
     use crate::search::{QueryClause, SearchRequest};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Duration;
 
     /// Helper: create a HotEngine backed by a temp directory.
@@ -8610,6 +8667,59 @@ mod tests {
         assert!(!flushed);
     }
 
+    #[test]
+    fn try_flush_with_global_checkpoint_returns_error_when_translog_is_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = engine.translog.lock().unwrap();
+            panic!("poison translog lock");
+        }));
+
+        let err = engine.try_flush_with_global_checkpoint(1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("translog lock poisoned during checkpoint-aware flush")
+        );
+    }
+
+    #[test]
+    fn add_document_returns_error_when_translog_lock_is_poisoned() {
+        let (_dir, engine) = create_engine();
+
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = engine.translog.lock().unwrap();
+            panic!("poison translog lock");
+        }));
+
+        let err = engine
+            .add_document("doc-1", json!({"title": "poisoned"}))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("translog lock poisoned during document indexing")
+        );
+        assert_eq!(engine.doc_count(), 0);
+    }
+
+    #[test]
+    fn refresh_returns_error_when_translog_lock_is_poisoned() {
+        let (_dir, engine) = create_engine();
+
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = engine.translog.lock().unwrap();
+            panic!("poison translog lock");
+        }));
+
+        let err = engine.refresh().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("translog lock poisoned during refresh")
+        );
+    }
+
     // ── refresh visibility ──────────────────────────────────────────────
 
     #[test]
@@ -10836,6 +10946,22 @@ mod tests {
             .expect("empty result should still emit one empty batch");
         assert_eq!(first.num_rows(), 0);
         assert!(handle.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn join_scoped_handles_returns_error_when_worker_panics() {
+        let message = std::thread::scope(|scope| {
+            let handles = vec![
+                scope.spawn(|| 1usize),
+                scope.spawn(|| -> usize { panic!("segment boom") }),
+            ];
+            join_scoped_handles(handles, "segment scan")
+                .unwrap_err()
+                .to_string()
+        });
+
+        assert!(message.contains("segment scan thread panicked"));
+        assert!(message.contains("segment boom"));
     }
 
     #[test]

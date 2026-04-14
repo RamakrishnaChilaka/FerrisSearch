@@ -105,7 +105,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1008 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 44 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1194 total
+- 1014 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 44 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1200 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -496,14 +496,14 @@ ReplicaCheckpoint { checkpoint: u64, last_updated: Instant }
 
 ### TranslogEntry & WriteAheadLog Trait
 ```rust
-TranslogEntry { seq_no: u64, op: String /* "index"|"delete" */, payload: Value }
+TranslogEntry { seq_no: u64, op: WalOperation, payload: Value }
 
 trait WriteAheadLog: Send + Sync {
-    fn append(&self, op: &str, payload: Value) -> Result<TranslogEntry>;
-    fn append_with_seq(&self, seq_no: u64, op: &str, payload: Value) -> Result<TranslogEntry>;
-    fn append_bulk(&self, ops: &[(&str, Value)]) -> Result<Vec<TranslogEntry>>;
-    fn write_bulk(&self, ops: &[(&str, Value)]) -> Result<()>;
-    fn write_bulk_with_start_seq(&self, start_seq_no: u64, ops: &[(&str, Value)]) -> Result<()>;
+    fn append(&self, op: WalOperation, payload: Value) -> Result<TranslogEntry>;
+    fn append_with_seq(&self, seq_no: u64, op: WalOperation, payload: Value) -> Result<TranslogEntry>;
+    fn append_bulk(&self, ops: &[(WalOperation, Value)]) -> Result<Vec<TranslogEntry>>;
+    fn write_bulk(&self, ops: &[(WalOperation, Value)]) -> Result<()>;
+    fn write_bulk_with_start_seq(&self, start_seq_no: u64, ops: &[(WalOperation, Value)]) -> Result<()>;
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;  // replica recovery
     fn truncate(&self) -> Result<()>;       // clear after commit
@@ -519,11 +519,15 @@ trait WriteAheadLog: Send + Sync {
 - Length-prefixed: `[u32 LE: payload_len][bincode(WireEntry { seq_no, op, payload_json })]`
 - Seq numbers are monotonically increasing, survive generation rolls (persisted in `.seqno` file)
 - On-disk files are `translog-<generation>.bin` plus `translog.manifest`; reopen requires the manifest, trusts it for retained generation metadata, scans only the active generation file, and ignores unrelated non-generation side files
+- Unknown operation tags in persisted entries must surface as reopen/replay errors instead of panicking the node
 - `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only fully obsolete generations whose max seq_no is at or below the checkpoint; mixed generations are retained for replica recovery instead of being rewritten in place
 - `truncate()` rolls to a new empty generation and deletes all older generations
 - `translog.committed` stores the exclusive committed seq_no so restart replay skips already committed entries; replay persists this checkpoint after each intermediate batch commit to stay idempotent across repeated crash recovery
 - Persist the manifest before deleting pruned generation files so crashes never strand retained generations without authoritative metadata
 - Handles partial writes at EOF gracefully (skips/truncates)
+
+### HotEngine Wrapper Locking
+- `HotEngine` wraps the WAL in a separate `Arc<Mutex<dyn WriteAheadLog>>`; poisoned wrapper locks must return `Result` errors on write, refresh, flush, and force-merge paths instead of panicking request handlers
 
 ## Replication Protocol (src/replication/mod.rs)
 - `replicate_write(transport_client, cluster_state, index, shard_id, doc_id, payload, op, seq_no)` — sync single write to all replicas

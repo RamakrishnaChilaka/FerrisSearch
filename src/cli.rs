@@ -1985,7 +1985,10 @@ mod tests {
             metadata_approximate_top_k_label(&serde_json::json!({ "approximate_top_k": false })),
             Some("approx top-k: off")
         );
-        assert_eq!(metadata_approximate_top_k_label(&serde_json::json!({})), None);
+        assert_eq!(
+            metadata_approximate_top_k_label(&serde_json::json!({})),
+            None
+        );
     }
 
     #[test]
@@ -1998,7 +2001,10 @@ mod tests {
             explain_approximate_top_k_status(&serde_json::json!({ "approximate_top_k": false })),
             Some("disabled")
         );
-        assert_eq!(explain_approximate_top_k_status(&serde_json::json!({})), None);
+        assert_eq!(
+            explain_approximate_top_k_status(&serde_json::json!({})),
+            None
+        );
     }
 
     #[test]
