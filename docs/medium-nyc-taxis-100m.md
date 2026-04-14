@@ -6,7 +6,7 @@
 
 ## The Dataset
 
-243 million high-volume for-hire vehicle (FHVHV) trips in New York City — every Uber and Lyft ride recorded by the [NYC Taxi & Limousine Commission](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) from January 2024 through early 2025. Two carriers, 265 taxi zones, and $6.5 billion in fare revenue.
+243 million high-volume for-hire vehicle (FHVHV) trips in New York City — every Uber and Lyft ride recorded by the [NYC Taxi & Limousine Commission](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) from the 2025 monthly releases. Two carriers, 265 taxi zones, and $6.5 billion in fare revenue.
 
 The TLC publishes trip-level data for all licensed vehicles. In the HVFHS dataset, each row is a single ride dispatched by a high-volume platform. The two active HVFHS license holders are **Uber** (HV0003, dispatching through 30+ base entities) and **Lyft** (HV0005, dispatching through 2 bases). See the [TLC Trip Record User Guide](https://www.nyc.gov/assets/tlc/downloads/pdf/trip_record_user_guide.pdf) for full field definitions.
 
@@ -14,7 +14,7 @@ The TLC publishes trip-level data for all licensed vehicles. In the HVFHS datase
 |--------|-------|
 | Total rides | 243,589,684 |
 | Carriers | Uber (HV0003), Lyft (HV0005) |
-| Shards | 12 |
+| Benchmark cluster | 3 nodes, 24 shards |
 | Fields | 25 |
 | Avg trip distance | ~5 miles |
 
@@ -211,56 +211,39 @@ WAV drivers earn a 10-percentage-point payout premium on **every ride**, not jus
 
 ## Query Performance
 
-Representative latencies from the full 243.6M-row dataset (3 nodes, 12 shards, 1 segment per shard post-force-merge, i5-13600K, warm cache, best of 3 runs):
+Canonical benchmark numbers for the full 243.6M-row dataset on the current benchmark cluster:
 
-These timings come from the benchmark build used for the original draft. Current builds keep more of the appendix queries on `tantivy_grouped_partials`, including the carrier margin-gap query.
+### Azure 32-Core Benchmark
 
-| Query | Hits Scanned | Execution Mode | Latency |
-|-------|-------------|----------------|--------|
-| `SELECT count(*) FROM "nyc-taxis"` | 243.6M | count_star_fast | **2ms** |
-| Carrier market share (GROUP BY license, 3 metrics) | 243.6M | tantivy_grouped_partials | **506ms** |
-| Fee stack by carrier (GROUP BY license, 6 metrics) | 243.6M | tantivy_grouped_partials | **1.65s** |
-| Top 5 pickup zones (GROUP BY zone, 5 metrics, LIMIT) | 243.6M | tantivy_fast_fields | **9.6s** |
-| Top 10 routes (GROUP BY 2 cols, 3 metrics, LIMIT) | 243.6M | tantivy_fast_fields | **9.6s** |
-| Margin gap (WHERE + expr GROUP BY, 4 metrics) | 243.1M | tantivy_fast_fields | **21s** |
-| Airport corridor (WHERE + 2-col GROUP BY, 5 metrics) | 1.5M | tantivy_fast_fields | **170ms** |
-| WAV headline (WHERE + GROUP BY, 4 metrics) | 699K | tantivy_fast_fields | **176ms** |
-| WAV short trips (<5 mi, WHERE + range + GROUP BY) | 489K | tantivy_fast_fields | **170ms** |
+Full 243.6M-row dataset, 3 nodes, 24 shards, **1 segment per shard post-force-merge**, Azure Standard_L32s_v4 (32 vCPU, 256 GB RAM, NVMe RAID0), `sql_approximate_top_k: true`, best of 10 runs via `scripts/benchmark_1pager.py`.
+
+| Query | Hits Scanned | Execution Mode | Best Latency |
+|-------|-------------|----------------|---------|
+| Count | 243,589,684 | `count_star_fast` | **0.4ms** |
+| Carrier market share | 243,589,684 | `tantivy_grouped_partials` | **207ms** |
+| Fee stack by carrier | 243,589,684 | `tantivy_grouped_partials` | **817ms** |
+| Top 5 pickup zones | 243,589,684 | `tantivy_grouped_partials` | **761ms** |
+| Top 10 routes | 243,589,684 | `tantivy_grouped_partials` | **1.43s** |
+| Margin gap | 243,110,337 | `tantivy_grouped_partials` | **1.18s** |
+| Airport corridor | 1,489,906 | `tantivy_grouped_partials` | **111ms** |
+| WAV headline | 698,730 | `tantivy_grouped_partials` | **32ms** |
+| WAV short trips | 489,193 | `tantivy_grouped_partials` | **69ms** |
+| Shared-ride discount | 175,964,464 | `tantivy_grouped_partials` | **692ms** |
+| WAV fleet effect | 243,204,544 | `tantivy_grouped_partials` | **606ms** |
 
 **Notes:**
-- All grouped analytics use either `tantivy_grouped_partials` (shard-local fast-field partial aggregation with coordinator merge) or `tantivy_fast_fields` (expression-based fallback with bitset streaming). No row materialization.
-- The `count_star_fast` path skips search entirely and reads segment metadata — 2ms across 243.6M docs.
-- `tantivy_grouped_partials` handles simple GROUP BY shapes at sub-second latency even on 243M rows (506ms for carrier market share). At the time of these measurements, several ratio-heavy grouped queries still fell to `tantivy_fast_fields`; current builds keep plain grouped ratio queries like `AVG(base_passenger_fare / trip_miles)` on `tantivy_grouped_partials`, and only unsupported residual shapes fall back.
-- Filtered queries (WHERE on keyword + range) narrow to sub-million hit sets before aggregation; these complete in **under 200ms** regardless of execution mode.
-- Force-merging to 1 segment per shard is critical for performance — eliminates per-segment overhead on 20M-doc shards.
-
-### Current Rerun vs Draft
-
-On Apr 10 2026, the benchmark set above was re-run against the current post-force-merge cluster using the archived shell query set from the benchmark notes, sent to `POST /nyc-taxis/_sql`, and taking the best wall-clock time from 3 runs per query.
-
-| Query | Published Draft | Current Rerun | Current Mode |
-|-------|-----------------|---------------|--------------|
-| `SELECT count(*) FROM "nyc-taxis"` | 2ms | 1.9ms | `count_star_fast` |
-| Carrier market share | 506ms | 696ms | `tantivy_grouped_partials` |
-| Fee stack by carrier | 1.65s | 2.97s | `tantivy_grouped_partials` |
-| Top 5 pickup zones | 9.6s | 2.66s | `tantivy_grouped_partials` |
-| Top 10 routes | 9.6s | 14.39s | `tantivy_grouped_partials` |
-| Margin gap | 21.0s | 3.44s | `tantivy_grouped_partials` |
-| Airport corridor | 170ms | 302ms | `tantivy_grouped_partials` |
-| WAV headline | 176ms | 88ms | `tantivy_grouped_partials` |
-| WAV short trips | 170ms | 161ms | `tantivy_grouped_partials` |
-
-### Why `Top 10 Routes` Is Still ~15s
-
-This query is still the worst-case shape in the appendix: a full-scan `GROUP BY (PULocationID, DOLocationID)` over the entire 243.6M-row corpus, ordered by ride count, with only the top 10 rows returned at the end. The current `EXPLAIN` plan for the exact archived query keeps it on `tantivy_grouped_partials`, but still shows `limit_pushed_down: false` and applies `top_k_selection` only in the final SQL-shaping stage after shard partials have already been collected and merged.
-
-Approximate shard-level top-K pruning exists for exactly this kind of query. At the time of this rerun, it was still disabled for the measured cluster, so each shard kept the full route-bucket map and shipped it to the coordinator before the top 10 was selected. The pickup-zone query only has 265 groups, so it stays relatively cheap; the route query has far higher bucket cardinality, so it remains expensive even after force-merge.
+- All 11 queries landed on `tantivy_grouped_partials` — no fallback to `tantivy_fast_fields` or row materialization.
+- Top 10 routes used `approximate_top_k: true` (shard-level pruning) on the highest-cardinality grouped query in the set.
+- Filtered queries (airport corridor, WAV headline, WAV short trips) complete in **32–111ms** with sub-2M hit sets.
+- Full-corpus scans over all 243.6M rows complete in **0.2–1.4s** depending on metric count and GROUP BY cardinality.
+- Force-merging to 1 segment per shard improved full-corpus query latency by ~25% vs pre-force-merge (e.g. carrier market share 298ms → 207ms).
+- The machine had 256 GB RAM with ~170 GB in buffer/cache at query time.
 
 ---
 
-## Exact Benchmark SQL
+## Benchmark SQL
 
-The 9 queries below are the exact SQL strings used for the Apr 10 2026 rerun and the side-by-side table above. These match the archived benchmark helper queries, including their rounding and filter thresholds.
+The Azure benchmark table above is driven by these query shapes. The first 9 queries are listed here exactly; the remaining 2 benchmarked queries appear later under Supporting Story SQL.
 
 ### 1. Count
 
@@ -521,8 +504,8 @@ ORDER BY wav_match_flag;
 
 ---
 
-*Data source: [NYC TLC FHVHV Trip Records](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page), 2024–2025 monthly parquet files. Field definitions per the [TLC Trip Record User Guide](https://www.nyc.gov/assets/tlc/downloads/pdf/trip_record_user_guide.pdf). HV0003 = Uber, HV0005 = Lyft, as identified by HVFHS license number in the official base-company mapping.*
+*Data source: [NYC TLC FHVHV Trip Records](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page), 2025 monthly parquet files. Field definitions per the [TLC Trip Record User Guide](https://www.nyc.gov/assets/tlc/downloads/pdf/trip_record_user_guide.pdf). HV0003 = Uber, HV0005 = Lyft, as identified by HVFHS license number in the official base-company mapping.*
 
 ---
 
-*Analysis performed on [FerrisSearch](https://github.com/rchilaka/ROpenSearch), a distributed search engine built in Rust. 243.6M documents across 12 shards, queried via SQL with grouped analytics on fast-field columnar storage. All queries ran on fast-field execution paths — no row materialization, no post-hoc aggregation.*
+*Analysis performed on [FerrisSearch](https://github.com/rchilaka/ROpenSearch), a distributed search engine built in Rust. 243.6M documents on a 1-node, 24-shard 32 core, 128 GB memory cluster, queried via SQL with grouped analytics on fast-field columnar storage. All queries ran on fast-field execution paths — no row materialization, no post-hoc aggregation.*

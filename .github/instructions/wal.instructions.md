@@ -12,7 +12,7 @@ pub enum TranslogDurability {
 ```rust
 pub struct TranslogEntry {
     pub seq_no: u64,        // monotonic, survives truncation (persisted in .seqno file)
-    pub op: String,         // "index" or "delete"
+    pub op: WalOperation,   // Index or Delete
     pub payload: Value,     // document JSON
 }
 ```
@@ -20,11 +20,11 @@ pub struct TranslogEntry {
 ## WriteAheadLog Trait
 ```rust
 pub trait WriteAheadLog: Send + Sync {
-    fn append(&self, op: &str, payload: Value) -> Result<TranslogEntry>;
-    fn append_with_seq(&self, seq_no: u64, op: &str, payload: Value) -> Result<TranslogEntry>;
-    fn append_bulk(&self, ops: &[(&str, Value)]) -> Result<Vec<TranslogEntry>>;
-    fn write_bulk(&self, ops: &[(&str, Value)]) -> Result<()>;
-    fn write_bulk_with_start_seq(&self, start_seq_no: u64, ops: &[(&str, Value)]) -> Result<()>;
+    fn append(&self, op: WalOperation, payload: Value) -> Result<TranslogEntry>;
+    fn append_with_seq(&self, seq_no: u64, op: WalOperation, payload: Value) -> Result<TranslogEntry>;
+    fn append_bulk(&self, ops: &[(WalOperation, Value)]) -> Result<Vec<TranslogEntry>>;
+    fn write_bulk(&self, ops: &[(WalOperation, Value)]) -> Result<()>;
+    fn write_bulk_with_start_seq(&self, start_seq_no: u64, ops: &[(WalOperation, Value)]) -> Result<()>;
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;  // replica recovery
     fn truncate(&self) -> Result<()>;
@@ -61,6 +61,7 @@ pub trait WriteAheadLog: Send + Sync {
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths
 - Async durability: background task fsyncs every `sync_interval_ms` via Tokio's blocking pool — never call `File::sync_data()` inline on an async worker
 - Reopen requires `translog.manifest`; it trusts persisted metadata for old generations, removes stray generation files not listed in the manifest, ignores unrelated non-generation side files, and scans only the active generation file to recover the allocator high-water mark
+- Unknown operation tags in persisted entries are corruption errors: reopen/replay must return `Err`, not panic
 - Persist the manifest before deleting obsolete generation files during `truncate()` / `truncate_below()` so crashes never leave startup without authoritative generation metadata
 - `translog.committed` should be persisted after each intermediate replay batch commit so replay remains idempotent across repeated crash recovery
 

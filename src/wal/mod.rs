@@ -60,14 +60,11 @@ pub enum WalOperation {
 
 impl WalOperation {
     /// Parse from the string representation used in the WAL wire format.
-    ///
-    /// # Panics
-    /// Panics on unknown operation types — a corrupt WAL entry.
-    pub fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Result<Self> {
         match s {
-            "index" => Self::Index,
-            "delete" => Self::Delete,
-            other => panic!("unknown WAL operation type: {other}"),
+            "index" => Ok(Self::Index),
+            "delete" => Ok(Self::Delete),
+            other => anyhow::bail!("unknown WAL operation type: {other}"),
         }
     }
 
@@ -120,7 +117,13 @@ impl WireEntry {
     fn into_translog(self) -> Result<TranslogEntry> {
         Ok(TranslogEntry {
             seq_no: self.seq_no,
-            op: WalOperation::parse(&self.op),
+            op: WalOperation::parse(&self.op).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to decode translog entry seq_no {}: {}",
+                    self.seq_no,
+                    error
+                )
+            })?,
             payload: serde_json::from_str(&self.payload_json)?,
         })
     }
@@ -427,12 +430,14 @@ struct TranslogState {
 }
 
 impl TranslogState {
-    fn active_generation_mut(&mut self) -> &mut GenerationInfo {
+    fn active_generation_index(&self) -> Result<usize> {
         let active_id = self.active_generation_id;
         self.generations
-            .iter_mut()
-            .find(|generation| generation.id == active_id)
-            .expect("active translog generation must exist")
+            .iter()
+            .position(|generation| generation.id == active_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("translog state is missing active generation {}", active_id)
+            })
     }
 
     fn generations_snapshot(&self) -> Vec<GenerationInfo> {
@@ -690,7 +695,12 @@ impl HotTranslog {
                 let active_generation = generations
                     .iter_mut()
                     .find(|generation| generation.id == active_generation_id)
-                    .expect("manifest validation guarantees active generation exists");
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "manifest active generation {} missing after generation load",
+                            active_generation_id
+                        )
+                    })?;
                 let active_scan = scan_generation_from_path(&active_generation.path)?;
                 active_generation.first_seq_no = active_scan.first_seq_no;
                 active_generation.last_seq_no = active_scan.last_seq_no;
@@ -893,13 +903,14 @@ impl HotTranslog {
 impl WriteAheadLog for HotTranslog {
     fn append(&self, op: WalOperation, payload: serde_json::Value) -> Result<TranslogEntry> {
         let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
         let seq_no = state.next_seq_no;
         let frame = encode_entry_borrowed(seq_no, op, &payload)?;
         state.active_file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
             state.active_file.sync_data()?;
         }
-        let generation = state.active_generation_mut();
+        let generation = &mut state.generations[generation_index];
         generation.observe_seq(seq_no);
         generation.size_bytes += frame.len() as u64;
         state.next_seq_no = state.next_seq_no.saturating_add(1);
@@ -920,12 +931,13 @@ impl WriteAheadLog for HotTranslog {
         payload: serde_json::Value,
     ) -> Result<TranslogEntry> {
         let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
         let frame = encode_entry_borrowed(seq_no, op, &payload)?;
         state.active_file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
             state.active_file.sync_data()?;
         }
-        let generation = state.active_generation_mut();
+        let generation = &mut state.generations[generation_index];
         generation.observe_seq(seq_no);
         generation.size_bytes += frame.len() as u64;
         state.next_seq_no = state.next_seq_no.max(seq_no.saturating_add(1));
@@ -941,6 +953,7 @@ impl WriteAheadLog for HotTranslog {
 
     fn append_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
         let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
         let start_seq_no = state.next_seq_no;
         let mut entries = Vec::with_capacity(ops.len());
         let mut buf = Vec::with_capacity(ops.len() * 200);
@@ -962,7 +975,7 @@ impl WriteAheadLog for HotTranslog {
             state.active_file.sync_data()?;
         }
         if let Some(last_seq_no) = last_seq_no {
-            let generation = state.active_generation_mut();
+            let generation = &mut state.generations[generation_index];
             generation.observe_seq(start_seq_no);
             generation.observe_seq(last_seq_no);
             generation.size_bytes += buf.len() as u64;
@@ -974,6 +987,7 @@ impl WriteAheadLog for HotTranslog {
 
     fn write_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<()> {
         let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
         let start_seq_no = state.next_seq_no;
         let mut buf = Vec::with_capacity(ops.len() * 200);
         let mut last_seq_no = None;
@@ -989,7 +1003,7 @@ impl WriteAheadLog for HotTranslog {
             state.active_file.sync_data()?;
         }
         if let Some(last_seq_no) = last_seq_no {
-            let generation = state.active_generation_mut();
+            let generation = &mut state.generations[generation_index];
             generation.observe_seq(start_seq_no);
             generation.observe_seq(last_seq_no);
             generation.size_bytes += buf.len() as u64;
@@ -1005,6 +1019,7 @@ impl WriteAheadLog for HotTranslog {
         ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<()> {
         let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
         let mut buf = Vec::with_capacity(ops.len() * 200);
         let mut last_seq_no = None;
 
@@ -1019,7 +1034,7 @@ impl WriteAheadLog for HotTranslog {
             state.active_file.sync_data()?;
         }
         if let Some(last_seq_no) = last_seq_no {
-            let generation = state.active_generation_mut();
+            let generation = &mut state.generations[generation_index];
             generation.observe_seq(start_seq_no);
             generation.observe_seq(last_seq_no);
             generation.size_bytes += buf.len() as u64;
@@ -1667,6 +1682,61 @@ mod tests {
 
         let tl = HotTranslog::open(dir.path()).unwrap();
         assert_eq!(tl.current_seq_no(), 8);
+    }
+
+    #[test]
+    fn open_returns_error_for_unknown_active_generation_wal_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let wire = WireEntry {
+            seq_no: 0,
+            op: "bogus".to_string(),
+            payload_json: serde_json::to_string(&json!({"doc": 1})).unwrap(),
+        };
+        let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
+        let mut frame = Vec::with_capacity(4 + encoded.len());
+        frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&encoded);
+        fs::write(generation_path(dir.path(), 0), &frame).unwrap();
+
+        let manifest = TranslogManifest {
+            version: TRANSLOG_MANIFEST_VERSION,
+            active_generation_id: 0,
+            next_generation_id: 1,
+            generations: vec![ManifestGenerationInfo {
+                id: 0,
+                first_seq_no: Some(0),
+                last_seq_no: Some(0),
+                size_bytes: frame.len() as u64,
+            }],
+        };
+        persist_translog_manifest(&manifest_path(dir.path()), &manifest).unwrap();
+
+        let err = match HotTranslog::open(dir.path()) {
+            Ok(_) => panic!("open should fail for unknown WAL operation type"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("unknown WAL operation type: bogus")
+        );
+    }
+
+    #[test]
+    fn append_returns_error_when_active_generation_is_missing_from_state() {
+        let (_dir, tl) = open_translog();
+        {
+            let mut state = tl.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.active_generation_id = 99;
+        }
+
+        let err = tl
+            .append(WalOperation::Index, json!({"doc": 1}))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("translog state is missing active generation 99")
+        );
+        assert!(tl.read_all().unwrap().is_empty());
     }
 
     // ── last_seq_no ─────────────────────────────────────────────────────
