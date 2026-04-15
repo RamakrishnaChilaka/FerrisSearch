@@ -88,22 +88,17 @@ pub struct FieldMapping {
 
 /// Controls whether unmapped fields in documents are auto-detected and added
 /// to the index mappings (OpenSearch-compatible `dynamic` parameter).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DynamicMapping {
     /// Auto-detect field types and add new fields to mappings on first encounter.
     True,
     /// Ignore unknown fields (index only into the "body" catch-all). This is the
     /// legacy behaviour and the default for backward compatibility.
+    #[default]
     False,
     /// Reject documents that contain fields not present in the explicit mappings.
     Strict,
-}
-
-impl Default for DynamicMapping {
-    fn default() -> Self {
-        Self::False
-    }
 }
 
 impl std::fmt::Display for DynamicMapping {
