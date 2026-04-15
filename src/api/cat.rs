@@ -582,6 +582,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing,
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         });
 
@@ -699,6 +700,7 @@ mod tests {
                 ),
             ]),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         });
         app_state.cluster_manager.update_state(cluster_state);

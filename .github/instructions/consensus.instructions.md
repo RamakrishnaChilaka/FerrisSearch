@@ -15,6 +15,7 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `DeleteIndex { index_name: String }` — delete index and all metadata
 - `SetMaster { node_id: String }` — set cluster master
 - `UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replicas, settings)
+- `AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
 
 ## ClusterResponse
 - `Ok` — command applied successfully

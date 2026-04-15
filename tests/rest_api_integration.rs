@@ -553,6 +553,7 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
                 },
             ),
         ]),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     };
 
@@ -2654,6 +2655,287 @@ async fn rest_sql_distributed_semijoin_merges_inner_groups_across_shards() -> Re
             "story-1-2",
             "story-2-0",
         ]
+    );
+
+    Ok(())
+}
+
+// ── Dynamic Mapping Integration Tests ──────────────────────────────────
+
+#[tokio::test]
+async fn dynamic_true_auto_creates_mappings_on_index() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    // Create index with dynamic: true, no explicit mappings.
+    let (status, body) = harness
+        .put_json(
+            "/dyntest",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 100
+                },
+                "mappings": {
+                    "dynamic": "true"
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["acknowledged"], json!(true));
+
+    // Index a document with previously unknown fields.
+    let (status, body) = harness
+        .put_json(
+            "/dyntest/_doc/1?refresh=true",
+            json!({
+                "title": "hello world",
+                "count": 42,
+                "price": 9.99,
+                "active": true
+            }),
+        )
+        .await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "expected 201, got {}: {}",
+        status,
+        body
+    );
+    assert_eq!(body["_id"], json!("1"));
+
+    // Verify cluster state has the auto-detected mappings.
+    let cs = harness.app_state.cluster_manager.get_state();
+    let idx = cs.indices.get("dyntest").expect("index should exist");
+    assert_eq!(
+        idx.dynamic,
+        ferrissearch::cluster::state::DynamicMapping::True
+    );
+    assert_eq!(idx.mappings["title"].field_type, FieldType::Text);
+    assert_eq!(idx.mappings["count"].field_type, FieldType::Integer);
+    assert_eq!(idx.mappings["price"].field_type, FieldType::Float);
+    assert_eq!(idx.mappings["active"].field_type, FieldType::Boolean);
+
+    // Retrieve the document.
+    let (status, body) = harness.get_json("/dyntest/_doc/1").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["_source"]["title"], "hello world");
+    assert_eq!(body["_source"]["count"], 42);
+
+    // The newly mapped numeric field must be searchable immediately, without a
+    // restart or unrelated shard reopen.
+    let (status, body) = harness
+        .post_json(
+            "/dyntest/_search",
+            json!({
+                "query": {
+                    "term": {
+                        "count": 42
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hits"]["total"]["value"], json!(1));
+    assert_eq!(body["hits"]["hits"][0]["_id"], json!("1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dynamic_false_index_does_not_add_mappings() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    // Create index with dynamic: false (default), no explicit field mappings.
+    let (status, _) = harness
+        .put_json(
+            "/statictest",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 100
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // Index a document — fields should go into the "body" catch-all.
+    let (status, _) = harness
+        .put_json(
+            "/statictest/_doc/1?refresh=true",
+            json!({"title": "hello", "count": 42}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Cluster state should have NO auto-detected mappings.
+    let cs = harness.app_state.cluster_manager.get_state();
+    let idx = cs.indices.get("statictest").expect("index should exist");
+    assert!(
+        idx.mappings.is_empty(),
+        "dynamic=false should not auto-create mappings, got: {:?}",
+        idx.mappings
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dynamic_strict_rejects_unknown_fields() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    // Create index with dynamic: strict + one known field.
+    let (status, body) = harness
+        .put_json(
+            "/stricttest",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 100
+                },
+                "mappings": {
+                    "dynamic": "strict",
+                    "properties": {
+                        "title": { "type": "text" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["acknowledged"], json!(true));
+
+    // Index a document with a known field — should succeed.
+    let (status, _) = harness
+        .put_json(
+            "/stricttest/_doc/ok?refresh=true",
+            json!({"title": "hello"}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Index a document with an unknown field — should be rejected.
+    let (status, body) = harness
+        .put_json(
+            "/stricttest/_doc/bad",
+            json!({"title": "hello", "unknown_field": 123}),
+        )
+        .await?;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "strict mode should reject unknown fields, got status {}",
+        status
+    );
+    let error_msg = body.to_string();
+    assert!(
+        error_msg.contains("unknown_field") || error_msg.contains("strict"),
+        "error should mention the unknown field or strict mode, got: {}",
+        error_msg
+    );
+
+    // Arrays/objects are not inferable, but strict mode must still reject them
+    // as unknown top-level fields.
+    let (status, body) = harness
+        .put_json(
+            "/stricttest/_doc/nested",
+            json!({"title": "hello", "metadata": {"nested": true}, "tags": ["x"]}),
+        )
+        .await?;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "strict mode should reject unknown object/array fields, got status {}",
+        status
+    );
+    let error_msg = body.to_string();
+    assert!(
+        error_msg.contains("metadata") || error_msg.contains("tags"),
+        "error should mention unknown nested fields, got: {}",
+        error_msg
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dynamic_true_bulk_index_creates_mappings() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    // Create index with dynamic: true.
+    let (status, _) = harness
+        .put_json(
+            "/bulkdyn",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 100
+                },
+                "mappings": {
+                    "dynamic": "true"
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // Bulk index with NDJSON.
+    let ndjson = r#"{"index":{"_id":"b1"}}
+{"name":"Alice","age":30}
+{"index":{"_id":"b2"}}
+{"name":"Bob","age":25,"score":9.5}
+"#;
+    let response = harness
+        .client
+        .post(format!("{}/bulkdyn/_bulk?refresh=true", harness.base_url))
+        .header(CONTENT_TYPE, "application/x-ndjson")
+        .body(ndjson.to_string())
+        .send()
+        .await?;
+    assert!(response.status().is_success());
+
+    // Verify mappings were auto-detected.
+    let cs = harness.app_state.cluster_manager.get_state();
+    let idx = cs.indices.get("bulkdyn").expect("index should exist");
+    assert_eq!(idx.mappings["name"].field_type, FieldType::Text);
+    assert_eq!(idx.mappings["age"].field_type, FieldType::Integer);
+    assert_eq!(idx.mappings["score"].field_type, FieldType::Float);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_settings_exposes_dynamic_field() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    // Create index with dynamic: true.
+    let (status, _) = harness
+        .put_json(
+            "/settingstest",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                },
+                "mappings": {
+                    "dynamic": "true"
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = harness.get_json("/settingstest/_settings").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["settingstest"]["settings"]["index"]["dynamic"],
+        json!("true"),
+        "GET _settings should expose the dynamic field"
     );
 
     Ok(())

@@ -50,6 +50,92 @@ pub struct HotEngine {
 const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 10_000;
 const TANTIVY_WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
+/// Add a single mapped field to a Tantivy `SchemaBuilder`.
+fn add_mapping_field_to_schema(
+    builder: &mut tantivy::schema::SchemaBuilder,
+    name: &str,
+    mapping: &crate::cluster::state::FieldMapping,
+) -> Option<Field> {
+    use crate::cluster::state::FieldType;
+    let field = match mapping.field_type {
+        FieldType::Text => builder.add_text_field(name, TEXT | STORED),
+        FieldType::Keyword => builder.add_text_field(name, (STRING | STORED).set_fast(None)),
+        FieldType::Integer => builder.add_i64_field(name, tantivy::schema::INDEXED | STORED | FAST),
+        FieldType::Float => builder.add_f64_field(name, tantivy::schema::INDEXED | STORED | FAST),
+        FieldType::Boolean => builder.add_text_field(name, (STRING | STORED).set_fast(None)),
+        FieldType::Date => builder.add_i64_field(name, tantivy::schema::INDEXED | STORED | FAST),
+        FieldType::KnnVector => return None, // vectors in USearch, not Tantivy
+    };
+    Some(field)
+}
+
+/// Evolve an existing Tantivy meta.json to include new mapped fields.
+///
+/// Reads the current meta.json, collects the names already in the stored schema,
+/// then appends entries for any mapped fields that are missing.  Existing fields
+/// are never moved or reordered — new fields get strictly higher Field handles —
+/// so segments written against the old schema remain valid.
+fn evolve_meta_json_schema(
+    meta_json_path: &Path,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(meta_json_path)?;
+    let mut meta: serde_json::Value = serde_json::from_str(&raw)?;
+
+    let schema_arr = meta
+        .get_mut("schema")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("meta.json missing 'schema' array"))?;
+
+    // Collect names already in the stored schema.
+    let existing_names: std::collections::HashSet<String> = schema_arr
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+
+    // Build JSON entries for any new mapped fields by round-tripping through
+    // SchemaBuilder so the serialized form exactly matches Tantivy's own
+    // conventions (indexing options, fast-field flags, etc.).
+    let mut new_names: Vec<_> = mappings
+        .keys()
+        .filter(|name| !existing_names.contains(*name))
+        .cloned()
+        .collect();
+    if new_names.is_empty() {
+        return Ok(()); // nothing to do
+    }
+    new_names.sort();
+
+    for name in &new_names {
+        let mapping = &mappings[name];
+        let mut tmp_builder = Schema::builder();
+        let Some(_) = add_mapping_field_to_schema(&mut tmp_builder, name, mapping) else {
+            continue; // knn_vector → skip
+        };
+        let tmp_schema = tmp_builder.build();
+        let serialized = serde_json::to_value(&tmp_schema)?;
+        if let Some(arr) = serialized.as_array() {
+            // tmp_schema has exactly one field; take its serialized entry.
+            if let Some(entry) = arr.first() {
+                schema_arr.push(entry.clone());
+            }
+        }
+    }
+
+    // Write atomically: temp file + rename.
+    let tmp_path = meta_json_path.with_extension("json.tmp");
+    let mut buf = serde_json::to_vec_pretty(&meta)?;
+    buf.push(b'\n');
+    std::fs::write(&tmp_path, &buf)?;
+    std::fs::rename(&tmp_path, meta_json_path)?;
+    tracing::info!(
+        "Evolved Tantivy schema: appended {} new field(s): {:?}",
+        new_names.len(),
+        new_names
+    );
+    Ok(())
+}
+
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -89,6 +175,11 @@ impl HotEngine {
     /// Create a new HotEngine with explicit field mappings.
     /// When mappings are provided, named Tantivy fields are created for each mapped field.
     /// The "body" catch-all is always created for backward compatibility with `?q=` queries.
+    ///
+    /// **Schema evolution**: If the on-disk index already exists but the provided
+    /// mappings contain fields not yet in the stored schema, the meta.json is
+    /// updated in place (new fields are appended, preserving existing field IDs)
+    /// before the index is opened.
     pub fn new_with_mappings<P: AsRef<Path>>(
         data_dir: P,
         refresh_interval: Duration,
@@ -100,62 +191,67 @@ impl HotEngine {
         let index_path = data_dir.join("index");
         std::fs::create_dir_all(&index_path)?;
 
-        let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
-        let source_field = schema_builder.add_text_field("_source", STORED);
-        let body_field = schema_builder.add_text_field("body", TEXT | STORED);
+        let meta_json_path = index_path.join("meta.json");
+        let index_exists = meta_json_path.exists();
 
-        // Create typed fields from mappings
-        let mut mapped_fields: HashMap<String, Field> = HashMap::new();
-        let mut mapped_field_types: HashMap<String, crate::cluster::state::FieldType> =
-            HashMap::new();
-        let mut mapped_date_fields = Vec::new();
-        let mut mapping_names: Vec<_> = mappings.keys().cloned().collect();
-        mapping_names.sort();
-        for name in mapping_names {
-            let mapping = &mappings[&name];
-            use crate::cluster::state::FieldType;
-            let field =
-                match mapping.field_type {
-                    FieldType::Text => schema_builder.add_text_field(&name, TEXT | STORED),
-                    FieldType::Keyword => {
-                        schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
-                    }
-                    FieldType::Integer => schema_builder
-                        .add_i64_field(&name, tantivy::schema::INDEXED | STORED | FAST),
-                    FieldType::Float => schema_builder
-                        .add_f64_field(&name, tantivy::schema::INDEXED | STORED | FAST),
-                    FieldType::Boolean => {
-                        schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
-                    }
-                    FieldType::Date => schema_builder
-                        .add_i64_field(&name, tantivy::schema::INDEXED | STORED | FAST),
-                    FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
-                };
-            if matches!(mapping.field_type, FieldType::Date) {
-                mapped_date_fields.push(name.clone());
+        // If an existing index is on disk, evolve its schema to include any
+        // new mapped fields before opening.  This preserves the existing field
+        // order (and thus Field handle IDs) and only appends.
+        if index_exists {
+            evolve_meta_json_schema(&meta_json_path, mappings)?;
+        }
+
+        // Build the schema from scratch only for brand-new indices.
+        // For existing indices we open from disk (which now has any new fields).
+        let index = if index_exists {
+            let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
+            Index::open(mmap_dir)?
+        } else {
+            let mut schema_builder = Schema::builder();
+            schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
+            schema_builder.add_text_field("_source", STORED);
+            schema_builder.add_text_field("body", TEXT | STORED);
+
+            let mut mapping_names: Vec<_> = mappings.keys().cloned().collect();
+            mapping_names.sort();
+            for name in mapping_names {
+                let mapping = &mappings[&name];
+                add_mapping_field_to_schema(&mut schema_builder, &name, mapping);
             }
-            mapped_field_types.insert(name.clone(), mapping.field_type.clone());
-            mapped_fields.insert(name, field);
-        }
 
-        let schema = schema_builder.build();
+            let schema = schema_builder.build();
+            let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
+            Index::open_or_create(mmap_dir, schema)?
+        };
 
-        let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
-        let index = Index::open_or_create(mmap_dir, schema.clone())?;
+        let schema = index.schema();
 
-        // Rebuild field registry from persisted schema (handles restart)
+        // Build the FieldRegistry from the opened schema (authoritative).
+        let id_field = schema.get_field("_id").expect("_id must exist in schema");
+        let source_field = schema
+            .get_field("_source")
+            .expect("_source must exist in schema");
+
         let mut fields = HashMap::new();
-        fields.insert("body".to_string(), body_field);
-        // Merge in the mapped fields
-        for (name, field) in &mapped_fields {
-            fields.insert(name.clone(), *field);
-        }
-        // Also pick up any fields from the persisted schema (restart case)
+        let mut field_types = HashMap::new();
+        let mut date_fields = Vec::new();
         for (field, entry) in schema.fields() {
-            let name = entry.name().to_string();
-            if name != "_source" && name != "_id" && !fields.contains_key(&name) {
-                fields.insert(name, field);
+            let name: String = entry.name().to_string();
+            if name == "_source" || name == "_id" {
+                continue;
+            }
+            fields.insert(name.clone(), field);
+            // Recover logical field types from mappings (Date vs Integer).
+            if let Some(mapping) = mappings.get(&name) {
+                if !matches!(
+                    mapping.field_type,
+                    crate::cluster::state::FieldType::KnnVector
+                ) {
+                    field_types.insert(name.clone(), mapping.field_type.clone());
+                }
+                if matches!(mapping.field_type, crate::cluster::state::FieldType::Date) {
+                    date_fields.push(name);
+                }
             }
         }
 
@@ -177,8 +273,8 @@ impl HotEngine {
             id_field,
             source_field,
             fields,
-            field_types: mapped_field_types,
-            date_fields: mapped_date_fields,
+            field_types,
+            date_fields,
         };
 
         let committed_seq_no_path = data_dir.join("translog.committed");
@@ -5664,6 +5760,158 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
         (dir, engine)
+    }
+
+    // ── schema evolution ────────────────────────────────────────────────
+
+    #[test]
+    fn evolve_meta_json_appends_new_fields() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Create an initial engine with one mapped field.
+        let initial_mappings = HashMap::from([(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        let engine = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &initial_mappings,
+            crate::wal::TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        drop(engine);
+
+        // Evolve the schema by adding two new fields.
+        let evolved_mappings = {
+            let mut m = initial_mappings.clone();
+            m.insert(
+                "count".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Integer,
+                    dimension: None,
+                },
+            );
+            m.insert(
+                "active".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Boolean,
+                    dimension: None,
+                },
+            );
+            m
+        };
+
+        let meta_path = dir.path().join("index/meta.json");
+        evolve_meta_json_schema(&meta_path, &evolved_mappings).unwrap();
+
+        // Re-open the index — Tantivy must accept the evolved schema.
+        let engine2 = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &evolved_mappings,
+            crate::wal::TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+
+        // Verify all three mapped fields exist in the field registry.
+        let registry = engine2.field_registry.read().unwrap();
+        assert!(registry.fields.contains_key("title"));
+        assert!(registry.fields.contains_key("count"));
+        assert!(registry.fields.contains_key("active"));
+    }
+
+    #[test]
+    fn evolve_meta_json_noop_when_no_new_fields() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mappings = HashMap::from([(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        let engine = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            crate::wal::TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        drop(engine);
+
+        let meta_path = dir.path().join("index/meta.json");
+        let before = std::fs::read_to_string(&meta_path).unwrap();
+        evolve_meta_json_schema(&meta_path, &mappings).unwrap();
+        let after = std::fs::read_to_string(&meta_path).unwrap();
+
+        // File should be unchanged — no rewrite needed.
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn reopen_with_evolved_schema_can_index_new_field() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let initial = HashMap::from([(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        let engine = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &initial,
+            crate::wal::TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        engine.add_document("1", json!({"title": "hello"})).unwrap();
+        engine.refresh().unwrap();
+        drop(engine);
+
+        // Add a new integer field.
+        let mut evolved = initial;
+        evolved.insert(
+            "count".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        let engine2 = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &evolved,
+            crate::wal::TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+
+        // Index a doc with the new field.
+        engine2
+            .add_document("2", json!({"title": "world", "count": 42}))
+            .unwrap();
+        engine2.refresh().unwrap();
+
+        // Both docs should be retrievable.
+        let d1 = engine2.get_document("1").unwrap().unwrap();
+        assert_eq!(d1["title"], "hello");
+        let d2 = engine2.get_document("2").unwrap().unwrap();
+        assert_eq!(d2["title"], "world");
+        assert_eq!(d2["count"], 42);
     }
 
     // ── basic CRUD ──────────────────────────────────────────────────────

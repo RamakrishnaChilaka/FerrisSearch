@@ -146,6 +146,7 @@ async fn auto_create_index(
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: crate::cluster::state::DynamicMapping::True,
         settings: crate::cluster::state::IndexSettings::default(),
     };
     let created_metadata = if let Some(master) =
@@ -312,6 +313,25 @@ pub async fn create_index(
     }
     if let Some(bytes) = flush_threshold_bytes {
         metadata.settings.flush_threshold_bytes = Some(bytes);
+    }
+
+    // Parse dynamic mapping mode: { "mappings": { "dynamic": "true" | "false" | "strict" } }
+    // or top-level: { "dynamic": "true" }
+    let dynamic_str = settings
+        .pointer("/mappings/dynamic")
+        .or_else(|| settings.get("dynamic"))
+        .and_then(|v| {
+            // Accept both string "true" and boolean true
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.as_bool().map(|b| b.to_string()))
+        });
+    if let Some(ds) = dynamic_str {
+        metadata.dynamic = match ds.as_str() {
+            "true" => crate::cluster::state::DynamicMapping::True,
+            "strict" => crate::cluster::state::DynamicMapping::Strict,
+            _ => crate::cluster::state::DynamicMapping::False,
+        };
     }
 
     // Parse field mappings: { "mappings": { "properties": { "title": { "type": "text" }, ... } } }
@@ -1135,6 +1155,7 @@ pub async fn get_index_settings(
                         "number_of_replicas": metadata.number_of_replicas,
                         "refresh_interval_ms": metadata.settings.refresh_interval_ms,
                         "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
+                        "dynamic": metadata.dynamic.to_string(),
                     }
                 }
             }

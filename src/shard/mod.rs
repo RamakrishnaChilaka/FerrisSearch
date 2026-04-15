@@ -273,6 +273,61 @@ impl ShardManager {
     ///
     /// `index_uuid` determines the on-disk directory: `<data_dir>/<uuid>/shard_<id>`.
     /// Callers must provide the authoritative UUID from cluster metadata.
+    fn open_composite_engine(
+        &self,
+        index: &str,
+        shard_id: u32,
+        shard_dir: &std::path::Path,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> Result<Arc<CompositeEngine>> {
+        const LOCK_BUSY_RETRIES: usize = 50;
+        const LOCK_BUSY_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+        let mut cleaned_stale_schema = false;
+        for attempt in 0..=LOCK_BUSY_RETRIES {
+            match CompositeEngine::new_with_mappings(
+                shard_dir,
+                refresh_interval,
+                mappings,
+                self.durability,
+                self.column_cache.clone(),
+            ) {
+                Ok(engine) => return Ok(Arc::new(engine)),
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    if err_msg.contains("schema does not match") && !cleaned_stale_schema {
+                        tracing::warn!(
+                            "Schema mismatch for {}/shard_{}, removing stale data and retrying",
+                            index,
+                            shard_id
+                        );
+                        std::fs::remove_dir_all(shard_dir)?;
+                        std::fs::create_dir_all(shard_dir)?;
+                        cleaned_stale_schema = true;
+                        continue;
+                    }
+                    if err_msg.contains("Failed to acquire index lock")
+                        && attempt < LOCK_BUSY_RETRIES
+                    {
+                        tracing::debug!(
+                            "Index lock busy reopening {}/shard_{} (attempt {}/{}), retrying",
+                            index,
+                            shard_id,
+                            attempt + 1,
+                            LOCK_BUSY_RETRIES
+                        );
+                        std::thread::sleep(LOCK_BUSY_RETRY_DELAY);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        unreachable!("lock busy retry loop should return or error before exhaustion")
+    }
+
     pub fn open_shard_with_settings(
         &self,
         index: &str,
@@ -324,39 +379,8 @@ impl ShardManager {
             .join(format!("shard_{}", shard_id));
         std::fs::create_dir_all(&shard_dir)?;
 
-        // Try to open the engine. If it fails with a schema mismatch (stale data
-        // from a previous run whose index was already deleted/re-created), wipe the
-        // orphaned directory and retry with a fresh index.
-        let engine = match CompositeEngine::new_with_mappings(
-            &shard_dir,
-            refresh_interval,
-            mappings,
-            self.durability,
-            self.column_cache.clone(),
-        ) {
-            Ok(e) => Arc::new(e),
-            Err(first_err) => {
-                let err_msg = first_err.to_string();
-                if err_msg.contains("schema does not match") {
-                    tracing::warn!(
-                        "Schema mismatch for {}/shard_{}, removing stale data and retrying",
-                        index,
-                        shard_id
-                    );
-                    std::fs::remove_dir_all(&shard_dir)?;
-                    std::fs::create_dir_all(&shard_dir)?;
-                    Arc::new(CompositeEngine::new_with_mappings(
-                        &shard_dir,
-                        refresh_interval,
-                        mappings,
-                        self.durability,
-                        self.column_cache.clone(),
-                    )?)
-                } else {
-                    return Err(first_err);
-                }
-            }
-        };
+        let engine =
+            self.open_composite_engine(index, shard_id, &shard_dir, refresh_interval, mappings)?;
         CompositeEngine::start_refresh_loop_reactive(
             engine.clone(),
             refresh_rx,
@@ -408,6 +432,98 @@ impl ShardManager {
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking shard open task failed: {}", e))?
+    }
+
+    /// Close an existing shard engine and reopen it with updated mappings.
+    ///
+    /// Dynamic mapping uses this after the Raft AddMappings commit succeeds so
+    /// the live shard immediately picks up the new typed fields instead of
+    /// waiting for a later restart or maintenance reopen.
+    pub async fn reopen_shard(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: IndexSettings,
+        index_uuid: String,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let key = ShardKey::new(&index, shard_id);
+
+        // Serialize with other open/reopen attempts for the same shard.
+        let per_shard_lock = {
+            let mut locks = self.open_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.entry(key.clone()).or_default().clone()
+        };
+
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Commit the old engine before dropping to persist pending docs.
+            {
+                let shards = shard_manager
+                    .shards
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(engine) = shards.get(&key) {
+                    let _ = engine.flush();
+                }
+            }
+
+            // Remove old engine (drop releases the Tantivy write lock).
+            {
+                let mut shards = shard_manager
+                    .shards
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                shards.remove(&key);
+            }
+
+            // Reopen inline — do NOT call open_shard_with_settings() because it
+            // tries to acquire the same per_shard_lock (deadlock).
+            shard_manager.register_index_uuid(&index, &index_uuid);
+
+            let settings_mgr = shard_manager.ensure_settings_manager(&index, &settings);
+            let refresh_interval = settings_mgr.refresh_interval();
+            let refresh_rx = settings_mgr.watch_refresh_interval();
+            let flush_threshold_rx = settings_mgr.watch_flush_threshold();
+
+            let shard_dir = shard_manager
+                .data_dir
+                .join(&index_uuid)
+                .join(format!("shard_{}", shard_id));
+            std::fs::create_dir_all(&shard_dir)?;
+
+            let engine = shard_manager.open_composite_engine(
+                &index,
+                shard_id,
+                &shard_dir,
+                refresh_interval,
+                &mappings,
+            )?;
+            CompositeEngine::start_refresh_loop_reactive(
+                engine.clone(),
+                refresh_rx,
+                flush_threshold_rx,
+            );
+
+            tracing::info!(
+                "Reopened shard engine for {}/{} at {:?}",
+                index,
+                shard_id,
+                shard_dir
+            );
+
+            let dyn_engine: Arc<dyn SearchEngine> = engine;
+            let mut shards = shard_manager
+                .shards
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            shards.insert(key, dyn_engine.clone());
+            Ok(dyn_engine)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking shard reopen task failed: {}", e))?
     }
 
     /// Get an already-open shard engine.

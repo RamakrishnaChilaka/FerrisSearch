@@ -86,13 +86,19 @@ impl CompositeEngine {
     }
 
     /// Start the background refresh loop for the text engine.
-    /// Must be called with an Arc to self.
+    /// Holds only a Weak reference so dropping the shard from the manager lets
+    /// the old engine shut down cleanly before a reopen.
     pub fn start_refresh_loop(engine: Arc<Self>) {
         let interval = engine.text.refresh_interval;
+        let weak_engine = Arc::downgrade(&engine);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                if let Err(e) = Self::run_background_maintenance(engine.clone(), None).await {
+                let Some(engine) = weak_engine.upgrade() else {
+                    tracing::info!("Shard refresh loop stopping because engine was dropped");
+                    break;
+                };
+                if let Err(e) = Self::run_background_maintenance(engine, None).await {
                     tracing::error!("Background shard maintenance task failed: {}", e);
                 }
             }
@@ -134,6 +140,7 @@ impl CompositeEngine {
         mut refresh_rx: tokio::sync::watch::Receiver<std::time::Duration>,
         mut flush_threshold_rx: tokio::sync::watch::Receiver<u64>,
     ) {
+        let weak_engine = Arc::downgrade(&engine);
         tokio::spawn(async move {
             const MIN_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
             let mut interval = (*refresh_rx.borrow_and_update()).max(MIN_REFRESH);
@@ -141,8 +148,12 @@ impl CompositeEngine {
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(interval) => {
+                        let Some(engine) = weak_engine.upgrade() else {
+                            tracing::info!("Reactive shard refresh loop stopping because engine was dropped");
+                            break;
+                        };
                         if let Err(e) = Self::run_background_maintenance(
-                            engine.clone(),
+                            engine,
                             Some(flush_threshold),
                         ).await {
                             tracing::error!("Background shard maintenance task failed: {}", e);
@@ -151,6 +162,10 @@ impl CompositeEngine {
                     result = refresh_rx.changed() => {
                         match result {
                             Ok(()) => {
+                                if weak_engine.upgrade().is_none() {
+                                    tracing::info!("Reactive refresh loop stopping because engine was dropped");
+                                    break;
+                                }
                                 interval = (*refresh_rx.borrow_and_update()).max(MIN_REFRESH);
                                 tracing::info!("Refresh interval updated to {:?}", interval);
                             }
@@ -164,6 +179,10 @@ impl CompositeEngine {
                     result = flush_threshold_rx.changed() => {
                         match result {
                             Ok(()) => {
+                                if weak_engine.upgrade().is_none() {
+                                    tracing::info!("Reactive refresh loop stopping because engine was dropped");
+                                    break;
+                                }
                                 flush_threshold = *flush_threshold_rx.borrow_and_update();
                                 tracing::info!("Flush threshold updated to {} bytes", flush_threshold);
                             }

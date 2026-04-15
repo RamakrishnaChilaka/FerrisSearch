@@ -99,13 +99,14 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterCommand::DeleteIndex { index_name: String }` — delete index and all metadata
 - `ClusterCommand::SetMaster { node_id: String }` — set cluster master (Raft leader)
 - `ClusterCommand::UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replica changes, settings)
+- `ClusterCommand::AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
 
 ## ClusterResponse
 - `ClusterResponse::Ok` — command applied successfully
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1014 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 44 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1200 total
+- 1049 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 49 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1240 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -153,6 +154,20 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Refresh/auto-flush ticks must run through Tokio's blocking pool instead of inline on async runtime workers; the maintenance path performs blocking commit/truncate/vector-save work and can otherwise starve Raft heartbeats during multi-shard compaction bursts
 - To add a new reactive setting: add field to `IndexSettings`, add `watch::Sender<T>` to `SettingsManager`, detect changes in `update()`, subscribe in consumer
 
+## Dynamic Field Mapping
+- `DynamicMapping` enum: `True` (auto-detect), `False` (body catch-all, default), `Strict` (reject unknown fields)
+- Controlled per-index via `IndexMetadata.dynamic` field, set at create time: `PUT /idx { "mappings": { "dynamic": "true" } }`
+- Type inference: `infer_field_type()` in `src/common/mod.rs` — bool→Boolean, i64→Integer, float→Float, ISO 8601 string→Date, other string→Text, null/array/object→skip
+- `detect_new_fields()` / `detect_new_fields_batch()` compare inferred types against existing `IndexMetadata.mappings`
+- `detect_unknown_fields()` / `detect_unknown_fields_batch()` enforce `DynamicMapping::Strict` for any unknown top-level field, including arrays/objects that inference skips
+- New mappings committed atomically via Raft `AddMappings` command (first-seen type wins, existing fields never overwritten)
+- Schema evolution: `evolve_meta_json_schema()` in `src/engine/tantivy.rs` appends new field entries to Tantivy's stored schema (meta.json) — preserves existing field IDs and order
+- Wired into both single-doc (`index_doc` gRPC handler) and bulk (`bulk_index` gRPC handler) paths; currently-open local shards reopen immediately after a successful mapping commit so the current request indexes against the typed schema
+- `auto_create_index()` uses `DynamicMapping::True` by default for implicit index creation
+- `GET /{index}/_settings` exposes the `dynamic` field
+- Proto roundtrip: `dynamic` stored as string in `IndexMetadata` proto message, `AddMappings` RPC for forwarding to leader
+- `DynamicMapping::Strict` rejects documents with any field not in the explicit mappings (returns gRPC `INVALID_ARGUMENT`)
+
 ## AppState (shared across all API handlers)
 ```rust
 pub struct AppState {
@@ -175,6 +190,7 @@ pub struct AppState {
 - `NodeRole` — `Master`, `Data`, `Client`
 - `ShardState` — `Started` (active), `Unassigned` (needs a node)
 - `FieldType` — `Text`, `Keyword`, `Integer`, `Float`, `Boolean`, `Date`, `KnnVector`
+- `DynamicMapping` — `True` (auto-detect), `False` (body catch-all, default), `Strict` (reject unknown)
 
 ### Structs
 ```
@@ -183,7 +199,7 @@ FieldMapping { field_type: FieldType, dimension: Option<usize> }  // dimension f
 IndexSettings { refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // None = cluster defaults (5000ms, 512MB)
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary: NodeId, replicas: Vec<NodeId>, unassigned_replicas: u32 }
-IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing: HashMap<u32, ShardRoutingEntry>, mappings: HashMap<String, FieldMapping>, settings: IndexSettings }
+IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing: HashMap<u32, ShardRoutingEntry>, mappings: HashMap<String, FieldMapping>, dynamic: DynamicMapping, settings: IndexSettings }
 ClusterState { cluster_name, version: u64, master_node: Option<NodeId>, nodes: HashMap<NodeId, NodeInfo>, indices: HashMap<String, IndexMetadata>, last_seen: HashMap<NodeId, Instant> }
 ```
 
@@ -264,6 +280,7 @@ if let Some(ref raft) = state.raft {
 | `DeleteIndex` | Forward index deletion to leader | `forward_delete_index()` |
 | `UpdateSettings` | Forward settings update to leader | `forward_update_settings()` |
 | `TransferMaster` | Forward leadership transfer to leader | `forward_transfer_master()` |
+| `AddMappings` | Forward dynamic mapping commit to leader | `forward_add_mappings()` |
 | `IndexDoc` | Route doc write to shard primary | `forward_index_to_shard()` |
 | `DeleteDoc` | Route doc delete to shard primary | `forward_delete_to_shard()` |
 | `GetDoc` | Route doc get to shard primary | `forward_get_to_shard()` |

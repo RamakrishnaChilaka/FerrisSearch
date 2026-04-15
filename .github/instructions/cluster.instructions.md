@@ -14,7 +14,7 @@ FieldMapping { field_type, dimension }  // dimension for knn_vector only
 IndexSettings { refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // None = cluster defaults (5000ms, 512MB)
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary, replicas, unassigned_replicas }
-IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, settings }
+IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, dynamic, settings }
 ClusterState { cluster_name, version, master_node, nodes, indices, last_seen }
 ```
 

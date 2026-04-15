@@ -242,6 +242,7 @@ fn setup_single_node_cluster_state(cm: &ClusterManager, index_name: &str) {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
     cm.update_state(cs);
@@ -279,6 +280,7 @@ fn setup_multi_shard_single_node_cluster_state(cm: &ClusterManager, index_name: 
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
     cm.update_state(cs);
@@ -327,6 +329,7 @@ fn setup_two_node_cluster_state(
         number_of_replicas: 1,
         shard_routing,
         mappings: std::collections::HashMap::new(),
+        dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
     primary_cm.update_state(cs.clone());
@@ -1006,6 +1009,7 @@ async fn search_shard_reopens_persisted_shard_after_restart() {
             number_of_replicas: 0,
             shard_routing,
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: ferrissearch::cluster::state::IndexSettings::default(),
         });
         cm.update_state(cs);
@@ -1133,6 +1137,7 @@ async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
             number_of_replicas: 0,
             shard_routing,
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: ferrissearch::cluster::state::IndexSettings::default(),
         });
         cm.update_state(cs);
@@ -1237,6 +1242,7 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
         number_of_replicas: 0,
         shard_routing,
         mappings: restarted_mappings,
+        dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
     cm.update_state(cs);
@@ -1314,6 +1320,7 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
             number_of_replicas: 0,
             shard_routing,
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: ferrissearch::cluster::state::IndexSettings::default(),
         });
         cm.update_state(cs);
@@ -1435,6 +1442,7 @@ async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
         number_of_replicas: 0,
         shard_routing,
         mappings,
+        dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
     cm.update_state(cs);
@@ -1562,6 +1570,7 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
         number_of_replicas: 0,
         shard_routing,
         mappings,
+        dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
     cm.update_state(cs);
