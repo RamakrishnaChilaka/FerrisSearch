@@ -49,7 +49,7 @@ pub(super) fn proto_to_node_info(p: &NodeInfo) -> Result<crate::cluster::state::
     })
 }
 
-pub(super) fn field_type_to_proto(field_type: &crate::cluster::state::FieldType) -> String {
+pub fn field_type_to_proto(field_type: &crate::cluster::state::FieldType) -> String {
     match field_type {
         crate::cluster::state::FieldType::Text => "text",
         crate::cluster::state::FieldType::Keyword => "keyword",
@@ -100,6 +100,15 @@ pub(super) fn proto_to_index_settings(
     crate::cluster::state::IndexSettings {
         refresh_interval_ms: settings.refresh_interval_ms,
         flush_threshold_bytes: settings.flush_threshold_bytes,
+    }
+}
+
+pub(super) fn proto_to_dynamic_mapping(s: &str) -> crate::cluster::state::DynamicMapping {
+    match s {
+        "true" => crate::cluster::state::DynamicMapping::True,
+        "strict" => crate::cluster::state::DynamicMapping::Strict,
+        // Empty string or "false" → default (backward compat with old snapshots)
+        _ => crate::cluster::state::DynamicMapping::False,
     }
 }
 
@@ -168,6 +177,7 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
                     })
                     .collect(),
                 settings: Some(index_settings_to_proto(&idx.settings)),
+                dynamic: idx.dynamic.to_string(),
             })
             .collect(),
     }
@@ -229,6 +239,7 @@ pub fn proto_to_cluster_state(
                 number_of_replicas: idx.number_of_replicas,
                 shard_routing,
                 mappings,
+                dynamic: proto_to_dynamic_mapping(&idx.dynamic),
                 settings: proto_to_index_settings(idx.settings.as_ref()),
             },
         );

@@ -107,6 +107,7 @@ fn make_sql_metadata(index: &str) -> IndexMetadata {
         number_of_replicas: 0,
         shard_routing,
         mappings,
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     }
 }
@@ -1023,6 +1024,7 @@ async fn group_by_text_field_returns_error() {
         number_of_replicas: 0,
         shard_routing,
         mappings,
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 

@@ -169,6 +169,7 @@ fn make_test_metadata(primary: Option<&str>) -> IndexMetadata {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     }
 }

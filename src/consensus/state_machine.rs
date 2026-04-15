@@ -64,6 +64,22 @@ impl ClusterStateMachine {
                     .insert(metadata.name.clone(), metadata.clone());
                 state.version += 1;
             }
+            ClusterCommand::AddMappings {
+                index_name,
+                new_fields,
+                dynamic,
+            } => {
+                if let Some(existing) = state.indices.get_mut(index_name) {
+                    for (name, mapping) in new_fields {
+                        existing
+                            .mappings
+                            .entry(name.clone())
+                            .or_insert(mapping.clone());
+                    }
+                    existing.dynamic = dynamic.clone();
+                    state.version += 1;
+                }
+            }
         }
     }
 }
@@ -228,6 +244,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing,
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         }
     }
@@ -444,5 +461,114 @@ mod tests {
             let restored: ClusterState = serde_json::from_slice(&data).unwrap();
             assert!(restored.nodes.contains_key("b1"));
         });
+    }
+
+    // ── AddMappings command tests ──────────────────────────────────────
+
+    #[test]
+    fn apply_add_mappings_merges_new_fields() {
+        use crate::cluster::state::{DynamicMapping, FieldMapping, FieldType};
+
+        let sm = ClusterStateMachine::new("test".into());
+        let meta = make_index("idx");
+        sm.apply_command(&ClusterCommand::CreateIndex {
+            metadata: meta.clone(),
+        });
+
+        let new_fields = std::collections::HashMap::from([
+            (
+                "count".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Integer,
+                    dimension: None,
+                },
+            ),
+            (
+                "active".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Boolean,
+                    dimension: None,
+                },
+            ),
+        ]);
+
+        sm.apply_command(&ClusterCommand::AddMappings {
+            index_name: "idx".into(),
+            new_fields,
+            dynamic: DynamicMapping::True,
+        });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        let idx = &state.indices["idx"];
+        assert_eq!(idx.mappings.len(), 2);
+        assert_eq!(idx.mappings["count"].field_type, FieldType::Integer);
+        assert_eq!(idx.mappings["active"].field_type, FieldType::Boolean);
+        assert_eq!(idx.dynamic, DynamicMapping::True);
+    }
+
+    #[test]
+    fn apply_add_mappings_preserves_existing_fields() {
+        use crate::cluster::state::{DynamicMapping, FieldMapping, FieldType};
+
+        let sm = ClusterStateMachine::new("test".into());
+        let mut meta = make_index("idx");
+        meta.mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        sm.apply_command(&ClusterCommand::CreateIndex {
+            metadata: meta.clone(),
+        });
+
+        // Try to add "title" with a different type — existing should win.
+        let new_fields = std::collections::HashMap::from([(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]);
+        sm.apply_command(&ClusterCommand::AddMappings {
+            index_name: "idx".into(),
+            new_fields,
+            dynamic: DynamicMapping::True,
+        });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        // Existing mapping wins — still Text, not Keyword.
+        assert_eq!(
+            state.indices["idx"].mappings["title"].field_type,
+            FieldType::Text
+        );
+    }
+
+    #[test]
+    fn apply_add_mappings_noop_for_nonexistent_index() {
+        use crate::cluster::state::{DynamicMapping, FieldMapping, FieldType};
+
+        let sm = ClusterStateMachine::new("test".into());
+        let new_fields = std::collections::HashMap::from([(
+            "f".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        sm.apply_command(&ClusterCommand::AddMappings {
+            index_name: "nonexistent".into(),
+            new_fields,
+            dynamic: DynamicMapping::True,
+        });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        // Version should not have been bumped.
+        assert_eq!(state.version, 0);
+        assert!(!state.indices.contains_key("nonexistent"));
     }
 }

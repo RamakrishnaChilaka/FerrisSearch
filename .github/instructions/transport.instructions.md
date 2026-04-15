@@ -33,6 +33,7 @@ UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
 CreateIndex(CreateIndexRequest) → CreateIndexResponse
 DeleteIndex(DeleteIndexRequest) → DeleteIndexResponse
 TransferMaster(TransferMasterRequest) → TransferMasterResponse
+AddMappings(AddMappingsRequest) → AddMappingsResponse
 
 // Shard stats (for _cat endpoints)
 GetShardStats(ShardStatsRequest) → ShardStatsResponse

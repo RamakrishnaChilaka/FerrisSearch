@@ -78,6 +78,7 @@ fn make_full_cluster_state() -> DomainClusterState {
         number_of_replicas: 1,
         shard_routing,
         mappings,
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings {
             refresh_interval_ms: Some(1500),
             flush_threshold_bytes: Some(65_536),
@@ -190,6 +191,7 @@ fn roundtrip_index_with_no_replicas() {
         number_of_replicas: 0,
         shard_routing,
         mappings: std::collections::HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
 
@@ -324,6 +326,7 @@ async fn get_or_open_search_shard_reopens_persisted_shard_via_metadata() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
     let manager = ClusterManager::new(cluster_state.cluster_name.clone());
@@ -380,6 +383,7 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
     let manager = ClusterManager::new(cluster_state.cluster_name.clone());
@@ -633,6 +637,7 @@ async fn maintenance_skips_orphaned_shards() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
 
@@ -692,6 +697,7 @@ async fn maintenance_includes_replica_shards() {
         number_of_replicas: 1,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
 
@@ -747,6 +753,7 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
 
@@ -797,6 +804,7 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
 
@@ -882,6 +890,7 @@ async fn force_merge_task_counts_missing_assigned_shard_as_failure() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
 
@@ -951,6 +960,7 @@ async fn flush_index_refuses_to_create_missing_uuid_dir() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings::default(),
     });
 
@@ -1069,6 +1079,7 @@ fn roundtrip_unknown_field_type_returns_error() {
                 dimension: None,
             }],
             settings: None,
+            dynamic: String::new(),
         }],
     };
 
@@ -1079,5 +1090,102 @@ fn roundtrip_unknown_field_type_returns_error() {
         ),
         "unexpected error: {}",
         err.message()
+    );
+}
+
+#[test]
+fn roundtrip_preserves_dynamic_mapping_true() {
+    let mut cs = DomainClusterState::new("dyn-test".into());
+    let mut meta = DomainIndexMetadata {
+        name: "dyn-idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("d-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: std::collections::HashMap::new(),
+        mappings: std::collections::HashMap::new(),
+        dynamic: crate::cluster::state::DynamicMapping::True,
+        settings: crate::cluster::state::IndexSettings::default(),
+    };
+    meta.shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "n1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    cs.add_index(meta);
+    cs.version = 1;
+
+    let proto = cluster_state_to_proto(&cs);
+    let restored = proto_to_cluster_state(&proto).unwrap();
+    assert_eq!(
+        restored.indices["dyn-idx"].dynamic,
+        crate::cluster::state::DynamicMapping::True
+    );
+}
+
+#[test]
+fn roundtrip_preserves_dynamic_mapping_strict() {
+    let mut cs = DomainClusterState::new("dyn-test".into());
+    let mut meta = DomainIndexMetadata {
+        name: "strict-idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("s-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: std::collections::HashMap::new(),
+        mappings: std::collections::HashMap::new(),
+        dynamic: crate::cluster::state::DynamicMapping::Strict,
+        settings: crate::cluster::state::IndexSettings::default(),
+    };
+    meta.shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "n1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    cs.add_index(meta);
+    cs.version = 1;
+
+    let proto = cluster_state_to_proto(&cs);
+    let restored = proto_to_cluster_state(&proto).unwrap();
+    assert_eq!(
+        restored.indices["strict-idx"].dynamic,
+        crate::cluster::state::DynamicMapping::Strict
+    );
+}
+
+#[test]
+fn roundtrip_empty_dynamic_defaults_to_false() {
+    let mut cs = DomainClusterState::new("dyn-test".into());
+    let mut meta = DomainIndexMetadata {
+        name: "legacy-idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("l-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: std::collections::HashMap::new(),
+        mappings: std::collections::HashMap::new(),
+        dynamic: crate::cluster::state::DynamicMapping::False,
+        settings: crate::cluster::state::IndexSettings::default(),
+    };
+    meta.shard_routing.insert(
+        0,
+        ShardRoutingEntry {
+            primary: "n1".into(),
+            replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    cs.add_index(meta);
+    cs.version = 1;
+
+    let proto = cluster_state_to_proto(&cs);
+    let restored = proto_to_cluster_state(&proto).unwrap();
+    // Empty or "false" string in proto should deserialize to DynamicMapping::False
+    assert_eq!(
+        restored.indices["legacy-idx"].dynamic,
+        crate::cluster::state::DynamicMapping::False
     );
 }

@@ -3,7 +3,7 @@
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
-use crate::cluster::state::{IndexMetadata, NodeInfo};
+use crate::cluster::state::{DynamicMapping, FieldMapping, IndexMetadata, NodeInfo};
 
 // ─── Raft Type Config ───────────────────────────────────────────────────────
 
@@ -44,6 +44,14 @@ pub enum ClusterCommand {
     SetMaster { node_id: String },
     /// Update an existing index's metadata (e.g. shard routing after replica allocation).
     UpdateIndex { metadata: IndexMetadata },
+    /// Merge new field mappings into an existing index without replacing the
+    /// entire metadata. This avoids TOCTOU races when concurrent documents
+    /// discover different new fields at the same time.
+    AddMappings {
+        index_name: String,
+        new_fields: std::collections::HashMap<String, FieldMapping>,
+        dynamic: DynamicMapping,
+    },
 }
 
 impl std::fmt::Display for ClusterCommand {
@@ -62,6 +70,18 @@ impl std::fmt::Display for ClusterCommand {
             ClusterCommand::SetMaster { node_id } => write!(f, "SetMaster({})", node_id),
             ClusterCommand::UpdateIndex { metadata } => {
                 write!(f, "UpdateIndex({})", metadata.name)
+            }
+            ClusterCommand::AddMappings {
+                index_name,
+                new_fields,
+                ..
+            } => {
+                write!(
+                    f,
+                    "AddMappings({}, {} fields)",
+                    index_name,
+                    new_fields.len()
+                )
             }
         }
     }
@@ -116,6 +136,7 @@ mod tests {
                 number_of_replicas: 0,
                 shard_routing: HashMap::new(),
                 mappings: std::collections::HashMap::new(),
+                dynamic: Default::default(),
                 settings: crate::cluster::state::IndexSettings::default(),
             },
         };
@@ -181,6 +202,7 @@ mod tests {
                 number_of_replicas: 1,
                 shard_routing,
                 mappings: std::collections::HashMap::new(),
+                dynamic: Default::default(),
                 settings: crate::cluster::state::IndexSettings::default(),
             },
         };

@@ -56,6 +56,13 @@ impl MaintenanceDispatchOp {
     }
 }
 
+#[derive(Clone)]
+struct DynamicShardOpenOverride {
+    mappings: std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+    settings: crate::cluster::state::IndexSettings,
+    index_uuid: String,
+}
+
 pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
@@ -238,7 +245,7 @@ pub(crate) async fn run_maintenance_on_assigned_shards_async(
     (successful, failed)
 }
 
-mod conversions;
+pub mod conversions;
 
 pub use conversions::cluster_state_to_proto;
 pub use conversions::proto_to_cluster_state;
@@ -430,9 +437,6 @@ impl InternalTransport for TransportService {
         request: Request<ShardDocRequest>,
     ) -> Result<Response<ShardDocResponse>, Status> {
         let req = request.into_inner();
-        let engine = self
-            .get_or_open_shard(&req.index_name, req.shard_id)
-            .await?;
 
         let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
             .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
@@ -442,6 +446,15 @@ impl InternalTransport for TransportService {
         } else {
             req.doc_id
         };
+
+        // Dynamic mapping: detect/register new fields before opening the live
+        // engine so a successful AddMappings commit can safely reopen the shard.
+        let dynamic_override = self
+            .ensure_dynamic_mappings(&req.index_name, req.shard_id, &payload)
+            .await?;
+        let engine = self
+            .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
+            .await?;
 
         info!(
             "gRPC: index doc '{}' into {}/shard_{}",
@@ -519,9 +532,6 @@ impl InternalTransport for TransportService {
         request: Request<ShardBulkRequest>,
     ) -> Result<Response<ShardBulkResponse>, Status> {
         let req = request.into_inner();
-        let engine = self
-            .get_or_open_shard(&req.index_name, req.shard_id)
-            .await?;
 
         let mut docs: Vec<(String, serde_json::Value)> =
             Vec::with_capacity(req.documents_json.len());
@@ -536,6 +546,15 @@ impl InternalTransport for TransportService {
             let payload = val.get("_source").cloned().unwrap_or(val.clone());
             docs.push((doc_id, payload));
         }
+
+        // Dynamic mapping (batch): detect/register before opening the live
+        // engine so a successful AddMappings commit can reopen safely.
+        let dynamic_override = self
+            .ensure_dynamic_mappings_batch(&req.index_name, req.shard_id, &docs)
+            .await?;
+        let engine = self
+            .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
+            .await?;
 
         trace!(
             "gRPC: bulk {} docs into {}/shard_{}",
@@ -1659,6 +1678,64 @@ impl InternalTransport for TransportService {
         }))
     }
 
+    // ─── Dynamic Mapping ──────────────────────────────────────────────────────
+
+    async fn add_mappings(
+        &self,
+        request: Request<AddMappingsRequest>,
+    ) -> Result<Response<AddMappingsResponse>, Status> {
+        let req = request.into_inner();
+
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+
+        let mut new_fields = std::collections::HashMap::new();
+        for entry in &req.new_fields {
+            let field_type = conversions::proto_to_field_type(&entry.field_type).map_err(|_| {
+                Status::invalid_argument(format!(
+                    "unknown field type '{}' for field '{}'",
+                    entry.field_type, entry.name
+                ))
+            })?;
+            new_fields.insert(
+                entry.name.clone(),
+                crate::cluster::state::FieldMapping {
+                    field_type,
+                    dimension: entry.dimension.map(|d| d as usize),
+                },
+            );
+        }
+
+        let dynamic = conversions::proto_to_dynamic_mapping(&req.dynamic);
+
+        let cmd = crate::consensus::types::ClusterCommand::AddMappings {
+            index_name: req.index_name.clone(),
+            new_fields,
+            dynamic,
+        };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft AddMappings failed: {}", e)))?;
+
+        tracing::info!(
+            "gRPC: added {} dynamic mappings for index '{}'",
+            req.new_fields.len(),
+            req.index_name
+        );
+        Ok(Response::new(AddMappingsResponse {
+            acknowledged: true,
+            error: String::new(),
+        }))
+    }
+
     // ─── Shard Stats ──────────────────────────────────────────────────────────
 
     async fn get_shard_stats(
@@ -1912,9 +1989,35 @@ impl TransportService {
         index_name: &str,
         shard_id: u32,
     ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
+        self.get_or_open_shard_with_override(index_name, shard_id, None)
+            .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn get_or_open_shard_with_override(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        open_override: Option<DynamicShardOpenOverride>,
+    ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
         if let Some(e) = self.shard_manager.get_shard(index_name, shard_id) {
             return Ok(e);
         }
+
+        if let Some(open_override) = open_override {
+            return self
+                .shard_manager
+                .open_shard_with_settings_blocking(
+                    index_name.to_string(),
+                    shard_id,
+                    open_override.mappings,
+                    open_override.settings,
+                    open_override.index_uuid,
+                )
+                .await
+                .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)));
+        }
+
         let cs = self.cluster_manager.get_state();
         let Some(metadata) = cs.indices.get(index_name) else {
             return Err(Status::not_found(format!(
@@ -2013,6 +2116,212 @@ impl TransportService {
         }
 
         (successful, failed)
+    }
+
+    /// Detect new fields in a document payload, register them via Raft, and if
+    /// needed prepare merged mappings for the immediate shard open.
+    async fn ensure_dynamic_mappings(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        payload: &serde_json::Value,
+    ) -> Result<Option<DynamicShardOpenOverride>, Status> {
+        let cs = self.cluster_manager.get_state();
+        let metadata = cs.indices.get(index_name).ok_or_else(|| {
+            Status::not_found(format!("index '{}' not found in cluster state", index_name))
+        })?;
+
+        if !matches!(
+            metadata.dynamic,
+            crate::cluster::state::DynamicMapping::True
+        ) {
+            if matches!(
+                metadata.dynamic,
+                crate::cluster::state::DynamicMapping::Strict
+            ) {
+                let unknown_fields =
+                    crate::common::detect_unknown_fields(payload, &metadata.mappings);
+                if !unknown_fields.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "strict mapping: unknown fields {:?} in index '{}'",
+                        unknown_fields, index_name
+                    )));
+                }
+            }
+            return Ok(None);
+        }
+
+        let new_fields = crate::common::detect_new_fields(payload, &metadata.mappings);
+        if new_fields.is_empty() {
+            return Ok(None);
+        }
+
+        tracing::info!(
+            "Dynamic mapping: detected {} new field(s) in index '{}': {:?}",
+            new_fields.len(),
+            index_name,
+            new_fields.keys().collect::<Vec<_>>()
+        );
+
+        let mut merged_mappings = metadata.mappings.clone();
+        for (name, mapping) in &new_fields {
+            merged_mappings
+                .entry(name.clone())
+                .or_insert(mapping.clone());
+        }
+
+        self.apply_dynamic_mappings(
+            index_name,
+            shard_id,
+            &new_fields,
+            &metadata.dynamic,
+            metadata,
+            &merged_mappings,
+        )
+        .await?;
+
+        Ok(Some(DynamicShardOpenOverride {
+            mappings: merged_mappings,
+            settings: metadata.settings.clone(),
+            index_uuid: metadata.uuid.to_string(),
+        }))
+    }
+
+    /// Batch version: detect/register new fields and prepare merged mappings for
+    /// the immediate shard open if needed.
+    async fn ensure_dynamic_mappings_batch(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        docs: &[(String, serde_json::Value)],
+    ) -> Result<Option<DynamicShardOpenOverride>, Status> {
+        let cs = self.cluster_manager.get_state();
+        let metadata = cs.indices.get(index_name).ok_or_else(|| {
+            Status::not_found(format!("index '{}' not found in cluster state", index_name))
+        })?;
+
+        if !matches!(
+            metadata.dynamic,
+            crate::cluster::state::DynamicMapping::True
+        ) {
+            if matches!(
+                metadata.dynamic,
+                crate::cluster::state::DynamicMapping::Strict
+            ) {
+                let unknown_fields =
+                    crate::common::detect_unknown_fields_batch(docs, &metadata.mappings);
+                if !unknown_fields.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "strict mapping: unknown fields {:?} in index '{}'",
+                        unknown_fields, index_name
+                    )));
+                }
+            }
+            return Ok(None);
+        }
+
+        let new_fields = crate::common::detect_new_fields_batch(docs, &metadata.mappings);
+        if new_fields.is_empty() {
+            return Ok(None);
+        }
+
+        tracing::info!(
+            "Dynamic mapping (bulk): detected {} new field(s) in index '{}': {:?}",
+            new_fields.len(),
+            index_name,
+            new_fields.keys().collect::<Vec<_>>()
+        );
+
+        let mut merged_mappings = metadata.mappings.clone();
+        for (name, mapping) in &new_fields {
+            merged_mappings
+                .entry(name.clone())
+                .or_insert(mapping.clone());
+        }
+
+        self.apply_dynamic_mappings(
+            index_name,
+            shard_id,
+            &new_fields,
+            &metadata.dynamic,
+            metadata,
+            &merged_mappings,
+        )
+        .await?;
+
+        Ok(Some(DynamicShardOpenOverride {
+            mappings: merged_mappings,
+            settings: metadata.settings.clone(),
+            index_uuid: metadata.uuid.to_string(),
+        }))
+    }
+
+    /// Common path: commit new mappings via Raft and immediately reopen any live
+    /// local shard so the current request can index against the updated schema.
+    async fn apply_dynamic_mappings(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        new_fields: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        dynamic: &crate::cluster::state::DynamicMapping,
+        metadata: &crate::cluster::state::IndexMetadata,
+        merged_mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> Result<(), Status> {
+        if let Some(raft) = self.raft.as_ref()
+            && raft.is_leader()
+        {
+            let cmd = crate::consensus::types::ClusterCommand::AddMappings {
+                index_name: index_name.to_string(),
+                new_fields: new_fields.clone(),
+                dynamic: dynamic.clone(),
+            };
+            raft.client_write(cmd).await.map_err(|e| {
+                Status::internal(format!(
+                    "Raft AddMappings failed for index '{}': {}",
+                    index_name, e
+                ))
+            })?;
+        } else {
+            let cs = self.cluster_manager.get_state();
+            if let Some(master_id) = cs.master_node.as_ref()
+                && let Some(master_node) = cs.nodes.get(master_id)
+            {
+                self.transport_client
+                    .forward_add_mappings(master_node, index_name, new_fields, dynamic)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!(
+                            "forward AddMappings to leader for index '{}': {}",
+                            index_name, e
+                        ))
+                    })?;
+            } else {
+                return Err(Status::internal(format!(
+                    "No master node available to commit dynamic mappings for index '{}'",
+                    index_name
+                )));
+            }
+        }
+
+        if self.shard_manager.get_shard(index_name, shard_id).is_some() {
+            self.shard_manager
+                .reopen_shard(
+                    index_name.to_string(),
+                    shard_id,
+                    merged_mappings.clone(),
+                    metadata.settings.clone(),
+                    metadata.uuid.to_string(),
+                )
+                .await
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "reopen shard after dynamic mapping for [{index_name}][{shard_id}]: {}",
+                        e
+                    ))
+                })?;
+        }
+
+        Ok(())
     }
 }
 

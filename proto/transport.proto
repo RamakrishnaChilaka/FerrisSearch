@@ -40,6 +40,8 @@ message IndexMetadata {
     string uuid = 5;
     repeated FieldMappingEntry mappings = 6;
     IndexSettings settings = 7;
+    // Dynamic mapping mode: \"true\", \"false\", \"strict\" (empty = \"false\" for backward compat)
+    string dynamic = 8;
 }
 
 message ClusterState {
@@ -254,6 +256,19 @@ message TransferMasterResponse {
     string error = 2;
 }
 
+// ─── Dynamic Mapping (forwarded to leader) ────────────────────────────────────
+
+message AddMappingsRequest {
+    string index_name = 1;
+    repeated FieldMappingEntry new_fields = 2;
+    string dynamic = 3;  // "true", "false", "strict"
+}
+
+message AddMappingsResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
 // ─── Shard Stats (for _cat endpoints) ───────────────────────────────────────
 
 message ShardStatsRequest {}
@@ -381,6 +396,9 @@ service InternalTransport {
 
     // Cluster management (forwarded to leader)
     rpc TransferMaster(TransferMasterRequest) returns (TransferMasterResponse);
+
+    // Dynamic mapping (forwarded to leader)
+    rpc AddMappings(AddMappingsRequest) returns (AddMappingsResponse);
 
     // Shard stats (for _cat endpoints)
     rpc GetShardStats(ShardStatsRequest) returns (ShardStatsResponse);

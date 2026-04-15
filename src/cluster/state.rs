@@ -86,6 +86,36 @@ pub struct FieldMapping {
     pub dimension: Option<usize>,
 }
 
+/// Controls whether unmapped fields in documents are auto-detected and added
+/// to the index mappings (OpenSearch-compatible `dynamic` parameter).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DynamicMapping {
+    /// Auto-detect field types and add new fields to mappings on first encounter.
+    True,
+    /// Ignore unknown fields (index only into the "body" catch-all). This is the
+    /// legacy behaviour and the default for backward compatibility.
+    False,
+    /// Reject documents that contain fields not present in the explicit mappings.
+    Strict,
+}
+
+impl Default for DynamicMapping {
+    fn default() -> Self {
+        Self::False
+    }
+}
+
+impl std::fmt::Display for DynamicMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::True => write!(f, "true"),
+            Self::False => write!(f, "false"),
+            Self::Strict => write!(f, "strict"),
+        }
+    }
+}
+
 /// Per-index settings that control engine behavior.
 ///
 /// Settings are divided into two categories:
@@ -217,6 +247,9 @@ pub struct IndexMetadata {
     /// Field name → mapping definition. Empty means dynamic (all-to-body).
     #[serde(default)]
     pub mappings: HashMap<String, FieldMapping>,
+    /// Controls auto-detection of unmapped fields. Default: `False` (legacy).
+    #[serde(default)]
+    pub dynamic: DynamicMapping,
     /// Per-index dynamic settings. Controls refresh interval, and will hold
     /// engine-specific configuration when shardless mode is added.
     #[serde(default)]
@@ -263,6 +296,7 @@ impl IndexMetadata {
             number_of_replicas: num_replicas,
             shard_routing,
             mappings: HashMap::new(),
+            dynamic: DynamicMapping::default(),
             settings: IndexSettings::default(),
         }
     }
@@ -546,6 +580,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         state.add_index(meta);
@@ -563,6 +598,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -588,6 +624,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -611,6 +648,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -646,6 +684,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -678,6 +717,7 @@ mod tests {
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -703,6 +743,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         assert!(meta.replica_nodes(99).is_empty());
@@ -717,6 +758,7 @@ mod tests {
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -751,6 +793,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         assert!(!meta.promote_replica(99));
@@ -765,6 +808,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -810,6 +854,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -865,6 +910,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.mappings.insert(
@@ -1095,6 +1141,7 @@ mod tests {
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1121,6 +1168,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1148,6 +1196,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1173,6 +1222,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1214,6 +1264,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1332,6 +1383,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1367,6 +1419,7 @@ mod tests {
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1395,6 +1448,7 @@ mod tests {
             number_of_replicas: 3,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1423,6 +1477,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1449,6 +1504,7 @@ mod tests {
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         };
         meta.shard_routing.insert(
@@ -1475,6 +1531,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         };
         for s in 0..3 {
@@ -1504,6 +1561,7 @@ mod tests {
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
             mappings: HashMap::new(),
+            dynamic: Default::default(),
             settings: IndexSettings {
                 refresh_interval_ms: Some(10000),
                 ..Default::default()
@@ -1512,5 +1570,75 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let back: IndexMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(back.settings.refresh_interval_ms, Some(10000));
+    }
+
+    // ── DynamicMapping tests ───────────────────────────────────────────
+
+    #[test]
+    fn dynamic_mapping_default_is_false() {
+        assert_eq!(DynamicMapping::default(), DynamicMapping::False);
+    }
+
+    #[test]
+    fn dynamic_mapping_display() {
+        assert_eq!(DynamicMapping::True.to_string(), "true");
+        assert_eq!(DynamicMapping::False.to_string(), "false");
+        assert_eq!(DynamicMapping::Strict.to_string(), "strict");
+    }
+
+    #[test]
+    fn dynamic_mapping_serde_roundtrip() {
+        for variant in &[
+            DynamicMapping::True,
+            DynamicMapping::False,
+            DynamicMapping::Strict,
+        ] {
+            let json = serde_json::to_string(variant).unwrap();
+            let back: DynamicMapping = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, variant);
+        }
+    }
+
+    #[test]
+    fn dynamic_mapping_serde_from_string_values() {
+        let t: DynamicMapping = serde_json::from_str("\"true\"").unwrap();
+        assert_eq!(t, DynamicMapping::True);
+        let f: DynamicMapping = serde_json::from_str("\"false\"").unwrap();
+        assert_eq!(f, DynamicMapping::False);
+        let s: DynamicMapping = serde_json::from_str("\"strict\"").unwrap();
+        assert_eq!(s, DynamicMapping::Strict);
+    }
+
+    #[test]
+    fn dynamic_mapping_serde_rejects_unknown() {
+        let result: std::result::Result<DynamicMapping, _> = serde_json::from_str("\"runtime\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn index_metadata_with_dynamic_true_serde() {
+        let meta = IndexMetadata {
+            name: "dyn-test".into(),
+            uuid: IndexUuid::new("u1"),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            dynamic: DynamicMapping::True,
+            settings: IndexSettings::default(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"dynamic\":\"true\""));
+        let back: IndexMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dynamic, DynamicMapping::True);
+    }
+
+    #[test]
+    fn index_metadata_missing_dynamic_defaults_to_false() {
+        // Simulates loading legacy JSON that predates the dynamic field.
+        let json = r#"{"name":"legacy","uuid":"u","number_of_shards":1,
+                       "number_of_replicas":0,"shard_routing":{},"mappings":{},"settings":{}}"#;
+        let meta: IndexMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.dynamic, DynamicMapping::False);
     }
 }

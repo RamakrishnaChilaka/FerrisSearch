@@ -229,6 +229,7 @@ mod tests {
             number_of_replicas: 1,
             shard_routing,
             mappings: std::collections::HashMap::new(),
+            dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         });
     }

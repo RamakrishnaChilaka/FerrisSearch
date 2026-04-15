@@ -151,6 +151,7 @@ async fn open_local_assigned_shards_opens_unopened_local_shards() {
         number_of_replicas: 1,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -188,6 +189,7 @@ fn open_local_assigned_shards_skips_missing_expected_uuid_dir_for_recovered_assi
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -224,6 +226,7 @@ async fn open_local_assigned_shards_creates_missing_dir_for_new_assignment() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -261,6 +264,7 @@ async fn recovered_node_only_guards_assignments_from_local_recovered_state() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -297,6 +301,7 @@ async fn recovered_startup_shards_remain_guarded_across_reopen_attempts() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -342,6 +347,7 @@ async fn open_local_assigned_shards_blocking_does_not_starve_runtime() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -438,6 +444,7 @@ fn cleanup_orphaned_data_if_authoritative_keeps_known_uuid_dirs() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -476,6 +483,7 @@ fn cleanup_orphaned_data_if_authoritative_skips_when_local_uuid_dir_missing() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -529,6 +537,7 @@ fn cleanup_skips_when_uuid_dir_was_freshly_created() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -578,6 +587,7 @@ fn cleanup_runs_when_uuid_dir_was_pre_existing() {
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 
@@ -625,6 +635,7 @@ fn two_restart_recovery_sequence_preserves_old_data_and_never_creates_fresh_uuid
         number_of_replicas: 0,
         shard_routing,
         mappings: HashMap::new(),
+        dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
 

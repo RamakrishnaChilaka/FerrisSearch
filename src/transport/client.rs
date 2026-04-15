@@ -736,6 +736,45 @@ impl TransportClient {
         Ok(())
     }
 
+    /// Forward an AddMappings request to the Raft leader.
+    pub async fn forward_add_mappings(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+        new_fields: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        dynamic: &crate::cluster::state::DynamicMapping,
+    ) -> Result<(), anyhow::Error> {
+        use crate::transport::server::conversions::field_type_to_proto;
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master for AddMappings: {}", e))?;
+
+        let entries: Vec<FieldMappingEntry> = new_fields
+            .iter()
+            .map(|(name, mapping)| FieldMappingEntry {
+                name: name.clone(),
+                field_type: field_type_to_proto(&mapping.field_type),
+                dimension: mapping.dimension.map(|d| d as u32),
+            })
+            .collect();
+
+        let request = tonic::Request::new(AddMappingsRequest {
+            index_name: index_name.to_string(),
+            new_fields: entries,
+            dynamic: dynamic.to_string(),
+        });
+        let resp = client
+            .add_mappings(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("AddMappings RPC: {}", e))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
+
     /// Fetch shard doc counts from a remote node.
     /// Returns a map of (index_name, shard_id) → doc_count.
     pub async fn get_shard_stats(

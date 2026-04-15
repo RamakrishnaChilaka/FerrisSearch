@@ -181,6 +181,7 @@ impl FerrisDB {
             number_of_replicas: 0,
             shard_routing,
             mappings,
+            dynamic: Default::default(),
             settings: IndexSettings::default(),
         });
 
