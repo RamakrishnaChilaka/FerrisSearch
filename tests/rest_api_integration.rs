@@ -95,14 +95,47 @@ async fn post_json_to_base_url(
     Ok((status, value))
 }
 
+async fn put_json_to_base_url(
+    client: &Client,
+    base_url: &str,
+    path: &str,
+    body: Value,
+) -> Result<(StatusCode, Value)> {
+    let response = client
+        .put(format!("{}{}", base_url, path))
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let value = response.json().await?;
+    Ok((status, value))
+}
+
 impl RestTestHarness {
     async fn start() -> Result<Self> {
         Self::start_with_column_cache(0, 0).await
     }
 
+    async fn start_with_roles(roles: Vec<NodeRole>) -> Result<Self> {
+        Self::start_internal(0, 0, roles).await
+    }
+
     async fn start_with_column_cache(
         column_cache_bytes: u64,
         populate_threshold_percent: u8,
+    ) -> Result<Self> {
+        Self::start_internal(
+            column_cache_bytes,
+            populate_threshold_percent,
+            vec![NodeRole::Master, NodeRole::Data],
+        )
+        .await
+    }
+
+    async fn start_internal(
+        column_cache_bytes: u64,
+        populate_threshold_percent: u8,
+        roles: Vec<NodeRole>,
     ) -> Result<Self> {
         let temp_dir = tempfile::tempdir()?;
         let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -116,7 +149,7 @@ impl RestTestHarness {
             host: "127.0.0.1".into(),
             transport_port: transport_addr.port(),
             http_port: http_addr.port(),
-            roles: vec![NodeRole::Master, NodeRole::Data],
+            roles,
             raft_node_id: 1,
         };
 
@@ -968,6 +1001,10 @@ async fn rest_can_create_update_settings_and_delete_index() -> Result<()> {
         settings_body["products"]["settings"]["index"]["number_of_replicas"],
         json!(0)
     );
+    assert_eq!(
+        settings_body["products"]["settings"]["index"]["engine"],
+        json!("local_shards")
+    );
 
     let (update_status, update_body) = harness
         .put_json(
@@ -988,6 +1025,10 @@ async fn rest_can_create_update_settings_and_delete_index() -> Result<()> {
     assert_eq!(
         settings_after_body["products"]["settings"]["index"]["number_of_replicas"],
         json!(0)
+    );
+    assert_eq!(
+        settings_after_body["products"]["settings"]["index"]["engine"],
+        json!("local_shards")
     );
 
     let (delete_status, delete_body) = harness.delete_json("/products").await?;
@@ -2936,6 +2977,107 @@ async fn get_settings_exposes_dynamic_field() -> Result<()> {
         body["settingstest"]["settings"]["index"]["dynamic"],
         json!("true"),
         "GET _settings should expose the dynamic field"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_index_rejects_unimplemented_remote_store_engine() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/remoteidx",
+            json!({
+                "engine": "remote_store"
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("remote_store")
+    );
+    assert_eq!(
+        harness.head_status("/remoteidx").await?,
+        StatusCode::NOT_FOUND
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_index_rejects_unimplemented_remote_store_engine_when_forwarded_to_leader()
+-> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+
+    let (status, body) = put_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
+        "/remoteidx-forwarded",
+        json!({
+            "engine": "remote_store"
+        }),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("remote_store")
+    );
+
+    let follower_status = harness
+        .client
+        .head(format!("{}/remoteidx-forwarded", harness.nodes[1].base_url))
+        .send()
+        .await?
+        .status();
+    assert_eq!(follower_status, StatusCode::NOT_FOUND);
+
+    let leader_status = harness
+        .client
+        .head(format!("{}/remoteidx-forwarded", harness.nodes[0].base_url))
+        .send()
+        .await?
+        .status();
+    assert_eq!(leader_status, StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_index_returns_no_data_nodes_exception_on_master_only_node() -> Result<()> {
+    let harness = RestTestHarness::start_with_roles(vec![NodeRole::Master]).await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/nodataidx",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["type"], json!("no_data_nodes_exception"));
+    assert_eq!(
+        body["error"]["reason"],
+        json!("No data nodes available to assign shards")
+    );
+    assert_eq!(
+        harness.head_status("/nodataidx").await?,
+        StatusCode::NOT_FOUND
     );
 
     Ok(())

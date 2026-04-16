@@ -895,10 +895,12 @@ async fn global_sql_show_tables_returns_index_list() {
     assert_eq!(status, StatusCode::OK);
     let columns = body["columns"].as_array().unwrap();
     assert!(columns.contains(&json!("index")));
+    assert!(columns.contains(&json!("engine")));
     assert!(columns.contains(&json!("docs")));
     let rows = body["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["index"], "products");
+    assert_eq!(rows[0]["engine"], "local_shards");
 }
 
 #[tokio::test]
@@ -955,8 +957,10 @@ async fn global_sql_show_create_table_returns_index_json() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["index"], "products");
     let create = &body["create_statement"];
+    assert_eq!(create["engine"], "local_shards");
     assert!(create.get("settings").is_some());
     assert!(create.get("mappings").is_some());
+    assert_eq!(create["mappings"]["dynamic"], "false");
     let props = &create["mappings"]["properties"];
     assert!(props.get("title").is_some());
 }

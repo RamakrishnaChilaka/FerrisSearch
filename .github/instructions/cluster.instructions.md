@@ -6,17 +6,23 @@
 - `NodeRole` — `Master`, `Data`, `Client`
 - `ShardState` — `Started` (active), `Unassigned` (needs a node)
 - `FieldType` — `Text`, `Keyword`, `Integer`, `Float`, `Boolean`, `KnnVector`
+- `IndexEngine` — `LocalShards` (current shard-owned engine), `RemoteStore` (future shardless object-store engine)
 
 ### Structs
 ```
 NodeInfo { id, name, host, transport_port, http_port, roles, raft_node_id }
 FieldMapping { field_type, dimension }  // dimension for knn_vector only
-IndexSettings { refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // None = cluster defaults (5000ms, 512MB)
+IndexSettings { engine: IndexEngine, refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // engine defaults to LocalShards; None settings use cluster defaults (5000ms, 512MB)
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary, replicas, unassigned_replicas }
 IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, dynamic, settings }
 ClusterState { cluster_name, version, master_node, nodes, indices, last_seen }
 ```
+
+### Engine Selection
+- `IndexSettings.engine` is a create-time selector persisted in cluster state, surfaced by `GET /{index}/_settings`, `SHOW TABLES`, and `SHOW CREATE TABLE`
+- `engine` is immutable after creation — `PUT /{index}/_settings` must reject attempts to change it
+- `local_shards` is the only operational engine today; `remote_store` is recognized for forward compatibility but create-index paths must reject it until the shardless engine exists
 
 ### Index UUID
 - Every `IndexMetadata` has a `uuid: String` field (UUID v4, auto-generated on creation)

@@ -1,5 +1,7 @@
 use super::*;
-use crate::cluster::state::{ClusterState, IndexSettings, NodeInfo, NodeRole, ShardRoutingEntry};
+use crate::cluster::state::{
+    ClusterState, IndexEngine, IndexSettings, NodeInfo, NodeRole, ShardRoutingEntry,
+};
 use crate::engine::{CompositeEngine, SearchEngine};
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,13 +141,17 @@ fn parse_odd_number_of_lines_ignores_trailing() {
 }
 
 fn make_test_node(id: &str) -> NodeInfo {
+    make_test_node_with_roles(id, vec![NodeRole::Data])
+}
+
+fn make_test_node_with_roles(id: &str, roles: Vec<NodeRole>) -> NodeInfo {
     NodeInfo {
         id: id.into(),
         name: id.into(),
         host: "127.0.0.1".into(),
         transport_port: 9300,
         http_port: 9200,
-        roles: vec![NodeRole::Data],
+        roles,
         raft_node_id: 1,
     }
 }
@@ -338,6 +344,143 @@ async fn create_index_applies_flush_threshold_setting() {
 }
 
 #[tokio::test]
+async fn create_index_returns_no_data_nodes_exception_when_no_data_nodes_are_available() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_node(make_test_node_with_roles("node-1", vec![NodeRole::Master]));
+    let (_tmp, state) = make_test_app_state(cluster_state).await;
+
+    let body = axum::body::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0
+            }
+        }))
+        .unwrap(),
+    );
+
+    let (status, Json(response)) = create_index(
+        State(state),
+        Path(crate::common::IndexName::new("idx").unwrap()),
+        body,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response["error"]["type"], "no_data_nodes_exception");
+    assert_eq!(
+        response["error"]["reason"],
+        "No data nodes available to assign shards"
+    );
+}
+
+#[test]
+fn forwarded_create_index_error_response_preserves_create_index_statuses() {
+    let invalid_argument = anyhow::Error::from(tonic::Status::invalid_argument("unknown engine"));
+    let (status, Json(body)) =
+        forwarded_create_index_error_response(&invalid_argument).expect("status should map");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert_eq!(body["error"]["reason"], "unknown engine");
+
+    let unimplemented = anyhow::Error::from(tonic::Status::unimplemented(
+        "remote_store engine is not implemented yet",
+    ));
+    let (status, Json(body)) =
+        forwarded_create_index_error_response(&unimplemented).expect("status should map");
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert_eq!(
+        body["error"]["reason"],
+        "remote_store engine is not implemented yet"
+    );
+
+    let no_data_nodes = anyhow::Error::from(tonic::Status::internal(
+        "No data nodes available to assign shards",
+    ));
+    let (status, Json(body)) =
+        forwarded_create_index_error_response(&no_data_nodes).expect("status should map");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["type"], "no_data_nodes_exception");
+    assert_eq!(
+        body["error"]["reason"],
+        "No data nodes available to assign shards"
+    );
+
+    let unrelated_internal = anyhow::Error::from(tonic::Status::internal("boom"));
+    assert!(forwarded_create_index_error_response(&unrelated_internal).is_none());
+}
+
+#[tokio::test]
+async fn create_index_accepts_explicit_local_shards_engine() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_node(make_test_node("node-1"));
+    let (_tmp, state) = make_test_app_state(cluster_state).await;
+
+    let body = axum::body::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "engine": "local_shards",
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0
+            }
+        }))
+        .unwrap(),
+    );
+
+    let (status, _) = create_index(
+        State(state.clone()),
+        Path(crate::common::IndexName::new("idx").unwrap()),
+        body,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state.cluster_manager.get_state().indices["idx"]
+            .settings
+            .engine,
+        IndexEngine::LocalShards
+    );
+}
+
+#[tokio::test]
+async fn create_index_rejects_unimplemented_remote_store_engine() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_node(make_test_node("node-1"));
+    let (_tmp, state) = make_test_app_state(cluster_state).await;
+
+    let body = axum::body::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "engine": "remote_store"
+        }))
+        .unwrap(),
+    );
+
+    let (status, Json(response)) = create_index(
+        State(state.clone()),
+        Path(crate::common::IndexName::new("idx").unwrap()),
+        body,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        response["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("remote_store")
+    );
+    assert!(
+        !state
+            .cluster_manager
+            .get_state()
+            .indices
+            .contains_key("idx")
+    );
+}
+
+#[tokio::test]
 async fn fan_out_maintenance_keeps_local_target_without_node_entry() {
     let mut cluster_state = ClusterState::new("test-cluster".into());
     cluster_state.add_index(make_test_metadata(Some("node-1")));
@@ -468,6 +611,7 @@ async fn get_index_settings_includes_flush_threshold_setting() {
     let mut cluster_state = ClusterState::new("test-cluster".into());
     cluster_state.add_node(make_test_node("node-1"));
     let mut metadata = make_test_metadata(Some("node-1"));
+    metadata.settings.engine = IndexEngine::LocalShards;
     metadata.settings.flush_threshold_bytes = Some(8192);
     cluster_state.add_index(metadata);
 
@@ -482,6 +626,34 @@ async fn get_index_settings_includes_flush_threshold_setting() {
     assert_eq!(
         body["idx"]["settings"]["index"]["flush_threshold_bytes"],
         8192
+    );
+    assert_eq!(body["idx"]["settings"]["index"]["engine"], "local_shards");
+}
+
+#[tokio::test]
+async fn update_index_settings_rejects_engine_changes() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_node(make_test_node("node-1"));
+    cluster_state.add_index(make_test_metadata(Some("node-1")));
+
+    let (_tmp, state) = make_test_app_state(cluster_state).await;
+    let (status, Json(body)) = update_index_settings(
+        State(state),
+        Path(crate::common::IndexName::new("idx").unwrap()),
+        Json(serde_json::json!({
+            "index": {
+                "engine": "remote_store"
+            }
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("index.engine is immutable")
     );
 }
 

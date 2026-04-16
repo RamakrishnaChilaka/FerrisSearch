@@ -94,7 +94,7 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Read-side shard reopen MUST fail closed on UUID mismatch**: `get_or_open_search_shard()` must reject empty UUIDs and missing expected UUID directories instead of creating a fresh shard on a read path.
 - **Transport serialization must fail loudly**: gRPC handlers and clients must not use `unwrap_or_default()` for protocol payloads (`source_json`, `payload_json`, `partial_aggs_json`, Raft snapshot fields). Serialization or decode failures must surface as RPC errors, not empty payloads or silently dropped hits.
 - **Raft snapshot RPCs must require all fields**: missing `vote`, `meta`, or `data` in `RaftSnapshot` is `INVALID_ARGUMENT`, not a defaulted empty snapshot.
-- **ClusterState transport snapshots must be lossless**: startup consumes `JoinCluster` snapshots for shard reopen and orphan cleanup, so proto/domain conversion must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and `uuid` exactly. Never synthesize defaults or new UUIDs during roundtrip, and reject unknown field types instead of coercing them.
+- **ClusterState transport snapshots must be lossless**: startup consumes `JoinCluster` snapshots for shard reopen and orphan cleanup, so proto/domain conversion must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and `uuid` exactly. Never synthesize defaults or new UUIDs during roundtrip, and reject unknown field types or unknown non-empty engine strings instead of coercing them.
 
 ## TransportClient (src/transport/client.rs)
 ```rust

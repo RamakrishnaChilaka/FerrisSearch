@@ -72,6 +72,7 @@ Every SQL response tells you how the planner executed the query:
 - **OpenSearch-compatible REST API** — `PUT /{index}`, `POST /_doc`, `GET /_search`, `POST /_bulk`, async `POST /{index}/_forcemerge`, `GET /_tasks/{task_id}`
 - **Search-aware SQL planner** — `text_match()` with `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and same-index semijoin support
 - **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, and `materialized_hits_fallback`, with `streaming_used` reported whenever the fast-field path streams locally or over gRPC
+- **Engine-ready index metadata** — indices now persist a create-time engine selector; `local_shards` is the only operational engine today, while `remote_store` is reserved for the upcoming shardless object-store engine
 - **Raft-backed coordination** — leader election, shard routing, and failover for a multi-node cluster
 - **Synchronous shard replication** — primary-replica writes over gRPC with ISR tracking; writes are acknowledged only after all in-sync replicas confirm
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) with hybrid text + vector querying
@@ -79,7 +80,7 @@ Every SQL response tells you how the planner executed the query:
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1240 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, and a bulk-body regression guarding benchmark-sized uploads
+- **Test depth** — 1258 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, and a bulk-body regression guarding benchmark-sized uploads
 
 ## Tech Stack
 
@@ -218,7 +219,7 @@ Scan limits are mode-specific. Flat `tantivy_fast_fields` queries keep their int
 - `_score` as the synthetic SQL relevance column; mapped `score` remains a normal field
 - `EXPLAIN` and `EXPLAIN ANALYZE` with per-stage timings
 - `POST /{index}/_sql/stream` and `POST /_sql/stream` — NDJSON SQL stream endpoints (`meta` frame followed by `rows` frames)
-- `SHOW TABLES`, `DESCRIBE <index>`, `SHOW CREATE TABLE <index>`
+- `SHOW TABLES`, `DESCRIBE <index>`, `SHOW CREATE TABLE <index>` — `SHOW TABLES` includes the persisted engine, and `SHOW CREATE TABLE` round-trips the engine, dynamic mode, and flush threshold
 - Alias-safe pushdown — `WHERE posts > 10` when `posts` is `count(*) AS posts` correctly stays as a DataFusion residual, never pushed to Tantivy
 
 ### Example Queries
@@ -262,6 +263,7 @@ FROM hackernews WHERE text_match(title, 'GPT OR LLM');
 ```bash
 # Create with mappings
 curl -X PUT 'http://localhost:9200/movies' -H 'Content-Type: application/json' -d '{
+  "engine": "local_shards",
   "settings": {"number_of_shards": 3, "number_of_replicas": 1},
   "mappings": {"properties": {
     "title": {"type": "text"}, "genre": {"type": "keyword"},
@@ -282,6 +284,7 @@ curl -X PUT 'http://localhost:9200/movies/_settings' -H 'Content-Type: applicati
 
 `flush_threshold_bytes` is a per-index WAL auto-flush threshold. The default is `536870912` (512 MB). Setting it to `0` disables automatic background flushes.
 Background auto-flush is best-effort: it skips the tick while the shard is busy ingesting or persisting vectors instead of blocking live writes, and the maintenance tick itself runs on blocking threads so compaction does not stall Raft heartbeats.
+`engine` is immutable after index creation. `local_shards` is the default and the only operational engine today. `remote_store` is recognized but currently returns `501 Not Implemented` until the shardless object-store engine lands.
 
 **Field types:** `text`, `keyword`, `integer`, `float`, `boolean`, `date`, `knn_vector`. Unmapped fields are auto-detected on first document.
 

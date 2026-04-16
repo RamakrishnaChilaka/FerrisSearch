@@ -80,6 +80,7 @@ fn make_full_cluster_state() -> DomainClusterState {
         mappings,
         dynamic: Default::default(),
         settings: crate::cluster::state::IndexSettings {
+            engine: crate::cluster::state::IndexEngine::LocalShards,
             refresh_interval_ms: Some(1500),
             flush_threshold_bytes: Some(65_536),
         },
@@ -1187,5 +1188,125 @@ fn roundtrip_empty_dynamic_defaults_to_false() {
     assert_eq!(
         restored.indices["legacy-idx"].dynamic,
         crate::cluster::state::DynamicMapping::False
+    );
+}
+
+#[test]
+fn roundtrip_preserves_remote_store_engine() {
+    let mut cs = DomainClusterState::new("engine-test".into());
+    let meta = DomainIndexMetadata {
+        name: "remote-idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("remote-uuid"),
+        number_of_shards: 0,
+        number_of_replicas: 0,
+        shard_routing: std::collections::HashMap::new(),
+        mappings: std::collections::HashMap::new(),
+        dynamic: crate::cluster::state::DynamicMapping::False,
+        settings: crate::cluster::state::IndexSettings {
+            engine: crate::cluster::state::IndexEngine::RemoteStore,
+            ..Default::default()
+        },
+    };
+    cs.add_index(meta);
+
+    let proto = cluster_state_to_proto(&cs);
+    let restored = proto_to_cluster_state(&proto).unwrap();
+    assert_eq!(
+        restored.indices["remote-idx"].settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    );
+}
+
+#[test]
+fn roundtrip_rejects_unknown_non_empty_engine() {
+    let proto = ClusterState {
+        cluster_name: "engine-test".into(),
+        version: 1,
+        master_node: None,
+        nodes: vec![],
+        indices: vec![IndexMetadata {
+            name: "mystery-idx".into(),
+            uuid: "mystery-uuid".into(),
+            number_of_shards: 0,
+            number_of_replicas: 0,
+            shards: vec![],
+            mappings: vec![],
+            settings: Some(crate::transport::proto::IndexSettings {
+                engine: "alien_store".into(),
+                refresh_interval_ms: None,
+                flush_threshold_bytes: None,
+            }),
+            dynamic: String::new(),
+        }],
+    };
+
+    let err = proto_to_cluster_state(&proto).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("unknown engine 'alien_store'"));
+}
+
+#[tokio::test]
+async fn create_index_returns_internal_when_no_data_nodes_are_available() {
+    let mut cluster_state = DomainClusterState::new("create-index-test".into());
+    cluster_state.add_node(DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9300,
+        http_port: 9200,
+        roles: vec![NodeRole::Master],
+        raft_node_id: 1,
+    });
+    cluster_state.master_node = Some("node-1".into());
+
+    let (raft, shared_state) =
+        crate::consensus::create_raft_instance_mem(1, cluster_state.cluster_name.clone())
+            .await
+            .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19300".into())
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        if raft.current_leader().await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let manager = ClusterManager::with_shared_state(shared_state);
+    manager.update_state(cluster_state);
+
+    let service = TransportService {
+        cluster_manager: Arc::new(manager),
+        shard_manager: Arc::new(ShardManager::new(
+            tempfile::tempdir().unwrap().path(),
+            Duration::from_secs(60),
+        )),
+        transport_client: crate::transport::TransportClient::new(),
+        raft: Some(raft),
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+
+    let err = service
+        .create_index(Request::new(CreateIndexRequest {
+            index_name: "idx".into(),
+            body_json: serde_json::to_vec(&json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }))
+            .unwrap(),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::Internal);
+    assert!(
+        err.message()
+            .contains("No data nodes available to assign shards")
     );
 }

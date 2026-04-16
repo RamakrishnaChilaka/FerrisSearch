@@ -283,6 +283,23 @@ fn sql_batch_error_response(error: impl Into<String>) -> SqlRecordBatchResponse 
     }
 }
 
+fn create_index_error_status(error: crate::cluster::state::CreateIndexMetadataError) -> Status {
+    match error {
+        crate::cluster::state::CreateIndexMetadataError::NoDataNodes => {
+            Status::internal("No data nodes available to assign shards")
+        }
+        crate::cluster::state::CreateIndexMetadataError::InvalidArgument(message) => {
+            Status::invalid_argument(message)
+        }
+        crate::cluster::state::CreateIndexMetadataError::UnimplementedEngine(engine) => {
+            Status::unimplemented(format!(
+                "index engine [{}] is recognized but not implemented yet",
+                engine
+            ))
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl InternalTransport for TransportService {
     type SqlRecordBatchStreamStream =
@@ -1451,21 +1468,6 @@ impl InternalTransport for TransportService {
         let body: serde_json::Value =
             serde_json::from_slice(&req.body_json).unwrap_or(serde_json::json!({}));
 
-        let num_shards = body
-            .pointer("/settings/number_of_shards")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
-        let num_replicas = body
-            .pointer("/settings/number_of_replicas")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
-        let refresh_interval_ms = body
-            .pointer("/settings/refresh_interval_ms")
-            .and_then(|v| v.as_u64());
-        let flush_threshold_bytes = body
-            .pointer("/settings/flush_threshold_bytes")
-            .and_then(|v| v.as_u64());
-
         let cluster_state = self.cluster_manager.get_state();
 
         if cluster_state.indices.contains_key(index_name) {
@@ -1483,70 +1485,16 @@ impl InternalTransport for TransportService {
             .map(|n| n.id.clone())
             .collect();
 
-        if data_nodes.is_empty() {
-            return Err(Status::internal("No data nodes available to assign shards"));
-        }
-
-        let mut metadata = crate::cluster::state::IndexMetadata::build_shard_routing(
+        let metadata = crate::cluster::state::IndexMetadata::from_create_request_body(
             index_name,
-            num_shards,
-            num_replicas,
+            &body,
             &data_nodes,
-        );
+        )
+        .map_err(create_index_error_status)?;
 
-        if let Some(ms) = refresh_interval_ms {
-            metadata.settings.refresh_interval_ms = Some(ms);
-        }
-        if let Some(bytes) = flush_threshold_bytes {
-            metadata.settings.flush_threshold_bytes = Some(bytes);
-        }
-
-        // Parse field mappings
-        if let Some(properties) = body
-            .pointer("/mappings/properties")
-            .and_then(|v| v.as_object())
-        {
-            for (field_name, field_def) in properties {
-                if let Some(type_str) = field_def.get("type").and_then(|v| v.as_str()) {
-                    let field_mapping = match type_str {
-                        "text" => Some(crate::cluster::state::FieldMapping {
-                            field_type: crate::cluster::state::FieldType::Text,
-                            dimension: None,
-                        }),
-                        "keyword" => Some(crate::cluster::state::FieldMapping {
-                            field_type: crate::cluster::state::FieldType::Keyword,
-                            dimension: None,
-                        }),
-                        "integer" | "long" => Some(crate::cluster::state::FieldMapping {
-                            field_type: crate::cluster::state::FieldType::Integer,
-                            dimension: None,
-                        }),
-                        "float" | "double" => Some(crate::cluster::state::FieldMapping {
-                            field_type: crate::cluster::state::FieldType::Float,
-                            dimension: None,
-                        }),
-                        "boolean" => Some(crate::cluster::state::FieldMapping {
-                            field_type: crate::cluster::state::FieldType::Boolean,
-                            dimension: None,
-                        }),
-                        "knn_vector" => {
-                            let dim = field_def
-                                .get("dimension")
-                                .and_then(|v| v.as_u64())
-                                .map(|d| d as usize);
-                            Some(crate::cluster::state::FieldMapping {
-                                field_type: crate::cluster::state::FieldType::KnnVector,
-                                dimension: dim,
-                            })
-                        }
-                        _ => None,
-                    };
-                    if let Some(fm) = field_mapping {
-                        metadata.mappings.insert(field_name.clone(), fm);
-                    }
-                }
-            }
-        }
+        let engine_name = metadata.settings.engine.to_string();
+        let num_shards = metadata.number_of_shards;
+        let num_replicas = metadata.number_of_replicas;
 
         let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
         raft.client_write(cmd)
@@ -1561,8 +1509,9 @@ impl InternalTransport for TransportService {
         .map_err(|e| Status::internal(format!("serialize create index response: {}", e)))?;
 
         tracing::info!(
-            "gRPC: created index '{}' with {} shards, {} replicas",
+            "gRPC: created index '{}' with engine {}, {} shards, {} replicas",
             index_name,
+            engine_name,
             num_shards,
             num_replicas
         );

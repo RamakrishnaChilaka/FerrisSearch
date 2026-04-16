@@ -106,7 +106,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1049 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 49 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1240 total
+- 1064 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 52 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1258 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -140,11 +140,14 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Shard failover uses existing `UpdateIndex` Raft command — no new command variant needed
 - `raft_node_id` field on NodeInfo is critical for Raft membership changes — must be non-zero for Raft-managed nodes
 - `raft_node_id` must remain unique across node IDs; JoinCluster must reject conflicting identity reuse
-- Transport `ClusterState` snapshots are authoritative startup inputs — proto/domain roundtrips must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` exactly, and must reject unknown field types instead of coercing them
+- Transport `ClusterState` snapshots are authoritative startup inputs — proto/domain roundtrips must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` exactly, and must reject unknown field types or unknown non-empty engine strings instead of coercing them
 
 ## Dynamic Settings
 - `PUT /{index}/_settings` and `GET /{index}/_settings` API endpoints
-- `IndexSettings` struct on `IndexMetadata` holds `refresh_interval_ms: Option<u64>` and `flush_threshold_bytes: Option<u64>`
+- `IndexSettings` struct on `IndexMetadata` holds the immutable create-time `engine: IndexEngine` selector plus `refresh_interval_ms: Option<u64>` and `flush_threshold_bytes: Option<u64>`
+- `IndexEngine` values: `LocalShards` (current shard-owned engine) and `RemoteStore` (reserved for the future shardless/object-store engine)
+- `engine` is surfaced by `GET /{index}/_settings`, `SHOW TABLES`, and `SHOW CREATE TABLE`, but `PUT /{index}/_settings` must reject changes because engine selection is immutable after index creation
+- `create_index()` / forwarded `CreateIndex` must currently reject `remote_store` with `501 Not Implemented` / gRPC `UNIMPLEMENTED` instead of silently manufacturing shard routing for it
 - `SettingsManager` (src/cluster/settings.rs) uses `tokio::sync::watch` channels for reactive pub/sub
 - Consumers subscribe via `watch_refresh_interval()` / `watch_flush_threshold()` and react in `tokio::select!` loops
 - Non-leader nodes forward settings updates to master via gRPC `UpdateSettings` RPC
@@ -190,13 +193,14 @@ pub struct AppState {
 - `NodeRole` — `Master`, `Data`, `Client`
 - `ShardState` — `Started` (active), `Unassigned` (needs a node)
 - `FieldType` — `Text`, `Keyword`, `Integer`, `Float`, `Boolean`, `Date`, `KnnVector`
+- `IndexEngine` — `LocalShards` (current operational engine), `RemoteStore` (future shardless object-store engine)
 - `DynamicMapping` — `True` (auto-detect), `False` (body catch-all, default), `Strict` (reject unknown)
 
 ### Structs
 ```
 NodeInfo { id: NodeId, name: String, host: String, transport_port: u16, http_port: u16, roles: Vec<NodeRole>, raft_node_id: u64 }
 FieldMapping { field_type: FieldType, dimension: Option<usize> }  // dimension for knn_vector only
-IndexSettings { refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // None = cluster defaults (5000ms, 512MB)
+IndexSettings { engine: IndexEngine, refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // engine defaults to LocalShards; None settings use cluster defaults (5000ms, 512MB)
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary: NodeId, replicas: Vec<NodeId>, unassigned_replicas: u32 }
 IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing: HashMap<u32, ShardRoutingEntry>, mappings: HashMap<String, FieldMapping>, dynamic: DynamicMapping, settings: IndexSettings }
@@ -364,8 +368,10 @@ if let Some(ref raft) = state.raft {
 ### Create Index Body Format
 ```json
 {
-    "settings": { "number_of_shards": 3, "number_of_replicas": 1, "refresh_interval_ms": 5000, "flush_threshold_bytes": 536870912 },
+        "engine": "local_shards",
+        "settings": { "number_of_shards": 3, "number_of_replicas": 1, "refresh_interval_ms": 5000, "flush_threshold_bytes": 536870912 },
   "mappings": {
+        "dynamic": "true",
     "properties": {
       "title": { "type": "text" },
       "status": { "type": "keyword" },
@@ -374,6 +380,8 @@ if let Some(ref raft) = state.raft {
   }
 }
 ```
+
+- `engine` may be passed either as a string (`"local_shards"`) or as an object (`{"type":"remote_store"}`) in the create body parser, but only `local_shards` is operational today
 
 ## Search & Query DSL (src/search/mod.rs)
 

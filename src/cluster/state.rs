@@ -111,6 +111,136 @@ impl std::fmt::Display for DynamicMapping {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateIndexMetadataError {
+    NoDataNodes,
+    InvalidArgument(String),
+    UnimplementedEngine(IndexEngine),
+}
+
+impl std::fmt::Display for CreateIndexMetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDataNodes => write!(f, "No data nodes available to assign shards"),
+            Self::InvalidArgument(message) => f.write_str(message),
+            Self::UnimplementedEngine(engine) => {
+                write!(
+                    f,
+                    "index engine [{}] is recognized but not implemented yet",
+                    engine
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CreateIndexMetadataError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseIndexEngineNameError {
+    name: String,
+}
+
+impl ParseIndexEngineNameError {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::fmt::Display for ParseIndexEngineNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown engine [{}]; supported values are [local_shards, remote_store]",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for ParseIndexEngineNameError {}
+
+/// Selects which index engine backs a logical index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexEngine {
+    /// Current engine: local shard ownership backed by Tantivy + USearch.
+    #[default]
+    LocalShards,
+    /// Future engine: shardless immutable artifacts stored in remote object storage.
+    RemoteStore,
+}
+
+impl IndexEngine {
+    /// Parse the engine selector from a create-index body.
+    ///
+    /// Accepts either:
+    /// - top-level `{"engine": "local_shards"}`
+    /// - top-level `{"engine": {"type": "remote_store"}}`
+    /// - legacy-friendly `{"settings": {"engine": "local_shards"}}`
+    pub fn from_create_request_body(
+        body: &serde_json::Value,
+    ) -> Result<Self, CreateIndexMetadataError> {
+        let engine_value = body
+            .get("engine")
+            .or_else(|| body.pointer("/settings/engine"));
+        Self::from_create_value(engine_value)
+    }
+
+    pub fn parse_name(name: &str) -> Result<Self, ParseIndexEngineNameError> {
+        match name {
+            "local_shards" => Ok(Self::LocalShards),
+            "remote_store" => Ok(Self::RemoteStore),
+            other => Err(ParseIndexEngineNameError::new(other)),
+        }
+    }
+
+    pub fn uses_local_shards(&self) -> bool {
+        matches!(self, Self::LocalShards)
+    }
+
+    pub fn is_implemented(&self) -> bool {
+        matches!(self, Self::LocalShards)
+    }
+
+    fn from_create_value(
+        value: Option<&serde_json::Value>,
+    ) -> Result<Self, CreateIndexMetadataError> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+
+        match value {
+            serde_json::Value::String(name) => Self::parse_name(name)
+                .map_err(|err| CreateIndexMetadataError::InvalidArgument(err.to_string())),
+            serde_json::Value::Object(map) => {
+                let Some(name) = map.get("type").and_then(|v| v.as_str()) else {
+                    return Err(CreateIndexMetadataError::InvalidArgument(
+                        "engine object must contain a string 'type' field".to_string(),
+                    ));
+                };
+                Self::parse_name(name)
+                    .map_err(|err| CreateIndexMetadataError::InvalidArgument(err.to_string()))
+            }
+            _ => Err(CreateIndexMetadataError::InvalidArgument(
+                "engine must be a string or an object with a string 'type' field".into(),
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for IndexEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalShards => write!(f, "local_shards"),
+            Self::RemoteStore => write!(f, "remote_store"),
+        }
+    }
+}
+
 /// Per-index settings that control engine behavior.
 ///
 /// Settings are divided into two categories:
@@ -130,6 +260,9 @@ impl std::fmt::Display for DynamicMapping {
 /// fields and `shard_routing` would be absent.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct IndexSettings {
+    /// Immutable engine selector chosen at index creation time.
+    #[serde(default)]
+    pub engine: IndexEngine,
     // ── Common settings ─────────────────────────────────────────────
     /// Refresh interval in milliseconds. `None` = use cluster default (5000ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +385,139 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    /// Parse a create-index body into authoritative cluster metadata.
+    ///
+    /// This is shared by the HTTP handler and the forwarded gRPC leader path so
+    /// engine selection, settings, dynamic mapping, and field mappings stay
+    /// consistent regardless of which node receives the request first.
+    pub fn from_create_request_body(
+        index_name: &str,
+        body: &serde_json::Value,
+        data_nodes: &[String],
+    ) -> Result<Self, CreateIndexMetadataError> {
+        let engine = IndexEngine::from_create_request_body(body)?;
+
+        let refresh_interval_ms = body
+            .pointer("/settings/refresh_interval_ms")
+            .and_then(|v| v.as_u64());
+        let flush_threshold_bytes = body
+            .pointer("/settings/flush_threshold_bytes")
+            .and_then(|v| v.as_u64());
+
+        let mut metadata = if engine.uses_local_shards() {
+            if data_nodes.is_empty() {
+                return Err(CreateIndexMetadataError::NoDataNodes);
+            }
+
+            let num_shards = body
+                .pointer("/settings/number_of_shards")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+            let num_replicas = body
+                .pointer("/settings/number_of_replicas")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+
+            Self::build_shard_routing(index_name, num_shards, num_replicas, data_nodes)
+        } else {
+            Self {
+                name: index_name.to_string(),
+                uuid: IndexUuid::new_random(),
+                number_of_shards: 0,
+                number_of_replicas: 0,
+                shard_routing: HashMap::new(),
+                mappings: HashMap::new(),
+                dynamic: DynamicMapping::default(),
+                settings: IndexSettings::default(),
+            }
+        };
+
+        metadata.settings.engine = engine;
+        metadata.settings.refresh_interval_ms = refresh_interval_ms;
+        metadata.settings.flush_threshold_bytes = flush_threshold_bytes;
+
+        let dynamic_str = body
+            .pointer("/mappings/dynamic")
+            .or_else(|| body.get("dynamic"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .or_else(|| v.as_bool().map(|b| b.to_string()))
+            });
+        if let Some(dynamic) = dynamic_str {
+            metadata.dynamic = match dynamic.as_str() {
+                "true" => DynamicMapping::True,
+                "strict" => DynamicMapping::Strict,
+                _ => DynamicMapping::False,
+            };
+        }
+
+        if let Some(properties) = body
+            .pointer("/mappings/properties")
+            .and_then(|v| v.as_object())
+        {
+            for (field_name, field_def) in properties {
+                let Some(type_str) = field_def.get("type").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+
+                let field_mapping = match type_str {
+                    "text" => Some(FieldMapping {
+                        field_type: FieldType::Text,
+                        dimension: None,
+                    }),
+                    "keyword" => Some(FieldMapping {
+                        field_type: FieldType::Keyword,
+                        dimension: None,
+                    }),
+                    "integer" | "long" => Some(FieldMapping {
+                        field_type: FieldType::Integer,
+                        dimension: None,
+                    }),
+                    "float" | "double" => Some(FieldMapping {
+                        field_type: FieldType::Float,
+                        dimension: None,
+                    }),
+                    "boolean" => Some(FieldMapping {
+                        field_type: FieldType::Boolean,
+                        dimension: None,
+                    }),
+                    "date" | "datetime" | "timestamp" => Some(FieldMapping {
+                        field_type: FieldType::Date,
+                        dimension: None,
+                    }),
+                    "knn_vector" => Some(FieldMapping {
+                        field_type: FieldType::KnnVector,
+                        dimension: field_def
+                            .get("dimension")
+                            .and_then(|v| v.as_u64())
+                            .map(|d| d as usize),
+                    }),
+                    other => {
+                        tracing::warn!(
+                            "Unknown field type '{}' for field '{}', skipping",
+                            other,
+                            field_name
+                        );
+                        None
+                    }
+                };
+
+                if let Some(field_mapping) = field_mapping {
+                    metadata.mappings.insert(field_name.clone(), field_mapping);
+                }
+            }
+        }
+
+        if !metadata.settings.engine.is_implemented() {
+            return Err(CreateIndexMetadataError::UnimplementedEngine(
+                metadata.settings.engine.clone(),
+            ));
+        }
+
+        Ok(metadata)
+    }
+
     /// Build shard routing for a new index, distributing primaries and replicas
     /// round-robin across the given data nodes. Guarantees that a shard's primary
     /// and replicas are never assigned to the same node.
@@ -1283,6 +1549,20 @@ mod tests {
     fn index_settings_default_has_no_refresh_interval() {
         let s = IndexSettings::default();
         assert_eq!(s.refresh_interval_ms, None);
+        assert_eq!(s.engine, IndexEngine::LocalShards);
+    }
+
+    #[test]
+    fn index_engine_display_and_default() {
+        assert_eq!(IndexEngine::default(), IndexEngine::LocalShards);
+        assert_eq!(IndexEngine::LocalShards.to_string(), "local_shards");
+        assert_eq!(IndexEngine::RemoteStore.to_string(), "remote_store");
+    }
+
+    #[test]
+    fn index_engine_parse_name_rejects_unknown_engine() {
+        let error = IndexEngine::parse_name("columnstore_v99").unwrap_err();
+        assert_eq!(error.name(), "columnstore_v99");
     }
 
     #[test]
@@ -1330,6 +1610,102 @@ mod tests {
         };
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn index_metadata_from_create_request_body_parses_local_engine_and_mappings() {
+        let metadata = IndexMetadata::from_create_request_body(
+            "events",
+            &serde_json::json!({
+                "engine": "local_shards",
+                "settings": {
+                    "number_of_shards": 2,
+                    "number_of_replicas": 1,
+                    "refresh_interval_ms": 1500,
+                    "flush_threshold_bytes": 4096
+                },
+                "mappings": {
+                    "dynamic": "true",
+                    "properties": {
+                        "created_at": { "type": "date" },
+                        "title": { "type": "text" }
+                    }
+                }
+            }),
+            &["node-1".into(), "node-2".into()],
+        )
+        .unwrap();
+
+        assert_eq!(metadata.settings.engine, IndexEngine::LocalShards);
+        assert_eq!(metadata.number_of_shards, 2);
+        assert_eq!(metadata.number_of_replicas, 1);
+        assert_eq!(metadata.settings.refresh_interval_ms, Some(1500));
+        assert_eq!(metadata.settings.flush_threshold_bytes, Some(4096));
+        assert_eq!(metadata.dynamic, DynamicMapping::True);
+        assert_eq!(metadata.mappings["created_at"].field_type, FieldType::Date);
+        assert_eq!(metadata.mappings["title"].field_type, FieldType::Text);
+    }
+
+    #[test]
+    fn index_metadata_from_create_request_body_rejects_unimplemented_engine_object() {
+        let error = IndexMetadata::from_create_request_body(
+            "remote-idx",
+            &serde_json::json!({
+                "engine": { "type": "remote_store" }
+            }),
+            &[],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CreateIndexMetadataError::UnimplementedEngine(IndexEngine::RemoteStore)
+        );
+    }
+
+    #[test]
+    fn index_engine_parses_remote_store_name() {
+        // Parsing the engine name itself succeeds — the not-implemented check
+        // is at the IndexMetadata level, not at the enum level.
+        let engine = IndexEngine::from_create_request_body(
+            &serde_json::json!({ "engine": { "type": "remote_store" } }),
+        )
+        .unwrap();
+        assert_eq!(engine, IndexEngine::RemoteStore);
+        assert!(!engine.is_implemented());
+    }
+
+    #[test]
+    fn index_metadata_from_create_request_body_rejects_no_data_nodes() {
+        let error = IndexMetadata::from_create_request_body(
+            "idx",
+            &serde_json::json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+            &[],
+        )
+        .unwrap_err();
+
+        assert_eq!(error, CreateIndexMetadataError::NoDataNodes);
+    }
+
+    #[test]
+    fn index_metadata_from_create_request_body_rejects_unknown_engine() {
+        let error = IndexMetadata::from_create_request_body(
+            "idx",
+            &serde_json::json!({ "engine": "columnstore_v99" }),
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CreateIndexMetadataError::InvalidArgument(reason)
+                if reason.contains("unknown engine [columnstore_v99]")
+        ));
     }
 
     #[test]
