@@ -1,5 +1,5 @@
 use crate::api::AppState;
-use crate::cluster::state::IndexMetadata;
+use crate::cluster::state::{CreateIndexMetadataError, IndexMetadata};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -176,6 +176,9 @@ async fn auto_create_index(
                 }
             },
             Err(e) => {
+                if let Some(response) = forwarded_create_index_error_response(&e) {
+                    return Err(response);
+                }
                 return Err(crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
@@ -253,8 +256,59 @@ pub async fn index_exists(
     }
 }
 
-/// PUT /{index} — Create an index with shard settings.
-/// Body: `{ "settings": { "number_of_shards": 3, "number_of_replicas": 1 } }`
+fn create_index_error_response(error: CreateIndexMetadataError) -> (StatusCode, Json<Value>) {
+    match error {
+        CreateIndexMetadataError::NoDataNodes => crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no_data_nodes_exception",
+            CreateIndexMetadataError::NoDataNodes,
+        ),
+        CreateIndexMetadataError::InvalidArgument(message) => crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            message,
+        ),
+        CreateIndexMetadataError::UnimplementedEngine(engine) => crate::api::error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "illegal_argument_exception",
+            CreateIndexMetadataError::UnimplementedEngine(engine),
+        ),
+    }
+}
+
+fn forwarded_create_index_error_response(
+    error: &anyhow::Error,
+) -> Option<(StatusCode, Json<Value>)> {
+    let status = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())?;
+
+    match status.code() {
+        tonic::Code::InvalidArgument => Some(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            status.message(),
+        )),
+        tonic::Code::Unimplemented => Some(crate::api::error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "illegal_argument_exception",
+            status.message(),
+        )),
+        tonic::Code::Internal
+            if status.message() == CreateIndexMetadataError::NoDataNodes.to_string() =>
+        {
+            Some(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no_data_nodes_exception",
+                status.message(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// PUT /{index} — Create an index.
+/// Body: `{ "engine": "local_shards", "settings": { "number_of_shards": 3, "number_of_replicas": 1 } }`
 pub async fn create_index(
     State(state): State<AppState>,
     Path(index_name): Path<crate::common::IndexName>,
@@ -263,20 +317,6 @@ pub async fn create_index(
     // IndexName is validated at extraction time
 
     let settings: Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
-    let num_shards = settings
-        .pointer("/settings/number_of_shards")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
-    let num_replicas = settings
-        .pointer("/settings/number_of_replicas")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
-    let refresh_interval_ms = settings
-        .pointer("/settings/refresh_interval_ms")
-        .and_then(|v| v.as_u64());
-    let flush_threshold_bytes = settings
-        .pointer("/settings/flush_threshold_bytes")
-        .and_then(|v| v.as_u64());
 
     let cluster_state = state.cluster_manager.get_state();
 
@@ -296,108 +336,17 @@ pub async fn create_index(
         .map(|n| n.id.clone())
         .collect();
 
-    if data_nodes.is_empty() {
-        return crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "no_data_nodes_exception",
-            "No data nodes available to assign shards",
-        );
-    }
-
-    let mut metadata =
-        IndexMetadata::build_shard_routing(&index_name, num_shards, num_replicas, &data_nodes);
-
-    // Apply per-index settings
-    if let Some(ms) = refresh_interval_ms {
-        metadata.settings.refresh_interval_ms = Some(ms);
-    }
-    if let Some(bytes) = flush_threshold_bytes {
-        metadata.settings.flush_threshold_bytes = Some(bytes);
-    }
-
-    // Parse dynamic mapping mode: { "mappings": { "dynamic": "true" | "false" | "strict" } }
-    // or top-level: { "dynamic": "true" }
-    let dynamic_str = settings
-        .pointer("/mappings/dynamic")
-        .or_else(|| settings.get("dynamic"))
-        .and_then(|v| {
-            // Accept both string "true" and boolean true
-            v.as_str()
-                .map(String::from)
-                .or_else(|| v.as_bool().map(|b| b.to_string()))
-        });
-    if let Some(ds) = dynamic_str {
-        metadata.dynamic = match ds.as_str() {
-            "true" => crate::cluster::state::DynamicMapping::True,
-            "strict" => crate::cluster::state::DynamicMapping::Strict,
-            _ => crate::cluster::state::DynamicMapping::False,
+    let metadata =
+        match IndexMetadata::from_create_request_body(&index_name, &settings, &data_nodes) {
+            Ok(metadata) => metadata,
+            Err(error) => return create_index_error_response(error),
         };
-    }
-
-    // Parse field mappings: { "mappings": { "properties": { "title": { "type": "text" }, ... } } }
-    if let Some(properties) = settings
-        .pointer("/mappings/properties")
-        .and_then(|v| v.as_object())
-    {
-        for (field_name, field_def) in properties {
-            if let Some(type_str) = field_def.get("type").and_then(|v| v.as_str()) {
-                let field_mapping = match type_str {
-                    "text" => Some(crate::cluster::state::FieldMapping {
-                        field_type: crate::cluster::state::FieldType::Text,
-                        dimension: None,
-                    }),
-                    "keyword" => Some(crate::cluster::state::FieldMapping {
-                        field_type: crate::cluster::state::FieldType::Keyword,
-                        dimension: None,
-                    }),
-                    "integer" | "long" => Some(crate::cluster::state::FieldMapping {
-                        field_type: crate::cluster::state::FieldType::Integer,
-                        dimension: None,
-                    }),
-                    "float" | "double" => Some(crate::cluster::state::FieldMapping {
-                        field_type: crate::cluster::state::FieldType::Float,
-                        dimension: None,
-                    }),
-                    "boolean" => Some(crate::cluster::state::FieldMapping {
-                        field_type: crate::cluster::state::FieldType::Boolean,
-                        dimension: None,
-                    }),
-                    "date" | "datetime" | "timestamp" => {
-                        Some(crate::cluster::state::FieldMapping {
-                            field_type: crate::cluster::state::FieldType::Date,
-                            dimension: None,
-                        })
-                    }
-                    "knn_vector" => {
-                        let dim = field_def
-                            .get("dimension")
-                            .and_then(|v| v.as_u64())
-                            .map(|d| d as usize);
-                        Some(crate::cluster::state::FieldMapping {
-                            field_type: crate::cluster::state::FieldType::KnnVector,
-                            dimension: dim,
-                        })
-                    }
-                    _ => {
-                        tracing::warn!(
-                            "Unknown field type '{}' for field '{}', skipping",
-                            type_str,
-                            field_name
-                        );
-                        None
-                    }
-                };
-                if let Some(fm) = field_mapping {
-                    metadata.mappings.insert(field_name.clone(), fm);
-                }
-            }
-        }
-    }
 
     let shard_assignment = metadata.shard_routing.clone();
     let index_mappings = metadata.mappings.clone();
     let index_settings = metadata.settings.clone();
     let index_uuid = metadata.uuid.clone();
+    let replica_count = metadata.number_of_replicas;
 
     // Coordinator: forward to leader or write locally via Raft
     if let Some(master) = match resolve_leader_or_master(&state, "index creation") {
@@ -411,6 +360,9 @@ pub async fn create_index(
         {
             Ok(resp) => return (StatusCode::OK, Json(resp)),
             Err(e) => {
+                if let Some(response) = forwarded_create_index_error_response(&e) {
+                    return response;
+                }
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
@@ -449,10 +401,11 @@ pub async fn create_index(
     }
 
     tracing::info!(
-        "Created index '{}' with {} shards, {} replicas",
+        "Created index '{}' with engine {}, {} shards, {} replicas",
         index_name,
-        num_shards,
-        num_replicas
+        index_settings.engine,
+        shard_assignment.len(),
+        replica_count
     );
 
     (
@@ -1153,6 +1106,7 @@ pub async fn get_index_settings(
                     "index": {
                         "number_of_shards": metadata.number_of_shards,
                         "number_of_replicas": metadata.number_of_replicas,
+                        "engine": metadata.settings.engine.to_string(),
                         "refresh_interval_ms": metadata.settings.refresh_interval_ms,
                         "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
                         "dynamic": metadata.dynamic.to_string(),
@@ -1172,6 +1126,7 @@ pub async fn get_index_settings(
 ///
 /// Immutable settings (rejected with 400):
 /// - `index.number_of_shards`
+/// - `index.engine`
 ///
 /// Body format (OpenSearch-compatible):
 /// ```json
@@ -1196,6 +1151,13 @@ pub async fn update_index_settings(
             StatusCode::BAD_REQUEST,
             "illegal_argument_exception",
             "index.number_of_shards is immutable and cannot be changed after index creation",
+        );
+    }
+    if body.pointer("/index/engine").is_some() {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "index.engine is immutable and cannot be changed after index creation",
         );
     }
 

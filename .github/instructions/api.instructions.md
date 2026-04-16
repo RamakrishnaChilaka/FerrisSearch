@@ -104,6 +104,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | POST | `/_cluster/transfer_master` | `transfer_master()` — forwarded |
 
 `create_index()`, `get_index_settings()`, and `update_index_settings()` must keep `refresh_interval_ms` and `flush_threshold_bytes` in sync end-to-end across HTTP parsing, gRPC forwarding, and Raft state updates. `GET /{index}/_settings` must return both fields when set. `flush_threshold_bytes: 0` is a valid disable value and must not be treated as "missing".
+`engine` is a create-time immutable selector. `create_index()` accepts `engine: "local_shards"` (or an object form with `type`) and persists it through Raft/transport metadata. `GET /{index}/_settings` must expose the engine. `PUT /{index}/_settings` must reject engine changes. `remote_store` is recognized but must currently fail with `501 Not Implemented` / gRPC `UNIMPLEMENTED` rather than falling through shard-routing code.
 `AppState.raft` is `Arc<RaftInstance>`, not `Option` — Raft is always present. Index-management handlers use `state.raft` directly without unwrapping.
 
 ### Local Shard Reopen Rule
@@ -140,9 +141,9 @@ Bulk routes intentionally disable Axum's default buffered request-body limit so 
 - `POST /_sql` handles SQL commands that don't require an index in the URL path.
 - `POST /_sql/stream` exposes the same commands over `application/x-ndjson`, emitting one `meta` frame followed by zero or more `rows` frames.
 - Supported commands:
-    - `SHOW TABLES` / `SHOW INDICES` — lists all indices with doc counts, shards, replicas, field count
+    - `SHOW TABLES` / `SHOW INDICES` — lists all indices with engine, doc counts, shards, replicas, field count
     - `DESCRIBE <index>` / `DESC <index>` — shows field names and types for an index
-    - `SHOW CREATE TABLE <index>` — returns settings + mappings JSON for recreating the index
+    - `SHOW CREATE TABLE <index>` — returns engine + settings + mappings JSON for recreating the index
     - `SELECT ... FROM "index" ...` — auto-extracts index name from the FROM clause and routes to `execute_sql_query()`
 - Helper functions: `matches_command()`, `strip_command()`, `unquote_identifier()`, `extract_index_from_sql()`
 - All commands are case-insensitive and handle optional trailing semicolons and quoted identifiers

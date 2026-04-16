@@ -1871,7 +1871,7 @@ fn extract_index_from_sql(sql: &str) -> Option<String> {
     }
 }
 
-/// SHOW TABLES — list all indices with doc counts and shard info.
+/// SHOW TABLES — list all indices with doc counts, engine, and shard info.
 async fn handle_show_tables(state: &AppState) -> (StatusCode, Json<Value>) {
     let cluster_state = state.cluster_manager.get_state();
     let mut rows = Vec::new();
@@ -1886,6 +1886,7 @@ async fn handle_show_tables(state: &AppState) -> (StatusCode, Json<Value>) {
 
         rows.push(serde_json::json!({
             "index": name,
+            "engine": metadata.settings.engine.to_string(),
             "docs": doc_count,
             "shards": num_shards,
             "replicas": num_replicas,
@@ -1903,7 +1904,7 @@ async fn handle_show_tables(state: &AppState) -> (StatusCode, Json<Value>) {
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "columns": ["index", "docs", "shards", "replicas", "fields"],
+            "columns": ["index", "engine", "docs", "shards", "replicas", "fields"],
             "rows": rows,
         })),
     )
@@ -1997,12 +1998,15 @@ async fn handle_show_create_table(state: &AppState, index_name: &str) -> (Status
     }
 
     let create_body = serde_json::json!({
+        "engine": metadata.settings.engine.to_string(),
         "settings": {
             "number_of_shards": metadata.number_of_shards,
             "number_of_replicas": metadata.number_of_replicas,
             "refresh_interval_ms": metadata.settings.refresh_interval_ms,
+            "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
         },
         "mappings": {
+            "dynamic": metadata.dynamic.to_string(),
             "properties": properties,
         }
     });

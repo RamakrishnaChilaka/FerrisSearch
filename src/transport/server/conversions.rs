@@ -85,6 +85,7 @@ pub(super) fn index_settings_to_proto(
     settings: &crate::cluster::state::IndexSettings,
 ) -> IndexSettings {
     IndexSettings {
+        engine: settings.engine.to_string(),
         refresh_interval_ms: settings.refresh_interval_ms,
         flush_threshold_bytes: settings.flush_threshold_bytes,
     }
@@ -92,15 +93,22 @@ pub(super) fn index_settings_to_proto(
 
 pub(super) fn proto_to_index_settings(
     settings: Option<&IndexSettings>,
-) -> crate::cluster::state::IndexSettings {
+) -> Result<crate::cluster::state::IndexSettings, crate::cluster::state::ParseIndexEngineNameError>
+{
     let Some(settings) = settings else {
-        return crate::cluster::state::IndexSettings::default();
+        return Ok(crate::cluster::state::IndexSettings::default());
     };
 
-    crate::cluster::state::IndexSettings {
+    let engine = match settings.engine.as_str() {
+        "" => crate::cluster::state::IndexEngine::LocalShards,
+        other => crate::cluster::state::IndexEngine::parse_name(other)?,
+    };
+
+    Ok(crate::cluster::state::IndexSettings {
+        engine,
         refresh_interval_ms: settings.refresh_interval_ms,
         flush_threshold_bytes: settings.flush_threshold_bytes,
-    }
+    })
 }
 
 pub(super) fn proto_to_dynamic_mapping(s: &str) -> crate::cluster::state::DynamicMapping {
@@ -240,7 +248,12 @@ pub fn proto_to_cluster_state(
                 shard_routing,
                 mappings,
                 dynamic: proto_to_dynamic_mapping(&idx.dynamic),
-                settings: proto_to_index_settings(idx.settings.as_ref()),
+                settings: proto_to_index_settings(idx.settings.as_ref()).map_err(|err| {
+                    Status::invalid_argument(format!(
+                        "unknown engine '{}' in cluster state snapshot; supported values are [local_shards, remote_store]",
+                        err.name()
+                    ))
+                })?,
             },
         );
     }

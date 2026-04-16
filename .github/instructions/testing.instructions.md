@@ -1,14 +1,14 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **1049 unit tests** (`cargo test --lib`)
+- **1064 unit tests** (`cargo test --lib`)
 - **68 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **49 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **52 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 180 assertions across 4 files
-- **1240 total** (`cargo test`)
+- **1258 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -45,6 +45,7 @@ cargo test -- test_name                         # Single test by name
 - For restart/rejoin data-loss fixes that depend on real process startup order, add or extend a process-backed `restart_regression` test that runs real `ferrissearch` binaries through create -> ingest -> flush -> restart -> verify count/UUID-dir invariants.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
+- For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.
 - For SQL identifier case-sensitivity fixes, add helper-level canonicalization coverage plus REST regressions for both buffered and streamed SQL endpoints using real mixed-case mapping fields, and cover both unquoted source references and quoted exact-identifier preservation on the residual/DataFusion path.
 - For `ferris-cli` interactive features, test command parsing and completion token boundaries in pure helpers; keep watch-mode behavior factored so the logic is covered without relying on terminal I/O in tests.
 - For `ferris-cli` SQL metadata/footer changes, keep search-stage counts distinct from final SQL row counts, surface the actual `approximate_top_k` state from API metadata when present, and add pure helper coverage for the displayed labels so `matched_hits` is not presented as returned rows.

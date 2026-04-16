@@ -4,6 +4,7 @@ use crate::cluster::state::{ClusterState, NodeInfo};
 use crate::transport::proto::internal_transport_client::InternalTransportClient;
 use crate::transport::proto::*;
 use crate::transport::server::proto_to_cluster_state;
+use anyhow::Context;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use std::collections::HashMap;
@@ -669,7 +670,7 @@ impl TransportClient {
         let mut client = self
             .connect(&master.host, master.transport_port)
             .await
-            .map_err(|e| anyhow::anyhow!("connect to master: {}", e))?;
+            .context("connect to master")?;
         let request = tonic::Request::new(CreateIndexRequest {
             index_name: index_name.to_string(),
             body_json: body.to_vec(),
@@ -677,7 +678,7 @@ impl TransportClient {
         let resp = client
             .create_index(request)
             .await
-            .map_err(|e| anyhow::anyhow!("CreateIndex RPC: {}", e))?;
+            .context("CreateIndex RPC")?;
         let inner = resp.into_inner();
         if !inner.error.is_empty() {
             return Err(anyhow::anyhow!("{}", inner.error));

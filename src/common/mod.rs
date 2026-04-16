@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn infer_float_value() {
-        let m = infer_field_type(&json!(3.14)).unwrap();
+        let m = infer_field_type(&json!(3.15)).unwrap();
         assert_eq!(m.field_type, FieldType::Float);
 
         let m = infer_field_type(&json!(-0.001)).unwrap();
@@ -488,7 +488,7 @@ mod tests {
         // First-seen type (integer) should win.
         let docs = vec![
             ("1".into(), json!({"value": 42})),
-            ("2".into(), json!({"value": 3.14})),
+            ("2".into(), json!({"value": 3.15})),
         ];
         let new = detect_new_fields_batch(&docs, &existing);
         assert_eq!(new["value"].field_type, FieldType::Integer);
