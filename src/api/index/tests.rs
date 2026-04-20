@@ -209,6 +209,9 @@ async fn make_test_app_state(cluster_state: ClusterState) -> (tempfile::TempDir,
         raft,
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        storage_manager: Arc::new(
+            crate::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
+        ),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };
@@ -445,7 +448,7 @@ async fn create_index_accepts_explicit_local_shards_engine() {
 }
 
 #[tokio::test]
-async fn create_index_rejects_unimplemented_remote_store_engine() {
+async fn create_index_with_remote_store_engine_succeeds_but_rejects_writes() {
     let mut cluster_state = ClusterState::new("test-cluster".into());
     cluster_state.add_node(make_test_node("node-1"));
     let (_tmp, state) = make_test_app_state(cluster_state).await;
@@ -457,27 +460,23 @@ async fn create_index_rejects_unimplemented_remote_store_engine() {
         .unwrap(),
     );
 
-    let (status, Json(response)) = create_index(
+    let (status, Json(_response)) = create_index(
         State(state.clone()),
         Path(crate::common::IndexName::new("idx").unwrap()),
         body,
     )
     .await;
 
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert!(
-        response["error"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("remote_store")
-    );
-    assert!(
-        !state
-            .cluster_manager
-            .get_state()
-            .indices
-            .contains_key("idx")
-    );
+    assert_eq!(status, StatusCode::OK);
+    let snapshot = state.cluster_manager.get_state();
+    let metadata = snapshot
+        .indices
+        .get("idx")
+        .expect("remote_store index should be present in cluster state");
+    assert_eq!(metadata.settings.engine, IndexEngine::RemoteStore);
+    assert_eq!(metadata.number_of_shards, 0);
+    assert!(metadata.shard_routing.is_empty());
+    assert!(!metadata.settings.engine.supports_writes());
 }
 
 #[tokio::test]

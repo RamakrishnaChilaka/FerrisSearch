@@ -88,6 +88,38 @@ pub(super) fn index_settings_to_proto(
         engine: settings.engine.to_string(),
         refresh_interval_ms: settings.refresh_interval_ms,
         flush_threshold_bytes: settings.flush_threshold_bytes,
+        remote_store: settings.remote_store.as_ref().map(|remote_store| {
+            crate::transport::proto::RemoteStoreSettings {
+                object_store_uri: remote_store.object_store_uri.clone(),
+                manifest_path: remote_store.manifest_path.clone(),
+                manifest_generation: remote_store.manifest_generation,
+                manifest_checksum: remote_store.manifest_checksum.clone(),
+                manifest_refresh_ms: remote_store.manifest_refresh_ms,
+                hotcache_bytes: remote_store.hotcache_bytes,
+                split_cache_bytes: remote_store.split_cache_bytes,
+            }
+        }),
+    }
+}
+
+fn proto_to_remote_store_settings(
+    settings: Option<&crate::transport::proto::RemoteStoreSettings>,
+) -> Option<crate::cluster::state::RemoteStoreSettings> {
+    let settings = settings?;
+    let remote_store = crate::cluster::state::RemoteStoreSettings {
+        object_store_uri: settings.object_store_uri.clone(),
+        manifest_path: settings.manifest_path.clone(),
+        manifest_generation: settings.manifest_generation,
+        manifest_checksum: settings.manifest_checksum.clone(),
+        manifest_refresh_ms: settings.manifest_refresh_ms,
+        hotcache_bytes: settings.hotcache_bytes,
+        split_cache_bytes: settings.split_cache_bytes,
+    };
+
+    if remote_store.is_empty() {
+        None
+    } else {
+        Some(remote_store)
     }
 }
 
@@ -108,6 +140,7 @@ pub(super) fn proto_to_index_settings(
         engine,
         refresh_interval_ms: settings.refresh_interval_ms,
         flush_threshold_bytes: settings.flush_threshold_bytes,
+        remote_store: proto_to_remote_store_settings(settings.remote_store.as_ref()),
     })
 }
 

@@ -56,6 +56,8 @@ pub struct AppState {
     pub worker_pools: WorkerPools,
     /// Tracks background maintenance and other asynchronous node-local tasks.
     pub task_manager: Arc<crate::tasks::TaskManager>,
+    /// Object-store-backed storage for remote_store engine (manifests, splits).
+    pub storage_manager: Arc<crate::storage::StorageManager>,
     /// Max docs to scan for GROUP BY queries on the fast-fields fallback path.
     /// 0 = unlimited.
     pub sql_group_by_scan_limit: usize,
@@ -80,6 +82,26 @@ pub fn error_response(
             "status": status.as_u16()
         })),
     )
+}
+
+/// Reject write operations for indices whose engine does not yet accept
+/// writes (today: `remote_store`). Returns `Some(...)` if the caller should
+/// short-circuit and reply with the error.
+pub(crate) fn reject_write_if_engine_read_only(
+    metadata: &crate::cluster::state::IndexMetadata,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if metadata.settings.engine.supports_writes() {
+        None
+    } else {
+        Some(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] uses engine [{}] which does not accept writes yet",
+                metadata.name, metadata.settings.engine
+            ),
+        ))
+    }
 }
 
 /// If this node is the Raft leader, returns `None`.
@@ -415,6 +437,9 @@ mod tests {
                 raft,
                 worker_pools: crate::worker::WorkerPools::new(2, 2),
                 task_manager: std::sync::Arc::new(TaskManager::new()),
+                storage_manager: std::sync::Arc::new(
+                    crate::storage::StorageManager::new_in_path(&data_dir).unwrap(),
+                ),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             },

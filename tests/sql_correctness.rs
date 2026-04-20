@@ -219,6 +219,9 @@ impl FerrisDB {
             raft,
             worker_pools: WorkerPools::new(2, 2),
             task_manager: Arc::new(ferrissearch::tasks::TaskManager::new()),
+            storage_manager: Arc::new(
+                ferrissearch::storage::StorageManager::new_in_path(tmp.path()).unwrap(),
+            ),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
         };

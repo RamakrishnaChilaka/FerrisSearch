@@ -452,6 +452,10 @@ pub async fn index_document(
         }
     };
 
+    if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
+        return resp;
+    }
+
     // Route document to the correct shard
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
@@ -529,6 +533,10 @@ pub async fn index_document_with_id(
         }
     };
 
+    if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
+        return resp;
+    }
+
     // Route document to the correct shard
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
@@ -596,6 +604,14 @@ pub(crate) async fn execute_distributed_dsl_search(
             ));
         }
     };
+
+    // remote_store engine: shardless, splits are read from object storage.
+    if matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    ) {
+        return crate::engine::remote_store::search(state, index_name, &metadata, search_req).await;
+    }
 
     let mut shard_hit_lists: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut knn_hits = Vec::new();
@@ -944,6 +960,10 @@ pub async fn update_document(
         }
     };
 
+    if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
+        return resp;
+    }
+
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
@@ -1040,6 +1060,10 @@ pub async fn delete_document(
             );
         }
     };
+
+    if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
+        return resp;
+    }
 
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {

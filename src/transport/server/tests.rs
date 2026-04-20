@@ -83,6 +83,7 @@ fn make_full_cluster_state() -> DomainClusterState {
             engine: crate::cluster::state::IndexEngine::LocalShards,
             refresh_interval_ms: Some(1500),
             flush_threshold_bytes: Some(65_536),
+            remote_store: None,
         },
     });
     cs.version = 42; // reset again after add_index
@@ -1204,6 +1205,15 @@ fn roundtrip_preserves_remote_store_engine() {
         dynamic: crate::cluster::state::DynamicMapping::False,
         settings: crate::cluster::state::IndexSettings {
             engine: crate::cluster::state::IndexEngine::RemoteStore,
+            remote_store: Some(crate::cluster::state::RemoteStoreSettings {
+                object_store_uri: Some("s3://bucket/remote".into()),
+                manifest_path: Some("manifests/11.json".into()),
+                manifest_generation: Some(11),
+                manifest_checksum: Some("sha256:manifest-11".into()),
+                manifest_refresh_ms: Some(1000),
+                hotcache_bytes: Some(4 * 1024 * 1024),
+                split_cache_bytes: Some(64 * 1024 * 1024),
+            }),
             ..Default::default()
         },
     };
@@ -1214,6 +1224,14 @@ fn roundtrip_preserves_remote_store_engine() {
     assert_eq!(
         restored.indices["remote-idx"].settings.engine,
         crate::cluster::state::IndexEngine::RemoteStore
+    );
+    assert_eq!(
+        restored.indices["remote-idx"]
+            .settings
+            .remote_store
+            .as_ref()
+            .and_then(|settings| settings.manifest_generation),
+        Some(11)
     );
 }
 
@@ -1235,6 +1253,7 @@ fn roundtrip_rejects_unknown_non_empty_engine() {
                 engine: "alien_store".into(),
                 refresh_interval_ms: None,
                 flush_threshold_bytes: None,
+                remote_store: None,
             }),
             dynamic: String::new(),
         }],

@@ -528,6 +528,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let manager = ClusterManager::with_shared_state(shared_state);
+        let storage_manager =
+            Arc::new(crate::storage::StorageManager::new_in_path(dir.path()).unwrap());
         (
             dir,
             AppState {
@@ -538,6 +540,7 @@ mod tests {
                 raft,
                 worker_pools: WorkerPools::default_for_system(),
                 task_manager: Arc::new(crate::tasks::TaskManager::new()),
+                storage_manager,
                 sql_group_by_scan_limit: 0,
                 sql_approximate_top_k: false,
             },

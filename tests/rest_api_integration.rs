@@ -186,6 +186,9 @@ impl RestTestHarness {
             raft: raft.clone(),
             worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
             task_manager: task_manager.clone(),
+            storage_manager: Arc::new(
+                ferrissearch::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
+            ),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
         };
@@ -426,6 +429,10 @@ impl MultiNodeRestHarness {
                 raft: raft.clone(),
                 worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
                 task_manager: task_manager.clone(),
+                storage_manager: Arc::new(
+                    ferrissearch::storage::StorageManager::new_in_path(pending.temp_dir.path())
+                        .unwrap(),
+                ),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             };
@@ -2983,10 +2990,12 @@ async fn get_settings_exposes_dynamic_field() -> Result<()> {
 }
 
 #[tokio::test]
-async fn create_index_rejects_unimplemented_remote_store_engine() -> Result<()> {
+async fn create_index_with_remote_store_engine_allows_create_but_rejects_writes() -> Result<()> {
     let harness = RestTestHarness::start().await?;
 
-    let (status, body) = harness
+    // Creation of a remote_store index is allowed — it is a shardless index
+    // whose read path fetches splits from the configured object store.
+    let (status, _body) = harness
         .put_json(
             "/remoteidx",
             json!({
@@ -2994,28 +3003,33 @@ async fn create_index_rejects_unimplemented_remote_store_engine() -> Result<()> 
             }),
         )
         .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.head_status("/remoteidx").await?, StatusCode::OK);
 
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    // Writes are not yet implemented for remote_store — must be rejected with 501.
+    let (write_status, write_body) = harness
+        .post_json("/remoteidx/_doc", json!({ "title": "should-be-rejected" }))
+        .await?;
+    assert_eq!(write_status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        write_body["error"]["type"],
+        json!("illegal_argument_exception")
+    );
     assert!(
-        body["error"]["reason"]
+        write_body["error"]["reason"]
             .as_str()
             .unwrap()
             .contains("remote_store")
-    );
-    assert_eq!(
-        harness.head_status("/remoteidx").await?,
-        StatusCode::NOT_FOUND
     );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn create_index_rejects_unimplemented_remote_store_engine_when_forwarded_to_leader()
--> Result<()> {
+async fn create_index_with_remote_store_engine_when_forwarded_to_leader() -> Result<()> {
     let harness = MultiNodeRestHarness::start_three_nodes().await?;
 
-    let (status, body) = put_json_to_base_url(
+    let (status, _body) = put_json_to_base_url(
         &harness.client,
         &harness.nodes[1].base_url,
         "/remoteidx-forwarded",
@@ -3025,30 +3039,45 @@ async fn create_index_rejects_unimplemented_remote_store_engine_when_forwarded_t
     )
     .await?;
 
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
-    assert!(
-        body["error"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("remote_store")
+    assert_eq!(status, StatusCode::OK);
+
+    // The test harness uses isolated Raft instances (not actually replicated),
+    // so only the leader (node-1) sees the applied CreateIndex. That is enough
+    // to prove the follower successfully forwarded to the leader.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let leader_status = harness
+            .client
+            .head(format!("{}/remoteidx-forwarded", harness.nodes[0].base_url))
+            .send()
+            .await?
+            .status();
+        if leader_status == StatusCode::OK {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "remote_store index did not appear on leader: {}",
+                leader_status
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Writes are rejected at whichever node processes them \u2014 send to the leader
+    // directly so we do not depend on Raft replication semantics in this harness.
+    let (write_status, write_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[0].base_url,
+        "/remoteidx-forwarded/_doc",
+        json!({ "title": "should-be-rejected" }),
+    )
+    .await?;
+    assert_eq!(write_status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        write_body["error"]["type"],
+        json!("illegal_argument_exception")
     );
-
-    let follower_status = harness
-        .client
-        .head(format!("{}/remoteidx-forwarded", harness.nodes[1].base_url))
-        .send()
-        .await?
-        .status();
-    assert_eq!(follower_status, StatusCode::NOT_FOUND);
-
-    let leader_status = harness
-        .client
-        .head(format!("{}/remoteidx-forwarded", harness.nodes[0].base_url))
-        .send()
-        .await?
-        .status();
-    assert_eq!(leader_status, StatusCode::NOT_FOUND);
 
     Ok(())
 }
@@ -3079,6 +3108,113 @@ async fn create_index_returns_no_data_nodes_exception_on_master_only_node() -> R
         harness.head_status("/nodataidx").await?,
         StatusCode::NOT_FOUND
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_search_returns_hits_from_published_split() -> Result<()> {
+    use ferrissearch::engine::SearchEngine;
+    use ferrissearch::storage::{RemoteSplitManifest, RemoteSplitState, RemoteStoreManifest};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let harness = RestTestHarness::start().await?;
+
+    // 1. Create the remote_store index.
+    let (status, _body) = harness
+        .put_json(
+            "/remotehits",
+            json!({
+                "engine": "remote_store"
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // 2. Read the index UUID from cluster state.
+    let cs = harness.app_state.cluster_manager.get_state();
+    let metadata = cs
+        .indices
+        .get("remotehits")
+        .expect("remote_store index should be registered in cluster state");
+    let uuid = metadata.uuid.as_str().to_string();
+
+    // 3. Build a one-doc Tantivy index inside the storage root using HotEngine
+    //    at <storage_root>/<uuid>/splits/split-a/.
+    let storage_root = harness.app_state.storage_manager.root().to_path_buf();
+    let split_rel = format!("{}/splits/split-a", uuid);
+    let split_dir = storage_root.join(&split_rel);
+    std::fs::create_dir_all(&split_dir)?;
+
+    let mappings: HashMap<String, ferrissearch::cluster::state::FieldMapping> = HashMap::new();
+    let column_cache = Arc::new(ferrissearch::engine::column_cache::ColumnCache::new(0, 0));
+    let engine = ferrissearch::engine::tantivy::HotEngine::new_with_mappings(
+        &split_dir,
+        Duration::from_secs(60),
+        &mappings,
+        ferrissearch::wal::TranslogDurability::Request,
+        column_cache,
+    )?;
+    engine.add_document(
+        "doc-1",
+        json!({ "title": "remote store hit", "body": "first published split" }),
+    )?;
+    engine.refresh()?;
+    drop(engine);
+
+    // 4. Publish a manifest pointing at the split.
+    let manifest = RemoteStoreManifest {
+        version: 1,
+        engine: ferrissearch::cluster::state::IndexEngine::RemoteStore,
+        index_uuid: uuid.clone(),
+        index_name: "remotehits".into(),
+        generation: 1,
+        published_at: "2026-04-16T00:00:00Z".into(),
+        schema_hash: "sha256:test".into(),
+        settings: None,
+        splits: vec![RemoteSplitManifest {
+            split_id: "split-a".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: split_rel.clone(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:test".into(),
+            doc_count: 1,
+            size_bytes: 0,
+            uncompressed_bytes: 0,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        }],
+    };
+    harness
+        .app_state
+        .storage_manager
+        .publish_manifest(&manifest)
+        .await?;
+
+    // 5. POST /_search and assert at least one hit comes back.
+    let (search_status, search_body) = harness
+        .post_json(
+            "/remotehits/_search",
+            json!({ "query": { "match_all": {} } }),
+        )
+        .await?;
+    assert_eq!(search_status, StatusCode::OK);
+    assert_eq!(search_body["_shards"]["successful"], json!(1));
+    assert_eq!(search_body["_shards"]["failed"], json!(0));
+    assert!(
+        search_body["hits"]["total"]["value"].as_u64().unwrap_or(0) >= 1,
+        "expected at least one hit, got: {}",
+        search_body
+    );
+    let hits = search_body["hits"]["hits"]
+        .as_array()
+        .expect("hits.hits must be an array");
+    assert!(!hits.is_empty());
+    assert_eq!(hits[0]["_id"], json!("doc-1"));
 
     Ok(())
 }

@@ -31,6 +31,17 @@ message IndexSettings {
     string engine = 1;
     optional uint64 refresh_interval_ms = 2;
     optional uint64 flush_threshold_bytes = 3;
+    RemoteStoreSettings remote_store = 4;
+}
+
+message RemoteStoreSettings {
+    optional string object_store_uri = 1;
+    optional string manifest_path = 2;
+    optional uint64 manifest_generation = 3;
+    optional string manifest_checksum = 4;
+    optional uint64 manifest_refresh_ms = 5;
+    optional uint64 hotcache_bytes = 6;
+    optional uint64 split_cache_bytes = 7;
 }
 
 message IndexMetadata {
