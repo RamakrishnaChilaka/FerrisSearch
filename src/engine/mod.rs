@@ -1,5 +1,6 @@
 pub mod column_cache;
 pub mod composite;
+pub mod remote_store;
 pub mod routing;
 pub mod tantivy;
 pub mod vector;

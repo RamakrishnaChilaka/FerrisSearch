@@ -41,6 +41,7 @@ pub struct Node {
     pub shard_manager: Arc<ShardManager>,
     pub raft: Arc<RaftInstance>,
     pub task_manager: Arc<crate::tasks::TaskManager>,
+    pub storage_manager: Arc<crate::storage::StorageManager>,
 }
 
 #[derive(Debug)]
@@ -153,6 +154,10 @@ impl Node {
         ));
         let task_manager = Arc::new(crate::tasks::TaskManager::new());
 
+        let storage_manager = Arc::new(crate::storage::StorageManager::new_in_path(
+            std::path::Path::new(&config.data_dir),
+        )?);
+
         Ok(Self {
             config,
             cluster_manager,
@@ -160,6 +165,7 @@ impl Node {
             shard_manager,
             raft,
             task_manager,
+            storage_manager,
         })
     }
 
@@ -189,6 +195,7 @@ impl Node {
             raft: self.raft.clone(),
             worker_pools: crate::worker::WorkerPools::default_for_system(),
             task_manager: self.task_manager.clone(),
+            storage_manager: self.storage_manager.clone(),
             sql_group_by_scan_limit: self.config.sql_group_by_scan_limit,
             sql_approximate_top_k: self.config.sql_approximate_top_k,
         };

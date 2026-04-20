@@ -336,6 +336,9 @@ mod tests {
                 raft,
                 worker_pools: crate::worker::WorkerPools::new(2, 2),
                 task_manager: std::sync::Arc::new(TaskManager::new()),
+                storage_manager: std::sync::Arc::new(
+                    crate::storage::StorageManager::new_in_path(&data_dir).unwrap(),
+                ),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             },

@@ -80,7 +80,7 @@ Every SQL response tells you how the planner executed the query:
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1258 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, and a bulk-body regression guarding benchmark-sized uploads
+- **Test depth** — 1274 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest coverage
 
 ## Tech Stack
 
@@ -92,6 +92,7 @@ Every SQL response tells you how the planner executed the query:
 | Vector search | [USearch](https://github.com/unum-cloud/usearch) | HNSW approximate nearest neighbor |
 | gRPC transport | [tonic](https://github.com/hyperium/tonic) 0.13 | Inter-node RPCs, shard forwarding |
 | Persistent storage | [redb](https://github.com/cberner/redb) 3 | Raft log on disk |
+| Object storage abstraction | [object_store](https://crates.io/crates/object_store) 0.13 | Local filesystem backend today, cloud object stores later for `remote_store` |
 | Thread pools | [rayon](https://github.com/rayon-rs/rayon) | Search/write workload isolation |
 | Allocator | [jemalloc](https://github.com/tikv/jemallocator) | Reduced memory fragmentation |
 
@@ -537,8 +538,8 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1200 tests
-cargo test --lib                                # Unit tests (1014)
+cargo test                                      # All 1274 tests
+cargo test --lib                                # Unit tests (1079)
 cargo test --bin ferris-cli                      # CLI tests (68)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)

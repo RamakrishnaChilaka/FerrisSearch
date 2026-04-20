@@ -11,6 +11,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - DataFusion 53 / sqlparser 0.61 (SQL layer)
 - Axum (HTTP API)
 - Tonic 0.13/gRPC (inter-node transport)
+- object_store 0.13.2 (filesystem-first object storage abstraction for remote_store foundations)
 - Protobuf (proto/transport.proto)
 - redb 3 (persistent Raft log storage — v3 file format, ~15% faster bulk writes, smaller files)
 - jemalloc (global allocator via tikv-jemallocator — reduces post-workload RSS retention vs glibc malloc)
@@ -31,7 +32,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/node/mod.rs` — Node struct, startup, Raft bootstrap, lifecycle loop, AppState
 - `src/transport/` — gRPC server (server.rs: Raft RPCs + shard ops + replication) and client (client.rs: forwarding methods)
 - `src/api/` — Axum HTTP handlers: index.rs (index CRUD, doc ops), search.rs (query-string search), cat.rs (catalog), cluster.rs (health, state, transfer_master), mod.rs (router)
-- `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing)
+- `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing), remote_store.rs (shardless read path over published split manifests)
 - `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
 - `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
 - `src/tasks.rs` — TaskManager for async background maintenance tracking (`_forcemerge`, `/_tasks/{task_id}`)
@@ -40,7 +41,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/replication/` — replicate_write, replicate_bulk (sync to ISR replicas)
 - `src/common/` — `Result<T>` type alias (anyhow), `validate_index_name()`, ISO 8601 date parse/format (`date.rs`)
 - `src/config/` — AppConfig (YAML + env var loading)
-- `src/storage/` — StorageManager placeholder (future: blob storage abstraction)
+- `src/storage/` — object_store-backed storage abstraction + remote manifest types
 - `proto/transport.proto` — gRPC service definition, all message types
 
 ## openraft 0.10.0-alpha.17 API Gotchas
@@ -106,7 +107,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1064 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 52 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1258 total
+- 1079 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 53 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1274 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -145,9 +146,9 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 ## Dynamic Settings
 - `PUT /{index}/_settings` and `GET /{index}/_settings` API endpoints
 - `IndexSettings` struct on `IndexMetadata` holds the immutable create-time `engine: IndexEngine` selector plus `refresh_interval_ms: Option<u64>` and `flush_threshold_bytes: Option<u64>`
-- `IndexEngine` values: `LocalShards` (current shard-owned engine) and `RemoteStore` (reserved for the future shardless/object-store engine)
+- `IndexEngine` values: `LocalShards` (current shard-owned engine) and `RemoteStore` (shardless/object-store engine — read-only today; writes rejected with 501)
 - `engine` is surfaced by `GET /{index}/_settings`, `SHOW TABLES`, and `SHOW CREATE TABLE`, but `PUT /{index}/_settings` must reject changes because engine selection is immutable after index creation
-- `create_index()` / forwarded `CreateIndex` must currently reject `remote_store` with `501 Not Implemented` / gRPC `UNIMPLEMENTED` instead of silently manufacturing shard routing for it
+- `create_index()` / forwarded `CreateIndex` accept both `local_shards` and `remote_store`. `remote_store` indices are shardless (zero shard routing) and reject writes (single/bulk `_doc`, `_update`, `_delete`) with `501 Not Implemented` + `illegal_argument_exception`. `IndexEngine::supports_writes()` gates write handlers; `api::reject_write_if_engine_read_only()` is the shared helper.
 - `SettingsManager` (src/cluster/settings.rs) uses `tokio::sync::watch` channels for reactive pub/sub
 - Consumers subscribe via `watch_refresh_interval()` / `watch_flush_threshold()` and react in `tokio::select!` loops
 - Non-leader nodes forward settings updates to master via gRPC `UpdateSettings` RPC
@@ -181,10 +182,12 @@ pub struct AppState {
     pub raft: Arc<RaftInstance>,
     pub worker_pools: WorkerPools,
     pub task_manager: Arc<TaskManager>,
+    pub storage_manager: Arc<StorageManager>,
     pub sql_group_by_scan_limit: usize,
     pub sql_approximate_top_k: bool,
 }
 ```
+- `storage_manager` is an object_store-backed abstraction rooted at `<data_dir>/_remote_store/`; used by the `remote_store` engine for manifest I/O and split reads
 - `sql_approximate_top_k` currently defaults to `true`; eligible grouped-partials `GROUP BY ... ORDER BY metric LIMIT N` queries use shard-level approximate top-K pruning unless the user disables it in config
 
 ## Core Data Structures (src/cluster/state.rs)
@@ -193,7 +196,7 @@ pub struct AppState {
 - `NodeRole` — `Master`, `Data`, `Client`
 - `ShardState` — `Started` (active), `Unassigned` (needs a node)
 - `FieldType` — `Text`, `Keyword`, `Integer`, `Float`, `Boolean`, `Date`, `KnnVector`
-- `IndexEngine` — `LocalShards` (current operational engine), `RemoteStore` (future shardless object-store engine)
+- `IndexEngine` — `LocalShards` (current shard-owned engine) and `RemoteStore` (shardless object-store engine; read-only today)
 - `DynamicMapping` — `True` (auto-detect), `False` (body catch-all, default), `Strict` (reject unknown)
 
 ### Structs
@@ -381,7 +384,7 @@ if let Some(ref raft) = state.raft {
 }
 ```
 
-- `engine` may be passed either as a string (`"local_shards"`) or as an object (`{"type":"remote_store"}`) in the create body parser, but only `local_shards` is operational today
+- `engine` may be passed either as a string (`"local_shards"` / `"remote_store"`) or as an object (`{"type":"remote_store"}`) in the create body parser. `remote_store` indices are shardless and served from manifests published to the configured object store; writes return 501 until a publish path lands.
 
 ## Search & Query DSL (src/search/mod.rs)
 

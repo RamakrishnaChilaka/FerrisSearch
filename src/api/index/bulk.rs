@@ -334,6 +334,24 @@ pub async fn bulk_index_global(
             }
         };
 
+        if !metadata.settings.engine.supports_writes() {
+            has_errors = true;
+            let engine = metadata.settings.engine.to_string();
+            for (position, doc_id, _) in batch {
+                item_results[position] = Some(bulk_error_item(
+                    Some(&index_name),
+                    &doc_id,
+                    StatusCode::NOT_IMPLEMENTED,
+                    "illegal_argument_exception",
+                    format!(
+                        "index [{}] uses engine [{}] which does not accept writes yet",
+                        index_name, engine
+                    ),
+                ));
+            }
+            continue;
+        }
+
         for (position, doc_id, payload) in batch {
             match route_bulk_doc(
                 position,
@@ -432,6 +450,10 @@ pub async fn bulk_index(
             Err(err_resp) => return err_resp,
         }
     };
+
+    if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
+        return resp;
+    }
 
     let mut item_results: Vec<Option<Value>> = vec![None; docs.len()];
     let mut has_errors = false;

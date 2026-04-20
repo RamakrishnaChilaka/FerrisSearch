@@ -202,8 +202,17 @@ impl IndexEngine {
         matches!(self, Self::LocalShards)
     }
 
-    pub fn is_implemented(&self) -> bool {
+    /// Whether the engine currently accepts write/ingest operations.
+    /// The `remote_store` engine is read-only until a publish path lands.
+    pub fn supports_writes(&self) -> bool {
         matches!(self, Self::LocalShards)
+    }
+
+    /// Whether the engine has an operational implementation (can be created
+    /// and read). Historically this gated creation; today both engines can be
+    /// created (writes are gated separately by `supports_writes`).
+    pub fn is_implemented(&self) -> bool {
+        matches!(self, Self::LocalShards | Self::RemoteStore)
     }
 
     fn from_create_value(
@@ -241,6 +250,69 @@ impl std::fmt::Display for IndexEngine {
     }
 }
 
+/// Engine-specific settings for the future `remote_store` execution path.
+///
+/// These values are metadata-only in the current implementation. They are
+/// parsed, serialized, and preserved across transport snapshots, but they do
+/// not alter `local_shards` behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RemoteStoreSettings {
+    /// Base object-store URI for remote artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_store_uri: Option<String>,
+    /// Pinned manifest object path for the currently searchable generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
+    /// Monotonic manifest generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_generation: Option<u64>,
+    /// Integrity checksum for the pinned manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_checksum: Option<String>,
+    /// How frequently roots refresh the manifest pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_refresh_ms: Option<u64>,
+    /// Memory budget reserved for remote split hotcache data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotcache_bytes: Option<u64>,
+    /// Disk budget reserved for hydrated split bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_cache_bytes: Option<u64>,
+}
+
+impl RemoteStoreSettings {
+    pub fn is_empty(&self) -> bool {
+        self.object_store_uri.is_none()
+            && self.manifest_path.is_none()
+            && self.manifest_generation.is_none()
+            && self.manifest_checksum.is_none()
+            && self.manifest_refresh_ms.is_none()
+            && self.hotcache_bytes.is_none()
+            && self.split_cache_bytes.is_none()
+    }
+
+    fn from_create_request_body(
+        body: &serde_json::Value,
+    ) -> Result<Option<Self>, CreateIndexMetadataError> {
+        let Some(value) = body.pointer("/settings/remote_store") else {
+            return Ok(None);
+        };
+
+        let parsed: Self = serde_json::from_value(value.clone()).map_err(|error| {
+            CreateIndexMetadataError::InvalidArgument(format!(
+                "invalid remote_store settings: {}",
+                error
+            ))
+        })?;
+
+        if parsed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(parsed))
+        }
+    }
+}
+
 /// Per-index settings that control engine behavior.
 ///
 /// Settings are divided into two categories:
@@ -272,11 +344,11 @@ pub struct IndexSettings {
     /// the background refresh tick. `None` = use default (512 MB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flush_threshold_bytes: Option<u64>,
-    // ── Future: shardless engine settings ────────────────────────────
-    // When switching to a Quickwit-style engine, add fields here:
-    //   pub split_max_merge_factor: Option<u32>,
-    //   pub retention_period_secs: Option<u64>,
-    //   pub object_store_uri: Option<String>,
+    // ── Remote-store engine settings ───────────────────────────────
+    /// Optional `remote_store` configuration. Preserved in cluster state and
+    /// transport snapshots even though the execution path is not enabled yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_store: Option<RemoteStoreSettings>,
 }
 
 /// Validated wrapper for index UUIDs.
@@ -396,6 +468,11 @@ impl IndexMetadata {
         data_nodes: &[String],
     ) -> Result<Self, CreateIndexMetadataError> {
         let engine = IndexEngine::from_create_request_body(body)?;
+        let remote_store_settings = if matches!(engine, IndexEngine::RemoteStore) {
+            RemoteStoreSettings::from_create_request_body(body)?
+        } else {
+            None
+        };
 
         let refresh_interval_ms = body
             .pointer("/settings/refresh_interval_ms")
@@ -435,6 +512,7 @@ impl IndexMetadata {
         metadata.settings.engine = engine;
         metadata.settings.refresh_interval_ms = refresh_interval_ms;
         metadata.settings.flush_threshold_bytes = flush_threshold_bytes;
+        metadata.settings.remote_store = remote_store_settings;
 
         let dynamic_str = body
             .pointer("/mappings/dynamic")
@@ -1550,6 +1628,7 @@ mod tests {
         let s = IndexSettings::default();
         assert_eq!(s.refresh_interval_ms, None);
         assert_eq!(s.engine, IndexEngine::LocalShards);
+        assert_eq!(s.remote_store, None);
     }
 
     #[test]
@@ -1595,6 +1674,27 @@ mod tests {
     }
 
     #[test]
+    fn index_settings_serde_roundtrip_with_remote_store_settings() {
+        let s = IndexSettings {
+            engine: IndexEngine::RemoteStore,
+            remote_store: Some(RemoteStoreSettings {
+                object_store_uri: Some("s3://bucket/indexes".into()),
+                manifest_path: Some("manifests/42.json".into()),
+                manifest_generation: Some(42),
+                manifest_checksum: Some("sha256:abc123".into()),
+                manifest_refresh_ms: Some(1500),
+                hotcache_bytes: Some(8 * 1024 * 1024),
+                split_cache_bytes: Some(256 * 1024 * 1024),
+            }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&s).unwrap();
+        let back: IndexSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
     fn index_settings_equality() {
         let a = IndexSettings {
             refresh_interval_ms: Some(1000),
@@ -1637,6 +1737,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(metadata.settings.engine, IndexEngine::LocalShards);
+        assert_eq!(metadata.settings.remote_store, None);
         assert_eq!(metadata.number_of_shards, 2);
         assert_eq!(metadata.number_of_replicas, 1);
         assert_eq!(metadata.settings.refresh_interval_ms, Some(1500));
@@ -1647,32 +1748,108 @@ mod tests {
     }
 
     #[test]
-    fn index_metadata_from_create_request_body_rejects_unimplemented_engine_object() {
+    fn local_shards_create_request_ignores_remote_store_settings() {
+        let metadata = IndexMetadata::from_create_request_body(
+            "events",
+            &serde_json::json!({
+                "engine": "local_shards",
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "remote_store": {
+                        "object_store_uri": "s3://ignored",
+                        "manifest_path": "manifests/999.json"
+                    }
+                }
+            }),
+            &["node-1".into()],
+        )
+        .unwrap();
+
+        assert_eq!(metadata.settings.engine, IndexEngine::LocalShards);
+        assert_eq!(metadata.settings.remote_store, None);
+    }
+
+    #[test]
+    fn remote_store_settings_survive_create_request_body() {
+        let metadata = IndexMetadata::from_create_request_body(
+            "remote-idx",
+            &serde_json::json!({
+                "engine": "remote_store",
+                "settings": {
+                    "remote_store": {
+                        "object_store_uri": "s3://bucket/indexes",
+                        "manifest_path": "manifests/42.json",
+                        "manifest_generation": 42,
+                        "manifest_checksum": "sha256:abc123",
+                        "manifest_refresh_ms": 500,
+                        "hotcache_bytes": 4096,
+                        "split_cache_bytes": 8192
+                    }
+                }
+            }),
+            &[],
+        )
+        .expect("remote_store creation should be allowed");
+
+        assert_eq!(metadata.settings.engine, IndexEngine::RemoteStore);
+        assert_eq!(metadata.number_of_shards, 0);
+        assert!(metadata.shard_routing.is_empty());
+        assert_eq!(
+            metadata
+                .settings
+                .remote_store
+                .as_ref()
+                .and_then(|s| s.manifest_generation),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn remote_store_create_request_rejects_invalid_remote_store_settings_shape() {
         let error = IndexMetadata::from_create_request_body(
+            "remote-idx",
+            &serde_json::json!({
+                "engine": "remote_store",
+                "settings": {
+                    "remote_store": "not-an-object"
+                }
+            }),
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CreateIndexMetadataError::InvalidArgument(reason)
+                if reason.contains("invalid remote_store settings")
+        ));
+    }
+
+    #[test]
+    fn index_metadata_from_create_request_body_allows_remote_store_engine_object() {
+        let metadata = IndexMetadata::from_create_request_body(
             "remote-idx",
             &serde_json::json!({
                 "engine": { "type": "remote_store" }
             }),
             &[],
         )
-        .unwrap_err();
+        .expect("remote_store object form should succeed");
 
-        assert_eq!(
-            error,
-            CreateIndexMetadataError::UnimplementedEngine(IndexEngine::RemoteStore)
-        );
+        assert_eq!(metadata.settings.engine, IndexEngine::RemoteStore);
+        assert!(!metadata.settings.engine.supports_writes());
     }
 
     #[test]
     fn index_engine_parses_remote_store_name() {
-        // Parsing the engine name itself succeeds — the not-implemented check
-        // is at the IndexMetadata level, not at the enum level.
         let engine = IndexEngine::from_create_request_body(
             &serde_json::json!({ "engine": { "type": "remote_store" } }),
         )
         .unwrap();
         assert_eq!(engine, IndexEngine::RemoteStore);
-        assert!(!engine.is_implemented());
+        assert!(engine.is_implemented());
+        assert!(!engine.supports_writes());
     }
 
     #[test]
