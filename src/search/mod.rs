@@ -810,7 +810,7 @@ fn compute_terms(hits: &[serde_json::Value], field: &str, _size: usize) -> Parti
         .into_iter()
         .map(|(key, doc_count)| TermsBucket { key, doc_count })
         .collect();
-    buckets.sort_by(|a, b| b.doc_count.cmp(&a.doc_count));
+    buckets.sort_by_key(|a| std::cmp::Reverse(a.doc_count));
 
     // Preserve the full per-shard term counts. The requested size is applied
     // only after coordinator merge so globally top terms are not dropped.

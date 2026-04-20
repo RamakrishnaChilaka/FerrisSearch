@@ -3024,10 +3024,10 @@ fn expr_contains_text_match(expr: &Expr) -> bool {
             if let FunctionArguments::List(list) = &f.args {
                 for arg in &list.args {
                     match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                            if expr_contains_text_match(e) {
-                                return true;
-                            }
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                            if expr_contains_text_match(e) =>
+                        {
+                            return true;
                         }
                         FunctionArg::Named {
                             arg: FunctionArgExpr::Expr(e),
@@ -3036,10 +3036,8 @@ fn expr_contains_text_match(expr: &Expr) -> bool {
                         | FunctionArg::ExprNamed {
                             arg: FunctionArgExpr::Expr(e),
                             ..
-                        } => {
-                            if expr_contains_text_match(e) {
-                                return true;
-                            }
+                        } if expr_contains_text_match(e) => {
+                            return true;
                         }
                         _ => {}
                     }
