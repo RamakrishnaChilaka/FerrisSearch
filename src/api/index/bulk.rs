@@ -143,7 +143,7 @@ async fn forward_bulk_batches(
     }
 
     let results = join_all(futures).await;
-    for (key, result) in shard_keys.into_iter().zip(results.into_iter()) {
+    for (key, result) in shard_keys.into_iter().zip(results) {
         match result {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {

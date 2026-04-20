@@ -4385,7 +4385,7 @@ fn convert_to_partial(kind: &AggKind, data: SegmentAggData) -> crate::search::Pa
                     doc_count: c,
                 })
                 .collect();
-            tb.sort_by(|a, b| b.doc_count.cmp(&a.doc_count));
+            tb.sort_by_key(|a| std::cmp::Reverse(a.doc_count));
             // Preserve every bucket in the shard partial. Coordinator merge is
             // where the requested size is applied so distributed top terms stay correct.
             PartialAggResult::Terms { buckets: tb }
