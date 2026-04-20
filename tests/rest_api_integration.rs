@@ -3253,3 +3253,80 @@ async fn remote_store_publish_appends_across_generations() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn remote_store_publish_survives_orphan_cleanup() -> Result<()> {
+    // Regression: the node startup orphan scanner walks `<data_dir>/*` and
+    // deletes any top-level directory whose name is not in the known-UUIDs
+    // set. The remote_store root lives at `<data_dir>/_remote_store/` and is
+    // NOT a per-index UUID dir, so treating it as an orphan would wipe every
+    // published split on every restart. This test pins the contract that the
+    // scanner must preserve `_remote_store/`.
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json("/pubrestart", json!({ "engine": "remote_store" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // Publish two generations so we have real on-disk state under _remote_store/.
+    let (s1, b1) = harness
+        .post_json(
+            "/pubrestart/_remote_store/publish",
+            json!({ "docs": [ { "_id": "r1", "title": "alpha" } ] }),
+        )
+        .await?;
+    assert_eq!(s1, StatusCode::OK, "{b1}");
+    let (s2, b2) = harness
+        .post_json(
+            "/pubrestart/_remote_store/publish",
+            json!({ "docs": [ { "_id": "r2", "title": "beta" } ] }),
+        )
+        .await?;
+    assert_eq!(s2, StatusCode::OK, "{b2}");
+    assert_eq!(b2["generation"], json!(2));
+
+    // Sanity: search sees both docs before cleanup.
+    let (ss, sb) = harness
+        .post_json(
+            "/pubrestart/_search",
+            json!({ "query": { "match_all": {} } }),
+        )
+        .await?;
+    assert_eq!(ss, StatusCode::OK);
+    assert_eq!(sb["_shards"]["successful"], json!(2));
+    assert!(sb["hits"]["total"]["value"].as_u64().unwrap_or(0) >= 2);
+
+    // Simulate the restart-path orphan scan: empty known_uuids means every
+    // top-level dir is "unknown" except ones the scanner explicitly reserves.
+    // Before the fix, this would have blown away `_remote_store/`.
+    harness
+        .app_state
+        .shard_manager
+        .cleanup_orphaned_data(&std::collections::HashSet::new());
+
+    // The remote_store root and its published content must still exist.
+    let remote_store_root = harness
+        ._temp_dir
+        .path()
+        .join(ferrissearch::storage::REMOTE_STORE_DIR_NAME);
+    assert!(
+        remote_store_root.exists(),
+        "_remote_store dir must survive orphan cleanup"
+    );
+
+    // Search must still succeed and return the published docs.
+    let (ss2, sb2) = harness
+        .post_json(
+            "/pubrestart/_search",
+            json!({ "query": { "match_all": {} } }),
+        )
+        .await?;
+    assert_eq!(ss2, StatusCode::OK);
+    assert_eq!(sb2["_shards"]["successful"], json!(2));
+    assert_eq!(sb2["_shards"]["failed"], json!(0));
+    assert!(
+        sb2["hits"]["total"]["value"].as_u64().unwrap_or(0) >= 2,
+        "expected >=2 hits after orphan-cleanup sweep, got {sb2}"
+    );
+    Ok(())
+}

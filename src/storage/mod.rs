@@ -16,6 +16,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use url::Url;
 
+/// Directory name used under `<data_dir>/` for the node-local remote_store root.
+/// Exported so orphan cleanup (which otherwise treats unknown top-level data_dir
+/// entries as UUID directories) can exclude it.
+pub const REMOTE_STORE_DIR_NAME: &str = "_remote_store";
+
 #[derive(Debug, Clone)]
 pub struct StorageManager {
     root: PathBuf,
@@ -56,7 +61,7 @@ impl StorageManager {
     /// (uses `<parent>/_remote_store`). Convenient for tests and for the
     /// node startup path that roots the store under `<data_dir>/_remote_store`.
     pub fn new_in_path(parent: &Path) -> Result<Self> {
-        let root = parent.join("_remote_store");
+        let root = parent.join(REMOTE_STORE_DIR_NAME);
         Self::new(root.to_string_lossy().into_owned())
     }
 
