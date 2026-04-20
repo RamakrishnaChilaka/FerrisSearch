@@ -28,6 +28,7 @@ rustyline = "15"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
+sha2 = "0.10"
 sqlparser = "0.61"
 tantivy = "0.25.0"
 thiserror = "2.0.18"

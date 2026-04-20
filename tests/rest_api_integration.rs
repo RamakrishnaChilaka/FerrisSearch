@@ -3114,12 +3114,6 @@ async fn create_index_returns_no_data_nodes_exception_on_master_only_node() -> R
 
 #[tokio::test]
 async fn remote_store_search_returns_hits_from_published_split() -> Result<()> {
-    use ferrissearch::engine::SearchEngine;
-    use ferrissearch::storage::{RemoteSplitManifest, RemoteSplitState, RemoteStoreManifest};
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
-    use std::time::Duration;
-
     let harness = RestTestHarness::start().await?;
 
     // 1. Create the remote_store index.
@@ -3133,69 +3127,30 @@ async fn remote_store_search_returns_hits_from_published_split() -> Result<()> {
         .await?;
     assert_eq!(status, StatusCode::OK);
 
-    // 2. Read the index UUID from cluster state.
-    let cs = harness.app_state.cluster_manager.get_state();
-    let metadata = cs
-        .indices
-        .get("remotehits")
-        .expect("remote_store index should be registered in cluster state");
-    let uuid = metadata.uuid.as_str().to_string();
-
-    // 3. Build a one-doc Tantivy index inside the storage root using HotEngine
-    //    at <storage_root>/<uuid>/splits/split-a/.
-    let storage_root = harness.app_state.storage_manager.root().to_path_buf();
-    let split_rel = format!("{}/splits/split-a", uuid);
-    let split_dir = storage_root.join(&split_rel);
-    std::fs::create_dir_all(&split_dir)?;
-
-    let mappings: HashMap<String, ferrissearch::cluster::state::FieldMapping> = HashMap::new();
-    let column_cache = Arc::new(ferrissearch::engine::column_cache::ColumnCache::new(0, 0));
-    let engine = ferrissearch::engine::tantivy::HotEngine::new_with_mappings(
-        &split_dir,
-        Duration::from_secs(60),
-        &mappings,
-        ferrissearch::wal::TranslogDurability::Request,
-        column_cache,
-    )?;
-    engine.add_document(
-        "doc-1",
-        json!({ "title": "remote store hit", "body": "first published split" }),
-    )?;
-    engine.refresh()?;
-    drop(engine);
-
-    // 4. Publish a manifest pointing at the split.
-    let manifest = RemoteStoreManifest {
-        version: 1,
-        engine: ferrissearch::cluster::state::IndexEngine::RemoteStore,
-        index_uuid: uuid.clone(),
-        index_name: "remotehits".into(),
-        generation: 1,
-        published_at: "2026-04-16T00:00:00Z".into(),
-        schema_hash: "sha256:test".into(),
-        settings: None,
-        splits: vec![RemoteSplitManifest {
-            split_id: "split-a".into(),
-            state: RemoteSplitState::Published,
-            bundle_path: split_rel.clone(),
-            bundle_etag: None,
-            hotcache_path: None,
-            checksum: "sha256:test".into(),
-            doc_count: 1,
-            size_bytes: 0,
-            uncompressed_bytes: 0,
-            hotcache_bytes: None,
-            time_range: None,
-            tags: BTreeMap::new(),
-        }],
-    };
-    harness
-        .app_state
-        .storage_manager
-        .publish_manifest(&manifest)
+    // 2. Publish one split via the new publish API.
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remotehits/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-1", "title": "remote store hit", "body": "first published split" }
+                ]
+            }),
+        )
         .await?;
+    assert_eq!(
+        publish_status,
+        StatusCode::OK,
+        "publish body: {publish_body}"
+    );
+    assert_eq!(publish_body["generation"], json!(1));
+    assert_eq!(publish_body["doc_count"], json!(1));
+    assert!(
+        publish_body["split_id"].as_str().is_some(),
+        "split_id must be a string: {publish_body}"
+    );
 
-    // 5. POST /_search and assert at least one hit comes back.
+    // 3. POST /_search and assert the published doc comes back.
     let (search_status, search_body) = harness
         .post_json(
             "/remotehits/_search",
@@ -3216,5 +3171,85 @@ async fn remote_store_search_returns_hits_from_published_split() -> Result<()> {
     assert!(!hits.is_empty());
     assert_eq!(hits[0]["_id"], json!("doc-1"));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_publish_rejects_empty_docs_array() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json("/pubempty", json!({ "engine": "remote_store" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (publish_status, publish_body) = harness
+        .post_json("/pubempty/_remote_store/publish", json!({ "docs": [] }))
+        .await?;
+    assert_eq!(publish_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        publish_body["error"]["type"],
+        json!("illegal_argument_exception")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_publish_rejects_on_local_shards_engine() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json("/pubwrong", json!({ "engine": "local_shards" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/pubwrong/_remote_store/publish",
+            json!({ "docs": [ { "_id": "a" } ] }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        publish_body["error"]["type"],
+        json!("illegal_argument_exception")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_publish_appends_across_generations() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json("/pubgen", json!({ "engine": "remote_store" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (s1, b1) = harness
+        .post_json(
+            "/pubgen/_remote_store/publish",
+            json!({ "docs": [ { "_id": "d1", "title": "one" } ] }),
+        )
+        .await?;
+    assert_eq!(s1, StatusCode::OK, "{b1}");
+    assert_eq!(b1["generation"], json!(1));
+
+    let (s2, b2) = harness
+        .post_json(
+            "/pubgen/_remote_store/publish",
+            json!({ "docs": [ { "_id": "d2", "title": "two" } ] }),
+        )
+        .await?;
+    assert_eq!(s2, StatusCode::OK, "{b2}");
+    assert_eq!(b2["generation"], json!(2));
+
+    // Search should see both published splits.
+    let (ss, sb) = harness
+        .post_json("/pubgen/_search", json!({ "query": { "match_all": {} } }))
+        .await?;
+    assert_eq!(ss, StatusCode::OK);
+    assert_eq!(sb["_shards"]["successful"], json!(2));
+    assert!(
+        sb["hits"]["total"]["value"].as_u64().unwrap_or(0) >= 2,
+        "expected >=2 hits across two splits, got {sb}"
+    );
     Ok(())
 }
