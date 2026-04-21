@@ -6,3 +6,4 @@ test_workload_data/
 .venv/
 logs/
 CLAUDE.md
+.rustfs-dev/

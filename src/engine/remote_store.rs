@@ -130,7 +130,21 @@ pub(crate) async fn search(
         }
     };
 
-    let storage_root = state.storage_manager.root().to_path_buf();
+    let storage_root = match state.storage_manager.root() {
+        Some(p) => p.to_path_buf(),
+        None => {
+            return Err(crate::api::error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "illegal_argument_exception",
+                format!(
+                    "remote_store search requires a local storage backend; \
+                     current backend is remote ({}). Split download/cache is \
+                     not yet implemented.",
+                    state.storage_manager.uri()
+                ),
+            ));
+        }
+    };
     // Wrap mappings in an Arc so per-split spawn_search tasks share the
     // allocation instead of cloning the full HashMap for every split.
     let mappings = Arc::new(metadata.mappings.clone());
@@ -278,7 +292,22 @@ pub(crate) async fn publish_docs(
         ));
     }
 
-    let storage_root = state.storage_manager.root().to_path_buf();
+    let storage_root = match state.storage_manager.root() {
+        Some(p) => p.to_path_buf(),
+        None => {
+            return Err(crate::api::error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "illegal_argument_exception",
+                format!(
+                    "remote_store publish requires a local storage backend for \
+                     the staging directory; current backend is remote ({}). \
+                     Remote publish (build-local-then-upload) is not yet \
+                     implemented.",
+                    state.storage_manager.uri()
+                ),
+            ));
+        }
+    };
     let index_uuid = metadata.uuid.as_str().to_string();
     let split_id = uuid::Uuid::new_v4().to_string();
     let split_rel = format!("{}/splits/{}", index_uuid, split_id);
@@ -516,7 +545,21 @@ pub(crate) async fn verify_splits(
         }
     };
 
-    let storage_root = state.storage_manager.root().to_path_buf();
+    let storage_root = match state.storage_manager.root() {
+        Some(p) => p.to_path_buf(),
+        None => {
+            return Err(crate::api::error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "illegal_argument_exception",
+                format!(
+                    "remote_store verify requires a local storage backend; \
+                     current backend is remote ({}). Split download/cache is \
+                     not yet implemented.",
+                    state.storage_manager.uri()
+                ),
+            ));
+        }
+    };
     let splits: Vec<_> = manifest.published_splits().cloned().collect();
 
     let mut ok_count = 0u32;

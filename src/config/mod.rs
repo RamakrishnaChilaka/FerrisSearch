@@ -103,6 +103,14 @@ pub struct AppConfig {
     /// Required when `transport_tls_enabled` is true.
     #[serde(default)]
     pub transport_tls_ca_file: Option<String>,
+    /// Optional storage URI for the remote_store engine backend.
+    /// When unset, `<data_dir>/_remote_store` is used (local filesystem).
+    /// Supported schemes: bare path, `file://`, `s3://<bucket>[/prefix]`.
+    /// For `s3://`, AWS credentials and endpoint are read from the standard
+    /// AWS environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+    /// `AWS_REGION`, `AWS_ENDPOINT_URL`, ...).
+    #[serde(default)]
+    pub storage_uri: Option<String>,
 }
 
 fn default_raft_node_id() -> u64 {
@@ -149,6 +157,7 @@ impl Default for AppConfig {
             transport_tls_cert_file: None,
             transport_tls_key_file: None,
             transport_tls_ca_file: None,
+            storage_uri: None,
         }
     }
 }

@@ -1,12 +1,25 @@
 //! Object-store-backed storage abstraction.
 //!
-//! Today this wraps a local filesystem backend via the `object_store` crate.
-//! Cloud backends (S3, Azure, GCS) can be added by extending `normalize_local_root`
-//! and constructing a different `Arc<dyn ObjectStore>` at build time.
+//! Dispatches at construction time between a local filesystem backend and a
+//! remote S3 backend based on the URL scheme of the storage root.
+//! All manifest I/O flows through `Arc<dyn ObjectStore>` and works against
+//! either backend.
+//!
+//! Supported schemes:
+//!   * bare path (e.g. `/var/data/_remote_store`) — `LocalFileSystem`
+//!   * `file://<path>` — `LocalFileSystem`
+//!   * `s3://<bucket>[/prefix]` — `AmazonS3` (requires AWS credentials in env)
+//!
+//! AWS credentials for s3:// backends are read from the standard environment
+//! variables supported by `object_store::aws::AmazonS3Builder::from_env`
+//! (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_SESSION_TOKEN,
+//! AWS_ENDPOINT_URL, etc). The `AWS_ENDPOINT_URL` env var is how a MinIO or
+//! RustFS dev server is pointed at.
 
 use anyhow::{Context, Result};
 use object_store::{
-    ObjectStore, ObjectStoreExt, PutPayload, local::LocalFileSystem, path::Path as ObjectPath,
+    ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, local::LocalFileSystem,
+    path::Path as ObjectPath,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,10 +34,24 @@ use url::Url;
 /// entries as UUID directories) can exclude it.
 pub const REMOTE_STORE_DIR_NAME: &str = "_remote_store";
 
+/// Backend behind a `StorageManager`. Remote backends have no local root.
+#[derive(Debug, Clone)]
+enum Backend {
+    Local {
+        root: PathBuf,
+        local: Arc<LocalFileSystem>,
+    },
+    Remote {
+        /// The object_store trait object (e.g. `AmazonS3`).
+        store: Arc<dyn ObjectStore>,
+        /// The original URI (e.g. `s3://bucket/prefix`) — kept for diagnostics.
+        uri: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct StorageManager {
-    root: PathBuf,
-    local: Arc<LocalFileSystem>,
+    backend: Backend,
     /// Serializes concurrent `publish_manifest` calls on this process so
     /// two in-process publishers cannot race on the generation pointer.
     /// The fs/object_store backend does not give us compare-and-set on the
@@ -34,27 +61,68 @@ pub struct StorageManager {
 }
 
 impl StorageManager {
+    /// Construct a StorageManager from a storage URI.
+    ///
+    /// Accepts bare paths, `file://` URLs, and `s3://bucket[/prefix]` URLs.
     pub fn new(path: String) -> Result<Self> {
-        let root = normalize_local_root(&path)?;
-        std::fs::create_dir_all(&root)
-            .with_context(|| format!("failed to create storage root {:?}", root))?;
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize storage root {:?}", root))?;
-        let local =
-            Arc::new(LocalFileSystem::new_with_prefix(&root).with_context(|| {
-                format!("failed to create object_store backend for {:?}", root)
-            })?);
+        let backend = match storage_scheme(&path) {
+            StorageScheme::Local => {
+                let root = normalize_local_root(&path)?;
+                std::fs::create_dir_all(&root)
+                    .with_context(|| format!("failed to create storage root {:?}", root))?;
+                let root = root
+                    .canonicalize()
+                    .with_context(|| format!("failed to canonicalize storage root {:?}", root))?;
+                let local =
+                    Arc::new(LocalFileSystem::new_with_prefix(&root).with_context(|| {
+                        format!("failed to create object_store backend for {:?}", root)
+                    })?);
+                Backend::Local { root, local }
+            }
+            StorageScheme::S3 => {
+                let store = build_s3_backend(&path)?;
+                Backend::Remote {
+                    store,
+                    uri: path.clone(),
+                }
+            }
+            StorageScheme::Unsupported(scheme) => {
+                anyhow::bail!(
+                    "unsupported storage URL scheme '{}'; supported schemes: file, s3, or bare path",
+                    scheme
+                );
+            }
+        };
 
         Ok(Self {
-            root,
-            local,
+            backend,
             publish_lock: Arc::new(Mutex::new(())),
         })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// Returns the on-disk root when the backend is local, `None` for remote.
+    pub fn root(&self) -> Option<&Path> {
+        match &self.backend {
+            Backend::Local { root, .. } => Some(root.as_path()),
+            Backend::Remote { .. } => None,
+        }
+    }
+
+    /// URI describing the storage backend (e.g. `s3://bucket/prefix` for
+    /// remote, canonical local path for local). Useful for log / error
+    /// messages so operators can tell at a glance which backend is active.
+    pub fn uri(&self) -> String {
+        match &self.backend {
+            Backend::Local { root, .. } => root.to_string_lossy().into_owned(),
+            Backend::Remote { uri, .. } => uri.clone(),
+        }
+    }
+
+    /// True when the backend is a local filesystem. Callers that still need
+    /// direct disk access (for example, the initial remote_store publish path
+    /// that builds a Tantivy index in place) gate behind this.
+    pub fn is_local(&self) -> bool {
+        matches!(&self.backend, Backend::Local { .. })
     }
 
     /// Construct a StorageManager rooted inside an existing directory
@@ -65,23 +133,34 @@ impl StorageManager {
         Self::new(root.to_string_lossy().into_owned())
     }
 
-    /// Upcast the concrete local backend to the generic `ObjectStore` trait object.
+    /// Upcast the concrete backend to the generic `ObjectStore` trait object.
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
-        self.local.clone()
+        match &self.backend {
+            Backend::Local { local, .. } => local.clone(),
+            Backend::Remote { store, .. } => store.clone(),
+        }
     }
 
     pub fn object_path(&self, location: &str) -> Result<ObjectPath> {
         ObjectPath::parse(location).map_err(anyhow::Error::from)
     }
 
+    /// Resolves an `ObjectPath` to a filesystem path. Fails for remote backends.
     pub fn filesystem_path(&self, location: &ObjectPath) -> Result<PathBuf> {
-        self.local
-            .path_to_filesystem(location)
-            .map_err(anyhow::Error::from)
+        match &self.backend {
+            Backend::Local { local, .. } => local
+                .path_to_filesystem(location)
+                .map_err(anyhow::Error::from),
+            Backend::Remote { .. } => anyhow::bail!(
+                "filesystem_path is only supported for local storage backends; \
+                 current backend is remote ({})",
+                self.uri()
+            ),
+        }
     }
 
     pub async fn put(&self, location: &ObjectPath, payload: impl Into<PutPayload>) -> Result<()> {
-        self.local
+        self.object_store()
             .put(location, payload.into())
             .await
             .map(|_| ())
@@ -89,7 +168,7 @@ impl StorageManager {
     }
 
     pub async fn get_bytes(&self, location: &ObjectPath) -> Result<Vec<u8>> {
-        let result = self.local.get(location).await?;
+        let result = self.object_store().get(location).await?;
         let bytes = result.bytes().await?;
         Ok(bytes.to_vec())
     }
@@ -109,7 +188,7 @@ impl StorageManager {
         index_uuid: &str,
     ) -> Result<Option<RemoteManifestPointer>> {
         let location = self.object_path(&manifest_pointer_key(index_uuid))?;
-        match self.local.get(&location).await {
+        match self.object_store().get(&location).await {
             Ok(result) => {
                 let bytes = result.bytes().await?;
                 let pointer: RemoteManifestPointer = serde_json::from_slice(&bytes)
@@ -134,7 +213,7 @@ impl StorageManager {
     ) -> Result<RemoteStoreManifest> {
         let location = self.object_path(&manifest_generation_key(index_uuid, generation))?;
         let result = self
-            .local
+            .object_store()
             .get(&location)
             .await
             .with_context(|| format!("manifest generation {} not found", generation))?;
@@ -365,14 +444,79 @@ fn normalize_local_root(path: &str) -> Result<PathBuf> {
                 path
             )
         })
-    } else if let Some(scheme_end) = path.find("://") {
-        let scheme = &path[..scheme_end];
-        anyhow::bail!(
-            "unsupported storage URL scheme '{}' ; only file:// roots are implemented currently",
-            scheme
-        );
     } else {
         Ok(PathBuf::from(path))
+    }
+}
+
+/// Classification of a storage URI for dispatch in `StorageManager::new`.
+enum StorageScheme {
+    Local,
+    S3,
+    Unsupported(String),
+}
+
+fn storage_scheme(path: &str) -> StorageScheme {
+    if path.starts_with("file://") {
+        return StorageScheme::Local;
+    }
+    if path.starts_with("s3://") {
+        return StorageScheme::S3;
+    }
+    if let Some(scheme_end) = path.find("://") {
+        return StorageScheme::Unsupported(path[..scheme_end].to_string());
+    }
+    StorageScheme::Local
+}
+
+/// Build an `AmazonS3` object store from an `s3://bucket[/prefix]` URI.
+///
+/// Reads credentials and region from environment variables via
+/// `AmazonS3Builder::from_env`. `AWS_ENDPOINT_URL` overrides the default
+/// AWS endpoint (needed for MinIO / RustFS dev servers).
+///
+/// When a prefix is present in the URI (e.g. `s3://bucket/indexes`), all
+/// manifest keys are scoped under that prefix automatically by the
+/// object_store crate's `new_with_prefix` construction.
+fn build_s3_backend(uri: &str) -> Result<Arc<dyn ObjectStore>> {
+    let url = Url::parse(uri).with_context(|| format!("invalid s3:// storage URL '{}'", uri))?;
+    let bucket = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("s3:// URL '{}' is missing a bucket name", uri))?;
+    let prefix = url.path().trim_start_matches('/').to_string();
+
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+
+    // `from_env` reads AWS_ENDPOINT_URL, but only if set. For MinIO/RustFS
+    // deployments using path-style addressing over plain HTTP, we must also
+    // enable virtual_hosted_style=false and allow_http=true. Both are inferred
+    // from the endpoint URL scheme when we hand it to the builder explicitly.
+    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
+        let allow_http = endpoint.starts_with("http://");
+        builder = builder
+            .with_endpoint(endpoint)
+            .with_virtual_hosted_style_request(false)
+            .with_allow_http(allow_http);
+    }
+
+    // Region is required by the AWS SDK even for MinIO; default to us-east-1
+    // when unset so dev servers work out of the box.
+    if std::env::var("AWS_REGION").is_err() && std::env::var("AWS_DEFAULT_REGION").is_err() {
+        builder = builder.with_region("us-east-1");
+    }
+
+    let s3 = builder
+        .build()
+        .with_context(|| format!("failed to build S3 backend for '{}'", uri))?;
+
+    if prefix.is_empty() {
+        Ok(Arc::new(s3))
+    } else {
+        // `object_store`'s PrefixStore wraps any ObjectStore with a fixed prefix.
+        let prefix_path = ObjectPath::parse(&prefix)
+            .with_context(|| format!("invalid s3 prefix '{}' in URL '{}'", prefix, uri))?;
+        let prefixed = object_store::prefix::PrefixStore::new(s3, prefix_path);
+        Ok(Arc::new(prefixed))
     }
 }
 
@@ -558,15 +702,56 @@ mod tests {
 
         let manager = StorageManager::new(root_url.to_string()).unwrap();
 
-        assert_eq!(manager.root(), temp_dir.path().canonicalize().unwrap());
+        assert_eq!(
+            manager.root().unwrap(),
+            temp_dir.path().canonicalize().unwrap()
+        );
+        assert!(manager.is_local());
     }
 
     #[test]
-    fn storage_manager_rejects_non_file_scheme() {
-        let error = StorageManager::new("s3://bucket/indexes".into()).unwrap_err();
+    fn storage_manager_rejects_unsupported_scheme() {
+        let error = StorageManager::new("gs://bucket/indexes".into()).unwrap_err();
         assert!(
-            error.to_string().contains("unsupported storage URL scheme"),
+            error
+                .to_string()
+                .contains("unsupported storage URL scheme 'gs'"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn storage_manager_s3_url_build_requires_env() {
+        // When neither AWS_ACCESS_KEY_ID nor an explicit builder is configured
+        // and AWS_ENDPOINT_URL is unset, AmazonS3Builder::from_env returns the
+        // unconfigured builder which can still build (object_store defers
+        // credential resolution until first request). So construction
+        // succeeds; we just verify it dispatched to the remote backend and
+        // that `filesystem_path` errors instead of returning a bogus path.
+        //
+        // NOTE: we do NOT set AWS env vars here to avoid racing other tests.
+        // The real S3 roundtrip is covered by the env-gated
+        // `tests/remote_store_s3_integration.rs` suite.
+        let manager = StorageManager::new("s3://test-bucket/indexes".into()).unwrap();
+        assert!(!manager.is_local());
+        assert!(manager.root().is_none());
+        assert_eq!(manager.uri(), "s3://test-bucket/indexes");
+
+        let path = manager.object_path("foo").unwrap();
+        let err = manager.filesystem_path(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("only supported for local"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_manager_s3_url_rejects_missing_bucket() {
+        let err = StorageManager::new("s3:///prefix-only".into()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing a bucket name") || msg.contains("failed to build S3 backend"),
+            "unexpected error: {msg}"
         );
     }
 

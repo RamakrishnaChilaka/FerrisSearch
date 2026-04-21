@@ -107,7 +107,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1102 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 62 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1306 total
+- 1104 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 62 REST API integration + 5 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1313 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -187,7 +187,7 @@ pub struct AppState {
     pub sql_approximate_top_k: bool,
 }
 ```
-- `storage_manager` is an object_store-backed abstraction rooted at `<data_dir>/_remote_store/`; used by the `remote_store` engine for manifest I/O and split reads
+- `storage_manager` is an object_store-backed abstraction. By default rooted at `<data_dir>/_remote_store/` (local filesystem). Set `storage_uri` in `AppConfig` to override — supports bare path, `file://`, and `s3://<bucket>[/prefix]`. For `s3://`, AWS credentials and endpoint are read from standard env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`). Used by the `remote_store` engine for manifest I/O; split reads/publish still require a local backend today (Phase B adds download/upload cache).
 - `sql_approximate_top_k` currently defaults to `true`; eligible grouped-partials `GROUP BY ... ORDER BY metric LIMIT N` queries use shard-level approximate top-K pruning unless the user disables it in config
 
 ## Core Data Structures (src/cluster/state.rs)
@@ -243,6 +243,7 @@ pub struct AppConfig {
     pub transport_tls_cert_file: Option<String>, // PEM cert for gRPC server
     pub transport_tls_key_file: Option<String>,  // PEM key for gRPC server
     pub transport_tls_ca_file: Option<String>,   // PEM CA for client verification
+    pub storage_uri: Option<String>,             // override <data_dir>/_remote_store ; supports file:// and s3://bucket[/prefix]
 }
 ```
 - Load order: defaults → `config/ferrissearch.yml` → `FERRISSEARCH_*` env vars
