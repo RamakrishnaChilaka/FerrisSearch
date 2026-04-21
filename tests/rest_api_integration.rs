@@ -3330,3 +3330,155 @@ async fn remote_store_publish_survives_orphan_cleanup() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn remote_store_verify_reports_ok_for_untouched_splits() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json("/vok", json!({ "engine": "remote_store" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    for i in 0..3 {
+        let (ps, pb) = harness
+            .post_json(
+                "/vok/_remote_store/publish",
+                json!({ "docs": [ { "_id": format!("d{}", i), "title": format!("doc {}", i) } ] }),
+            )
+            .await?;
+        assert_eq!(ps, StatusCode::OK, "{pb}");
+    }
+
+    let (vs, vb) = harness
+        .post_json("/vok/_remote_store/verify", json!({}))
+        .await?;
+    assert_eq!(vs, StatusCode::OK, "{vb}");
+    assert_eq!(vb["index"], json!("vok"));
+    assert_eq!(vb["generation"], json!(3));
+    assert_eq!(vb["ok_count"], json!(3));
+    assert_eq!(vb["mismatch_count"], json!(0));
+    assert_eq!(vb["missing_count"], json!(0));
+    assert_eq!(vb["unsupported_count"], json!(0));
+    let splits = vb["splits"].as_array().expect("splits array");
+    assert_eq!(splits.len(), 3);
+    for s in splits {
+        assert_eq!(s["status"], json!("ok"), "split: {s}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_verify_reports_mismatch_after_file_tamper() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json("/vbad", json!({ "engine": "remote_store" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (ps, pb) = harness
+        .post_json(
+            "/vbad/_remote_store/publish",
+            json!({ "docs": [ { "_id": "x", "title": "original" } ] }),
+        )
+        .await?;
+    assert_eq!(ps, StatusCode::OK, "{pb}");
+    let split_id = pb["split_id"]
+        .as_str()
+        .expect("split_id string")
+        .to_string();
+
+    // Corrupt one file under the split bundle. Target the stored schema
+    // (`meta.json`) because it exists for every Tantivy index and a trailing
+    // byte change is guaranteed to alter the bundle hash without making the
+    // file so malformed that Tantivy might reject it before our hash runs.
+    let remote_store_root = harness
+        ._temp_dir
+        .path()
+        .join(ferrissearch::storage::REMOTE_STORE_DIR_NAME);
+    let mut victim: Option<std::path::PathBuf> = None;
+    for uuid_entry in std::fs::read_dir(&remote_store_root)? {
+        let uuid_path = uuid_entry?.path();
+        let candidate = uuid_path
+            .join("splits")
+            .join(&split_id)
+            .join("index")
+            .join("meta.json");
+        if candidate.exists() {
+            victim = Some(candidate);
+            break;
+        }
+    }
+    let victim = victim.expect("split index/meta.json must exist after publish");
+    let mut bytes = std::fs::read(&victim)?;
+    bytes.push(b' '); // single-byte change is enough
+    std::fs::write(&victim, &bytes)?;
+
+    let (vs, vb) = harness
+        .post_json("/vbad/_remote_store/verify", json!({}))
+        .await?;
+    assert_eq!(vs, StatusCode::OK, "{vb}");
+    assert_eq!(vb["ok_count"], json!(0));
+    assert_eq!(vb["mismatch_count"], json!(1));
+    let splits = vb["splits"].as_array().expect("splits array");
+    assert_eq!(splits.len(), 1);
+    assert_eq!(splits[0]["split_id"], json!(split_id));
+    assert_eq!(splits[0]["status"], json!("mismatch"));
+    let expected = splits[0]["expected"].as_str().unwrap();
+    let actual = splits[0]["actual"].as_str().unwrap();
+    assert!(expected.starts_with("sha256:"));
+    assert!(actual.starts_with("sha256:"));
+    assert_ne!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_verify_rejects_non_remote_store_engine() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json("/vlocal", json!({ "engine": "local_shards" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (vs, vb) = harness
+        .post_json("/vlocal/_remote_store/verify", json!({}))
+        .await?;
+    assert_eq!(vs, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        vb["error"]["type"],
+        json!("illegal_argument_exception"),
+        "{vb}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_verify_missing_index_returns_404() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (vs, vb) = harness
+        .post_json("/nope/_remote_store/verify", json!({}))
+        .await?;
+    assert_eq!(vs, StatusCode::NOT_FOUND);
+    assert_eq!(vb["error"]["type"], json!("index_not_found_exception"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_verify_empty_index_returns_zero_counts() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json("/vempty", json!({ "engine": "remote_store" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (vs, vb) = harness
+        .post_json("/vempty/_remote_store/verify", json!({}))
+        .await?;
+    assert_eq!(vs, StatusCode::OK, "{vb}");
+    assert_eq!(vb["generation"], json!(0));
+    assert_eq!(vb["ok_count"], json!(0));
+    assert_eq!(vb["mismatch_count"], json!(0));
+    assert_eq!(vb["missing_count"], json!(0));
+    assert_eq!(vb["unsupported_count"], json!(0));
+    assert_eq!(vb["splits"].as_array().unwrap().len(), 0);
+    Ok(())
+}

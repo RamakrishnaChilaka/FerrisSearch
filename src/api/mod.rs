@@ -301,6 +301,10 @@ pub fn create_router(state: AppState) -> Router {
             "/{index}/_remote_store/publish",
             post(index::publish_remote_store_documents),
         )
+        .route(
+            "/{index}/_remote_store/verify",
+            post(index::verify_remote_store_splits),
+        )
         // Document operations
         .route("/{index}/_doc", post(index::index_document))
         .route("/{index}/_doc/{id}", put(index::index_document_with_id))

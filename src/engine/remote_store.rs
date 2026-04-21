@@ -458,6 +458,172 @@ pub(crate) async fn publish_docs(
     }))
 }
 
+/// Walk every `Published` split in the current manifest, recompute its
+/// bundle checksum, and compare against the value stored in the manifest.
+///
+/// Returns an error response when the request itself is invalid (index
+/// missing, wrong engine, manifest load failure). Per-split problems are
+/// returned as individual entries in the `splits` JSON array so a single
+/// corrupt split does not make the whole request fail.
+///
+/// This runs on the node that receives the request; the storage root is
+/// local-filesystem today. A future PR (issue #123) that adds an S3 backend
+/// will need to hydrate splits into a local cache first, at which point
+/// verify can reuse the same hashing function over the cached bytes.
+pub(crate) async fn verify_splits(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if !matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    ) {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] uses engine [{}] which does not support remote_store verify",
+                index_name, metadata.settings.engine
+            ),
+        ));
+    }
+
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let manifest = match state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .await
+    {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Ok(serde_json::json!({
+                "index": index_name,
+                "generation": 0,
+                "splits": [],
+                "ok_count": 0,
+                "mismatch_count": 0,
+                "missing_count": 0,
+                "unsupported_count": 0,
+            }));
+        }
+        Err(e) => {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_manifest_exception",
+                format!("failed to load manifest: {}", e),
+            ));
+        }
+    };
+
+    let storage_root = state.storage_manager.root().to_path_buf();
+    let splits: Vec<_> = manifest.published_splits().cloned().collect();
+
+    let mut ok_count = 0u32;
+    let mut mismatch_count = 0u32;
+    let mut missing_count = 0u32;
+    let mut unsupported_count = 0u32;
+    let mut split_reports: Vec<Value> = Vec::with_capacity(splits.len());
+
+    for split in splits {
+        let split_id = split.split_id.clone();
+        let expected = split.checksum.clone();
+
+        // Legacy placeholder from an earlier build of this feature. Surface
+        // it so operators know which splits cannot be verified until they
+        // are republished, without failing the whole request.
+        if expected.starts_with("sha256:pending:") {
+            unsupported_count += 1;
+            split_reports.push(serde_json::json!({
+                "split_id": split_id,
+                "status": "unsupported",
+                "reason": "legacy placeholder checksum; republish to get a real hash",
+                "expected": expected,
+            }));
+            continue;
+        }
+
+        let split_dir = match resolve_split_dir(&storage_root, &split.bundle_path) {
+            Ok(p) => p,
+            Err(reason) => {
+                missing_count += 1;
+                split_reports.push(serde_json::json!({
+                    "split_id": split_id,
+                    "status": "missing",
+                    "reason": reason,
+                    "expected": expected,
+                }));
+                continue;
+            }
+        };
+
+        if !split_dir.exists() {
+            missing_count += 1;
+            split_reports.push(serde_json::json!({
+                "split_id": split_id,
+                "status": "missing",
+                "reason": "bundle directory does not exist on this node",
+                "bundle_path": split.bundle_path,
+                "expected": expected,
+            }));
+            continue;
+        }
+
+        // Hashing is CPU + IO heavy — run it on the search worker pool so
+        // we don't stall the Tokio reactor and don't compete with ingest.
+        let dir_for_hash = split_dir.clone();
+        let hash_result = state
+            .worker_pools
+            .spawn_search(move || compute_bundle_checksum(&dir_for_hash))
+            .await;
+
+        match hash_result {
+            Ok(Ok(actual)) if actual == expected => {
+                ok_count += 1;
+                split_reports.push(serde_json::json!({
+                    "split_id": split_id,
+                    "status": "ok",
+                }));
+            }
+            Ok(Ok(actual)) => {
+                mismatch_count += 1;
+                tracing::error!(
+                    "remote_store: checksum mismatch for index {} split {} — expected {} got {}",
+                    index_name,
+                    split_id,
+                    expected,
+                    actual
+                );
+                split_reports.push(serde_json::json!({
+                    "split_id": split_id,
+                    "status": "mismatch",
+                    "expected": expected,
+                    "actual": actual,
+                }));
+            }
+            Ok(Err(e)) | Err(e) => {
+                missing_count += 1;
+                split_reports.push(serde_json::json!({
+                    "split_id": split_id,
+                    "status": "missing",
+                    "reason": format!("checksum computation failed: {}", e),
+                    "expected": expected,
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "index": index_name,
+        "generation": manifest.generation,
+        "splits": split_reports,
+        "ok_count": ok_count,
+        "mismatch_count": mismatch_count,
+        "missing_count": missing_count,
+        "unsupported_count": unsupported_count,
+    }))
+}
+
 /// Recursively sum the size of every regular file under `dir`. Returns 0 on
 /// error because the size is informational (used only for manifest stats).
 fn directory_size_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
