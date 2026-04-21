@@ -1216,6 +1216,53 @@ pub async fn publish_remote_store_documents(
     }
 }
 
+/// POST /{index}/_remote_store/verify — Recompute the sha256 checksum of
+/// every published split bundle on this node and compare against the value
+/// stored in the current manifest.
+///
+/// Valid only for `engine: remote_store` indices. Other engines return 400.
+/// Missing index returns 404. Per-split outcomes ("ok" / "mismatch" /
+/// "missing" / "unsupported") are reported in the response body; the HTTP
+/// status stays 200 as long as the request itself is valid, so operators
+/// can see full diagnostics even when some splits are corrupt.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "index": "...",
+///   "generation": 6,
+///   "splits": [
+///     { "split_id": "...", "status": "ok" },
+///     { "split_id": "...", "status": "mismatch", "expected": "sha256:...", "actual": "sha256:..." }
+///   ],
+///   "ok_count": 5,
+///   "mismatch_count": 1,
+///   "missing_count": 0,
+///   "unsupported_count": 0
+/// }
+/// ```
+pub async fn verify_remote_store_splits(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = match cluster_state.indices.get(index_name.as_str()) {
+        Some(m) => m.clone(),
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name.as_str()),
+            );
+        }
+    };
+
+    match crate::engine::remote_store::verify_splits(&state, index_name.as_str(), &metadata).await {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
 /// PUT /{index}/_settings — Update dynamic index settings.
 ///
 /// Supported dynamic settings:

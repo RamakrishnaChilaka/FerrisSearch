@@ -28,6 +28,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::http::StatusCode;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::api::AppState;
 use crate::api::index::DistributedDslSearchResult;
@@ -371,17 +372,44 @@ pub(crate) async fn publish_docs(
 
     let schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
 
+    // Compute a real content-addressable checksum over the bundle. This gives
+    // the S3/MinIO follow-up (issue #123) something to verify against when it
+    // downloads a split into the local cache. It's intentionally computed
+    // AFTER the atomic rename so we hash the final on-disk bytes, and
+    // intentionally on the write worker pool since it's blocking I/O over
+    // potentially hundreds of MB.
+    let split_dir_for_hash = split_dir.clone();
+    let checksum = match state
+        .worker_pools
+        .spawn_write(move || compute_bundle_checksum(&split_dir_for_hash))
+        .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) | Err(e) => {
+            // The split bytes are already in their final location. Leave them
+            // there (next publish attempt can reuse the dir if desired) and
+            // return an error so the caller knows not to trust this split.
+            tracing::error!(
+                "remote_store: bundle checksum failed for {} split_id {}: {}",
+                index_name,
+                split_id,
+                e
+            );
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_build_exception",
+                format!("bundle checksum failed: {}", e),
+            ));
+        }
+    };
+
     let new_split = crate::storage::RemoteSplitManifest {
         split_id: split_id.clone(),
         state: crate::storage::RemoteSplitState::Published,
         bundle_path: split_rel.clone(),
         bundle_etag: None,
         hotcache_path: None,
-        // Checksum is a placeholder until the tarball PR lands with a real
-        // content hash over the bundle bytes. The schema_hash check at load
-        // time and the atomic rename above are the current correctness
-        // guarantees.
-        checksum: format!("sha256:pending:{}", split_id),
+        checksum,
         doc_count,
         size_bytes,
         uncompressed_bytes: size_bytes,
@@ -430,6 +458,172 @@ pub(crate) async fn publish_docs(
     }))
 }
 
+/// Walk every `Published` split in the current manifest, recompute its
+/// bundle checksum, and compare against the value stored in the manifest.
+///
+/// Returns an error response when the request itself is invalid (index
+/// missing, wrong engine, manifest load failure). Per-split problems are
+/// returned as individual entries in the `splits` JSON array so a single
+/// corrupt split does not make the whole request fail.
+///
+/// This runs on the node that receives the request; the storage root is
+/// local-filesystem today. A future PR (issue #123) that adds an S3 backend
+/// will need to hydrate splits into a local cache first, at which point
+/// verify can reuse the same hashing function over the cached bytes.
+pub(crate) async fn verify_splits(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if !matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    ) {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] uses engine [{}] which does not support remote_store verify",
+                index_name, metadata.settings.engine
+            ),
+        ));
+    }
+
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let manifest = match state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .await
+    {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Ok(serde_json::json!({
+                "index": index_name,
+                "generation": 0,
+                "splits": [],
+                "ok_count": 0,
+                "mismatch_count": 0,
+                "missing_count": 0,
+                "unsupported_count": 0,
+            }));
+        }
+        Err(e) => {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_manifest_exception",
+                format!("failed to load manifest: {}", e),
+            ));
+        }
+    };
+
+    let storage_root = state.storage_manager.root().to_path_buf();
+    let splits: Vec<_> = manifest.published_splits().cloned().collect();
+
+    let mut ok_count = 0u32;
+    let mut mismatch_count = 0u32;
+    let mut missing_count = 0u32;
+    let mut unsupported_count = 0u32;
+    let mut split_reports: Vec<Value> = Vec::with_capacity(splits.len());
+
+    for split in splits {
+        let split_id = split.split_id.clone();
+        let expected = split.checksum.clone();
+
+        // Legacy placeholder from an earlier build of this feature. Surface
+        // it so operators know which splits cannot be verified until they
+        // are republished, without failing the whole request.
+        if expected.starts_with("sha256:pending:") {
+            unsupported_count += 1;
+            split_reports.push(serde_json::json!({
+                "split_id": split_id,
+                "status": "unsupported",
+                "reason": "legacy placeholder checksum; republish to get a real hash",
+                "expected": expected,
+            }));
+            continue;
+        }
+
+        let split_dir = match resolve_split_dir(&storage_root, &split.bundle_path) {
+            Ok(p) => p,
+            Err(reason) => {
+                missing_count += 1;
+                split_reports.push(serde_json::json!({
+                    "split_id": split_id,
+                    "status": "missing",
+                    "reason": reason,
+                    "expected": expected,
+                }));
+                continue;
+            }
+        };
+
+        if !split_dir.exists() {
+            missing_count += 1;
+            split_reports.push(serde_json::json!({
+                "split_id": split_id,
+                "status": "missing",
+                "reason": "bundle directory does not exist on this node",
+                "bundle_path": split.bundle_path,
+                "expected": expected,
+            }));
+            continue;
+        }
+
+        // Hashing is CPU + IO heavy — run it on the search worker pool so
+        // we don't stall the Tokio reactor and don't compete with ingest.
+        let dir_for_hash = split_dir.clone();
+        let hash_result = state
+            .worker_pools
+            .spawn_search(move || compute_bundle_checksum(&dir_for_hash))
+            .await;
+
+        match hash_result {
+            Ok(Ok(actual)) if actual == expected => {
+                ok_count += 1;
+                split_reports.push(serde_json::json!({
+                    "split_id": split_id,
+                    "status": "ok",
+                }));
+            }
+            Ok(Ok(actual)) => {
+                mismatch_count += 1;
+                tracing::error!(
+                    "remote_store: checksum mismatch for index {} split {} — expected {} got {}",
+                    index_name,
+                    split_id,
+                    expected,
+                    actual
+                );
+                split_reports.push(serde_json::json!({
+                    "split_id": split_id,
+                    "status": "mismatch",
+                    "expected": expected,
+                    "actual": actual,
+                }));
+            }
+            Ok(Err(e)) | Err(e) => {
+                missing_count += 1;
+                split_reports.push(serde_json::json!({
+                    "split_id": split_id,
+                    "status": "missing",
+                    "reason": format!("checksum computation failed: {}", e),
+                    "expected": expected,
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "index": index_name,
+        "generation": manifest.generation,
+        "splits": split_reports,
+        "ok_count": ok_count,
+        "mismatch_count": mismatch_count,
+        "missing_count": missing_count,
+        "unsupported_count": unsupported_count,
+    }))
+}
+
 /// Recursively sum the size of every regular file under `dir`. Returns 0 on
 /// error because the size is informational (used only for manifest stats).
 fn directory_size_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
@@ -455,6 +649,77 @@ fn directory_size_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// Compute a deterministic SHA-256 checksum over every regular file under
+/// `dir`. Files are hashed in POSIX-path sorted order so the result is stable
+/// regardless of directory iteration order. Each file contributes:
+///
+///   u64_le(rel_path_bytes.len()) || rel_path_bytes
+///   || u64_le(content.len())     || content_bytes
+///
+/// Returns a `"sha256:<64-hex>"` string. Any I/O failure (missing dir,
+/// unreadable file) surfaces as an error so the caller can reject the publish
+/// instead of storing a bogus hash.
+fn compute_bundle_checksum(dir: &std::path::Path) -> anyhow::Result<String> {
+    use anyhow::Context;
+
+    // 1. Collect every regular file under `dir` with its relative POSIX path.
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&next).with_context(|| format!("failed to read_dir {:?}", next))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("dir entry in {:?}", next))?;
+            let ft = entry
+                .file_type()
+                .with_context(|| format!("file_type of {:?}", entry.path()))?;
+            let path = entry.path();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(dir)
+                    .with_context(|| format!("path {:?} not under bundle root {:?}", path, dir))?;
+                // Canonicalize to POSIX separators so the hash is identical
+                // on every platform (relevant for tests and future S3
+                // replicas built on different hosts).
+                let rel_posix = rel
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(s) => s.to_str(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files.push((rel_posix, path));
+            }
+            // Skip symlinks and other non-regular entries — we never create
+            // them when building a split, so their presence indicates
+            // tampering and we must not silently include them.
+        }
+    }
+
+    // 2. Sort by relative path so the hash is order-stable.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // 3. Hash each file's path + content with explicit length framing so
+    //    different paths / different splits cannot collide by chunking the
+    //    same bytes differently.
+    let mut hasher = Sha256::new();
+    for (rel_posix, abs_path) in &files {
+        let rel_bytes = rel_posix.as_bytes();
+        hasher.update((rel_bytes.len() as u64).to_le_bytes());
+        hasher.update(rel_bytes);
+
+        let content = std::fs::read(abs_path)
+            .with_context(|| format!("failed to read bundle file {:?}", abs_path))?;
+        hasher.update((content.len() as u64).to_le_bytes());
+        hasher.update(&content);
+    }
+
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -517,5 +782,115 @@ mod tests {
         let root = Path::new(r"C:\var\data\_remote_store");
         let err = resolve_split_dir(root, r"C:\Windows\System32").unwrap_err();
         assert!(err.contains("must be relative"));
+    }
+
+    // ── compute_bundle_checksum ────────────────────────────────────────
+
+    fn write_file(root: &std::path::Path, rel: &str, content: &[u8]) {
+        let abs = root.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(abs, content).unwrap();
+    }
+
+    #[test]
+    fn compute_bundle_checksum_has_sha256_prefix_and_64_hex_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.txt", b"hello");
+        let checksum = compute_bundle_checksum(dir.path()).unwrap();
+        assert!(
+            checksum.starts_with("sha256:"),
+            "checksum must start with sha256:, got {checksum}"
+        );
+        let hex = &checksum["sha256:".len()..];
+        assert_eq!(hex.len(), 64, "sha256 hex digest must be 64 chars");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn compute_bundle_checksum_is_deterministic_across_iteration_orders() {
+        // Two bundles with identical file content should hash the same even
+        // though std::fs::read_dir does not guarantee any particular order.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        // Create the files in opposite orders in the two bundles.
+        write_file(a.path(), "index/meta.json", b"{\"v\":1}");
+        write_file(a.path(), "index/000.store", b"\x00\x01\x02");
+        write_file(a.path(), "aaa.bin", b"top-level");
+
+        write_file(b.path(), "aaa.bin", b"top-level");
+        write_file(b.path(), "index/000.store", b"\x00\x01\x02");
+        write_file(b.path(), "index/meta.json", b"{\"v\":1}");
+
+        let ha = compute_bundle_checksum(a.path()).unwrap();
+        let hb = compute_bundle_checksum(b.path()).unwrap();
+        assert_eq!(ha, hb, "bundles with identical content must hash equal");
+    }
+
+    #[test]
+    fn compute_bundle_checksum_changes_on_single_byte_flip() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write_file(a.path(), "data.bin", b"hello world");
+        write_file(b.path(), "data.bin", b"hello worlD");
+        let ha = compute_bundle_checksum(a.path()).unwrap();
+        let hb = compute_bundle_checksum(b.path()).unwrap();
+        assert_ne!(ha, hb);
+    }
+
+    #[test]
+    fn compute_bundle_checksum_changes_on_rename_only() {
+        // Length framing means renaming a file without changing content must
+        // still change the hash — a hash scheme without path framing (just
+        // concatenated bytes) would wrongly produce the same digest here.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write_file(a.path(), "foo.bin", b"same bytes");
+        write_file(b.path(), "bar.bin", b"same bytes");
+        let ha = compute_bundle_checksum(a.path()).unwrap();
+        let hb = compute_bundle_checksum(b.path()).unwrap();
+        assert_ne!(
+            ha, hb,
+            "renaming a file must change the bundle checksum: {ha} vs {hb}"
+        );
+    }
+
+    #[test]
+    fn compute_bundle_checksum_different_chunking_is_not_collision() {
+        // Length framing also prevents the "boundary shift" collision:
+        // ("ab","c") vs ("a","bc") have identical concatenated bytes but
+        // different framing, so their bundle hashes must differ.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write_file(a.path(), "f1", b"ab");
+        write_file(a.path(), "f2", b"c");
+        write_file(b.path(), "f1", b"a");
+        write_file(b.path(), "f2", b"bc");
+        let ha = compute_bundle_checksum(a.path()).unwrap();
+        let hb = compute_bundle_checksum(b.path()).unwrap();
+        assert_ne!(ha, hb);
+    }
+
+    #[test]
+    fn compute_bundle_checksum_empty_dir_is_stable() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let ha = compute_bundle_checksum(a.path()).unwrap();
+        let hb = compute_bundle_checksum(b.path()).unwrap();
+        assert_eq!(ha, hb);
+        // sha256("") for reference — we hash nothing for an empty bundle, so
+        // the digest matches the SHA-256 of the empty string.
+        assert_eq!(
+            ha,
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn compute_bundle_checksum_errors_on_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert!(compute_bundle_checksum(&missing).is_err());
     }
 }
