@@ -6,11 +6,12 @@
 - ✅ `remote_store` indices are shardless (zero shard routing) at create time.
 - ✅ Writes to `remote_store` indices are rejected with `501 Not Implemented` + `illegal_argument_exception` across every ingest handler (single `_doc`, `_bulk`, `_update`, `_delete`). `IndexEngine::supports_writes()` + `api::reject_write_if_engine_read_only()` gate all write paths.
 - ✅ Object-store-backed `StorageManager` (filesystem backend via `object_store`) wired into `AppState` and `Node::new`, rooted at `<data_dir>/_remote_store/`.
-- ✅ Manifest I/O: `load_manifest_pointer`, `load_manifest`, `load_current_manifest`, `publish_manifest`.
-- ✅ Coordinator-local read path: `src/engine/remote_store.rs::search()` loads the current manifest, opens each published split as a `HotEngine`, runs `search_query`, merges results into the same `DistributedDslSearchResult` the `local_shards` path uses.
+- ✅ Manifest I/O: `load_manifest_pointer`, `load_manifest`, `load_current_manifest`, `publish_manifest`, `append_split_and_publish` (serialized per-storage via an in-process `publish_lock`).
+- ✅ Coordinator-local read path: `src/engine/remote_store.rs::search()` loads the current manifest, opens each published split as a `HotEngine`, runs `search_query`, merges results into the same `DistributedDslSearchResult` the `local_shards` path uses. Schema hash is computed from `IndexMetadata.mappings` and validated on manifest load (fails closed on mismatch).
+- ✅ Split publish API: `POST /{index}/_remote_store/publish` accepts `{ "docs": [...] }`, builds a Tantivy split under `<storage_root>/<uuid>/.staging/<split_id>/`, atomically renames into `splits/<split_id>/`, then appends a new `Published` entry via `append_split_and_publish` (bumps manifest generation). Runs locally on the receiving node; 100K-doc hard cap per publish.
 - ❌ Leaf gRPC fan-out (root/leaf split distribution) — not yet implemented.
 - ❌ Tarball/hotcache/LRU split cache — not yet implemented; split dirs must currently be laid out as `HotEngine` data directories (`<bundle_path>/index/meta.json`).
-- ❌ Split publish path (ingestion → manifest publish) — not yet implemented.
+- ❌ Janitor/GC for splits orphaned by failed publishes or stale manifest generations — not yet implemented.
 - ❌ k-NN on `remote_store` — currently rejected with 501.
 
 ## Decision

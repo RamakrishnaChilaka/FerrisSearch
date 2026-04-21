@@ -297,6 +297,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}", delete(index::delete_index))
         .route("/{index}/_settings", get(index::get_index_settings))
         .route("/{index}/_settings", put(index::update_index_settings))
+        .route(
+            "/{index}/_remote_store/publish",
+            post(index::publish_remote_store_documents),
+        )
         // Document operations
         .route("/{index}/_doc", post(index::index_document))
         .route("/{index}/_doc/{id}", put(index::index_document_with_id))

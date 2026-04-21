@@ -107,7 +107,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1079 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 53 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1274 total
+- 1095 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 57 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1294 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -330,6 +330,7 @@ if let Some(ref raft) = state.raft {
 | DELETE | `/{index}` | `delete_index()` | Delete index and all shards |
 | GET | `/{index}/_settings` | `get_index_settings()` | Get index settings (read-only, local) |
 | PUT | `/{index}/_settings` | `update_index_settings()` | Update settings (forwarded to leader) |
+| POST | `/{index}/_remote_store/publish` | `publish_remote_store_documents()` | Build a split from supplied docs and publish a new manifest generation (remote_store engine only; runs locally on the receiving node; 100K-doc cap per publish) |
 | POST | `/_cluster/transfer_master` | `transfer_master()` | Leadership transfer (forwarded) |
 
 ### Document Operations (routed to shard primary)

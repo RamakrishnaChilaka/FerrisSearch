@@ -1141,6 +1141,81 @@ pub async fn get_index_settings(
     )
 }
 
+/// POST /{index}/_remote_store/publish — Build a split from the supplied
+/// documents and publish it as a new manifest generation.
+///
+/// Body format:
+/// ```json
+/// { "docs": [ {"_id": "a", "title": "..."}, {"title": "..."} ] }
+/// ```
+///
+/// This endpoint is only valid for indices created with `engine: remote_store`.
+/// Any other engine is rejected with 400. The publish is executed locally on
+/// the node that receives the request because the object-store root today is
+/// backed by each node's local filesystem; cross-node publish requires a
+/// shared remote object store (S3/Azure/GCS) and is tracked in the roadmap.
+pub async fn publish_remote_store_documents(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = match cluster_state.indices.get(index_name.as_str()) {
+        Some(m) => m.clone(),
+        None => {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name.as_str()),
+            );
+        }
+    };
+
+    if !matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    ) {
+        return crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] uses engine [{}] which does not support remote_store publish",
+                index_name.as_str(),
+                metadata.settings.engine
+            ),
+        );
+    }
+
+    let docs_value = match body.get("docs") {
+        Some(v) => v,
+        None => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                "publish body must contain a 'docs' array",
+            );
+        }
+    };
+    let docs_array = match docs_value.as_array() {
+        Some(arr) => arr,
+        None => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                "'docs' must be a JSON array",
+            );
+        }
+    };
+    let docs: Vec<Value> = docs_array.to_vec();
+
+    match crate::engine::remote_store::publish_docs(&state, index_name.as_str(), &metadata, docs)
+        .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
 /// PUT /{index}/_settings — Update dynamic index settings.
 ///
 /// Supported dynamic settings:

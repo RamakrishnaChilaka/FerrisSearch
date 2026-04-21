@@ -732,7 +732,10 @@ impl ShardManager {
                 Err(_) => continue,
             };
             // Skip known directories (raft data, etc.)
-            if dir_name == "raft" || dir_name == "raft-disk" {
+            if dir_name == "raft"
+                || dir_name == "raft-disk"
+                || dir_name == crate::storage::REMOTE_STORE_DIR_NAME
+            {
                 continue;
             }
             if !known_uuids.contains(&dir_name) {
@@ -1222,5 +1225,55 @@ mod tests {
 
         // Engine opened successfully without triggering 100K-doc MatchAll
         assert_eq!(engine.doc_count(), 1);
+    }
+
+    #[test]
+    fn cleanup_orphaned_data_skips_remote_store_dir() {
+        let (_dir, mgr) = create_shard_manager();
+        let data_dir = mgr.data_dir().to_path_buf();
+
+        // Simulate what `StorageManager::new_in_path` creates on a live node
+        // and some per-index content under it.
+        let remote_store = data_dir.join(crate::storage::REMOTE_STORE_DIR_NAME);
+        let remote_index_uuid = remote_store.join("idx-uuid-1");
+        std::fs::create_dir_all(remote_index_uuid.join("manifests")).unwrap();
+        std::fs::write(
+            remote_index_uuid.join("manifest.current.json"),
+            "{\"version\":1}",
+        )
+        .unwrap();
+
+        // Also create an unrelated orphan UUID directory that SHOULD be removed.
+        let orphan_uuid = data_dir.join("dead-beef-1234");
+        std::fs::create_dir_all(&orphan_uuid).unwrap();
+        std::fs::write(orphan_uuid.join("marker"), b"x").unwrap();
+
+        // And a known UUID directory that should be retained because it appears
+        // in the authoritative known_uuids set.
+        let known_uuid = data_dir.join("live-uuid-9999");
+        std::fs::create_dir_all(&known_uuid).unwrap();
+        std::fs::write(known_uuid.join("marker"), b"x").unwrap();
+
+        let mut known = std::collections::HashSet::new();
+        known.insert("live-uuid-9999".to_string());
+
+        mgr.cleanup_orphaned_data(&known);
+
+        assert!(
+            remote_store.exists(),
+            "_remote_store must never be treated as an orphan UUID directory"
+        );
+        assert!(
+            remote_index_uuid.join("manifest.current.json").exists(),
+            "remote_store contents must survive orphan cleanup"
+        );
+        assert!(
+            !orphan_uuid.exists(),
+            "unknown UUID directories should still be removed"
+        );
+        assert!(
+            known_uuid.exists(),
+            "known UUID directories must be retained"
+        );
     }
 }

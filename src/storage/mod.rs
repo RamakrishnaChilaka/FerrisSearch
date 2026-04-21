@@ -9,15 +9,28 @@ use object_store::{
     ObjectStore, ObjectStoreExt, PutPayload, local::LocalFileSystem, path::Path as ObjectPath,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use url::Url;
+
+/// Directory name used under `<data_dir>/` for the node-local remote_store root.
+/// Exported so orphan cleanup (which otherwise treats unknown top-level data_dir
+/// entries as UUID directories) can exclude it.
+pub const REMOTE_STORE_DIR_NAME: &str = "_remote_store";
 
 #[derive(Debug, Clone)]
 pub struct StorageManager {
     root: PathBuf,
     local: Arc<LocalFileSystem>,
+    /// Serializes concurrent `publish_manifest` calls on this process so
+    /// two in-process publishers cannot race on the generation pointer.
+    /// The fs/object_store backend does not give us compare-and-set on the
+    /// pointer object, so we serialize in-process for correctness and leave
+    /// cross-process publish to a dedicated indexer role in a later PR.
+    publish_lock: Arc<Mutex<()>>,
 }
 
 impl StorageManager {
@@ -33,7 +46,11 @@ impl StorageManager {
                 format!("failed to create object_store backend for {:?}", root)
             })?);
 
-        Ok(Self { root, local })
+        Ok(Self {
+            root,
+            local,
+            publish_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -44,7 +61,7 @@ impl StorageManager {
     /// (uses `<parent>/_remote_store`). Convenient for tests and for the
     /// node startup path that roots the store under `<data_dir>/_remote_store`.
     pub fn new_in_path(parent: &Path) -> Result<Self> {
-        let root = parent.join("_remote_store");
+        let root = parent.join(REMOTE_STORE_DIR_NAME);
         Self::new(root.to_string_lossy().into_owned())
     }
 
@@ -165,7 +182,106 @@ impl StorageManager {
     ///
     /// If the pointer write fails, the immutable generation object is left in
     /// place (it's immutable by design) and callers can retry.
+    ///
+    /// Serialized on `publish_lock` so that concurrent in-process publishers
+    /// observe a consistent pointer when reading-then-writing.
     pub async fn publish_manifest(
+        &self,
+        manifest: &RemoteStoreManifest,
+    ) -> Result<RemoteManifestPointer> {
+        let _guard = self.publish_lock.lock().await;
+        self.publish_manifest_inner(manifest).await
+    }
+
+    /// Append a single new split to the currently-published manifest and
+    /// publish a new generation. Load-modify-publish runs under the per-
+    /// storage `publish_lock` so concurrent in-process publishers serialize.
+    ///
+    /// - If no manifest exists yet, generation 1 is published with the new
+    ///   split as the only entry.
+    /// - If a manifest exists, its `schema_hash` must match `schema_hash`
+    ///   (we fail closed on mismatch to avoid publishing splits against a
+    ///   stale schema assumption).
+    ///
+    /// Returns the newly-published manifest.
+    pub async fn append_split_and_publish(
+        &self,
+        index_uuid: &str,
+        index_name: &str,
+        schema_hash: &str,
+        settings: Option<&crate::cluster::state::RemoteStoreSettings>,
+        new_split: RemoteSplitManifest,
+    ) -> Result<RemoteStoreManifest> {
+        let _guard = self.publish_lock.lock().await;
+
+        // Load current manifest (if any) WITHOUT schema validation — we want
+        // to surface a mismatch as a clear, targeted error rather than a
+        // generic load failure.
+        let current = self.load_current_manifest_unchecked(index_uuid).await?;
+
+        let (generation, mut splits, existing_settings) = match current {
+            Some(existing) => {
+                if existing.schema_hash != schema_hash {
+                    anyhow::bail!(
+                        "schema_hash mismatch while appending split: manifest={} local={}",
+                        existing.schema_hash,
+                        schema_hash
+                    );
+                }
+                (existing.generation + 1, existing.splits, existing.settings)
+            }
+            None => (1, Vec::new(), None),
+        };
+
+        // Reject duplicate split_id within the same manifest — `published_splits`
+        // would otherwise return two entries for the same bundle.
+        if splits.iter().any(|s| s.split_id == new_split.split_id) {
+            anyhow::bail!(
+                "split_id {} already exists in manifest for index {}",
+                new_split.split_id,
+                index_uuid
+            );
+        }
+        splits.push(new_split);
+
+        let manifest = RemoteStoreManifest {
+            version: 1,
+            engine: crate::cluster::state::IndexEngine::RemoteStore,
+            index_uuid: index_uuid.to_string(),
+            index_name: index_name.to_string(),
+            generation,
+            published_at: chrono::Utc::now().to_rfc3339(),
+            schema_hash: schema_hash.to_string(),
+            settings: settings.cloned().or(existing_settings),
+            splits,
+        };
+
+        // Reuse `publish_manifest` for the actual I/O — it takes the lock
+        // again, but tokio::sync::Mutex is NOT reentrant, so we release
+        // ours first by calling the inner non-locking write path directly.
+        self.publish_manifest_inner(&manifest).await?;
+        Ok(manifest)
+    }
+
+    /// Load the current manifest without schema validation. Used by
+    /// `append_split_and_publish` so we can produce a better error on
+    /// schema mismatch than `load_current_manifest` would.
+    async fn load_current_manifest_unchecked(
+        &self,
+        index_uuid: &str,
+    ) -> Result<Option<RemoteStoreManifest>> {
+        let Some(pointer) = self.load_manifest_pointer(index_uuid).await? else {
+            return Ok(None);
+        };
+        let manifest = self
+            .load_manifest(index_uuid, pointer.current_generation, None)
+            .await?;
+        Ok(Some(manifest))
+    }
+
+    /// Internal publish that does not take the publish_lock (called from
+    /// `append_split_and_publish` which already holds it).
+    async fn publish_manifest_inner(
         &self,
         manifest: &RemoteStoreManifest,
     ) -> Result<RemoteManifestPointer> {
@@ -187,6 +303,47 @@ impl StorageManager {
         self.put(&pointer_path, pointer_bytes).await?;
         Ok(pointer)
     }
+}
+
+/// Compute a deterministic content fingerprint over an index's field mappings.
+///
+/// The hash covers `(field_name, field_type, dimension)` for every declared
+/// field, sorted by field name. Two mappings that differ in any of those
+/// dimensions produce different hashes; two mappings that are logically
+/// identical but iterated in different orders produce the same hash.
+///
+/// Format: `"sha256:<64 hex chars>"` so the prefix identifies the algorithm
+/// for future algorithm bumps.
+pub fn compute_schema_hash(
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> String {
+    // BTreeMap for deterministic iteration order.
+    let ordered: BTreeMap<&str, &crate::cluster::state::FieldMapping> =
+        mappings.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+    let mut hasher = Sha256::new();
+    for (name, mapping) in ordered {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\x1f"); // unit separator to avoid name/type bleed
+        hasher.update(format!("{:?}", mapping.field_type).as_bytes());
+        hasher.update(b"\x1f");
+        if let Some(dim) = mapping.dimension {
+            hasher.update(dim.to_le_bytes());
+        }
+        hasher.update(b"\x1e"); // record separator
+    }
+    let digest = hasher.finalize();
+    format!("sha256:{}", hex_lower(&digest))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn manifest_pointer_key(index_uuid: &str) -> String {
@@ -541,5 +698,252 @@ mod tests {
 
         let loaded = manager.load_current_manifest("idx-1", None).await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn compute_schema_hash_is_deterministic_regardless_of_insertion_order() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut a = HashMap::new();
+        a.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        a.insert(
+            "year".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+
+        let mut b = HashMap::new();
+        b.insert(
+            "year".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        b.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+
+        assert_eq!(compute_schema_hash(&a), compute_schema_hash(&b));
+    }
+
+    #[test]
+    fn compute_schema_hash_differs_on_type_change() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut a = HashMap::new();
+        a.insert(
+            "year".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        let mut b = HashMap::new();
+        b.insert(
+            "year".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        );
+        assert_ne!(compute_schema_hash(&a), compute_schema_hash(&b));
+    }
+
+    #[test]
+    fn compute_schema_hash_differs_on_dimension_change() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut a = HashMap::new();
+        a.insert(
+            "embedding".to_string(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(384),
+            },
+        );
+        let mut b = HashMap::new();
+        b.insert(
+            "embedding".to_string(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(768),
+            },
+        );
+        assert_ne!(compute_schema_hash(&a), compute_schema_hash(&b));
+    }
+
+    #[test]
+    fn compute_schema_hash_is_stable_across_calls() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut m = HashMap::new();
+        m.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        let h1 = compute_schema_hash(&m);
+        let h2 = compute_schema_hash(&m);
+        assert_eq!(h1, h2);
+        assert!(h1.starts_with("sha256:"));
+        assert_eq!(h1.len(), "sha256:".len() + 64);
+    }
+
+    #[tokio::test]
+    async fn append_split_and_publish_bootstraps_generation_1() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+
+        let split = RemoteSplitManifest {
+            split_id: "split-a".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: "idx-1/splits/split-a".into(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:a".into(),
+            doc_count: 1,
+            size_bytes: 16,
+            uncompressed_bytes: 16,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+        let manifest = manager
+            .append_split_and_publish("idx-1", "events", "sha256:abc", None, split)
+            .await
+            .unwrap();
+        assert_eq!(manifest.generation, 1);
+        assert_eq!(manifest.splits.len(), 1);
+
+        let loaded = manager
+            .load_current_manifest("idx-1", Some("sha256:abc"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.generation, 1);
+        assert_eq!(loaded.splits[0].split_id, "split-a");
+    }
+
+    #[tokio::test]
+    async fn append_split_and_publish_bumps_generation_and_appends() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+
+        let split_a = RemoteSplitManifest {
+            split_id: "split-a".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: "idx-1/splits/split-a".into(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:a".into(),
+            doc_count: 1,
+            size_bytes: 16,
+            uncompressed_bytes: 16,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+        manager
+            .append_split_and_publish("idx-1", "events", "sha256:abc", None, split_a)
+            .await
+            .unwrap();
+
+        let split_b = RemoteSplitManifest {
+            split_id: "split-b".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: "idx-1/splits/split-b".into(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:b".into(),
+            doc_count: 2,
+            size_bytes: 32,
+            uncompressed_bytes: 32,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+        let second = manager
+            .append_split_and_publish("idx-1", "events", "sha256:abc", None, split_b)
+            .await
+            .unwrap();
+
+        assert_eq!(second.generation, 2);
+        assert_eq!(second.splits.len(), 2);
+        assert_eq!(second.splits[0].split_id, "split-a");
+        assert_eq!(second.splits[1].split_id, "split-b");
+    }
+
+    #[tokio::test]
+    async fn append_split_and_publish_rejects_schema_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+
+        let split = RemoteSplitManifest {
+            split_id: "split-a".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: "idx-1/splits/split-a".into(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:a".into(),
+            doc_count: 1,
+            size_bytes: 16,
+            uncompressed_bytes: 16,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+        manager
+            .append_split_and_publish("idx-1", "events", "sha256:abc", None, split.clone())
+            .await
+            .unwrap();
+
+        let mut split_b = split.clone();
+        split_b.split_id = "split-b".into();
+        let err = manager
+            .append_split_and_publish("idx-1", "events", "sha256:DIFFERENT", None, split_b)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("schema_hash mismatch"));
+    }
+
+    #[tokio::test]
+    async fn append_split_and_publish_rejects_duplicate_split_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+
+        let split = RemoteSplitManifest {
+            split_id: "split-a".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: "idx-1/splits/split-a".into(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:a".into(),
+            doc_count: 1,
+            size_bytes: 16,
+            uncompressed_bytes: 16,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+        manager
+            .append_split_and_publish("idx-1", "events", "sha256:abc", None, split.clone())
+            .await
+            .unwrap();
+        let err = manager
+            .append_split_and_publish("idx-1", "events", "sha256:abc", None, split)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
     }
 }
