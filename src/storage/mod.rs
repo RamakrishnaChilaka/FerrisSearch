@@ -17,6 +17,7 @@
 //! RustFS dev server is pointed at.
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use object_store::{
     ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, local::LocalFileSystem,
     path::Path as ObjectPath,
@@ -33,6 +34,17 @@ use url::Url;
 /// Exported so orphan cleanup (which otherwise treats unknown top-level data_dir
 /// entries as UUID directories) can exclude it.
 pub const REMOTE_STORE_DIR_NAME: &str = "_remote_store";
+
+/// Directory name used under `<data_dir>/` for the node-local split cache.
+pub const REMOTE_STORE_CACHE_DIR_NAME: &str = "_remote_store_cache";
+
+/// Directory name used under `<data_dir>/` for in-progress split builds.
+pub const REMOTE_STORE_STAGING_DIR_NAME: &str = "_remote_store_staging";
+
+/// Magic header prefix written at the start of every packed split bundle.
+/// `FSBND` + version byte. Bumping the version byte reserves room for a
+/// future format change without needing a separate checksum scheme.
+const BUNDLE_MAGIC: &[u8; 6] = b"FSBND\x01";
 
 /// Backend behind a `StorageManager`. Remote backends have no local root.
 #[derive(Debug, Clone)]
@@ -52,19 +64,29 @@ enum Backend {
 #[derive(Debug, Clone)]
 pub struct StorageManager {
     backend: Backend,
+    /// Node-local directory for split download/extract cache and for
+    /// in-progress split builds staged before upload. Always set.
+    local_workdir: PathBuf,
     /// Serializes concurrent `publish_manifest` calls on this process so
     /// two in-process publishers cannot race on the generation pointer.
     /// The fs/object_store backend does not give us compare-and-set on the
     /// pointer object, so we serialize in-process for correctness and leave
     /// cross-process publish to a dedicated indexer role in a later PR.
     publish_lock: Arc<Mutex<()>>,
+    /// Per-split async mutex used to single-flight concurrent download+
+    /// extract operations against the local cache. Key format:
+    /// `"<index_uuid>/<split_id>"`.
+    split_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl StorageManager {
-    /// Construct a StorageManager from a storage URI.
+    /// Construct a StorageManager from a storage URI and a node-local working
+    /// directory for split build-staging and cache.
     ///
-    /// Accepts bare paths, `file://` URLs, and `s3://bucket[/prefix]` URLs.
-    pub fn new(path: String) -> Result<Self> {
+    /// Accepts bare paths, `file://` URLs, and `s3://bucket[/prefix]` URLs for
+    /// the storage URI. `local_workdir` must be a writable local filesystem
+    /// path; it's created if missing.
+    pub fn new(path: String, local_workdir: PathBuf) -> Result<Self> {
         let backend = match storage_scheme(&path) {
             StorageScheme::Local => {
                 let root = normalize_local_root(&path)?;
@@ -94,9 +116,24 @@ impl StorageManager {
             }
         };
 
+        std::fs::create_dir_all(&local_workdir).with_context(|| {
+            format!(
+                "failed to create remote_store local workdir {:?}",
+                local_workdir
+            )
+        })?;
+        let local_workdir = local_workdir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize remote_store local workdir {:?}",
+                local_workdir
+            )
+        })?;
+
         Ok(Self {
             backend,
+            local_workdir,
             publish_lock: Arc::new(Mutex::new(())),
+            split_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -126,11 +163,225 @@ impl StorageManager {
     }
 
     /// Construct a StorageManager rooted inside an existing directory
-    /// (uses `<parent>/_remote_store`). Convenient for tests and for the
-    /// node startup path that roots the store under `<data_dir>/_remote_store`.
+    /// (uses `<parent>/_remote_store` for the storage backend and
+    /// `<parent>/_remote_store_cache` for the node-local split cache).
+    /// Convenient for tests and for the node startup path that roots the
+    /// store under `<data_dir>/_remote_store`.
     pub fn new_in_path(parent: &Path) -> Result<Self> {
         let root = parent.join(REMOTE_STORE_DIR_NAME);
-        Self::new(root.to_string_lossy().into_owned())
+        let workdir = parent.join(REMOTE_STORE_CACHE_DIR_NAME);
+        Self::new(root.to_string_lossy().into_owned(), workdir)
+    }
+
+    /// Node-local working directory root (cache + staging live under this).
+    pub fn local_workdir(&self) -> &Path {
+        &self.local_workdir
+    }
+
+    /// Cache directory for a specific (index, split). The path is always
+    /// computed from trusted IDs (never from untrusted manifest fields).
+    fn cache_dir(&self, index_uuid: &str, split_id: &str) -> PathBuf {
+        self.local_workdir
+            .join("splits")
+            .join(index_uuid)
+            .join(split_id)
+    }
+
+    /// Staging directory for building a split in-progress. Used by the
+    /// publish path; the staging tree never appears in the published
+    /// storage backend.
+    pub fn staging_dir(&self, index_uuid: &str, split_id: &str) -> PathBuf {
+        self.local_workdir
+            .join("staging")
+            .join(index_uuid)
+            .join(split_id)
+    }
+
+    /// Object-store key where a split's bundle is published. Derived from
+    /// trusted IDs so the key is never attacker-controllable.
+    pub fn split_bundle_key(index_uuid: &str, split_id: &str) -> String {
+        format!("{}/splits/{}/bundle", index_uuid, split_id)
+    }
+
+    /// Acquire a per-split async mutex so concurrent downloads of the same
+    /// split coalesce into a single fetch.
+    async fn split_lock(&self, cache_key: &str) -> Arc<Mutex<()>> {
+        let mut map = self.split_locks.lock().await;
+        map.entry(cache_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Download a split's bundle from the object store, verify its checksum,
+    /// and unpack it into the node-local cache. Reuses the cached copy on
+    /// subsequent calls when the `.done` marker matches `expected_checksum`.
+    ///
+    /// `split` is trusted only for its `split_id`, `bundle_path`, and
+    /// `checksum` fields; `bundle_path` is validated against the expected
+    /// canonical key shape so a malicious manifest cannot escape the key
+    /// namespace or reference another index's splits.
+    pub async fn fetch_split_into_cache(
+        &self,
+        index_uuid: &str,
+        split: &RemoteSplitManifest,
+    ) -> Result<PathBuf> {
+        let expected_key = Self::split_bundle_key(index_uuid, &split.split_id);
+        if split.bundle_path != expected_key {
+            anyhow::bail!(
+                "bundle_path {} does not match canonical key {} for split {}",
+                split.bundle_path,
+                expected_key,
+                split.split_id
+            );
+        }
+
+        let cache_dir = self.cache_dir(index_uuid, &split.split_id);
+        let done_marker = cache_dir.join(".done");
+        if let Ok(bytes) = std::fs::read(&done_marker)
+            && bytes == split.checksum.as_bytes()
+        {
+            return Ok(cache_dir);
+        }
+        // A stale `.done` with a different checksum means the manifest was
+        // republished with a different payload for the same split_id — it
+        // shouldn't happen for an immutable split_id, but fall through and
+        // re-download defensively.
+
+        let cache_key = format!("{}/{}", index_uuid, split.split_id);
+        let guard_arc = self.split_lock(&cache_key).await;
+        let _guard = guard_arc.lock().await;
+
+        // Re-check inside the lock: a concurrent caller may have just finished.
+        if let Ok(bytes) = std::fs::read(&done_marker)
+            && bytes == split.checksum.as_bytes()
+        {
+            return Ok(cache_dir);
+        }
+
+        // Clean up any partial state from a previous failed extract.
+        if cache_dir.exists() {
+            std::fs::remove_dir_all(&cache_dir)
+                .with_context(|| format!("failed to clear stale cache dir {:?}", cache_dir))?;
+        }
+        let tmp_dir = cache_dir.with_extension("tmp");
+        if tmp_dir.exists() {
+            std::fs::remove_dir_all(&tmp_dir)
+                .with_context(|| format!("failed to clear stale tmp dir {:?}", tmp_dir))?;
+        }
+        std::fs::create_dir_all(&tmp_dir)
+            .with_context(|| format!("failed to create tmp cache dir {:?}", tmp_dir))?;
+
+        let object_path = self.object_path(&split.bundle_path)?;
+        let (bundle_bytes, actual_checksum) = self.download_and_hash(&object_path).await?;
+        if actual_checksum != split.checksum {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            anyhow::bail!(
+                "bundle checksum mismatch for split {}: expected {}, got {}",
+                split.split_id,
+                split.checksum,
+                actual_checksum
+            );
+        }
+
+        // Unpack in a blocking task so we don't stall the reactor on large
+        // bundles.
+        let tmp_dir_for_unpack = tmp_dir.clone();
+        let unpack_result = tokio::task::spawn_blocking(move || {
+            unpack_bundle_into(&bundle_bytes, &tmp_dir_for_unpack)
+        })
+        .await;
+
+        match unpack_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(e);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(anyhow::anyhow!("unpack task panicked: {}", e));
+            }
+        }
+
+        if let Some(parent) = cache_dir.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create cache parent {:?}", parent))?;
+        }
+        std::fs::rename(&tmp_dir, &cache_dir).with_context(|| {
+            format!(
+                "failed to promote tmp cache dir {:?} to final {:?}",
+                tmp_dir, cache_dir
+            )
+        })?;
+        std::fs::write(&done_marker, split.checksum.as_bytes())
+            .with_context(|| format!("failed to write done marker {:?}", done_marker))?;
+
+        Ok(cache_dir)
+    }
+
+    /// Stream-download a split's bundle and compute its sha256 without
+    /// writing anything to disk. Used by `verify_splits`.
+    pub async fn hash_split_bundle(
+        &self,
+        index_uuid: &str,
+        split: &RemoteSplitManifest,
+    ) -> Result<String> {
+        let expected_key = Self::split_bundle_key(index_uuid, &split.split_id);
+        if split.bundle_path != expected_key {
+            anyhow::bail!(
+                "bundle_path {} does not match canonical key {} for split {}",
+                split.bundle_path,
+                expected_key,
+                split.split_id
+            );
+        }
+        let object_path = self.object_path(&split.bundle_path)?;
+        let mut stream = self.object_store().get(&object_path).await?.into_stream();
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+        }
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    }
+
+    /// Upload an already-built local split directory as a packed bundle
+    /// to the object store. Returns the `(bundle_key, checksum, size_bytes)`
+    /// the caller needs to fill in the manifest entry.
+    pub async fn upload_split_bundle(
+        &self,
+        index_uuid: &str,
+        split_id: &str,
+        staging_dir: &Path,
+    ) -> Result<(String, String, u64)> {
+        let staging_dir = staging_dir.to_path_buf();
+        let (bundle_bytes, checksum) =
+            tokio::task::spawn_blocking(move || pack_bundle_from_dir(&staging_dir))
+                .await
+                .map_err(|e| anyhow::anyhow!("pack task panicked: {}", e))??;
+        let size_bytes = bundle_bytes.len() as u64;
+
+        let bundle_key = Self::split_bundle_key(index_uuid, split_id);
+        let object_path = self.object_path(&bundle_key)?;
+        self.put(&object_path, bundle_bytes).await?;
+        Ok((bundle_key, checksum, size_bytes))
+    }
+
+    /// Stream-download an object into a `Vec<u8>` and compute its sha256 in
+    /// the same pass. For MVP we buffer the whole bundle in memory; a
+    /// future PR can switch to a file-backed staging buffer for very large
+    /// bundles.
+    async fn download_and_hash(&self, key: &ObjectPath) -> Result<(Vec<u8>, String)> {
+        let mut stream = self.object_store().get(key).await?.into_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            buf.extend_from_slice(&chunk);
+        }
+        let checksum = format!("sha256:{:x}", hasher.finalize());
+        Ok((buf, checksum))
     }
 
     /// Upcast the concrete backend to the generic `ObjectStore` trait object.
@@ -425,6 +676,185 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+// ── Split bundle format ───────────────────────────────────────────────
+//
+// A split is uploaded as a single opaque object in the object store.
+// The bundle layout is:
+//
+//   MAGIC:       6 bytes  (b"FSBND\x01")  — format identifier + version
+//   file_count:  u64 LE
+//   for each file (in POSIX-path sorted order):
+//     rel_path_len:    u64 LE
+//     rel_path_bytes:  utf8 (never contains "..", never absolute)
+//     content_len:     u64 LE
+//     content_bytes
+//
+// The checksum stored in the manifest is the SHA-256 of the entire bundle
+// byte stream (`"sha256:<hex>"`). Packing is deterministic (sorted paths +
+// explicit length framing) so two bundles with identical contents always
+// produce identical bytes and identical checksums, regardless of directory
+// iteration order on the builder host.
+pub(crate) fn pack_bundle_from_dir(dir: &Path) -> Result<(Vec<u8>, String)> {
+    use std::path::Component;
+
+    // Collect every regular file under `dir` with its POSIX relative path.
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&next).with_context(|| format!("failed to read_dir {:?}", next))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("dir entry in {:?}", next))?;
+            let ft = entry
+                .file_type()
+                .with_context(|| format!("file_type of {:?}", entry.path()))?;
+            let path = entry.path();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(dir)
+                    .with_context(|| format!("path {:?} not under bundle root {:?}", path, dir))?;
+                let rel_posix = rel
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(s) => s.to_str(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if rel_posix.is_empty() {
+                    anyhow::bail!("empty relative path produced for {:?}", path);
+                }
+                files.push((rel_posix, path));
+            }
+            // Skip symlinks and other non-regular entries on purpose.
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(BUNDLE_MAGIC);
+    buf.extend_from_slice(&(files.len() as u64).to_le_bytes());
+    for (rel_posix, abs_path) in &files {
+        let rel_bytes = rel_posix.as_bytes();
+        buf.extend_from_slice(&(rel_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(rel_bytes);
+
+        let content = std::fs::read(abs_path)
+            .with_context(|| format!("failed to read bundle file {:?}", abs_path))?;
+        buf.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&content);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&buf);
+    let checksum = format!("sha256:{:x}", hasher.finalize());
+    Ok((buf, checksum))
+}
+
+/// Inverse of `pack_bundle_from_dir`: parse `bytes` as a bundle and write
+/// each embedded file under `dir`. Rejects malformed frames and any
+/// relative path that would escape the target directory.
+pub(crate) fn unpack_bundle_into(bytes: &[u8], dir: &Path) -> Result<()> {
+    use std::path::Component;
+
+    if bytes.len() < BUNDLE_MAGIC.len() + 8 {
+        anyhow::bail!("bundle too short to contain header ({} bytes)", bytes.len());
+    }
+    if &bytes[..BUNDLE_MAGIC.len()] != BUNDLE_MAGIC {
+        anyhow::bail!(
+            "bundle magic mismatch: expected {:?}, got {:?}",
+            BUNDLE_MAGIC,
+            &bytes[..BUNDLE_MAGIC.len()]
+        );
+    }
+    let mut off = BUNDLE_MAGIC.len();
+
+    let file_count = read_u64_le(bytes, &mut off)?;
+    // Defensive upper bound: splits realistically have thousands of files
+    // at most. Reject values that would let a malformed bundle trigger huge
+    // allocations.
+    if file_count > 1_000_000 {
+        anyhow::bail!(
+            "bundle declares implausibly large file_count {}",
+            file_count
+        );
+    }
+
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create bundle extract dir {:?}", dir))?;
+    let dir_canon = dir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {:?}", dir))?;
+
+    for _ in 0..file_count {
+        let rel_len = read_u64_le(bytes, &mut off)? as usize;
+        if off + rel_len > bytes.len() {
+            anyhow::bail!("bundle truncated while reading relative path");
+        }
+        let rel_bytes = &bytes[off..off + rel_len];
+        off += rel_len;
+        let rel_str =
+            std::str::from_utf8(rel_bytes).context("bundle relative path is not valid utf-8")?;
+
+        let rel_path = Path::new(rel_str);
+        if rel_path.is_absolute() {
+            anyhow::bail!("bundle contains absolute path {:?}", rel_str);
+        }
+        for component in rel_path.components() {
+            match component {
+                Component::Normal(_) => {}
+                _ => anyhow::bail!("bundle contains disallowed path component in {:?}", rel_str),
+            }
+        }
+
+        let content_len = read_u64_le(bytes, &mut off)? as usize;
+        if off + content_len > bytes.len() {
+            anyhow::bail!(
+                "bundle truncated while reading file content for {:?}",
+                rel_str
+            );
+        }
+        let content = &bytes[off..off + content_len];
+        off += content_len;
+
+        let abs = dir_canon.join(rel_path);
+        // Belt-and-suspenders: ensure the joined path still lives under `dir_canon`.
+        if !abs.starts_with(&dir_canon) {
+            anyhow::bail!(
+                "bundle file path {:?} would escape extract dir {:?}",
+                abs,
+                dir_canon
+            );
+        }
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create parent dir {:?}", parent))?;
+        }
+        std::fs::write(&abs, content)
+            .with_context(|| format!("failed to write bundle file {:?}", abs))?;
+    }
+
+    if off != bytes.len() {
+        anyhow::bail!(
+            "bundle has {} trailing bytes after last file",
+            bytes.len() - off
+        );
+    }
+    Ok(())
+}
+
+fn read_u64_le(bytes: &[u8], off: &mut usize) -> Result<u64> {
+    if *off + 8 > bytes.len() {
+        anyhow::bail!("bundle truncated while reading u64");
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&bytes[*off..*off + 8]);
+    *off += 8;
+    Ok(u64::from_le_bytes(b))
+}
+
 fn manifest_pointer_key(index_uuid: &str) -> String {
     format!("{}/manifest.current.json", index_uuid)
 }
@@ -681,7 +1111,7 @@ mod tests {
     #[tokio::test]
     async fn storage_manager_uses_object_store_local_backend_for_roundtrip() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
         let path = manager.object_path("manifests/1.json").unwrap();
 
         manager
@@ -699,8 +1129,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root_url = Url::from_file_path(temp_dir.path())
             .expect("temp dir path should convert to a file:// URL");
+        let workdir = temp_dir.path().join("workdir");
 
-        let manager = StorageManager::new(root_url.to_string()).unwrap();
+        let manager = StorageManager::new(root_url.to_string(), workdir).unwrap();
 
         assert_eq!(
             manager.root().unwrap(),
@@ -711,7 +1142,12 @@ mod tests {
 
     #[test]
     fn storage_manager_rejects_unsupported_scheme() {
-        let error = StorageManager::new("gs://bucket/indexes".into()).unwrap_err();
+        let temp_dir = TempDir::new().unwrap();
+        let error = StorageManager::new(
+            "gs://bucket/indexes".into(),
+            temp_dir.path().join("workdir"),
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -732,7 +1168,12 @@ mod tests {
         // NOTE: we do NOT set AWS env vars here to avoid racing other tests.
         // The real S3 roundtrip is covered by the env-gated
         // `tests/remote_store_s3_integration.rs` suite.
-        let manager = StorageManager::new("s3://test-bucket/indexes".into()).unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new(
+            "s3://test-bucket/indexes".into(),
+            temp_dir.path().join("workdir"),
+        )
+        .unwrap();
         assert!(!manager.is_local());
         assert!(manager.root().is_none());
         assert_eq!(manager.uri(), "s3://test-bucket/indexes");
@@ -747,7 +1188,9 @@ mod tests {
 
     #[test]
     fn storage_manager_s3_url_rejects_missing_bucket() {
-        let err = StorageManager::new("s3:///prefix-only".into()).unwrap_err();
+        let temp_dir = TempDir::new().unwrap();
+        let err = StorageManager::new("s3:///prefix-only".into(), temp_dir.path().join("workdir"))
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("missing a bucket name") || msg.contains("failed to build S3 backend"),
@@ -789,7 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn load_manifest_pointer_returns_none_for_fresh_index() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
 
         let pointer = manager.load_manifest_pointer("idx-1").await.unwrap();
         assert!(pointer.is_none());
@@ -798,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn publish_then_load_current_manifest_roundtrips() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
         let manifest = sample_manifest("idx-1", 7, "sha256:v1");
 
         let pointer = manager.publish_manifest(&manifest).await.unwrap();
@@ -823,7 +1266,7 @@ mod tests {
     #[tokio::test]
     async fn load_manifest_rejects_schema_hash_mismatch() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
         let manifest = sample_manifest("idx-1", 3, "sha256:v1");
         manager.publish_manifest(&manifest).await.unwrap();
 
@@ -840,7 +1283,7 @@ mod tests {
     #[tokio::test]
     async fn load_manifest_rejects_generation_mismatch() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
         // Publish a manifest whose pointer says generation 5 but whose payload declares 6.
         // We simulate this by writing the manifest by hand under a different generation key.
         let mut manifest = sample_manifest("idx-1", 6, "sha256:v1");
@@ -863,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn load_manifest_rejects_corrupt_json() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
         let path = manager
             .object_path(&manifest_generation_key("idx-1", 1))
             .unwrap();
@@ -879,7 +1322,7 @@ mod tests {
     #[tokio::test]
     async fn load_current_manifest_returns_none_when_pointer_missing() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
 
         let loaded = manager.load_current_manifest("idx-1", None).await.unwrap();
         assert!(loaded.is_none());
@@ -988,7 +1431,7 @@ mod tests {
     #[tokio::test]
     async fn append_split_and_publish_bootstraps_generation_1() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
 
         let split = RemoteSplitManifest {
             split_id: "split-a".into(),
@@ -1023,7 +1466,7 @@ mod tests {
     #[tokio::test]
     async fn append_split_and_publish_bumps_generation_and_appends() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
 
         let split_a = RemoteSplitManifest {
             split_id: "split-a".into(),
@@ -1072,7 +1515,7 @@ mod tests {
     #[tokio::test]
     async fn append_split_and_publish_rejects_schema_mismatch() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
 
         let split = RemoteSplitManifest {
             split_id: "split-a".into(),
@@ -1105,7 +1548,7 @@ mod tests {
     #[tokio::test]
     async fn append_split_and_publish_rejects_duplicate_split_id() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = StorageManager::new(temp_dir.path().to_string_lossy().into_owned()).unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
 
         let split = RemoteSplitManifest {
             split_id: "split-a".into(),
@@ -1130,5 +1573,246 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    // ── Bundle pack/unpack ────────────────────────────────────────────
+
+    fn write_file(root: &Path, rel: &str, content: &[u8]) {
+        let abs = root.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(abs, content).unwrap();
+    }
+
+    #[test]
+    fn pack_bundle_produces_deterministic_sha256() {
+        // Same contents, different creation order → identical bytes + checksum.
+        let a = TempDir::new().unwrap();
+        let b = TempDir::new().unwrap();
+        write_file(a.path(), "index/meta.json", b"{\"v\":1}");
+        write_file(a.path(), "index/000.store", b"\x00\x01\x02");
+        write_file(b.path(), "index/000.store", b"\x00\x01\x02");
+        write_file(b.path(), "index/meta.json", b"{\"v\":1}");
+
+        let (bytes_a, sum_a) = pack_bundle_from_dir(a.path()).unwrap();
+        let (bytes_b, sum_b) = pack_bundle_from_dir(b.path()).unwrap();
+        assert_eq!(bytes_a, bytes_b);
+        assert_eq!(sum_a, sum_b);
+        assert!(sum_a.starts_with("sha256:"));
+        assert_eq!(sum_a.len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn pack_then_unpack_roundtrip_preserves_every_file() {
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "index/meta.json", b"{\"hello\":true}");
+        write_file(src.path(), "index/nested/dir/blob.bin", b"\xaa\xbb\xcc\xdd");
+        write_file(src.path(), "top.txt", b"root-level");
+
+        let (bytes, checksum) = pack_bundle_from_dir(src.path()).unwrap();
+        assert!(checksum.starts_with("sha256:"));
+
+        let dst = TempDir::new().unwrap();
+        unpack_bundle_into(&bytes, dst.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(dst.path().join("index/meta.json")).unwrap(),
+            b"{\"hello\":true}"
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join("index/nested/dir/blob.bin")).unwrap(),
+            b"\xaa\xbb\xcc\xdd"
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join("top.txt")).unwrap(),
+            b"root-level"
+        );
+    }
+
+    #[test]
+    fn pack_then_unpack_then_pack_yields_identical_bytes() {
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.bin", b"hello");
+        write_file(src.path(), "b/c.bin", b"world");
+        let (bytes1, checksum1) = pack_bundle_from_dir(src.path()).unwrap();
+
+        let mid = TempDir::new().unwrap();
+        unpack_bundle_into(&bytes1, mid.path()).unwrap();
+        let (bytes2, checksum2) = pack_bundle_from_dir(mid.path()).unwrap();
+
+        assert_eq!(bytes1, bytes2);
+        assert_eq!(checksum1, checksum2);
+    }
+
+    #[test]
+    fn unpack_rejects_missing_magic() {
+        let dst = TempDir::new().unwrap();
+        // 14+ bytes so the length check passes, but the magic prefix is wrong.
+        let bogus: Vec<u8> = b"BOGUS!!!\x00\x00\x00\x00\x00\x00\x00\x00".to_vec();
+        let err = unpack_bundle_into(&bogus, dst.path()).unwrap_err();
+        assert!(err.to_string().contains("magic"), "{err}");
+    }
+
+    #[test]
+    fn unpack_rejects_truncated_header() {
+        let dst = TempDir::new().unwrap();
+        // First 5 bytes of the magic are valid but the header is incomplete.
+        let err = unpack_bundle_into(b"FSBND", dst.path()).unwrap_err();
+        assert!(err.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn unpack_rejects_absolute_path_in_bundle() {
+        // Hand-craft a bundle with one file whose rel path is absolute.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(BUNDLE_MAGIC);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let evil = "/etc/passwd";
+        bytes.extend_from_slice(&(evil.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(evil.as_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let dst = TempDir::new().unwrap();
+        let err = unpack_bundle_into(&bytes, dst.path()).unwrap_err();
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn unpack_rejects_parent_dir_component() {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(BUNDLE_MAGIC);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let evil = "../escape.txt";
+        bytes.extend_from_slice(&(evil.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(evil.as_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let dst = TempDir::new().unwrap();
+        let err = unpack_bundle_into(&bytes, dst.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("disallowed path component"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_and_fetch_split_bundle_roundtrips_via_local_backend() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+
+        // Build a local staging dir that looks like a mini split.
+        let stage = manager.staging_dir("idx-uuid", "split-42");
+        std::fs::create_dir_all(&stage).unwrap();
+        write_file(&stage, "index/meta.json", b"{\"meta\":1}");
+        write_file(&stage, "index/000.store", b"\x11\x22\x33");
+
+        let (bundle_key, checksum, size) = manager
+            .upload_split_bundle("idx-uuid", "split-42", &stage)
+            .await
+            .unwrap();
+        assert_eq!(bundle_key, "idx-uuid/splits/split-42/bundle");
+        assert!(checksum.starts_with("sha256:"));
+        assert!(size > 0);
+
+        let split = RemoteSplitManifest {
+            split_id: "split-42".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: bundle_key,
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: checksum.clone(),
+            doc_count: 0,
+            size_bytes: size,
+            uncompressed_bytes: size,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+
+        let hashed = manager.hash_split_bundle("idx-uuid", &split).await.unwrap();
+        assert_eq!(hashed, checksum);
+
+        let cache_dir = manager
+            .fetch_split_into_cache("idx-uuid", &split)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(cache_dir.join("index/meta.json")).unwrap(),
+            b"{\"meta\":1}"
+        );
+        assert!(cache_dir.join(".done").exists());
+
+        // Second fetch should short-circuit without re-downloading (same cache dir).
+        let cache_dir_2 = manager
+            .fetch_split_into_cache("idx-uuid", &split)
+            .await
+            .unwrap();
+        assert_eq!(cache_dir, cache_dir_2);
+    }
+
+    #[tokio::test]
+    async fn fetch_split_rejects_unexpected_bundle_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+        let split = RemoteSplitManifest {
+            split_id: "split-42".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: "attacker/splits/split-42/bundle".into(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:zz".into(),
+            doc_count: 0,
+            size_bytes: 0,
+            uncompressed_bytes: 0,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+        let err = manager
+            .fetch_split_into_cache("idx-uuid", &split)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match canonical key"));
+
+        let err = manager
+            .hash_split_bundle("idx-uuid", &split)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match canonical key"));
+    }
+
+    #[tokio::test]
+    async fn fetch_split_rejects_checksum_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+        let stage = manager.staging_dir("idx-uuid", "split-42");
+        std::fs::create_dir_all(&stage).unwrap();
+        write_file(&stage, "index/meta.json", b"{}");
+
+        let (bundle_key, checksum, size) = manager
+            .upload_split_bundle("idx-uuid", "split-42", &stage)
+            .await
+            .unwrap();
+        let bogus_checksum = format!("sha256:{}", "0".repeat(64));
+        assert_ne!(bogus_checksum, checksum);
+
+        let split = RemoteSplitManifest {
+            split_id: "split-42".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: bundle_key,
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: bogus_checksum,
+            doc_count: 0,
+            size_bytes: size,
+            uncompressed_bytes: size,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+        let err = manager
+            .fetch_split_into_cache("idx-uuid", &split)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bundle checksum mismatch"));
     }
 }

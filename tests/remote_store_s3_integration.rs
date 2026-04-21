@@ -94,7 +94,11 @@ async fn s3_backend_reports_as_remote_and_exposes_s3_uri() {
     let prefix = random_prefix();
     let uri = format!("s3://{}/{}", bucket, prefix);
 
-    let manager = StorageManager::new(uri.clone()).expect("s3 manager should build");
+    let manager = StorageManager::new(
+        uri.clone(),
+        std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
+    )
+    .expect("s3 manager should build");
 
     assert!(!manager.is_local());
     assert!(manager.root().is_none());
@@ -109,7 +113,11 @@ async fn s3_backend_publishes_and_loads_manifest_roundtrip() {
     };
     let prefix = random_prefix();
     let uri = format!("s3://{}/{}", bucket, prefix);
-    let manager = StorageManager::new(uri).expect("s3 manager should build");
+    let manager = StorageManager::new(
+        uri,
+        std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
+    )
+    .expect("s3 manager should build");
 
     let index_uuid = Uuid::new_v4().to_string();
     let manifest_v1 = sample_manifest(&index_uuid, 1);
@@ -138,7 +146,11 @@ async fn s3_backend_append_split_and_publish_bumps_generation() {
     };
     let prefix = random_prefix();
     let uri = format!("s3://{}/{}", bucket, prefix);
-    let manager = StorageManager::new(uri).expect("s3 manager should build");
+    let manager = StorageManager::new(
+        uri,
+        std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
+    )
+    .expect("s3 manager should build");
 
     let index_uuid = Uuid::new_v4().to_string();
 
@@ -202,7 +214,11 @@ async fn s3_backend_load_current_manifest_returns_none_for_fresh_index() {
     };
     let prefix = random_prefix();
     let uri = format!("s3://{}/{}", bucket, prefix);
-    let manager = StorageManager::new(uri).expect("s3 manager should build");
+    let manager = StorageManager::new(
+        uri,
+        std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
+    )
+    .expect("s3 manager should build");
 
     let index_uuid = Uuid::new_v4().to_string();
     let loaded = manager
@@ -220,7 +236,11 @@ async fn s3_backend_append_rejects_schema_mismatch() {
     };
     let prefix = random_prefix();
     let uri = format!("s3://{}/{}", bucket, prefix);
-    let manager = StorageManager::new(uri).expect("s3 manager should build");
+    let manager = StorageManager::new(
+        uri,
+        std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
+    )
+    .expect("s3 manager should build");
 
     let index_uuid = Uuid::new_v4().to_string();
 
@@ -251,4 +271,74 @@ async fn s3_backend_append_rejects_schema_mismatch() {
         err.to_string().contains("schema_hash mismatch"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn s3_backend_upload_fetch_verify_split_roundtrip() {
+    let Some((_, bucket)) = s3_env() else {
+        eprintln!("skip: {} not set", ENDPOINT_ENV);
+        return;
+    };
+    let prefix = random_prefix();
+    let uri = format!("s3://{}/{}", bucket, prefix);
+    let workdir = std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4()));
+    let manager = StorageManager::new(uri, workdir).expect("s3 manager should build");
+
+    // Build a tiny staging dir on local disk.
+    let index_uuid = Uuid::new_v4().to_string();
+    let split_id = Uuid::new_v4().to_string();
+    let staging = manager.staging_dir(&index_uuid, &split_id);
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(staging.join("index")).unwrap();
+    std::fs::write(staging.join("index/meta.json"), b"{\"v\":1}").unwrap();
+    std::fs::write(staging.join("index/000.store"), b"\x01\x02\x03\x04").unwrap();
+
+    // Upload → S3.
+    let (bundle_key, checksum, size) = manager
+        .upload_split_bundle(&index_uuid, &split_id, &staging)
+        .await
+        .expect("upload split bundle to s3");
+    assert_eq!(
+        bundle_key,
+        format!("{}/splits/{}/bundle", index_uuid, split_id)
+    );
+    assert!(checksum.starts_with("sha256:"));
+    assert!(size > 0);
+
+    let split = RemoteSplitManifest {
+        split_id: split_id.clone(),
+        state: RemoteSplitState::Published,
+        bundle_path: bundle_key,
+        bundle_etag: None,
+        hotcache_path: None,
+        checksum: checksum.clone(),
+        doc_count: 0,
+        size_bytes: size,
+        uncompressed_bytes: size,
+        hotcache_bytes: None,
+        time_range: None,
+        tags: BTreeMap::new(),
+    };
+
+    // Verify via hash-only path (no local download).
+    let hashed = manager
+        .hash_split_bundle(&index_uuid, &split)
+        .await
+        .expect("hash bundle over s3");
+    assert_eq!(hashed, checksum);
+
+    // Fetch into the node-local cache and confirm files round-trip.
+    let cache_dir = manager
+        .fetch_split_into_cache(&index_uuid, &split)
+        .await
+        .expect("fetch split from s3");
+    assert_eq!(
+        std::fs::read(cache_dir.join("index/meta.json")).unwrap(),
+        b"{\"v\":1}"
+    );
+    assert_eq!(
+        std::fs::read(cache_dir.join("index/000.store")).unwrap(),
+        b"\x01\x02\x03\x04"
+    );
+    assert!(cache_dir.join(".done").exists());
 }

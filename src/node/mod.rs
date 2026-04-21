@@ -155,7 +155,11 @@ impl Node {
         let task_manager = Arc::new(crate::tasks::TaskManager::new());
 
         let storage_manager = Arc::new(match config.storage_uri.as_deref() {
-            Some(uri) => crate::storage::StorageManager::new(uri.to_string())?,
+            Some(uri) => {
+                let workdir = std::path::Path::new(&config.data_dir)
+                    .join(crate::storage::REMOTE_STORE_CACHE_DIR_NAME);
+                crate::storage::StorageManager::new(uri.to_string(), workdir)?
+            }
             None => {
                 crate::storage::StorageManager::new_in_path(std::path::Path::new(&config.data_dir))?
             }

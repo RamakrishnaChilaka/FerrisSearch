@@ -72,7 +72,7 @@ Every SQL response tells you how the planner executed the query:
 - **OpenSearch-compatible REST API** — `PUT /{index}`, `POST /_doc`, `GET /_search`, `POST /_bulk`, async `POST /{index}/_forcemerge`, `GET /_tasks/{task_id}`
 - **Search-aware SQL planner** — `text_match()` with `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and same-index semijoin support
 - **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, and `materialized_hits_fallback`, with `streaming_used` reported whenever the fast-field path streams locally or over gRPC
-- **Engine-ready index metadata** — indices now persist a create-time engine selector; `local_shards` is the only operational engine today, while `remote_store` is reserved for the upcoming shardless object-store engine
+- **Engine-ready index metadata** — indices persist a create-time engine selector; `local_shards` is the default, and `remote_store` is now queryable via published split bundles stored in a local or S3-compatible object store
 - **Raft-backed coordination** — leader election, shard routing, and failover for a multi-node cluster
 - **Synchronous shard replication** — primary-replica writes over gRPC with ISR tracking; writes are acknowledged only after all in-sync replicas confirm
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) with hybrid text + vector querying
@@ -80,7 +80,7 @@ Every SQL response tells you how the planner executed the query:
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1313 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest coverage
+- **Test depth** — 1310 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
 
 ## Tech Stack
 
@@ -92,7 +92,7 @@ Every SQL response tells you how the planner executed the query:
 | Vector search | [USearch](https://github.com/unum-cloud/usearch) | HNSW approximate nearest neighbor |
 | gRPC transport | [tonic](https://github.com/hyperium/tonic) 0.13 | Inter-node RPCs, shard forwarding |
 | Persistent storage | [redb](https://github.com/cberner/redb) 3 | Raft log on disk |
-| Object storage abstraction | [object_store](https://crates.io/crates/object_store) 0.13 | Local filesystem backend today, cloud object stores later for `remote_store` |
+| Object storage abstraction | [object_store](https://crates.io/crates/object_store) 0.13 | Local filesystem or S3/S3-compatible backends for `remote_store` split bundles and manifests |
 | Thread pools | [rayon](https://github.com/rayon-rs/rayon) | Search/write workload isolation |
 | Allocator | [jemalloc](https://github.com/tikv/jemallocator) | Reduced memory fragmentation |
 
@@ -285,7 +285,7 @@ curl -X PUT 'http://localhost:9200/movies/_settings' -H 'Content-Type: applicati
 
 `flush_threshold_bytes` is a per-index WAL auto-flush threshold. The default is `536870912` (512 MB). Setting it to `0` disables automatic background flushes.
 Background auto-flush is best-effort: it skips the tick while the shard is busy ingesting or persisting vectors instead of blocking live writes, and the maintenance tick itself runs on blocking threads so compaction does not stall Raft heartbeats.
-`engine` is immutable after index creation. `local_shards` is the default and the only operational engine today. `remote_store` is recognized but currently returns `501 Not Implemented` until the shardless object-store engine lands.
+`engine` is immutable after index creation. `local_shards` is the default. `remote_store` is a shardless engine served from split bundles published to the configured object store (local or `s3://`); reads go through `POST /{index}/_search` and writes go through `POST /{index}/_remote_store/publish`. Direct `_doc` / `_bulk` writes against `remote_store` indices still return `501 Not Implemented`.
 
 **Field types:** `text`, `keyword`, `integer`, `float`, `boolean`, `date`, `knn_vector`. Unmapped fields are auto-detected on first document.
 
@@ -538,7 +538,7 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1313 tests
+cargo test                                      # All 1310 tests
 cargo test --lib                                # Unit tests (1104)
 cargo test --bin ferris-cli                      # CLI tests (68)
 cargo test --test consensus_integration          # Raft consensus (33)

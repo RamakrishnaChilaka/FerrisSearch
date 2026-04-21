@@ -1,76 +1,33 @@
 //! Read-path for the `remote_store` engine.
 //!
-//! Loads the current published manifest for an index, opens each published
-//! split as a local `HotEngine`, runs the DSL search against every split, and
-//! merges the per-split results into a `DistributedDslSearchResult` that the
-//! existing coordinator post-processing can consume.
+//! Loads the current published manifest for an index, fetches each published
+//! split bundle from the object store into a node-local cache, unpacks each
+//! bundle into a standard `HotEngine` data layout, runs the DSL search
+//! against every split, and merges the per-split results into a
+//! `DistributedDslSearchResult` that the existing coordinator post-processing
+//! can consume.
 //!
 //! Limitations (intentional for this slice):
 //! - Runs on the coordinator only; no leaf gRPC fan-out.
-//! - No split-bundle extraction (tarball support); `bundle_path` must refer
-//!   to an on-disk directory laid out like a `HotEngine` data-dir (i.e.,
-//!   contains an `index/` subdirectory with `meta.json`).
-//! - No hotcache, no LRU split cache, no rendezvous hashing.
+//! - No hotcache, no LRU eviction of the local cache, no rendezvous hashing.
 //! - k-NN vector search is not supported yet (remote_store is for
 //!   inverted-index splits).
-//! - `schema_hash` from the manifest is not validated against the live
-//!   index mappings today. It is safe to skip: `remote_store` indices reject
-//!   writes (including dynamic-mapping `AddMappings`), so mappings cannot
-//!   change after creation. When the split publish path lands, this module
-//!   must start passing a computed schema hash to
-//!   `StorageManager::load_current_manifest` so stale manifests are rejected.
+//! - `schema_hash` from the manifest is validated against the live index
+//!   mappings on load (`remote_store` rejects writes so mappings cannot
+//!   change after creation).
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use axum::http::StatusCode;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::api::AppState;
 use crate::api::index::DistributedDslSearchResult;
 use crate::cluster::state::IndexMetadata;
 use crate::search::{PartialAggResult, SearchRequest};
-
-/// Resolve a manifest-supplied `bundle_path` against `storage_root` while
-/// rejecting anything that would escape the root. Manifests may be written
-/// by external components (and, with cloud object stores, by other tenants),
-/// so `bundle_path` is treated as untrusted input.
-///
-/// Rejects:
-/// - empty paths
-/// - absolute paths (`/foo`, `C:\foo`, or leading path separators)
-/// - any `..` or root components via `Path::components`
-///
-/// Returns the resolved absolute `PathBuf` when the path is safely contained.
-fn resolve_split_dir(storage_root: &Path, bundle_path: &str) -> Result<PathBuf, String> {
-    if bundle_path.is_empty() {
-        return Err("bundle_path is empty".into());
-    }
-
-    let rel = Path::new(bundle_path);
-    if rel.is_absolute() {
-        return Err(format!("bundle_path must be relative: {}", bundle_path));
-    }
-
-    for component in rel.components() {
-        match component {
-            Component::Normal(_) => {}
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "bundle_path contains disallowed component: {}",
-                    bundle_path
-                ));
-            }
-        }
-    }
-
-    Ok(storage_root.join(rel))
-}
 
 /// Entry point invoked from `execute_distributed_dsl_search` when an index's
 /// engine is `IndexEngine::RemoteStore`.
@@ -130,24 +87,10 @@ pub(crate) async fn search(
         }
     };
 
-    let storage_root = match state.storage_manager.root() {
-        Some(p) => p.to_path_buf(),
-        None => {
-            return Err(crate::api::error_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "illegal_argument_exception",
-                format!(
-                    "remote_store search requires a local storage backend; \
-                     current backend is remote ({}). Split download/cache is \
-                     not yet implemented.",
-                    state.storage_manager.uri()
-                ),
-            ));
-        }
-    };
     // Wrap mappings in an Arc so per-split spawn_search tasks share the
     // allocation instead of cloning the full HashMap for every split.
     let mappings = Arc::new(metadata.mappings.clone());
+    let index_uuid = metadata.uuid.as_str().to_string();
 
     let mut all_hits: Vec<Value> = Vec::new();
     let mut total_hits: usize = 0;
@@ -160,14 +103,21 @@ pub(crate) async fn search(
     let splits: Vec<_> = manifest.published_splits().cloned().collect();
 
     for split in splits {
-        let split_dir = match resolve_split_dir(&storage_root, &split.bundle_path) {
+        // Fetch the bundle from the object store into the node-local cache.
+        // Subsequent searches for the same split short-circuit on the cache's
+        // `.done` marker.
+        let split_dir = match state
+            .storage_manager
+            .fetch_split_into_cache(&index_uuid, &split)
+            .await
+        {
             Ok(p) => p,
-            Err(reason) => {
+            Err(e) => {
                 tracing::error!(
-                    "remote_store: rejecting split {} for {}: {}",
+                    "remote_store: failed to fetch split {} for {}: {}",
                     split.split_id,
                     index_name,
-                    reason
+                    e
                 );
                 failed += 1;
                 continue;
@@ -176,9 +126,8 @@ pub(crate) async fn search(
 
         if !split_dir.join("index").join("meta.json").exists() {
             tracing::warn!(
-                "remote_store: split {} bundle_path {} missing index/meta.json at {:?}",
+                "remote_store: split {} cache dir {:?} missing index/meta.json after extract",
                 split.split_id,
-                split.bundle_path,
                 split_dir
             );
             failed += 1;
@@ -251,17 +200,21 @@ pub(crate) async fn search(
 ///
 /// Flow (matches Quickwit's build-then-publish pattern):
 /// 1. Generate a fresh `split_id` (UUID v4).
-/// 2. Build a local Tantivy index under `<storage_root>/<uuid>/.staging/<split_id>/`
-///    using `HotEngine`, index every doc, flush.
-/// 3. Rename the staging dir to `<storage_root>/<uuid>/splits/<split_id>/` so the
-///    split directory only ever appears atomically.
+/// 2. Build a local Tantivy index in a node-local staging directory under
+///    `<data_dir>/_remote_store_cache/staging/<uuid>/<split_id>/` using
+///    `HotEngine`, index every doc, flush.
+/// 3. Pack the staging tree into a single deterministic bundle byte stream
+///    and upload it to the object store at
+///    `<index_uuid>/splits/<split_id>/bundle`. The checksum stored in the
+///    manifest is the sha256 of the bundle bytes.
 /// 4. Append a new `Published` `RemoteSplitManifest` to the current manifest
 ///    via `StorageManager::append_split_and_publish` (serialized by the
 ///    per-storage publish lock).
 ///
-/// Failure handling: on any failure before rename, the staging dir is
-/// removed. After rename, the split dir is left in place — a future janitor
-/// PR will reap splits not referenced by any live manifest generation.
+/// Failure handling: on any failure before successful upload, the staging
+/// dir is removed. After upload, the object-store bundle is left in place —
+/// a future janitor PR will reap splits not referenced by any live manifest
+/// generation.
 pub(crate) async fn publish_docs(
     state: &AppState,
     index_name: &str,
@@ -292,28 +245,9 @@ pub(crate) async fn publish_docs(
         ));
     }
 
-    let storage_root = match state.storage_manager.root() {
-        Some(p) => p.to_path_buf(),
-        None => {
-            return Err(crate::api::error_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "illegal_argument_exception",
-                format!(
-                    "remote_store publish requires a local storage backend for \
-                     the staging directory; current backend is remote ({}). \
-                     Remote publish (build-local-then-upload) is not yet \
-                     implemented.",
-                    state.storage_manager.uri()
-                ),
-            ));
-        }
-    };
     let index_uuid = metadata.uuid.as_str().to_string();
     let split_id = uuid::Uuid::new_v4().to_string();
-    let split_rel = format!("{}/splits/{}", index_uuid, split_id);
-    let staging_rel = format!("{}/.staging/{}", index_uuid, split_id);
-    let staging_dir = storage_root.join(&staging_rel);
-    let split_dir = storage_root.join(&split_rel);
+    let staging_dir = state.storage_manager.staging_dir(&index_uuid, &split_id);
 
     // Extract or generate _id per doc, then strip _id from payload so stored
     // source stays clean (mirrors single-doc index path).
@@ -339,6 +273,9 @@ pub(crate) async fn publish_docs(
     let build_result = state
         .worker_pools
         .spawn_write(move || -> anyhow::Result<()> {
+            if staging_for_build.exists() {
+                std::fs::remove_dir_all(&staging_for_build)?;
+            }
             std::fs::create_dir_all(&staging_for_build)?;
             let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
             let engine = crate::engine::tantivy::HotEngine::new_with_mappings(
@@ -357,69 +294,75 @@ pub(crate) async fn publish_docs(
         })
         .await;
 
-    match build_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) | Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            tracing::error!(
-                "remote_store: split build failed for {} split_id {}: {}",
-                index_name,
-                split_id,
-                e
-            );
-            return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "remote_store_build_exception",
-                format!("split build failed: {}", e),
-            ));
-        }
-    }
-
-    // Atomic rename so readers never observe a half-built split directory.
-    // Ensure the parent (`splits/`) exists first — it may not on the first
-    // publish for this index.
-    if let Some(parent) = split_dir.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
+    if let Err(e) = match build_result {
+        Ok(inner) => inner,
+        Err(join_err) => Err(anyhow::anyhow!(join_err)),
+    } {
         let _ = std::fs::remove_dir_all(&staging_dir);
+        tracing::error!(
+            "remote_store: split build failed for {} split_id {}: {}",
+            index_name,
+            split_id,
+            e
+        );
         return Err(crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "remote_store_build_exception",
-            format!("failed to create splits/ parent: {}", e),
-        ));
-    }
-    if let Err(e) = std::fs::rename(&staging_dir, &split_dir) {
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        return Err(crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "remote_store_build_exception",
-            format!("failed to promote staging split into splits/: {}", e),
+            format!("split build failed: {}", e),
         ));
     }
 
-    let size_bytes = directory_size_bytes(&split_dir).unwrap_or(0);
-
-    let schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
-
-    // Compute a real content-addressable checksum over the bundle. This gives
-    // the S3/MinIO follow-up (issue #123) something to verify against when it
-    // downloads a split into the local cache. It's intentionally computed
-    // AFTER the atomic rename so we hash the final on-disk bytes, and
-    // intentionally on the write worker pool since it's blocking I/O over
-    // potentially hundreds of MB.
-    let split_dir_for_hash = split_dir.clone();
-    let checksum = match state
+    // Strip out the translog generation files from the staging tree before
+    // packing: they're WAL state for crash recovery on a live engine, not
+    // queryable data. `HotEngine::flush` empties the translog but the file
+    // itself stays on disk; we want the bundle contents to be exactly the
+    // Tantivy `index/` subtree plus the vector index payload.
+    let staging_for_strip = staging_dir.clone();
+    let strip_result = state
         .worker_pools
-        .spawn_write(move || compute_bundle_checksum(&split_dir_for_hash))
+        .spawn_write(move || -> anyhow::Result<()> {
+            let translog = staging_for_strip.join("translog.manifest");
+            if translog.exists() {
+                std::fs::remove_file(&translog)?;
+            }
+            for entry in std::fs::read_dir(&staging_for_strip)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("translog-") && name_str.ends_with(".bin") {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+            Ok(())
+        })
+        .await;
+    if let Err(e) = match strip_result {
+        Ok(inner) => inner,
+        Err(join_err) => Err(anyhow::anyhow!(join_err)),
+    } {
+        tracing::warn!(
+            "remote_store: failed to strip translog from staging for split {} of {}: {} \
+             (continuing with upload; translog files will be bundled)",
+            split_id,
+            index_name,
+            e
+        );
+    }
+
+    // Pack + upload the bundle. `upload_split_bundle` is uniform across local
+    // and remote backends: on a local backend the bundle becomes a file under
+    // `<data_dir>/_remote_store/<uuid>/splits/<split_id>/bundle`; on s3:// it
+    // becomes an object at the same relative key.
+    let (bundle_key, checksum, size_bytes) = match state
+        .storage_manager
+        .upload_split_bundle(&index_uuid, &split_id, &staging_dir)
         .await
     {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) | Err(e) => {
-            // The split bytes are already in their final location. Leave them
-            // there (next publish attempt can reuse the dir if desired) and
-            // return an error so the caller knows not to trust this split.
+        Ok(triple) => triple,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
             tracing::error!(
-                "remote_store: bundle checksum failed for {} split_id {}: {}",
+                "remote_store: bundle upload failed for {} split_id {}: {}",
                 index_name,
                 split_id,
                 e
@@ -427,15 +370,20 @@ pub(crate) async fn publish_docs(
             return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "remote_store_build_exception",
-                format!("bundle checksum failed: {}", e),
+                format!("bundle upload failed: {}", e),
             ));
         }
     };
 
+    // Staging bytes are no longer needed after a successful upload.
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    let schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+
     let new_split = crate::storage::RemoteSplitManifest {
         split_id: split_id.clone(),
         state: crate::storage::RemoteSplitState::Published,
-        bundle_path: split_rel.clone(),
+        bundle_path: bundle_key,
         bundle_etag: None,
         hotcache_path: None,
         checksum,
@@ -545,21 +493,7 @@ pub(crate) async fn verify_splits(
         }
     };
 
-    let storage_root = match state.storage_manager.root() {
-        Some(p) => p.to_path_buf(),
-        None => {
-            return Err(crate::api::error_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "illegal_argument_exception",
-                format!(
-                    "remote_store verify requires a local storage backend; \
-                     current backend is remote ({}). Split download/cache is \
-                     not yet implemented.",
-                    state.storage_manager.uri()
-                ),
-            ));
-        }
-    };
+    let index_uuid = metadata.uuid.as_str();
     let splits: Vec<_> = manifest.published_splits().cloned().collect();
 
     let mut ok_count = 0u32;
@@ -586,49 +520,22 @@ pub(crate) async fn verify_splits(
             continue;
         }
 
-        let split_dir = match resolve_split_dir(&storage_root, &split.bundle_path) {
-            Ok(p) => p,
-            Err(reason) => {
-                missing_count += 1;
-                split_reports.push(serde_json::json!({
-                    "split_id": split_id,
-                    "status": "missing",
-                    "reason": reason,
-                    "expected": expected,
-                }));
-                continue;
-            }
-        };
-
-        if !split_dir.exists() {
-            missing_count += 1;
-            split_reports.push(serde_json::json!({
-                "split_id": split_id,
-                "status": "missing",
-                "reason": "bundle directory does not exist on this node",
-                "bundle_path": split.bundle_path,
-                "expected": expected,
-            }));
-            continue;
-        }
-
-        // Hashing is CPU + IO heavy — run it on the search worker pool so
-        // we don't stall the Tokio reactor and don't compete with ingest.
-        let dir_for_hash = split_dir.clone();
+        // Stream-download the bundle and hash it without materializing to disk.
+        // This works uniformly against both the local and S3 backends.
         let hash_result = state
-            .worker_pools
-            .spawn_search(move || compute_bundle_checksum(&dir_for_hash))
+            .storage_manager
+            .hash_split_bundle(index_uuid, &split)
             .await;
 
         match hash_result {
-            Ok(Ok(actual)) if actual == expected => {
+            Ok(actual) if actual == expected => {
                 ok_count += 1;
                 split_reports.push(serde_json::json!({
                     "split_id": split_id,
                     "status": "ok",
                 }));
             }
-            Ok(Ok(actual)) => {
+            Ok(actual) => {
                 mismatch_count += 1;
                 tracing::error!(
                     "remote_store: checksum mismatch for index {} split {} — expected {} got {}",
@@ -644,12 +551,12 @@ pub(crate) async fn verify_splits(
                     "actual": actual,
                 }));
             }
-            Ok(Err(e)) | Err(e) => {
+            Err(e) => {
                 missing_count += 1;
                 split_reports.push(serde_json::json!({
                     "split_id": split_id,
                     "status": "missing",
-                    "reason": format!("checksum computation failed: {}", e),
+                    "reason": format!("bundle fetch or hash failed: {}", e),
                     "expected": expected,
                 }));
             }
@@ -665,275 +572,4 @@ pub(crate) async fn verify_splits(
         "missing_count": missing_count,
         "unsupported_count": unsupported_count,
     }))
-}
-
-/// Recursively sum the size of every regular file under `dir`. Returns 0 on
-/// error because the size is informational (used only for manifest stats).
-fn directory_size_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
-    let mut total: u64 = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(next) = stack.pop() {
-        let entries = match std::fs::read_dir(&next) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let ft = match entry.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                stack.push(entry.path());
-            } else if ft.is_file()
-                && let Ok(meta) = entry.metadata()
-            {
-                total = total.saturating_add(meta.len());
-            }
-        }
-    }
-    Ok(total)
-}
-
-/// Compute a deterministic SHA-256 checksum over every regular file under
-/// `dir`. Files are hashed in POSIX-path sorted order so the result is stable
-/// regardless of directory iteration order. Each file contributes:
-///
-///   u64_le(rel_path_bytes.len()) || rel_path_bytes
-///   || u64_le(content.len())     || content_bytes
-///
-/// Returns a `"sha256:<64-hex>"` string. Any I/O failure (missing dir,
-/// unreadable file) surfaces as an error so the caller can reject the publish
-/// instead of storing a bogus hash.
-fn compute_bundle_checksum(dir: &std::path::Path) -> anyhow::Result<String> {
-    use anyhow::Context;
-
-    // 1. Collect every regular file under `dir` with its relative POSIX path.
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(next) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&next).with_context(|| format!("failed to read_dir {:?}", next))?;
-        for entry in entries {
-            let entry = entry.with_context(|| format!("dir entry in {:?}", next))?;
-            let ft = entry
-                .file_type()
-                .with_context(|| format!("file_type of {:?}", entry.path()))?;
-            let path = entry.path();
-            if ft.is_dir() {
-                stack.push(path);
-            } else if ft.is_file() {
-                let rel = path
-                    .strip_prefix(dir)
-                    .with_context(|| format!("path {:?} not under bundle root {:?}", path, dir))?;
-                // Canonicalize to POSIX separators so the hash is identical
-                // on every platform (relevant for tests and future S3
-                // replicas built on different hosts).
-                let rel_posix = rel
-                    .components()
-                    .filter_map(|c| match c {
-                        Component::Normal(s) => s.to_str(),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("/");
-                files.push((rel_posix, path));
-            }
-            // Skip symlinks and other non-regular entries — we never create
-            // them when building a split, so their presence indicates
-            // tampering and we must not silently include them.
-        }
-    }
-
-    // 2. Sort by relative path so the hash is order-stable.
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // 3. Hash each file's path + content with explicit length framing so
-    //    different paths / different splits cannot collide by chunking the
-    //    same bytes differently.
-    let mut hasher = Sha256::new();
-    for (rel_posix, abs_path) in &files {
-        let rel_bytes = rel_posix.as_bytes();
-        hasher.update((rel_bytes.len() as u64).to_le_bytes());
-        hasher.update(rel_bytes);
-
-        let content = std::fs::read(abs_path)
-            .with_context(|| format!("failed to read bundle file {:?}", abs_path))?;
-        hasher.update((content.len() as u64).to_le_bytes());
-        hasher.update(&content);
-    }
-
-    Ok(format!("sha256:{:x}", hasher.finalize()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_split_dir_accepts_simple_relative_path() {
-        let root = Path::new("/var/data/_remote_store");
-        let resolved = resolve_split_dir(root, "uuid-1/splits/split-a").unwrap();
-        assert_eq!(resolved, root.join("uuid-1/splits/split-a"));
-    }
-
-    #[test]
-    fn resolve_split_dir_accepts_current_dir_components() {
-        let root = Path::new("/var/data/_remote_store");
-        // `./splits/split-a` should be permitted (Component::CurDir is a no-op).
-        let resolved = resolve_split_dir(root, "./splits/split-a").unwrap();
-        assert_eq!(resolved, root.join("./splits/split-a"));
-    }
-
-    #[test]
-    fn resolve_split_dir_rejects_empty() {
-        let root = Path::new("/var/data/_remote_store");
-        let err = resolve_split_dir(root, "").unwrap_err();
-        assert!(err.contains("empty"));
-    }
-
-    #[test]
-    fn resolve_split_dir_rejects_absolute_unix() {
-        let root = Path::new("/var/data/_remote_store");
-        let err = resolve_split_dir(root, "/etc/passwd").unwrap_err();
-        assert!(err.contains("must be relative"));
-    }
-
-    #[test]
-    fn resolve_split_dir_rejects_parent_dir_traversal() {
-        let root = Path::new("/var/data/_remote_store");
-        let err = resolve_split_dir(root, "../../etc/passwd").unwrap_err();
-        assert!(err.contains("disallowed component"));
-    }
-
-    #[test]
-    fn resolve_split_dir_rejects_embedded_parent_dir() {
-        let root = Path::new("/var/data/_remote_store");
-        let err = resolve_split_dir(root, "uuid-1/../../etc/passwd").unwrap_err();
-        assert!(err.contains("disallowed component"));
-    }
-
-    #[test]
-    fn resolve_split_dir_rejects_trailing_parent_dir() {
-        let root = Path::new("/var/data/_remote_store");
-        let err = resolve_split_dir(root, "uuid-1/splits/..").unwrap_err();
-        assert!(err.contains("disallowed component"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn resolve_split_dir_rejects_windows_drive_prefix() {
-        let root = Path::new(r"C:\var\data\_remote_store");
-        let err = resolve_split_dir(root, r"C:\Windows\System32").unwrap_err();
-        assert!(err.contains("must be relative"));
-    }
-
-    // ── compute_bundle_checksum ────────────────────────────────────────
-
-    fn write_file(root: &std::path::Path, rel: &str, content: &[u8]) {
-        let abs = root.join(rel);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(abs, content).unwrap();
-    }
-
-    #[test]
-    fn compute_bundle_checksum_has_sha256_prefix_and_64_hex_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        write_file(dir.path(), "a.txt", b"hello");
-        let checksum = compute_bundle_checksum(dir.path()).unwrap();
-        assert!(
-            checksum.starts_with("sha256:"),
-            "checksum must start with sha256:, got {checksum}"
-        );
-        let hex = &checksum["sha256:".len()..];
-        assert_eq!(hex.len(), 64, "sha256 hex digest must be 64 chars");
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn compute_bundle_checksum_is_deterministic_across_iteration_orders() {
-        // Two bundles with identical file content should hash the same even
-        // though std::fs::read_dir does not guarantee any particular order.
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        // Create the files in opposite orders in the two bundles.
-        write_file(a.path(), "index/meta.json", b"{\"v\":1}");
-        write_file(a.path(), "index/000.store", b"\x00\x01\x02");
-        write_file(a.path(), "aaa.bin", b"top-level");
-
-        write_file(b.path(), "aaa.bin", b"top-level");
-        write_file(b.path(), "index/000.store", b"\x00\x01\x02");
-        write_file(b.path(), "index/meta.json", b"{\"v\":1}");
-
-        let ha = compute_bundle_checksum(a.path()).unwrap();
-        let hb = compute_bundle_checksum(b.path()).unwrap();
-        assert_eq!(ha, hb, "bundles with identical content must hash equal");
-    }
-
-    #[test]
-    fn compute_bundle_checksum_changes_on_single_byte_flip() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        write_file(a.path(), "data.bin", b"hello world");
-        write_file(b.path(), "data.bin", b"hello worlD");
-        let ha = compute_bundle_checksum(a.path()).unwrap();
-        let hb = compute_bundle_checksum(b.path()).unwrap();
-        assert_ne!(ha, hb);
-    }
-
-    #[test]
-    fn compute_bundle_checksum_changes_on_rename_only() {
-        // Length framing means renaming a file without changing content must
-        // still change the hash — a hash scheme without path framing (just
-        // concatenated bytes) would wrongly produce the same digest here.
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        write_file(a.path(), "foo.bin", b"same bytes");
-        write_file(b.path(), "bar.bin", b"same bytes");
-        let ha = compute_bundle_checksum(a.path()).unwrap();
-        let hb = compute_bundle_checksum(b.path()).unwrap();
-        assert_ne!(
-            ha, hb,
-            "renaming a file must change the bundle checksum: {ha} vs {hb}"
-        );
-    }
-
-    #[test]
-    fn compute_bundle_checksum_different_chunking_is_not_collision() {
-        // Length framing also prevents the "boundary shift" collision:
-        // ("ab","c") vs ("a","bc") have identical concatenated bytes but
-        // different framing, so their bundle hashes must differ.
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        write_file(a.path(), "f1", b"ab");
-        write_file(a.path(), "f2", b"c");
-        write_file(b.path(), "f1", b"a");
-        write_file(b.path(), "f2", b"bc");
-        let ha = compute_bundle_checksum(a.path()).unwrap();
-        let hb = compute_bundle_checksum(b.path()).unwrap();
-        assert_ne!(ha, hb);
-    }
-
-    #[test]
-    fn compute_bundle_checksum_empty_dir_is_stable() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        let ha = compute_bundle_checksum(a.path()).unwrap();
-        let hb = compute_bundle_checksum(b.path()).unwrap();
-        assert_eq!(ha, hb);
-        // sha256("") for reference — we hash nothing for an empty bundle, so
-        // the digest matches the SHA-256 of the empty string.
-        assert_eq!(
-            ha,
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[test]
-    fn compute_bundle_checksum_errors_on_missing_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = tmp.path().join("does-not-exist");
-        assert!(compute_bundle_checksum(&missing).is_err());
-    }
 }
