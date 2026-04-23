@@ -18,6 +18,8 @@ GetDoc(ShardGetRequest) → ShardGetResponse
 // Search (scatter to remote shards)
 SearchShard(ShardSearchRequest) → ShardSearchResponse
 SearchShardDsl(ShardSearchDslRequest) → ShardSearchResponse
+GetRemoteStoreLeafStatus(RemoteStoreLeafStatusRequest) → RemoteStoreLeafStatusResponse
+SearchRemoteStoreSplits(RemoteStoreSearchRequest) → RemoteStoreSearchResponse
 
 // Distributed SQL (scatter Arrow IPC batches from remote shards)
 SqlRecordBatch(SqlRecordBatchRequest) → SqlRecordBatchResponse
@@ -57,6 +59,8 @@ pub struct TransportService {
     pub cluster_manager: Arc<ClusterManager>,
     pub shard_manager: Arc<ShardManager>,
     pub transport_client: TransportClient,
+    pub storage_manager: Arc<StorageManager>,
+    pub remote_store_reader_cache: Arc<RemoteSplitReaderCache>,
     pub raft: Option<Arc<RaftInstance>>,
     pub local_node_id: String,  // filters locally-assigned shards
 }
@@ -78,6 +82,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **replicate_doc / replicate_bulk**: Apply to local replica engine using the seq_no supplied by the primary, persist that same seq_no in the replica WAL, return checkpoint
 - **recover_replica**: Read WAL entries via `read_from()`, return operations
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
+- **get_remote_store_leaf_status**: Report whether the local node is root/leaf-capable plus per-split artifact/reader warmth and current `StorageManager` load counters
+- **search_remote_store_splits**: Validate the remote_store index/UUID, batch split execution through the shared leaf helper, and return per-split hits, totals, partial aggs, and per-split errors
 - **sql_record_batch / sql_record_batch_stream**: Execute local shard SQL fast-field reads and return Arrow IPC batches. `SqlRecordBatchStream` may emit multiple batches for the same shard; `batch_size = 0` means use the engine default. Stream responses must carry `total_hits`, `collected_rows`, and actual `streaming_used` metadata on every batch so the coordinator can build accurate `meta` / truncation decisions before draining the rest of the stream. The coordinator-facing live path should prefer `open_sql_batch_stream_to_shard()` so only the first response is read eagerly.
 - **raft_vote / raft_append_entries / raft_snapshot**: Deserialize JSON, forward to Raft instance
 - **create_index / delete_index**: Must be leader; execute via `raft.client_write()`. `create_index` must preserve index settings from the forwarded JSON body, including `refresh_interval_ms` and `flush_threshold_bytes`.
@@ -118,6 +124,8 @@ pub struct TransportClient {
 | `forward_bulk_to_shard()` | Route bulk write to shard primary — returns `Err` on shard failure |
 | `forward_search_to_shard()` | Scatter search to remote shard |
 | `forward_search_dsl_to_shard()` | Scatter DSL search to remote shard |
+| `get_remote_store_leaf_status()` | Fetch remote_store cache/load warmth from a remote leaf |
+| `forward_remote_store_search()` | Execute a batched remote_store split search on a remote leaf |
 | `forward_sql_batch_to_shard()` | Scatter SQL RecordBatch to remote shard (Arrow IPC) |
 | `open_sql_batch_stream_to_shard()` | Open a live remote SQL batch stream, eagerly decode only the first batch + metadata, then keep the remaining gRPC stream live for `StreamingTable` partitions |
 | `forward_sql_batch_stream_to_shard()` | Stream multiple SQL RecordBatches from a remote shard (Arrow IPC) and report whether the shard actually used streaming |

@@ -1,33 +1,637 @@
 //! Read-path for the `remote_store` engine.
 //!
-//! Loads the current published manifest for an index, fetches each published
-//! split bundle from the object store into a node-local cache, unpacks each
-//! bundle into a standard `HotEngine` data layout, runs the DSL search
-//! against every split, and merges the per-split results into a
-//! `DistributedDslSearchResult` that the existing coordinator post-processing
-//! can consume.
+//! Loads the current published manifest for an index, asks candidate leaves
+//! for cache and load status, assigns published splits in batches via
+//! rendezvous ranking, executes the DSL search on local or remote leaves, and
+//! merges the per-split results into a `DistributedDslSearchResult` that the
+//! existing coordinator post-processing can consume.
 //!
 //! Limitations (intentional for this slice):
-//! - Runs on the coordinator only; no leaf gRPC fan-out.
-//! - No hotcache, no LRU eviction of the local cache, no rendezvous hashing.
+//! - No hotcache tier yet; split readers are reopened from full split bundles.
+//! - No object-store janitor yet; only node-local split cache reaping exists.
 //! - k-NN vector search is not supported yet (remote_store is for
 //!   inverted-index splits).
 //! - `schema_hash` from the manifest is validated against the live index
 //!   mappings on load (`remote_store` rejects writes so mappings cannot
 //!   change after creation).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use axum::Json;
 use axum::http::StatusCode;
+use futures::FutureExt;
+use murmur3::murmur3_32;
 use serde_json::Value;
 
 use crate::api::AppState;
 use crate::api::index::DistributedDslSearchResult;
 use crate::cluster::state::IndexMetadata;
+use crate::engine::SearchEngine;
 use crate::search::{PartialAggResult, SearchRequest};
+
+/// Process-local cache for open remote_store split readers.
+pub struct RemoteSplitReaderCache {
+    readers: RwLock<HashMap<String, Arc<CachedRemoteSplitReader>>>,
+}
+
+impl Default for RemoteSplitReaderCache {
+    fn default() -> Self {
+        Self {
+            readers: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AssignedRemoteSplit {
+    pub split_id: String,
+    pub bundle_path: String,
+    pub checksum: String,
+    pub size_bytes: u64,
+}
+
+impl AssignedRemoteSplit {
+    pub(crate) fn from_manifest(split: &crate::storage::RemoteSplitManifest) -> Self {
+        Self {
+            split_id: split.split_id.clone(),
+            bundle_path: split.bundle_path.clone(),
+            checksum: split.checksum.clone(),
+            size_bytes: split.size_bytes,
+        }
+    }
+
+    fn as_manifest(&self) -> crate::storage::RemoteSplitManifest {
+        crate::storage::RemoteSplitManifest {
+            split_id: self.split_id.clone(),
+            state: crate::storage::RemoteSplitState::Published,
+            bundle_path: self.bundle_path.clone(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: self.checksum.clone(),
+            doc_count: 0,
+            size_bytes: self.size_bytes,
+            uncompressed_bytes: self.size_bytes,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SplitWarmth {
+    pub artifact_cached: bool,
+    pub reader_cached: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LeafStatusSnapshot {
+    pub root_capable: bool,
+    pub leaf_capable: bool,
+    pub inflight_bytes: u64,
+    pub queue_depth: usize,
+    pub split_statuses: HashMap<String, SplitWarmth>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LeafSplitSearchOutcome {
+    pub split_id: String,
+    pub hits: Vec<Value>,
+    pub total_hits: usize,
+    pub partial_aggs: HashMap<String, PartialAggResult>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LeafExecutionContext {
+    pub worker_pools: crate::worker::WorkerPools,
+    pub storage_manager: Arc<crate::storage::StorageManager>,
+    pub reader_cache: Arc<RemoteSplitReaderCache>,
+}
+
+struct CachedRemoteSplitReader {
+    index_uuid: String,
+    split_id: String,
+    size_bytes: u64,
+    last_access_epoch_ms: AtomicU64,
+    engine: Arc<crate::engine::tantivy::HotEngine>,
+    _pin: crate::storage::SplitCachePin,
+}
+
+impl CachedRemoteSplitReader {
+    fn touch(&self, storage_manager: &crate::storage::StorageManager) {
+        let now = now_epoch_ms();
+        self.last_access_epoch_ms.store(now, Ordering::Relaxed);
+        storage_manager.record_cached_split_access(
+            &self.index_uuid,
+            &self.split_id,
+            self.size_bytes,
+        );
+    }
+}
+
+const REMOTE_STORE_RENDEZVOUS_WINDOW: usize = 2;
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn reader_cache_key(index_uuid: &str, split_id: &str, checksum: &str) -> String {
+    format!("{index_uuid}/{split_id}@{checksum}")
+}
+
+fn node_is_remote_store_root(node: &crate::cluster::state::NodeInfo) -> bool {
+    node.roles.iter().any(|role| {
+        matches!(
+            role,
+            crate::cluster::state::NodeRole::Master | crate::cluster::state::NodeRole::Data
+        )
+    })
+}
+
+fn node_is_remote_store_leaf(node: &crate::cluster::state::NodeInfo) -> bool {
+    node.roles
+        .iter()
+        .any(|role| matches!(role, crate::cluster::state::NodeRole::Data))
+}
+
+fn rendezvous_score(index_uuid: &str, generation: u64, split_id: &str, node_id: &str) -> u32 {
+    let mut cursor = Cursor::new(format!("{index_uuid}:{generation}:{split_id}:{node_id}"));
+    murmur3_32(&mut cursor, 0).unwrap_or(0)
+}
+
+fn split_warmth_rank(status: &LeafStatusSnapshot, split_id: &str) -> u8 {
+    match status.split_statuses.get(split_id) {
+        Some(warmth) if warmth.reader_cached => 2,
+        Some(warmth) if warmth.artifact_cached => 1,
+        _ => 0,
+    }
+}
+
+fn dedupe_pending_splits(splits: Vec<AssignedRemoteSplit>) -> Vec<AssignedRemoteSplit> {
+    let mut deduped = HashMap::new();
+    for split in splits {
+        deduped.insert(split.split_id.clone(), split);
+    }
+    deduped.into_values().collect()
+}
+
+impl RemoteSplitReaderCache {
+    pub(crate) fn has_reader(&self, index_uuid: &str, split_id: &str, checksum: &str) -> bool {
+        let key = reader_cache_key(index_uuid, split_id, checksum);
+        self.readers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key)
+    }
+
+    pub(crate) fn evict_for_index(
+        &self,
+        index_uuid: &str,
+        live_split_ids: &HashSet<String>,
+        budget_bytes: Option<u64>,
+    ) {
+        let mut readers = self.readers.write().unwrap_or_else(|e| e.into_inner());
+        let mut entries: Vec<_> = readers
+            .iter()
+            .filter(|(_, reader)| reader.index_uuid == index_uuid)
+            .map(|(key, reader)| (key.clone(), Arc::clone(reader)))
+            .collect();
+
+        let mut total_bytes: u64 = entries.iter().map(|(_, reader)| reader.size_bytes).sum();
+        entries.sort_by_key(|(_, reader)| {
+            (
+                live_split_ids.contains(&reader.split_id),
+                reader.last_access_epoch_ms.load(Ordering::Relaxed),
+            )
+        });
+
+        for (key, reader) in entries {
+            let is_stale = !live_split_ids.contains(&reader.split_id);
+            let over_budget = budget_bytes.is_some_and(|budget| total_bytes > budget);
+            if !is_stale && !over_budget {
+                continue;
+            }
+
+            if readers.remove(&key).is_some() {
+                total_bytes = total_bytes.saturating_sub(reader.size_bytes);
+            }
+        }
+    }
+
+    async fn get_or_open(
+        &self,
+        context: &LeafExecutionContext,
+        metadata: &IndexMetadata,
+        split: &AssignedRemoteSplit,
+    ) -> anyhow::Result<Arc<CachedRemoteSplitReader>> {
+        let key = reader_cache_key(metadata.uuid.as_str(), &split.split_id, &split.checksum);
+        if let Some(reader) = self
+            .readers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            reader.touch(context.storage_manager.as_ref());
+            return Ok(reader);
+        }
+
+        let split_dir = context
+            .storage_manager
+            .fetch_split_into_cache(metadata.uuid.as_str(), &split.as_manifest())
+            .await?;
+        let index_uuid = metadata.uuid.to_string();
+        let split_id = split.split_id.clone();
+        let size_bytes = context
+            .storage_manager
+            .cached_split_size_bytes(metadata.uuid.as_str(), &split_id);
+        let mappings = metadata.mappings.clone();
+        let pin = context
+            .storage_manager
+            .pin_cached_split(metadata.uuid.as_str(), &split_id);
+
+        let engine = context
+            .worker_pools
+            .spawn_search(
+                move || -> anyhow::Result<Arc<crate::engine::tantivy::HotEngine>> {
+                    let column_cache =
+                        Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
+                    let engine = crate::engine::tantivy::HotEngine::new_with_mappings(
+                        &split_dir,
+                        Duration::from_secs(60),
+                        &mappings,
+                        crate::wal::TranslogDurability::Request,
+                        column_cache,
+                    )?;
+                    Ok(Arc::new(engine))
+                },
+            )
+            .await??;
+
+        let entry = Arc::new(CachedRemoteSplitReader {
+            index_uuid: index_uuid.clone(),
+            split_id: split_id.clone(),
+            size_bytes,
+            last_access_epoch_ms: AtomicU64::new(now_epoch_ms()),
+            engine,
+            _pin: pin,
+        });
+        entry.touch(context.storage_manager.as_ref());
+
+        let mut readers = self.readers.write().unwrap_or_else(|e| e.into_inner());
+        let reader = readers
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&entry))
+            .clone();
+        reader.touch(context.storage_manager.as_ref());
+        Ok(reader)
+    }
+}
+
+pub(crate) fn local_leaf_status_snapshot(
+    cluster_state: &crate::cluster::state::ClusterState,
+    local_node_id: &str,
+    storage_manager: &crate::storage::StorageManager,
+    reader_cache: &RemoteSplitReaderCache,
+    index_uuid: &str,
+    splits: &[AssignedRemoteSplit],
+) -> LeafStatusSnapshot {
+    let node_info = cluster_state.nodes.get(local_node_id);
+    let load = storage_manager.remote_store_load_snapshot();
+    let split_statuses = splits
+        .iter()
+        .map(|split| {
+            let artifact_cached = storage_manager
+                .cached_split_status(index_uuid, &split.split_id, &split.checksum)
+                .artifact_cached;
+            let reader_cached =
+                reader_cache.has_reader(index_uuid, &split.split_id, &split.checksum);
+            (
+                split.split_id.clone(),
+                SplitWarmth {
+                    artifact_cached,
+                    reader_cached,
+                },
+            )
+        })
+        .collect();
+
+    LeafStatusSnapshot {
+        root_capable: node_info.map(node_is_remote_store_root).unwrap_or(true),
+        leaf_capable: node_info.map(node_is_remote_store_leaf).unwrap_or(true),
+        inflight_bytes: load.inflight_bytes,
+        queue_depth: load.queue_depth,
+        split_statuses,
+    }
+}
+
+pub(crate) async fn execute_leaf_search_batch(
+    context: &LeafExecutionContext,
+    metadata: &IndexMetadata,
+    search_req: &SearchRequest,
+    assigned_splits: &[AssignedRemoteSplit],
+    live_split_ids: &HashSet<String>,
+) -> anyhow::Result<Vec<LeafSplitSearchOutcome>> {
+    let budget_bytes = metadata
+        .settings
+        .remote_store
+        .as_ref()
+        .and_then(|settings| settings.split_cache_bytes);
+    context
+        .reader_cache
+        .evict_for_index(metadata.uuid.as_str(), live_split_ids, budget_bytes);
+    context.storage_manager.reap_split_cache(
+        metadata.uuid.as_str(),
+        live_split_ids,
+        budget_bytes,
+    )?;
+
+    let _load_guard = context
+        .storage_manager
+        .begin_remote_store_batch(assigned_splits.iter().map(|split| split.size_bytes).sum());
+
+    let mut outcomes = Vec::with_capacity(assigned_splits.len());
+    for split in assigned_splits {
+        let outcome = match context
+            .reader_cache
+            .get_or_open(context, metadata, split)
+            .await
+        {
+            Ok(reader) => {
+                let engine = Arc::clone(&reader.engine);
+                let search_req = search_req.clone();
+                match context
+                    .worker_pools
+                    .spawn_search(move || engine.search_query(&search_req))
+                    .await
+                {
+                    Ok(Ok((hits, total_hits, partial_aggs))) => LeafSplitSearchOutcome {
+                        split_id: split.split_id.clone(),
+                        hits,
+                        total_hits,
+                        partial_aggs,
+                        error: None,
+                    },
+                    Ok(Err(error)) | Err(error) => LeafSplitSearchOutcome {
+                        split_id: split.split_id.clone(),
+                        hits: Vec::new(),
+                        total_hits: 0,
+                        partial_aggs: HashMap::new(),
+                        error: Some(error.to_string()),
+                    },
+                }
+            }
+            Err(error) => LeafSplitSearchOutcome {
+                split_id: split.split_id.clone(),
+                hits: Vec::new(),
+                total_hits: 0,
+                partial_aggs: HashMap::new(),
+                error: Some(error.to_string()),
+            },
+        };
+        outcomes.push(outcome);
+    }
+
+    context
+        .reader_cache
+        .evict_for_index(metadata.uuid.as_str(), live_split_ids, budget_bytes);
+    context.storage_manager.reap_split_cache(
+        metadata.uuid.as_str(),
+        live_split_ids,
+        budget_bytes,
+    )?;
+
+    Ok(outcomes)
+}
+
+async fn collect_leaf_statuses(
+    state: &AppState,
+    index_name: &str,
+    index_uuid: &str,
+    splits: &[AssignedRemoteSplit],
+    leaf_nodes: &[crate::cluster::state::NodeInfo],
+) -> HashMap<String, LeafStatusSnapshot> {
+    let cluster_state = state.cluster_manager.get_state();
+    let local_leaf_context = local_leaf_status_snapshot(
+        &cluster_state,
+        &state.local_node_id,
+        state.storage_manager.as_ref(),
+        state.remote_store_reader_cache.as_ref(),
+        index_uuid,
+        splits,
+    );
+
+    let mut statuses = HashMap::new();
+    statuses.insert(state.local_node_id.clone(), local_leaf_context);
+
+    let mut futures = Vec::new();
+    for node in leaf_nodes {
+        if node.id == state.local_node_id {
+            continue;
+        }
+        let client = state.transport_client.clone();
+        let node = node.clone();
+        let index_name = index_name.to_string();
+        let index_uuid = index_uuid.to_string();
+        let splits = splits.to_vec();
+        futures.push(tokio::spawn(async move {
+            let status = client
+                .get_remote_store_leaf_status(&node, &index_name, &index_uuid, &splits)
+                .await;
+            (node.id.clone(), status)
+        }));
+    }
+
+    for result in futures::future::join_all(futures).await {
+        if let Ok((node_id, Ok(status))) = result {
+            statuses.insert(node_id, status);
+        }
+    }
+
+    statuses
+}
+
+fn assign_remote_store_splits(
+    index_uuid: &str,
+    generation: u64,
+    pending_splits: &[AssignedRemoteSplit],
+    leaf_nodes: &[crate::cluster::state::NodeInfo],
+    statuses: &HashMap<String, LeafStatusSnapshot>,
+    unhealthy_nodes: &HashSet<String>,
+) -> HashMap<String, Vec<AssignedRemoteSplit>> {
+    let mut assignments: HashMap<String, Vec<AssignedRemoteSplit>> = HashMap::new();
+
+    for split in pending_splits {
+        let mut candidates: Vec<_> = leaf_nodes
+            .iter()
+            .filter(|node| !unhealthy_nodes.contains(&node.id))
+            .filter(|node| {
+                statuses
+                    .get(&node.id)
+                    .is_some_and(|status| status.leaf_capable)
+            })
+            .map(|node| {
+                (
+                    node.id.clone(),
+                    rendezvous_score(index_uuid, generation, &split.split_id, &node.id),
+                )
+            })
+            .collect();
+        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let window_len = candidates.len().clamp(1, REMOTE_STORE_RENDEZVOUS_WINDOW);
+
+        let mut best: Option<(String, u8, u64, usize, u32)> = None;
+        for (node_id, score) in candidates.iter().take(window_len) {
+            let Some(status) = statuses.get(node_id) else {
+                continue;
+            };
+            let candidate = (
+                node_id.clone(),
+                split_warmth_rank(status, &split.split_id),
+                status.inflight_bytes,
+                status.queue_depth,
+                *score,
+            );
+            let replace = match &best {
+                None => true,
+                Some(current) => {
+                    candidate.1 > current.1
+                        || (candidate.1 == current.1 && candidate.2 < current.2)
+                        || (candidate.1 == current.1
+                            && candidate.2 == current.2
+                            && candidate.3 < current.3)
+                        || (candidate.1 == current.1
+                            && candidate.2 == current.2
+                            && candidate.3 == current.3
+                            && candidate.4 > current.4)
+                }
+            };
+            if replace {
+                best = Some(candidate);
+            }
+        }
+
+        if let Some((node_id, ..)) = best {
+            assignments.entry(node_id).or_default().push(split.clone());
+        }
+    }
+
+    assignments
+}
+
+#[derive(Default)]
+struct RemoteStoreSearchAccumulator {
+    split_hit_lists: Vec<Vec<Value>>,
+    total_hits: usize,
+    successful: u32,
+    partial_aggs: Vec<HashMap<String, PartialAggResult>>,
+}
+
+struct RemoteStoreRoundOutcome {
+    next_pending: Vec<AssignedRemoteSplit>,
+    newly_unhealthy_nodes: HashSet<String>,
+    made_progress: bool,
+}
+
+type RemoteStoreBatchResult = (
+    String,
+    Vec<AssignedRemoteSplit>,
+    std::result::Result<Vec<LeafSplitSearchOutcome>, anyhow::Error>,
+);
+
+fn apply_remote_store_batch_results(
+    index_name: &str,
+    batch_results: Vec<RemoteStoreBatchResult>,
+    split_lookup: &HashMap<String, AssignedRemoteSplit>,
+    accumulator: &mut RemoteStoreSearchAccumulator,
+) -> RemoteStoreRoundOutcome {
+    let mut next_pending = Vec::new();
+    let mut newly_unhealthy_nodes = HashSet::new();
+    let mut made_progress = false;
+
+    for (node_id, assigned_splits, result) in batch_results {
+        match result {
+            Ok(outcomes) => {
+                let mut node_failed = false;
+                for outcome in outcomes {
+                    let LeafSplitSearchOutcome {
+                        split_id,
+                        hits,
+                        total_hits,
+                        partial_aggs,
+                        error,
+                    } = outcome;
+
+                    if let Some(error) = error {
+                        tracing::error!(
+                            "remote_store: split {} failed on leaf {} for {}: {}",
+                            split_id,
+                            node_id,
+                            index_name,
+                            error
+                        );
+                        if let Some(split) = split_lookup.get(&split_id) {
+                            next_pending.push(split.clone());
+                        }
+                        node_failed = true;
+                        continue;
+                    }
+
+                    made_progress = true;
+                    accumulator.successful += 1;
+                    accumulator.total_hits += total_hits;
+                    if !partial_aggs.is_empty() {
+                        accumulator.partial_aggs.push(partial_aggs);
+                    }
+
+                    let hit_list = hits
+                        .into_iter()
+                        .map(|hit| {
+                            serde_json::json!({
+                                "_index": index_name,
+                                "_split": split_id,
+                                "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                "_score": hit.get("_score"),
+                                "_source": hit.get("_source").unwrap_or(&hit),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    accumulator.split_hit_lists.push(hit_list);
+                }
+
+                if node_failed {
+                    newly_unhealthy_nodes.insert(node_id);
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    "remote_store: leaf batch failed on {} for {}: {}",
+                    node_id,
+                    index_name,
+                    error
+                );
+                newly_unhealthy_nodes.insert(node_id);
+                next_pending.extend(assigned_splits);
+            }
+        }
+    }
+
+    RemoteStoreRoundOutcome {
+        next_pending,
+        newly_unhealthy_nodes,
+        made_progress,
+    }
+}
 
 /// Entry point invoked from `execute_distributed_dsl_search` when an index's
 /// engine is `IndexEngine::RemoteStore`.
@@ -87,112 +691,170 @@ pub(crate) async fn search(
         }
     };
 
-    // Wrap mappings in an Arc so per-split spawn_search tasks share the
-    // allocation instead of cloning the full HashMap for every split.
-    let mappings = Arc::new(metadata.mappings.clone());
-    let index_uuid = metadata.uuid.as_str().to_string();
-
-    let mut all_hits: Vec<Value> = Vec::new();
-    let mut total_hits: usize = 0;
-    let mut successful: u32 = 0;
-    let mut failed: u32 = 0;
-    let mut all_partial_aggs: Vec<HashMap<String, PartialAggResult>> = Vec::new();
-
-    // `published_splits()` already filters to `RemoteSplitState::Published`, so
-    // staged and marked-for-deletion splits are never opened.
-    let splits: Vec<_> = manifest.published_splits().cloned().collect();
-
-    for split in splits {
-        // Fetch the bundle from the object store into the node-local cache.
-        // Subsequent searches for the same split short-circuit on the cache's
-        // `.done` marker.
-        let split_dir = match state
-            .storage_manager
-            .fetch_split_into_cache(&index_uuid, &split)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(
-                    "remote_store: failed to fetch split {} for {}: {}",
-                    split.split_id,
-                    index_name,
-                    e
-                );
-                failed += 1;
-                continue;
-            }
-        };
-
-        if !split_dir.join("index").join("meta.json").exists() {
-            tracing::warn!(
-                "remote_store: split {} cache dir {:?} missing index/meta.json after extract",
-                split.split_id,
-                split_dir
-            );
-            failed += 1;
-            continue;
-        }
-
-        let split_id = split.split_id.clone();
-        let split_dir_cloned = split_dir.clone();
-        let mappings_arc = Arc::clone(&mappings);
-        let search_req_cloned = search_req.clone();
-
-        // Opening a Tantivy index + running a query is blocking work — run it
-        // on the search worker pool so we don't stall the Tokio reactor.
-        let result = state
-            .worker_pools
-            .spawn_search(move || -> anyhow::Result<(Vec<Value>, usize, HashMap<String, PartialAggResult>)> {
-                let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-                let engine = crate::engine::tantivy::HotEngine::new_with_mappings(
-                    &split_dir_cloned,
-                    Duration::from_secs(60),
-                    mappings_arc.as_ref(),
-                    crate::wal::TranslogDurability::Request,
-                    column_cache,
-                )?;
-                use crate::engine::SearchEngine;
-                engine.search_query(&search_req_cloned)
-            })
-            .await;
-
-        match result {
-            Ok(Ok((hits, shard_total, partial_aggs))) => {
-                successful += 1;
-                total_hits += shard_total;
-                if !partial_aggs.is_empty() {
-                    all_partial_aggs.push(partial_aggs);
-                }
-                for hit in hits {
-                    all_hits.push(serde_json::json!({
-                        "_index": index_name,
-                        "_split": split_id,
-                        "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
-                        "_score": hit.get("_score"),
-                        "_source": hit.get("_source").unwrap_or(&hit),
-                    }));
-                }
-            }
-            Ok(Err(e)) | Err(e) => {
-                tracing::error!(
-                    "remote_store: search failed on split {} at {:?}: {}",
-                    split_id,
-                    split_dir,
-                    e
-                );
-                failed += 1;
-            }
-        }
+    let split_plans: Vec<_> = manifest
+        .published_splits()
+        .map(AssignedRemoteSplit::from_manifest)
+        .collect();
+    if split_plans.is_empty() {
+        return Ok(DistributedDslSearchResult {
+            all_hits: Vec::new(),
+            total_hits: 0,
+            successful_shards: 0,
+            failed_shards: 0,
+            aggregations: HashMap::new(),
+            partial_aggs: Vec::new(),
+        });
     }
+
+    let live_split_ids: HashSet<String> = split_plans
+        .iter()
+        .map(|split| split.split_id.clone())
+        .collect();
+    let cluster_state = state.cluster_manager.get_state();
+    let leaf_nodes: Vec<_> = cluster_state
+        .nodes
+        .values()
+        .filter(|node| node_is_remote_store_leaf(node))
+        .cloned()
+        .collect();
+    if leaf_nodes.is_empty() {
+        return Err(crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote_store_leaf_unavailable_exception",
+            format!(
+                "no remote_store-capable leaf nodes available for index [{}]",
+                index_name
+            ),
+        ));
+    }
+
+    let leaf_context = LeafExecutionContext {
+        worker_pools: state.worker_pools.clone(),
+        storage_manager: state.storage_manager.clone(),
+        reader_cache: state.remote_store_reader_cache.clone(),
+    };
+    let statuses = collect_leaf_statuses(
+        state,
+        index_name,
+        metadata.uuid.as_str(),
+        &split_plans,
+        &leaf_nodes,
+    )
+    .await;
+
+    let split_lookup: HashMap<_, _> = split_plans
+        .iter()
+        .cloned()
+        .map(|split| (split.split_id.clone(), split))
+        .collect();
+    let mut pending_splits = split_plans.clone();
+    let mut unhealthy_nodes = HashSet::new();
+    let mut accumulator = RemoteStoreSearchAccumulator::default();
+    let mut failed = 0u32;
+
+    while !pending_splits.is_empty() {
+        let assignments = assign_remote_store_splits(
+            metadata.uuid.as_str(),
+            manifest.generation,
+            &pending_splits,
+            &leaf_nodes,
+            &statuses,
+            &unhealthy_nodes,
+        );
+        if assignments.is_empty() {
+            failed += pending_splits.len() as u32;
+            break;
+        }
+
+        let mut work = Vec::new();
+        for (node_id, splits) in assignments {
+            let node_id_for_result = node_id.clone();
+            if node_id == state.local_node_id {
+                let context = leaf_context.clone();
+                let metadata = metadata.clone();
+                let search_req = search_req.clone();
+                let live_split_ids = live_split_ids.clone();
+                work.push(
+                    async move {
+                        (
+                            node_id_for_result,
+                            splits.clone(),
+                            execute_leaf_search_batch(
+                                &context,
+                                &metadata,
+                                &search_req,
+                                &splits,
+                                &live_split_ids,
+                            )
+                            .await,
+                        )
+                    }
+                    .boxed(),
+                );
+            } else {
+                let Some(node) = leaf_nodes.iter().find(|node| node.id == node_id).cloned() else {
+                    continue;
+                };
+                let client = state.transport_client.clone();
+                let index_name = index_name.to_string();
+                let index_uuid = metadata.uuid.to_string();
+                let search_req = search_req.clone();
+                let live_split_ids: Vec<_> = live_split_ids.iter().cloned().collect();
+                work.push(
+                    async move {
+                        (
+                            node_id_for_result,
+                            splits.clone(),
+                            client
+                                .forward_remote_store_search(
+                                    &node,
+                                    &index_name,
+                                    &index_uuid,
+                                    &search_req,
+                                    &splits,
+                                    &live_split_ids,
+                                )
+                                .await,
+                        )
+                    }
+                    .boxed(),
+                );
+            }
+        }
+
+        let round = apply_remote_store_batch_results(
+            index_name,
+            futures::future::join_all(work).await,
+            &split_lookup,
+            &mut accumulator,
+        );
+        unhealthy_nodes.extend(round.newly_unhealthy_nodes);
+
+        if round.next_pending.is_empty() {
+            break;
+        }
+        if !round.made_progress && round.next_pending.len() == pending_splits.len() {
+            failed += round.next_pending.len() as u32;
+            break;
+        }
+        pending_splits = dedupe_pending_splits(round.next_pending);
+    }
+
+    let all_hits =
+        crate::search::merge_sorted_hit_lists(accumulator.split_hit_lists, &search_req.sort);
+    let aggregations = if accumulator.partial_aggs.is_empty() {
+        HashMap::new()
+    } else {
+        crate::search::merge_aggregations(accumulator.partial_aggs.clone(), &search_req.aggs)
+    };
 
     Ok(DistributedDslSearchResult {
         all_hits,
-        total_hits,
-        successful_shards: successful,
+        total_hits: accumulator.total_hits,
+        successful_shards: accumulator.successful,
         failed_shards: failed,
-        aggregations: HashMap::new(),
-        partial_aggs: all_partial_aggs,
+        aggregations,
+        partial_aggs: accumulator.partial_aggs,
     })
 }
 
@@ -572,4 +1234,368 @@ pub(crate) async fn verify_splits(
         "missing_count": missing_count,
         "unsupported_count": unsupported_count,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::state::{
+        DynamicMapping, FieldMapping, FieldType, IndexEngine, IndexMetadata, IndexSettings,
+        IndexUuid, NodeInfo, NodeRole, RemoteStoreSettings,
+    };
+    use crate::engine::tantivy::HotEngine;
+    use crate::storage::{RemoteSplitManifest, RemoteSplitState, StorageManager};
+    use crate::wal::TranslogDurability;
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+    use tempfile::TempDir;
+
+    fn test_leaf(node_id: &str) -> NodeInfo {
+        NodeInfo {
+            id: node_id.to_string(),
+            name: node_id.to_string(),
+            host: "127.0.0.1".to_string(),
+            transport_port: 9300,
+            http_port: 9200,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 1,
+        }
+    }
+
+    fn test_split(split_id: &str) -> AssignedRemoteSplit {
+        AssignedRemoteSplit {
+            split_id: split_id.to_string(),
+            bundle_path: format!("idx-1/splits/{split_id}/bundle"),
+            checksum: format!("sha256:{split_id}"),
+            size_bytes: 128,
+        }
+    }
+
+    fn test_status(entries: &[(&str, SplitWarmth)]) -> LeafStatusSnapshot {
+        LeafStatusSnapshot {
+            root_capable: true,
+            leaf_capable: true,
+            inflight_bytes: 0,
+            queue_depth: 0,
+            split_statuses: entries
+                .iter()
+                .map(|(split_id, warmth)| ((*split_id).to_string(), warmth.clone()))
+                .collect(),
+        }
+    }
+
+    fn test_remote_store_metadata(
+        mappings: HashMap<String, FieldMapping>,
+        split_cache_bytes: Option<u64>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            name: "remotehits".into(),
+            uuid: IndexUuid::new("idx-1"),
+            number_of_shards: 0,
+            number_of_replicas: 0,
+            shard_routing: HashMap::new(),
+            mappings,
+            dynamic: DynamicMapping::False,
+            settings: IndexSettings {
+                engine: IndexEngine::RemoteStore,
+                refresh_interval_ms: None,
+                flush_threshold_bytes: None,
+                remote_store: Some(RemoteStoreSettings {
+                    split_cache_bytes,
+                    ..Default::default()
+                }),
+            },
+        }
+    }
+
+    async fn build_cached_remote_split(
+        manager: &StorageManager,
+    ) -> (IndexMetadata, AssignedRemoteSplit, HashSet<String>) {
+        let mappings = HashMap::from([(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        let metadata = test_remote_store_metadata(mappings.clone(), Some(0));
+
+        let stage = manager.staging_dir(metadata.uuid.as_str(), "split-a");
+        std::fs::create_dir_all(&stage).unwrap();
+        let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
+        let engine = HotEngine::new_with_mappings(
+            &stage,
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+            column_cache,
+        )
+        .unwrap();
+        engine
+            .add_document(
+                "doc-1",
+                serde_json::json!({ "title": "distributed remote hit" }),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+
+        let (bundle_path, checksum, size_bytes) = manager
+            .upload_split_bundle(metadata.uuid.as_str(), "split-a", &stage)
+            .await
+            .unwrap();
+        let manifest = RemoteSplitManifest {
+            split_id: "split-a".into(),
+            state: RemoteSplitState::Published,
+            bundle_path,
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum,
+            doc_count: 1,
+            size_bytes,
+            uncompressed_bytes: size_bytes,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+        };
+        let split = AssignedRemoteSplit::from_manifest(&manifest);
+        let live_split_ids = HashSet::from([split.split_id.clone()]);
+        (metadata, split, live_split_ids)
+    }
+
+    #[test]
+    fn assign_remote_store_splits_prefers_reader_cached_leaf_over_artifact_cached_leaf() {
+        let split = test_split("split-a");
+        let leaf_nodes = vec![test_leaf("artifact"), test_leaf("reader")];
+        let statuses = HashMap::from([
+            (
+                "artifact".to_string(),
+                test_status(&[(
+                    "split-a",
+                    SplitWarmth {
+                        artifact_cached: true,
+                        reader_cached: false,
+                    },
+                )]),
+            ),
+            (
+                "reader".to_string(),
+                test_status(&[(
+                    "split-a",
+                    SplitWarmth {
+                        artifact_cached: true,
+                        reader_cached: true,
+                    },
+                )]),
+            ),
+        ]);
+
+        let assignments = assign_remote_store_splits(
+            "idx-1",
+            7,
+            std::slice::from_ref(&split),
+            &leaf_nodes,
+            &statuses,
+            &HashSet::new(),
+        );
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments["reader"], vec![split]);
+    }
+
+    #[test]
+    fn assign_remote_store_splits_prefers_artifact_cached_leaf_over_cold_leaf() {
+        let split = test_split("split-a");
+        let leaf_nodes = vec![test_leaf("warm"), test_leaf("cold")];
+        let statuses = HashMap::from([
+            (
+                "warm".to_string(),
+                test_status(&[(
+                    "split-a",
+                    SplitWarmth {
+                        artifact_cached: true,
+                        reader_cached: false,
+                    },
+                )]),
+            ),
+            ("cold".to_string(), test_status(&[])),
+        ]);
+
+        let assignments = assign_remote_store_splits(
+            "idx-1",
+            7,
+            std::slice::from_ref(&split),
+            &leaf_nodes,
+            &statuses,
+            &HashSet::new(),
+        );
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments["warm"], vec![split]);
+    }
+
+    #[test]
+    fn retry_flow_reassigns_failed_split_to_remaining_healthy_leaf() {
+        let split_a = test_split("split-a");
+        let split_b = test_split("split-b");
+        let leaf_nodes = vec![test_leaf("node-2"), test_leaf("node-3")];
+        let statuses = HashMap::from([
+            (
+                "node-2".to_string(),
+                test_status(&[(
+                    "split-a",
+                    SplitWarmth {
+                        artifact_cached: true,
+                        reader_cached: true,
+                    },
+                )]),
+            ),
+            (
+                "node-3".to_string(),
+                test_status(&[(
+                    "split-b",
+                    SplitWarmth {
+                        artifact_cached: true,
+                        reader_cached: true,
+                    },
+                )]),
+            ),
+        ]);
+
+        let pending_splits = vec![split_a.clone(), split_b.clone()];
+        let first_round = assign_remote_store_splits(
+            "idx-1",
+            7,
+            &pending_splits,
+            &leaf_nodes,
+            &statuses,
+            &HashSet::new(),
+        );
+        assert_eq!(first_round["node-2"], vec![split_a.clone()]);
+        assert_eq!(first_round["node-3"], vec![split_b.clone()]);
+
+        let split_lookup = HashMap::from([
+            (split_a.split_id.clone(), split_a.clone()),
+            (split_b.split_id.clone(), split_b.clone()),
+        ]);
+        let mut accumulator = RemoteStoreSearchAccumulator::default();
+        let round = apply_remote_store_batch_results(
+            "remotehits",
+            vec![
+                (
+                    "node-2".to_string(),
+                    first_round["node-2"].clone(),
+                    Err(anyhow::anyhow!("leaf batch failed")),
+                ),
+                (
+                    "node-3".to_string(),
+                    first_round["node-3"].clone(),
+                    Ok(vec![LeafSplitSearchOutcome {
+                        split_id: split_b.split_id.clone(),
+                        hits: vec![serde_json::json!({
+                            "_id": "doc-2",
+                            "_score": 1.0,
+                            "_source": { "title": "split-b" },
+                        })],
+                        total_hits: 1,
+                        partial_aggs: HashMap::new(),
+                        error: None,
+                    }]),
+                ),
+            ],
+            &split_lookup,
+            &mut accumulator,
+        );
+
+        assert!(round.made_progress);
+        assert_eq!(round.next_pending, vec![split_a.clone()]);
+        assert_eq!(
+            round.newly_unhealthy_nodes,
+            HashSet::from(["node-2".to_string()])
+        );
+        assert_eq!(accumulator.successful, 1);
+        assert_eq!(accumulator.total_hits, 1);
+        assert_eq!(accumulator.split_hit_lists.len(), 1);
+        assert_eq!(accumulator.split_hit_lists[0][0]["_id"], "doc-2");
+
+        let second_round = assign_remote_store_splits(
+            "idx-1",
+            7,
+            &round.next_pending,
+            &leaf_nodes,
+            &statuses,
+            &round.newly_unhealthy_nodes,
+        );
+
+        assert_eq!(second_round.len(), 1);
+        assert_eq!(second_round["node-3"], vec![split_a]);
+    }
+
+    #[tokio::test]
+    async fn get_or_open_pins_cached_split_before_reader_open_finishes() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage_manager = Arc::new(StorageManager::new_in_path(temp_dir.path()).unwrap());
+        let reader_cache = Arc::new(RemoteSplitReaderCache::default());
+        let worker_pools = crate::worker::WorkerPools::new(1, 1);
+        let (metadata, split, live_split_ids) =
+            build_cached_remote_split(storage_manager.as_ref()).await;
+        let context = LeafExecutionContext {
+            worker_pools: worker_pools.clone(),
+            storage_manager: storage_manager.clone(),
+            reader_cache: reader_cache.clone(),
+        };
+
+        let (block_tx, block_rx) = mpsc::channel::<()>();
+        let blocker_pools = worker_pools.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_pools
+                .spawn_search(move || {
+                    block_rx.recv().unwrap();
+                })
+                .await
+                .unwrap();
+        });
+
+        let open_context = context.clone();
+        let open_metadata = metadata.clone();
+        let open_split = split.clone();
+        let open_reader_cache = reader_cache.clone();
+        let open_handle = tokio::spawn(async move {
+            open_reader_cache
+                .get_or_open(&open_context, &open_metadata, &open_split)
+                .await
+        });
+
+        let cache_dir = storage_manager
+            .local_workdir()
+            .join("splits")
+            .join(metadata.uuid.as_str())
+            .join(&split.split_id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (!cache_dir.exists())
+            || storage_manager.cached_split_pin_count(metadata.uuid.as_str(), &split.split_id) == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "split cache dir was never pinned during reader open"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        storage_manager
+            .reap_split_cache(metadata.uuid.as_str(), &live_split_ids, Some(0))
+            .unwrap();
+        assert!(
+            cache_dir.exists(),
+            "pinned split cache dir was reaped while reader open was pending"
+        );
+
+        block_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        let reader = open_handle.await.unwrap().unwrap();
+        assert!(reader.engine.doc_count() >= 1);
+        assert!(
+            cache_dir.exists(),
+            "successful reader open should leave cache dir intact"
+        );
+    }
 }

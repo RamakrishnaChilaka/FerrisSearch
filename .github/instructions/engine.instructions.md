@@ -90,6 +90,13 @@ tokio::select! {
 - Auto-creates VectorIndex if a `knn_vector` field is encountered
 - `rebuild_vectors()` — recovers USearch index from Tantivy docs on startup (crash recovery)
 
+## RemoteStore Engine (src/engine/remote_store.rs)
+- `remote_store` is a shardless read path. Root nodes load the published manifest for an index, query per-leaf cache/load status over gRPC, and batch split assignments to data-node leaves.
+- Leaf selection uses rendezvous ranking over `(index_uuid, manifest_generation, split_id, node_id)`, then chooses among the top-ranked candidates by `reader_cached` > `artifact_cached` > lower `inflight_bytes` > lower `queue_depth`.
+- Leaves use `RemoteSplitReaderCache` to reuse open `HotEngine` readers across requests. Reader entries pin the underlying cached split directory for as long as the reader stays live.
+- `StorageManager::cached_split_status()` reports warm-artifact state, `begin_remote_store_batch()` / `remote_store_load_snapshot()` publish live load signals, and `reap_split_cache()` removes stale or over-budget split directories after batches while leaving pinned artifacts intact.
+- Master-only coordinators are valid remote_store roots; only nodes with `NodeRole::Data` are eligible leaves.
+
 ## HotEngine (src/engine/tantivy.rs)
 ```rust
 // Key internals

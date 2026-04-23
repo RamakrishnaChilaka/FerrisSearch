@@ -541,6 +541,9 @@ mod tests {
                 worker_pools: WorkerPools::default_for_system(),
                 task_manager: Arc::new(crate::tasks::TaskManager::new()),
                 storage_manager,
+                remote_store_reader_cache: Arc::new(
+                    crate::engine::remote_store::RemoteSplitReaderCache::default(),
+                ),
                 sql_group_by_scan_limit: 0,
                 sql_approximate_top_k: false,
             },

@@ -222,6 +222,9 @@ impl FerrisDB {
             storage_manager: Arc::new(
                 ferrissearch::storage::StorageManager::new_in_path(tmp.path()).unwrap(),
             ),
+            remote_store_reader_cache: Arc::new(
+                ferrissearch::engine::remote_store::RemoteSplitReaderCache::default(),
+            ),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
         };

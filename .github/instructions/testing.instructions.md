@@ -1,15 +1,15 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **1100 unit tests** (`cargo test --lib`)
+- **1107 unit tests** (`cargo test --lib`)
 - **68 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **62 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **63 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **6 remote_store S3 integration tests** (`cargo test --test remote_store_s3_integration`) — skipped unless `FERRIS_RUSTFS_ENDPOINT` is set
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 180 assertions across 4 files
-- **1310 total** (`cargo test`)
+- **1318 total** (`cargo test`)
 
 ## Running Tests
 ```bash
@@ -31,6 +31,8 @@ cargo test -- test_name                         # Single test by name
 - For large bulk-ingest changes, add a router-level regression proving `POST /_bulk` accepts a body larger than Axum's default 2MB limit and reaches the handler instead of failing with `413` at the framework layer.
 - For in-process REST integration harnesses, wait for both the HTTP listener and the gRPC transport listener before issuing the first request; Raft-backed index/settings handlers may still forward through transport before the harness is usable, and any readiness `Ping` must use a registered `source_node_id` because transport rejects unknown nodes.
 - Multi-node REST harnesses that claim coordinator coverage must preserve real `raft_node_id` values in cluster state and route at least one request through a non-master node; otherwise follower-forwarding regressions can hide behind leader-only traffic.
+- Multi-node `remote_store` tests must use a shared object-store root across nodes plus per-node local workdirs/caches; otherwise a coordinator-local read path can masquerade as distributed execution.
+- The current multi-node REST harness uses isolated in-memory Raft instances, so any `remote_store` regression that depends on leaf-side index metadata lookups needs a direct transport-level test in addition to any REST harness fan-out assertion.
 - For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
 - For WAL corruption hardening, add regressions that an unknown operation tag in the active generation returns `Err` on reopen instead of panicking, and that an internal active-generation mismatch fails before append writes bytes.
 - For HotEngine WAL-wrapper hardening, add unit tests that poisoned translog wrapper locks return `Err` on write and maintenance paths, and that grouped segment worker panics are surfaced as ordinary query errors.

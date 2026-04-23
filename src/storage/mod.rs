@@ -24,9 +24,12 @@ use object_store::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -61,6 +64,87 @@ enum Backend {
     },
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CachedSplitStatus {
+    pub artifact_cached: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteStoreLoadSnapshot {
+    pub inflight_bytes: u64,
+    pub queue_depth: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSplitEntry {
+    index_uuid: String,
+    split_id: String,
+    size_bytes: u64,
+    last_access_epoch_ms: u64,
+}
+
+fn cache_entry_key(index_uuid: &str, split_id: &str) -> String {
+    format!("{index_uuid}/{split_id}")
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            total += dir_size_bytes(&entry.path());
+        }
+    }
+    total
+}
+
+pub struct SplitCachePin {
+    key: String,
+    pin_counts: Arc<StdMutex<HashMap<String, usize>>>,
+}
+
+impl Drop for SplitCachePin {
+    fn drop(&mut self) {
+        let mut pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = pin_counts.get_mut(&self.key) {
+            if *count <= 1 {
+                pin_counts.remove(&self.key);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
+
+pub struct RemoteStoreLoadGuard {
+    bytes: u64,
+    inflight_bytes: Arc<AtomicU64>,
+    queue_depth: Arc<AtomicUsize>,
+}
+
+impl Drop for RemoteStoreLoadGuard {
+    fn drop(&mut self) {
+        self.inflight_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StorageManager {
     backend: Backend,
@@ -77,6 +161,10 @@ pub struct StorageManager {
     /// extract operations against the local cache. Key format:
     /// `"<index_uuid>/<split_id>"`.
     split_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    cache_entries: Arc<StdMutex<HashMap<String, CachedSplitEntry>>>,
+    pin_counts: Arc<StdMutex<HashMap<String, usize>>>,
+    remote_store_inflight_bytes: Arc<AtomicU64>,
+    remote_store_queue_depth: Arc<AtomicUsize>,
 }
 
 impl StorageManager {
@@ -134,6 +222,10 @@ impl StorageManager {
             local_workdir,
             publish_lock: Arc::new(Mutex::new(())),
             split_locks: Arc::new(Mutex::new(HashMap::new())),
+            cache_entries: Arc::new(StdMutex::new(HashMap::new())),
+            pin_counts: Arc::new(StdMutex::new(HashMap::new())),
+            remote_store_inflight_bytes: Arc::new(AtomicU64::new(0)),
+            remote_store_queue_depth: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -185,6 +277,164 @@ impl StorageManager {
             .join("splits")
             .join(index_uuid)
             .join(split_id)
+    }
+
+    pub fn cached_split_size_bytes(&self, index_uuid: &str, split_id: &str) -> u64 {
+        dir_size_bytes(&self.cache_dir(index_uuid, split_id))
+    }
+
+    pub fn record_cached_split_access(&self, index_uuid: &str, split_id: &str, size_bytes: u64) {
+        let key = cache_entry_key(index_uuid, split_id);
+        let mut cache_entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+        cache_entries.insert(
+            key,
+            CachedSplitEntry {
+                index_uuid: index_uuid.to_string(),
+                split_id: split_id.to_string(),
+                size_bytes,
+                last_access_epoch_ms: now_epoch_ms(),
+            },
+        );
+    }
+
+    pub fn cached_split_status(
+        &self,
+        index_uuid: &str,
+        split_id: &str,
+        checksum: &str,
+    ) -> CachedSplitStatus {
+        let cache_dir = self.cache_dir(index_uuid, split_id);
+        let done_marker = cache_dir.join(".done");
+        let artifact_cached = cache_dir.exists()
+            && std::fs::read(&done_marker)
+                .map(|bytes| bytes == checksum.as_bytes())
+                .unwrap_or(false);
+        CachedSplitStatus { artifact_cached }
+    }
+
+    pub fn pin_cached_split(&self, index_uuid: &str, split_id: &str) -> SplitCachePin {
+        let key = cache_entry_key(index_uuid, split_id);
+        let mut pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
+        *pin_counts.entry(key.clone()).or_insert(0) += 1;
+        SplitCachePin {
+            key,
+            pin_counts: Arc::clone(&self.pin_counts),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_split_pin_count(&self, index_uuid: &str, split_id: &str) -> usize {
+        let key = cache_entry_key(index_uuid, split_id);
+        self.pin_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn begin_remote_store_batch(&self, bytes: u64) -> RemoteStoreLoadGuard {
+        self.remote_store_queue_depth
+            .fetch_add(1, Ordering::Relaxed);
+        self.remote_store_inflight_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        RemoteStoreLoadGuard {
+            bytes,
+            inflight_bytes: Arc::clone(&self.remote_store_inflight_bytes),
+            queue_depth: Arc::clone(&self.remote_store_queue_depth),
+        }
+    }
+
+    pub fn remote_store_load_snapshot(&self) -> RemoteStoreLoadSnapshot {
+        RemoteStoreLoadSnapshot {
+            inflight_bytes: self.remote_store_inflight_bytes.load(Ordering::Relaxed),
+            queue_depth: self.remote_store_queue_depth.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reap_split_cache(
+        &self,
+        index_uuid: &str,
+        live_split_ids: &HashSet<String>,
+        budget_bytes: Option<u64>,
+    ) -> Result<()> {
+        let cache_root = self.local_workdir.join("splits").join(index_uuid);
+
+        let mut entries: Vec<(String, CachedSplitEntry)> = {
+            let cache_entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+            cache_entries
+                .iter()
+                .filter(|(_, entry)| entry.index_uuid == index_uuid)
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect()
+        };
+
+        if cache_root.exists() {
+            for entry in std::fs::read_dir(&cache_root)
+                .with_context(|| format!("read cache root {:?}", cache_root))?
+            {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let split_id = entry.file_name().to_string_lossy().to_string();
+                let key = cache_entry_key(index_uuid, &split_id);
+                if entries.iter().any(|(existing_key, _)| existing_key == &key) {
+                    continue;
+                }
+
+                entries.push((
+                    key,
+                    CachedSplitEntry {
+                        index_uuid: index_uuid.to_string(),
+                        split_id,
+                        size_bytes: dir_size_bytes(&entry.path()),
+                        last_access_epoch_ms: 0,
+                    },
+                ));
+            }
+        }
+
+        let mut total_bytes: u64 = entries.iter().map(|(_, entry)| entry.size_bytes).sum();
+        entries.sort_by_key(|(_, entry)| {
+            (
+                live_split_ids.contains(&entry.split_id),
+                entry.last_access_epoch_ms,
+            )
+        });
+
+        for (key, entry) in entries {
+            let is_stale = !live_split_ids.contains(&entry.split_id);
+            let over_budget = budget_bytes.is_some_and(|budget| total_bytes > budget);
+            if !is_stale && !over_budget {
+                continue;
+            }
+
+            let is_pinned = self
+                .pin_counts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                > 0;
+            if is_pinned {
+                continue;
+            }
+
+            let cache_dir = self.cache_dir(index_uuid, &entry.split_id);
+            if cache_dir.exists() {
+                std::fs::remove_dir_all(&cache_dir)
+                    .with_context(|| format!("remove stale cache dir {:?}", cache_dir))?;
+            }
+            self.cache_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            total_bytes = total_bytes.saturating_sub(entry.size_bytes);
+        }
+
+        Ok(())
     }
 
     /// Staging directory for building a split in-progress. Used by the
@@ -240,6 +490,11 @@ impl StorageManager {
         if let Ok(bytes) = std::fs::read(&done_marker)
             && bytes == split.checksum.as_bytes()
         {
+            self.record_cached_split_access(
+                index_uuid,
+                &split.split_id,
+                self.cached_split_size_bytes(index_uuid, &split.split_id),
+            );
             return Ok(cache_dir);
         }
         // A stale `.done` with a different checksum means the manifest was
@@ -255,6 +510,11 @@ impl StorageManager {
         if let Ok(bytes) = std::fs::read(&done_marker)
             && bytes == split.checksum.as_bytes()
         {
+            self.record_cached_split_access(
+                index_uuid,
+                &split.split_id,
+                self.cached_split_size_bytes(index_uuid, &split.split_id),
+            );
             return Ok(cache_dir);
         }
 
@@ -315,6 +575,11 @@ impl StorageManager {
         })?;
         std::fs::write(&done_marker, split.checksum.as_bytes())
             .with_context(|| format!("failed to write done marker {:?}", done_marker))?;
+        self.record_cached_split_access(
+            index_uuid,
+            &split.split_id,
+            self.cached_split_size_bytes(index_uuid, &split.split_id),
+        );
 
         Ok(cache_dir)
     }
@@ -1026,6 +1291,7 @@ pub struct SplitTimeRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     #[test]
@@ -1740,6 +2006,18 @@ mod tests {
             b"{\"meta\":1}"
         );
         assert!(cache_dir.join(".done").exists());
+        let cached_size = manager.cached_split_size_bytes("idx-uuid", "split-42");
+        assert_eq!(cached_size, dir_size_bytes(&cache_dir));
+        assert_ne!(cached_size, size);
+        assert_eq!(
+            manager
+                .cache_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("idx-uuid/split-42")
+                .map(|entry| entry.size_bytes),
+            Some(cached_size)
+        );
 
         // Second fetch should short-circuit without re-downloading (same cache dir).
         let cache_dir_2 = manager
@@ -1747,6 +2025,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache_dir, cache_dir_2);
+        assert_eq!(
+            manager.cached_split_size_bytes("idx-uuid", "split-42"),
+            cached_size
+        );
     }
 
     #[tokio::test]
@@ -1814,5 +2096,86 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("bundle checksum mismatch"));
+    }
+
+    #[test]
+    fn remote_store_load_snapshot_tracks_active_batches() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+
+        assert_eq!(manager.remote_store_load_snapshot().inflight_bytes, 0);
+        assert_eq!(manager.remote_store_load_snapshot().queue_depth, 0);
+
+        let guard = manager.begin_remote_store_batch(4096);
+        let snapshot = manager.remote_store_load_snapshot();
+        assert_eq!(snapshot.inflight_bytes, 4096);
+        assert_eq!(snapshot.queue_depth, 1);
+
+        {
+            let _nested = manager.begin_remote_store_batch(1024);
+            let nested_snapshot = manager.remote_store_load_snapshot();
+            assert_eq!(nested_snapshot.inflight_bytes, 5120);
+            assert_eq!(nested_snapshot.queue_depth, 2);
+        }
+
+        let snapshot = manager.remote_store_load_snapshot();
+        assert_eq!(snapshot.inflight_bytes, 4096);
+        assert_eq!(snapshot.queue_depth, 1);
+        drop(guard);
+
+        let snapshot = manager.remote_store_load_snapshot();
+        assert_eq!(snapshot.inflight_bytes, 0);
+        assert_eq!(snapshot.queue_depth, 0);
+    }
+
+    #[test]
+    fn reap_split_cache_respects_live_set_budget_and_pins() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+
+        for split_id in ["stale", "live-pinned", "live-budget"] {
+            let cache_dir = manager.cache_dir("idx-1", split_id);
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::write(cache_dir.join("blob.bin"), vec![b'x'; 20]).unwrap();
+            std::fs::write(cache_dir.join(".done"), b"sha256:test").unwrap();
+            manager.record_cached_split_access("idx-1", split_id, dir_size_bytes(&cache_dir));
+        }
+
+        {
+            let mut entries = manager
+                .cache_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries.get_mut("idx-1/stale").unwrap().last_access_epoch_ms = 1;
+            entries
+                .get_mut("idx-1/live-pinned")
+                .unwrap()
+                .last_access_epoch_ms = 2;
+            entries
+                .get_mut("idx-1/live-budget")
+                .unwrap()
+                .last_access_epoch_ms = 3;
+        }
+
+        let _pin = manager.pin_cached_split("idx-1", "live-pinned");
+        let live_split_ids = HashSet::from(["live-pinned".to_string(), "live-budget".to_string()]);
+
+        manager
+            .reap_split_cache("idx-1", &live_split_ids, Some(40))
+            .unwrap();
+
+        assert!(!manager.cache_dir("idx-1", "stale").exists());
+        assert!(manager.cache_dir("idx-1", "live-pinned").exists());
+        assert!(!manager.cache_dir("idx-1", "live-budget").exists());
+        assert!(
+            manager
+                .cached_split_status("idx-1", "live-pinned", "sha256:test")
+                .artifact_cached
+        );
+        assert!(
+            !manager
+                .cached_split_status("idx-1", "live-budget", "sha256:test")
+                .artifact_cached
+        );
     }
 }
