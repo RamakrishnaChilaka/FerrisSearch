@@ -3387,10 +3387,12 @@ async fn remote_store_verify_reports_mismatch_after_file_tamper() -> Result<()> 
         .expect("split_id string")
         .to_string();
 
-    // Corrupt one file under the split bundle. Target the stored schema
-    // (`meta.json`) because it exists for every Tantivy index and a trailing
-    // byte change is guaranteed to alter the bundle hash without making the
-    // file so malformed that Tantivy might reject it before our hash runs.
+    // Corrupt the published bundle file so the sha256 computed during verify
+    // no longer matches the value stored in the manifest. With the new
+    // bundle layout, each split is a single opaque file at
+    // `<storage_root>/<uuid>/splits/<split_id>/bundle`. We flip a byte near
+    // the tail of the file so the framing header is untouched and the
+    // download still succeeds.
     let remote_store_root = harness
         ._temp_dir
         .path()
@@ -3398,19 +3400,17 @@ async fn remote_store_verify_reports_mismatch_after_file_tamper() -> Result<()> 
     let mut victim: Option<std::path::PathBuf> = None;
     for uuid_entry in std::fs::read_dir(&remote_store_root)? {
         let uuid_path = uuid_entry?.path();
-        let candidate = uuid_path
-            .join("splits")
-            .join(&split_id)
-            .join("index")
-            .join("meta.json");
+        let candidate = uuid_path.join("splits").join(&split_id).join("bundle");
         if candidate.exists() {
             victim = Some(candidate);
             break;
         }
     }
-    let victim = victim.expect("split index/meta.json must exist after publish");
+    let victim = victim.expect("split bundle file must exist after publish");
     let mut bytes = std::fs::read(&victim)?;
-    bytes.push(b' '); // single-byte change is enough
+    assert!(!bytes.is_empty(), "bundle file must not be empty");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
     std::fs::write(&victim, &bytes)?;
 
     let (vs, vb) = harness

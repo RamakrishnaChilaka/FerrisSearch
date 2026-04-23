@@ -18,7 +18,7 @@ datafusion = "53"
 futures = "0.3.32"
 moka = { version = "0.12", features = ["sync"] }
 murmur3 = "0.5.2"
-object_store = "0.13.2"
+object_store = { version = "0.13.2", features = ["aws"] }
 openraft = { version = "0.10.0-alpha.17", features = ["serde", "tokio-rt"] }
 prometheus = "0.14"
 prost = "0.13"

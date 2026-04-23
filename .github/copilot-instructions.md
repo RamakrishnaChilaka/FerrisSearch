@@ -11,7 +11,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - DataFusion 53 / sqlparser 0.61 (SQL layer)
 - Axum (HTTP API)
 - Tonic 0.13/gRPC (inter-node transport)
-- object_store 0.13.2 (filesystem-first object storage abstraction for remote_store foundations)
+- object_store 0.13.2 (object storage abstraction for the remote_store engine; supports local filesystem and S3/S3-compatible backends via the `aws` feature)
 - Protobuf (proto/transport.proto)
 - redb 3 (persistent Raft log storage — v3 file format, ~15% faster bulk writes, smaller files)
 - jemalloc (global allocator via tikv-jemallocator — reduces post-workload RSS retention vs glibc malloc)
@@ -32,7 +32,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/node/mod.rs` — Node struct, startup, Raft bootstrap, lifecycle loop, AppState
 - `src/transport/` — gRPC server (server.rs: Raft RPCs + shard ops + replication) and client (client.rs: forwarding methods)
 - `src/api/` — Axum HTTP handlers: index.rs (index CRUD, doc ops), search.rs (query-string search), cat.rs (catalog), cluster.rs (health, state, transfer_master), mod.rs (router)
-- `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing), remote_store.rs (shardless read path over published split manifests)
+- `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing), remote_store.rs (shardless read path; downloads split bundles from the configured object store into a node-local cache, unpacks, and queries via HotEngine)
 - `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
 - `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
 - `src/tasks.rs` — TaskManager for async background maintenance tracking (`_forcemerge`, `/_tasks/{task_id}`)
@@ -107,7 +107,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1102 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 62 REST API integration + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1306 total
+- 1100 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 62 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1310 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -187,7 +187,7 @@ pub struct AppState {
     pub sql_approximate_top_k: bool,
 }
 ```
-- `storage_manager` is an object_store-backed abstraction rooted at `<data_dir>/_remote_store/`; used by the `remote_store` engine for manifest I/O and split reads
+- `storage_manager` is an object_store-backed abstraction with a node-local workdir for split staging and cache. By default storage is rooted at `<data_dir>/_remote_store/` (local filesystem) and cache at `<data_dir>/_remote_store_cache/`. Set `storage_uri` in `AppConfig` to override the storage backend — supports bare path, `file://`, and `s3://<bucket>[/prefix]`. For `s3://`, AWS credentials and endpoint are read from standard env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`). The `remote_store` engine writes split bundles (`<uuid>/splits/<split_id>/bundle`) and manifest generations (`<uuid>/manifests/<gen>.json` + `manifest.current.json`) through this store; publish streams a packed deterministic bundle + sha256 up, search fetches bundles into the node-local cache keyed on sha256 with a `.done` marker (re-downloads only on cache miss), verify stream-hashes bundles without touching disk.
 - `sql_approximate_top_k` currently defaults to `true`; eligible grouped-partials `GROUP BY ... ORDER BY metric LIMIT N` queries use shard-level approximate top-K pruning unless the user disables it in config
 
 ## Core Data Structures (src/cluster/state.rs)
@@ -243,6 +243,7 @@ pub struct AppConfig {
     pub transport_tls_cert_file: Option<String>, // PEM cert for gRPC server
     pub transport_tls_key_file: Option<String>,  // PEM key for gRPC server
     pub transport_tls_ca_file: Option<String>,   // PEM CA for client verification
+    pub storage_uri: Option<String>,             // override <data_dir>/_remote_store ; supports file:// and s3://bucket[/prefix]
 }
 ```
 - Load order: defaults → `config/ferrissearch.yml` → `FERRISSEARCH_*` env vars
@@ -386,7 +387,7 @@ if let Some(ref raft) = state.raft {
 }
 ```
 
-- `engine` may be passed either as a string (`"local_shards"` / `"remote_store"`) or as an object (`{"type":"remote_store"}`) in the create body parser. `remote_store` indices are shardless and served from manifests published to the configured object store; writes return 501 until a publish path lands.
+- `engine` may be passed either as a string (`"local_shards"` / `"remote_store"`) or as an object (`{"type":"remote_store"}`) in the create body parser. `remote_store` indices are shardless and served from manifests published to the configured object store; inserts via the standard `_doc` / `_bulk` write paths still return 501, while `POST /{index}/_remote_store/publish` builds and uploads split bundles (local or S3) for the queryable read path.
 
 ## Search & Query DSL (src/search/mod.rs)
 
