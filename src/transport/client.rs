@@ -421,6 +421,92 @@ impl TransportClient {
         }
     }
 
+    pub(crate) async fn get_remote_store_leaf_status(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        index_uuid: &str,
+        splits: &[crate::engine::remote_store::AssignedRemoteSplit],
+    ) -> Result<crate::engine::remote_store::LeafStatusSnapshot, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(RemoteStoreLeafStatusRequest {
+            index_name: index_name.to_string(),
+            index_uuid: index_uuid.to_string(),
+            splits: splits.iter().map(remote_store_split_to_proto).collect(),
+        });
+        let response = client
+            .get_remote_store_leaf_status(request)
+            .await?
+            .into_inner();
+        Ok(crate::engine::remote_store::LeafStatusSnapshot {
+            root_capable: response.root_capable,
+            leaf_capable: response.leaf_capable,
+            inflight_bytes: response.inflight_bytes,
+            queue_depth: response.queue_depth as usize,
+            split_statuses: response
+                .split_statuses
+                .into_iter()
+                .map(|status| {
+                    (
+                        status.split_id,
+                        crate::engine::remote_store::SplitWarmth {
+                            artifact_cached: status.artifact_cached,
+                            reader_cached: status.reader_cached,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) async fn forward_remote_store_search(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        index_uuid: &str,
+        req: &crate::search::SearchRequest,
+        splits: &[crate::engine::remote_store::AssignedRemoteSplit],
+        live_split_ids: &[String],
+    ) -> Result<Vec<crate::engine::remote_store::LeafSplitSearchOutcome>, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = tonic::Request::new(RemoteStoreSearchRequest {
+            index_name: index_name.to_string(),
+            index_uuid: index_uuid.to_string(),
+            search_request_json: serde_json::to_vec(req)?,
+            splits: splits.iter().map(remote_store_split_to_proto).collect(),
+            live_split_ids: live_split_ids.to_vec(),
+        });
+        let response = client
+            .search_remote_store_splits(request)
+            .await?
+            .into_inner();
+        response
+            .results
+            .into_iter()
+            .map(|result| {
+                let partial_aggs = result
+                    .partial_aggs_json
+                    .into_iter()
+                    .map(|bytes| crate::search::decode_partial_aggs(&bytes))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .fold(std::collections::HashMap::new(), |mut merged, partial| {
+                        for (key, value) in partial {
+                            merged.insert(key, value);
+                        }
+                        merged
+                    });
+                Ok(crate::engine::remote_store::LeafSplitSearchOutcome {
+                    split_id: result.split_id,
+                    hits: decode_search_hits(&result.hits)?,
+                    total_hits: result.total_hits as usize,
+                    partial_aggs,
+                    error: (!result.success).then_some(result.error),
+                })
+            })
+            .collect()
+    }
+
     /// Forward a SQL RecordBatch request to a specific shard (returns Arrow IPC)
     #[allow(clippy::too_many_arguments)]
     pub async fn forward_sql_batch_to_shard(
@@ -963,6 +1049,17 @@ fn decode_search_hits(hits: &[SearchHit]) -> Result<Vec<serde_json::Value>, anyh
     hits.iter()
         .map(|hit| serde_json::from_slice(&hit.source_json).map_err(anyhow::Error::from))
         .collect()
+}
+
+fn remote_store_split_to_proto(
+    split: &crate::engine::remote_store::AssignedRemoteSplit,
+) -> RemoteStoreSplitPlan {
+    RemoteStoreSplitPlan {
+        split_id: split.split_id.clone(),
+        bundle_path: split.bundle_path.clone(),
+        checksum: split.checksum.clone(),
+        size_bytes: split.size_bytes,
+    }
 }
 
 /// Result of a recovery request from the primary.

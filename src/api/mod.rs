@@ -58,6 +58,8 @@ pub struct AppState {
     pub task_manager: Arc<crate::tasks::TaskManager>,
     /// Object-store-backed storage for remote_store engine (manifests, splits).
     pub storage_manager: Arc<crate::storage::StorageManager>,
+    /// Process-local cache of open remote_store split readers.
+    pub remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
     /// Max docs to scan for GROUP BY queries on the fast-fields fallback path.
     /// 0 = unlimited.
     pub sql_group_by_scan_limit: usize,
@@ -447,6 +449,9 @@ mod tests {
                 task_manager: std::sync::Arc::new(TaskManager::new()),
                 storage_manager: std::sync::Arc::new(
                     crate::storage::StorageManager::new_in_path(&data_dir).unwrap(),
+                ),
+                remote_store_reader_cache: std::sync::Arc::new(
+                    crate::engine::remote_store::RemoteSplitReaderCache::default(),
                 ),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,

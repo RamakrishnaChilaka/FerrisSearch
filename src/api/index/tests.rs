@@ -212,6 +212,9 @@ async fn make_test_app_state(cluster_state: ClusterState) -> (tempfile::TempDir,
         storage_manager: Arc::new(
             crate::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
         ),
+        remote_store_reader_cache: Arc::new(
+            crate::engine::remote_store::RemoteSplitReaderCache::default(),
+        ),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };

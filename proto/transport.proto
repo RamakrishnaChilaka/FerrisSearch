@@ -158,6 +158,54 @@ message ShardSearchResponse {
     bytes partial_aggs_json = 5;  // serialized HashMap<String, PartialAggResult>
 }
 
+message RemoteStoreSplitPlan {
+    string split_id = 1;
+    string bundle_path = 2;
+    string checksum = 3;
+    uint64 size_bytes = 4;
+}
+
+message RemoteStoreLeafStatusRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    repeated RemoteStoreSplitPlan splits = 3;
+}
+
+message RemoteStoreSplitCacheStatus {
+    string split_id = 1;
+    bool artifact_cached = 2;
+    bool reader_cached = 3;
+}
+
+message RemoteStoreLeafStatusResponse {
+    bool root_capable = 1;
+    bool leaf_capable = 2;
+    uint64 inflight_bytes = 3;
+    uint32 queue_depth = 4;
+    repeated RemoteStoreSplitCacheStatus split_statuses = 5;
+}
+
+message RemoteStoreSearchRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    bytes search_request_json = 3;
+    repeated RemoteStoreSplitPlan splits = 4;
+    repeated string live_split_ids = 5;
+}
+
+message RemoteStoreSplitSearchResult {
+    string split_id = 1;
+    bool success = 2;
+    repeated SearchHit hits = 3;
+    uint64 total_hits = 4;
+    repeated bytes partial_aggs_json = 5;
+    string error = 6;
+}
+
+message RemoteStoreSearchResponse {
+    repeated RemoteStoreSplitSearchResult results = 1;
+}
+
 // ─── Replication ──────────────────────────────────────────────────────────────
 
 message ReplicateDocRequest {
@@ -387,6 +435,8 @@ service InternalTransport {
     // Shard-level search
     rpc SearchShard(ShardSearchRequest) returns (ShardSearchResponse);
     rpc SearchShardDsl(ShardSearchDslRequest) returns (ShardSearchResponse);
+    rpc GetRemoteStoreLeafStatus(RemoteStoreLeafStatusRequest) returns (RemoteStoreLeafStatusResponse);
+    rpc SearchRemoteStoreSplits(RemoteStoreSearchRequest) returns (RemoteStoreSearchResponse);
 
     // Shard-level SQL (returns Arrow IPC RecordBatch)
     rpc SqlRecordBatch(SqlRecordBatchRequest) returns (SqlRecordBatchResponse);

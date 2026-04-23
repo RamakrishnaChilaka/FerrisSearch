@@ -10,6 +10,14 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::time::Duration;
 
+fn test_storage_manager(data_dir: &std::path::Path) -> Arc<crate::storage::StorageManager> {
+    Arc::new(crate::storage::StorageManager::new_in_path(data_dir).unwrap())
+}
+
+fn test_remote_store_reader_cache() -> Arc<crate::engine::remote_store::RemoteSplitReaderCache> {
+    Arc::new(crate::engine::remote_store::RemoteSplitReaderCache::default())
+}
+
 fn make_full_cluster_state() -> DomainClusterState {
     let mut cs = DomainClusterState::new("roundtrip-cluster".into());
     cs.version = 42;
@@ -338,6 +346,8 @@ async fn get_or_open_search_shard_reopens_persisted_shard_via_metadata() {
         cluster_manager: Arc::new(manager),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -395,6 +405,8 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
         cluster_manager: Arc::new(manager),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -428,6 +440,8 @@ async fn get_shard_stats_only_reports_open_shards() {
         cluster_manager: Arc::new(ClusterManager::new("stats-cluster".into())),
         shard_manager: sm,
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -463,6 +477,8 @@ async fn get_segment_stats_only_reports_open_shard_segments() {
         cluster_manager: Arc::new(ClusterManager::new("segment-stats-cluster".into())),
         shard_manager: sm,
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -490,6 +506,8 @@ async fn get_or_open_search_shard_returns_not_found_for_unknown_shard() {
         cluster_manager: Arc::new(ClusterManager::new("missing-unit".into())),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -512,6 +530,8 @@ async fn get_or_open_shard_returns_not_found_for_unknown_shard() {
         cluster_manager: Arc::new(ClusterManager::new("missing-unit".into())),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -544,6 +564,8 @@ async fn ping_rejects_unregistered_source_node() {
         cluster_manager: manager,
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -579,6 +601,8 @@ async fn ping_updates_last_seen_for_registered_source_node() {
         cluster_manager: Arc::clone(&manager),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -650,6 +674,8 @@ async fn maintenance_skips_orphaned_shards() {
         cluster_manager: Arc::new(manager),
         shard_manager: sm,
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -710,6 +736,8 @@ async fn maintenance_includes_replica_shards() {
         cluster_manager: Arc::new(manager),
         shard_manager: sm,
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -766,6 +794,8 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
         cluster_manager: Arc::new(manager),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -817,6 +847,8 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
         cluster_manager: Arc::new(manager),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -849,6 +881,8 @@ async fn get_task_status_rpc_returns_local_force_merge_snapshot() {
         cluster_manager: Arc::new(ClusterManager::new("task-status-cluster".into())),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -903,6 +937,8 @@ async fn force_merge_task_counts_missing_assigned_shard_as_failure() {
         cluster_manager: Arc::new(manager),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -973,6 +1009,8 @@ async fn flush_index_refuses_to_create_missing_uuid_dir() {
         cluster_manager: Arc::new(manager),
         shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -1266,6 +1304,7 @@ fn roundtrip_rejects_unknown_non_empty_engine() {
 
 #[tokio::test]
 async fn create_index_returns_internal_when_no_data_nodes_are_available() {
+    let dir = tempfile::tempdir().unwrap();
     let mut cluster_state = DomainClusterState::new("create-index-test".into());
     cluster_state.add_node(DomainNodeInfo {
         id: "node-1".into(),
@@ -1297,11 +1336,10 @@ async fn create_index_returns_internal_when_no_data_nodes_are_available() {
 
     let service = TransportService {
         cluster_manager: Arc::new(manager),
-        shard_manager: Arc::new(ShardManager::new(
-            tempfile::tempdir().unwrap().path(),
-            Duration::from_secs(60),
-        )),
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
         transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: Some(raft),
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
@@ -1328,4 +1366,43 @@ async fn create_index_returns_internal_when_no_data_nodes_are_available() {
         err.message()
             .contains("No data nodes available to assign shards")
     );
+}
+
+#[tokio::test]
+async fn search_remote_store_splits_requires_local_index_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = TransportService {
+        cluster_manager: Arc::new(ClusterManager::new("remote-store-metadata".into())),
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+
+    let err = service
+        .search_remote_store_splits(Request::new(RemoteStoreSearchRequest {
+            index_name: "remotehits".into(),
+            index_uuid: "idx-1".into(),
+            search_request_json: serde_json::to_vec(&crate::search::SearchRequest {
+                query: crate::search::QueryClause::MatchAll(serde_json::json!({})),
+                size: 10,
+                from: 0,
+                knn: None,
+                sort: Vec::new(),
+                aggs: HashMap::new(),
+            })
+            .unwrap(),
+            splits: Vec::new(),
+            live_split_ids: Vec::new(),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    assert!(err.message().contains("index [remotehits] not found"));
 }

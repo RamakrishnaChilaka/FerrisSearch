@@ -147,6 +147,9 @@ async fn make_test_app_state(index_name: &str) -> (tempfile::TempDir, AppState) 
         storage_manager: Arc::new(
             crate::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
         ),
+        remote_store_reader_cache: Arc::new(
+            crate::engine::remote_store::RemoteSplitReaderCache::default(),
+        ),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };
@@ -1064,6 +1067,9 @@ async fn group_by_text_field_returns_error() {
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         storage_manager: Arc::new(
             crate::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
+        ),
+        remote_store_reader_cache: Arc::new(
+            crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,

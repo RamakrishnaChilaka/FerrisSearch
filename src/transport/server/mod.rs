@@ -10,6 +10,7 @@ use crate::transport::proto::*;
 use crate::wal::WriteAheadLog;
 use futures::{FutureExt, Stream, stream};
 use openraft::type_config::async_runtime::WatchReceiver;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -22,6 +23,8 @@ pub struct TransportService {
     pub cluster_manager: Arc<ClusterManager>,
     pub shard_manager: Arc<ShardManager>,
     pub transport_client: crate::transport::TransportClient,
+    pub storage_manager: Arc<crate::storage::StorageManager>,
+    pub remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
     /// Optional Raft consensus instance. When present, Raft RPCs are forwarded here.
     pub raft: Option<Arc<RaftInstance>>,
     /// This node's identifier — used to filter locally-assigned shards.
@@ -922,6 +925,142 @@ impl InternalTransport for TransportService {
                 partial_aggs_json: vec![],
             })),
         }
+    }
+
+    async fn get_remote_store_leaf_status(
+        &self,
+        request: Request<RemoteStoreLeafStatusRequest>,
+    ) -> Result<Response<RemoteStoreLeafStatusResponse>, Status> {
+        let req = request.into_inner();
+        let split_plans: Vec<_> = req
+            .splits
+            .into_iter()
+            .map(|split| crate::engine::remote_store::AssignedRemoteSplit {
+                split_id: split.split_id,
+                bundle_path: split.bundle_path,
+                checksum: split.checksum,
+                size_bytes: split.size_bytes,
+            })
+            .collect();
+        let cluster_state = self.cluster_manager.get_state();
+        let status = crate::engine::remote_store::local_leaf_status_snapshot(
+            &cluster_state,
+            &self.local_node_id,
+            self.storage_manager.as_ref(),
+            self.remote_store_reader_cache.as_ref(),
+            &req.index_uuid,
+            &split_plans,
+        );
+
+        Ok(Response::new(RemoteStoreLeafStatusResponse {
+            root_capable: status.root_capable,
+            leaf_capable: status.leaf_capable,
+            inflight_bytes: status.inflight_bytes,
+            queue_depth: status.queue_depth as u32,
+            split_statuses: status
+                .split_statuses
+                .into_iter()
+                .map(|(split_id, warmth)| RemoteStoreSplitCacheStatus {
+                    split_id,
+                    artifact_cached: warmth.artifact_cached,
+                    reader_cached: warmth.reader_cached,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn search_remote_store_splits(
+        &self,
+        request: Request<RemoteStoreSearchRequest>,
+    ) -> Result<Response<RemoteStoreSearchResponse>, Status> {
+        let req = request.into_inner();
+        let metadata = self
+            .cluster_manager
+            .get_state()
+            .indices
+            .get(&req.index_name)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("index [{}] not found", req.index_name)))?;
+        if metadata.uuid.as_str() != req.index_uuid {
+            return Err(Status::invalid_argument(format!(
+                "remote_store UUID mismatch for [{}]: request={} cluster={}",
+                req.index_name, req.index_uuid, metadata.uuid
+            )));
+        }
+        if !matches!(
+            metadata.settings.engine,
+            crate::cluster::state::IndexEngine::RemoteStore
+        ) {
+            return Err(Status::invalid_argument(format!(
+                "index [{}] uses engine [{}], not remote_store",
+                req.index_name, metadata.settings.engine
+            )));
+        }
+
+        let search_req: crate::search::SearchRequest =
+            serde_json::from_slice(&req.search_request_json).map_err(|e| {
+                Status::invalid_argument(format!("invalid SearchRequest JSON: {}", e))
+            })?;
+        let split_plans: Vec<_> = req
+            .splits
+            .into_iter()
+            .map(|split| crate::engine::remote_store::AssignedRemoteSplit {
+                split_id: split.split_id,
+                bundle_path: split.bundle_path,
+                checksum: split.checksum,
+                size_bytes: split.size_bytes,
+            })
+            .collect();
+        let live_split_ids: HashSet<String> = req.live_split_ids.into_iter().collect();
+        let context = crate::engine::remote_store::LeafExecutionContext {
+            worker_pools: self.worker_pools.clone(),
+            storage_manager: self.storage_manager.clone(),
+            reader_cache: self.remote_store_reader_cache.clone(),
+        };
+
+        let outcomes = crate::engine::remote_store::execute_leaf_search_batch(
+            &context,
+            &metadata,
+            &search_req,
+            &split_plans,
+            &live_split_ids,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        let results = outcomes
+            .into_iter()
+            .map(|outcome| {
+                let hits = outcome
+                    .hits
+                    .into_iter()
+                    .map(|value| {
+                        Ok::<SearchHit, serde_json::Error>(SearchHit {
+                            source_json: serde_json::to_vec(&value)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Status::internal(format!("serialize remote_store hit: {}", e)))?;
+                let partial_aggs_json = if outcome.partial_aggs.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![
+                        crate::search::encode_partial_aggs(&outcome.partial_aggs)
+                            .map_err(|e| Status::internal(format!("encode partial aggs: {}", e)))?,
+                    ]
+                };
+                Ok(RemoteStoreSplitSearchResult {
+                    split_id: outcome.split_id,
+                    success: outcome.error.is_none(),
+                    hits,
+                    total_hits: outcome.total_hits as u64,
+                    partial_aggs_json,
+                    error: outcome.error.unwrap_or_default(),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        Ok(Response::new(RemoteStoreSearchResponse { results }))
     }
 
     async fn sql_record_batch(
@@ -2283,10 +2422,19 @@ pub fn create_transport_service_for_test(
     task_manager: Arc<crate::tasks::TaskManager>,
     local_node_id: String,
 ) -> InternalTransportServer<TransportService> {
+    let storage_manager = Arc::new(
+        crate::storage::StorageManager::new_in_path(shard_manager.data_dir()).unwrap_or_else(
+            |error| panic!("create default test remote_store storage manager: {error}"),
+        ),
+    );
     let service = TransportService {
         cluster_manager,
         shard_manager,
         transport_client,
+        storage_manager,
+        remote_store_reader_cache: Arc::new(
+            crate::engine::remote_store::RemoteSplitReaderCache::default(),
+        ),
         raft: None,
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),
@@ -2307,10 +2455,38 @@ pub fn create_transport_service_with_raft(
     task_manager: Arc<crate::tasks::TaskManager>,
     local_node_id: String,
 ) -> InternalTransportServer<TransportService> {
+    let storage_manager = Arc::new(
+        crate::storage::StorageManager::new_in_path(shard_manager.data_dir())
+            .unwrap_or_else(|error| panic!("create default remote_store storage manager: {error}")),
+    );
+    create_transport_service_with_raft_and_storage(
+        cluster_manager,
+        shard_manager,
+        transport_client,
+        raft,
+        task_manager,
+        storage_manager,
+        Arc::new(crate::engine::remote_store::RemoteSplitReaderCache::default()),
+        local_node_id,
+    )
+}
+
+pub fn create_transport_service_with_raft_and_storage(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    transport_client: crate::transport::TransportClient,
+    raft: Arc<RaftInstance>,
+    task_manager: Arc<crate::tasks::TaskManager>,
+    storage_manager: Arc<crate::storage::StorageManager>,
+    remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
+    local_node_id: String,
+) -> InternalTransportServer<TransportService> {
     let service = TransportService {
         cluster_manager,
         shard_manager,
         transport_client,
+        storage_manager,
+        remote_store_reader_cache,
         raft: Some(raft),
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),

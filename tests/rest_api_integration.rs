@@ -10,7 +10,9 @@ use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::{
     PingRequest, internal_transport_client::InternalTransportClient,
 };
-use ferrissearch::transport::server::create_transport_service_with_raft;
+use ferrissearch::transport::server::{
+    create_transport_service_with_raft, create_transport_service_with_raft_and_storage,
+};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -33,6 +35,7 @@ struct RestTestHarness {
 struct MultiNodeRestHarness {
     client: Client,
     nodes: Vec<MultiNodeRestNode>,
+    _shared_remote_store: Option<TempDir>,
 }
 
 struct MultiNodeRestNode {
@@ -188,6 +191,9 @@ impl RestTestHarness {
             task_manager: task_manager.clone(),
             storage_manager: Arc::new(
                 ferrissearch::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
+            ),
+            remote_store_reader_cache: Arc::new(
+                ferrissearch::engine::remote_store::RemoteSplitReaderCache::default(),
             ),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
@@ -360,6 +366,19 @@ impl RestTestHarness {
 
 impl MultiNodeRestHarness {
     async fn start_three_nodes() -> Result<Self> {
+        Self::start_three_nodes_internal(vec![NodeRole::Master, NodeRole::Data], None).await
+    }
+
+    async fn start_three_nodes_with_shared_remote_store(
+        master_roles: Vec<NodeRole>,
+    ) -> Result<Self> {
+        Self::start_three_nodes_internal(master_roles, Some(tempfile::tempdir()?)).await
+    }
+
+    async fn start_three_nodes_internal(
+        master_roles: Vec<NodeRole>,
+        shared_remote_store: Option<TempDir>,
+    ) -> Result<Self> {
         let mut pending_nodes = Vec::new();
         for index in 1..=3 {
             let temp_dir = tempfile::tempdir()?;
@@ -388,7 +407,7 @@ impl MultiNodeRestHarness {
                 transport_port: node.transport_addr.port(),
                 http_port: node.http_addr.port(),
                 roles: if index == 0 {
-                    vec![NodeRole::Master, NodeRole::Data]
+                    master_roles.clone()
                 } else {
                     vec![NodeRole::Data]
                 },
@@ -421,6 +440,17 @@ impl MultiNodeRestHarness {
             ));
             let transport_client = TransportClient::new();
             let task_manager = Arc::new(ferrissearch::tasks::TaskManager::new());
+            let storage_manager = Arc::new(match shared_remote_store.as_ref() {
+                Some(shared_root) => ferrissearch::storage::StorageManager::new(
+                    shared_root.path().to_string_lossy().into_owned(),
+                    pending.temp_dir.path().join("_remote_store_workdir"),
+                )?,
+                None => {
+                    ferrissearch::storage::StorageManager::new_in_path(pending.temp_dir.path())?
+                }
+            });
+            let remote_store_reader_cache =
+                Arc::new(ferrissearch::engine::remote_store::RemoteSplitReaderCache::default());
             let app_state = AppState {
                 cluster_manager: cluster_manager.clone(),
                 shard_manager: shard_manager.clone(),
@@ -429,20 +459,20 @@ impl MultiNodeRestHarness {
                 raft: raft.clone(),
                 worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
                 task_manager: task_manager.clone(),
-                storage_manager: Arc::new(
-                    ferrissearch::storage::StorageManager::new_in_path(pending.temp_dir.path())
-                        .unwrap(),
-                ),
+                storage_manager: storage_manager.clone(),
+                remote_store_reader_cache: remote_store_reader_cache.clone(),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             };
 
-            let transport_service = create_transport_service_with_raft(
+            let transport_service = create_transport_service_with_raft_and_storage(
                 cluster_manager,
                 shard_manager,
                 transport_client,
                 raft,
                 task_manager,
+                storage_manager,
+                remote_store_reader_cache,
                 pending.node_id.clone(),
             );
             let transport_handle = tokio::spawn(async move {
@@ -473,7 +503,11 @@ impl MultiNodeRestHarness {
             });
         }
 
-        let harness = Self { client, nodes };
+        let harness = Self {
+            client,
+            nodes,
+            _shared_remote_store: shared_remote_store,
+        };
         harness.wait_until_ready().await?;
         Ok(harness)
     }
@@ -3170,6 +3204,102 @@ async fn remote_store_search_returns_hits_from_published_split() -> Result<()> {
         .expect("hits.hits must be an array");
     assert!(!hits.is_empty());
     assert_eq!(hits[0]["_id"], json!("doc-1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_search_fans_out_from_master_only_coordinator() -> Result<()> {
+    let harness =
+        MultiNodeRestHarness::start_three_nodes_with_shared_remote_store(vec![NodeRole::Master])
+            .await?;
+
+    let coordinator = &harness.nodes[0];
+    let (status, _body) = put_json_to_base_url(
+        &harness.client,
+        &coordinator.base_url,
+        "/remotedist",
+        json!({ "engine": "remote_store" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let metadata = coordinator
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("remotedist")
+        .cloned()
+        .expect("leader should hold remotedist metadata");
+    // This harness intentionally uses isolated in-memory Raft instances rather
+    // than a fully replicated cluster, so seed follower metadata explicitly.
+    // The leaf-side metadata dependency itself is covered directly in the
+    // transport regression `search_remote_store_splits_requires_local_index_metadata`.
+    for node in harness.nodes.iter().skip(1) {
+        let mut cluster_state = node.app_state.cluster_manager.get_state();
+        cluster_state.add_index(metadata.clone());
+        node.app_state.cluster_manager.update_state(cluster_state);
+    }
+
+    let (publish_status, publish_body) = post_json_to_base_url(
+        &harness.client,
+        &coordinator.base_url,
+        "/remotedist/_remote_store/publish",
+        json!({
+            "docs": [
+                { "_id": "doc-1", "title": "distributed remote hit", "body": "leaf fanout" }
+            ]
+        }),
+    )
+    .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+
+    let manifest = coordinator
+        .app_state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), None)
+        .await?
+        .expect("manifest should exist after publish");
+    let split = manifest
+        .published_splits()
+        .next()
+        .cloned()
+        .expect("publish should create one published split");
+
+    let (search_status, search_body) = post_json_to_base_url(
+        &harness.client,
+        &coordinator.base_url,
+        "/remotedist/_search",
+        json!({ "query": { "match_all": {} } }),
+    )
+    .await?;
+    assert_eq!(search_status, StatusCode::OK, "{search_body}");
+    assert_eq!(search_body["_shards"]["successful"], json!(1));
+    assert_eq!(search_body["_shards"]["failed"], json!(0));
+    assert_eq!(
+        search_body["hits"]["hits"][0]["_id"],
+        json!("doc-1"),
+        "unexpected search response: {search_body}"
+    );
+
+    assert!(
+        !coordinator
+            .app_state
+            .storage_manager
+            .cached_split_status(metadata.uuid.as_str(), &split.split_id, &split.checksum)
+            .artifact_cached,
+        "master-only coordinator should not execute remote_store split locally"
+    );
+    assert!(
+        harness.nodes[1..].iter().any(|node| {
+            node.app_state
+                .storage_manager
+                .cached_split_status(metadata.uuid.as_str(), &split.split_id, &split.checksum)
+                .artifact_cached
+        }),
+        "at least one data leaf should fetch the split into its local cache"
+    );
 
     Ok(())
 }

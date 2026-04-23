@@ -101,10 +101,12 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | DELETE | `/{index}` | `delete_index()` |
 | GET | `/{index}/_settings` | `get_index_settings()` — local read |
 | PUT | `/{index}/_settings` | `update_index_settings()` — forwarded to leader |
+| POST | `/{index}/_remote_store/publish` | `publish_remote_store_documents()` — build and publish one split generation |
+| POST | `/{index}/_remote_store/verify` | `verify_remote_store_splits()` — checksum all published bundles |
 | POST | `/_cluster/transfer_master` | `transfer_master()` — forwarded |
 
 `create_index()`, `get_index_settings()`, and `update_index_settings()` must keep `refresh_interval_ms` and `flush_threshold_bytes` in sync end-to-end across HTTP parsing, gRPC forwarding, and Raft state updates. `GET /{index}/_settings` must return both fields when set. `flush_threshold_bytes: 0` is a valid disable value and must not be treated as "missing".
-`engine` is a create-time immutable selector. `create_index()` accepts `engine: "local_shards"` (or an object form with `type`) and persists it through Raft/transport metadata. `GET /{index}/_settings` must expose the engine. `PUT /{index}/_settings` must reject engine changes. `remote_store` is recognized but must currently fail with `501 Not Implemented` / gRPC `UNIMPLEMENTED` rather than falling through shard-routing code.
+`engine` is a create-time immutable selector. `create_index()` accepts `engine: "local_shards"` (or an object form with `type`) and persists it through Raft/transport metadata. `GET /{index}/_settings` must expose the engine. `PUT /{index}/_settings` must reject engine changes. `remote_store` reads must route through the dedicated manifest + split execution path, while write-style `_doc` / `_bulk` / `_update` / `_delete` requests still fail with `501 Not Implemented` instead of falling through shard-routing code.
 `AppState.raft` is `Arc<RaftInstance>`, not `Option` — Raft is always present. Index-management handlers use `state.raft` directly without unwrapping.
 
 ### Local Shard Reopen Rule

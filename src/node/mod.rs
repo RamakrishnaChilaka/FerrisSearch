@@ -42,6 +42,7 @@ pub struct Node {
     pub raft: Arc<RaftInstance>,
     pub task_manager: Arc<crate::tasks::TaskManager>,
     pub storage_manager: Arc<crate::storage::StorageManager>,
+    pub remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
 }
 
 #[derive(Debug)]
@@ -164,6 +165,8 @@ impl Node {
                 crate::storage::StorageManager::new_in_path(std::path::Path::new(&config.data_dir))?
             }
         });
+        let remote_store_reader_cache =
+            Arc::new(crate::engine::remote_store::RemoteSplitReaderCache::default());
 
         Ok(Self {
             config,
@@ -173,6 +176,7 @@ impl Node {
             raft,
             task_manager,
             storage_manager,
+            remote_store_reader_cache,
         })
     }
 
@@ -203,19 +207,23 @@ impl Node {
             worker_pools: crate::worker::WorkerPools::default_for_system(),
             task_manager: self.task_manager.clone(),
             storage_manager: self.storage_manager.clone(),
+            remote_store_reader_cache: self.remote_store_reader_cache.clone(),
             sql_group_by_scan_limit: self.config.sql_group_by_scan_limit,
             sql_approximate_top_k: self.config.sql_approximate_top_k,
         };
 
         // 1. Start internal gRPC Transport Server (Port 9300)
-        let transport_service = crate::transport::server::create_transport_service_with_raft(
-            self.cluster_manager.clone(),
-            self.shard_manager.clone(),
-            self.transport_client.clone(),
-            self.raft.clone(),
-            self.task_manager.clone(),
-            self.config.node_name.clone(),
-        );
+        let transport_service =
+            crate::transport::server::create_transport_service_with_raft_and_storage(
+                self.cluster_manager.clone(),
+                self.shard_manager.clone(),
+                self.transport_client.clone(),
+                self.raft.clone(),
+                self.task_manager.clone(),
+                self.storage_manager.clone(),
+                self.remote_store_reader_cache.clone(),
+                self.config.node_name.clone(),
+            );
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));
         info!("gRPC Transport listening on {}", transport_addr);
         let transport_tls = resolve_transport_tls_paths(&self.config)?;
