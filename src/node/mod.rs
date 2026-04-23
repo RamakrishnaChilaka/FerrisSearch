@@ -220,8 +220,10 @@ impl Node {
                 self.transport_client.clone(),
                 self.raft.clone(),
                 self.task_manager.clone(),
-                self.storage_manager.clone(),
-                self.remote_store_reader_cache.clone(),
+                crate::transport::server::RemoteStoreTransportResources {
+                    storage_manager: self.storage_manager.clone(),
+                    remote_store_reader_cache: self.remote_store_reader_cache.clone(),
+                },
                 self.config.node_name.clone(),
             );
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));

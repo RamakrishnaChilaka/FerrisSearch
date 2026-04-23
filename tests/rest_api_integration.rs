@@ -471,8 +471,10 @@ impl MultiNodeRestHarness {
                 transport_client,
                 raft,
                 task_manager,
-                storage_manager,
-                remote_store_reader_cache,
+                ferrissearch::transport::server::RemoteStoreTransportResources {
+                    storage_manager,
+                    remote_store_reader_cache,
+                },
                 pending.node_id.clone(),
             );
             let transport_handle = tokio::spawn(async move {

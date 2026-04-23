@@ -38,6 +38,12 @@ pub struct TransportService {
     join_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Clone)]
+pub struct RemoteStoreTransportResources {
+    pub storage_manager: Arc<crate::storage::StorageManager>,
+    pub remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
+}
+
 fn new_join_lock() -> Arc<Mutex<()>> {
     Arc::new(Mutex::new(()))
 }
@@ -812,6 +818,7 @@ impl InternalTransport for TransportService {
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Status::internal(format!("serialize search hit: {}", e)))?;
+
                 Ok(Response::new(ShardSearchResponse {
                     success: true,
                     hits,
@@ -1028,37 +1035,33 @@ impl InternalTransport for TransportService {
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
-        let results = outcomes
-            .into_iter()
-            .map(|outcome| {
-                let hits = outcome
-                    .hits
-                    .into_iter()
-                    .map(|value| {
-                        Ok::<SearchHit, serde_json::Error>(SearchHit {
-                            source_json: serde_json::to_vec(&value)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Status::internal(format!("serialize remote_store hit: {}", e)))?;
-                let partial_aggs_json = if outcome.partial_aggs.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![
-                        crate::search::encode_partial_aggs(&outcome.partial_aggs)
-                            .map_err(|e| Status::internal(format!("encode partial aggs: {}", e)))?,
-                    ]
-                };
-                Ok(RemoteStoreSplitSearchResult {
-                    split_id: outcome.split_id,
-                    success: outcome.error.is_none(),
-                    hits,
-                    total_hits: outcome.total_hits as u64,
-                    partial_aggs_json,
-                    error: outcome.error.unwrap_or_default(),
-                })
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
+        let mut results = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            let mut hits = Vec::with_capacity(outcome.hits.len());
+            for value in outcome.hits {
+                hits.push(SearchHit {
+                    source_json: serde_json::to_vec(&value).map_err(|e| {
+                        Status::internal(format!("serialize remote_store hit: {}", e))
+                    })?,
+                });
+            }
+            let partial_aggs_json = if outcome.partial_aggs.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    crate::search::encode_partial_aggs(&outcome.partial_aggs)
+                        .map_err(|e| Status::internal(format!("encode partial aggs: {}", e)))?,
+                ]
+            };
+            results.push(RemoteStoreSplitSearchResult {
+                split_id: outcome.split_id,
+                success: outcome.error.is_none(),
+                hits,
+                total_hits: outcome.total_hits as u64,
+                partial_aggs_json,
+                error: outcome.error.unwrap_or_default(),
+            });
+        }
 
         Ok(Response::new(RemoteStoreSearchResponse { results }))
     }
@@ -2455,18 +2458,23 @@ pub fn create_transport_service_with_raft(
     task_manager: Arc<crate::tasks::TaskManager>,
     local_node_id: String,
 ) -> InternalTransportServer<TransportService> {
-    let storage_manager = Arc::new(
-        crate::storage::StorageManager::new_in_path(shard_manager.data_dir())
-            .unwrap_or_else(|error| panic!("create default remote_store storage manager: {error}")),
-    );
+    let remote_store_resources = RemoteStoreTransportResources {
+        storage_manager: Arc::new(
+            crate::storage::StorageManager::new_in_path(shard_manager.data_dir()).unwrap_or_else(
+                |error| panic!("create default remote_store storage manager: {error}"),
+            ),
+        ),
+        remote_store_reader_cache: Arc::new(
+            crate::engine::remote_store::RemoteSplitReaderCache::default(),
+        ),
+    };
     create_transport_service_with_raft_and_storage(
         cluster_manager,
         shard_manager,
         transport_client,
         raft,
         task_manager,
-        storage_manager,
-        Arc::new(crate::engine::remote_store::RemoteSplitReaderCache::default()),
+        remote_store_resources,
         local_node_id,
     )
 }
@@ -2477,16 +2485,15 @@ pub fn create_transport_service_with_raft_and_storage(
     transport_client: crate::transport::TransportClient,
     raft: Arc<RaftInstance>,
     task_manager: Arc<crate::tasks::TaskManager>,
-    storage_manager: Arc<crate::storage::StorageManager>,
-    remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
+    remote_store_resources: RemoteStoreTransportResources,
     local_node_id: String,
 ) -> InternalTransportServer<TransportService> {
     let service = TransportService {
         cluster_manager,
         shard_manager,
         transport_client,
-        storage_manager,
-        remote_store_reader_cache,
+        storage_manager: remote_store_resources.storage_manager,
+        remote_store_reader_cache: remote_store_resources.remote_store_reader_cache,
         raft: Some(raft),
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),

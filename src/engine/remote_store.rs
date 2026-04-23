@@ -488,7 +488,7 @@ fn assign_remote_store_splits(
             })
             .collect();
         candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        let window_len = candidates.len().min(REMOTE_STORE_RENDEZVOUS_WINDOW).max(1);
+        let window_len = candidates.len().clamp(1, REMOTE_STORE_RENDEZVOUS_WINDOW);
 
         let mut best: Option<(String, u8, u64, usize, u32)> = None;
         for (node_id, score) in candidates.iter().take(window_len) {
@@ -543,13 +543,15 @@ struct RemoteStoreRoundOutcome {
     made_progress: bool,
 }
 
+type RemoteStoreBatchResult = (
+    String,
+    Vec<AssignedRemoteSplit>,
+    std::result::Result<Vec<LeafSplitSearchOutcome>, anyhow::Error>,
+);
+
 fn apply_remote_store_batch_results(
     index_name: &str,
-    batch_results: Vec<(
-        String,
-        Vec<AssignedRemoteSplit>,
-        std::result::Result<Vec<LeafSplitSearchOutcome>, anyhow::Error>,
-    )>,
+    batch_results: Vec<RemoteStoreBatchResult>,
     split_lookup: &HashMap<String, AssignedRemoteSplit>,
     accumulator: &mut RemoteStoreSearchAccumulator,
 ) -> RemoteStoreRoundOutcome {
