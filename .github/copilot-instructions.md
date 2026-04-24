@@ -107,7 +107,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1107 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 63 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1318 total
+- 1107 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 65 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1320 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -387,7 +387,7 @@ if let Some(ref raft) = state.raft {
 }
 ```
 
-- `engine` may be passed either as a string (`"local_shards"` / `"remote_store"`) or as an object (`{"type":"remote_store"}`) in the create body parser. `remote_store` indices are shardless and served from manifests published to the configured object store; `POST /{index}/_search` now schedules split batches onto data-node leaves using rendezvous ranking plus cache/load signals, inserts via the standard `_doc` / `_bulk` write paths still return 501, and `POST /{index}/_remote_store/publish` builds and uploads split bundles (local or S3) for the queryable read path.
+- `engine` may be passed either as a string (`"local_shards"` / `"remote_store"`) or as an object (`{"type":"remote_store"}`) in the create body parser. `remote_store` indices are shardless and served from manifests published to the configured object store; `POST /{index}/_search`, query-string `GET /{index}/_search?q=...`, and match-all `GET/POST /{index}/_count` route through the manifest-backed read path, inserts via the standard `_doc` / `_bulk` write paths still return 501, and `POST /{index}/_remote_store/publish` builds and uploads split bundles (local or S3) for the queryable read path.
 
 ## Search & Query DSL (src/search/mod.rs)
 

@@ -94,6 +94,26 @@ async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode
         }
     };
 
+    if matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    ) {
+        return match count_remote_store_docs_from_manifest(state, index_name, &metadata).await {
+            Ok((count, successful, failed)) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "count": count,
+                    "_shards": {
+                        "total": successful + failed,
+                        "successful": successful,
+                        "failed": failed
+                    }
+                })),
+            ),
+            Err(err) => err,
+        };
+    }
+
     let (count, successful, failed) = count_docs_from_metadata(state, index_name, &metadata).await;
 
     (
@@ -107,6 +127,43 @@ async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode
             }
         })),
     )
+}
+
+async fn count_remote_store_docs_from_manifest(
+    state: &AppState,
+    index_name: &str,
+    metadata: &crate::cluster::state::IndexMetadata,
+) -> Result<(u64, u32, u32), (StatusCode, Json<Value>)> {
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let manifest = match state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .await
+    {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return Ok((0, 0, 0)),
+        Err(error) => {
+            tracing::error!(
+                "remote_store: failed to load current manifest for {} ({}): {}",
+                index_name,
+                metadata.uuid.as_str(),
+                error
+            );
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_manifest_exception",
+                format!("failed to load manifest: {}", error),
+            ));
+        }
+    };
+
+    let (count, successful) = manifest
+        .published_splits()
+        .fold((0u64, 0u32), |(doc_count, split_count), split| {
+            (doc_count + split.doc_count, split_count + 1)
+        });
+
+    Ok((count, successful, 0))
 }
 
 #[derive(Deserialize)]
@@ -219,6 +276,26 @@ fn default_size() -> usize {
     10
 }
 
+fn query_string_search_request(params: &SearchParams) -> crate::search::SearchRequest {
+    let query = if params.q == "*" {
+        crate::search::QueryClause::MatchAll(serde_json::json!({}))
+    } else {
+        crate::search::QueryClause::Match(HashMap::from([(
+            "body".to_string(),
+            Value::String(params.q.clone()),
+        )]))
+    };
+
+    crate::search::SearchRequest {
+        query,
+        size: params.size,
+        from: params.from,
+        knn: None,
+        sort: vec![],
+        aggs: HashMap::new(),
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct SqlQueryRequest {
     #[serde(default)]
@@ -248,6 +325,47 @@ pub async fn search_documents(
             );
         }
     };
+
+    if matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    ) {
+        let search_req = query_string_search_request(&params);
+        let result = match crate::api::index::execute_distributed_dsl_search(
+            &state,
+            &index_name,
+            &search_req,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => return err,
+        };
+
+        crate::metrics::SEARCH_QUERIES_TOTAL.inc();
+
+        let paginated: Vec<_> = result
+            .all_hits
+            .into_iter()
+            .skip(search_req.from)
+            .take(search_req.size)
+            .collect();
+
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "_shards": {
+                    "total": result.successful_shards + result.failed_shards,
+                    "successful": result.successful_shards,
+                    "failed": result.failed_shards
+                },
+                "hits": {
+                    "total": { "value": result.total_hits, "relation": "eq" },
+                    "hits": paginated
+                }
+            })),
+        );
+    }
 
     let mut all_hits = Vec::new();
     let mut successful_shards = 0u32;

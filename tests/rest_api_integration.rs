@@ -3211,6 +3211,85 @@ async fn remote_store_search_returns_hits_from_published_split() -> Result<()> {
 }
 
 #[tokio::test]
+async fn remote_store_query_string_search_returns_hits_from_published_split() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, _body) = harness
+        .put_json(
+            "/remotequery",
+            json!({
+                "engine": "remote_store"
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remotequery/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-1", "title": "warm remote store hit", "body": "first published split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+
+    let (search_status, search_body) = harness.get_json("/remotequery/_search?q=warm").await?;
+    assert_eq!(search_status, StatusCode::OK);
+    assert_eq!(search_body["_shards"]["successful"], json!(1));
+    assert_eq!(search_body["_shards"]["failed"], json!(0));
+    assert_eq!(search_body["hits"]["total"]["value"], json!(1));
+    assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("doc-1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_count_match_all_uses_manifest_doc_counts() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, _body) = harness
+        .put_json(
+            "/remotecount",
+            json!({
+                "engine": "remote_store"
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remotecount/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-1", "title": "warm remote store hit", "body": "first published split" },
+                    { "_id": "doc-2", "title": "second remote hit", "body": "same split second doc" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+
+    let (count_status, count_body) = harness
+        .post_json(
+            "/remotecount/_count",
+            json!({
+                "query": { "match_all": {} }
+            }),
+        )
+        .await?;
+    assert_eq!(count_status, StatusCode::OK);
+    assert_eq!(count_body["count"], json!(2));
+    assert_eq!(count_body["_shards"]["successful"], json!(1));
+    assert_eq!(count_body["_shards"]["failed"], json!(0));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_store_search_fans_out_from_master_only_coordinator() -> Result<()> {
     let harness =
         MultiNodeRestHarness::start_three_nodes_with_shared_remote_store(vec![NodeRole::Master])
