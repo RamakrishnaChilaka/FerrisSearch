@@ -80,7 +80,7 @@ Every SQL response tells you how the planner executed the query:
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1318 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
+- **Test depth** — 1320 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
 
 ## Tech Stack
 
@@ -285,7 +285,8 @@ curl -X PUT 'http://localhost:9200/movies/_settings' -H 'Content-Type: applicati
 
 `flush_threshold_bytes` is a per-index WAL auto-flush threshold. The default is `536870912` (512 MB). Setting it to `0` disables automatic background flushes.
 Background auto-flush is best-effort: it skips the tick while the shard is busy ingesting or persisting vectors instead of blocking live writes, and the maintenance tick itself runs on blocking threads so compaction does not stall Raft heartbeats.
-`engine` is immutable after index creation. `local_shards` is the default. `remote_store` is a shardless engine served from split bundles published to the configured object store (local or `s3://`); `POST /{index}/_search` now schedules published splits across data-node leaves, reuses node-local cached readers when warm, and reaps stale or over-budget cached artifacts after search batches. Writes go through `POST /{index}/_remote_store/publish`. Direct `_doc` / `_bulk` writes against `remote_store` indices still return `501 Not Implemented`.
+`engine` is immutable after index creation. `local_shards` is the default. `remote_store` is a shardless engine served from split bundles published to the configured object store (local or `s3://`); `POST /{index}/_search`, `GET /{index}/_search?q=...`, and match-all `GET/POST /{index}/_count` all route through the manifest-backed remote_store read path, reuse node-local cached readers when warm, and reap stale or over-budget cached artifacts after search batches. Writes go through `POST /{index}/_remote_store/publish`. Direct `_doc` / `_bulk` writes against `remote_store` indices still return `501 Not Implemented`.
+For a real RustFS-backed release-cluster validation flow, see [docs/remote-store-rustfs-live-runbook.md](/home/rchilaka/ROpenSearch/docs/remote-store-rustfs-live-runbook.md). For an isolated scripted smoke run, use `./scripts/remote_store_rustfs_smoke.sh`.
 
 **Field types:** `text`, `keyword`, `integer`, `float`, `boolean`, `date`, `knn_vector`. Unmapped fields are auto-detected on first document.
 
@@ -538,13 +539,14 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1318 tests
+cargo test                                      # All 1320 tests
 cargo test --lib                                # Unit tests (1107)
 cargo test --bin ferris-cli                      # CLI tests (68)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (44)
+cargo test --test rest_api_integration           # REST API (65)
+cargo test --test remote_store_s3_integration    # remote_store S3-compatible storage ops (6, requires FERRIS_RUSTFS_ENDPOINT)
 cargo test --test restart_regression             # Real 3-node flush + restart regression (1)
 cargo test --test sql_correctness                # SQL correctness (1 test, 180 sqllogictest assertions)
 ```
