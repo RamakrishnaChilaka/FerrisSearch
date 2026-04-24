@@ -612,6 +612,8 @@ scripts/           Ingestion and benchmark scripts
 ### Next
 
 - [ ] Adaptive shard top-K auto mode for grouped analytics — replace the static `sql_approximate_top_k` boolean with `off | auto | force`, runtime activation thresholds, and EXPLAIN visibility for why shard pruning was or was not applied; design in [docs/adaptive-top-k-auto-mode.md](docs/adaptive-top-k-auto-mode.md)
+- [ ] Remote-store split pruning — reduce `remote_store` fan-out by pruning published splits from manifest field summaries before rendezvous scheduling and leaf RPC dispatch; design in [docs/remote-store-split-pruning.md](docs/remote-store-split-pruning.md)
+- [ ] Richer EXPLAIN / EXPLAIN ANALYZE output — add execution-mode eligibility reasons, runtime collection counters, and remote-store-specific analysis blocks while preserving the current JSON contract; design in [docs/explain-analyze-output.md](docs/explain-analyze-output.md)
 - [ ] Time functions for mapped `date` fields — support SQL temporal functions such as `date_trunc`, `extract`, `now()`, and timezone-aware bucketing/filtering without forcing queries onto the generic fallback path
 - [ ] Branch-aware boolean lowering for `text_match()` inside `OR` / complex expressions — today `text_match()` must remain a top-level `AND` predicate because residual SQL/DataFusion cannot evaluate it; future support must lower the full boolean subtree into Tantivy instead of leaving residual `text_match()` work behind
 - [ ] Streaming fast-field TableProvider — custom DataFusion `TableProvider` reading Tantivy fast fields as streaming Arrow batches (8K rows/batch), eliminating the GROUP BY scan limit entirely
