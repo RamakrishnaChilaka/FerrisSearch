@@ -579,6 +579,7 @@ pub async fn explain_sql(
             if let Some(key_count) = result.semijoin_key_count {
                 explain["semijoin"]["resolved_key_count"] = serde_json::json!(key_count);
             }
+            insert_remote_store_stats(&mut explain, result.remote_store_stats.as_ref());
             (StatusCode::OK, Json(explain))
         }
         Err(err) => err,
@@ -597,6 +598,7 @@ struct SqlExecutionResult {
     streaming_used: bool,
     truncated: bool,
     semijoin_key_count: Option<usize>,
+    remote_store_stats: Option<crate::api::index::RemoteStoreSearchStats>,
     timings: crate::hybrid::SqlTimings,
 }
 
@@ -619,7 +621,17 @@ struct SqlStreamMeta {
     successful_shards: u32,
     failed_shards: u32,
     columns: Vec<String>,
+    remote_store_stats: Option<crate::api::index::RemoteStoreSearchStats>,
     timings: Option<crate::hybrid::SqlTimings>,
+}
+
+fn insert_remote_store_stats(
+    body: &mut Value,
+    stats: Option<&crate::api::index::RemoteStoreSearchStats>,
+) {
+    if let Some(stats) = stats {
+        body["remote_store"] = stats.to_response_json();
+    }
 }
 
 enum RemoteSqlPartitionResult {
@@ -1160,6 +1172,7 @@ async fn execute_sql_query_with_plan(
             streaming_used: false,
             truncated: false,
             semijoin_key_count,
+            remote_store_stats: None,
             timings: crate::hybrid::SqlTimings {
                 planning_ms,
                 semijoin_ms,
@@ -1242,6 +1255,7 @@ async fn execute_sql_query_with_plan(
             streaming_used: false,
             truncated: false,
             semijoin_key_count,
+            remote_store_stats: distributed.remote_store_stats.clone(),
             timings: crate::hybrid::SqlTimings {
                 planning_ms,
                 semijoin_ms,
@@ -1264,10 +1278,14 @@ async fn execute_sql_query_with_plan(
     .await;
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
+    let is_remote_store = matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    );
 
     // Fast-field path: collect direct SQL partitions from local + remote shards
     let search_start = Instant::now();
-    let direct_sql = if !plan.selects_all_columns {
+    let direct_sql = if !plan.selects_all_columns && !is_remote_store {
         match collect_direct_sql_partitions(
             state,
             &plan.index_name,
@@ -1304,6 +1322,7 @@ async fn execute_sql_query_with_plan(
         successful_shards,
         failed_shards,
         execution_mode,
+        remote_store_stats,
     ) = if let Some(direct_sql) = direct_sql {
         let sql_result = match crate::hybrid::execute_planned_sql_partitions(
             &plan,
@@ -1329,6 +1348,7 @@ async fn execute_sql_query_with_plan(
             direct_sql.successful_shards,
             direct_sql.failed_shards,
             "tantivy_fast_fields",
+            None,
         )
     } else {
         let distributed = match crate::api::index::execute_distributed_dsl_search(
@@ -1366,6 +1386,7 @@ async fn execute_sql_query_with_plan(
             distributed.successful_shards,
             distributed.failed_shards,
             "materialized_hits_fallback",
+            distributed.remote_store_stats.clone(),
         )
     };
     let datafusion_ms = datafusion_start.elapsed().as_secs_f64() * 1000.0;
@@ -1413,6 +1434,7 @@ async fn execute_sql_query_with_plan(
         streaming_used,
         truncated,
         semijoin_key_count,
+        remote_store_stats,
         timings: crate::hybrid::SqlTimings {
             planning_ms,
             semijoin_ms,
@@ -1474,7 +1496,7 @@ fn planner_metadata_json(plan: &crate::hybrid::planner::QueryPlan) -> Value {
 }
 
 fn sql_response_body(result: &SqlExecutionResult) -> Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "execution_mode": result.execution_mode,
         "approximate_top_k": result.approximate_top_k,
         "streaming_used": result.streaming_used,
@@ -1488,7 +1510,9 @@ fn sql_response_body(result: &SqlExecutionResult) -> Value {
         "matched_hits": result.matched_hits,
         "columns": result.sql_result.columns,
         "rows": result.sql_result.rows,
-    })
+    });
+    insert_remote_store_stats(&mut body, result.remote_store_stats.as_ref());
+    body
 }
 
 fn sql_stream_response_body(result: &SqlExecutionResult) -> Value {
@@ -1503,6 +1527,7 @@ fn sql_stream_response_body(result: &SqlExecutionResult) -> Value {
             successful_shards: result.successful_shards,
             failed_shards: result.failed_shards,
             columns: result.sql_result.columns.clone(),
+            remote_store_stats: result.remote_store_stats.clone(),
             timings: Some(result.timings.clone()),
         },
     );
@@ -1532,6 +1557,7 @@ fn sql_stream_meta_json(plan: &crate::hybrid::QueryPlan, meta: SqlStreamMeta) ->
         "matched_hits": meta.matched_hits,
         "columns": meta.columns,
     });
+    insert_remote_store_stats(&mut body, meta.remote_store_stats.as_ref());
 
     if let Some(timings) = meta.timings {
         match serde_json::to_value(timings) {
@@ -1674,6 +1700,15 @@ async fn execute_sql_stream_query(
         }
     };
     let plan = canonicalize_sql_plan_fields(plan, &metadata.mappings)?;
+    let is_remote_store = matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    );
+
+    if is_remote_store {
+        let result = execute_sql_query(state, index_name, query).await?;
+        return Ok(stream_json_response(sql_stream_response_body(&result)));
+    }
 
     let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
     if plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback {
@@ -1770,6 +1805,7 @@ async fn execute_sql_stream_query(
                 successful_shards: direct_sql.successful_shards,
                 failed_shards: direct_sql.failed_shards,
                 columns,
+                remote_store_stats: None,
                 timings: None,
             },
         ),

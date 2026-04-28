@@ -3713,6 +3713,80 @@ async fn remote_store_unsupported_match_query_reports_no_split_pruning() -> Resu
 }
 
 #[tokio::test]
+async fn remote_store_sql_explain_analyze_reports_pruning_counters() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/remotesqlexplain",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "status": { "type": "keyword" },
+                        "title": { "type": "keyword" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remotesqlexplain/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-error", "status": "error", "title": "matching split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remotesqlexplain/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-ok", "status": "ok", "title": "pruned split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+
+    let (explain_status, explain_body) = harness
+        .post_json(
+            "/remotesqlexplain/_sql/explain",
+            json!({
+                "query": "SELECT title FROM remotesqlexplain WHERE status = 'error'",
+                "analyze": true
+            }),
+        )
+        .await?;
+    assert_eq!(explain_status, StatusCode::OK, "{explain_body}");
+    assert_eq!(
+        explain_body["execution_mode"],
+        json!("materialized_hits_fallback")
+    );
+    assert_eq!(explain_body["matched_hits"], json!(1));
+    assert_eq!(explain_body["row_count"], json!(1));
+    assert_eq!(explain_body["rows"][0]["title"], json!("matching split"));
+    assert!(explain_body["timings"]["total_ms"].as_f64().unwrap() > 0.0);
+    assert_eq!(
+        explain_body["remote_store"]["pruning"],
+        json!({
+            "published_splits": 2,
+            "candidate_splits": 1,
+            "pruned_splits": 1,
+            "assigned_splits": 1
+        })
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_store_search_fans_out_from_master_only_coordinator() -> Result<()> {
     let harness =
         MultiNodeRestHarness::start_three_nodes_with_shared_remote_store(vec![NodeRole::Master])

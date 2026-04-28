@@ -109,6 +109,7 @@ applyTo: "src/hybrid/**,src/api/search.rs,src/engine/tantivy.rs"
 - `POST /{index}/_sql/explain` with `"analyze": true` executes the query and returns plan + per-stage timings + result rows.
 - `SqlTimings` struct in `src/hybrid/mod.rs`: `planning_ms`, `search_ms`, `collect_ms`, `merge_ms`, `datafusion_ms`, `total_ms` (fractional milliseconds, `f64`).
 - `execute_sql_query()` in `src/api/search.rs` is the shared internal function used by both `search_sql` and `explain_sql(analyze=true)`. Timing instrumentation is in this one place.
+- Remote_store SQL paths that execute through manifest-backed distributed search carry `remote_store.pruning` into SQL responses, streamed buffered meta frames, and EXPLAIN ANALYZE output. Explicit-column remote_store SQL must not use shard-routed direct fast-field partitions because remote_store indices are shardless.
 - The `search_sql` handler is a thin response formatter over `execute_sql_query()`.
 - Without `"analyze": true`, `explain_sql` returns plan-only (no execution, no timings, no rows) — unchanged from the original behavior.
 

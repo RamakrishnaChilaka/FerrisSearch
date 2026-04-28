@@ -233,6 +233,49 @@ async fn search_sql_uses_materialized_hits_fallback_for_select_star() {
     assert_eq!(body["matched_hits"], 3);
 }
 
+#[test]
+fn sql_response_body_includes_remote_store_pruning_stats_when_present() {
+    let plan = crate::hybrid::planner::plan_sql(
+        "products",
+        "SELECT title FROM products WHERE brand = 'Apple'",
+    )
+    .unwrap();
+    let result = SqlExecutionResult {
+        plan,
+        sql_result: crate::hybrid::SqlQueryResult {
+            columns: vec!["title".to_string()],
+            rows: vec![json!({ "title": "iPhone" })],
+        },
+        matched_hits: 1,
+        successful_shards: 1,
+        failed_shards: 0,
+        execution_mode: "materialized_hits_fallback",
+        approximate_top_k: false,
+        streaming_used: false,
+        truncated: false,
+        semijoin_key_count: None,
+        remote_store_stats: Some(crate::api::index::RemoteStoreSearchStats {
+            published_splits: 2,
+            candidate_splits: 1,
+            pruned_splits: 1,
+            assigned_splits: 1,
+        }),
+        timings: crate::hybrid::SqlTimings::default(),
+    };
+
+    let body = sql_response_body(&result);
+
+    assert_eq!(
+        body["remote_store"]["pruning"],
+        json!({
+            "published_splits": 2,
+            "candidate_splits": 1,
+            "pruned_splits": 1,
+            "assigned_splits": 1
+        })
+    );
+}
+
 #[tokio::test]
 async fn explain_sql_returns_plan_without_executing() {
     let (_tmp, state) = make_test_app_state("products").await;
