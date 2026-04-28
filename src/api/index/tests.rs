@@ -7,6 +7,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
+fn remote_store_search_stats_response_json_contains_pruning_counters() {
+    let stats = RemoteStoreSearchStats {
+        published_splits: 5,
+        candidate_splits: 2,
+        pruned_splits: 3,
+        assigned_splits: 2,
+    };
+
+    assert_eq!(
+        stats.to_response_json(),
+        serde_json::json!({
+            "pruning": {
+                "published_splits": 5,
+                "candidate_splits": 2,
+                "pruned_splits": 3,
+                "assigned_splits": 2,
+            }
+        })
+    );
+}
+
+#[test]
 fn parse_opensearch_ndjson_format() {
     let input = r#"{"index":{"_index":"my-index","_id":"1"}}
 {"title":"Hello","year":2024}

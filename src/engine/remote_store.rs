@@ -30,7 +30,7 @@ use murmur3::murmur3_32;
 use serde_json::Value;
 
 use crate::api::AppState;
-use crate::api::index::DistributedDslSearchResult;
+use crate::api::index::{DistributedDslSearchResult, RemoteStoreSearchStats};
 use crate::cluster::state::{FieldMapping, FieldType, IndexMetadata};
 use crate::engine::SearchEngine;
 use crate::search::{PartialAggResult, QueryClause, RangeCondition, SearchRequest};
@@ -1085,6 +1085,7 @@ pub(crate) async fn search(
                 failed_shards: 0,
                 aggregations: HashMap::new(),
                 partial_aggs: Vec::new(),
+                remote_store_stats: Some(RemoteStoreSearchStats::default()),
             });
         }
         Err(e) => {
@@ -1103,11 +1104,18 @@ pub(crate) async fn search(
     };
 
     let pruning_predicate = build_split_pruning_predicate(&search_req.query, &metadata.mappings);
+    let published_split_count = manifest.published_splits().count();
     let split_plans: Vec<_> = manifest
         .published_splits()
         .filter(|split| split_matches_pruning_predicate(split, &pruning_predicate))
         .map(AssignedRemoteSplit::from_manifest)
         .collect();
+    let mut remote_store_stats = RemoteStoreSearchStats {
+        published_splits: published_split_count,
+        candidate_splits: split_plans.len(),
+        pruned_splits: published_split_count.saturating_sub(split_plans.len()),
+        assigned_splits: 0,
+    };
     if split_plans.is_empty() {
         return Ok(DistributedDslSearchResult {
             all_hits: Vec::new(),
@@ -1116,6 +1124,7 @@ pub(crate) async fn search(
             failed_shards: 0,
             aggregations: HashMap::new(),
             partial_aggs: Vec::new(),
+            remote_store_stats: Some(remote_store_stats),
         });
     }
 
@@ -1164,6 +1173,7 @@ pub(crate) async fn search(
     let mut unhealthy_nodes = HashSet::new();
     let mut accumulator = RemoteStoreSearchAccumulator::default();
     let mut failed = 0u32;
+    let mut assigned_split_ids = HashSet::new();
 
     while !pending_splits.is_empty() {
         let assignments = assign_remote_store_splits(
@@ -1177,6 +1187,9 @@ pub(crate) async fn search(
         if assignments.is_empty() {
             failed += pending_splits.len() as u32;
             break;
+        }
+        for split in assignments.values().flatten() {
+            assigned_split_ids.insert(split.split_id.clone());
         }
 
         let mut work = Vec::new();
@@ -1252,6 +1265,7 @@ pub(crate) async fn search(
         }
         pending_splits = dedupe_pending_splits(round.next_pending);
     }
+    remote_store_stats.assigned_splits = assigned_split_ids.len();
 
     let all_hits =
         crate::search::merge_sorted_hit_lists(accumulator.split_hit_lists, &search_req.sort);
@@ -1268,6 +1282,7 @@ pub(crate) async fn search(
         failed_shards: failed,
         aggregations,
         partial_aggs: accumulator.partial_aggs,
+        remote_store_stats: Some(remote_store_stats),
     })
 }
 

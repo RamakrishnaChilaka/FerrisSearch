@@ -139,7 +139,7 @@ Bulk routes intentionally disable Axum's default buffered request-body limit so 
 | POST | `/_sql` | `global_sql()` — global SQL endpoint: SHOW TABLES, DESCRIBE, SHOW CREATE TABLE, and SELECT (index auto-extracted from FROM clause) |
 | POST | `/_sql/stream` | `global_sql_stream()` — global NDJSON SQL stream endpoint |
 
-For `remote_store` indices, `GET /{index}/_search?q=...` and match-all `GET/POST /{index}/_count` must not derive work from `shard_routing` because the engine is shardless. Route those entry points through the same manifest + split execution path used by DSL `POST /{index}/_search`, and keep query-string search aligned with the existing catch-all `body` search semantics.
+For `remote_store` indices, `GET /{index}/_search?q=...` and match-all `GET/POST /{index}/_count` must not derive work from `shard_routing` because the engine is shardless. Route those entry points through the same manifest + split execution path used by DSL `POST /{index}/_search`, and keep query-string search aligned with the existing catch-all `body` search semantics. Search responses for remote_store indices include `remote_store.pruning` with `published_splits`, `candidate_splits`, `pruned_splits`, and `assigned_splits`; local_shards responses should not grow this block.
 
 ### Global SQL Endpoint
 - `POST /_sql` handles SQL commands that don't require an index in the URL path.

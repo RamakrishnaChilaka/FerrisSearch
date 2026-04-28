@@ -38,6 +38,28 @@ pub(crate) struct DistributedDslSearchResult {
     pub failed_shards: u32,
     pub aggregations: HashMap<String, Value>,
     pub partial_aggs: Vec<HashMap<String, crate::search::PartialAggResult>>,
+    pub remote_store_stats: Option<RemoteStoreSearchStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RemoteStoreSearchStats {
+    pub published_splits: usize,
+    pub candidate_splits: usize,
+    pub pruned_splits: usize,
+    pub assigned_splits: usize,
+}
+
+impl RemoteStoreSearchStats {
+    pub(crate) fn to_response_json(&self) -> Value {
+        serde_json::json!({
+            "pruning": {
+                "published_splits": self.published_splits,
+                "candidate_splits": self.candidate_splits,
+                "pruned_splits": self.pruned_splits,
+                "assigned_splits": self.assigned_splits,
+            }
+        })
+    }
 }
 
 pub(crate) async fn ensure_local_index_shards_open(
@@ -807,6 +829,7 @@ pub(crate) async fn execute_distributed_dsl_search(
         failed_shards: failed,
         aggregations: merged_aggs,
         partial_aggs: all_partial_aggs,
+        remote_store_stats: None,
     })
 }
 
@@ -855,6 +878,9 @@ pub async fn search_documents_dsl(
     });
     if !result.aggregations.is_empty() {
         response["aggregations"] = serde_json::json!(result.aggregations);
+    }
+    if let Some(stats) = result.remote_store_stats {
+        response["remote_store"] = stats.to_response_json();
     }
 
     (StatusCode::OK, Json(response))

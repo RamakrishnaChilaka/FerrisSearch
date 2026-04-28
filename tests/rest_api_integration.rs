@@ -3242,6 +3242,15 @@ async fn remote_store_query_string_search_returns_hits_from_published_split() ->
     assert_eq!(search_body["_shards"]["failed"], json!(0));
     assert_eq!(search_body["hits"]["total"]["value"], json!(1));
     assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("doc-1"));
+    assert_eq!(
+        search_body["remote_store"]["pruning"],
+        json!({
+            "published_splits": 1,
+            "candidate_splits": 1,
+            "pruned_splits": 0,
+            "assigned_splits": 1
+        })
+    );
 
     Ok(())
 }
@@ -3473,6 +3482,15 @@ async fn remote_store_term_filter_prunes_unmatched_split_before_cache_fetch() ->
     assert_eq!(search_body["_shards"]["failed"], json!(0));
     assert_eq!(search_body["hits"]["total"]["value"], json!(1));
     assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("doc-error"));
+    assert_eq!(
+        search_body["remote_store"]["pruning"],
+        json!({
+            "published_splits": 2,
+            "candidate_splits": 1,
+            "pruned_splits": 1,
+            "assigned_splits": 1
+        })
+    );
 
     assert!(
         harness
@@ -3589,6 +3607,15 @@ async fn remote_store_range_filter_prunes_unmatched_split_before_cache_fetch() -
     assert_eq!(search_body["_shards"]["failed"], json!(0));
     assert_eq!(search_body["hits"]["total"]["value"], json!(1));
     assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("doc-high"));
+    assert_eq!(
+        search_body["remote_store"]["pruning"],
+        json!({
+            "published_splits": 2,
+            "candidate_splits": 1,
+            "pruned_splits": 1,
+            "assigned_splits": 1
+        })
+    );
 
     assert!(
         harness
@@ -3612,6 +3639,74 @@ async fn remote_store_range_filter_prunes_unmatched_split_before_cache_fetch() -
             )
             .artifact_cached,
         "pruned split should not be fetched into the node-local cache"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_unsupported_match_query_reports_no_split_pruning() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/remoteprunematch",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "text" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remoteprunematch/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-match", "title": "matching split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remoteprunematch/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-other", "title": "other split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+
+    let (search_status, search_body) = harness
+        .post_json(
+            "/remoteprunematch/_search",
+            json!({
+                "query": { "match": { "title": "matching" } }
+            }),
+        )
+        .await?;
+    assert_eq!(search_status, StatusCode::OK, "{search_body}");
+    assert_eq!(search_body["_shards"]["successful"], json!(2));
+    assert_eq!(search_body["_shards"]["failed"], json!(0));
+    assert_eq!(search_body["hits"]["total"]["value"], json!(1));
+    assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("doc-match"));
+    assert_eq!(
+        search_body["remote_store"]["pruning"],
+        json!({
+            "published_splits": 2,
+            "candidate_splits": 2,
+            "pruned_splits": 0,
+            "assigned_splits": 2
+        })
     );
 
     Ok(())
