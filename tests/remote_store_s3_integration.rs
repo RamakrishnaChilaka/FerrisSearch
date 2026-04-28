@@ -81,6 +81,8 @@ fn sample_manifest(index_uuid: &str, generation: u64) -> RemoteStoreManifest {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         }],
     }
 }
@@ -167,6 +169,8 @@ async fn s3_backend_append_split_and_publish_bumps_generation() {
         hotcache_bytes: None,
         time_range: None,
         tags: BTreeMap::new(),
+        field_ranges: BTreeMap::new(),
+        field_terms: BTreeMap::new(),
     };
     let m1 = manager
         .append_split_and_publish(&index_uuid, "events", "sha256:v1", None, first_split)
@@ -188,6 +192,8 @@ async fn s3_backend_append_split_and_publish_bumps_generation() {
         hotcache_bytes: None,
         time_range: None,
         tags: BTreeMap::new(),
+        field_ranges: BTreeMap::new(),
+        field_terms: BTreeMap::new(),
     };
     let m2 = manager
         .append_split_and_publish(&index_uuid, "events", "sha256:v1", None, second_split)
@@ -257,6 +263,8 @@ async fn s3_backend_append_rejects_schema_mismatch() {
         hotcache_bytes: None,
         time_range: None,
         tags: BTreeMap::new(),
+        field_ranges: BTreeMap::new(),
+        field_terms: BTreeMap::new(),
     };
     manager
         .append_split_and_publish(&index_uuid, "events", "sha256:v1", None, split.clone())
@@ -318,6 +326,8 @@ async fn s3_backend_upload_fetch_verify_split_roundtrip() {
         hotcache_bytes: None,
         time_range: None,
         tags: BTreeMap::new(),
+        field_ranges: BTreeMap::new(),
+        field_terms: BTreeMap::new(),
     };
 
     // Verify via hash-only path (no local download).
