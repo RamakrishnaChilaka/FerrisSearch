@@ -7,9 +7,10 @@ The first implementation slice is now in place:
 - publish writes exact split summaries into `RemoteSplitManifest.field_ranges` for mapped `integer`, `float`, and `date` fields
 - publish writes exact small distinct sets into `RemoteSplitManifest.field_terms` for mapped `keyword` and `boolean` fields
 - root-side `remote_store` search prunes published splits against supported `term` and `range` filters before rendezvous assignment
+- search responses expose `remote_store.pruning` counters for published, candidate, pruned, and assigned split counts
 - missing or unsupported metadata still keeps the split, preserving correctness
 
-The remaining work in this document is still relevant as follow-up scope: broader predicate coverage, richer explainability, and deeper scheduling/reporting hooks.
+The remaining work in this document is still relevant as follow-up scope: broader predicate coverage, richer EXPLAIN ANALYZE blocks, and deeper scheduling/reporting hooks.
 
 ## Goal
 

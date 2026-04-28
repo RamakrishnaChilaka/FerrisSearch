@@ -351,20 +351,22 @@ pub async fn search_documents(
             .take(search_req.size)
             .collect();
 
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "_shards": {
-                    "total": result.successful_shards + result.failed_shards,
-                    "successful": result.successful_shards,
-                    "failed": result.failed_shards
-                },
-                "hits": {
-                    "total": { "value": result.total_hits, "relation": "eq" },
-                    "hits": paginated
-                }
-            })),
-        );
+        let mut response = serde_json::json!({
+            "_shards": {
+                "total": result.successful_shards + result.failed_shards,
+                "successful": result.successful_shards,
+                "failed": result.failed_shards
+            },
+            "hits": {
+                "total": { "value": result.total_hits, "relation": "eq" },
+                "hits": paginated
+            }
+        });
+        if let Some(stats) = result.remote_store_stats {
+            response["remote_store"] = stats.to_response_json();
+        }
+
+        return (StatusCode::OK, Json(response));
     }
 
     let mut all_hits = Vec::new();
