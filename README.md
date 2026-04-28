@@ -72,7 +72,7 @@ Every SQL response tells you how the planner executed the query:
 - **OpenSearch-compatible REST API** — `PUT /{index}`, `POST /_doc`, `GET /_search`, `POST /_bulk`, async `POST /{index}/_forcemerge`, `GET /_tasks/{task_id}`
 - **Search-aware SQL planner** — `text_match()` with `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and same-index semijoin support
 - **Four execution modes** — `count_star_fast`, `tantivy_fast_fields`, `tantivy_grouped_partials`, and `materialized_hits_fallback`, with `streaming_used` reported whenever the fast-field path streams locally or over gRPC
-- **Engine-ready index metadata** — indices persist a create-time engine selector; `local_shards` is the default, and `remote_store` reads now fan split batches out across data nodes from a shared local or S3-compatible object store with rendezvous-based assignment and node-local split caches
+- **Engine-ready index metadata** — indices persist a create-time engine selector; `local_shards` is the default, and `remote_store` reads now fan split batches out across data nodes from a shared local or S3-compatible object store with rendezvous-based assignment, node-local split caches, and manifest-driven structured split pruning for supported term/range filters
 - **Raft-backed coordination** — leader election, shard routing, and failover for a multi-node cluster
 - **Synchronous shard replication** — primary-replica writes over gRPC with ISR tracking; writes are acknowledged only after all in-sync replicas confirm
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) with hybrid text + vector querying
@@ -80,7 +80,7 @@ Every SQL response tells you how the planner executed the query:
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1320 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
+- **Test depth** — 1325 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
 
 ## Tech Stack
 
@@ -285,7 +285,7 @@ curl -X PUT 'http://localhost:9200/movies/_settings' -H 'Content-Type: applicati
 
 `flush_threshold_bytes` is a per-index WAL auto-flush threshold. The default is `536870912` (512 MB). Setting it to `0` disables automatic background flushes.
 Background auto-flush is best-effort: it skips the tick while the shard is busy ingesting or persisting vectors instead of blocking live writes, and the maintenance tick itself runs on blocking threads so compaction does not stall Raft heartbeats.
-`engine` is immutable after index creation. `local_shards` is the default. `remote_store` is a shardless engine served from split bundles published to the configured object store (local or `s3://`); `POST /{index}/_search`, `GET /{index}/_search?q=...`, and match-all `GET/POST /{index}/_count` all route through the manifest-backed remote_store read path, reuse node-local cached readers when warm, and reap stale or over-budget cached artifacts after search batches. Writes go through `POST /{index}/_remote_store/publish`. Direct `_doc` / `_bulk` writes against `remote_store` indices still return `501 Not Implemented`.
+`engine` is immutable after index creation. `local_shards` is the default. `remote_store` is a shardless engine served from split bundles published to the configured object store (local or `s3://`); `POST /{index}/_search`, `GET /{index}/_search?q=...`, and match-all `GET/POST /{index}/_count` all route through the manifest-backed remote_store read path, reuse node-local cached readers when warm, prune published splits by exact manifest keyword/boolean term sets plus numeric/date min/max summaries for supported structured filters, and reap stale or over-budget cached artifacts after search batches. Writes go through `POST /{index}/_remote_store/publish`. Direct `_doc` / `_bulk` writes against `remote_store` indices still return `501 Not Implemented`.
 For a real RustFS-backed release-cluster validation flow, see [docs/remote-store-rustfs-live-runbook.md](/home/rchilaka/ROpenSearch/docs/remote-store-rustfs-live-runbook.md). For an isolated scripted smoke run, use `./scripts/remote_store_rustfs_smoke.sh`.
 
 **Field types:** `text`, `keyword`, `integer`, `float`, `boolean`, `date`, `knn_vector`. Unmapped fields are auto-detected on first document.
@@ -539,13 +539,13 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1320 tests
-cargo test --lib                                # Unit tests (1107)
+cargo test                                      # All 1325 tests
+cargo test --lib                                # Unit tests (1109)
 cargo test --bin ferris-cli                      # CLI tests (68)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (65)
+cargo test --test rest_api_integration           # REST API (68)
 cargo test --test remote_store_s3_integration    # remote_store S3-compatible storage ops (6, requires FERRIS_RUSTFS_ENDPOINT)
 cargo test --test restart_regression             # Real 3-node flush + restart regression (1)
 cargo test --test sql_correctness                # SQL correctness (1 test, 180 sqllogictest assertions)
@@ -612,7 +612,7 @@ scripts/           Ingestion and benchmark scripts
 ### Next
 
 - [ ] Adaptive shard top-K auto mode for grouped analytics — replace the static `sql_approximate_top_k` boolean with `off | auto | force`, runtime activation thresholds, and EXPLAIN visibility for why shard pruning was or was not applied; design in [docs/adaptive-top-k-auto-mode.md](docs/adaptive-top-k-auto-mode.md)
-- [ ] Remote-store split pruning — reduce `remote_store` fan-out by pruning published splits from manifest field summaries before rendezvous scheduling and leaf RPC dispatch; design in [docs/remote-store-split-pruning.md](docs/remote-store-split-pruning.md)
+- [ ] Remote-store split pruning follow-up — extend the current structured term/range manifest pruning with broader predicate coverage, EXPLAIN visibility, and deeper scheduling/reporting hooks; design in [docs/remote-store-split-pruning.md](docs/remote-store-split-pruning.md)
 - [ ] Richer EXPLAIN / EXPLAIN ANALYZE output — add execution-mode eligibility reasons, runtime collection counters, and remote-store-specific analysis blocks while preserving the current JSON contract; design in [docs/explain-analyze-output.md](docs/explain-analyze-output.md)
 - [ ] Time functions for mapped `date` fields — support SQL temporal functions such as `date_trunc`, `extract`, `now()`, and timezone-aware bucketing/filtering without forcing queries onto the generic fallback path
 - [ ] Branch-aware boolean lowering for `text_match()` inside `OR` / complex expressions — today `text_match()` must remain a top-level `AND` predicate because residual SQL/DataFusion cannot evaluate it; future support must lower the full boolean subtree into Tantivy instead of leaving residual `text_match()` work behind

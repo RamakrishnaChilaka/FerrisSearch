@@ -15,7 +15,7 @@
 //!   mappings on load (`remote_store` rejects writes so mappings cannot
 //!   change after creation).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::{
     Arc, RwLock,
@@ -31,9 +31,11 @@ use serde_json::Value;
 
 use crate::api::AppState;
 use crate::api::index::DistributedDslSearchResult;
-use crate::cluster::state::IndexMetadata;
+use crate::cluster::state::{FieldMapping, FieldType, IndexMetadata};
 use crate::engine::SearchEngine;
-use crate::search::{PartialAggResult, SearchRequest};
+use crate::search::{PartialAggResult, QueryClause, RangeCondition, SearchRequest};
+
+const REMOTE_STORE_TERM_SUMMARY_CAP: usize = 64;
 
 /// Process-local cache for open remote_store split readers.
 pub struct RemoteSplitReaderCache {
@@ -80,8 +82,61 @@ impl AssignedRemoteSplit {
             hotcache_bytes: None,
             time_range: None,
             tags: std::collections::BTreeMap::new(),
+            field_ranges: std::collections::BTreeMap::new(),
+            field_terms: std::collections::BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct SplitPruningPredicate {
+    terms: Vec<TermPruningClause>,
+    ranges: Vec<RangePruningClause>,
+}
+
+#[derive(Debug)]
+struct TermPruningClause {
+    field: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RangeFieldKind {
+    Integer,
+    Float,
+    Date,
+}
+
+#[derive(Debug)]
+struct RangePruningClause {
+    field: String,
+    kind: RangeFieldKind,
+    lower: Option<RangePruningBound>,
+    upper: Option<RangePruningBound>,
+}
+
+#[derive(Debug)]
+struct RangePruningBound {
+    value: RangePruningValue,
+    inclusive: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RangePruningValue {
+    I64(i64),
+    F64(f64),
+}
+
+#[derive(Debug)]
+enum RangeSummaryAccumulator {
+    I64 { min: i64, max: i64 },
+    F64 { min: f64, max: f64 },
+}
+
+#[derive(Debug, Default)]
+struct TermSummaryAccumulator {
+    values: BTreeSet<String>,
+    exceeded_cap: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +238,362 @@ fn dedupe_pending_splits(splits: Vec<AssignedRemoteSplit>) -> Vec<AssignedRemote
         deduped.insert(split.split_id.clone(), split);
     }
     deduped.into_values().collect()
+}
+
+fn build_split_pruning_predicate(
+    query: &QueryClause,
+    mappings: &HashMap<String, FieldMapping>,
+) -> SplitPruningPredicate {
+    let mut predicate = SplitPruningPredicate::default();
+    collect_split_pruning_clauses(query, mappings, &mut predicate);
+    predicate
+}
+
+fn collect_split_pruning_clauses(
+    query: &QueryClause,
+    mappings: &HashMap<String, FieldMapping>,
+    predicate: &mut SplitPruningPredicate,
+) {
+    match query {
+        QueryClause::Term(fields) => {
+            if let Some((field, value)) = fields.iter().next()
+                && let Some(clause) = build_term_pruning_clause(field, value, mappings)
+            {
+                predicate.terms.push(clause);
+            }
+        }
+        QueryClause::Range(fields) => {
+            if let Some((field, condition)) = fields.iter().next()
+                && let Some(clause) = build_range_pruning_clause(field, condition, mappings)
+            {
+                predicate.ranges.push(clause);
+            }
+        }
+        QueryClause::Bool(bool_query) => {
+            for child in bool_query.must.iter().chain(bool_query.filter.iter()) {
+                collect_split_pruning_clauses(child, mappings, predicate);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_term_pruning_clause(
+    field: &str,
+    value: &Value,
+    mappings: &HashMap<String, FieldMapping>,
+) -> Option<TermPruningClause> {
+    let mapping = mappings.get(field)?;
+    let value = canonical_term_summary_value(&mapping.field_type, value)?;
+    Some(TermPruningClause {
+        field: field.to_string(),
+        value,
+    })
+}
+
+fn build_range_pruning_clause(
+    field: &str,
+    condition: &RangeCondition,
+    mappings: &HashMap<String, FieldMapping>,
+) -> Option<RangePruningClause> {
+    let mapping = mappings.get(field)?;
+    let kind = range_field_kind(&mapping.field_type)?;
+    let lower = condition
+        .gt
+        .as_ref()
+        .and_then(|value| canonical_range_summary_value(kind, value))
+        .map(|value| RangePruningBound {
+            value,
+            inclusive: false,
+        })
+        .or_else(|| {
+            condition
+                .gte
+                .as_ref()
+                .and_then(|value| canonical_range_summary_value(kind, value))
+                .map(|value| RangePruningBound {
+                    value,
+                    inclusive: true,
+                })
+        });
+    let upper = condition
+        .lt
+        .as_ref()
+        .and_then(|value| canonical_range_summary_value(kind, value))
+        .map(|value| RangePruningBound {
+            value,
+            inclusive: false,
+        })
+        .or_else(|| {
+            condition
+                .lte
+                .as_ref()
+                .and_then(|value| canonical_range_summary_value(kind, value))
+                .map(|value| RangePruningBound {
+                    value,
+                    inclusive: true,
+                })
+        });
+    if lower.is_none() && upper.is_none() {
+        return None;
+    }
+    Some(RangePruningClause {
+        field: field.to_string(),
+        kind,
+        lower,
+        upper,
+    })
+}
+
+fn range_field_kind(field_type: &FieldType) -> Option<RangeFieldKind> {
+    match field_type {
+        FieldType::Integer => Some(RangeFieldKind::Integer),
+        FieldType::Float => Some(RangeFieldKind::Float),
+        FieldType::Date => Some(RangeFieldKind::Date),
+        _ => None,
+    }
+}
+
+fn canonical_term_summary_value(field_type: &FieldType, value: &Value) -> Option<String> {
+    match field_type {
+        FieldType::Keyword => value.as_str().map(ToOwned::to_owned),
+        FieldType::Boolean => match value {
+            Value::Bool(boolean) => Some(boolean.to_string()),
+            Value::String(text) if text.eq_ignore_ascii_case("true") => Some("true".into()),
+            Value::String(text) if text.eq_ignore_ascii_case("false") => Some("false".into()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn canonical_range_summary_value(kind: RangeFieldKind, value: &Value) -> Option<RangePruningValue> {
+    match kind {
+        RangeFieldKind::Integer => match value {
+            Value::Number(number) => number.as_i64().map(RangePruningValue::I64),
+            _ => None,
+        },
+        RangeFieldKind::Date => match value {
+            Value::Number(number) => number.as_i64().map(RangePruningValue::I64),
+            Value::String(text) => {
+                crate::common::date::parse_iso8601_to_epoch_millis(text).map(RangePruningValue::I64)
+            }
+            _ => None,
+        },
+        RangeFieldKind::Float => match value {
+            Value::Number(number) => number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .map(RangePruningValue::F64),
+            _ => None,
+        },
+    }
+}
+
+fn split_matches_pruning_predicate(
+    split: &crate::storage::RemoteSplitManifest,
+    predicate: &SplitPruningPredicate,
+) -> bool {
+    predicate
+        .terms
+        .iter()
+        .all(|clause| split_matches_term_pruning_clause(split, clause))
+        && predicate
+            .ranges
+            .iter()
+            .all(|clause| split_matches_range_pruning_clause(split, clause))
+}
+
+fn split_matches_term_pruning_clause(
+    split: &crate::storage::RemoteSplitManifest,
+    clause: &TermPruningClause,
+) -> bool {
+    let Some(summary) = split.field_terms.get(&clause.field) else {
+        return true;
+    };
+    summary.values.iter().any(|value| value == &clause.value)
+}
+
+fn split_matches_range_pruning_clause(
+    split: &crate::storage::RemoteSplitManifest,
+    clause: &RangePruningClause,
+) -> bool {
+    let summary = split
+        .field_ranges
+        .get(&clause.field)
+        .map(|range| (range.min.as_str(), range.max.as_str()))
+        .or_else(|| {
+            split.time_range.as_ref().and_then(|range| {
+                (range.field == clause.field).then_some((range.min.as_str(), range.max.as_str()))
+            })
+        });
+    let Some((min, max)) = summary else {
+        return true;
+    };
+
+    match clause.kind {
+        RangeFieldKind::Integer | RangeFieldKind::Date => {
+            let Some(split_min) = min.parse::<i64>().ok() else {
+                return true;
+            };
+            let Some(split_max) = max.parse::<i64>().ok() else {
+                return true;
+            };
+            if let Some(bound) = &clause.lower {
+                let RangePruningValue::I64(bound_value) = bound.value else {
+                    return true;
+                };
+                if split_max < bound_value || (!bound.inclusive && split_max == bound_value) {
+                    return false;
+                }
+            }
+            if let Some(bound) = &clause.upper {
+                let RangePruningValue::I64(bound_value) = bound.value else {
+                    return true;
+                };
+                if split_min > bound_value || (!bound.inclusive && split_min == bound_value) {
+                    return false;
+                }
+            }
+            true
+        }
+        RangeFieldKind::Float => {
+            let Some(split_min) = min.parse::<f64>().ok().filter(|value| value.is_finite()) else {
+                return true;
+            };
+            let Some(split_max) = max.parse::<f64>().ok().filter(|value| value.is_finite()) else {
+                return true;
+            };
+            if let Some(bound) = &clause.lower {
+                let RangePruningValue::F64(bound_value) = bound.value else {
+                    return true;
+                };
+                if split_max < bound_value || (!bound.inclusive && split_max == bound_value) {
+                    return false;
+                }
+            }
+            if let Some(bound) = &clause.upper {
+                let RangePruningValue::F64(bound_value) = bound.value else {
+                    return true;
+                };
+                if split_min > bound_value || (!bound.inclusive && split_min == bound_value) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+impl RangeSummaryAccumulator {
+    fn new(value: RangePruningValue) -> Self {
+        match value {
+            RangePruningValue::I64(value) => Self::I64 {
+                min: value,
+                max: value,
+            },
+            RangePruningValue::F64(value) => Self::F64 {
+                min: value,
+                max: value,
+            },
+        }
+    }
+
+    fn observe(&mut self, value: RangePruningValue) {
+        match (self, value) {
+            (Self::I64 { min, max }, RangePruningValue::I64(value)) => {
+                *min = (*min).min(value);
+                *max = (*max).max(value);
+            }
+            (Self::F64 { min, max }, RangePruningValue::F64(value)) => {
+                *min = (*min).min(value);
+                *max = (*max).max(value);
+            }
+            _ => {}
+        }
+    }
+
+    fn into_manifest(self) -> crate::storage::SplitFieldRange {
+        match self {
+            Self::I64 { min, max } => crate::storage::SplitFieldRange {
+                min: min.to_string(),
+                max: max.to_string(),
+            },
+            Self::F64 { min, max } => crate::storage::SplitFieldRange {
+                min: min.to_string(),
+                max: max.to_string(),
+            },
+        }
+    }
+}
+
+impl TermSummaryAccumulator {
+    fn observe(&mut self, value: String) {
+        if self.exceeded_cap {
+            return;
+        }
+        self.values.insert(value);
+        if self.values.len() > REMOTE_STORE_TERM_SUMMARY_CAP {
+            self.values.clear();
+            self.exceeded_cap = true;
+        }
+    }
+
+    fn into_manifest(self) -> Option<crate::storage::SplitFieldTerms> {
+        if self.exceeded_cap || self.values.is_empty() {
+            return None;
+        }
+        Some(crate::storage::SplitFieldTerms {
+            values: self.values.into_iter().collect(),
+        })
+    }
+}
+
+fn build_split_field_summaries(
+    docs: &[Value],
+    mappings: &HashMap<String, FieldMapping>,
+) -> (
+    BTreeMap<String, crate::storage::SplitFieldRange>,
+    BTreeMap<String, crate::storage::SplitFieldTerms>,
+) {
+    let mut range_summaries: HashMap<String, RangeSummaryAccumulator> = HashMap::new();
+    let mut term_summaries: HashMap<String, TermSummaryAccumulator> = HashMap::new();
+
+    for doc in docs {
+        let Some(object) = doc.as_object() else {
+            continue;
+        };
+        for (field, value) in object {
+            let Some(mapping) = mappings.get(field) else {
+                continue;
+            };
+            if let Some(kind) = range_field_kind(&mapping.field_type)
+                && let Some(summary_value) = canonical_range_summary_value(kind, value)
+            {
+                range_summaries
+                    .entry(field.clone())
+                    .and_modify(|summary| summary.observe(summary_value))
+                    .or_insert_with(|| RangeSummaryAccumulator::new(summary_value));
+                continue;
+            }
+            if let Some(summary_value) = canonical_term_summary_value(&mapping.field_type, value) {
+                term_summaries
+                    .entry(field.clone())
+                    .or_default()
+                    .observe(summary_value);
+            }
+        }
+    }
+
+    let field_ranges = range_summaries
+        .into_iter()
+        .map(|(field, summary)| (field, summary.into_manifest()))
+        .collect();
+    let field_terms = term_summaries
+        .into_iter()
+        .filter_map(|(field, summary)| summary.into_manifest().map(|summary| (field, summary)))
+        .collect();
+    (field_ranges, field_terms)
 }
 
 impl RemoteSplitReaderCache {
@@ -691,8 +1102,10 @@ pub(crate) async fn search(
         }
     };
 
+    let pruning_predicate = build_split_pruning_predicate(&search_req.query, &metadata.mappings);
     let split_plans: Vec<_> = manifest
         .published_splits()
+        .filter(|split| split_matches_pruning_predicate(split, &pruning_predicate))
         .map(AssignedRemoteSplit::from_manifest)
         .collect();
     if split_plans.is_empty() {
@@ -907,6 +1320,8 @@ pub(crate) async fn publish_docs(
         ));
     }
 
+    let (field_ranges, field_terms) = build_split_field_summaries(&docs, &metadata.mappings);
+
     let index_uuid = metadata.uuid.as_str().to_string();
     let split_id = uuid::Uuid::new_v4().to_string();
     let staging_dir = state.storage_manager.staging_dir(&index_uuid, &split_id);
@@ -1055,6 +1470,8 @@ pub(crate) async fn publish_docs(
         hotcache_bytes: None,
         time_range: None,
         tags: std::collections::BTreeMap::new(),
+        field_ranges,
+        field_terms,
     };
 
     let settings_clone = metadata.settings.remote_store.clone();
@@ -1356,6 +1773,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
         let split = AssignedRemoteSplit::from_manifest(&manifest);
         let live_split_ids = HashSet::from([split.split_id.clone()]);
@@ -1400,6 +1819,262 @@ mod tests {
 
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments["reader"], vec![split]);
+    }
+
+    #[test]
+    fn split_pruning_keeps_only_matching_summaries_and_missing_metadata() {
+        let mappings = HashMap::from([
+            (
+                "status".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            ),
+            (
+                "ts".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Date,
+                    dimension: None,
+                },
+            ),
+        ]);
+        let query = QueryClause::Bool(crate::search::BoolQuery {
+            filter: vec![
+                QueryClause::Term(HashMap::from([(
+                    "status".to_string(),
+                    serde_json::json!("error"),
+                )])),
+                QueryClause::Range(HashMap::from([(
+                    "ts".to_string(),
+                    RangeCondition {
+                        gte: Some(serde_json::json!(200)),
+                        ..Default::default()
+                    },
+                )])),
+            ],
+            ..Default::default()
+        });
+        let predicate = build_split_pruning_predicate(&query, &mappings);
+
+        let matching = crate::storage::RemoteSplitManifest {
+            split_id: "split-a".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: "idx-1/splits/split-a/bundle".into(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:a".into(),
+            doc_count: 1,
+            size_bytes: 16,
+            uncompressed_bytes: 16,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+            field_ranges: BTreeMap::from([(
+                "ts".into(),
+                crate::storage::SplitFieldRange {
+                    min: "200".into(),
+                    max: "300".into(),
+                },
+            )]),
+            field_terms: BTreeMap::from([(
+                "status".into(),
+                crate::storage::SplitFieldTerms {
+                    values: vec!["error".into()],
+                },
+            )]),
+        };
+        let wrong_term = crate::storage::RemoteSplitManifest {
+            split_id: "split-b".into(),
+            field_terms: BTreeMap::from([(
+                "status".into(),
+                crate::storage::SplitFieldTerms {
+                    values: vec!["ok".into()],
+                },
+            )]),
+            ..matching.clone()
+        };
+        let wrong_range = crate::storage::RemoteSplitManifest {
+            split_id: "split-c".into(),
+            field_ranges: BTreeMap::from([(
+                "ts".into(),
+                crate::storage::SplitFieldRange {
+                    min: "0".into(),
+                    max: "199".into(),
+                },
+            )]),
+            ..matching.clone()
+        };
+        let missing_metadata = crate::storage::RemoteSplitManifest {
+            split_id: "split-d".into(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
+            ..matching.clone()
+        };
+
+        assert!(split_matches_pruning_predicate(&matching, &predicate));
+        assert!(!split_matches_pruning_predicate(&wrong_term, &predicate));
+        assert!(!split_matches_pruning_predicate(&wrong_range, &predicate));
+        assert!(split_matches_pruning_predicate(
+            &missing_metadata,
+            &predicate
+        ));
+    }
+
+    #[test]
+    fn split_pruning_ignores_unsupported_should_clause_but_uses_required_filters() {
+        let mappings = HashMap::from([(
+            "price".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        )]);
+        let query = QueryClause::Bool(crate::search::BoolQuery {
+            should: vec![QueryClause::Match(HashMap::from([(
+                "title".to_string(),
+                serde_json::json!("rust"),
+            )]))],
+            filter: vec![QueryClause::Range(HashMap::from([(
+                "price".to_string(),
+                RangeCondition {
+                    lt: Some(serde_json::json!(10.0)),
+                    ..Default::default()
+                },
+            )]))],
+            ..Default::default()
+        });
+        let predicate = build_split_pruning_predicate(&query, &mappings);
+
+        let split = crate::storage::RemoteSplitManifest {
+            split_id: "split-a".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: "idx-1/splits/split-a/bundle".into(),
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum: "sha256:a".into(),
+            doc_count: 1,
+            size_bytes: 16,
+            uncompressed_bytes: 16,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+            field_ranges: BTreeMap::from([(
+                "price".into(),
+                crate::storage::SplitFieldRange {
+                    min: "10".into(),
+                    max: "20".into(),
+                },
+            )]),
+            field_terms: BTreeMap::new(),
+        };
+
+        assert!(!split_matches_pruning_predicate(&split, &predicate));
+    }
+
+    #[test]
+    fn build_split_field_summaries_tracks_supported_mapped_fields() {
+        let mappings = HashMap::from([
+            (
+                "status".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            ),
+            (
+                "active".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Boolean,
+                    dimension: None,
+                },
+            ),
+            (
+                "count".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Integer,
+                    dimension: None,
+                },
+            ),
+            (
+                "price".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Float,
+                    dimension: None,
+                },
+            ),
+            (
+                "ts".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Date,
+                    dimension: None,
+                },
+            ),
+            (
+                "title".to_string(),
+                FieldMapping {
+                    field_type: FieldType::Text,
+                    dimension: None,
+                },
+            ),
+        ]);
+        let docs = vec![
+            serde_json::json!({
+                "status": "error",
+                "active": true,
+                "count": 5,
+                "price": 1.5,
+                "ts": "2026-04-01T00:00:00Z",
+                "title": "ignored text field"
+            }),
+            serde_json::json!({
+                "status": "warn",
+                "active": false,
+                "count": 9,
+                "price": 2.5,
+                "ts": "2026-04-02T00:00:00Z"
+            }),
+        ];
+
+        let (field_ranges, field_terms) = build_split_field_summaries(&docs, &mappings);
+
+        assert_eq!(field_ranges["count"].min, "5");
+        assert_eq!(field_ranges["count"].max, "9");
+        assert_eq!(field_ranges["price"].min, "1.5");
+        assert_eq!(field_ranges["price"].max, "2.5");
+        assert_eq!(
+            field_ranges["ts"].min,
+            crate::common::date::parse_iso8601_to_epoch_millis("2026-04-01T00:00:00Z")
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(
+            field_ranges["ts"].max,
+            crate::common::date::parse_iso8601_to_epoch_millis("2026-04-02T00:00:00Z")
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(field_terms["status"].values, vec!["error", "warn"]);
+        assert_eq!(field_terms["active"].values, vec!["false", "true"]);
+        assert!(!field_terms.contains_key("title"));
+    }
+
+    #[test]
+    fn build_split_field_summaries_omits_high_cardinality_term_sets() {
+        let mappings = HashMap::from([(
+            "status".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]);
+        let docs: Vec<_> = (0..=REMOTE_STORE_TERM_SUMMARY_CAP)
+            .map(|idx| serde_json::json!({ "status": format!("value-{idx}") }))
+            .collect();
+
+        let (_field_ranges, field_terms) = build_split_field_summaries(&docs, &mappings);
+
+        assert!(!field_terms.contains_key("status"));
     }
 
     #[test]

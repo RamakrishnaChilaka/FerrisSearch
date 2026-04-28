@@ -3290,6 +3290,334 @@ async fn remote_store_count_match_all_uses_manifest_doc_counts() -> Result<()> {
 }
 
 #[tokio::test]
+async fn remote_store_publish_populates_split_pruning_summaries() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/remotesummary",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "status": { "type": "keyword" },
+                        "count": { "type": "integer" },
+                        "price": { "type": "float" },
+                        "ts": { "type": "date" },
+                        "title": { "type": "text" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remotesummary/_remote_store/publish",
+            json!({
+                "docs": [
+                    {
+                        "_id": "doc-1",
+                        "status": "error",
+                        "count": 5,
+                        "price": 1.5,
+                        "ts": "2026-04-01T00:00:00Z",
+                        "title": "first"
+                    },
+                    {
+                        "_id": "doc-2",
+                        "status": "warn",
+                        "count": 9,
+                        "price": 2.5,
+                        "ts": "2026-04-02T00:00:00Z",
+                        "title": "second"
+                    }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+
+    let metadata = harness
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("remotesummary")
+        .cloned()
+        .expect("index metadata should exist");
+    let manifest = harness
+        .app_state
+        .storage_manager
+        .load_current_manifest(
+            metadata.uuid.as_str(),
+            Some(&ferrissearch::storage::compute_schema_hash(
+                &metadata.mappings,
+            )),
+        )
+        .await?
+        .expect("manifest should exist after publish");
+    let split = manifest
+        .published_splits()
+        .next()
+        .expect("publish should create one split");
+
+    assert_eq!(split.field_terms["status"].values, vec!["error", "warn"]);
+    assert_eq!(split.field_ranges["count"].min, "5");
+    assert_eq!(split.field_ranges["count"].max, "9");
+    assert_eq!(split.field_ranges["price"].min, "1.5");
+    assert_eq!(split.field_ranges["price"].max, "2.5");
+    assert_eq!(
+        split.field_ranges["ts"].min,
+        ferrissearch::common::date::parse_iso8601_to_epoch_millis("2026-04-01T00:00:00Z")
+            .unwrap()
+            .to_string()
+    );
+    assert_eq!(
+        split.field_ranges["ts"].max,
+        ferrissearch::common::date::parse_iso8601_to_epoch_millis("2026-04-02T00:00:00Z")
+            .unwrap()
+            .to_string()
+    );
+    assert!(!split.field_terms.contains_key("title"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_term_filter_prunes_unmatched_split_before_cache_fetch() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/remotepruneterm",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "status": { "type": "keyword" },
+                        "title": { "type": "text" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remotepruneterm/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-error", "status": "error", "title": "matching split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remotepruneterm/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-ok", "status": "ok", "title": "pruned split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+
+    let metadata = harness
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("remotepruneterm")
+        .cloned()
+        .expect("index metadata should exist");
+    let manifest = harness
+        .app_state
+        .storage_manager
+        .load_current_manifest(
+            metadata.uuid.as_str(),
+            Some(&ferrissearch::storage::compute_schema_hash(
+                &metadata.mappings,
+            )),
+        )
+        .await?
+        .expect("manifest should exist after publish");
+    let splits: Vec<_> = manifest.published_splits().collect();
+    assert_eq!(splits.len(), 2);
+    let error_split = splits
+        .iter()
+        .copied()
+        .find(|split| split.field_terms["status"].values == vec!["error"])
+        .expect("error split should have a status summary");
+    let ok_split = splits
+        .iter()
+        .copied()
+        .find(|split| split.field_terms["status"].values == vec!["ok"])
+        .expect("ok split should have a status summary");
+
+    let (search_status, search_body) = harness
+        .post_json(
+            "/remotepruneterm/_search",
+            json!({
+                "query": { "term": { "status": "error" } }
+            }),
+        )
+        .await?;
+    assert_eq!(search_status, StatusCode::OK, "{search_body}");
+    assert_eq!(search_body["_shards"]["successful"], json!(1));
+    assert_eq!(search_body["_shards"]["failed"], json!(0));
+    assert_eq!(search_body["hits"]["total"]["value"], json!(1));
+    assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("doc-error"));
+
+    assert!(
+        harness
+            .app_state
+            .storage_manager
+            .cached_split_status(
+                metadata.uuid.as_str(),
+                &error_split.split_id,
+                &error_split.checksum,
+            )
+            .artifact_cached
+    );
+    assert!(
+        !harness
+            .app_state
+            .storage_manager
+            .cached_split_status(
+                metadata.uuid.as_str(),
+                &ok_split.split_id,
+                &ok_split.checksum
+            )
+            .artifact_cached,
+        "pruned split should not be fetched into the node-local cache"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_range_filter_prunes_unmatched_split_before_cache_fetch() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/remoteprunerange",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "count": { "type": "integer" },
+                        "title": { "type": "text" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remoteprunerange/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-low", "count": 5, "title": "pruned split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remoteprunerange/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "doc-high", "count": 200, "title": "matching split" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+
+    let metadata = harness
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("remoteprunerange")
+        .cloned()
+        .expect("index metadata should exist");
+    let manifest = harness
+        .app_state
+        .storage_manager
+        .load_current_manifest(
+            metadata.uuid.as_str(),
+            Some(&ferrissearch::storage::compute_schema_hash(
+                &metadata.mappings,
+            )),
+        )
+        .await?
+        .expect("manifest should exist after publish");
+    let splits: Vec<_> = manifest.published_splits().collect();
+    assert_eq!(splits.len(), 2);
+    let low_split = splits
+        .iter()
+        .copied()
+        .find(|split| split.field_ranges["count"].max == "5")
+        .expect("low split should have a count range summary");
+    let high_split = splits
+        .iter()
+        .copied()
+        .find(|split| split.field_ranges["count"].min == "200")
+        .expect("high split should have a count range summary");
+
+    let (search_status, search_body) = harness
+        .post_json(
+            "/remoteprunerange/_search",
+            json!({
+                "query": { "range": { "count": { "gte": 100 } } }
+            }),
+        )
+        .await?;
+    assert_eq!(search_status, StatusCode::OK, "{search_body}");
+    assert_eq!(search_body["_shards"]["successful"], json!(1));
+    assert_eq!(search_body["_shards"]["failed"], json!(0));
+    assert_eq!(search_body["hits"]["total"]["value"], json!(1));
+    assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("doc-high"));
+
+    assert!(
+        harness
+            .app_state
+            .storage_manager
+            .cached_split_status(
+                metadata.uuid.as_str(),
+                &high_split.split_id,
+                &high_split.checksum,
+            )
+            .artifact_cached
+    );
+    assert!(
+        !harness
+            .app_state
+            .storage_manager
+            .cached_split_status(
+                metadata.uuid.as_str(),
+                &low_split.split_id,
+                &low_split.checksum
+            )
+            .artifact_cached,
+        "pruned split should not be fetched into the node-local cache"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_store_search_fans_out_from_master_only_coordinator() -> Result<()> {
     let harness =
         MultiNodeRestHarness::start_three_nodes_with_shared_remote_store(vec![NodeRole::Master])

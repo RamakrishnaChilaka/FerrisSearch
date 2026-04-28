@@ -32,7 +32,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/node/mod.rs` — Node struct, startup, Raft bootstrap, lifecycle loop, AppState
 - `src/transport/` — gRPC server (server.rs: Raft RPCs + shard ops + replication) and client (client.rs: forwarding methods)
 - `src/api/` — Axum HTTP handlers: index.rs (index CRUD, doc ops), search.rs (query-string search), cat.rs (catalog), cluster.rs (health, state, transfer_master), mod.rs (router)
-- `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing), remote_store.rs (shardless read path; root nodes load manifests, schedule split batches to data-node leaves, and leaves reuse node-local cached HotEngine readers over downloaded split bundles)
+- `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing), remote_store.rs (shardless read path; root nodes load manifests, prune splits by manifest field summaries for supported structured filters, schedule split batches to data-node leaves, and leaves reuse node-local cached HotEngine readers over downloaded split bundles)
 - `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
 - `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
 - `src/tasks.rs` — TaskManager for async background maintenance tracking (`_forcemerge`, `/_tasks/{task_id}`)
@@ -107,7 +107,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1107 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 65 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1320 total
+- 1109 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 68 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1325 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -187,7 +187,7 @@ pub struct AppState {
     pub sql_approximate_top_k: bool,
 }
 ```
-- `storage_manager` is an object_store-backed abstraction with a node-local workdir for split staging and cache. By default storage is rooted at `<data_dir>/_remote_store/` (local filesystem) and cache at `<data_dir>/_remote_store_cache/`. Set `storage_uri` in `AppConfig` to override the storage backend — supports bare path, `file://`, and `s3://<bucket>[/prefix]`. For `s3://`, AWS credentials and endpoint are read from standard env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`). The `remote_store` engine writes split bundles (`<uuid>/splits/<split_id>/bundle`) and manifest generations (`<uuid>/manifests/<gen>.json` + `manifest.current.json`) through this store; publish streams a packed deterministic bundle + sha256 up, roots query leaf status over gRPC, leaves fetch bundles into node-local caches keyed by split id with a `.done` marker, open-reader cache entries pin those cached artifacts while warm, and post-search reaping drops stale or over-budget split directories without touching pinned readers.
+- `storage_manager` is an object_store-backed abstraction with a node-local workdir for split staging and cache. By default storage is rooted at `<data_dir>/_remote_store/` (local filesystem) and cache at `<data_dir>/_remote_store_cache/`. Set `storage_uri` in `AppConfig` to override the storage backend — supports bare path, `file://`, and `s3://<bucket>[/prefix]`. For `s3://`, AWS credentials and endpoint are read from standard env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`). The `remote_store` engine writes split bundles (`<uuid>/splits/<split_id>/bundle`) and manifest generations (`<uuid>/manifests/<gen>.json` + `manifest.current.json`) through this store; publish streams a packed deterministic bundle + sha256 up plus exact split summaries under `field_ranges`/`field_terms`, roots query leaf status over gRPC, prunes supported structured filters against those summaries before scheduling, leaves fetch bundles into node-local caches keyed by split id with a `.done` marker, open-reader cache entries pin those cached artifacts while warm, and post-search reaping drops stale or over-budget split directories without touching pinned readers.
 - `sql_approximate_top_k` currently defaults to `true`; eligible grouped-partials `GROUP BY ... ORDER BY metric LIMIT N` queries use shard-level approximate top-K pruning unless the user disables it in config
 
 ## Core Data Structures (src/cluster/state.rs)
@@ -387,7 +387,7 @@ if let Some(ref raft) = state.raft {
 }
 ```
 
-- `engine` may be passed either as a string (`"local_shards"` / `"remote_store"`) or as an object (`{"type":"remote_store"}`) in the create body parser. `remote_store` indices are shardless and served from manifests published to the configured object store; `POST /{index}/_search`, query-string `GET /{index}/_search?q=...`, and match-all `GET/POST /{index}/_count` route through the manifest-backed read path, inserts via the standard `_doc` / `_bulk` write paths still return 501, and `POST /{index}/_remote_store/publish` builds and uploads split bundles (local or S3) for the queryable read path.
+- `engine` may be passed either as a string (`"local_shards"` / `"remote_store"`) or as an object (`{"type":"remote_store"}`) in the create body parser. `remote_store` indices are shardless and served from manifests published to the configured object store; `POST /{index}/_search`, query-string `GET /{index}/_search?q=...`, and match-all `GET/POST /{index}/_count` route through the manifest-backed read path, supported `term`/`range` filters prune splits via manifest `field_terms` / `field_ranges` summaries before rendezvous scheduling, inserts via the standard `_doc` / `_bulk` write paths still return 501, and `POST /{index}/_remote_store/publish` builds and uploads split bundles (local or S3) for the queryable read path.
 
 ## Search & Query DSL (src/search/mod.rs)
 
