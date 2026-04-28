@@ -1278,6 +1278,10 @@ pub struct RemoteSplitManifest {
     pub time_range: Option<SplitTimeRange>,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub field_ranges: BTreeMap<String, SplitFieldRange>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub field_terms: BTreeMap<String, SplitFieldTerms>,
 }
 
 /// Optional timestamp range summary used for split pruning.
@@ -1286,6 +1290,19 @@ pub struct SplitTimeRange {
     pub field: String,
     pub min: String,
     pub max: String,
+}
+
+/// Exact min/max summary for a mapped numeric or date field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SplitFieldRange {
+    pub min: String,
+    pub max: String,
+}
+
+/// Exact small distinct-set summary for a mapped keyword or boolean field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SplitFieldTerms {
+    pub values: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1345,6 +1362,19 @@ mod tests {
                         max: "2026-04-02T00:00:00Z".into(),
                     }),
                     tags: BTreeMap::from([("tenant".into(), "blue".into())]),
+                    field_ranges: BTreeMap::from([(
+                        "created_at".into(),
+                        SplitFieldRange {
+                            min: "1711929600000".into(),
+                            max: "1712016000000".into(),
+                        },
+                    )]),
+                    field_terms: BTreeMap::from([(
+                        "status".into(),
+                        SplitFieldTerms {
+                            values: vec!["error".into(), "warn".into()],
+                        },
+                    )]),
                 },
                 RemoteSplitManifest {
                     split_id: "split-b".into(),
@@ -1359,6 +1389,8 @@ mod tests {
                     hotcache_bytes: None,
                     time_range: None,
                     tags: BTreeMap::new(),
+                    field_ranges: BTreeMap::new(),
+                    field_terms: BTreeMap::new(),
                 },
             ],
         };
@@ -1491,6 +1523,8 @@ mod tests {
                 hotcache_bytes: None,
                 time_range: None,
                 tags: BTreeMap::new(),
+                field_ranges: BTreeMap::new(),
+                field_terms: BTreeMap::new(),
             }],
         }
     }
@@ -1712,6 +1746,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
         let manifest = manager
             .append_split_and_publish("idx-1", "events", "sha256:abc", None, split)
@@ -1747,6 +1783,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
         manager
             .append_split_and_publish("idx-1", "events", "sha256:abc", None, split_a)
@@ -1766,6 +1804,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
         let second = manager
             .append_split_and_publish("idx-1", "events", "sha256:abc", None, split_b)
@@ -1796,6 +1836,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
         manager
             .append_split_and_publish("idx-1", "events", "sha256:abc", None, split.clone())
@@ -1829,6 +1871,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
         manager
             .append_split_and_publish("idx-1", "events", "sha256:abc", None, split.clone())
@@ -1992,6 +2036,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
 
         let hashed = manager.hash_split_bundle("idx-uuid", &split).await.unwrap();
@@ -2048,6 +2094,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
         let err = manager
             .fetch_split_into_cache("idx-uuid", &split)
@@ -2090,6 +2138,8 @@ mod tests {
             hotcache_bytes: None,
             time_range: None,
             tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
         };
         let err = manager
             .fetch_split_into_cache("idx-uuid", &split)
