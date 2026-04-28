@@ -56,7 +56,7 @@ The current output still leaves important gaps:
 - `matched_hits` is present, but `collected_hits` is not
 - `_shards` exists, but local-vs-remote and stream-vs-buffer decisions are opaque
 - grouped merge timings exist only as nested timing data, not as a first-class analysis block
-- remote_store manifest generation, candidate split counts, and pruning effects are not surfaced
+- remote_store response-level pruning counters are surfaced, but richer manifest generation, warm-cache, and scheduling details are not yet first-class analysis fields
 
 ### UX Gap
 
@@ -235,13 +235,26 @@ Do not remove the existing top-level field in this change set.
 
 ## Remote Store Visibility
 
-Once remote_store split pruning lands, explain output should show the root-side split decisions. The initial block should answer:
+Remote_store SQL paths that execute through manifest-backed distributed search now expose the same response-level pruning counters as search responses:
+
+```json
+{
+  "remote_store": {
+    "pruning": {
+      "published_splits": 24,
+      "candidate_splits": 5,
+      "pruned_splits": 19,
+      "assigned_splits": 5
+    }
+  }
+}
+```
+
+The richer future analysis block should still answer:
 
 - which manifest generation was planned
-- how many published splits existed
-- how many candidate splits survived pruning
-- how many were pruned
 - how much of the candidate set was already warm
+- which leaves were scheduled and why
 
 This is intentionally aligned with [docs/remote-store-split-pruning.md](docs/remote-store-split-pruning.md).
 
@@ -278,7 +291,7 @@ The endpoint should not switch to a text explain format in this PR. JSON remains
 2. Analyze regression asserting `analysis.collection` and `analysis.shards` are present.
 3. Grouped query regression asserting `analysis.timings.grouped_merge` stays populated.
 4. CLI rendering test ensuring legacy fields still render if the new nested blocks are absent.
-5. Remote_store explain regression asserting `remote_store` appears once split-count bookkeeping exists.
+5. Remote_store explain regression asserting `remote_store.pruning` appears for SQL EXPLAIN ANALYZE.
 
 ## Rollout
 

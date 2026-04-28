@@ -139,7 +139,7 @@ Bulk routes intentionally disable Axum's default buffered request-body limit so 
 | POST | `/_sql` | `global_sql()` — global SQL endpoint: SHOW TABLES, DESCRIBE, SHOW CREATE TABLE, and SELECT (index auto-extracted from FROM clause) |
 | POST | `/_sql/stream` | `global_sql_stream()` — global NDJSON SQL stream endpoint |
 
-For `remote_store` indices, `GET /{index}/_search?q=...` and match-all `GET/POST /{index}/_count` must not derive work from `shard_routing` because the engine is shardless. Route those entry points through the same manifest + split execution path used by DSL `POST /{index}/_search`, and keep query-string search aligned with the existing catch-all `body` search semantics. Search responses for remote_store indices include `remote_store.pruning` with `published_splits`, `candidate_splits`, `pruned_splits`, and `assigned_splits`; local_shards responses should not grow this block.
+For `remote_store` indices, `GET /{index}/_search?q=...`, SQL materialized search paths, and match-all `GET/POST /{index}/_count` must not derive work from `shard_routing` because the engine is shardless. Route those entry points through the same manifest + split execution path used by DSL `POST /{index}/_search`, and keep query-string search aligned with the existing catch-all `body` search semantics. Search responses and SQL/EXPLAIN ANALYZE responses that execute through manifest-backed remote_store search include `remote_store.pruning` with `published_splits`, `candidate_splits`, `pruned_splits`, and `assigned_splits`; local_shards responses should not grow this block.
 
 ### Global SQL Endpoint
 - `POST /_sql` handles SQL commands that don't require an index in the URL path.
@@ -167,6 +167,7 @@ For `remote_store` indices, `GET /{index}/_search?q=...` and match-all `GET/POST
     - `timings` object: `planning_ms`, `search_ms`, `collect_ms`, `merge_ms`, `datafusion_ms`, `total_ms` (fractional milliseconds)
     - `rows` and `row_count`: the actual query results
     - `matched_hits`, `execution_mode`, `truncated`, `_shards`
+    - `remote_store.pruning` when the query executed through the remote_store manifest-backed search path
 - The `search_sql` handler internally delegates to `execute_sql_query()` — the same function used by EXPLAIN ANALYZE — so timing instrumentation is in one place.
 - Responses include an `execution_mode` field:
     - `count_star_fast` when `SELECT count(*) FROM ...` (no WHERE/GROUP BY) is answered from `doc_count()` metadata without scanning documents
