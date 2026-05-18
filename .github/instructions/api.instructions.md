@@ -57,6 +57,7 @@ pub fn error_response(
 | `forward_exception` | gRPC forwarding to another node failed |
 | `raft_write_exception` | Raft client_write command failed |
 | `master_not_discovered_exception` | No master in cluster state |
+| `illegal_argument_exception` | Request shape rejected by handler-side validation (e.g. invalid `search_after` cursor) |
 | `group_by_scan_limit_exceeded` | GROUP BY fallback query matched more docs than `sql_group_by_scan_limit` |
 
 ## API Handlers

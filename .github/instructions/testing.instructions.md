@@ -1,15 +1,15 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **1113 unit tests** (`cargo test --lib`)
+- **1123 unit tests** (`cargo test --lib`)
 - **68 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **70 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **75 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **6 remote_store S3 integration tests** (`cargo test --test remote_store_s3_integration`) — skipped unless `FERRIS_RUSTFS_ENDPOINT` is set
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 180 assertions across 4 files
-- **1331 total** (`cargo test`)
+- **1346 total** (`cargo test`)
 
 The `remote_store` automated coverage is split between REST integration tests (publish/search/verify behavior with in-process harnesses, including query-string `GET /_search`, match-all `/_count` on shardless indices, publish-time split-summary persistence for pruning, term/range pruning regressions that assert non-candidate splits are not fetched into cache, response-level `remote_store.pruning` counters including unsupported-query no-prune behavior, and SQL EXPLAIN ANALYZE pruning metadata) and `remote_store_s3_integration` (real S3-compatible manifest/object operations via `StorageManager`). That still does not replace a full process-backed RustFS + `./dev_cluster_release.sh --nodes 3` live validation; keep a manual runbook for that flow and an isolated smoke script for the automatable pieces.
 

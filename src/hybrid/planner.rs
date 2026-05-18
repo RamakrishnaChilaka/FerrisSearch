@@ -1164,6 +1164,7 @@ impl QueryPlan {
             from: 0,
             knn: None,
             sort: self.build_sort_clauses(),
+            search_after: None,
             aggs,
         }
     }

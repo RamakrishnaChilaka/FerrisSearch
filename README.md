@@ -80,7 +80,7 @@ Every SQL response tells you how the planner executed the query:
 - **Stable restarts** — covered by a real three-node flush + restart regression
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1331 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
+- **Test depth** — 1346 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
 
 ## Tech Stack
 
@@ -351,6 +351,16 @@ curl -X POST 'http://localhost:9200/movies/_search' -H 'Content-Type: applicatio
 curl -X POST 'http://localhost:9200/movies/_search' -H 'Content-Type: application/json' \
   -d '{"query": {"match_all": {}}, "sort": [{"year": "desc"}, "_score"]}'
 
+# Cursor pagination with search_after (deep, stable)
+# Page 1: send sort but no search_after
+curl -X POST 'http://localhost:9200/movies/_search' -H 'Content-Type: application/json' \
+  -d '{"size": 10, "sort": [{"year": "desc"}, {"id": "asc"}]}'
+# Each hit comes back annotated with `"sort": [year, id]`. Copy the last hit's `sort`
+# array verbatim into the next request as `search_after`:
+curl -X POST 'http://localhost:9200/movies/_search' -H 'Content-Type: application/json' \
+  -d '{"size": 10, "sort": [{"year": "desc"}, {"id": "asc"}], "search_after": [2018, "m-0123"]}'
+# Requires non-empty `sort`, `from = 0`, no `_score` in sort, and search_after.len() == sort.len().
+
 # Count
 curl 'http://localhost:9200/movies/_count'
 ```
@@ -539,8 +549,8 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1331 tests
-cargo test --lib                                # Unit tests (1113)
+cargo test                                      # All 1346 tests
+cargo test --lib                                # Unit tests (1123)
 cargo test --bin ferris-cli                      # CLI tests (68)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
@@ -620,7 +630,7 @@ scripts/           Ingestion and benchmark scripts
 - [ ] Streaming export / wildcard scan path — support large `SELECT *` and other unbounded result-set queries as block-streamed export-style execution instead of materializing full shard batches on remote nodes and the coordinator
 - [ ] `COUNT(DISTINCT field)`
 - [ ] `_msearch` API (batch searches)
-- [ ] `search_after` cursor-based pagination
+- [x] `search_after` cursor-based pagination
 - [ ] HTTP TLS
 - [ ] Snapshot and restore
 - [ ] Index aliases and templates

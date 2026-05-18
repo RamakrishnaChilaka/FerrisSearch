@@ -21,6 +21,15 @@ pub struct SearchRequest {
     /// Optional sort clauses. Default: sort by `_score` descending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sort: Vec<SortClause>,
+    /// Optional cursor for deep pagination. The values must align positionally
+    /// with `sort` (one value per sort clause). When present, each shard
+    /// returns only docs ranked AFTER this cursor in the sort order; the
+    /// coordinator merges them and takes the top `size`.
+    ///
+    /// Use the `sort` array on the last hit of the previous page as the
+    /// `search_after` of the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_after: Option<Vec<serde_json::Value>>,
     /// Optional aggregations. Maps agg name → agg definition.
     #[serde(
         default,
@@ -1462,13 +1471,57 @@ pub fn merge_sorted_hit_lists(
     result
 }
 
-/// Sort a list of search hits according to the given sort clauses.
-/// Each hit is a JSON object with `_score` and `_source` fields.
-/// Sort clauses are applied in order (primary sort first).
-/// If no sort clauses are given, sorts by `_score` descending (default).
+/// Normalize a `SortClause` into a `(field_name, direction)` pair.
+/// Returns `None` if the clause is a malformed empty `Field` map.
+pub fn sort_clause_name_direction(clause: &SortClause) -> Option<(&str, SortDirection)> {
+    match clause {
+        SortClause::Simple(name) => {
+            let dir = if name == "_score" {
+                SortDirection::Desc
+            } else {
+                SortDirection::Asc
+            };
+            Some((name.as_str(), dir))
+        }
+        SortClause::Field(map) => map.iter().next().map(|(name, order)| {
+            let dir = match order {
+                SortOrder::Direction(d) => d.clone(),
+                SortOrder::Object { order } => order.clone(),
+            };
+            (name.as_str(), dir)
+        }),
+    }
+}
+
+/// Extract a single sort value for `field_name` from a hit. Hits store
+/// `_score` and `_id` at the top level and user fields under `_source`.
+fn extract_sort_value(hit: &serde_json::Value, field_name: &str) -> serde_json::Value {
+    if field_name == "_score" {
+        return hit
+            .get("_score")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+    }
+    if field_name == "_id" {
+        return hit.get("_id").cloned().unwrap_or(serde_json::Value::Null);
+    }
+    hit.get("_source")
+        .and_then(|s| s.get(field_name))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Sort a list of search hits according to the given sort clauses, then
+/// annotate each hit with a `sort: [...]` array carrying the values used
+/// for ordering. The annotation supports `search_after` cursor pagination.
+///
+/// - With no sort clauses: sorts by `_score` descending and does not annotate.
+/// - With non-empty sort clauses: applies clauses in order (primary first)
+///   and writes `sort: [v0, v1, ...]` onto each hit. Annotation is idempotent
+///   — hits already carrying `sort` are left untouched.
 pub fn sort_hits(hits: &mut [serde_json::Value], sort_clauses: &[SortClause]) {
     if sort_clauses.is_empty() {
-        // Default: sort by _score descending
+        // Default: sort by _score descending. No sort-value annotation needed.
         hits.sort_by(|a, b| {
             let sa = a.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let sb = b.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1479,44 +1532,12 @@ pub fn sort_hits(hits: &mut [serde_json::Value], sort_clauses: &[SortClause]) {
 
     hits.sort_by(|a, b| {
         for clause in sort_clauses {
-            let (field_name, direction) = match clause {
-                SortClause::Simple(name) => {
-                    if name == "_score" {
-                        (name.as_str(), SortDirection::Desc)
-                    } else {
-                        (name.as_str(), SortDirection::Asc)
-                    }
-                }
-                SortClause::Field(map) => {
-                    if let Some((name, order)) = map.iter().next() {
-                        let dir = match order {
-                            SortOrder::Direction(d) => d.clone(),
-                            SortOrder::Object { order } => order.clone(),
-                        };
-                        (name.as_str(), dir)
-                    } else {
-                        continue;
-                    }
-                }
+            let Some((field_name, direction)) = sort_clause_name_direction(clause) else {
+                continue;
             };
 
-            let (va, vb) = if field_name == "_score" {
-                (
-                    a.get("_score").cloned().unwrap_or(serde_json::Value::Null),
-                    b.get("_score").cloned().unwrap_or(serde_json::Value::Null),
-                )
-            } else {
-                (
-                    a.get("_source")
-                        .and_then(|s| s.get(field_name))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    b.get("_source")
-                        .and_then(|s| s.get(field_name))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                )
-            };
+            let va = extract_sort_value(a, field_name);
+            let vb = extract_sort_value(b, field_name);
 
             let cmp = compare_json_values(&va, &vb);
             let ordered = match direction {
@@ -1529,6 +1550,24 @@ pub fn sort_hits(hits: &mut [serde_json::Value], sort_clauses: &[SortClause]) {
         }
         std::cmp::Ordering::Equal
     });
+
+    // Annotate each hit with its sort tuple so clients can feed it back
+    // as `search_after` on the next page. Idempotent across re-sorts.
+    for hit in hits.iter_mut() {
+        if hit.get("sort").is_some() {
+            continue;
+        }
+        let values: Vec<serde_json::Value> = sort_clauses
+            .iter()
+            .map(|clause| match sort_clause_name_direction(clause) {
+                Some((name, _)) => extract_sort_value(hit, name),
+                None => serde_json::Value::Null,
+            })
+            .collect();
+        if let Some(obj) = hit.as_object_mut() {
+            obj.insert("sort".to_string(), serde_json::Value::Array(values));
+        }
+    }
 }
 
 /// Compare two JSON values for sorting. Numbers are compared numerically,
@@ -1766,6 +1805,7 @@ mod tests {
             from: 5,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let json_str = serde_json::to_string(&req).unwrap();
@@ -1783,6 +1823,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -1909,6 +1950,7 @@ mod tests {
             from: 10,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let json_str = serde_json::to_string(&req).unwrap();

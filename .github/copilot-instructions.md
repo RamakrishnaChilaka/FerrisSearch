@@ -107,7 +107,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1113 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 70 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1331 total
+- 1123 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 75 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1346 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -400,8 +400,20 @@ pub struct SearchRequest {
     pub knn: Option<KnnQuery>,                      // optional k-NN
     pub sort: Vec<SortClause>,                      // default: sort by _score desc
     pub aggs: HashMap<String, AggregationRequest>,  // aggregations
+    pub search_after: Option<Vec<Value>>,           // optional cursor for deep pagination (size only, requires sort)
 }
 ```
+
+### search_after Cursor Pagination
+- OpenSearch/ES-compatible `search_after`: pass the previous page's last hit's `sort` array to fetch the next page.
+- API validation (`POST /{index}/_search` DSL body):
+    - `search_after` requires a non-empty `sort` clause; length must match.
+    - `from` must be `0` (use `size` only — cursor replaces offset pagination).
+    - Sort cannot include `_score` (deterministic numeric/keyword fields only).
+- Engine wraps the user query in a `BooleanQuery` with a strict-inequality filter built from the cursor. For each prefix `i` of the sort, the filter combines equality `TermQuery` on sort keys `[0..i)` with a strict `RangeQuery` on sort key `i` (`Bound::Excluded(cursor[i]), Bound::Unbounded` for Asc, reversed for Desc); prefixes OR'd with `Occur::Should`.
+- Engine returns hits with a top-level `sort: [...]` array (one value per sort clause). Coordinator preserves `sort` through DSL re-enrichment (local + remote shard paths) so clients can feed it back as the next page's cursor.
+- Hits are sorted engine-side (`crate::search::sort_hits`) after Tantivy collection for deterministic intra-K ordering, then annotated with `sort` values before serialization. This makes cursor advancement well-defined even when Tantivy's fast-field collector only orders by the primary sort key.
+- Supported sort fields: numeric fast-fields (Integer/Float/Date). String sort (`_id`, keyword) compiles and filters correctly but does not guarantee global top-K ordering without a custom Tantivy collector (out of scope for current implementation).
 
 ### QueryClause Variants
 - `MatchAll(Value)` — match all documents

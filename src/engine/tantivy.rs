@@ -447,6 +447,114 @@ impl HotEngine {
         }
     }
 
+    /// Resolve a named field for sort/search_after use.
+    /// Supports `_id` (returns the special id field) and any explicitly mapped
+    /// field. Returns an error for unknown names so callers can surface a 400
+    /// instead of silently treating it as the "body" field.
+    fn resolve_named_field(&self, name: &str) -> Result<Field> {
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if name == "_id" {
+            return Ok(registry.id_field);
+        }
+        registry
+            .fields
+            .get(name)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("unknown field for sort/search_after: {name}"))
+    }
+
+    /// Build a Tantivy filter that admits only docs strictly past the cursor
+    /// in tuple-lexicographic order over the configured sort fields.
+    ///
+    /// For sort `[(f1, dir1), (f2, dir2), ..., (fn, dirn)]` and cursor
+    /// `[v1, v2, ..., vn]`, the filter is the disjunction:
+    ///   (f1 strict_gt_dir1 v1)
+    /// OR (f1 == v1 AND f2 strict_gt_dir2 v2)
+    /// OR (f1 == v1 AND f2 == v2 AND f3 strict_gt_dir3 v3)
+    /// OR ...
+    ///
+    /// Caller is responsible for validating that `sort.len() == cursor.len()`,
+    /// `sort` is non-empty, and no clause sorts by `_score`.
+    fn build_search_after_filter(
+        &self,
+        sort: &[crate::search::SortClause],
+        cursor: &[serde_json::Value],
+    ) -> Result<Box<dyn tantivy::query::Query>> {
+        use std::ops::Bound;
+        use tantivy::query::{BooleanQuery, Occur, RangeQuery, TermQuery};
+        use tantivy::schema::IndexRecordOption;
+
+        if sort.is_empty() {
+            return Err(anyhow::anyhow!("search_after requires a non-empty sort"));
+        }
+        if sort.len() != cursor.len() {
+            return Err(anyhow::anyhow!(
+                "search_after length ({}) does not match sort length ({})",
+                cursor.len(),
+                sort.len()
+            ));
+        }
+
+        // Pre-resolve each (field_name, direction, Field handle).
+        let mut resolved: Vec<(&str, crate::search::SortDirection, Field)> =
+            Vec::with_capacity(sort.len());
+        for clause in sort {
+            let Some((name, direction)) = crate::search::sort_clause_name_direction(clause) else {
+                return Err(anyhow::anyhow!("malformed sort clause"));
+            };
+            if name == "_score" {
+                return Err(anyhow::anyhow!(
+                    "search_after does not support sorting by _score"
+                ));
+            }
+            let field = self.resolve_named_field(name)?;
+            resolved.push((name, direction, field));
+        }
+
+        let mut should_branches: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+            Vec::with_capacity(resolved.len());
+
+        for i in 0..resolved.len() {
+            let mut prefix: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+                Vec::with_capacity(i + 1);
+
+            // Equality clauses for all preceding sort fields.
+            for j in 0..i {
+                let (_name_j, _dir_j, field_j) = &resolved[j];
+                let term_j = self.typed_term(*field_j, &cursor[j]);
+                let eq = TermQuery::new(term_j, IndexRecordOption::Basic);
+                prefix.push((Occur::Must, Box::new(eq)));
+            }
+
+            // Strict inequality on the i-th sort field, oriented per direction.
+            let (_name_i, dir_i, field_i) = &resolved[i];
+            let term_i = self.typed_term(*field_i, &cursor[i]);
+            let range: RangeQuery = match dir_i {
+                crate::search::SortDirection::Asc => {
+                    RangeQuery::new(Bound::Excluded(term_i), Bound::Unbounded)
+                }
+                crate::search::SortDirection::Desc => {
+                    RangeQuery::new(Bound::Unbounded, Bound::Excluded(term_i))
+                }
+            };
+            prefix.push((Occur::Must, Box::new(range)));
+
+            // Bundle the prefix as a single AND-branch.
+            let branch: Box<dyn tantivy::query::Query> = if prefix.len() == 1 {
+                prefix.pop().unwrap().1
+            } else {
+                Box::new(BooleanQuery::new(prefix))
+            };
+            should_branches.push((Occur::Should, branch));
+        }
+
+        // A BooleanQuery with only Should branches requires at least one to match.
+        Ok(Box::new(BooleanQuery::new(should_branches)))
+    }
+
     pub fn sql_record_batch(
         &self,
         req: &crate::search::SearchRequest,
@@ -4954,7 +5062,23 @@ impl super::SearchEngine for HotEngine {
         // Use the exact requested limit when from+size is explicit.
         // The coordinator handles cross-shard merging at the API layer.
         let limit = req.from + req.size;
-        let query = self.build_query(&req.query)?;
+        let user_query = self.build_query(&req.query)?;
+        // search_after: build a separate hits_query that ANDs the cursor filter
+        // onto the user query. The cursor filter must NOT bias total counts or
+        // aggregations — Count and aggregation collectors always run against
+        // user_query so /_search returns the same total/aggs across all pages.
+        let hits_query: Option<Box<dyn tantivy::query::Query>> =
+            if let Some(cursor) = &req.search_after {
+                use tantivy::query::{BooleanQuery, Occur};
+                let filter = self.build_search_after_filter(&req.sort, cursor)?;
+                let q_for_hits = self.build_query(&req.query)?;
+                Some(Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, q_for_hits),
+                    (Occur::Must, filter),
+                ])))
+            } else {
+                None
+            };
         let effective_limit = if limit == 0 { 1 } else { limit };
 
         if GroupedAggCollector::has_grouped_metrics(&req.aggs) {
@@ -4977,20 +5101,35 @@ impl super::SearchEngine for HotEngine {
             );
 
             if req.size == 0 {
+                // size=0: no hits returned; cursor is moot. Run against user_query.
                 let (partial_aggs, total) =
-                    searcher.search(&*query, &(grouped_collector, Count))?;
+                    searcher.search(&*user_query, &(grouped_collector, Count))?;
                 return Ok((Vec::new(), total, partial_aggs));
             }
 
+            if let Some(hq) = hits_query.as_ref() {
+                // search_after with grouped aggs: two searches.
+                // 1) hits_query → TopDocs (post-cursor hits only)
+                // 2) user_query → grouped aggs + Count (unfiltered totals)
+                let top_docs =
+                    searcher.search(hq.as_ref(), &TopDocs::with_limit(effective_limit))?;
+                let (partial_aggs, total) =
+                    searcher.search(&*user_query, &(grouped_collector, Count))?;
+                let mut hits = self.collect_hits(&searcher, top_docs)?;
+                crate::search::sort_hits(&mut hits, &req.sort);
+                return Ok((hits, total, partial_aggs));
+            }
+
             let (top_docs, partial_aggs, total) = searcher.search(
-                &*query,
+                &*user_query,
                 &(
                     TopDocs::with_limit(effective_limit),
                     grouped_collector,
                     Count,
                 ),
             )?;
-            let hits = self.collect_hits(&searcher, top_docs)?;
+            let mut hits = self.collect_hits(&searcher, top_docs)?;
+            crate::search::sort_hits(&mut hits, &req.sort);
             return Ok((hits, total, partial_aggs));
         }
 
@@ -5003,7 +5142,7 @@ impl super::SearchEngine for HotEngine {
 
         // size=0 requests never need hits, so skip TopDocs entirely.
         if req.size == 0 {
-            let (partial_aggs, total) = searcher.search(&*query, &(agg_collector, Count))?;
+            let (partial_aggs, total) = searcher.search(&*user_query, &(agg_collector, Count))?;
             return Ok((Vec::new(), total, partial_aggs.unwrap_or_default()));
         }
 
@@ -5012,40 +5151,53 @@ impl super::SearchEngine for HotEngine {
             let schema = self.index.schema();
             let field = self.resolve_field(&sort_field);
             let field_type = schema.get_field_entry(field).field_type();
+
+            // Helper closure: runs the fast-field-sorted TopDocs collector and,
+            // when search_after is present, runs Count + aggs separately against
+            // the unfiltered user_query.
+            macro_rules! run_fast_field_sort {
+                ($ty:ty) => {{
+                    let td = TopDocs::with_limit(effective_limit)
+                        .order_by_fast_field::<$ty>(&sort_field, order);
+                    if let Some(hq) = hits_query.as_ref() {
+                        let top_docs = searcher.search(hq.as_ref(), &td)?;
+                        let (partial_aggs, total) =
+                            searcher.search(&*user_query, &(agg_collector, Count))?;
+                        let mut hits = self.collect_hits_sorted(&searcher, top_docs)?;
+                        crate::search::sort_hits(&mut hits, &req.sort);
+                        return Ok((hits, total, partial_aggs.unwrap_or_default()));
+                    }
+                    let (top_docs, partial_aggs, total) =
+                        searcher.search(&*user_query, &(td, agg_collector, Count))?;
+                    let mut hits = self.collect_hits_sorted(&searcher, top_docs)?;
+                    crate::search::sort_hits(&mut hits, &req.sort);
+                    return Ok((hits, total, partial_aggs.unwrap_or_default()));
+                }};
+            }
+
             match field_type {
-                tantivy::schema::FieldType::F64(_) => {
-                    let td = TopDocs::with_limit(effective_limit)
-                        .order_by_fast_field::<f64>(&sort_field, order);
-                    let (top_docs, partial_aggs, total) =
-                        searcher.search(&*query, &(td, agg_collector, Count))?;
-                    let hits = self.collect_hits_sorted(&searcher, top_docs)?;
-                    return Ok((hits, total, partial_aggs.unwrap_or_default()));
-                }
-                tantivy::schema::FieldType::I64(_) => {
-                    let td = TopDocs::with_limit(effective_limit)
-                        .order_by_fast_field::<i64>(&sort_field, order);
-                    let (top_docs, partial_aggs, total) =
-                        searcher.search(&*query, &(td, agg_collector, Count))?;
-                    let hits = self.collect_hits_sorted(&searcher, top_docs)?;
-                    return Ok((hits, total, partial_aggs.unwrap_or_default()));
-                }
-                tantivy::schema::FieldType::U64(_) => {
-                    let td = TopDocs::with_limit(effective_limit)
-                        .order_by_fast_field::<u64>(&sort_field, order);
-                    let (top_docs, partial_aggs, total) =
-                        searcher.search(&*query, &(td, agg_collector, Count))?;
-                    let hits = self.collect_hits_sorted(&searcher, top_docs)?;
-                    return Ok((hits, total, partial_aggs.unwrap_or_default()));
-                }
+                tantivy::schema::FieldType::F64(_) => run_fast_field_sort!(f64),
+                tantivy::schema::FieldType::I64(_) => run_fast_field_sort!(i64),
+                tantivy::schema::FieldType::U64(_) => run_fast_field_sort!(u64),
                 _ => {} // fall through to default score-based collection
             }
         }
 
+        if let Some(hq) = hits_query.as_ref() {
+            // search_after default path: two searches.
+            let top_docs = searcher.search(hq.as_ref(), &TopDocs::with_limit(effective_limit))?;
+            let (partial_aggs, total) = searcher.search(&*user_query, &(agg_collector, Count))?;
+            let mut hits = self.collect_hits(&searcher, top_docs)?;
+            crate::search::sort_hits(&mut hits, &req.sort);
+            return Ok((hits, total, partial_aggs.unwrap_or_default()));
+        }
+
         let (top_docs, partial_aggs, total) = searcher.search(
-            &*query,
+            &*user_query,
             &(TopDocs::with_limit(effective_limit), agg_collector, Count),
         )?;
-        let hits = self.collect_hits(&searcher, top_docs)?;
+        let mut hits = self.collect_hits(&searcher, top_docs)?;
+        crate::search::sort_hits(&mut hits, &req.sort);
         Ok((hits, total, partial_aggs.unwrap_or_default()))
     }
 
@@ -6050,6 +6202,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, total, _) = engine.search_query(&req).unwrap();
@@ -6075,6 +6228,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, total, _) = engine.search_query(&req).unwrap();
@@ -6136,6 +6290,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs,
         };
         let (results, total, partial_aggs) = engine.search_query(&req).unwrap();
@@ -6196,6 +6351,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::from([(
                 "sql_grouped".into(),
                 AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
@@ -6254,6 +6410,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, total, _) = engine.search_query(&req).unwrap();
@@ -6280,6 +6437,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -6378,6 +6536,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::new(),
         };
         let (_hits, total, _) = engine2.search_query(&req).unwrap();
@@ -6405,6 +6564,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::new(),
         };
         let (_hits, total, _) = engine2.search_query(&req).unwrap();
@@ -6622,6 +6782,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, total, _) = engine.search_query(&req).unwrap();
@@ -6646,6 +6807,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (all_results, _, _) = engine.search_query(&req_all).unwrap();
@@ -6658,6 +6820,7 @@ mod tests {
             from: 7,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (paged_results, _, _) = engine.search_query(&req_paged).unwrap();
@@ -6684,6 +6847,7 @@ mod tests {
             from: 100,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -6712,6 +6876,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -6748,6 +6913,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -6782,6 +6948,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -6822,6 +6989,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -6856,6 +7024,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -6875,6 +7044,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -6914,6 +7084,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -6972,6 +7143,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7001,6 +7173,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7029,6 +7202,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7057,6 +7231,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7090,6 +7265,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7127,6 +7303,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7162,6 +7339,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7236,6 +7414,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
 
@@ -7282,6 +7461,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7331,6 +7511,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7364,6 +7545,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7393,6 +7575,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7426,6 +7609,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7450,6 +7634,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7468,6 +7653,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7501,6 +7687,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7533,6 +7720,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7551,6 +7739,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -7616,6 +7805,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, _, _) = engine.search_query(&req).unwrap();
@@ -7654,6 +7844,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, _, _) = engine.search_query(&req).unwrap();
@@ -7703,6 +7894,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, _, _) = engine.search_query(&req).unwrap();
@@ -7764,6 +7956,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, _, _) = engine.search_query(&req).unwrap();
@@ -7791,6 +7984,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits2, _, _) = engine.search_query(&req2).unwrap();
@@ -7844,6 +8038,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, _, _) = engine.search_query(&req).unwrap();
@@ -7909,6 +8104,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::new(),
         };
         let (hits, _, _) = engine.search_query(&base_req).unwrap();
@@ -7961,6 +8157,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::new(),
         };
 
@@ -8001,6 +8198,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -8078,6 +8276,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::new(),
         };
 
@@ -8163,6 +8362,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, _, _) = engine.search_query(&req).unwrap();
@@ -8206,6 +8406,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8240,6 +8441,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8325,6 +8527,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8370,6 +8573,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8448,6 +8652,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8516,6 +8721,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8588,6 +8794,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8681,6 +8888,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8738,6 +8946,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -8984,6 +9193,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -9014,6 +9224,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -9037,6 +9248,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -9060,6 +9272,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, total, _) = engine.search_query(&req).unwrap();
@@ -9258,6 +9471,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9313,6 +9527,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9394,6 +9609,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![crate::search::SortClause::Field(price_sort)],
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9445,6 +9661,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine.sql_record_batch(&req, &[], true, false).unwrap();
@@ -9492,6 +9709,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9542,6 +9760,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9582,6 +9801,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9615,6 +9835,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9662,6 +9883,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9721,6 +9943,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9785,6 +10008,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9828,6 +10052,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9875,6 +10100,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine
@@ -9912,6 +10138,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: Vec::new(),
+            search_after: None,
             aggs: HashMap::new(),
         };
         let result = engine.sql_record_batch(&req, &[], false, false).unwrap();
@@ -10044,6 +10271,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::from([(
                 "sql_grouped".into(),
                 AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
@@ -10109,6 +10337,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::from([(
                 "sql_grouped".into(),
                 AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
@@ -10418,6 +10647,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::from([(
                 "sql_grouped".into(),
                 AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
@@ -10503,6 +10733,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::from([(
                 "sql_grouped".into(),
                 AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
@@ -10607,6 +10838,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: HashMap::from([(
                 "sql_grouped".into(),
                 AggregationRequest::GroupedMetrics(GroupedMetricsAggParams {
@@ -11030,6 +11262,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -11068,6 +11301,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -11103,6 +11337,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -11150,6 +11385,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -11179,6 +11415,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -11249,6 +11486,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let cols = vec!["brand".to_string(), "price".to_string()];
@@ -11306,6 +11544,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -11346,6 +11585,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -11426,6 +11666,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
 
@@ -11931,5 +12172,486 @@ mod tests {
                 avg
             );
         }
+    }
+
+    // ── search_after cursor pagination ──────────────────────────────────
+
+    fn search_after_engine_with_ints() -> (tempfile::TempDir, HotEngine) {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "n".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        let (dir, engine) = create_engine_with_mappings(mappings);
+        for i in 0..20i64 {
+            engine
+                .add_document(&format!("d{:02}", i), json!({ "n": i }))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+        (dir, engine)
+    }
+
+    fn sort_by(name: &str, dir: crate::search::SortDirection) -> crate::search::SortClause {
+        use crate::search::{SortClause, SortOrder};
+        SortClause::Field(HashMap::from([(
+            name.to_string(),
+            SortOrder::Direction(dir),
+        )]))
+    }
+
+    #[test]
+    fn search_after_integer_asc_paginates_contiguously() {
+        use crate::search::SortDirection;
+        let (_dir, engine) = search_after_engine_with_ints();
+
+        let req1 = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 5,
+            from: 0,
+            knn: None,
+            sort: vec![sort_by("n", SortDirection::Asc)],
+            search_after: None,
+            aggs: HashMap::new(),
+        };
+        let (page1, total, _) = engine.search_query(&req1).unwrap();
+        assert_eq!(total, 20);
+        assert_eq!(page1.len(), 5);
+
+        let cursor = page1.last().unwrap()["sort"].clone();
+        assert!(cursor.is_array());
+
+        let req2 = SearchRequest {
+            search_after: Some(cursor.as_array().unwrap().clone()),
+            ..req1.clone()
+        };
+        let (page2, _, _) = engine.search_query(&req2).unwrap();
+        assert_eq!(page2.len(), 5);
+
+        let ids1: Vec<String> = page1
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap().to_string())
+            .collect();
+        let ids2: Vec<String> = page2
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids1, vec!["d00", "d01", "d02", "d03", "d04"]);
+        assert_eq!(ids2, vec!["d05", "d06", "d07", "d08", "d09"]);
+
+        // Hits carry sort: [...] arrays
+        for hit in page1.iter().chain(page2.iter()) {
+            assert!(hit.get("sort").is_some(), "hit missing sort: {hit:?}");
+        }
+    }
+
+    #[test]
+    fn search_after_integer_desc_paginates_contiguously() {
+        use crate::search::SortDirection;
+        let (_dir, engine) = search_after_engine_with_ints();
+
+        let req1 = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 4,
+            from: 0,
+            knn: None,
+            sort: vec![sort_by("n", SortDirection::Desc)],
+            search_after: None,
+            aggs: HashMap::new(),
+        };
+        let (page1, _, _) = engine.search_query(&req1).unwrap();
+        let cursor = page1.last().unwrap()["sort"].as_array().unwrap().clone();
+
+        let req2 = SearchRequest {
+            search_after: Some(cursor),
+            ..req1.clone()
+        };
+        let (page2, _, _) = engine.search_query(&req2).unwrap();
+
+        let ids: Vec<String> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|h| h["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["d19", "d18", "d17", "d16", "d15", "d14", "d13", "d12"]
+        );
+    }
+
+    #[test]
+    fn search_after_multi_field_uses_tuple_lex_order() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::SortDirection;
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "k".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "tie".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+
+        // Two docs share k=1; tie distinguishes them.
+        for (id, k, tie) in [
+            ("a", 1, 100),
+            ("b", 1, 200),
+            ("c", 2, 50),
+            ("d", 2, 60),
+            ("e", 3, 10),
+        ] {
+            engine
+                .add_document(id, json!({ "k": k, "tie": tie }))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        // Sort by k asc, tie asc.
+        let req1 = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 2,
+            from: 0,
+            knn: None,
+            sort: vec![
+                sort_by("k", SortDirection::Asc),
+                sort_by("tie", SortDirection::Asc),
+            ],
+            search_after: None,
+            aggs: HashMap::new(),
+        };
+        let (page1, _, _) = engine.search_query(&req1).unwrap();
+        let ids1: Vec<&str> = page1.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert_eq!(ids1, vec!["a", "b"]);
+
+        // Cursor should be the last hit's sort tuple [1, 200]; next page must skip past it.
+        let cursor = page1.last().unwrap()["sort"].as_array().unwrap().clone();
+        let req2 = SearchRequest {
+            search_after: Some(cursor),
+            ..req1.clone()
+        };
+        let (page2, _, _) = engine.search_query(&req2).unwrap();
+        let ids2: Vec<&str> = page2.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert_eq!(ids2, vec!["c", "d"]);
+
+        let cursor2 = page2.last().unwrap()["sort"].as_array().unwrap().clone();
+        let req3 = SearchRequest {
+            search_after: Some(cursor2),
+            ..req1
+        };
+        let (page3, _, _) = engine.search_query(&req3).unwrap();
+        let ids3: Vec<&str> = page3.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert_eq!(ids3, vec!["e"]);
+    }
+
+    #[test]
+    fn search_after_by_id_paginates_keyword_field() {
+        // _id sorts rely on Tantivy's string fast-field collector, which is
+        // not wired up in the current planner. Skipping until the multi-key
+        // fast-field collector lands. The engine still produces a deterministic
+        // intra-K order via crate::search::sort_hits, but the per-shard top-K
+        // is not globally correct without primary-key Tantivy ordering, so
+        // this test only sanity-checks the validation path.
+        use crate::search::SortDirection;
+        let (_dir, engine) = search_after_engine_with_ints();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 3,
+            from: 0,
+            knn: None,
+            sort: vec![sort_by("_id", SortDirection::Asc)],
+            search_after: Some(vec![json!("zzzz")]),
+            aggs: HashMap::new(),
+        };
+        // Cursor past every _id returns no hits — confirms the filter is wired
+        // for the _id (string) path even though full top-K sort is approximate.
+        let (page, _, _) = engine.search_query(&req).unwrap();
+        assert!(page.is_empty(), "cursor past all _ids should yield 0 hits");
+    }
+
+    #[test]
+    fn search_after_rejects_score_sort() {
+        use crate::search::SortClause;
+        let (_dir, engine) = search_after_engine_with_ints();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 3,
+            from: 0,
+            knn: None,
+            sort: vec![SortClause::Simple("_score".to_string())],
+            search_after: Some(vec![json!(1.0)]),
+            aggs: HashMap::new(),
+        };
+        let err = engine.search_query(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("_score"),
+            "expected _score rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn search_after_rejects_length_mismatch() {
+        use crate::search::SortDirection;
+        let (_dir, engine) = search_after_engine_with_ints();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 3,
+            from: 0,
+            knn: None,
+            sort: vec![sort_by("n", SortDirection::Asc)],
+            search_after: Some(vec![json!(1), json!(2)]),
+            aggs: HashMap::new(),
+        };
+        let err = engine.search_query(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("does not match sort length"),
+            "expected length mismatch error, got {err}"
+        );
+    }
+
+    #[test]
+    fn search_after_rejects_unknown_field() {
+        use crate::search::SortDirection;
+        let (_dir, engine) = search_after_engine_with_ints();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 3,
+            from: 0,
+            knn: None,
+            sort: vec![sort_by("does_not_exist", SortDirection::Asc)],
+            search_after: Some(vec![json!(1)]),
+            aggs: HashMap::new(),
+        };
+        let err = engine.search_query(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "expected unknown-field error, got {err}"
+        );
+    }
+
+    // ── High #2 fix: total + aggregations must NOT shrink across pages ──
+    // The cursor filter is applied only to TopDocs collection. Count and
+    // aggregation collectors run against the unfiltered user_query so totals
+    // and aggregation buckets are identical on every page of a paginated
+    // request.
+    #[test]
+    fn search_after_total_hits_unchanged_across_pages() {
+        use crate::search::SortDirection;
+        let (_dir, engine) = search_after_engine_with_ints();
+
+        let req1 = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 5,
+            from: 0,
+            knn: None,
+            sort: vec![sort_by("n", SortDirection::Asc)],
+            search_after: None,
+            aggs: HashMap::new(),
+        };
+        let (page1, total1, _) = engine.search_query(&req1).unwrap();
+        assert_eq!(total1, 20);
+
+        let cursor = page1.last().unwrap()["sort"].clone();
+        let req2 = SearchRequest {
+            search_after: Some(cursor.as_array().unwrap().clone()),
+            ..req1.clone()
+        };
+        let (_, total2, _) = engine.search_query(&req2).unwrap();
+        // Without the High #2 fix, total2 would shrink to 15 (post-cursor count).
+        assert_eq!(total2, 20, "total must be invariant across cursor pages");
+
+        // And page 3 too.
+        let cursor3 = {
+            let req2_full = SearchRequest {
+                size: 5,
+                ..req2.clone()
+            };
+            let (p2, _, _) = engine.search_query(&req2_full).unwrap();
+            p2.last().unwrap()["sort"].clone()
+        };
+        let req3 = SearchRequest {
+            search_after: Some(cursor3.as_array().unwrap().clone()),
+            ..req1.clone()
+        };
+        let (_, total3, _) = engine.search_query(&req3).unwrap();
+        assert_eq!(total3, 20, "total must be invariant on page 3 too");
+    }
+
+    #[test]
+    fn search_after_aggregations_unchanged_across_pages() {
+        use crate::search::{AggregationRequest, MetricAggParams, PartialAggResult, SortDirection};
+        let (_dir, engine) = search_after_engine_with_ints();
+
+        fn value_count(aggs: &HashMap<String, PartialAggResult>) -> f64 {
+            match aggs.get("n_count").expect("agg present") {
+                PartialAggResult::Metric { value } => value.expect("value present"),
+                other => panic!("unexpected agg shape: {other:?}"),
+            }
+        }
+
+        let mut aggs = HashMap::new();
+        aggs.insert(
+            "n_count".to_string(),
+            AggregationRequest::ValueCount(MetricAggParams {
+                field: "n".to_string(),
+            }),
+        );
+
+        let req1 = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 5,
+            from: 0,
+            knn: None,
+            sort: vec![sort_by("n", SortDirection::Asc)],
+            search_after: None,
+            aggs: aggs.clone(),
+        };
+        let (page1, total1, aggs1) = engine.search_query(&req1).unwrap();
+        assert_eq!(total1, 20);
+        assert_eq!(value_count(&aggs1), 20.0);
+
+        let cursor = page1.last().unwrap()["sort"].clone();
+        let req2 = SearchRequest {
+            search_after: Some(cursor.as_array().unwrap().clone()),
+            ..req1.clone()
+        };
+        let (_, total2, aggs2) = engine.search_query(&req2).unwrap();
+        assert_eq!(total2, 20);
+        // Without the High #2 fix, aggs2.n_count would be 15 (post-cursor count).
+        assert_eq!(
+            value_count(&aggs2),
+            20.0,
+            "aggregations must be invariant across cursor pages"
+        );
+    }
+
+    // ── High #1 documented limitation: single-key Tantivy collector + ties.
+    // Tantivy 0.25's `order_by_fast_field` is single-key. When many docs share
+    // the same primary sort value, Tantivy breaks ties by doc-address. Our
+    // `search_after` advances past the cursor tuple, but ties not picked into
+    // page N can be skipped on page N+1. This test pins the current behavior
+    // so that any future custom multi-key collector work has a regression
+    // baseline.
+    #[test]
+    fn search_after_with_tied_primary_sort_documents_single_key_limit() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        use crate::search::SortDirection;
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "n".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        mappings.insert(
+            "tie".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        );
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        // 5 docs all share n=2020; secondary sort key `tie` varies.
+        for i in 0..5i64 {
+            engine
+                .add_document(&format!("t{:02}", i), json!({ "n": 2020, "tie": i }))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        // Single-key sort: only `n`. With all ties on n, the cursor `[2020]`
+        // matches no doc strictly greater than 2020 → page 2 is empty.
+        let req1 = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 2,
+            from: 0,
+            knn: None,
+            sort: vec![sort_by("n", SortDirection::Asc)],
+            search_after: None,
+            aggs: HashMap::new(),
+        };
+        let (page1, _, _) = engine.search_query(&req1).unwrap();
+        assert_eq!(page1.len(), 2);
+        let cursor = page1.last().unwrap()["sort"].clone();
+        let req2 = SearchRequest {
+            search_after: Some(cursor.as_array().unwrap().clone()),
+            ..req1.clone()
+        };
+        let (page2, _, _) = engine.search_query(&req2).unwrap();
+        assert_eq!(
+            page2.len(),
+            0,
+            "documented limitation: single-key sort with ties on the primary \
+             key drops the remaining tied docs at the cursor boundary"
+        );
+
+        // Multi-key sort: [n, tie]. Tantivy's collector still only orders by
+        // `n` (the primary). Within the tied n=2020 group, Tantivy picks docs
+        // in *its* tie-break order (typically doc-address), which has nothing
+        // to do with the secondary sort key. The cursor advances past the
+        // last-returned tuple, so the secondary values of docs that did NOT
+        // make it into page 1 can be either smaller or larger than the cursor.
+        //
+        // This is the documented High #1 limitation. The only guarantees we
+        // can assert here are:
+        //   1. The query does not crash.
+        //   2. No id appears in both pages (the strict cursor filter prevents
+        //      duplicates regardless of which tied doc landed last on page 1).
+        let req_multi1 = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 2,
+            from: 0,
+            knn: None,
+            sort: vec![
+                sort_by("n", SortDirection::Asc),
+                sort_by("tie", SortDirection::Asc),
+            ],
+            search_after: None,
+            aggs: HashMap::new(),
+        };
+        let (mp1, _, _) = engine.search_query(&req_multi1).unwrap();
+        assert_eq!(mp1.len(), 2);
+        let mc = mp1.last().unwrap()["sort"].clone();
+        let req_multi2 = SearchRequest {
+            search_after: Some(mc.as_array().unwrap().clone()),
+            ..req_multi1.clone()
+        };
+        let (mp2, _, _) = engine.search_query(&req_multi2).unwrap();
+
+        // No duplicates across pages (strict cursor filter guarantees this
+        // even with the single-key collector limitation).
+        let ids1: std::collections::HashSet<String> = mp1
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap().to_string())
+            .collect();
+        let ids2: std::collections::HashSet<String> = mp2
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ids1.is_disjoint(&ids2),
+            "strict cursor filter must prevent duplicates across pages, \
+             even when primary-key ties leave secondary ordering undefined"
+        );
+        // Documented limitation: page 2 length is NOT asserted. Depending on
+        // which tied doc Tantivy placed last on page 1, page 2 may legitimately
+        // be empty (cursor past all secondary values) or non-empty.
     }
 }

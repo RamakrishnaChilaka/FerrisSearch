@@ -320,6 +320,7 @@ impl CompositeEngine {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (docs, _, _) = self.text.search_query(&req).unwrap_or_default();
@@ -741,6 +742,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (results, _, _) = engine.search_query(&req).unwrap();
@@ -1067,6 +1069,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (text_hits, _, _) = engine.search_query(&req).unwrap();
@@ -1108,6 +1111,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            search_after: None,
             aggs: std::collections::HashMap::new(),
         };
         let (hits, _, _) = engine.search_query(&req).unwrap();

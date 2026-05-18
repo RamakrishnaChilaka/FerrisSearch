@@ -60,6 +60,7 @@ pub async fn count_documents(
         from: 0,
         knn: None,
         sort: vec![],
+        search_after: None,
         aggs: std::collections::HashMap::new(),
     };
 
@@ -276,6 +277,23 @@ fn default_size() -> usize {
     10
 }
 
+/// Compute the OpenSearch-compatible `max_score` field from a slice of hits.
+/// Returns the maximum `_score` across the slice as a JSON number, or `null`
+/// when no hit carries a numeric `_score` (no hits, or all `_score` values are
+/// null — e.g. when the request used `sort`).
+pub(crate) fn max_score_from_hits(hits: &[serde_json::Value]) -> serde_json::Value {
+    let mut max: Option<f64> = None;
+    for hit in hits {
+        if let Some(s) = hit.get("_score").and_then(|v| v.as_f64()) {
+            max = Some(max.map_or(s, |m| m.max(s)));
+        }
+    }
+    match max {
+        Some(s) => serde_json::Value::from(s),
+        None => serde_json::Value::Null,
+    }
+}
+
 fn query_string_search_request(params: &SearchParams) -> crate::search::SearchRequest {
     let query = if params.q == "*" {
         crate::search::QueryClause::MatchAll(serde_json::json!({}))
@@ -292,6 +310,7 @@ fn query_string_search_request(params: &SearchParams) -> crate::search::SearchRe
         from: params.from,
         knn: None,
         sort: vec![],
+        search_after: None,
         aggs: HashMap::new(),
     }
 }
@@ -350,6 +369,9 @@ pub async fn search_documents(
             .skip(search_req.from)
             .take(search_req.size)
             .collect();
+        // Query-string GET path never sorts, so max_score is the max BM25
+        // score across returned hits (null when there are no hits).
+        let max_score = max_score_from_hits(&paginated);
 
         let mut response = serde_json::json!({
             "_shards": {
@@ -359,6 +381,7 @@ pub async fn search_documents(
             },
             "hits": {
                 "total": { "value": result.total_hits, "relation": "eq" },
+                "max_score": max_score,
                 "hits": paginated
             }
         });
@@ -484,6 +507,7 @@ pub async fn search_documents(
     let from = params.from;
     let size = params.size;
     let paginated: Vec<_> = all_hits.into_iter().skip(from).take(size).collect();
+    let max_score = max_score_from_hits(&paginated);
 
     crate::metrics::SEARCH_QUERIES_TOTAL.inc();
 
@@ -497,6 +521,7 @@ pub async fn search_documents(
             },
             "hits": {
                 "total": { "value": total, "relation": "eq" },
+                "max_score": max_score,
                 "hits": paginated
             }
         })),
