@@ -1394,6 +1394,7 @@ async fn search_remote_store_splits_requires_local_index_metadata() {
                 from: 0,
                 knn: None,
                 sort: Vec::new(),
+                search_after: None,
                 aggs: HashMap::new(),
             })
             .unwrap(),

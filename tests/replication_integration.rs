@@ -1626,6 +1626,7 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
         from: 0,
         knn: None,
         sort: vec![],
+        search_after: None,
         aggs: HashMap::new(),
     };
 

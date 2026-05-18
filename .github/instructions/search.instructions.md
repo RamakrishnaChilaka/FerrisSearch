@@ -9,6 +9,7 @@ pub struct SearchRequest {
     pub knn: Option<KnnQuery>,                      // optional k-NN search
     pub sort: Vec<SortClause>,                      // default: sort by _score desc
     pub aggs: HashMap<String, AggregationRequest>,  // aggregations
+    pub search_after: Option<Vec<Value>>,           // optional cursor for deep pagination
 }
 ```
 
@@ -81,6 +82,20 @@ pub struct KnnParams {
 - `SortClause::Field(HashMap<String, SortOrder>)` — `{ "year": "desc" }`
 - Default sort (no `sort` clause): `_score` descending
 - Nulls sort last
+
+## search_after Cursor Pagination
+- OpenSearch/ES-compatible deep-pagination cursor. Pass the previous page's last hit's `sort` array as `search_after` on the next request.
+- Validation in `search_documents_dsl` returns 400 `illegal_argument_exception` when:
+    - `sort` is empty or its length does not match `search_after.len()`
+    - `from != 0` (cursor replaces offset pagination)
+    - any sort clause is `_score`
+    - `knn` is also present (the cursor filter only applies to the text leg; combining would let page 2 repeat page 1 kNN hits)
+- Engine builds a separate hits-only query that ANDs the cursor filter onto the user query: `BooleanQuery { (Must, user_query), (Must, cursor_filter) }`. The cursor filter is a `Should`-OR of `sort.len()` prefix clauses: prefix `i` is `(Eq sort[0]..sort[i-1]) AND (StrictInequality sort[i])`. `Bound::Excluded` is on the cursor side, `Bound::Unbounded` on the other; direction flips for `Desc`.
+- **Total/aggregations invariant**: when `search_after` is present, `Count` and aggregation collectors run against the unfiltered `user_query`, not the cursor-filtered hits query. Only `TopDocs` uses the cursor-filtered query. This guarantees `hits.total` and `aggregations` are identical across all pages of a paginated request.
+- Engine calls `crate::search::sort_hits(hits, sort_clauses)` after Tantivy collection (Tantivy's fast-field collector only orders by the primary sort key). `sort_hits` both sorts and annotates each hit with `sort: [v0, v1, ...]` in a single pass; annotation is idempotent (hits that already carry `sort` are left untouched). The coordinator preserves the `sort` field through local and remote shard re-enrichment in `execute_distributed_dsl_search`.
+- **Response shape**: when `sort` is non-empty, every hit's `_score` is `null` and `hits.max_score` is `null`. When `sort` is empty, `_score` is the BM25 score and `max_score` is the max across returned hits (or `null` when there are no hits).
+- **Sort uniqueness requirement (current limitation)**: Tantivy 0.25's `order_by_fast_field` is single-key only. The fast-field collector orders only by `sort[0]`; secondary sort keys are only applied to the shard-local hit set in `sort_hits` and do **not** influence Tantivy's top-K selection. Consequently, when many docs share the same primary sort value, Tantivy breaks ties by doc-address. `search_after` advances past the tuple `(last_primary, last_secondary, ...)`, but docs with the same `last_primary` that lost the doc-address tie-break on page N will be skipped on page N+1. For globally correct deep pagination today: ensure the primary sort field's values are unique across the queryable result set, or accept that ties may drop docs across page boundaries. Multi-key tuple-sort that pushes all sort keys into a custom Tantivy collector is tracked as future work.
+- Supported sort fields for global ordering correctness: numeric fast-fields (Integer/Float/Date) with **unique** primary values. String sort (`_id`, keyword) compiles, filters correctly, and pages forward without overlap but does not guarantee global top-K ordering across pages without a custom Tantivy collector.
 
 ## Search Flow (Scatter-Gather)
 1. Coordinator receives `POST /{index}/_search` with SearchRequest

@@ -4190,3 +4190,284 @@ async fn remote_store_verify_empty_index_returns_zero_counts() -> Result<()> {
     assert_eq!(vb["splits"].as_array().unwrap().len(), 0);
     Ok(())
 }
+
+async fn create_search_after_index_and_docs(
+    harness: &RestTestHarness,
+    index_name: &str,
+    doc_count: usize,
+) -> Result<()> {
+    let (status, body) = harness
+        .put_json(
+            &format!("/{index_name}"),
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 100
+                },
+                "mappings": {
+                    "properties": {
+                        "n": { "type": "integer" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "create index: {body}");
+
+    for i in 0..doc_count {
+        let doc_id = format!("d{:03}", i);
+        let (status, body) = harness
+            .put_json(
+                &format!("/{index_name}/_doc/{}?refresh=true", doc_id),
+                json!({ "n": i as i64 }),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "index {doc_id}: {body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_search_after_paginates_integer_ascending() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_search_after_index_and_docs(&harness, "sapage", 30).await?;
+
+    let page_size = 10usize;
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<Value> = None;
+
+    for page_idx in 0..3 {
+        let mut body = json!({
+            "size": page_size,
+            "sort": [{ "n": "asc" }]
+        });
+        if let Some(c) = cursor.clone() {
+            body["search_after"] = c;
+        }
+
+        let (status, resp) = harness.post_json("/sapage/_search", body).await?;
+        assert_eq!(status, StatusCode::OK, "page {page_idx}: {resp}");
+
+        let hits = resp["hits"]["hits"]
+            .as_array()
+            .expect("hits.hits must be array");
+        assert_eq!(hits.len(), page_size, "page {page_idx} size mismatch");
+
+        for hit in hits {
+            let id = hit["_id"].as_str().expect("_id").to_string();
+            let sort = hit["sort"].as_array().expect("sort must be present");
+            assert_eq!(sort.len(), 1, "sort tuple len");
+            assert!(!seen.contains(&id), "duplicate _id {id} on page {page_idx}");
+            seen.push(id);
+        }
+
+        cursor = Some(hits.last().unwrap()["sort"].clone());
+    }
+
+    assert_eq!(seen.len(), 30, "should see all 30 docs across 3 pages");
+    let expected: Vec<String> = (0..30).map(|i| format!("d{:03}", i)).collect();
+    assert_eq!(seen, expected, "global ordering across pages");
+
+    // Page past the end returns 0 hits.
+    let (status, resp) = harness
+        .post_json(
+            "/sapage/_search",
+            json!({
+                "size": page_size,
+                "sort": [{ "n": "asc" }],
+                "search_after": cursor.unwrap()
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["hits"]["hits"].as_array().map(Vec::len), Some(0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_search_after_rejects_invalid_shapes() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_search_after_index_and_docs(&harness, "sareject", 3).await?;
+
+    // Missing sort
+    let (status, body) = harness
+        .post_json("/sareject/_search", json!({ "search_after": [0] }))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["type"],
+        json!("illegal_argument_exception"),
+        "{body}"
+    );
+
+    // Length mismatch
+    let (status, body) = harness
+        .post_json(
+            "/sareject/_search",
+            json!({
+                "sort": [{ "n": "asc" }],
+                "search_after": [0, 1]
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
+
+    // _score in sort
+    let (status, body) = harness
+        .post_json(
+            "/sareject/_search",
+            json!({
+                "sort": ["_score"],
+                "search_after": [0.0]
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
+
+    // from != 0
+    let (status, body) = harness
+        .post_json(
+            "/sareject/_search",
+            json!({
+                "from": 1,
+                "sort": [{ "n": "asc" }],
+                "search_after": [0]
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
+
+    // search_after + knn is rejected (cursor filter does not apply to kNN leg).
+    let (status, body) = harness
+        .post_json(
+            "/sareject/_search",
+            json!({
+                "sort": [{ "n": "asc" }],
+                "search_after": [0],
+                "knn": {
+                    "vec": { "vector": [0.1, 0.2, 0.3], "k": 5 }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
+    let reason = body["error"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("k-NN") || reason.contains("knn"),
+        "expected kNN rejection reason, got: {reason}"
+    );
+
+    Ok(())
+}
+
+// ── Cosmetic fix: response shape matches OpenSearch for sorted vs unsorted ──
+#[tokio::test]
+async fn rest_search_response_shape_unsorted_emits_max_score_and_per_hit_score() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_search_after_index_and_docs(&harness, "shapeu", 5).await?;
+
+    // Unsorted match_all: max_score is a numeric value (BM25 score on match_all
+    // is typically 1.0, but we only assert it's a number, not null). Per-hit
+    // _score is numeric too.
+    let (status, resp) = harness
+        .post_json(
+            "/shapeu/_search",
+            json!({ "size": 3, "query": { "match_all": {} } }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(
+        resp["hits"]["max_score"].is_number(),
+        "unsorted response must emit numeric max_score, got: {}",
+        resp["hits"]["max_score"]
+    );
+    for hit in resp["hits"]["hits"].as_array().expect("hits.hits array") {
+        assert!(
+            hit["_score"].is_number(),
+            "unsorted hit must carry numeric _score, got: {hit}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_search_response_shape_sorted_nulls_score_and_max_score() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_search_after_index_and_docs(&harness, "shapes", 5).await?;
+
+    // Sorted: max_score is null and every hit's _score is null (OpenSearch parity).
+    let (status, resp) = harness
+        .post_json(
+            "/shapes/_search",
+            json!({ "size": 3, "sort": [{ "n": "asc" }] }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(
+        resp["hits"]["max_score"].is_null(),
+        "sorted response must emit max_score: null, got: {}",
+        resp["hits"]["max_score"]
+    );
+    for hit in resp["hits"]["hits"].as_array().expect("hits.hits array") {
+        assert!(
+            hit["_score"].is_null(),
+            "sorted hit must carry _score: null, got: {hit}"
+        );
+        assert!(
+            hit["sort"].is_array(),
+            "sorted hit must carry sort array, got: {hit}"
+        );
+    }
+    Ok(())
+}
+
+// ── High #2 fix: total + aggs unchanged across search_after pages ──
+#[tokio::test]
+async fn rest_search_after_total_and_aggs_invariant_across_pages() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_search_after_index_and_docs(&harness, "satotal", 20).await?;
+
+    let body1 = json!({
+        "size": 5,
+        "sort": [{ "n": "asc" }],
+        "aggs": {
+            "n_count": { "value_count": { "field": "n" } }
+        }
+    });
+    let (status1, resp1) = harness.post_json("/satotal/_search", body1.clone()).await?;
+    assert_eq!(status1, StatusCode::OK, "{resp1}");
+    let total1 = resp1["hits"]["total"]["value"].as_u64().expect("total1");
+    let agg1 = resp1["aggregations"]["n_count"]["value"]
+        .as_f64()
+        .expect("agg1");
+    assert_eq!(total1, 20, "page 1 total");
+    assert_eq!(agg1, 20.0, "page 1 agg");
+
+    let cursor = resp1["hits"]["hits"]
+        .as_array()
+        .and_then(|h| h.last())
+        .and_then(|h| h.get("sort"))
+        .cloned()
+        .expect("page 1 cursor");
+
+    let mut body2 = body1.clone();
+    body2["search_after"] = cursor;
+
+    let (status2, resp2) = harness.post_json("/satotal/_search", body2).await?;
+    assert_eq!(status2, StatusCode::OK, "{resp2}");
+    let total2 = resp2["hits"]["total"]["value"].as_u64().expect("total2");
+    let agg2 = resp2["aggregations"]["n_count"]["value"]
+        .as_f64()
+        .expect("agg2");
+    // The High #2 fix: cursor filter must NOT bias totals or aggs.
+    // Without the fix, total2 would shrink to 15 and agg2 to 15.0.
+    assert_eq!(total2, 20, "page 2 total must equal page 1 total");
+    assert_eq!(agg2, 20.0, "page 2 agg must equal page 1 agg");
+    Ok(())
+}

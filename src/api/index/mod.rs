@@ -675,12 +675,16 @@ pub(crate) async fn execute_distributed_dsl_search(
                 }
                 let mut shard_list = Vec::with_capacity(hits.len());
                 for hit in hits {
-                    shard_list.push(serde_json::json!({
+                    let mut enriched = serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
                         "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
                         "_score": hit.get("_score"),
                         "_source": hit.get("_source").unwrap_or(&hit)
-                    }));
+                    });
+                    if let Some(sort_vals) = hit.get("sort") {
+                        enriched["sort"] = sort_vals.clone();
+                    }
+                    shard_list.push(enriched);
                 }
                 shard_hit_lists.push(shard_list);
             }
@@ -770,7 +774,7 @@ pub(crate) async fn execute_distributed_dsl_search(
                 }
                 let mut shard_text = Vec::new();
                 for hit in hits {
-                    let enriched = serde_json::json!({
+                    let mut enriched = serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
                         "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
                         "_score": hit.get("_score"),
@@ -778,6 +782,9 @@ pub(crate) async fn execute_distributed_dsl_search(
                         "_knn_field": hit.get("_knn_field"),
                         "_knn_distance": hit.get("_knn_distance"),
                     });
+                    if let Some(sort_vals) = hit.get("sort") {
+                        enriched["sort"] = sort_vals.clone();
+                    }
                     if hit.get("_knn_field").is_some() {
                         knn_hits.push(enriched);
                     } else {
@@ -851,6 +858,57 @@ pub async fn search_documents_dsl(
         }
     };
 
+    // Validate search_after request shape before dispatching to shards.
+    if let Some(cursor) = &search_req.search_after {
+        if search_req.sort.is_empty() {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                "search_after requires a non-empty `sort` clause",
+            );
+        }
+        if cursor.len() != search_req.sort.len() {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                format!(
+                    "search_after length ({}) must match sort length ({})",
+                    cursor.len(),
+                    search_req.sort.len()
+                ),
+            );
+        }
+        if search_req.from != 0 {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                "search_after is incompatible with `from`; set from=0 and paginate via search_after",
+            );
+        }
+        if search_req.knn.is_some() {
+            // k-NN merges similarity-ranked hits into the response separately
+            // from the BM25/text leg, and the cursor filter is only applied to
+            // the text leg. Combining the two would let page 2 re-return page 1
+            // kNN hits. Reject the combo until we have a proper kNN cursor.
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                "search_after is not supported with k-NN queries",
+            );
+        }
+        for clause in &search_req.sort {
+            if let Some((name, _)) = crate::search::sort_clause_name_direction(clause)
+                && name == "_score"
+            {
+                return crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "search_after does not support sorting by _score",
+                );
+            }
+        }
+    }
+
     let result = match execute_distributed_dsl_search(&state, &index_name, &search_req).await {
         Ok(result) => result,
         Err(err) => return err,
@@ -858,12 +916,29 @@ pub async fn search_documents_dsl(
 
     crate::metrics::SEARCH_QUERIES_TOTAL.inc();
 
-    let paginated: Vec<_> = result
+    let mut paginated: Vec<_> = result
         .all_hits
         .into_iter()
         .skip(search_req.from)
         .take(search_req.size)
         .collect();
+
+    // OpenSearch parity:
+    //   - When `sort` is present, hits ignore relevance, so each hit's `_score`
+    //     is reported as null and the top-level `max_score` is null.
+    //   - When `sort` is empty, `_score` is the BM25 score and `max_score` is
+    //     the max across returned hits (null if there are no hits).
+    let sorted_response = !search_req.sort.is_empty();
+    let max_score: serde_json::Value = if sorted_response {
+        for hit in paginated.iter_mut() {
+            if let Some(obj) = hit.as_object_mut() {
+                obj.insert("_score".to_string(), serde_json::Value::Null);
+            }
+        }
+        serde_json::Value::Null
+    } else {
+        crate::api::search::max_score_from_hits(&paginated)
+    };
 
     let mut response = serde_json::json!({
         "_shards": {
@@ -873,6 +948,7 @@ pub async fn search_documents_dsl(
         },
         "hits": {
             "total": { "value": result.total_hits, "relation": "eq" },
+            "max_score": max_score,
             "hits": paginated
         }
     });
