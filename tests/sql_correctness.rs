@@ -222,6 +222,7 @@ impl FerrisDB {
             storage_manager: Arc::new(
                 ferrissearch::storage::StorageManager::new_in_path(tmp.path()).unwrap(),
             ),
+            security_manager: Arc::new(ferrissearch::security::SecurityManager::disabled()),
             remote_store_reader_cache: Arc::new(
                 ferrissearch::engine::remote_store::RemoteSplitReaderCache::default(),
             ),

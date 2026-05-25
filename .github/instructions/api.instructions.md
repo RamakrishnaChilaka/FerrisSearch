@@ -1,9 +1,17 @@
 # API Module — src/api/
 
 ## Router (src/api/mod.rs)
-Axum router with two middleware layers and a Prometheus metrics endpoint.
+Axum router with security, metrics, pretty-JSON middleware, and a Prometheus metrics endpoint.
 
 ### Middleware
+```rust
+pub async fn auth_middleware(State(security): State<Arc<SecurityManager>>, req: Request<Body>, next: Next) -> Response
+```
+- Runs on every HTTP node before handlers execute.
+- Disabled by default. When enabled, it accepts `Authorization: ApiKey <secret>` or `Authorization: Bearer <secret>`, hashes the presented secret with SHA-256, and checks configured bootstrap API-key hashes.
+- Classifies path-based requests into cluster, metrics, index, or security actions and inserts a `Principal` into request extensions for handlers that need body-derived resource authorization.
+- Middleware cannot infer target indices for body-routed global endpoints. `POST /_bulk`, `POST /_sql`, and `POST /_sql/stream` must do handler-level authorization after parsing `_index` or SQL table names.
+
 ```rust
 async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response
 ```
@@ -59,6 +67,14 @@ pub fn error_response(
 | `master_not_discovered_exception` | No master in cluster state |
 | `illegal_argument_exception` | Request shape rejected by handler-side validation (e.g. invalid `search_after` cursor) |
 | `group_by_scan_limit_exceeded` | GROUP BY fallback query matched more docs than `sql_group_by_scan_limit` |
+| `security_exception` | HTTP authentication or authorization failed |
+
+## Security Rules
+- Protected system index name: `.ferris_security`.
+- Ordinary index APIs must not create, write, read, describe, or show-create `.ferris_security`; return `403 security_exception` for body-routed attempts and rely on `IndexName` validation for path indices that reject dot-prefixed names.
+- `_cat/indices`, `_cat/shards`, `_cat/segments`, and `SHOW TABLES` / `SHOW INDICES` hide `.ferris_security`.
+- `SHOW TABLES` filters rows by the authenticated principal's index allow-list when security is enabled.
+- `DESCRIBE`, `SHOW CREATE TABLE`, and `SELECT ... FROM` on `/_sql` and `/_sql/stream` must authorize the extracted table name before reading metadata or executing.
 
 ## API Handlers
 
@@ -127,6 +143,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 | POST | `/{index}/_bulk` | `bulk_index()` |
 
 Bulk routes intentionally disable Axum's default buffered request-body limit so benchmark-sized NDJSON payloads reach the handler. When changing router composition or middleware layering, preserve large-body support on `POST /_bulk` and `POST /{index}/_bulk` or benchmark loaders will fail with `413 Failed to buffer the request body` before any item-level handling occurs.
+`bulk_index_global()` must validate raw action `_index` values with `IndexName::new()`, reject `.ferris_security`, and enforce the authenticated principal's index permissions per item before metadata lookup or auto-create.
 
 ### Search — src/api/search.rs
 | HTTP | Path | Handler |
@@ -146,7 +163,7 @@ For `remote_store` indices, `GET /{index}/_search?q=...`, SQL materialized searc
 - `POST /_sql` handles SQL commands that don't require an index in the URL path.
 - `POST /_sql/stream` exposes the same commands over `application/x-ndjson`, emitting one `meta` frame followed by zero or more `rows` frames.
 - Supported commands:
-    - `SHOW TABLES` / `SHOW INDICES` — lists all indices with engine, doc counts, shards, replicas, field count
+    - `SHOW TABLES` / `SHOW INDICES` — lists authorized non-system indices with engine, doc counts, shards, replicas, field count
     - `DESCRIBE <index>` / `DESC <index>` — shows field names and types for an index
     - `SHOW CREATE TABLE <index>` — returns engine + settings + mappings JSON for recreating the index
     - `SELECT ... FROM "index" ...` — auto-extracts index name from the FROM clause and routes to `execute_sql_query()`

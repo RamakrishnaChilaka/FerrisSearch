@@ -35,6 +35,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing), remote_store.rs (shardless read path; root nodes load manifests, prune splits by manifest field summaries for supported structured filters, expose pruning counters on search and SQL/EXPLAIN ANALYZE responses, schedule split batches to data-node leaves, and leaves reuse node-local cached HotEngine readers over downloaded split bundles)
 - `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
 - `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
+- `src/security/` — core HTTP security: API-key authentication, action/resource authorization, `.ferris_security` metadata, system-index guards
 - `src/tasks.rs` — TaskManager for async background maintenance tracking (`_forcemerge`, `/_tasks/{task_id}`)
 - `src/wal/` — HotTranslog (generation-based binary WAL), TranslogDurability, WriteAheadLog trait
 - `src/worker.rs` — WorkerPools: dedicated rayon thread pools for search/write isolation
@@ -107,7 +108,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1123 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 75 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1346 total
+- 1147 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 75 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1370 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -128,6 +129,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - Joining node does NOT call `update_state` — Raft log replication propagates state, but `JoinCluster` returns an authoritative snapshot for initial shard reopen/cleanup decisions
 - Nodes reopen locally assigned shards after startup using the authoritative bootstrap/join snapshot when available, keep recovered-node startup assignments fail-closed when their expected UUID dirs are missing, never clear that recovered-startup guard just because authoritative state arrived, allow later assignments to create their shard dirs in the lifecycle loop, and skip orphan cleanup until index UUIDs are known and the expected local shard UUID paths exist
 - Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader), shard failover (promote best ISR replica to primary for orphaned shards)
+- Security-enabled leaders auto-create the protected `.ferris_security` system index via Raft once data nodes are known and adapt its replica count to `data_nodes - 1` as topology changes.
 - Follower lifecycle loop: pings the master for liveness; if the ping target no longer recognizes this node in cluster state, immediately reruns `JoinCluster` so stale/removed followers can self-heal after transient partitions or leader-side removals
 
 ## Important Design Decisions
@@ -183,12 +185,19 @@ pub struct AppState {
     pub worker_pools: WorkerPools,
     pub task_manager: Arc<TaskManager>,
     pub storage_manager: Arc<StorageManager>,
+    pub security_manager: Arc<SecurityManager>,
     pub sql_group_by_scan_limit: usize,
     pub sql_approximate_top_k: bool,
 }
 ```
 - `storage_manager` is an object_store-backed abstraction with a node-local workdir for split staging and cache. By default storage is rooted at `<data_dir>/_remote_store/` (local filesystem) and cache at `<data_dir>/_remote_store_cache/`. Set `storage_uri` in `AppConfig` to override the storage backend — supports bare path, `file://`, and `s3://<bucket>[/prefix]`. For `s3://`, AWS credentials and endpoint are read from standard env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`). The `remote_store` engine writes split bundles (`<uuid>/splits/<split_id>/bundle`) and manifest generations (`<uuid>/manifests/<gen>.json` + `manifest.current.json`) through this store; publish streams a packed deterministic bundle + sha256 up plus exact split summaries under `field_ranges`/`field_terms`, roots query leaf status over gRPC, prunes supported structured filters against those summaries before scheduling, leaves fetch bundles into node-local caches keyed by split id with a `.done` marker, open-reader cache entries pin those cached artifacts while warm, and post-search reaping drops stale or over-budget split directories without touching pinned readers.
 - `sql_approximate_top_k` currently defaults to `true`; eligible grouped-partials `GROUP BY ... ORDER BY metric LIMIT N` queries use shard-level approximate top-K pruning unless the user disables it in config
+
+## Core Security
+- `AppConfig.security` is disabled by default. When enabled, HTTP middleware requires `Authorization: ApiKey <secret>` or `Authorization: Bearer <secret>` and matches the SHA-256 hash against `bootstrap_api_keys`.
+- `SecurityManager` classifies path-based HTTP requests into cluster, index, metrics, and security actions, then inserts the authenticated `Principal` into request extensions for body-routed handlers.
+- Global body-routed endpoints must do their own resource checks after parsing: `POST /_bulk` authorizes each action `_index`, and `POST /_sql` / `/_sql/stream` authorize extracted table names from `DESCRIBE`, `SHOW CREATE TABLE`, and `SELECT ... FROM`.
+- `.ferris_security` is a protected system index created internally by the leader via Raft only when `security.enabled && auto_create_security_index` are explicitly enabled. It uses one primary shard and adaptive replicas (`data_nodes - 1`) reconciled in the leader lifecycle loop. Ordinary index APIs, global bulk, SQL metadata commands, cat endpoints, and `SHOW TABLES` must not expose it.
 
 ## Core Data Structures (src/cluster/state.rs)
 
@@ -244,6 +253,7 @@ pub struct AppConfig {
     pub transport_tls_key_file: Option<String>,  // PEM key for gRPC server
     pub transport_tls_ca_file: Option<String>,   // PEM CA for client verification
     pub storage_uri: Option<String>,             // override <data_dir>/_remote_store ; supports file:// and s3://bucket[/prefix]
+    pub security: SecurityConfig,                // HTTP authn/authz; disabled by default
 }
 ```
 - Load order: defaults → `config/ferrissearch.yml` → `FERRISSEARCH_*` env vars

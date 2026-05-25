@@ -192,6 +192,7 @@ impl RestTestHarness {
             storage_manager: Arc::new(
                 ferrissearch::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
             ),
+            security_manager: Arc::new(ferrissearch::security::SecurityManager::disabled()),
             remote_store_reader_cache: Arc::new(
                 ferrissearch::engine::remote_store::RemoteSplitReaderCache::default(),
             ),
@@ -460,6 +461,7 @@ impl MultiNodeRestHarness {
                 worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
                 task_manager: task_manager.clone(),
                 storage_manager: storage_manager.clone(),
+                security_manager: Arc::new(ferrissearch::security::SecurityManager::disabled()),
                 remote_store_reader_cache: remote_store_reader_cache.clone(),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,

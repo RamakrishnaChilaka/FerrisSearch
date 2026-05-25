@@ -42,6 +42,7 @@ pub struct Node {
     pub raft: Arc<RaftInstance>,
     pub task_manager: Arc<crate::tasks::TaskManager>,
     pub storage_manager: Arc<crate::storage::StorageManager>,
+    pub security_manager: Arc<crate::security::SecurityManager>,
     pub remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
 }
 
@@ -165,6 +166,9 @@ impl Node {
                 crate::storage::StorageManager::new_in_path(std::path::Path::new(&config.data_dir))?
             }
         });
+        let security_manager = Arc::new(crate::security::SecurityManager::new(
+            config.security.clone(),
+        )?);
         let remote_store_reader_cache =
             Arc::new(crate::engine::remote_store::RemoteSplitReaderCache::default());
 
@@ -176,6 +180,7 @@ impl Node {
             raft,
             task_manager,
             storage_manager,
+            security_manager,
             remote_store_reader_cache,
         })
     }
@@ -207,6 +212,7 @@ impl Node {
             worker_pools: crate::worker::WorkerPools::default_for_system(),
             task_manager: self.task_manager.clone(),
             storage_manager: self.storage_manager.clone(),
+            security_manager: self.security_manager.clone(),
             remote_store_reader_cache: self.remote_store_reader_cache.clone(),
             sql_group_by_scan_limit: self.config.sql_group_by_scan_limit,
             sql_approximate_top_k: self.config.sql_approximate_top_k,
@@ -273,6 +279,7 @@ impl Node {
         let raft = self.raft.clone();
         let raft_node_id = self.config.raft_node_id;
         let manager_clone = self.shard_manager.clone();
+        let security_manager = self.security_manager.clone();
         let remote_seeds = remote_seed_hosts(&seed_hosts, local_node.transport_port);
 
         tokio::spawn(async move {
@@ -621,6 +628,60 @@ impl Node {
                             .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
                             .map(|n| n.id.clone())
                             .collect();
+
+                        if security_manager.should_auto_create_security_index()
+                            && !alloc_state
+                                .indices
+                                .contains_key(crate::security::SECURITY_INDEX_NAME)
+                            && !data_nodes.is_empty()
+                        {
+                            match crate::security::security_index_metadata(&data_nodes) {
+                                Ok(metadata) => {
+                                    tracing::info!(
+                                        "Creating protected security system index {}",
+                                        crate::security::SECURITY_INDEX_NAME
+                                    );
+                                    if let Err(e) = raft
+                                        .client_write(ClusterCommand::CreateIndex { metadata })
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Failed to create security system index via Raft: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    "Failed to build security system index metadata: {}",
+                                    e
+                                ),
+                            }
+                        }
+
+                        if security_manager.should_auto_create_security_index()
+                            && let Some(metadata) = alloc_state
+                                .indices
+                                .get(crate::security::SECURITY_INDEX_NAME)
+                            && let Some(updated) = crate::security::adapt_security_index_replicas(
+                                metadata,
+                                &data_nodes,
+                            )
+                        {
+                            tracing::info!(
+                                "Adapting protected security system index {} replicas to {}",
+                                crate::security::SECURITY_INDEX_NAME,
+                                updated.number_of_replicas
+                            );
+                            if let Err(e) = raft
+                                .client_write(ClusterCommand::UpdateIndex { metadata: updated })
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to adapt security system index replicas via Raft: {}",
+                                    e
+                                );
+                            }
+                        }
 
                         for idx_meta in alloc_state.indices.values() {
                             if idx_meta.unassigned_replica_count() > 0 {

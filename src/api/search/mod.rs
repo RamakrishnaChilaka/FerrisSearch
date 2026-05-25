@@ -2,7 +2,7 @@ use crate::api::AppState;
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -1853,12 +1853,14 @@ pub async fn search_sql_stream(
 /// POST /_sql/stream — Global NDJSON SQL stream endpoint.
 pub async fn global_sql_stream(
     State(state): State<AppState>,
+    principal: Option<Extension<crate::security::Principal>>,
     Json(req): Json<SqlQueryRequest>,
 ) -> Response {
     let trimmed = req.query.trim();
+    let principal = principal.as_ref().map(|Extension(p)| p);
 
     if matches_command(trimmed, "SHOW TABLES") || matches_command(trimmed, "SHOW INDICES") {
-        let (status, body) = handle_show_tables(&state).await;
+        let (status, body) = handle_show_tables(&state, principal).await;
         return if status.is_success() {
             stream_json_response(body.0)
         } else {
@@ -1870,6 +1872,9 @@ pub async fn global_sql_stream(
         strip_command(trimmed, "DESCRIBE").or_else(|| strip_command(trimmed, "DESC"))
     {
         let table = unquote_identifier(table);
+        if let Some(error) = authorize_global_sql_index(&state, principal, &table) {
+            return error.into_response();
+        }
         let (status, body) = handle_describe(&state, &table).await;
         return if status.is_success() {
             stream_json_response(body.0)
@@ -1880,6 +1885,9 @@ pub async fn global_sql_stream(
 
     if let Some(table) = strip_command(trimmed, "SHOW CREATE TABLE") {
         let table = unquote_identifier(table);
+        if let Some(error) = authorize_global_sql_index(&state, principal, &table) {
+            return error.into_response();
+        }
         let (status, body) = handle_show_create_table(&state, &table).await;
         return if status.is_success() {
             stream_json_response(body.0)
@@ -1912,6 +1920,10 @@ pub async fn global_sql_stream(
         }
     };
 
+    if let Some(error) = authorize_global_sql_index(&state, principal, index_name.as_str()) {
+        return error.into_response();
+    }
+
     match execute_sql_stream_query(&state, &index_name, &req.query).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
@@ -1939,13 +1951,15 @@ pub async fn search_sql(
 /// and regular SELECT queries (index extracted from FROM clause).
 pub async fn global_sql(
     State(state): State<AppState>,
+    principal: Option<Extension<crate::security::Principal>>,
     Json(req): Json<SqlQueryRequest>,
 ) -> (StatusCode, Json<Value>) {
     let trimmed = req.query.trim();
+    let principal = principal.as_ref().map(|Extension(p)| p);
 
     // SHOW TABLES / SHOW INDICES
     if matches_command(trimmed, "SHOW TABLES") || matches_command(trimmed, "SHOW INDICES") {
-        return handle_show_tables(&state).await;
+        return handle_show_tables(&state, principal).await;
     }
 
     // DESCRIBE {table} / DESC {table}
@@ -1953,12 +1967,18 @@ pub async fn global_sql(
         strip_command(trimmed, "DESCRIBE").or_else(|| strip_command(trimmed, "DESC"))
     {
         let table = unquote_identifier(table);
+        if let Some(error) = authorize_global_sql_index(&state, principal, &table) {
+            return error;
+        }
         return handle_describe(&state, &table).await;
     }
 
     // SHOW CREATE TABLE {table}
     if let Some(table) = strip_command(trimmed, "SHOW CREATE TABLE") {
         let table = unquote_identifier(table);
+        if let Some(error) = authorize_global_sql_index(&state, principal, &table) {
+            return error;
+        }
         return handle_show_create_table(&state, &table).await;
     }
 
@@ -1984,6 +2004,10 @@ pub async fn global_sql(
             );
         }
     };
+
+    if let Some(error) = authorize_global_sql_index(&state, principal, index_name.as_str()) {
+        return error;
+    }
 
     let result = match execute_sql_query(&state, &index_name, &req.query).await {
         Ok(result) => result,
@@ -2052,12 +2076,55 @@ fn extract_index_from_sql(sql: &str) -> Option<String> {
     }
 }
 
+fn authorize_global_sql_index(
+    state: &AppState,
+    principal: Option<&crate::security::Principal>,
+    index_name: &str,
+) -> Option<(StatusCode, Json<Value>)> {
+    if crate::security::is_protected_system_index(index_name) {
+        return Some(crate::security::protected_system_index_error(index_name));
+    }
+
+    state
+        .security_manager
+        .authorize_or_error(
+            principal,
+            &crate::security::ClassifiedRequest {
+                action: crate::security::SecurityAction::IndexRead,
+                index: Some(index_name.to_string()),
+            },
+        )
+        .err()
+        .map(crate::security::SecurityError::into_response_json)
+}
+
 /// SHOW TABLES — list all indices with doc counts, engine, and shard info.
-async fn handle_show_tables(state: &AppState) -> (StatusCode, Json<Value>) {
+async fn handle_show_tables(
+    state: &AppState,
+    principal: Option<&crate::security::Principal>,
+) -> (StatusCode, Json<Value>) {
     let cluster_state = state.cluster_manager.get_state();
     let mut rows = Vec::new();
 
     for (name, metadata) in &cluster_state.indices {
+        if crate::security::is_protected_system_index(name) {
+            continue;
+        }
+
+        if state
+            .security_manager
+            .authorize_or_error(
+                principal,
+                &crate::security::ClassifiedRequest {
+                    action: crate::security::SecurityAction::IndexRead,
+                    index: Some(name.clone()),
+                },
+            )
+            .is_err()
+        {
+            continue;
+        }
+
         let num_shards = metadata.number_of_shards;
         let num_replicas = metadata.number_of_replicas;
         let field_count = metadata.mappings.len();
@@ -2093,6 +2160,10 @@ async fn handle_show_tables(state: &AppState) -> (StatusCode, Json<Value>) {
 
 /// DESCRIBE {table} — show field names and types for an index.
 async fn handle_describe(state: &AppState, index_name: &str) -> (StatusCode, Json<Value>) {
+    if crate::security::is_protected_system_index(index_name) {
+        return crate::security::protected_system_index_error(index_name);
+    }
+
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
@@ -2148,6 +2219,10 @@ async fn handle_describe(state: &AppState, index_name: &str) -> (StatusCode, Jso
 
 /// SHOW CREATE TABLE {table} — show the CREATE INDEX JSON for an index.
 async fn handle_show_create_table(state: &AppState, index_name: &str) -> (StatusCode, Json<Value>) {
+    if crate::security::is_protected_system_index(index_name) {
+        return crate::security::protected_system_index_error(index_name);
+    }
+
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,

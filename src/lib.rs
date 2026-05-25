@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod node;
 pub mod replication;
 pub mod search;
+pub mod security;
 pub mod shard;
 pub mod storage;
 pub mod tasks;

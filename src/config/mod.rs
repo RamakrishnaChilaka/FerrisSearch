@@ -1,4 +1,5 @@
 // Adds required field to AppConfig
+use crate::security::SecurityConfig;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +112,9 @@ pub struct AppConfig {
     /// `AWS_REGION`, `AWS_ENDPOINT_URL`, ...).
     #[serde(default)]
     pub storage_uri: Option<String>,
+    /// HTTP authentication and authorization settings.
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 fn default_raft_node_id() -> u64 {
@@ -158,6 +162,7 @@ impl Default for AppConfig {
             transport_tls_key_file: None,
             transport_tls_ca_file: None,
             storage_uri: None,
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -229,6 +234,45 @@ mod tests {
     fn default_translog_sync_interval_is_none() {
         let config = AppConfig::default();
         assert!(config.translog_sync_interval_ms.is_none());
+    }
+
+    #[test]
+    fn security_defaults_to_disabled() {
+        let config = AppConfig::default();
+        assert!(!config.security.enabled);
+        assert!(!config.security.auto_create_security_index);
+        assert!(config.security.bootstrap_api_keys.is_empty());
+    }
+
+    #[test]
+    fn security_deserializes_bootstrap_api_keys() {
+        let json = r#"{
+            "node_name": "n1",
+            "cluster_name": "test",
+            "http_port": 9200,
+            "transport_port": 9300,
+            "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "security": {
+                "enabled": true,
+                "auto_create_security_index": false,
+                "bootstrap_api_keys": [
+                    {
+                        "id": "admin-key",
+                        "name": "admin",
+                        "hash_sha256": "sha256:2bb80d537b1da3e38bd30361aa855686bde0bae6a6cf2f9c1b294d409b06f9e3",
+                        "roles": ["admin"],
+                        "indices": ["*"]
+                    }
+                ]
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+
+        assert!(config.security.enabled);
+        assert!(!config.security.auto_create_security_index);
+        assert_eq!(config.security.bootstrap_api_keys.len(), 1);
+        assert_eq!(config.security.bootstrap_api_keys[0].roles, ["admin"]);
     }
 
     #[test]

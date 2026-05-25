@@ -11,5 +11,16 @@ transport_port: 9300
 # instead of approximate shard-level top-K pruning for eligible GROUP BY queries.
 # sql_approximate_top_k: false
 
+# HTTP security (disabled by default)
+# security:
+#   enabled: false
+#   auto_create_security_index: false
+#   bootstrap_api_keys:
+#     - id: "admin-key"
+#       name: "admin"
+#       hash_sha256: "sha256:<64-char-sha256-hex>"
+#       roles: ["admin"]
+#       indices: ["*"]
+
 # Storage
 # data_dir: "./data/ferrissearch-dev-1"

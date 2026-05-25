@@ -78,9 +78,10 @@ Every SQL response tells you how the planner executed the query:
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) with hybrid text + vector querying
 - **Generation-based WAL** — durable writes, replica catch-up, background auto-flush, and corruption-safe reopen errors
 - **Stable restarts** — covered by a real three-node flush + restart regression
+- **Core security foundation** — optional API-key HTTP auth with role/index authorization, protected `.ferris_security` system-index metadata with adaptive replicas, and guards on body-routed bulk and SQL endpoints
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1346 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
+- **Test depth** — 1370 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, security auth/guard coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
 
 ## Tech Stack
 
@@ -180,9 +181,13 @@ Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variable
 | `transport_tls_cert_file` | (unset) | PEM certificate for the gRPC transport server when TLS is enabled |
 | `transport_tls_key_file` | (unset) | PEM private key for the gRPC transport server when TLS is enabled |
 | `transport_tls_ca_file` | (unset) | PEM CA certificate used by transport clients to verify peers |
+| `security.enabled` | `false` | Enable HTTP API authentication and authorization |
+| `security.auto_create_security_index` | `false` | Auto-create protected `.ferris_security` metadata through Raft when explicitly enabled; replicas adapt to `data_nodes - 1` |
+| `security.bootstrap_api_keys` | `[]` | Startup API-key records with `id`, `name`, `hash_sha256`, `roles`, and optional `indices` patterns |
 
 If `transport_tls_enabled: true` is set without compiling `--features transport-tls`, node startup fails instead of silently falling back to plaintext transport.
-  "approximate_top_k": false,
+
+When `security.enabled: true`, clients send `Authorization: ApiKey <secret>` or `Authorization: Bearer <secret>`. Store only SHA-256 hashes in `security.bootstrap_api_keys`; the plaintext key is never persisted by FerrisSearch.
 
 ## SQL Over Search Results
 
@@ -549,13 +554,13 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1346 tests
-cargo test --lib                                # Unit tests (1123)
+cargo test                                      # All 1370 tests
+cargo test --lib                                # Unit tests (1147)
 cargo test --bin ferris-cli                      # CLI tests (68)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
 cargo test --test replication_integration --features transport-tls  # Replication with encrypted gRPC transport
-cargo test --test rest_api_integration           # REST API (69)
+cargo test --test rest_api_integration           # REST API (75)
 cargo test --test remote_store_s3_integration    # remote_store S3-compatible storage ops (6, requires FERRIS_RUSTFS_ENDPOINT)
 cargo test --test restart_regression             # Real 3-node flush + restart regression (1)
 cargo test --test sql_correctness                # SQL correctness (1 test, 180 sqllogictest assertions)
