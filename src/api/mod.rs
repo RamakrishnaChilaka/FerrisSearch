@@ -58,6 +58,8 @@ pub struct AppState {
     pub task_manager: Arc<crate::tasks::TaskManager>,
     /// Object-store-backed storage for remote_store engine (manifests, splits).
     pub storage_manager: Arc<crate::storage::StorageManager>,
+    /// HTTP security manager. Disabled by default.
+    pub security_manager: Arc<crate::security::SecurityManager>,
     /// Process-local cache of open remote_store split readers.
     pub remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
     /// Max docs to scan for GROUP BY queries on the fast-fields fallback path.
@@ -271,6 +273,8 @@ async fn handle_metrics(State(state): State<AppState>) -> Response {
 }
 
 pub fn create_router(state: AppState) -> Router {
+    let security_manager = state.security_manager.clone();
+
     let bulk_router = Router::new()
         .route("/_bulk", post(index::bulk_index_global))
         .route("/{index}/_bulk", post(index::bulk_index))
@@ -330,6 +334,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_flush", get(index::flush_index))
         .route("/{index}/_forcemerge", post(index::force_merge_index))
         .merge(bulk_router)
+        .layer(middleware::from_fn_with_state(
+            security_manager,
+            crate::security::auth_middleware,
+        ))
         .layer(middleware::from_fn(pretty_json_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
@@ -450,6 +458,7 @@ mod tests {
                 storage_manager: std::sync::Arc::new(
                     crate::storage::StorageManager::new_in_path(&data_dir).unwrap(),
                 ),
+                security_manager: std::sync::Arc::new(crate::security::SecurityManager::disabled()),
                 remote_store_reader_cache: std::sync::Arc::new(
                     crate::engine::remote_store::RemoteSplitReaderCache::default(),
                 ),
@@ -457,6 +466,124 @@ mod tests {
                 sql_approximate_top_k: false,
             },
         )
+    }
+
+    fn enabled_security_manager() -> std::sync::Arc<crate::security::SecurityManager> {
+        std::sync::Arc::new(
+            crate::security::SecurityManager::new(crate::security::SecurityConfig {
+                enabled: true,
+                auto_create_security_index: false,
+                bootstrap_api_keys: vec![crate::security::SecurityApiKeyConfig {
+                    id: "reader-key".into(),
+                    name: "reader".into(),
+                    hash_sha256: crate::security::sha256_hex("secret"),
+                    roles: vec!["read".into()],
+                    indices: vec!["logs-*".into()],
+                }],
+            })
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn security_disabled_allows_requests_without_auth() {
+        let (_temp_dir, state) = make_test_state().await;
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn security_enabled_requires_api_key() {
+        let (_temp_dir, mut state) = make_test_state().await;
+        state.security_manager = enabled_security_manager();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn security_enabled_rejects_invalid_api_key() {
+        let (_temp_dir, mut state) = make_test_state().await;
+        state.security_manager = enabled_security_manager();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::AUTHORIZATION, "ApiKey wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn read_api_key_can_monitor_cluster_but_cannot_write() {
+        let (_temp_dir, mut state) = make_test_state().await;
+        state.security_manager = enabled_security_manager();
+        let app = create_router(state);
+
+        let monitor_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_cluster/health")
+                    .header(header::AUTHORIZATION, "ApiKey secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let write_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/logs-2026")
+                    .header(header::AUTHORIZATION, "ApiKey secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(monitor_response.status(), StatusCode::OK);
+        assert_eq!(write_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn read_api_key_cannot_read_full_cluster_state() {
+        let (_temp_dir, mut state) = make_test_state().await;
+        state.security_manager = enabled_security_manager();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_cluster/state")
+                    .header(header::AUTHORIZATION, "ApiKey secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

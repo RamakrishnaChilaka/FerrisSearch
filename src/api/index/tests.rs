@@ -234,6 +234,7 @@ async fn make_test_app_state(cluster_state: ClusterState) -> (tempfile::TempDir,
         storage_manager: Arc::new(
             crate::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
         ),
+        security_manager: Arc::new(crate::security::SecurityManager::disabled()),
         remote_store_reader_cache: Arc::new(
             crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
@@ -300,8 +301,13 @@ async fn bulk_index_global_reports_missing_action_index() {
     let (_tmp, state) = make_test_app_state(cluster_state).await;
     let input = axum::body::Bytes::from("{\"index\":{\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n");
 
-    let (status, Json(body)) =
-        bulk_index_global(State(state), Query(RefreshParam { refresh: None }), input).await;
+    let (status, Json(body)) = bulk_index_global(
+        State(state),
+        None,
+        Query(RefreshParam { refresh: None }),
+        input,
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["errors"], true);
@@ -310,6 +316,101 @@ async fn bulk_index_global_reports_missing_action_index() {
     assert_eq!(
         body["items"][0]["index"]["error"]["type"],
         "action_request_validation_exception"
+    );
+}
+
+#[tokio::test]
+async fn bulk_index_global_rejects_protected_security_index() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_node(make_test_node("node-1"));
+
+    let (_tmp, state) = make_test_app_state(cluster_state).await;
+    let input = axum::body::Bytes::from(
+        "{\"index\":{\"_index\":\".ferris_security\",\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n",
+    );
+
+    let (status, Json(body)) = bulk_index_global(
+        State(state),
+        None,
+        Query(RefreshParam { refresh: None }),
+        input,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["errors"], true);
+    assert_eq!(body["items"][0]["index"]["status"], 403);
+    assert_eq!(
+        body["items"][0]["index"]["error"]["type"],
+        "security_exception"
+    );
+}
+
+#[tokio::test]
+async fn bulk_index_global_validates_raw_action_index_name() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_node(make_test_node("node-1"));
+
+    let (_tmp, state) = make_test_app_state(cluster_state).await;
+    let input = axum::body::Bytes::from(
+        "{\"index\":{\"_index\":\"BadName\",\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n",
+    );
+
+    let (status, Json(body)) = bulk_index_global(
+        State(state),
+        None,
+        Query(RefreshParam { refresh: None }),
+        input,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["errors"], true);
+    assert_eq!(body["items"][0]["index"]["status"], 400);
+    assert_eq!(
+        body["items"][0]["index"]["error"]["type"],
+        "invalid_index_name_exception"
+    );
+}
+
+#[tokio::test]
+async fn bulk_index_global_enforces_principal_index_permissions() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_node(make_test_node("node-1"));
+
+    let (_tmp, mut state) = make_test_app_state(cluster_state).await;
+    state.security_manager = Arc::new(
+        crate::security::SecurityManager::new(crate::security::SecurityConfig {
+            enabled: true,
+            auto_create_security_index: false,
+            bootstrap_api_keys: vec![],
+        })
+        .unwrap(),
+    );
+    let principal = crate::security::Principal {
+        name: "writer".into(),
+        key_id: "writer-key".into(),
+        roles: vec!["write".into()],
+        indices: vec!["logs-*".into()],
+    };
+    let input = axum::body::Bytes::from(
+        "{\"index\":{\"_index\":\"metrics\",\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n",
+    );
+
+    let (status, Json(body)) = bulk_index_global(
+        State(state),
+        Some(axum::extract::Extension(principal)),
+        Query(RefreshParam { refresh: None }),
+        input,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["errors"], true);
+    assert_eq!(body["items"][0]["index"]["status"], 403);
+    assert_eq!(
+        body["items"][0]["index"]["error"]["type"],
+        "security_exception"
     );
 }
 

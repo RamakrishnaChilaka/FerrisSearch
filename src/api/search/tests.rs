@@ -3,7 +3,7 @@ use crate::cluster::state::{
     ClusterState, FieldMapping, FieldType, IndexMetadata, IndexSettings, NodeInfo, NodeRole,
     ShardRoutingEntry,
 };
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use datafusion::arrow::array::{Float32Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
@@ -147,6 +147,7 @@ async fn make_test_app_state(index_name: &str) -> (tempfile::TempDir, AppState) 
         storage_manager: Arc::new(
             crate::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
         ),
+        security_manager: Arc::new(crate::security::SecurityManager::disabled()),
         remote_store_reader_cache: Arc::new(
             crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
@@ -940,7 +941,7 @@ async fn global_sql_show_tables_returns_index_list() {
         query: "SHOW TABLES".to_string(),
         analyze: false,
     };
-    let (status, Json(body)) = super::global_sql(State(state), Json(req)).await;
+    let (status, Json(body)) = super::global_sql(State(state), None, Json(req)).await;
     assert_eq!(status, StatusCode::OK);
     let columns = body["columns"].as_array().unwrap();
     assert!(columns.contains(&json!("index")));
@@ -953,13 +954,117 @@ async fn global_sql_show_tables_returns_index_list() {
 }
 
 #[tokio::test]
+async fn global_sql_show_tables_hides_security_index() {
+    let (_tmp, state) = make_test_app_state("products").await;
+    let mut cluster_state = state.cluster_manager.get_state();
+    cluster_state
+        .add_index(crate::security::security_index_metadata(&["node-1".to_string()]).unwrap());
+    state.cluster_manager.update_state(cluster_state);
+
+    let req = SqlQueryRequest {
+        query: "SHOW TABLES".to_string(),
+        analyze: false,
+    };
+    let (status, Json(body)) = super::global_sql(State(state), None, Json(req)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["index"], "products");
+}
+
+#[tokio::test]
+async fn global_sql_show_tables_filters_by_principal_indices() {
+    let (_tmp, mut state) = make_test_app_state("products").await;
+    state.security_manager = Arc::new(
+        crate::security::SecurityManager::new(crate::security::SecurityConfig {
+            enabled: true,
+            auto_create_security_index: false,
+            bootstrap_api_keys: vec![],
+        })
+        .unwrap(),
+    );
+    let mut cluster_state = state.cluster_manager.get_state();
+    cluster_state.add_index(make_sql_metadata("metrics"));
+    state.cluster_manager.update_state(cluster_state);
+    let principal = crate::security::Principal {
+        name: "reader".into(),
+        key_id: "reader-key".into(),
+        roles: vec!["read".into()],
+        indices: vec!["products".into()],
+    };
+
+    let req = SqlQueryRequest {
+        query: "SHOW TABLES".to_string(),
+        analyze: false,
+    };
+    let (status, Json(body)) =
+        super::global_sql(State(state), Some(Extension(principal)), Json(req)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["index"], "products");
+}
+
+#[tokio::test]
+async fn global_sql_describe_enforces_principal_indices() {
+    let (_tmp, mut state) = make_test_app_state("products").await;
+    state.security_manager = Arc::new(
+        crate::security::SecurityManager::new(crate::security::SecurityConfig {
+            enabled: true,
+            auto_create_security_index: false,
+            bootstrap_api_keys: vec![],
+        })
+        .unwrap(),
+    );
+    let mut cluster_state = state.cluster_manager.get_state();
+    cluster_state.add_index(make_sql_metadata("metrics"));
+    state.cluster_manager.update_state(cluster_state);
+    let principal = crate::security::Principal {
+        name: "reader".into(),
+        key_id: "reader-key".into(),
+        roles: vec!["read".into()],
+        indices: vec!["products".into()],
+    };
+
+    let req = SqlQueryRequest {
+        query: "DESCRIBE metrics".to_string(),
+        analyze: false,
+    };
+    let (status, Json(body)) =
+        super::global_sql(State(state), Some(Extension(principal)), Json(req)).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["type"], "security_exception");
+}
+
+#[tokio::test]
+async fn global_sql_describe_rejects_protected_security_index() {
+    let (_tmp, state) = make_test_app_state("products").await;
+    let mut cluster_state = state.cluster_manager.get_state();
+    cluster_state
+        .add_index(crate::security::security_index_metadata(&["node-1".to_string()]).unwrap());
+    state.cluster_manager.update_state(cluster_state);
+
+    let req = SqlQueryRequest {
+        query: "DESCRIBE .ferris_security".to_string(),
+        analyze: false,
+    };
+    let (status, Json(body)) = super::global_sql(State(state), None, Json(req)).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["type"], "security_exception");
+}
+
+#[tokio::test]
 async fn global_sql_show_tables_case_insensitive() {
     let (_tmp, state) = make_test_app_state("products").await;
     let req = SqlQueryRequest {
         query: "show tables;".to_string(),
         analyze: false,
     };
-    let (status, _) = super::global_sql(State(state), Json(req)).await;
+    let (status, _) = super::global_sql(State(state), None, Json(req)).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -970,7 +1075,7 @@ async fn global_sql_describe_returns_field_mappings() {
         query: "DESCRIBE products".to_string(),
         analyze: false,
     };
-    let (status, Json(body)) = super::global_sql(State(state), Json(req)).await;
+    let (status, Json(body)) = super::global_sql(State(state), None, Json(req)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["index"], "products");
     let rows = body["rows"].as_array().unwrap();
@@ -991,7 +1096,7 @@ async fn global_sql_describe_nonexistent_index_returns_404() {
         query: "DESCRIBE nonexistent".to_string(),
         analyze: false,
     };
-    let (status, _) = super::global_sql(State(state), Json(req)).await;
+    let (status, _) = super::global_sql(State(state), None, Json(req)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -1002,7 +1107,7 @@ async fn global_sql_show_create_table_returns_index_json() {
         query: "SHOW CREATE TABLE products".to_string(),
         analyze: false,
     };
-    let (status, Json(body)) = super::global_sql(State(state), Json(req)).await;
+    let (status, Json(body)) = super::global_sql(State(state), None, Json(req)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["index"], "products");
     let create = &body["create_statement"];
@@ -1021,7 +1126,7 @@ async fn global_sql_select_routes_to_correct_index() {
         query: r#"SELECT count(*) AS total FROM "products""#.to_string(),
         analyze: false,
     };
-    let (status, Json(body)) = super::global_sql(State(state), Json(req)).await;
+    let (status, Json(body)) = super::global_sql(State(state), None, Json(req)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.get("columns").is_some());
     assert!(body.get("rows").is_some());
@@ -1034,7 +1139,7 @@ async fn global_sql_invalid_query_returns_error() {
         query: "THIS IS NOT SQL".to_string(),
         analyze: false,
     };
-    let (status, _) = super::global_sql(State(state), Json(req)).await;
+    let (status, _) = super::global_sql(State(state), None, Json(req)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1111,6 +1216,7 @@ async fn group_by_text_field_returns_error() {
         storage_manager: Arc::new(
             crate::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
         ),
+        security_manager: Arc::new(crate::security::SecurityManager::disabled()),
         remote_store_reader_cache: Arc::new(
             crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),

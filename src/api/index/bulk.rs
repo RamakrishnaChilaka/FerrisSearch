@@ -262,6 +262,7 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
 /// POST /_bulk — Global bulk endpoint (index name comes from action metadata).
 pub async fn bulk_index_global(
     State(state): State<AppState>,
+    principal: Option<axum::extract::Extension<crate::security::Principal>>,
     Query(refresh_param): Query<RefreshParam>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
@@ -312,7 +313,59 @@ pub async fn bulk_index_global(
     }
 
     let mut routed_docs = Vec::new();
+    let principal = principal.as_ref().map(|axum::extract::Extension(p)| p);
     for (index_name, batch) in by_index {
+        if crate::security::is_protected_system_index(&index_name) {
+            has_errors = true;
+            for (position, doc_id, _) in batch {
+                item_results[position] = Some(bulk_error_item(
+                    Some(&index_name),
+                    &doc_id,
+                    StatusCode::FORBIDDEN,
+                    "security_exception",
+                    format!(
+                        "index [{}] is a protected system index and cannot be accessed through ordinary index APIs",
+                        index_name
+                    ),
+                ));
+            }
+            continue;
+        }
+
+        if let Err(reason) = crate::common::IndexName::new(index_name.clone()) {
+            has_errors = true;
+            for (position, doc_id, _) in batch {
+                item_results[position] = Some(bulk_error_item(
+                    Some(&index_name),
+                    &doc_id,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_index_name_exception",
+                    reason,
+                ));
+            }
+            continue;
+        }
+
+        if let Err(error) = state.security_manager.authorize_or_error(
+            principal,
+            &crate::security::ClassifiedRequest {
+                action: crate::security::SecurityAction::IndexWrite,
+                index: Some(index_name.clone()),
+            },
+        ) {
+            has_errors = true;
+            for (position, doc_id, _) in batch {
+                item_results[position] = Some(bulk_error_item(
+                    Some(&index_name),
+                    &doc_id,
+                    error.status,
+                    error.error_type,
+                    error.reason,
+                ));
+            }
+            continue;
+        }
+
         let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
             m.clone()
         } else {

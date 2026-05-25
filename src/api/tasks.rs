@@ -339,6 +339,7 @@ mod tests {
                 storage_manager: std::sync::Arc::new(
                     crate::storage::StorageManager::new_in_path(&data_dir).unwrap(),
                 ),
+                security_manager: std::sync::Arc::new(crate::security::SecurityManager::disabled()),
                 remote_store_reader_cache: std::sync::Arc::new(
                     crate::engine::remote_store::RemoteSplitReaderCache::default(),
                 ),

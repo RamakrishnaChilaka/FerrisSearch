@@ -228,6 +228,10 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
     index_names.sort();
 
     for idx_name in index_names {
+        if crate::security::is_protected_system_index(idx_name) {
+            continue;
+        }
+
         let meta = &cs.indices[idx_name];
         let mut shard_ids: Vec<u32> = meta.shard_routing.keys().copied().collect();
         shard_ids.sort();
@@ -352,6 +356,10 @@ pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>
     index_names.sort();
 
     for idx_name in index_names {
+        if crate::security::is_protected_system_index(idx_name) {
+            continue;
+        }
+
         let meta = &cs.indices[idx_name];
         let health = health_fn(idx_name);
 
@@ -445,6 +453,10 @@ pub async fn cat_segments(State(state): State<AppState>, params: Query<CatParams
     index_names.sort();
 
     for idx_name in index_names {
+        if crate::security::is_protected_system_index(idx_name) {
+            continue;
+        }
+
         let meta = &cs.indices[idx_name];
         let mut shard_ids: Vec<u32> = meta.shard_routing.keys().copied().collect();
         shard_ids.sort();
@@ -541,6 +553,7 @@ mod tests {
                 worker_pools: WorkerPools::default_for_system(),
                 task_manager: Arc::new(crate::tasks::TaskManager::new()),
                 storage_manager,
+                security_manager: Arc::new(crate::security::SecurityManager::disabled()),
                 remote_store_reader_cache: Arc::new(
                     crate::engine::remote_store::RemoteSplitReaderCache::default(),
                 ),
@@ -740,5 +753,31 @@ mod tests {
         let fields: Vec<&str> = lines[1].split_whitespace().collect();
         assert_eq!(fields[0], "segments");
         assert_eq!(fields[1], "0");
+    }
+
+    #[tokio::test]
+    async fn cat_indices_hides_security_index() {
+        let (_dir, app_state) = make_app_state("node-1").await;
+        let mut cluster_state = make_cluster_state();
+        cluster_state
+            .add_index(crate::security::security_index_metadata(&["node-1".to_string()]).unwrap());
+        app_state.cluster_manager.update_state(cluster_state);
+
+        let response = cat_indices(
+            State(app_state),
+            Query(CatParams {
+                v: Some(String::new()),
+                local: Some(String::new()),
+            }),
+        )
+        .await;
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("idx"));
+        assert!(!text.contains(crate::security::SECURITY_INDEX_NAME));
     }
 }
