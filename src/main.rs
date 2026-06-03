@@ -39,9 +39,9 @@ where
                 Level::DEBUG => ("\x1b[34m", "\x1b[0m"),
                 Level::TRACE => ("\x1b[35m", "\x1b[0m"),
             };
-            write!(writer, " {}{:>5}{}", start, level, end)?;
+            write!(writer, " {start}{level:>5}{end}")?;
         } else {
-            write!(writer, " {:>5}", level)?;
+            write!(writer, " {level:>5}")?;
         }
 
         // Node ID — always present on every line

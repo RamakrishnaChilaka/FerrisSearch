@@ -168,7 +168,7 @@ impl SqlStreamAccumulator {
                     .get("reason")
                     .and_then(|value| value.as_str())
                     .unwrap_or("Unknown streamed SQL error");
-                bail!("{}", reason);
+                bail!("{reason}");
             }
             other => bail!("Malformed SQL stream frame: unknown type [{other}]"),
         }
@@ -223,7 +223,7 @@ impl FerrisClient {
             .expect("Failed to create HTTP client");
         Self {
             client,
-            base_url: format!("http://{}:{}", host, port),
+            base_url: format!("http://{host}:{port}"),
             host: host.to_string(),
             port,
         }
@@ -265,13 +265,13 @@ impl FerrisClient {
                 })
                 .unwrap_or_else(|| {
                     if text.is_empty() {
-                        format!("HTTP {}", status)
+                        format!("HTTP {status}")
                     } else {
                         let preview: String = text.chars().take(200).collect();
-                        format!("HTTP {}: {}", status, preview)
+                        format!("HTTP {status}: {preview}")
                     }
                 });
-            bail!("{}", reason);
+            bail!("{reason}");
         }
 
         let mut stream = SqlStreamAccumulator::default();
@@ -313,7 +313,7 @@ impl FerrisClient {
                 .pointer("/error/reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown error");
-            bail!("{}", reason);
+            bail!("{reason}");
         }
 
         Ok((body, elapsed))
@@ -444,7 +444,7 @@ fn editor_shortcuts() -> &'static [(&'static str, &'static str)] {
 fn format_shortcut_hint() -> String {
     editor_shortcuts()
         .iter()
-        .map(|(shortcut, description)| format!("{} {}", shortcut, description))
+        .map(|(shortcut, description)| format!("{shortcut} {description}"))
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -509,7 +509,7 @@ fn format_value(val: &Value) -> String {
                 if f == f.trunc() && f.abs() < 1e15 {
                     format!("{}", f as i64)
                 } else {
-                    format!("{:.2}", f)
+                    format!("{f:.2}")
                 }
             } else {
                 n.to_string()
@@ -615,7 +615,7 @@ fn render_metadata(body: &Value, client_ms: f64) {
             "materialized_hits_fallback" => mode.bright_red().to_string(),
             _ => mode.to_string(),
         };
-        parts.push(format!("mode: {}", mode_colored));
+        parts.push(format!("mode: {mode_colored}"));
     }
 
     if metadata_collector_label(body).is_some() {
@@ -652,12 +652,12 @@ fn render_metadata(body: &Value, client_ms: f64) {
                 "failed".bright_red()
             ));
         } else {
-            parts.push(format!("shards: {}/{}", success, total));
+            parts.push(format!("shards: {success}/{total}"));
         }
     }
 
     // Timing
-    parts.push(format!("{}", format!("{:.1}ms", client_ms).bright_green()));
+    parts.push(format!("{}", format!("{client_ms:.1}ms").bright_green()));
 
     println!();
     println!(" {}", parts.join(" | ").dimmed());
@@ -811,7 +811,7 @@ fn render_explain(body: &Value, client_ms: f64) {
                 .unwrap_or("");
             println!(
                 "   {}  {} — {}",
-                format!("{}.", num).bright_yellow(),
+                format!("{num}.").bright_yellow(),
                 name.bright_white(),
                 desc.dimmed()
             );
@@ -1241,7 +1241,7 @@ async fn run_interactive(client: &FerrisClient) -> Result<()> {
                 break;
             }
             Err(e) => {
-                print_error(&format!("Input error: {}", e));
+                print_error(&format!("Input error: {e}"));
                 break;
             }
         }
@@ -1273,7 +1273,7 @@ fn history_entry_for_buffer(buffer: &str) -> Option<String> {
     }
 
     if trimmed.ends_with(';') {
-        Some(format!("{};", query))
+        Some(format!("{query};"))
     } else {
         Some(query.to_string())
     }
@@ -1308,7 +1308,7 @@ fn auto_quote_table_names(sql: &str) -> String {
         if let Some(after_quote) = trimmed.strip_prefix('\'') {
             if let Some(end_quote) = after_quote.find('\'') {
                 let ident = &after_quote[..end_quote];
-                let quoted = format!("\"{}\"", ident);
+                let quoted = format!("\"{ident}\"");
                 let total_len = end_quote + 2; // includes both single quotes
                 result = format!(
                     "{}{}{}",
@@ -1330,7 +1330,7 @@ fn auto_quote_table_names(sql: &str) -> String {
         let ident = &trimmed[..end];
 
         if ident.contains('-') {
-            let quoted = format!("\"{}\"", ident);
+            let quoted = format!("\"{ident}\"");
             result = format!("{}{}{}", &result[..start], quoted, &result[start + end..]);
             search_from = start + quoted.len();
         } else {
@@ -1754,8 +1754,7 @@ mod tests {
         let quoted = auto_quote_table_names(input);
         assert!(
             quoted.contains("FROM \"benchmark-1gb\""),
-            "single quotes should become double quotes: {}",
-            quoted
+            "single quotes should become double quotes: {quoted}"
         );
         let inner_sql =
             parse_explain(&quoted).expect("parse_explain should succeed for EXPLAIN SELECT");
@@ -1772,8 +1771,7 @@ mod tests {
             .expect("parse_explain should succeed for EXPLAIN ANALYZE SELECT");
         assert!(
             inner_sql.starts_with("SELECT"),
-            "should return the SELECT part, not ANALYZE: {}",
-            inner_sql
+            "should return the SELECT part, not ANALYZE: {inner_sql}"
         );
         let table =
             extract_table_for_explain(&inner_sql).expect("extract_table should find benchmark-1gb");

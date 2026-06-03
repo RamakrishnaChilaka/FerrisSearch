@@ -69,12 +69,12 @@ fn sample_manifest(index_uuid: &str, generation: u64) -> RemoteStoreManifest {
         schema_hash: "sha256:v1".into(),
         settings: None,
         splits: vec![RemoteSplitManifest {
-            split_id: format!("split-{}", generation),
+            split_id: format!("split-{generation}"),
             state: RemoteSplitState::Published,
-            bundle_path: format!("splits/split-{}/bundle", generation),
+            bundle_path: format!("splits/split-{generation}/bundle"),
             bundle_etag: None,
             hotcache_path: None,
-            checksum: format!("sha256:split-{}", generation),
+            checksum: format!("sha256:split-{generation}"),
             doc_count: 1,
             size_bytes: 16,
             uncompressed_bytes: 32,
@@ -90,11 +90,11 @@ fn sample_manifest(index_uuid: &str, generation: u64) -> RemoteStoreManifest {
 #[tokio::test]
 async fn s3_backend_reports_as_remote_and_exposes_s3_uri() {
     let Some((_, bucket)) = s3_env() else {
-        eprintln!("skip: {} not set", ENDPOINT_ENV);
+        eprintln!("skip: {ENDPOINT_ENV} not set");
         return;
     };
     let prefix = random_prefix();
-    let uri = format!("s3://{}/{}", bucket, prefix);
+    let uri = format!("s3://{bucket}/{prefix}");
 
     let manager = StorageManager::new(
         uri.clone(),
@@ -110,11 +110,11 @@ async fn s3_backend_reports_as_remote_and_exposes_s3_uri() {
 #[tokio::test]
 async fn s3_backend_publishes_and_loads_manifest_roundtrip() {
     let Some((_, bucket)) = s3_env() else {
-        eprintln!("skip: {} not set", ENDPOINT_ENV);
+        eprintln!("skip: {ENDPOINT_ENV} not set");
         return;
     };
     let prefix = random_prefix();
-    let uri = format!("s3://{}/{}", bucket, prefix);
+    let uri = format!("s3://{bucket}/{prefix}");
     let manager = StorageManager::new(
         uri,
         std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
@@ -143,11 +143,11 @@ async fn s3_backend_publishes_and_loads_manifest_roundtrip() {
 #[tokio::test]
 async fn s3_backend_append_split_and_publish_bumps_generation() {
     let Some((_, bucket)) = s3_env() else {
-        eprintln!("skip: {} not set", ENDPOINT_ENV);
+        eprintln!("skip: {ENDPOINT_ENV} not set");
         return;
     };
     let prefix = random_prefix();
-    let uri = format!("s3://{}/{}", bucket, prefix);
+    let uri = format!("s3://{bucket}/{prefix}");
     let manager = StorageManager::new(
         uri,
         std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
@@ -215,11 +215,11 @@ async fn s3_backend_append_split_and_publish_bumps_generation() {
 #[tokio::test]
 async fn s3_backend_load_current_manifest_returns_none_for_fresh_index() {
     let Some((_, bucket)) = s3_env() else {
-        eprintln!("skip: {} not set", ENDPOINT_ENV);
+        eprintln!("skip: {ENDPOINT_ENV} not set");
         return;
     };
     let prefix = random_prefix();
-    let uri = format!("s3://{}/{}", bucket, prefix);
+    let uri = format!("s3://{bucket}/{prefix}");
     let manager = StorageManager::new(
         uri,
         std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
@@ -237,11 +237,11 @@ async fn s3_backend_load_current_manifest_returns_none_for_fresh_index() {
 #[tokio::test]
 async fn s3_backend_append_rejects_schema_mismatch() {
     let Some((_, bucket)) = s3_env() else {
-        eprintln!("skip: {} not set", ENDPOINT_ENV);
+        eprintln!("skip: {ENDPOINT_ENV} not set");
         return;
     };
     let prefix = random_prefix();
-    let uri = format!("s3://{}/{}", bucket, prefix);
+    let uri = format!("s3://{bucket}/{prefix}");
     let manager = StorageManager::new(
         uri,
         std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
@@ -284,11 +284,11 @@ async fn s3_backend_append_rejects_schema_mismatch() {
 #[tokio::test]
 async fn s3_backend_upload_fetch_verify_split_roundtrip() {
     let Some((_, bucket)) = s3_env() else {
-        eprintln!("skip: {} not set", ENDPOINT_ENV);
+        eprintln!("skip: {ENDPOINT_ENV} not set");
         return;
     };
     let prefix = random_prefix();
-    let uri = format!("s3://{}/{}", bucket, prefix);
+    let uri = format!("s3://{bucket}/{prefix}");
     let workdir = std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4()));
     let manager = StorageManager::new(uri, workdir).expect("s3 manager should build");
 
@@ -306,10 +306,7 @@ async fn s3_backend_upload_fetch_verify_split_roundtrip() {
         .upload_split_bundle(&index_uuid, &split_id, &staging)
         .await
         .expect("upload split bundle to s3");
-    assert_eq!(
-        bundle_key,
-        format!("{}/splits/{}/bundle", index_uuid, split_id)
-    );
+    assert_eq!(bundle_key, format!("{index_uuid}/splits/{split_id}/bundle"));
     assert!(checksum.starts_with("sha256:"));
     assert!(size > 0);
 

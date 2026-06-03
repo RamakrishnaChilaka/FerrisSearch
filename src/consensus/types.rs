@@ -59,15 +59,15 @@ impl std::fmt::Display for ClusterCommand {
         match self {
             ClusterCommand::AddNode { node } => write!(f, "AddNode({})", node.id),
             ClusterCommand::RemoveNode { node_id } => {
-                write!(f, "RemoveNode({})", node_id)
+                write!(f, "RemoveNode({node_id})")
             }
             ClusterCommand::CreateIndex { metadata } => {
                 write!(f, "CreateIndex({})", metadata.name)
             }
             ClusterCommand::DeleteIndex { index_name } => {
-                write!(f, "DeleteIndex({})", index_name)
+                write!(f, "DeleteIndex({index_name})")
             }
-            ClusterCommand::SetMaster { node_id } => write!(f, "SetMaster({})", node_id),
+            ClusterCommand::SetMaster { node_id } => write!(f, "SetMaster({node_id})"),
             ClusterCommand::UpdateIndex { metadata } => {
                 write!(f, "UpdateIndex({})", metadata.name)
             }
@@ -115,7 +115,7 @@ mod tests {
                 raft_node_id: 0,
             },
         };
-        assert_eq!(format!("{}", cmd), "AddNode(node-1)");
+        assert_eq!(format!("{cmd}"), "AddNode(node-1)");
     }
 
     #[test]
@@ -123,7 +123,7 @@ mod tests {
         let cmd = ClusterCommand::RemoveNode {
             node_id: "node-2".into(),
         };
-        assert_eq!(format!("{}", cmd), "RemoveNode(node-2)");
+        assert_eq!(format!("{cmd}"), "RemoveNode(node-2)");
     }
 
     #[test]
@@ -140,7 +140,7 @@ mod tests {
                 settings: crate::cluster::state::IndexSettings::default(),
             },
         };
-        assert_eq!(format!("{}", cmd), "CreateIndex(test-idx)");
+        assert_eq!(format!("{cmd}"), "CreateIndex(test-idx)");
     }
 
     #[test]
@@ -148,7 +148,7 @@ mod tests {
         let cmd = ClusterCommand::DeleteIndex {
             index_name: "old-idx".into(),
         };
-        assert_eq!(format!("{}", cmd), "DeleteIndex(old-idx)");
+        assert_eq!(format!("{cmd}"), "DeleteIndex(old-idx)");
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
         let cmd = ClusterCommand::AddNode { node };
         let json = serde_json::to_string(&cmd).unwrap();
         let deserialized: ClusterCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(format!("{}", deserialized), "AddNode(n1)");
+        assert_eq!(format!("{deserialized}"), "AddNode(n1)");
     }
 
     #[test]

@@ -123,7 +123,7 @@ pub(crate) fn resolve_leader_or_master(
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "master_not_discovered_exception",
-            format!("No master node available to forward {}", operation),
+            format!("No master node available to forward {operation}"),
         )
     })?;
     let master_node = cs.nodes.get(master_id).cloned().ok_or_else(|| {
@@ -145,7 +145,7 @@ pub(crate) async fn raft_write(
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "raft_write_exception",
-            format!("Raft write failed: {}", e),
+            format!("Raft write failed: {e}"),
         )
     })?;
     Ok(())

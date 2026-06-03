@@ -436,7 +436,7 @@ impl TranslogState {
             .iter()
             .position(|generation| generation.id == active_id)
             .ok_or_else(|| {
-                anyhow::anyhow!("translog state is missing active generation {}", active_id)
+                anyhow::anyhow!("translog state is missing active generation {active_id}")
             })
     }
 
@@ -471,8 +471,7 @@ fn parse_generation_id(file_name: &str) -> Option<u64> {
 
 fn generation_path(data_dir: &Path, generation_id: u64) -> PathBuf {
     data_dir.join(format!(
-        "{TRANSLOG_FILE_PREFIX}{generation_id:0width$}{TRANSLOG_FILE_SUFFIX}",
-        width = TRANSLOG_GENERATION_WIDTH
+        "{TRANSLOG_FILE_PREFIX}{generation_id:0TRANSLOG_GENERATION_WIDTH$}{TRANSLOG_FILE_SUFFIX}"
     ))
 }
 
@@ -659,7 +658,7 @@ async fn sync_file_in_background(state: Arc<Mutex<TranslogState>>) -> std::io::R
         state.active_file.sync_data()
     })
     .await
-    .map_err(|e| std::io::Error::other(format!("background translog sync task failed: {}", e)))?
+    .map_err(|e| std::io::Error::other(format!("background translog sync task failed: {e}")))?
 }
 
 impl HotTranslog {
@@ -687,57 +686,57 @@ impl HotTranslog {
             0
         };
 
-        let (generations, active_generation_id, next_generation_id, active_file) =
-            if let Some(manifest) = load_translog_manifest(data_dir)? {
-                remove_unreferenced_generation_files(data_dir, &manifest)?;
-                let mut generations = generations_from_manifest(data_dir, &manifest)?;
-                let active_generation_id = manifest.active_generation_id;
-                let active_generation = generations
+        let (generations, active_generation_id, next_generation_id, active_file) = if let Some(
+            manifest,
+        ) =
+            load_translog_manifest(data_dir)?
+        {
+            remove_unreferenced_generation_files(data_dir, &manifest)?;
+            let mut generations = generations_from_manifest(data_dir, &manifest)?;
+            let active_generation_id = manifest.active_generation_id;
+            let active_generation = generations
                     .iter_mut()
                     .find(|generation| generation.id == active_generation_id)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "manifest active generation {} missing after generation load",
-                            active_generation_id
+                            "manifest active generation {active_generation_id} missing after generation load"
                         )
                     })?;
-                let active_scan = scan_generation_from_path(&active_generation.path)?;
-                active_generation.first_seq_no = active_scan.first_seq_no;
-                active_generation.last_seq_no = active_scan.last_seq_no;
-                active_generation.size_bytes = fs::metadata(&active_generation.path)?.len();
-                let active_file = open_generation_writer(&active_generation.path)?;
+            let active_scan = scan_generation_from_path(&active_generation.path)?;
+            active_generation.first_seq_no = active_scan.first_seq_no;
+            active_generation.last_seq_no = active_scan.last_seq_no;
+            active_generation.size_bytes = fs::metadata(&active_generation.path)?.len();
+            let active_file = open_generation_writer(&active_generation.path)?;
 
-                (
-                    generations,
-                    active_generation_id,
-                    manifest.next_generation_id,
-                    active_file,
-                )
-            } else {
-                let existing_generations = discover_generation_files(data_dir)?;
-                if !existing_generations.is_empty() {
-                    anyhow::bail!(
-                        "generation-based translog files exist in {:?} without manifest {:?}",
-                        data_dir,
-                        manifest_path
-                    );
-                }
+            (
+                generations,
+                active_generation_id,
+                manifest.next_generation_id,
+                active_file,
+            )
+        } else {
+            let existing_generations = discover_generation_files(data_dir)?;
+            if !existing_generations.is_empty() {
+                anyhow::bail!(
+                    "generation-based translog files exist in {data_dir:?} without manifest {manifest_path:?}"
+                );
+            }
 
-                let (generation, active_file) = create_empty_generation(data_dir, 0)?;
-                let generations = vec![generation];
-                let manifest = TranslogManifest {
-                    version: TRANSLOG_MANIFEST_VERSION,
-                    active_generation_id: 0,
-                    next_generation_id: 1,
-                    generations: generations
-                        .iter()
-                        .map(ManifestGenerationInfo::from)
-                        .collect(),
-                };
-                persist_translog_manifest(&manifest_path, &manifest)?;
-
-                (generations, 0, 1, active_file)
+            let (generation, active_file) = create_empty_generation(data_dir, 0)?;
+            let generations = vec![generation];
+            let manifest = TranslogManifest {
+                version: TRANSLOG_MANIFEST_VERSION,
+                active_generation_id: 0,
+                next_generation_id: 1,
+                generations: generations
+                    .iter()
+                    .map(ManifestGenerationInfo::from)
+                    .collect(),
             };
+            persist_translog_manifest(&manifest_path, &manifest)?;
+
+            (generations, 0, 1, active_file)
+        };
 
         let next_seq = std::cmp::max(
             persisted_seq,
@@ -752,7 +751,7 @@ impl HotTranslog {
         let durability_label = match durability {
             TranslogDurability::Request => "request".to_string(),
             TranslogDurability::Async { sync_interval_ms } => {
-                format!("async ({}ms)", sync_interval_ms)
+                format!("async ({sync_interval_ms}ms)")
             }
         };
         tracing::info!(
@@ -1925,8 +1924,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(100),
-            "background translog sync stalled the async runtime for {:?}",
-            elapsed
+            "background translog sync stalled the async runtime for {elapsed:?}"
         );
 
         sync_task.await.unwrap();

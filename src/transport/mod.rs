@@ -48,9 +48,9 @@ pub fn load_server_tls_config(
     ensure_rustls_crypto_provider()?;
 
     let cert = std::fs::read_to_string(cert_path)
-        .map_err(|e| anyhow::anyhow!("failed to read TLS cert {}: {}", cert_path, e))?;
+        .map_err(|e| anyhow::anyhow!("failed to read TLS cert {cert_path}: {e}"))?;
     let key = std::fs::read_to_string(key_path)
-        .map_err(|e| anyhow::anyhow!("failed to read TLS key {}: {}", key_path, e))?;
+        .map_err(|e| anyhow::anyhow!("failed to read TLS key {key_path}: {e}"))?;
 
     let identity = tonic::transport::Identity::from_pem(cert, key);
     Ok(tonic::transport::ServerTlsConfig::new().identity(identity))
@@ -69,7 +69,7 @@ impl TonicTlsConnector {
         ensure_rustls_crypto_provider()?;
 
         let ca_cert = std::fs::read_to_string(ca_path)
-            .map_err(|e| anyhow::anyhow!("failed to read TLS CA cert {}: {}", ca_path, e))?;
+            .map_err(|e| anyhow::anyhow!("failed to read TLS CA cert {ca_path}: {e}"))?;
         let ca = tonic::transport::Certificate::from_pem(ca_cert);
         Ok(Self {
             config: tonic::transport::ClientTlsConfig::new().ca_certificate(ca),

@@ -184,7 +184,7 @@ async fn start_grpc_server_with_tls(
 async fn connect_client(
     addr: std::net::SocketAddr,
 ) -> InternalTransportClient<tonic::transport::Channel> {
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .unwrap()
         .connect()
         .await
@@ -237,7 +237,7 @@ fn setup_single_node_cluster_state(cm: &ClusterManager, index_name: &str) {
     );
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{}-uuid", index_name)),
+        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{index_name}-uuid")),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,
@@ -275,7 +275,7 @@ fn setup_multi_shard_single_node_cluster_state(cm: &ClusterManager, index_name: 
     }
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{}-uuid", index_name)),
+        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{index_name}-uuid")),
         number_of_shards: shards,
         number_of_replicas: 0,
         shard_routing,
@@ -324,7 +324,7 @@ fn setup_two_node_cluster_state(
     );
     cs.add_index(IndexMetadata {
         name: index_name.into(),
-        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{}-uuid", index_name)),
+        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{index_name}-uuid")),
         number_of_shards: 1,
         number_of_replicas: 1,
         shard_routing,
@@ -628,7 +628,7 @@ async fn replicate_bulk_via_grpc() {
         .map(|i| ReplicateDocRequest {
             index_name: String::new(), // ignored — set on the outer request
             shard_id: 0,
-            doc_id: format!("bulk-rep-{}", i),
+            doc_id: format!("bulk-rep-{i}"),
             payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
             op: "index".into(),
             seq_no: i,
@@ -656,12 +656,12 @@ async fn replicate_bulk_via_grpc() {
             .get_doc(tonic::Request::new(ShardGetRequest {
                 index_name: "bulk-rep-idx".into(),
                 shard_id: 0,
-                doc_id: format!("bulk-rep-{}", i),
+                doc_id: format!("bulk-rep-{i}"),
             }))
             .await
             .unwrap()
             .into_inner();
-        assert!(resp.found, "bulk-rep-{} not found", i);
+        assert!(resp.found, "bulk-rep-{i} not found");
     }
 
     let tl = HotTranslog::open(sm.shard_data_dir("bulk-rep-idx", 0).unwrap()).unwrap();
@@ -903,12 +903,12 @@ async fn primary_bulk_replicates_to_replica_node() {
             .get_doc(tonic::Request::new(ShardGetRequest {
                 index_name: "bulk-repl-idx".into(),
                 shard_id: 0,
-                doc_id: format!("repl-bulk-{}", i),
+                doc_id: format!("repl-bulk-{i}"),
             }))
             .await
             .unwrap()
             .into_inner();
-        assert!(resp.found, "repl-bulk-{} not replicated to replica", i);
+        assert!(resp.found, "repl-bulk-{i} not replicated to replica");
     }
 
     let tl = HotTranslog::open(replica_sm.shard_data_dir("bulk-repl-idx", 0).unwrap()).unwrap();
@@ -1381,9 +1381,7 @@ async fn search_shard_dsl_match_all_via_grpc() {
 
     for i in 0..4 {
         let payload = serde_json::json!({"title": format!("doc-{}", i)});
-        assert!(
-            index_doc_with_vectors(&mut client, "all-idx", 0, &format!("d{}", i), payload).await
-        );
+        assert!(index_doc_with_vectors(&mut client, "all-idx", 0, &format!("d{i}"), payload).await);
     }
     refresh_all(&sm);
 
@@ -2317,7 +2315,7 @@ async fn replicate_bulk_returns_local_checkpoint() {
         .map(|i| ReplicateDocRequest {
             index_name: String::new(),
             shard_id: 0,
-            doc_id: format!("bulk-cp-{}", i),
+            doc_id: format!("bulk-cp-{i}"),
             payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
             op: "index".into(),
             seq_no: 100 + i as u64,
@@ -2370,7 +2368,7 @@ async fn primary_write_advances_global_checkpoint() {
             .index_doc(tonic::Request::new(ShardDocRequest {
                 index_name: "gc-idx".into(),
                 shard_id: 0,
-                doc_id: format!("gc-{}", i),
+                doc_id: format!("gc-{i}"),
                 payload_json: serde_json::to_vec(&payload).unwrap(),
             }))
             .await
@@ -2384,8 +2382,7 @@ async fn primary_write_advances_global_checkpoint() {
     let global_cp = primary_engine.global_checkpoint();
     assert!(
         global_cp > 0,
-        "global checkpoint should advance after successful replication, got {}",
-        global_cp
+        "global checkpoint should advance after successful replication, got {global_cp}"
     );
 
     // And the ISR tracker should know about the replica
@@ -2413,7 +2410,7 @@ async fn recover_replica_returns_translog_entries() {
             .index_doc(tonic::Request::new(ShardDocRequest {
                 index_name: "recover-idx".into(),
                 shard_id: 0,
-                doc_id: format!("rec-{}", i),
+                doc_id: format!("rec-{i}"),
                 payload_json: serde_json::to_vec(&payload).unwrap(),
             }))
             .await
@@ -2463,7 +2460,7 @@ async fn recover_replica_returns_empty_when_caught_up() {
             .index_doc(tonic::Request::new(ShardDocRequest {
                 index_name: "caught-up-idx".into(),
                 shard_id: 0,
-                doc_id: format!("cu-{}", i),
+                doc_id: format!("cu-{i}"),
                 payload_json: serde_json::to_vec(&payload).unwrap(),
             }))
             .await
@@ -2597,9 +2594,7 @@ async fn delete_replication_advances_global_checkpoint() {
         .global_checkpoint();
     assert!(
         cp_after_delete > cp_after_index,
-        "global checkpoint should advance after delete replication: {} > {}",
-        cp_after_delete,
-        cp_after_index
+        "global checkpoint should advance after delete replication: {cp_after_delete} > {cp_after_index}"
     );
 }
 
@@ -2631,7 +2626,7 @@ async fn isr_tracker_updated_after_replication() {
             .index_doc(tonic::Request::new(ShardDocRequest {
                 index_name: "isr-idx".into(),
                 shard_id: 0,
-                doc_id: format!("isr-{}", i),
+                doc_id: format!("isr-{i}"),
                 payload_json: serde_json::to_vec(&payload).unwrap(),
             }))
             .await
@@ -2747,7 +2742,7 @@ async fn get_shard_stats_returns_doc_counts_for_open_shards() {
             .index_doc(tonic::Request::new(ShardDocRequest {
                 index_name: "stats-test".into(),
                 shard_id: 0,
-                doc_id: format!("doc-{}", i),
+                doc_id: format!("doc-{i}"),
                 payload_json: serde_json::to_vec(&payload).unwrap(),
             }))
             .await
@@ -2789,7 +2784,7 @@ async fn get_shard_stats_returns_multiple_shards() {
                 .index_doc(tonic::Request::new(ShardDocRequest {
                     index_name: "multi-shard".into(),
                     shard_id: shard,
-                    doc_id: format!("s{}-doc-{}", shard, i),
+                    doc_id: format!("s{shard}-doc-{i}"),
                     payload_json: serde_json::to_vec(&payload).unwrap(),
                 }))
                 .await

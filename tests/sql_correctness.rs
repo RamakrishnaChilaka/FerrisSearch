@@ -176,7 +176,7 @@ impl FerrisDB {
 
         cluster_state.add_index(IndexMetadata {
             name: index_name.to_string(),
-            uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{}-uuid", index_name)),
+            uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{index_name}-uuid")),
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
@@ -329,7 +329,7 @@ impl sqllogictest::DB for FerrisDB {
 fn json_number(row: &serde_json::Value, column: &str) -> f64 {
     row.get(column)
         .and_then(|value| value.as_f64().or_else(|| value.as_i64().map(|n| n as f64)))
-        .unwrap_or_else(|| panic!("expected numeric column {} in row {:?}", column, row))
+        .unwrap_or_else(|| panic!("expected numeric column {column} in row {row:?}"))
 }
 
 fn expected_average_by_author<F>(docs: &[SampleStory], value_fn: F) -> BTreeMap<&'static str, f64>
@@ -360,18 +360,14 @@ fn assert_grouped_numeric_results(
         let key = row
             .get(key_column)
             .and_then(serde_json::Value::as_str)
-            .unwrap_or_else(|| panic!("{} column should be present", key_column));
+            .unwrap_or_else(|| panic!("{key_column} column should be present"));
         let value = json_number(row, value_column);
         let expected = expected_by_key
             .get(key)
-            .unwrap_or_else(|| panic!("unexpected key {} in grouped rows", key));
+            .unwrap_or_else(|| panic!("unexpected key {key} in grouped rows"));
         assert!(
             (value - expected).abs() < 1e-9,
-            "{} {}: got {}, expected {}",
-            key_column,
-            key,
-            value,
-            expected
+            "{key_column} {key}: got {value}, expected {expected}"
         );
     }
 }

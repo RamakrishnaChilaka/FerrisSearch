@@ -87,7 +87,7 @@ pub(crate) async fn ensure_local_index_shards_open(
             .shard_manager
             .data_dir()
             .join(&metadata.uuid)
-            .join(format!("shard_{}", shard_id));
+            .join(format!("shard_{shard_id}"));
         if !expected_dir.exists() {
             tracing::error!(
                 "{}: refusing to create fresh shard data for {}/{} on a read/maintenance path because {:?} is missing",
@@ -191,8 +191,7 @@ async fn auto_create_index(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "master_not_discovered_exception",
                         format!(
-                            "Index [{}] was created by the leader but the local cluster state has not caught up yet",
-                            index_name
+                            "Index [{index_name}] was created by the leader but the local cluster state has not caught up yet"
                         ),
                     ));
                 }
@@ -204,7 +203,7 @@ async fn auto_create_index(
                 return Err(crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
-                    format!("Auto-create index forward to master failed: {}", e),
+                    format!("Auto-create index forward to master failed: {e}"),
                 ));
             }
         }
@@ -346,7 +345,7 @@ pub async fn create_index(
         return crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "resource_already_exists_exception",
-            format!("index [{}] already exists", index_name),
+            format!("index [{index_name}] already exists"),
         );
     }
 
@@ -388,7 +387,7 @@ pub async fn create_index(
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
-                    format!("Failed to forward index creation to master: {}", e),
+                    format!("Failed to forward index creation to master: {e}"),
                 );
             }
         }
@@ -522,7 +521,7 @@ pub async fn index_document(
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "forward_exception",
-            format!("Forward failed: {}", e),
+            format!("Forward failed: {e}"),
         ),
     }
 }
@@ -603,7 +602,7 @@ pub async fn index_document_with_id(
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "forward_exception",
-            format!("Forward failed: {}", e),
+            format!("Forward failed: {e}"),
         ),
     }
 }
@@ -622,7 +621,7 @@ pub(crate) async fn execute_distributed_dsl_search(
             return Err(crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             ));
         }
     };
@@ -853,7 +852,7 @@ pub async fn search_documents_dsl(
             return crate::api::error_response(
                 StatusCode::BAD_REQUEST,
                 "parsing_exception",
-                format!("Invalid query DSL: {}", e),
+                format!("Invalid query DSL: {e}"),
             );
         }
     };
@@ -976,7 +975,7 @@ pub async fn get_document(
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };
@@ -1024,7 +1023,7 @@ pub async fn get_document(
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "search_exception",
-            format!("{}", e),
+            format!("{e}"),
         ),
     }
 }
@@ -1057,7 +1056,7 @@ pub async fn update_document(
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };
@@ -1099,14 +1098,14 @@ pub async fn update_document(
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "document_missing_exception",
-                format!("[{}]: document missing", doc_id),
+                format!("[{doc_id}]: document missing"),
             );
         }
         Err(e) => {
             return crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "get_exception",
-                format!("{}", e),
+                format!("{e}"),
             );
         }
     };
@@ -1139,7 +1138,7 @@ pub async fn update_document(
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "forward_exception",
-            format!("Update failed: {}", e),
+            format!("Update failed: {e}"),
         ),
     }
 }
@@ -1158,7 +1157,7 @@ pub async fn delete_document(
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };
@@ -1199,7 +1198,7 @@ pub async fn delete_document(
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "search_exception",
-            format!("{}", e),
+            format!("{e}"),
         ),
     }
 }
@@ -1219,7 +1218,7 @@ pub async fn get_index_settings(
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };
@@ -1416,7 +1415,7 @@ pub async fn update_index_settings(
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };
@@ -1487,7 +1486,7 @@ pub async fn update_index_settings(
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
-                    format!("Failed to forward settings update to master: {}", e),
+                    format!("Failed to forward settings update to master: {e}"),
                 );
             }
         }
@@ -1525,7 +1524,7 @@ pub async fn delete_index(
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("no such index [{}]", index_name),
+            format!("no such index [{index_name}]"),
         );
     }
 
@@ -1544,7 +1543,7 @@ pub async fn delete_index(
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
-                    format!("Failed to forward index deletion to master: {}", e),
+                    format!("Failed to forward index deletion to master: {e}"),
                 );
             }
         }

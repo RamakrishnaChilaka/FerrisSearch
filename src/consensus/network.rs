@@ -115,7 +115,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
         let mut client = self.connect().await.map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!("{}", e))))
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!("{e}"))))
         })?;
 
         // Read snapshot data
@@ -127,7 +127,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
             "data": snapshot_data,
         });
         let data = serde_json::to_vec(&payload).map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!("{}", e))))
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!("{e}"))))
         })?;
 
         let resp = client
@@ -135,8 +135,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
             .await
             .map_err(|e| {
                 StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
-                    "{}",
-                    e
+                    "{e}"
                 ))))
             })?
             .into_inner();
@@ -150,8 +149,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         let result: SnapshotResponse<TypeConfig> =
             serde_json::from_slice(&resp.data).map_err(|e| {
                 StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
-                    "{}",
-                    e
+                    "{e}"
                 ))))
             })?;
         Ok(result)

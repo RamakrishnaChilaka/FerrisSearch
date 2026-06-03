@@ -89,7 +89,7 @@ async fn post_json_to_base_url(
     body: Value,
 ) -> Result<(StatusCode, Value)> {
     let response = client
-        .post(format!("{}{}", base_url, path))
+        .post(format!("{base_url}{path}"))
         .json(&body)
         .send()
         .await?;
@@ -105,7 +105,7 @@ async fn put_json_to_base_url(
     body: Value,
 ) -> Result<(StatusCode, Value)> {
     let response = client
-        .put(format!("{}{}", base_url, path))
+        .put(format!("{base_url}{path}"))
         .json(&body)
         .send()
         .await?;
@@ -230,7 +230,7 @@ impl RestTestHarness {
             _temp_dir: temp_dir,
             app_state,
             client: Client::builder().timeout(Duration::from_secs(10)).build()?,
-            base_url: format!("http://{}", http_addr),
+            base_url: format!("http://{http_addr}"),
             transport_addr,
             http_handle,
             transport_handle,
@@ -731,7 +731,7 @@ async fn index_product_docs_named(harness: &RestTestHarness, index_name: &str) -
     ] {
         let (status, body) = harness
             .put_json(
-                &format!("/{index_name}/_doc/{}?refresh=true", doc_id),
+                &format!("/{index_name}/_doc/{doc_id}?refresh=true"),
                 payload,
             )
             .await?;
@@ -786,7 +786,7 @@ async fn create_events_index_and_docs(harness: &RestTestHarness) -> Result<()> {
         ),
     ] {
         let (status, body) = harness
-            .put_json(&format!("/events/_doc/{}?refresh=true", doc_id), payload)
+            .put_json(&format!("/events/_doc/{doc_id}?refresh=true"), payload)
             .await?;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body["_id"], json!(doc_id));
@@ -845,7 +845,7 @@ async fn index_mixed_case_rides_docs(harness: &RestTestHarness) -> Result<()> {
         ),
     ] {
         let (status, body) = harness
-            .put_json(&format!("/rides/_doc/{}?refresh=true", doc_id), payload)
+            .put_json(&format!("/rides/_doc/{doc_id}?refresh=true"), payload)
             .await?;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body["_id"], json!(doc_id));
@@ -891,7 +891,7 @@ async fn create_scored_products_index_and_docs(harness: &RestTestHarness) -> Res
         ),
     ] {
         let (status, body) = harness
-            .put_json(&format!("/products/_doc/{}?refresh=true", doc_id), payload)
+            .put_json(&format!("/products/_doc/{doc_id}?refresh=true"), payload)
             .await?;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body["_id"], json!(doc_id));
@@ -959,7 +959,7 @@ async fn create_products_index_with_real_score_and_docs(harness: &RestTestHarnes
         ),
     ] {
         let (status, body) = harness
-            .put_json(&format!("/products/_doc/{}?refresh=true", doc_id), payload)
+            .put_json(&format!("/products/_doc/{doc_id}?refresh=true"), payload)
             .await?;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body["_id"], json!(doc_id));
@@ -1165,7 +1165,7 @@ async fn rest_can_index_get_update_delete_and_refresh_flush_documents() -> Resul
     assert_eq!(missing_body["found"], json!(false));
 
     let (auto_doc_status, auto_doc_body) = harness
-        .get_json(&format!("/products/_doc/{}", auto_id))
+        .get_json(&format!("/products/_doc/{auto_id}"))
         .await?;
     assert_eq!(auto_doc_status, StatusCode::OK);
     assert_eq!(auto_doc_body["_source"]["brand"], json!("Google"));
@@ -1194,7 +1194,7 @@ async fn rest_forcemerge_returns_task_and_task_endpoint_reports_completion() -> 
 
     let task_body = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let (status, body) = harness.get_json(&format!("/_tasks/{}", task_id)).await?;
+            let (status, body) = harness.get_json(&format!("/_tasks/{task_id}")).await?;
             if status == StatusCode::OK && body["task"]["status"] == "completed" {
                 break Ok::<Value, anyhow::Error>(body);
             }
@@ -2786,9 +2786,7 @@ async fn dynamic_true_auto_creates_mappings_on_index() -> Result<()> {
     assert_eq!(
         status,
         StatusCode::CREATED,
-        "expected 201, got {}: {}",
-        status,
-        body
+        "expected 201, got {status}: {body}"
     );
     assert_eq!(body["_id"], json!("1"));
 
@@ -2915,14 +2913,12 @@ async fn dynamic_strict_rejects_unknown_fields() -> Result<()> {
         .await?;
     assert!(
         status.is_client_error() || status.is_server_error(),
-        "strict mode should reject unknown fields, got status {}",
-        status
+        "strict mode should reject unknown fields, got status {status}"
     );
     let error_msg = body.to_string();
     assert!(
         error_msg.contains("unknown_field") || error_msg.contains("strict"),
-        "error should mention the unknown field or strict mode, got: {}",
-        error_msg
+        "error should mention the unknown field or strict mode, got: {error_msg}"
     );
 
     // Arrays/objects are not inferable, but strict mode must still reject them
@@ -2935,14 +2931,12 @@ async fn dynamic_strict_rejects_unknown_fields() -> Result<()> {
         .await?;
     assert!(
         status.is_client_error() || status.is_server_error(),
-        "strict mode should reject unknown object/array fields, got status {}",
-        status
+        "strict mode should reject unknown object/array fields, got status {status}"
     );
     let error_msg = body.to_string();
     assert!(
         error_msg.contains("metadata") || error_msg.contains("tags"),
-        "error should mention unknown nested fields, got: {}",
-        error_msg
+        "error should mention unknown nested fields, got: {error_msg}"
     );
 
     Ok(())
@@ -3094,10 +3088,7 @@ async fn create_index_with_remote_store_engine_when_forwarded_to_leader() -> Res
             break;
         }
         if std::time::Instant::now() >= deadline {
-            panic!(
-                "remote_store index did not appear on leader: {}",
-                leader_status
-            );
+            panic!("remote_store index did not appear on leader: {leader_status}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -3200,8 +3191,7 @@ async fn remote_store_search_returns_hits_from_published_split() -> Result<()> {
     assert_eq!(search_body["_shards"]["failed"], json!(0));
     assert!(
         search_body["hits"]["total"]["value"].as_u64().unwrap_or(0) >= 1,
-        "expected at least one hit, got: {}",
-        search_body
+        "expected at least one hit, got: {search_body}"
     );
     let hits = search_body["hits"]["hits"]
         .as_array()
@@ -4218,10 +4208,10 @@ async fn create_search_after_index_and_docs(
     assert_eq!(status, StatusCode::OK, "create index: {body}");
 
     for i in 0..doc_count {
-        let doc_id = format!("d{:03}", i);
+        let doc_id = format!("d{i:03}");
         let (status, body) = harness
             .put_json(
-                &format!("/{index_name}/_doc/{}?refresh=true", doc_id),
+                &format!("/{index_name}/_doc/{doc_id}?refresh=true"),
                 json!({ "n": i as i64 }),
             )
             .await?;
@@ -4268,7 +4258,7 @@ async fn rest_search_after_paginates_integer_ascending() -> Result<()> {
     }
 
     assert_eq!(seen.len(), 30, "should see all 30 docs across 3 pages");
-    let expected: Vec<String> = (0..30).map(|i| format!("d{:03}", i)).collect();
+    let expected: Vec<String> = (0..30).map(|i| format!("d{i:03}")).collect();
     assert_eq!(seen, expected, "global ordering across pages");
 
     // Page past the end returns 0 hits.

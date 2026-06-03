@@ -238,7 +238,7 @@ impl TaskManager {
         task.failed_shards = failed_shards;
         task.error = error.or_else(|| {
             if failed_shards > 0 {
-                Some(format!("{} shard(s) failed", failed_shards))
+                Some(format!("{failed_shards} shard(s) failed"))
             } else {
                 None
             }

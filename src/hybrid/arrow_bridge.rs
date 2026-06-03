@@ -72,7 +72,7 @@ pub fn build_timestamp_millis_array(values: &[Value]) -> Result<TimestampMillise
             Value::String(text) => {
                 let parsed =
                     crate::common::date::parse_iso8601_to_epoch_millis(text).ok_or_else(|| {
-                        anyhow::anyhow!("Invalid ISO 8601 value in date column: {}", text)
+                        anyhow::anyhow!("Invalid ISO 8601 value in date column: {text}")
                     })?;
                 millis.push(Some(parsed));
             }
@@ -248,7 +248,7 @@ pub fn record_batch_from_ipc(bytes: &[u8]) -> Result<RecordBatch> {
     reader
         .next()
         .ok_or_else(|| anyhow::anyhow!("Arrow IPC stream contained no batches"))?
-        .map_err(|e| anyhow::anyhow!("Arrow IPC deserialization error: {}", e))
+        .map_err(|e| anyhow::anyhow!("Arrow IPC deserialization error: {e}"))
 }
 
 #[cfg(test)]

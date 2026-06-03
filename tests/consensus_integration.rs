@@ -204,7 +204,7 @@ async fn multiple_writes_are_ordered() {
     let mut last_index = 0;
     for i in 0..5 {
         let cmd = ClusterCommand::AddNode {
-            node: make_node(&format!("node-{}", i)),
+            node: make_node(&format!("node-{i}")),
         };
         let resp = raft.client_write(cmd).await.unwrap();
         assert!(resp.log_id.index > last_index);
@@ -305,7 +305,7 @@ async fn create_multiple_indices() {
     wait_for_leader(&raft).await;
 
     for i in 0..3 {
-        let idx = make_index(&format!("index-{}", i));
+        let idx = make_index(&format!("index-{i}"));
         raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
             .await
             .unwrap();
@@ -935,7 +935,7 @@ async fn start_raft_follower_grpc_server(
 async fn connect_grpc(
     addr: std::net::SocketAddr,
 ) -> InternalTransportClient<tonic::transport::Channel> {
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .unwrap()
         .connect()
         .await

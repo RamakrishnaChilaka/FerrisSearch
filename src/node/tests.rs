@@ -371,8 +371,7 @@ async fn open_local_assigned_shards_blocking_does_not_starve_runtime() {
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_millis(100),
-        "blocking lifecycle shard-open wrapper stalled the async runtime for {:?}",
-        elapsed
+        "blocking lifecycle shard-open wrapper stalled the async runtime for {elapsed:?}"
     );
 
     task.await.unwrap();
@@ -900,8 +899,7 @@ async fn try_join_cluster_short_circuits_when_raft_leader() {
     assert!(result.is_none());
     assert!(
         elapsed < Duration::from_secs(2),
-        "leadership short-circuit should return immediately, but took {:?}",
-        elapsed
+        "leadership short-circuit should return immediately, but took {elapsed:?}"
     );
 }
 

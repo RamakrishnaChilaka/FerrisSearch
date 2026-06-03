@@ -126,8 +126,7 @@ impl std::fmt::Display for CreateIndexMetadataError {
             Self::UnimplementedEngine(engine) => {
                 write!(
                     f,
-                    "index engine [{}] is recognized but not implemented yet",
-                    engine
+                    "index engine [{engine}] is recognized but not implemented yet"
                 )
             }
         }
@@ -300,8 +299,7 @@ impl RemoteStoreSettings {
 
         let parsed: Self = serde_json::from_value(value.clone()).map_err(|error| {
             CreateIndexMetadataError::InvalidArgument(format!(
-                "invalid remote_store settings: {}",
-                error
+                "invalid remote_store settings: {error}"
             ))
         })?;
 
@@ -1295,7 +1293,7 @@ mod tests {
             ("date", FieldType::Date),
             ("knn_vector", FieldType::KnnVector),
         ] {
-            let json = format!(r#"{{"type":"{}"}}"#, type_str);
+            let json = format!(r#"{{"type":"{type_str}"}}"#);
             let fm: FieldMapping = serde_json::from_str(&json).unwrap();
             assert_eq!(fm.field_type, expected);
         }

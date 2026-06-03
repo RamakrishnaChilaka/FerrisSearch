@@ -301,7 +301,7 @@ mod tests {
     fn index_name_deref_and_display() {
         let name = IndexName::new("test-idx").unwrap();
         assert_eq!(name.as_str(), "test-idx");
-        assert_eq!(format!("{}", name), "test-idx");
+        assert_eq!(format!("{name}"), "test-idx");
         let s: &str = &name;
         assert_eq!(s, "test-idx");
     }
