@@ -71,7 +71,7 @@ pub(super) async fn cleanup_orphaned_data_if_authoritative_blocking(
             let shard_dir = shard_manager
                 .data_dir()
                 .join(&metadata.uuid)
-                .join(format!("shard_{}", shard_id));
+                .join(format!("shard_{shard_id}"));
             if !shard_dir.exists() {
                 tracing::warn!(
                     "Skipping orphaned data cleanup because locally assigned shard {}/{} expects data at {:?}, and deleting unknown UUID directories could discard live data",
@@ -140,7 +140,7 @@ pub(super) fn cleanup_orphaned_data_if_authoritative(
             let shard_dir = shard_manager
                 .data_dir()
                 .join(&metadata.uuid)
-                .join(format!("shard_{}", shard_id));
+                .join(format!("shard_{shard_id}"));
             if !shard_dir.exists() {
                 tracing::warn!(
                     "Skipping orphaned data cleanup because locally assigned shard {}/{} expects data at {:?}, and deleting unknown UUID directories could discard live data",
@@ -248,7 +248,7 @@ pub(super) fn open_local_assigned_shards(
             let shard_dir = shard_manager
                 .data_dir()
                 .join(&metadata.uuid)
-                .join(format!("shard_{}", shard_id));
+                .join(format!("shard_{shard_id}"));
             if !shard_dir.exists()
                 && guard_set.contains(&(index_name.clone(), *shard_id, metadata.uuid.to_string()))
             {

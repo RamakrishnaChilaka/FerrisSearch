@@ -1098,7 +1098,7 @@ pub(crate) async fn search(
             return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "remote_store_manifest_exception",
-                format!("failed to load manifest: {}", e),
+                format!("failed to load manifest: {e}"),
             ));
         }
     };
@@ -1143,10 +1143,7 @@ pub(crate) async fn search(
         return Err(crate::api::error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "remote_store_leaf_unavailable_exception",
-            format!(
-                "no remote_store-capable leaf nodes available for index [{}]",
-                index_name
-            ),
+            format!("no remote_store-capable leaf nodes available for index [{index_name}]"),
         ));
     }
 
@@ -1400,7 +1397,7 @@ pub(crate) async fn publish_docs(
         return Err(crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "remote_store_build_exception",
-            format!("split build failed: {}", e),
+            format!("split build failed: {e}"),
         ));
     }
 
@@ -1462,7 +1459,7 @@ pub(crate) async fn publish_docs(
             return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "remote_store_build_exception",
-                format!("bundle upload failed: {}", e),
+                format!("bundle upload failed: {e}"),
             ));
         }
     };
@@ -1515,7 +1512,7 @@ pub(crate) async fn publish_docs(
             return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "remote_store_publish_exception",
-                format!("manifest publish failed: {}", e),
+                format!("manifest publish failed: {e}"),
             ));
         }
     };
@@ -1582,7 +1579,7 @@ pub(crate) async fn verify_splits(
             return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "remote_store_manifest_exception",
-                format!("failed to load manifest: {}", e),
+                format!("failed to load manifest: {e}"),
             ));
         }
     };

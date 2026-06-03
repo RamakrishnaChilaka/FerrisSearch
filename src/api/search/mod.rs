@@ -41,7 +41,7 @@ pub async fn count_documents(
                 return crate::api::error_response(
                     StatusCode::BAD_REQUEST,
                     "parsing_exception",
-                    format!("Invalid count query: {}", e),
+                    format!("Invalid count query: {e}"),
                 );
             }
         },
@@ -90,7 +90,7 @@ async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };
@@ -153,7 +153,7 @@ async fn count_remote_store_docs_from_manifest(
             return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "remote_store_manifest_exception",
-                format!("failed to load manifest: {}", error),
+                format!("failed to load manifest: {error}"),
             ));
         }
     };
@@ -340,7 +340,7 @@ pub async fn search_documents(
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };
@@ -544,7 +544,7 @@ pub async fn explain_sql(
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("no such index [{}]", index_name),
+            format!("no such index [{index_name}]"),
         );
     }
 
@@ -583,7 +583,7 @@ pub async fn explain_sql(
                     return crate::api::error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "serialization_exception",
-                        format!("Failed to serialize timings: {}", err),
+                        format!("Failed to serialize timings: {err}"),
                     );
                 }
             };
@@ -952,7 +952,7 @@ async fn collect_direct_sql_partitions(
             }
             Ok(Err(error)) => return Err(error),
             Err(error) => {
-                return Err(anyhow::anyhow!("remote shard task failed: {}", error));
+                return Err(anyhow::anyhow!("remote shard task failed: {error}"));
             }
         }
     }
@@ -1225,8 +1225,7 @@ async fn execute_sql_query_with_plan(
                         StatusCode::BAD_REQUEST,
                         "group_by_text_field_exception",
                         format!(
-                            "Cannot GROUP BY field '{}': text fields are tokenized and don't support grouping. Use a 'keyword' type field instead.",
-                            mapping_name
+                            "Cannot GROUP BY field '{mapping_name}': text fields are tokenized and don't support grouping. Use a 'keyword' type field instead."
                         ),
                     ));
                 }
@@ -1720,7 +1719,7 @@ async fn execute_sql_stream_query(
             return Err(crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             ));
         }
     };
@@ -2171,7 +2170,7 @@ async fn handle_describe(state: &AppState, index_name: &str) -> (StatusCode, Jso
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };
@@ -2230,7 +2229,7 @@ async fn handle_show_create_table(state: &AppState, index_name: &str) -> (Status
             return crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
-                format!("no such index [{}]", index_name),
+                format!("no such index [{index_name}]"),
             );
         }
     };

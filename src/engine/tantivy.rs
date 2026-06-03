@@ -304,7 +304,7 @@ impl HotEngine {
         let tl = self
             .translog
             .lock()
-            .map_err(|_| anyhow::anyhow!("translog lock poisoned during {}", context))?;
+            .map_err(|_| anyhow::anyhow!("translog lock poisoned during {context}"))?;
         f(&*tl)
     }
 
@@ -1423,7 +1423,7 @@ impl HotEngine {
                     }
                     let target_field = self.resolve_field(field_name);
                     let query = RegexQuery::from_pattern(&regex_pattern, target_field)
-                        .map_err(|e| anyhow::anyhow!("Invalid wildcard pattern: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Invalid wildcard pattern: {e}"))?;
                     Ok(Box::new(query))
                 } else {
                     Ok(Box::new(AllQuery))
@@ -1448,10 +1448,10 @@ impl HotEngine {
                             _ => escaped.push(ch),
                         }
                     }
-                    let regex_pattern = format!("{}.*", escaped);
+                    let regex_pattern = format!("{escaped}.*");
                     let target_field = self.resolve_field(field_name);
                     let query = RegexQuery::from_pattern(&regex_pattern, target_field)
-                        .map_err(|e| anyhow::anyhow!("Invalid prefix pattern: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Invalid prefix pattern: {e}"))?;
                     Ok(Box::new(query))
                 } else {
                     Ok(Box::new(AllQuery))
@@ -4725,7 +4725,7 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
                         let key = if val.fract() == 0.0 {
                             format!("{}", val as i64)
                         } else {
-                            format!("{}", val)
+                            format!("{val}")
                         };
                         *counts.entry(key).or_insert(0) += 1;
                     }
@@ -6125,7 +6125,7 @@ mod tests {
     fn bulk_add_documents() {
         let (_dir, engine) = create_engine();
         let docs: Vec<(String, serde_json::Value)> = (0..10)
-            .map(|i| (format!("doc-{}", i), json!({"num": i})))
+            .map(|i| (format!("doc-{i}"), json!({"num": i})))
             .collect();
         let ids = engine.bulk_add_documents(docs).unwrap();
         engine.refresh().unwrap();
@@ -6216,7 +6216,7 @@ mod tests {
         // Insert 200 docs — more than the default limit of 100
         for i in 0..200 {
             engine
-                .add_document(&format!("doc-{}", i), json!({"val": i}))
+                .add_document(&format!("doc-{i}"), json!({"val": i}))
                 .unwrap();
         }
         engine.refresh().unwrap();
@@ -6392,12 +6392,12 @@ mod tests {
         let (_dir, engine) = create_engine();
         for i in 0..50 {
             engine
-                .add_document(&format!("d{}", i), json!({"body": "matching term"}))
+                .add_document(&format!("d{i}"), json!({"body": "matching term"}))
                 .unwrap();
         }
         for i in 50..100 {
             engine
-                .add_document(&format!("d{}", i), json!({"body": "other content"}))
+                .add_document(&format!("d{i}"), json!({"body": "other content"}))
                 .unwrap();
         }
         engine.refresh().unwrap();
@@ -6667,8 +6667,7 @@ mod tests {
         assert_eq!(
             engine2.doc_count(),
             doc_count,
-            "all {} docs must be recovered by streaming replay",
-            doc_count
+            "all {doc_count} docs must be recovered by streaming replay"
         );
         // Spot-check first and last
         assert!(engine2.get_document("d-0").unwrap().is_some());
@@ -6770,7 +6769,7 @@ mod tests {
         let (_dir, engine) = create_engine();
         for i in 0..20 {
             engine
-                .add_document(&format!("doc-{}", i), json!({"title": "hello world"}))
+                .add_document(&format!("doc-{i}"), json!({"title": "hello world"}))
                 .unwrap();
         }
         engine.refresh().unwrap();
@@ -6795,7 +6794,7 @@ mod tests {
         let (_dir, engine) = create_engine();
         for i in 0..10 {
             engine
-                .add_document(&format!("doc-{}", i), json!({"title": "hello world"}))
+                .add_document(&format!("doc-{i}"), json!({"title": "hello world"}))
                 .unwrap();
         }
         engine.refresh().unwrap();
@@ -6836,7 +6835,7 @@ mod tests {
         let (_dir, engine) = create_engine();
         for i in 0..5 {
             engine
-                .add_document(&format!("doc-{}", i), json!({"title": "test"}))
+                .add_document(&format!("doc-{i}"), json!({"title": "test"}))
                 .unwrap();
         }
         engine.refresh().unwrap();
@@ -6865,7 +6864,7 @@ mod tests {
         let (_dir, engine) = create_engine();
         for i in 0..15 {
             engine
-                .add_document(&format!("doc-{}", i), json!({"title": "hello"}))
+                .add_document(&format!("doc-{i}"), json!({"title": "hello"}))
                 .unwrap();
         }
         engine.refresh().unwrap();
@@ -9237,7 +9236,7 @@ mod tests {
     fn bulk_docs_not_visible_before_refresh() {
         let (_dir, engine) = create_engine();
         let docs: Vec<(String, serde_json::Value)> = (0..50)
-            .map(|i| (format!("b{}", i), json!({"val": i})))
+            .map(|i| (format!("b{i}"), json!({"val": i})))
             .collect();
         engine.bulk_add_documents(docs).unwrap();
 
@@ -9260,7 +9259,7 @@ mod tests {
     fn bulk_docs_visible_after_refresh() {
         let (_dir, engine) = create_engine();
         let docs: Vec<(String, serde_json::Value)> = (0..50)
-            .map(|i| (format!("b{}", i), json!({"val": i})))
+            .map(|i| (format!("b{i}"), json!({"val": i})))
             .collect();
         engine.bulk_add_documents(docs).unwrap();
 
@@ -9822,7 +9821,7 @@ mod tests {
         for i in 0..50 {
             engine
                 .add_document(
-                    &format!("doc-{:03}", i),
+                    &format!("doc-{i:03}"),
                     json!({"title": format!("item-{}", i), "price": i as f64}),
                 )
                 .unwrap();
@@ -9854,7 +9853,7 @@ mod tests {
             .map(|i| id_col.value(i).to_string())
             .collect();
         ids.sort();
-        let mut expected: Vec<String> = (0..50).map(|i| format!("doc-{:03}", i)).collect();
+        let mut expected: Vec<String> = (0..50).map(|i| format!("doc-{i:03}")).collect();
         expected.sort();
         assert_eq!(ids, expected);
     }
@@ -10087,7 +10086,7 @@ mod tests {
         for i in 0..100 {
             engine
                 .add_document(
-                    &format!("d-{}", i),
+                    &format!("d-{i}"),
                     json!({"title": format!("item-{}", i), "price": i as f64 * 1.5}),
                 )
                 .unwrap();
@@ -10180,7 +10179,7 @@ mod tests {
     fn metric_sum(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
         match &bucket.metrics[name] {
             crate::search::GroupedMetricPartial::Stats { sum, .. } => *sum,
-            _ => panic!("expected Stats for {}", name),
+            _ => panic!("expected Stats for {name}"),
         }
     }
 
@@ -10188,7 +10187,7 @@ mod tests {
     fn metric_avg(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
         match &bucket.metrics[name] {
             crate::search::GroupedMetricPartial::Stats { count, sum, .. } => *sum / *count as f64,
-            _ => panic!("expected Stats for {}", name),
+            _ => panic!("expected Stats for {name}"),
         }
     }
 
@@ -10196,7 +10195,7 @@ mod tests {
     fn metric_min(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
         match &bucket.metrics[name] {
             crate::search::GroupedMetricPartial::Stats { min, .. } => *min,
-            _ => panic!("expected Stats for {}", name),
+            _ => panic!("expected Stats for {name}"),
         }
     }
 
@@ -10204,7 +10203,7 @@ mod tests {
     fn metric_max(bucket: &crate::search::GroupedMetricsBucket, name: &str) -> f64 {
         match &bucket.metrics[name] {
             crate::search::GroupedMetricPartial::Stats { max, .. } => *max,
-            _ => panic!("expected Stats for {}", name),
+            _ => panic!("expected Stats for {name}"),
         }
     }
 
@@ -10251,7 +10250,7 @@ mod tests {
             let quantity = (i + 1) as i64;
             engine
                 .add_document(
-                    &format!("d{}", i),
+                    &format!("d{i}"),
                     json!({"brand": brand, "price": price, "quantity": quantity, "body": "phone"}),
                 )
                 .unwrap();
@@ -10317,7 +10316,7 @@ mod tests {
             let price = 100.0 + i as f64;
             engine
                 .add_document(
-                    &format!("pair-doc-{}", i),
+                    &format!("pair-doc-{i}"),
                     json!({"brand": brand, "zone": zone, "price": price, "body": "phone"}),
                 )
                 .unwrap();
@@ -10934,9 +10933,7 @@ mod tests {
             .sum();
         assert!(
             (apple_sum - expected_apple_sum).abs() < 0.01,
-            "apple sum: {} != {}",
-            apple_sum,
-            expected_apple_sum
+            "apple sum: {apple_sum} != {expected_apple_sum}"
         );
 
         let samsung_sum = metric_sum(samsung, "sum_price");
@@ -10946,9 +10943,7 @@ mod tests {
             .sum();
         assert!(
             (samsung_sum - expected_samsung_sum).abs() < 0.01,
-            "samsung sum: {} != {}",
-            samsung_sum,
-            expected_samsung_sum
+            "samsung sum: {samsung_sum} != {expected_samsung_sum}"
         );
     }
 
@@ -11029,9 +11024,7 @@ mod tests {
         let actual_avg = metric_sum(apple, "avg_price") / metric_count(apple, "avg_price") as f64;
         assert!(
             (actual_avg - expected_avg).abs() < 0.01,
-            "avg: {} != {}",
-            actual_avg,
-            expected_avg
+            "avg: {actual_avg} != {expected_avg}"
         );
     }
 
@@ -11656,8 +11649,7 @@ mod tests {
         let segment_count = engine.segment_infos().len();
         assert!(
             segment_count >= 2,
-            "expected multiple segments before streaming, got {}",
-            segment_count
+            "expected multiple segments before streaming, got {segment_count}"
         );
 
         let req = SearchRequest {
@@ -11846,7 +11838,7 @@ mod tests {
     fn apply_shard_top_k_prunes_to_limit() {
         let mut buckets: Vec<crate::search::GroupedMetricsBucket> = (0..100)
             .map(|i| crate::search::GroupedMetricsBucket {
-                group_values: vec![serde_json::Value::String(format!("author_{}", i))],
+                group_values: vec![serde_json::Value::String(format!("author_{i}"))],
                 metrics: std::collections::HashMap::from([(
                     "posts".to_string(),
                     crate::search::GroupedMetricPartial::Count { count: i as u64 },
@@ -11871,11 +11863,7 @@ mod tests {
                 crate::search::GroupedMetricPartial::Count { count } => *count,
                 _ => panic!("expected Count"),
             };
-            assert!(
-                count >= 90,
-                "top-K pruning kept count={} below cutoff",
-                count
-            );
+            assert!(count >= 90, "top-K pruning kept count={count} below cutoff");
         }
     }
 
@@ -11938,7 +11926,7 @@ mod tests {
                 crate::search::GroupedMetricPartial::Stats { sum, .. } => *sum,
                 _ => panic!("expected Stats"),
             };
-            assert!(sum <= 4.0, "ascending top-K kept sum={} above cutoff", sum);
+            assert!(sum <= 4.0, "ascending top-K kept sum={sum} above cutoff");
         }
     }
 
@@ -12087,9 +12075,7 @@ mod tests {
 
         assert!(
             va < vb,
-            "avg=1.0 should rank below avg=50.0, got va={} vb={}",
-            va,
-            vb
+            "avg=1.0 should rank below avg=50.0, got va={va} vb={vb}"
         );
     }
 
@@ -12168,8 +12154,7 @@ mod tests {
             };
             assert!(
                 avg >= 15.0,
-                "avg-sorted top-K should keep avg >= 15, got {}",
-                avg
+                "avg-sorted top-K should keep avg >= 15, got {avg}"
             );
         }
     }
@@ -12189,7 +12174,7 @@ mod tests {
         let (dir, engine) = create_engine_with_mappings(mappings);
         for i in 0..20i64 {
             engine
-                .add_document(&format!("d{:02}", i), json!({ "n": i }))
+                .add_document(&format!("d{i:02}"), json!({ "n": i }))
                 .unwrap();
         }
         engine.refresh().unwrap();
@@ -12571,7 +12556,7 @@ mod tests {
         // 5 docs all share n=2020; secondary sort key `tie` varies.
         for i in 0..5i64 {
             engine
-                .add_document(&format!("t{:02}", i), json!({ "n": 2020, "tie": i }))
+                .add_document(&format!("t{i:02}"), json!({ "n": 2020, "tie": i }))
                 .unwrap();
         }
         engine.refresh().unwrap();

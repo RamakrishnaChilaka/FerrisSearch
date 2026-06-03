@@ -130,7 +130,7 @@ fn array_value_to_json(array: &dyn Array, data_type: &DataType, row_idx: usize) 
                 crate::common::date::epoch_millis_to_iso8601(array.value(row_idx) / 1_000_000)
             }
         }),
-        _ => Value::String(format!("{:?}", data_type)),
+        _ => Value::String(format!("{data_type:?}")),
     };
 
     Ok(value)

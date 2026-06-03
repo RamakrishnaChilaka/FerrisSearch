@@ -122,7 +122,7 @@ impl CompositeEngine {
             }
         })
         .await
-        .map_err(|e| anyhow::anyhow!("background shard maintenance task failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("background shard maintenance task failed: {e}"))?;
         Ok(())
     }
 
@@ -1472,8 +1472,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(100),
-            "background maintenance blocked the async runtime for {:?}",
-            elapsed
+            "background maintenance blocked the async runtime for {elapsed:?}"
         );
 
         maintenance.await.unwrap().unwrap();

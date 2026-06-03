@@ -40,13 +40,11 @@ mod tests {
     fn shard_is_within_range() {
         for num_shards in [1, 2, 3, 5, 10, 100] {
             for i in 0..200 {
-                let doc_id = format!("doc-{}", i);
+                let doc_id = format!("doc-{i}");
                 let shard = calculate_shard(&doc_id, num_shards);
                 assert!(
                     shard < num_shards,
-                    "shard {} out of range for {} shards",
-                    shard,
-                    num_shards
+                    "shard {shard} out of range for {num_shards} shards"
                 );
             }
         }
@@ -65,7 +63,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         // With enough docs we should hit more than 1 shard
         for i in 0..100 {
-            seen.insert(calculate_shard(&format!("doc-{}", i), num_shards));
+            seen.insert(calculate_shard(&format!("doc-{i}"), num_shards));
         }
         assert!(seen.len() > 1, "documents should spread across shards");
     }
@@ -73,7 +71,7 @@ mod tests {
     #[test]
     fn single_shard_always_returns_zero() {
         for i in 0..50 {
-            assert_eq!(calculate_shard(&format!("id-{}", i), 1), 0);
+            assert_eq!(calculate_shard(&format!("id-{i}"), 1), 0);
         }
     }
 

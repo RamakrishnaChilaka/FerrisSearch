@@ -127,7 +127,7 @@ pub async fn transfer_master(
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
-                    format!("Failed to forward transfer request to master: {}", e),
+                    format!("Failed to forward transfer request to master: {e}"),
                 );
             }
         }
@@ -172,7 +172,7 @@ pub async fn transfer_master(
         return crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "raft_transfer_exception",
-            format!("Transfer leader failed: {}", e),
+            format!("Transfer leader failed: {e}"),
         );
     }
 

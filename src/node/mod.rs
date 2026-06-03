@@ -58,9 +58,9 @@ fn required_transport_tls_path<'a>(
     field_name: &'static str,
     value: Option<&'a str>,
 ) -> anyhow::Result<&'a str> {
-    value.filter(|path| !path.trim().is_empty()).ok_or_else(|| {
-        anyhow::anyhow!("{} is required when transport_tls_enabled=true", field_name)
-    })
+    value
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{field_name} is required when transport_tls_enabled=true"))
 }
 
 fn resolve_transport_tls_paths(

@@ -32,11 +32,11 @@ impl VectorIndex {
             multi: false,
         };
         let index = usearch::Index::new(&options)
-            .map_err(|e| anyhow::anyhow!("Failed to create vector index: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create vector index: {e}"))?;
         // Reserve initial capacity
         index
             .reserve(10_000)
-            .map_err(|e| anyhow::anyhow!("Failed to reserve initial capacity: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to reserve initial capacity: {e}"))?;
         Ok(Self {
             index,
             dimensions,
@@ -51,13 +51,13 @@ impl VectorIndex {
         if path.exists() {
             vi.index
                 .load(path.to_str().unwrap_or(""))
-                .map_err(|e| anyhow::anyhow!("Failed to load vector index: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to load vector index: {e}"))?;
             // Grow capacity if loaded index is at capacity
             if vi.index.size() >= vi.index.capacity() {
                 let new_cap = vi.index.capacity() * 2;
                 vi.index
                     .reserve(new_cap)
-                    .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {e}"))?;
             }
             // Load doc_id mapping sidecar if present
             vi.load_doc_id_map(path);
@@ -99,11 +99,11 @@ impl VectorIndex {
             let new_cap = std::cmp::max(self.index.capacity() * 2, 10_000);
             self.index
                 .reserve(new_cap)
-                .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {e}"))?;
         }
         self.index
             .add(key, vector)
-            .map_err(|e| anyhow::anyhow!("Failed to add vector: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to add vector: {e}"))?;
         Ok(())
     }
 
@@ -132,7 +132,7 @@ impl VectorIndex {
             let new_cap = std::cmp::max(needed * 2, 10_000);
             self.index
                 .reserve(new_cap)
-                .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {e}"))?;
         }
         // Insert all vectors into USearch, collecting (key, doc_id) pairs
         let mut pairs = Vec::with_capacity(docs.len());
@@ -143,7 +143,7 @@ impl VectorIndex {
             let key = crate::engine::routing::hash_string(doc_id);
             self.index
                 .add(key, vector)
-                .map_err(|e| anyhow::anyhow!("Failed to add vector: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to add vector: {e}"))?;
             pairs.push((key, doc_id));
         }
         // Single write lock for all doc_id mappings
@@ -167,7 +167,7 @@ impl VectorIndex {
     pub fn remove(&self, key: u64) -> Result<()> {
         self.index
             .remove(key)
-            .map_err(|e| anyhow::anyhow!("Failed to remove vector: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to remove vector: {e}"))?;
         Ok(())
     }
 
@@ -184,7 +184,7 @@ impl VectorIndex {
         let results = self
             .index
             .search(query, k)
-            .map_err(|e| anyhow::anyhow!("Vector search failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Vector search failed: {e}"))?;
         Ok((results.keys.to_vec(), results.distances.to_vec()))
     }
 
@@ -193,7 +193,7 @@ impl VectorIndex {
         let path = path.as_ref();
         self.index
             .save(path.to_str().unwrap_or(""))
-            .map_err(|e| anyhow::anyhow!("Failed to save vector index: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to save vector index: {e}"))?;
         // Persist key→doc_id mapping as a binary sidecar (bincode)
         let map_path = path.with_extension("docids.bin");
         let map = self.key_to_doc_id.read().unwrap_or_else(|e| e.into_inner());

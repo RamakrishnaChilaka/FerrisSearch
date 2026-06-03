@@ -22,7 +22,7 @@ pub async fn refresh_index(
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("no such index [{}]", index_name),
+            format!("no such index [{index_name}]"),
         );
     }
 
@@ -50,7 +50,7 @@ pub async fn flush_index(
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("no such index [{}]", index_name),
+            format!("no such index [{index_name}]"),
         );
     }
 
@@ -77,7 +77,7 @@ pub async fn force_merge_index(
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("no such index [{}]", index_name),
+            format!("no such index [{index_name}]"),
         );
     }
 
@@ -132,7 +132,7 @@ where
     Box::pin(async move {
         tokio::spawn(job)
             .await
-            .map_err(|e| anyhow::anyhow!("maintenance task panicked: {}", e))?
+            .map_err(|e| anyhow::anyhow!("maintenance task panicked: {e}"))?
     })
 }
 

@@ -88,7 +88,7 @@ pub(super) fn route_bulk_doc(
             &doc_id,
             StatusCode::INTERNAL_SERVER_ERROR,
             "node_not_found_exception",
-            format!("Primary node [{}] not found in cluster state", node_id),
+            format!("Primary node [{node_id}] not found in cluster state"),
         ));
     }
 
@@ -150,7 +150,7 @@ async fn forward_bulk_batches(
                 failed_targets.insert(key, e.to_string());
             }
             Err(join_err) => {
-                failed_targets.insert(key, format!("bulk forwarding task failed: {}", join_err));
+                failed_targets.insert(key, format!("bulk forwarding task failed: {join_err}"));
             }
         }
     }
@@ -193,7 +193,7 @@ pub(super) fn finalize_bulk_items(
                     "",
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "bulk_item_exception",
-                    format!("bulk item {} was dropped unexpectedly", position),
+                    format!("bulk item {position} was dropped unexpectedly"),
                 )
             })
         })
@@ -324,8 +324,7 @@ pub async fn bulk_index_global(
                     StatusCode::FORBIDDEN,
                     "security_exception",
                     format!(
-                        "index [{}] is a protected system index and cannot be accessed through ordinary index APIs",
-                        index_name
+                        "index [{index_name}] is a protected system index and cannot be accessed through ordinary index APIs"
                     ),
                 ));
             }
@@ -397,8 +396,7 @@ pub async fn bulk_index_global(
                     StatusCode::NOT_IMPLEMENTED,
                     "illegal_argument_exception",
                     format!(
-                        "index [{}] uses engine [{}] which does not accept writes yet",
-                        index_name, engine
+                        "index [{index_name}] uses engine [{engine}] which does not accept writes yet"
                     ),
                 ));
             }

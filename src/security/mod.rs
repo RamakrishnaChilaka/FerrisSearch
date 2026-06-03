@@ -244,8 +244,7 @@ pub fn protected_system_index_error(index: &str) -> (StatusCode, Json<serde_json
         StatusCode::FORBIDDEN,
         "security_exception",
         format!(
-            "index [{}] is a protected system index and cannot be accessed through ordinary index APIs",
-            index
+            "index [{index}] is a protected system index and cannot be accessed through ordinary index APIs"
         ),
     )
 }

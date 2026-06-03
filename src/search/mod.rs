@@ -2353,7 +2353,7 @@ mod tests {
         for w in merged.windows(2) {
             let s0 = w[0]["_score"].as_f64().unwrap();
             let s1 = w[1]["_score"].as_f64().unwrap();
-            assert!(s0 >= s1, "scores should be descending: {} >= {}", s0, s1);
+            assert!(s0 >= s1, "scores should be descending: {s0} >= {s1}");
         }
     }
 

@@ -1416,11 +1416,7 @@ pub fn plan_sql(index_name: &str, sql: &str) -> Result<QueryPlan> {
 
     let (source_table, source_alias) = extract_single_table_info(select)?;
     if source_table != index_name {
-        bail!(
-            "SQL FROM [{}] must match request index [{}]",
-            source_table,
-            index_name
-        );
+        bail!("SQL FROM [{source_table}] must match request index [{index_name}]");
     }
 
     // ── Binding ──────────────────────────────────────────────────────
@@ -2051,7 +2047,7 @@ fn try_parse_direct_aggregate(
                     _ => unreachable!(),
                 };
                 return Ok(Some(SqlGroupedMetric {
-                    output_name: alias.unwrap_or_else(|| format!("{}_{}", normalized, field)),
+                    output_name: alias.unwrap_or_else(|| format!("{normalized}_{field}")),
                     function,
                     field: Some(field),
                     field_expr: None,
@@ -2809,8 +2805,7 @@ fn parse_semijoin_predicate(
     {
         bail!(
             "Correlated semijoin subqueries are not supported in the MVP. \
-             Remove the outer alias reference [{}] from the inner query.",
-            outer_alias
+             Remove the outer alias reference [{outer_alias}] from the inner query."
         );
     }
 
@@ -2840,16 +2835,12 @@ fn resolve_semijoin_outer_key(
     };
     if alias_blocks_source_name(&name, select_aliases, identity_source_aliases) {
         bail!(
-            "Semijoin outer key [{}] cannot reference a SELECT alias. \
-             Use the underlying source column instead.",
-            name
+            "Semijoin outer key [{name}] cannot reference a SELECT alias. \
+             Use the underlying source column instead."
         );
     }
     if SyntheticColumn::parse(&name).is_some() {
-        bail!(
-            "Semijoin outer key [{}] cannot use synthetic columns like _id or _score",
-            name
-        );
+        bail!("Semijoin outer key [{name}] cannot use synthetic columns like _id or _score");
     }
     Ok(name)
 }
@@ -4136,7 +4127,7 @@ mod tests {
                 assert_eq!(bq.should.len(), 2);
                 assert!(bq.must.is_empty());
             }
-            other => panic!("Expected Bool query, got: {:?}", other),
+            other => panic!("Expected Bool query, got: {other:?}"),
         }
     }
 
@@ -4153,7 +4144,7 @@ mod tests {
             crate::search::QueryClause::Bool(bq) => {
                 assert_eq!(bq.should.len(), 3);
             }
-            other => panic!("Expected Bool query, got: {:?}", other),
+            other => panic!("Expected Bool query, got: {other:?}"),
         }
     }
 
@@ -4184,7 +4175,7 @@ mod tests {
             crate::search::QueryClause::Bool(bq) => {
                 assert_eq!(bq.should.len(), 2);
             }
-            other => panic!("Expected Bool query, got: {:?}", other),
+            other => panic!("Expected Bool query, got: {other:?}"),
         }
     }
 
@@ -4399,8 +4390,7 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("text_match()"),
-            "Error should mention text_match: {}",
-            err
+            "Error should mention text_match: {err}"
         );
     }
 
@@ -4535,7 +4525,7 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("text_match()"), "Error: {}", err);
+        assert!(err.contains("text_match()"), "Error: {err}");
     }
 
     #[test]
@@ -4547,7 +4537,7 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("text_match()"), "Error: {}", err);
+        assert!(err.contains("text_match()"), "Error: {err}");
     }
 
     // ── Unsupported query shape validation tests ───────────────────────
@@ -5115,8 +5105,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.to_string().contains("ambiguous column reference"),
-            "expected ambiguous column error, got: {}",
-            err
+            "expected ambiguous column error, got: {err}"
         );
     }
 

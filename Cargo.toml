@@ -50,6 +50,11 @@ zstd = "0.13"
 default = []
 transport-tls = ["dep:tonic-types", "dep:tokio-rustls", "dep:rustls-pemfile", "tonic/tls-ring"]
 
+[lints.clippy]
+# Edition-2024 idiom: prefer inlined format args (`format!("{x}")` over `format!("{}", x)`).
+# Enforced in CI via `clippy -- -D warnings` so it cannot regress.
+uninlined_format_args = "warn"
+
 [build-dependencies]
 tonic-build = "0.13"
 

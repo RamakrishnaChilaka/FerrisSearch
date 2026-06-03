@@ -149,7 +149,7 @@ pub async fn cat_nodes(State(state): State<AppState>, params: Query<CatParams>) 
             .collect();
         let is_master = cs.master_node.as_ref() == Some(&n.id);
         let roles_display = if is_master {
-            format!("{}*", roles)
+            format!("{roles}*")
         } else {
             roles
         };

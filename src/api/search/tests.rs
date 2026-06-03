@@ -102,7 +102,7 @@ fn make_sql_metadata(index: &str) -> IndexMetadata {
 
     IndexMetadata {
         name: index.to_string(),
-        uuid: crate::cluster::state::IndexUuid::new(format!("{}-uuid", index)),
+        uuid: crate::cluster::state::IndexUuid::new(format!("{index}-uuid")),
         number_of_shards: 1,
         number_of_replicas: 0,
         shard_routing,

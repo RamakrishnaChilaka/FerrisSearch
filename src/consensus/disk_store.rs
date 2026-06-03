@@ -35,21 +35,21 @@ impl DiskLogStore {
     /// Open (or create) a persistent log store at the given path.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let db = Database::create(path.as_ref())
-            .map_err(|e| io::Error::other(format!("redb open: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("redb open: {e}")))?;
 
         // Ensure tables exist
         {
             let tx = db
                 .begin_write()
-                .map_err(|e| io::Error::other(format!("redb write: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("redb write: {e}")))?;
             let _ = tx
                 .open_table(META_TABLE)
-                .map_err(|e| io::Error::other(format!("redb table: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("redb table: {e}")))?;
             let _ = tx
                 .open_table(LOG_TABLE)
-                .map_err(|e| io::Error::other(format!("redb table: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("redb table: {e}")))?;
             tx.commit()
-                .map_err(|e| io::Error::other(format!("redb commit: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("redb commit: {e}")))?;
         }
 
         Ok(Self {
@@ -107,7 +107,7 @@ where
 {
     tokio::task::spawn_blocking(operation)
         .await
-        .map_err(|e| io::Error::other(format!("disk-store blocking task failed: {}", e)))?
+        .map_err(|e| io::Error::other(format!("disk-store blocking task failed: {e}")))?
 }
 
 // ─── RaftLogReader ──────────────────────────────────────────────────────────
@@ -404,8 +404,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(100),
-            "disk-store read wrapper stalled the async runtime for {:?}",
-            elapsed
+            "disk-store read wrapper stalled the async runtime for {elapsed:?}"
         );
 
         read_task.await.unwrap();

@@ -66,7 +66,7 @@ pub async fn create_raft_instance(
 
     let raft = openraft::Raft::new(node_id, Arc::new(config), network, log_store, state_machine)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to create Raft instance: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create Raft instance: {e}"))?;
 
     Ok((Arc::new(raft), state_handle))
 }
@@ -85,7 +85,7 @@ pub async fn create_raft_instance_mem(
 
     let raft = openraft::Raft::new(node_id, Arc::new(config), network, log_store, state_machine)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to create Raft instance: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create Raft instance: {e}"))?;
 
     Ok((Arc::new(raft), state_handle))
 }
@@ -100,7 +100,7 @@ pub async fn bootstrap_single_node(
     members.insert(node_id, BasicNode { addr });
     raft.initialize(members)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to bootstrap Raft cluster: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to bootstrap Raft cluster: {e}"))?;
     Ok(())
 }
 

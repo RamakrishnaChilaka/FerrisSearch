@@ -45,7 +45,7 @@ pub async fn replicate_write(
                 futures.push(tokio::spawn(async move {
                     (
                         rid.clone(),
-                        Err::<u64, String>(format!("Replica node {} not in cluster state", rid)),
+                        Err::<u64, String>(format!("Replica node {rid} not in cluster state")),
                     )
                 }));
                 continue;
@@ -65,7 +65,7 @@ pub async fn replicate_write(
                 .await
             {
                 Ok(checkpoint) => (rid, Ok(checkpoint)),
-                Err(e) => (rid.clone(), Err(format!("{}: {}", rid, e))),
+                Err(e) => (rid.clone(), Err(format!("{rid}: {e}"))),
             }
         }));
     }
@@ -86,7 +86,7 @@ pub async fn replicate_write(
             }
             Err(e) => {
                 error!("Replication task panicked: {}", e);
-                errors.push(format!("task panicked: {}", e));
+                errors.push(format!("task panicked: {e}"));
             }
         }
     }
@@ -132,7 +132,7 @@ pub async fn replicate_bulk(
                 futures.push(tokio::spawn(async move {
                     (
                         rid.clone(),
-                        Err::<u64, String>(format!("Replica node {} not in cluster state", rid)),
+                        Err::<u64, String>(format!("Replica node {rid} not in cluster state")),
                     )
                 }));
                 continue;
@@ -150,7 +150,7 @@ pub async fn replicate_bulk(
                 .await
             {
                 Ok(checkpoint) => (rid, Ok(checkpoint)),
-                Err(e) => (rid.clone(), Err(format!("{}: {}", rid, e))),
+                Err(e) => (rid.clone(), Err(format!("{rid}: {e}"))),
             }
         }));
     }
@@ -171,7 +171,7 @@ pub async fn replicate_bulk(
             }
             Err(e) => {
                 error!("Bulk replication task panicked: {}", e);
-                errors.push(format!("task panicked: {}", e));
+                errors.push(format!("task panicked: {e}"));
             }
         }
     }

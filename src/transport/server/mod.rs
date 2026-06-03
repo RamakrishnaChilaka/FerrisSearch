@@ -158,11 +158,10 @@ async fn get_or_open_read_shard(
     let shard_dir = shard_manager
         .data_dir()
         .join(&metadata.uuid)
-        .join(format!("shard_{}", shard_id));
+        .join(format!("shard_{shard_id}"));
     if !shard_dir.exists() {
         return Err(Status::failed_precondition(format!(
-            "Shard [{index_name}][{shard_id}] is assigned here but {:?} is missing; refusing to create a fresh shard on a read path",
-            shard_dir
+            "Shard [{index_name}][{shard_id}] is assigned here but {shard_dir:?} is missing; refusing to create a fresh shard on a read path"
         )));
     }
 
@@ -175,7 +174,7 @@ async fn get_or_open_read_shard(
             metadata.uuid.clone(),
         )
         .await
-        .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
+        .map_err(|e| Status::internal(format!("Failed to open shard: {e}")))
 }
 
 pub(crate) async fn run_maintenance_on_assigned_shards_async(
@@ -270,7 +269,7 @@ fn sql_batch_success_response(
     streaming_used: bool,
 ) -> anyhow::Result<SqlRecordBatchResponse> {
     let ipc_bytes = crate::hybrid::arrow_bridge::record_batch_to_ipc(&batch)
-        .map_err(|e| anyhow::anyhow!("Arrow IPC encode error: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Arrow IPC encode error: {e}"))?;
     Ok(SqlRecordBatchResponse {
         success: true,
         arrow_ipc: ipc_bytes,
@@ -302,8 +301,7 @@ fn create_index_error_status(error: crate::cluster::state::CreateIndexMetadataEr
         }
         crate::cluster::state::CreateIndexMetadataError::UnimplementedEngine(engine) => {
             Status::unimplemented(format!(
-                "index engine [{}] is recognized but not implemented yet",
-                engine
+                "index engine [{engine}] is recognized but not implemented yet"
             ))
         }
     }
@@ -347,14 +345,14 @@ impl InternalTransport for TransportService {
                     .connect(&master_node.host, master_node.transport_port)
                     .await
                     .map_err(|e| {
-                        Status::internal(format!("Failed to connect to master for join: {}", e))
+                        Status::internal(format!("Failed to connect to master for join: {e}"))
                     })?;
                 let fwd_request = tonic::Request::new(JoinRequest {
                     node_info: Some(proto_node_fwd),
                     raft_node_id: joining_raft_id,
                 });
                 let fwd_response = client.join_cluster(fwd_request).await.map_err(|e| {
-                    Status::internal(format!("Failed to forward join to master: {}", e))
+                    Status::internal(format!("Failed to forward join to master: {e}"))
                 })?;
                 return Ok(fwd_response);
             }
@@ -375,12 +373,12 @@ impl InternalTransport for TransportService {
                     let addr = format!("{}:{}", ni.host, ni.transport_port);
                     raft.add_learner(joining_raft_id, openraft::BasicNode { addr }, false)
                         .await
-                        .map_err(|e| Status::internal(format!("Raft add_learner failed: {}", e)))?;
+                        .map_err(|e| Status::internal(format!("Raft add_learner failed: {e}")))?;
                 }
 
                 let cmd = crate::consensus::types::ClusterCommand::AddNode { node: ni.clone() };
                 if let Err(e) = raft.client_write(cmd).await {
-                    return Err(Status::internal(format!("Raft AddNode failed: {}", e)));
+                    return Err(Status::internal(format!("Raft AddNode failed: {e}")));
                 }
 
                 if !already_voter {
@@ -405,13 +403,11 @@ impl InternalTransport for TransportService {
                                 rollback_error
                             );
                             return Err(Status::internal(format!(
-                                "Raft change_membership failed after AddNode: {}; rollback failed: {}",
-                                e, rollback_error
+                                "Raft change_membership failed after AddNode: {e}; rollback failed: {rollback_error}"
                             )));
                         }
                         return Err(Status::internal(format!(
-                            "Raft change_membership failed: {}",
-                            e
+                            "Raft change_membership failed: {e}"
                         )));
                     }
                 }
@@ -465,7 +461,7 @@ impl InternalTransport for TransportService {
         let req = request.into_inner();
 
         let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
-            .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
 
         let doc_id = if req.doc_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
@@ -563,7 +559,7 @@ impl InternalTransport for TransportService {
             Vec::with_capacity(req.documents_json.len());
         for b in &req.documents_json {
             let val: serde_json::Value = serde_json::from_slice(b)
-                .map_err(|e| Status::invalid_argument(format!("invalid JSON in bulk: {}", e)))?;
+                .map_err(|e| Status::invalid_argument(format!("invalid JSON in bulk: {e}")))?;
             let doc_id = val
                 .get("_doc_id")
                 .and_then(|v| v.as_str())
@@ -757,7 +753,7 @@ impl InternalTransport for TransportService {
         match doc_result {
             Ok(Some(source)) => {
                 let source_json = serde_json::to_vec(&source)
-                    .map_err(|e| Status::internal(format!("serialize get_doc response: {}", e)))?;
+                    .map_err(|e| Status::internal(format!("serialize get_doc response: {e}")))?;
                 Ok(Response::new(ShardGetResponse {
                     found: true,
                     source_json,
@@ -817,7 +813,7 @@ impl InternalTransport for TransportService {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Status::internal(format!("serialize search hit: {}", e)))?;
+                    .map_err(|e| Status::internal(format!("serialize search hit: {e}")))?;
 
                 Ok(Response::new(ShardSearchResponse {
                     success: true,
@@ -860,7 +856,7 @@ impl InternalTransport for TransportService {
 
         let search_req: crate::search::SearchRequest =
             serde_json::from_slice(&req.search_request_json).map_err(|e| {
-                Status::invalid_argument(format!("invalid SearchRequest JSON: {}", e))
+                Status::invalid_argument(format!("invalid SearchRequest JSON: {e}"))
             })?;
 
         let mut all_hits = Vec::new();
@@ -903,7 +899,7 @@ impl InternalTransport for TransportService {
                     vec![]
                 } else {
                     crate::search::encode_partial_aggs(&partial_aggs)
-                        .map_err(|e| Status::internal(format!("encode partial aggs: {}", e)))?
+                        .map_err(|e| Status::internal(format!("encode partial aggs: {e}")))?
                 };
 
                 let hits = all_hits
@@ -914,7 +910,7 @@ impl InternalTransport for TransportService {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Status::internal(format!("serialize search hit: {}", e)))?;
+                    .map_err(|e| Status::internal(format!("serialize search hit: {e}")))?;
 
                 Ok(Response::new(ShardSearchResponse {
                     success: true,
@@ -1006,7 +1002,7 @@ impl InternalTransport for TransportService {
 
         let search_req: crate::search::SearchRequest =
             serde_json::from_slice(&req.search_request_json).map_err(|e| {
-                Status::invalid_argument(format!("invalid SearchRequest JSON: {}", e))
+                Status::invalid_argument(format!("invalid SearchRequest JSON: {e}"))
             })?;
         let split_plans: Vec<_> = req
             .splits
@@ -1041,7 +1037,7 @@ impl InternalTransport for TransportService {
             for value in outcome.hits {
                 hits.push(SearchHit {
                     source_json: serde_json::to_vec(&value).map_err(|e| {
-                        Status::internal(format!("serialize remote_store hit: {}", e))
+                        Status::internal(format!("serialize remote_store hit: {e}"))
                     })?,
                 });
             }
@@ -1050,7 +1046,7 @@ impl InternalTransport for TransportService {
             } else {
                 vec![
                     crate::search::encode_partial_aggs(&outcome.partial_aggs)
-                        .map_err(|e| Status::internal(format!("encode partial aggs: {}", e)))?,
+                        .map_err(|e| Status::internal(format!("encode partial aggs: {e}")))?,
                 ]
             };
             results.push(RemoteStoreSplitSearchResult {
@@ -1090,7 +1086,7 @@ impl InternalTransport for TransportService {
 
         let search_req: crate::search::SearchRequest =
             serde_json::from_slice(&req.search_request_json).map_err(|e| {
-                Status::invalid_argument(format!("invalid SearchRequest JSON: {}", e))
+                Status::invalid_argument(format!("invalid SearchRequest JSON: {e}"))
             })?;
 
         let columns: Vec<String> = req.columns;
@@ -1159,7 +1155,7 @@ impl InternalTransport for TransportService {
 
         let search_req: crate::search::SearchRequest =
             serde_json::from_slice(&req.search_request_json).map_err(|e| {
-                Status::invalid_argument(format!("invalid SearchRequest JSON: {}", e))
+                Status::invalid_argument(format!("invalid SearchRequest JSON: {e}"))
             })?;
 
         let columns = req.columns;
@@ -1293,7 +1289,7 @@ impl InternalTransport for TransportService {
         let result = match req.op.as_str() {
             "index" => {
                 let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
-                    .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
+                    .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
                 let engine = engine.clone();
                 let doc_id = req.doc_id.clone();
                 let seq_no = req.seq_no;
@@ -1317,7 +1313,7 @@ impl InternalTransport for TransportService {
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
             }
-            other => Err(anyhow::anyhow!("Unknown replication op: {}", other)),
+            other => Err(anyhow::anyhow!("Unknown replication op: {other}")),
         };
 
         match result {
@@ -1354,7 +1350,7 @@ impl InternalTransport for TransportService {
         for op in &req.ops {
             let payload: serde_json::Value =
                 serde_json::from_slice(&op.payload_json).map_err(|e| {
-                    Status::invalid_argument(format!("invalid JSON in bulk replicate: {}", e))
+                    Status::invalid_argument(format!("invalid JSON in bulk replicate: {e}"))
                 })?;
             docs.push((op.doc_id.clone(), payload));
         }
@@ -1438,7 +1434,7 @@ impl InternalTransport for TransportService {
                 Ok(Err(e)) => {
                     return Ok(Response::new(RecoverReplicaResponse {
                         success: false,
-                        error: format!("Failed to read translog: {}", e),
+                        error: format!("Failed to read translog: {e}"),
                         ops_replayed: 0,
                         primary_checkpoint: engine.local_checkpoint(),
                         operations: vec![],
@@ -1447,7 +1443,7 @@ impl InternalTransport for TransportService {
                 Err(e) => {
                     return Ok(Response::new(RecoverReplicaResponse {
                         success: false,
-                        error: format!("Translog read task failed: {}", e),
+                        error: format!("Translog read task failed: {e}"),
                         ops_replayed: 0,
                         primary_checkpoint: engine.local_checkpoint(),
                         operations: vec![],
@@ -1478,7 +1474,7 @@ impl InternalTransport for TransportService {
                 })
             })
             .collect::<Result<_, _>>()
-            .map_err(|e| Status::internal(format!("serialize recovery op: {}", e)))?;
+            .map_err(|e| Status::internal(format!("serialize recovery op: {e}")))?;
 
         Ok(Response::new(RecoverReplicaResponse {
             success: true,
@@ -1499,7 +1495,7 @@ impl InternalTransport for TransportService {
         let index_name = &req.index_name;
 
         let body: serde_json::Value = serde_json::from_slice(&req.settings_json)
-            .map_err(|e| Status::invalid_argument(format!("bad settings JSON: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("bad settings JSON: {e}")))?;
 
         // Look up current metadata
         let cluster_state = self.cluster_manager.get_state();
@@ -1507,7 +1503,7 @@ impl InternalTransport for TransportService {
             .indices
             .get(index_name)
             .cloned()
-            .ok_or_else(|| Status::not_found(format!("no such index [{}]", index_name)))?;
+            .ok_or_else(|| Status::not_found(format!("no such index [{index_name}]")))?;
 
         let mut changed = false;
 
@@ -1575,7 +1571,7 @@ impl InternalTransport for TransportService {
         };
         raft.client_write(cmd)
             .await
-            .map_err(|e| Status::internal(format!("Raft write failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
 
         // Apply settings to local engines
         self.shard_manager
@@ -1615,7 +1611,7 @@ impl InternalTransport for TransportService {
         if cluster_state.indices.contains_key(index_name) {
             return Ok(Response::new(CreateIndexResponse {
                 acknowledged: false,
-                error: format!("index [{}] already exists", index_name),
+                error: format!("index [{index_name}] already exists"),
                 response_json: Vec::new(),
             }));
         }
@@ -1641,14 +1637,14 @@ impl InternalTransport for TransportService {
         let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
         raft.client_write(cmd)
             .await
-            .map_err(|e| Status::internal(format!("Raft write failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
 
         let resp_json = serde_json::to_vec(&serde_json::json!({
             "acknowledged": true,
             "shards_acknowledged": true,
             "index": index_name
         }))
-        .map_err(|e| Status::internal(format!("serialize create index response: {}", e)))?;
+        .map_err(|e| Status::internal(format!("serialize create index response: {e}")))?;
 
         tracing::info!(
             "gRPC: created index '{}' with engine {}, {} shards, {} replicas",
@@ -1684,7 +1680,7 @@ impl InternalTransport for TransportService {
 
         let cluster_state = self.cluster_manager.get_state();
         if !cluster_state.indices.contains_key(index_name) {
-            return Err(Status::not_found(format!("no such index [{}]", index_name)));
+            return Err(Status::not_found(format!("no such index [{index_name}]")));
         }
 
         let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
@@ -1692,7 +1688,7 @@ impl InternalTransport for TransportService {
         };
         raft.client_write(cmd)
             .await
-            .map_err(|e| Status::internal(format!("Raft write failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
 
         // Close local shard engines and delete data on this (leader) node
         if let Err(e) = self
@@ -1735,12 +1731,11 @@ impl InternalTransport for TransportService {
             .nodes
             .get(target_node_id)
             .cloned()
-            .ok_or_else(|| Status::not_found(format!("Node '{}' not found", target_node_id)))?;
+            .ok_or_else(|| Status::not_found(format!("Node '{target_node_id}' not found")))?;
 
         if target_info.raft_node_id == 0 {
             return Err(Status::invalid_argument(format!(
-                "Node '{}' has no Raft ID assigned",
-                target_node_id
+                "Node '{target_node_id}' has no Raft ID assigned"
             )));
         }
 
@@ -1757,7 +1752,7 @@ impl InternalTransport for TransportService {
             openraft::raft::TransferLeaderRequest::new(vote, target_info.raft_node_id, last_log_id);
         raft.handle_transfer_leader(transfer_req)
             .await
-            .map_err(|e| Status::internal(format!("Transfer leader failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Transfer leader failed: {e}")))?;
 
         tracing::info!(
             "gRPC: leadership transfer initiated to node '{}'",
@@ -1814,7 +1809,7 @@ impl InternalTransport for TransportService {
         };
         raft.client_write(cmd)
             .await
-            .map_err(|e| Status::internal(format!("Raft AddMappings failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Raft AddMappings failed: {e}")))?;
 
         tracing::info!(
             "gRPC: added {} dynamic mappings for index '{}'",
@@ -1977,13 +1972,13 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
         let rpc: openraft::raft::VoteRequest<crate::consensus::TypeConfig> =
             serde_json::from_slice(&request.into_inner().data)
-                .map_err(|e| Status::invalid_argument(format!("bad vote request: {}", e)))?;
+                .map_err(|e| Status::invalid_argument(format!("bad vote request: {e}")))?;
         let resp = raft
             .vote(rpc)
             .await
-            .map_err(|e| Status::internal(format!("raft vote error: {}", e)))?;
+            .map_err(|e| Status::internal(format!("raft vote error: {e}")))?;
         let data = serde_json::to_vec(&resp)
-            .map_err(|e| Status::internal(format!("serialise vote response: {}", e)))?;
+            .map_err(|e| Status::internal(format!("serialise vote response: {e}")))?;
         Ok(Response::new(RaftReply {
             data,
             error: String::new(),
@@ -2000,14 +1995,14 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
         let rpc: openraft::raft::AppendEntriesRequest<crate::consensus::TypeConfig> =
             serde_json::from_slice(&request.into_inner().data).map_err(|e| {
-                Status::invalid_argument(format!("bad append_entries request: {}", e))
+                Status::invalid_argument(format!("bad append_entries request: {e}"))
             })?;
         let resp = raft
             .append_entries(rpc)
             .await
-            .map_err(|e| Status::internal(format!("raft append_entries error: {}", e)))?;
+            .map_err(|e| Status::internal(format!("raft append_entries error: {e}")))?;
         let data = serde_json::to_vec(&resp)
-            .map_err(|e| Status::internal(format!("serialise append_entries response: {}", e)))?;
+            .map_err(|e| Status::internal(format!("serialise append_entries response: {e}")))?;
         Ok(Response::new(RaftReply {
             data,
             error: String::new(),
@@ -2023,7 +2018,7 @@ impl InternalTransport for TransportService {
             .as_ref()
             .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
         let payload: serde_json::Value = serde_json::from_slice(&request.into_inner().data)
-            .map_err(|e| Status::invalid_argument(format!("bad snapshot request: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("bad snapshot request: {e}")))?;
         let vote_value = payload
             .get("vote")
             .cloned()
@@ -2037,11 +2032,11 @@ impl InternalTransport for TransportService {
             .cloned()
             .ok_or_else(|| Status::invalid_argument("bad snapshot request: missing data"))?;
         let vote: crate::consensus::types::Vote = serde_json::from_value(vote_value)
-            .map_err(|e| Status::invalid_argument(format!("bad vote in snapshot: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("bad vote in snapshot: {e}")))?;
         let meta: crate::consensus::types::SnapshotMeta = serde_json::from_value(meta_value)
-            .map_err(|e| Status::invalid_argument(format!("bad meta in snapshot: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("bad meta in snapshot: {e}")))?;
         let data: Vec<u8> = serde_json::from_value(data_value)
-            .map_err(|e| Status::invalid_argument(format!("bad data in snapshot: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("bad data in snapshot: {e}")))?;
         let snapshot = crate::consensus::types::Snapshot {
             meta,
             snapshot: std::io::Cursor::new(data),
@@ -2049,9 +2044,9 @@ impl InternalTransport for TransportService {
         let resp = raft
             .install_full_snapshot(vote, snapshot)
             .await
-            .map_err(|e| Status::internal(format!("raft snapshot error: {}", e)))?;
+            .map_err(|e| Status::internal(format!("raft snapshot error: {e}")))?;
         let data = serde_json::to_vec(&resp)
-            .map_err(|e| Status::internal(format!("serialise snapshot response: {}", e)))?;
+            .map_err(|e| Status::internal(format!("serialise snapshot response: {e}")))?;
         Ok(Response::new(RaftReply {
             data,
             error: String::new(),
@@ -2071,7 +2066,7 @@ impl TransportService {
             .shard_manager
             .data_dir()
             .join(&metadata.uuid)
-            .join(format!("shard_{}", shard_id)))
+            .join(format!("shard_{shard_id}")))
     }
 
     #[allow(clippy::result_large_err)]
@@ -2106,7 +2101,7 @@ impl TransportService {
                     open_override.index_uuid,
                 )
                 .await
-                .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)));
+                .map_err(|e| Status::internal(format!("Failed to open shard: {e}")));
         }
 
         let cs = self.cluster_manager.get_state();
@@ -2130,7 +2125,7 @@ impl TransportService {
                 metadata.uuid.clone(),
             )
             .await
-            .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
+            .map_err(|e| Status::internal(format!("Failed to open shard: {e}")))
     }
 
     #[allow(clippy::result_large_err)]
@@ -2219,7 +2214,7 @@ impl TransportService {
     ) -> Result<Option<DynamicShardOpenOverride>, Status> {
         let cs = self.cluster_manager.get_state();
         let metadata = cs.indices.get(index_name).ok_or_else(|| {
-            Status::not_found(format!("index '{}' not found in cluster state", index_name))
+            Status::not_found(format!("index '{index_name}' not found in cluster state"))
         })?;
 
         if !matches!(
@@ -2234,8 +2229,7 @@ impl TransportService {
                     crate::common::detect_unknown_fields(payload, &metadata.mappings);
                 if !unknown_fields.is_empty() {
                     return Err(Status::invalid_argument(format!(
-                        "strict mapping: unknown fields {:?} in index '{}'",
-                        unknown_fields, index_name
+                        "strict mapping: unknown fields {unknown_fields:?} in index '{index_name}'"
                     )));
                 }
             }
@@ -2288,7 +2282,7 @@ impl TransportService {
     ) -> Result<Option<DynamicShardOpenOverride>, Status> {
         let cs = self.cluster_manager.get_state();
         let metadata = cs.indices.get(index_name).ok_or_else(|| {
-            Status::not_found(format!("index '{}' not found in cluster state", index_name))
+            Status::not_found(format!("index '{index_name}' not found in cluster state"))
         })?;
 
         if !matches!(
@@ -2303,8 +2297,7 @@ impl TransportService {
                     crate::common::detect_unknown_fields_batch(docs, &metadata.mappings);
                 if !unknown_fields.is_empty() {
                     return Err(Status::invalid_argument(format!(
-                        "strict mapping: unknown fields {:?} in index '{}'",
-                        unknown_fields, index_name
+                        "strict mapping: unknown fields {unknown_fields:?} in index '{index_name}'"
                     )));
                 }
             }
@@ -2368,8 +2361,7 @@ impl TransportService {
             };
             raft.client_write(cmd).await.map_err(|e| {
                 Status::internal(format!(
-                    "Raft AddMappings failed for index '{}': {}",
-                    index_name, e
+                    "Raft AddMappings failed for index '{index_name}': {e}"
                 ))
             })?;
         } else {
@@ -2382,14 +2374,12 @@ impl TransportService {
                     .await
                     .map_err(|e| {
                         Status::internal(format!(
-                            "forward AddMappings to leader for index '{}': {}",
-                            index_name, e
+                            "forward AddMappings to leader for index '{index_name}': {e}"
                         ))
                     })?;
             } else {
                 return Err(Status::internal(format!(
-                    "No master node available to commit dynamic mappings for index '{}'",
-                    index_name
+                    "No master node available to commit dynamic mappings for index '{index_name}'"
                 )));
             }
         }
@@ -2406,8 +2396,7 @@ impl TransportService {
                 .await
                 .map_err(|e| {
                     Status::internal(format!(
-                        "reopen shard after dynamic mapping for [{index_name}][{shard_id}]: {}",
-                        e
+                        "reopen shard after dynamic mapping for [{index_name}][{shard_id}]: {e}"
                     ))
                 })?;
         }

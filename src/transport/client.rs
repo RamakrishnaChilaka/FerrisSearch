@@ -140,7 +140,7 @@ impl TransportClient {
         host: &str,
         port: u16,
     ) -> Result<InternalTransportClient<Channel>, tonic::transport::Error> {
-        let key = format!("{}:{}", host, port);
+        let key = format!("{host}:{port}");
 
         // Fast path: read lock for cache hit (concurrent, non-blocking)
         {
@@ -159,7 +159,7 @@ impl TransportClient {
             "http"
         };
         let mut endpoint =
-            tonic::transport::Endpoint::from_shared(format!("{}://{}:{}", scheme, host, port))?
+            tonic::transport::Endpoint::from_shared(format!("{scheme}://{host}:{port}"))?
                 .timeout(self.timeout)
                 .connect_timeout(Duration::from_secs(5));
 
@@ -728,7 +728,7 @@ impl TransportClient {
         let mut client = self
             .connect(&master.host, master.transport_port)
             .await
-            .map_err(|e| anyhow::anyhow!("connect to master: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
         let settings_json = serde_json::to_vec(settings_body)?;
         let request = tonic::Request::new(UpdateSettingsRequest {
             index_name: index_name.to_string(),
@@ -737,7 +737,7 @@ impl TransportClient {
         let resp = client
             .update_settings(request)
             .await
-            .map_err(|e| anyhow::anyhow!("UpdateSettings RPC: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("UpdateSettings RPC: {e}"))?;
         let inner = resp.into_inner();
         if !inner.error.is_empty() {
             return Err(anyhow::anyhow!("{}", inner.error));
@@ -784,14 +784,14 @@ impl TransportClient {
         let mut client = self
             .connect(&master.host, master.transport_port)
             .await
-            .map_err(|e| anyhow::anyhow!("connect to master: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
         let request = tonic::Request::new(DeleteIndexRequest {
             index_name: index_name.to_string(),
         });
         let resp = client
             .delete_index(request)
             .await
-            .map_err(|e| anyhow::anyhow!("DeleteIndex RPC: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("DeleteIndex RPC: {e}"))?;
         let inner = resp.into_inner();
         if !inner.error.is_empty() {
             return Err(anyhow::anyhow!("{}", inner.error));
@@ -808,14 +808,14 @@ impl TransportClient {
         let mut client = self
             .connect(&master.host, master.transport_port)
             .await
-            .map_err(|e| anyhow::anyhow!("connect to master: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
         let request = tonic::Request::new(TransferMasterRequest {
             target_node_id: target_node_id.to_string(),
         });
         let resp = client
             .transfer_master(request)
             .await
-            .map_err(|e| anyhow::anyhow!("TransferMaster RPC: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("TransferMaster RPC: {e}"))?;
         let inner = resp.into_inner();
         if !inner.error.is_empty() {
             return Err(anyhow::anyhow!("{}", inner.error));
@@ -835,7 +835,7 @@ impl TransportClient {
         let mut client = self
             .connect(&master.host, master.transport_port)
             .await
-            .map_err(|e| anyhow::anyhow!("connect to master for AddMappings: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("connect to master for AddMappings: {e}"))?;
 
         let entries: Vec<FieldMappingEntry> = new_fields
             .iter()
@@ -854,7 +854,7 @@ impl TransportClient {
         let resp = client
             .add_mappings(request)
             .await
-            .map_err(|e| anyhow::anyhow!("AddMappings RPC: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("AddMappings RPC: {e}"))?;
         let inner = resp.into_inner();
         if !inner.error.is_empty() {
             return Err(anyhow::anyhow!("{}", inner.error));

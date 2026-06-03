@@ -37,8 +37,7 @@ pub(super) fn resolve_case_insensitive_mapping_name(
                 StatusCode::BAD_REQUEST,
                 "ambiguous_column_reference_exception",
                 format!(
-                    "Unquoted SQL column [{}] is ambiguous. Quote the exact field name. Candidates: {}",
-                    field_name, candidates
+                    "Unquoted SQL column [{field_name}] is ambiguous. Quote the exact field name. Candidates: {candidates}"
                 ),
             ))
         }
@@ -245,7 +244,7 @@ pub(super) fn canonicalize_rewritten_sql_source_fields(
         crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "planning_exception",
-            format!("Failed to parse rewritten SQL for execution: {}", error),
+            format!("Failed to parse rewritten SQL for execution: {error}"),
         )
     })?;
 

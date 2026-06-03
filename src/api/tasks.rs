@@ -222,7 +222,7 @@ pub async fn get_task(
         return error_response(
             StatusCode::NOT_FOUND,
             "resource_not_found_exception",
-            format!("task [{}] not found", task_id),
+            format!("task [{task_id}] not found"),
         );
     };
 

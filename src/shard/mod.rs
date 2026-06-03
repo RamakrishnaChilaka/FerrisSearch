@@ -373,10 +373,7 @@ impl ShardManager {
         let refresh_rx = settings_mgr.watch_refresh_interval();
         let flush_threshold_rx = settings_mgr.watch_flush_threshold();
 
-        let shard_dir = self
-            .data_dir
-            .join(&uuid)
-            .join(format!("shard_{}", shard_id));
+        let shard_dir = self.data_dir.join(&uuid).join(format!("shard_{shard_id}"));
         std::fs::create_dir_all(&shard_dir)?;
 
         let engine =
@@ -431,7 +428,7 @@ impl ShardManager {
                 .open_shard_with_settings(&index, shard_id, &mappings, &settings, &uuid_str)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("blocking shard open task failed: {}", e))?
+        .map_err(|e| anyhow::anyhow!("blocking shard open task failed: {e}"))?
     }
 
     /// Close an existing shard engine and reopen it with updated mappings.
@@ -491,7 +488,7 @@ impl ShardManager {
             let shard_dir = shard_manager
                 .data_dir
                 .join(&index_uuid)
-                .join(format!("shard_{}", shard_id));
+                .join(format!("shard_{shard_id}"));
             std::fs::create_dir_all(&shard_dir)?;
 
             let engine = shard_manager.open_composite_engine(
@@ -523,7 +520,7 @@ impl ShardManager {
             Ok(dyn_engine)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("blocking shard reopen task failed: {}", e))?
+        .map_err(|e| anyhow::anyhow!("blocking shard reopen task failed: {e}"))?
     }
 
     /// Get an already-open shard engine.
@@ -636,7 +633,7 @@ impl ShardManager {
             shard_manager.close_index_shards_with_reason(&index, reason)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("blocking shard close task failed: {}", e))?
+        .map_err(|e| anyhow::anyhow!("blocking shard close task failed: {e}"))?
     }
 
     fn remove_dir_all_with_retry(path: &std::path::Path) -> Result<()> {
@@ -708,11 +705,8 @@ impl ShardManager {
 
     /// Return the on-disk path for a shard, using the registered UUID.
     pub fn shard_data_dir(&self, index: &str, shard_id: u32) -> Option<PathBuf> {
-        self.index_uuid(index).map(|uuid| {
-            self.data_dir
-                .join(&uuid)
-                .join(format!("shard_{}", shard_id))
-        })
+        self.index_uuid(index)
+            .map(|uuid| self.data_dir.join(&uuid).join(format!("shard_{shard_id}")))
     }
 
     /// Delete any directories under `data_dir` that don't correspond to a known
@@ -766,7 +760,7 @@ impl ShardManager {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || shard_manager.cleanup_orphaned_data(&known_uuids))
             .await
-            .map_err(|e| anyhow::anyhow!("blocking orphan cleanup task failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("blocking orphan cleanup task failed: {e}"))?;
         Ok(())
     }
 }
@@ -860,8 +854,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(100),
-            "blocking shard-open wrapper stalled the async runtime for {:?}",
-            elapsed
+            "blocking shard-open wrapper stalled the async runtime for {elapsed:?}"
         );
 
         task.await.unwrap();

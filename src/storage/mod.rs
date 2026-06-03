@@ -179,13 +179,13 @@ impl StorageManager {
             StorageScheme::Local => {
                 let root = normalize_local_root(&path)?;
                 std::fs::create_dir_all(&root)
-                    .with_context(|| format!("failed to create storage root {:?}", root))?;
+                    .with_context(|| format!("failed to create storage root {root:?}"))?;
                 let root = root
                     .canonicalize()
-                    .with_context(|| format!("failed to canonicalize storage root {:?}", root))?;
+                    .with_context(|| format!("failed to canonicalize storage root {root:?}"))?;
                 let local =
                     Arc::new(LocalFileSystem::new_with_prefix(&root).with_context(|| {
-                        format!("failed to create object_store backend for {:?}", root)
+                        format!("failed to create object_store backend for {root:?}")
                     })?);
                 Backend::Local { root, local }
             }
@@ -198,23 +198,16 @@ impl StorageManager {
             }
             StorageScheme::Unsupported(scheme) => {
                 anyhow::bail!(
-                    "unsupported storage URL scheme '{}'; supported schemes: file, s3, or bare path",
-                    scheme
+                    "unsupported storage URL scheme '{scheme}'; supported schemes: file, s3, or bare path"
                 );
             }
         };
 
         std::fs::create_dir_all(&local_workdir).with_context(|| {
-            format!(
-                "failed to create remote_store local workdir {:?}",
-                local_workdir
-            )
+            format!("failed to create remote_store local workdir {local_workdir:?}")
         })?;
         let local_workdir = local_workdir.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize remote_store local workdir {:?}",
-                local_workdir
-            )
+            format!("failed to canonicalize remote_store local workdir {local_workdir:?}")
         })?;
 
         Ok(Self {
@@ -371,7 +364,7 @@ impl StorageManager {
 
         if cache_root.exists() {
             for entry in std::fs::read_dir(&cache_root)
-                .with_context(|| format!("read cache root {:?}", cache_root))?
+                .with_context(|| format!("read cache root {cache_root:?}"))?
             {
                 let entry = entry?;
                 if !entry.file_type()?.is_dir() {
@@ -425,7 +418,7 @@ impl StorageManager {
             let cache_dir = self.cache_dir(index_uuid, &entry.split_id);
             if cache_dir.exists() {
                 std::fs::remove_dir_all(&cache_dir)
-                    .with_context(|| format!("remove stale cache dir {:?}", cache_dir))?;
+                    .with_context(|| format!("remove stale cache dir {cache_dir:?}"))?;
             }
             self.cache_entries
                 .lock()
@@ -450,7 +443,7 @@ impl StorageManager {
     /// Object-store key where a split's bundle is published. Derived from
     /// trusted IDs so the key is never attacker-controllable.
     pub fn split_bundle_key(index_uuid: &str, split_id: &str) -> String {
-        format!("{}/splits/{}/bundle", index_uuid, split_id)
+        format!("{index_uuid}/splits/{split_id}/bundle")
     }
 
     /// Acquire a per-split async mutex so concurrent downloads of the same
@@ -521,15 +514,15 @@ impl StorageManager {
         // Clean up any partial state from a previous failed extract.
         if cache_dir.exists() {
             std::fs::remove_dir_all(&cache_dir)
-                .with_context(|| format!("failed to clear stale cache dir {:?}", cache_dir))?;
+                .with_context(|| format!("failed to clear stale cache dir {cache_dir:?}"))?;
         }
         let tmp_dir = cache_dir.with_extension("tmp");
         if tmp_dir.exists() {
             std::fs::remove_dir_all(&tmp_dir)
-                .with_context(|| format!("failed to clear stale tmp dir {:?}", tmp_dir))?;
+                .with_context(|| format!("failed to clear stale tmp dir {tmp_dir:?}"))?;
         }
         std::fs::create_dir_all(&tmp_dir)
-            .with_context(|| format!("failed to create tmp cache dir {:?}", tmp_dir))?;
+            .with_context(|| format!("failed to create tmp cache dir {tmp_dir:?}"))?;
 
         let object_path = self.object_path(&split.bundle_path)?;
         let (bundle_bytes, actual_checksum) = self.download_and_hash(&object_path).await?;
@@ -559,22 +552,19 @@ impl StorageManager {
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(anyhow::anyhow!("unpack task panicked: {}", e));
+                return Err(anyhow::anyhow!("unpack task panicked: {e}"));
             }
         }
 
         if let Some(parent) = cache_dir.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create cache parent {:?}", parent))?;
+                .with_context(|| format!("failed to create cache parent {parent:?}"))?;
         }
         std::fs::rename(&tmp_dir, &cache_dir).with_context(|| {
-            format!(
-                "failed to promote tmp cache dir {:?} to final {:?}",
-                tmp_dir, cache_dir
-            )
+            format!("failed to promote tmp cache dir {tmp_dir:?} to final {cache_dir:?}")
         })?;
         std::fs::write(&done_marker, split.checksum.as_bytes())
-            .with_context(|| format!("failed to write done marker {:?}", done_marker))?;
+            .with_context(|| format!("failed to write done marker {done_marker:?}"))?;
         self.record_cached_split_access(
             index_uuid,
             &split.split_id,
@@ -623,7 +613,7 @@ impl StorageManager {
         let (bundle_bytes, checksum) =
             tokio::task::spawn_blocking(move || pack_bundle_from_dir(&staging_dir))
                 .await
-                .map_err(|e| anyhow::anyhow!("pack task panicked: {}", e))??;
+                .map_err(|e| anyhow::anyhow!("pack task panicked: {e}"))??;
         let size_bytes = bundle_bytes.len() as u64;
 
         let bundle_key = Self::split_bundle_key(index_uuid, split_id);
@@ -708,7 +698,7 @@ impl StorageManager {
             Ok(result) => {
                 let bytes = result.bytes().await?;
                 let pointer: RemoteManifestPointer = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("failed to parse manifest pointer at {}", location))?;
+                    .with_context(|| format!("failed to parse manifest pointer at {location}"))?;
                 Ok(Some(pointer))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -732,10 +722,10 @@ impl StorageManager {
             .object_store()
             .get(&location)
             .await
-            .with_context(|| format!("manifest generation {} not found", generation))?;
+            .with_context(|| format!("manifest generation {generation} not found"))?;
         let bytes = result.bytes().await?;
         let manifest: RemoteStoreManifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse manifest at {}", location))?;
+            .with_context(|| format!("failed to parse manifest at {location}"))?;
 
         if manifest.generation != generation {
             anyhow::bail!(
@@ -967,9 +957,9 @@ pub(crate) fn pack_bundle_from_dir(dir: &Path) -> Result<(Vec<u8>, String)> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(next) = stack.pop() {
         let entries =
-            std::fs::read_dir(&next).with_context(|| format!("failed to read_dir {:?}", next))?;
+            std::fs::read_dir(&next).with_context(|| format!("failed to read_dir {next:?}"))?;
         for entry in entries {
-            let entry = entry.with_context(|| format!("dir entry in {:?}", next))?;
+            let entry = entry.with_context(|| format!("dir entry in {next:?}"))?;
             let ft = entry
                 .file_type()
                 .with_context(|| format!("file_type of {:?}", entry.path()))?;
@@ -979,7 +969,7 @@ pub(crate) fn pack_bundle_from_dir(dir: &Path) -> Result<(Vec<u8>, String)> {
             } else if ft.is_file() {
                 let rel = path
                     .strip_prefix(dir)
-                    .with_context(|| format!("path {:?} not under bundle root {:?}", path, dir))?;
+                    .with_context(|| format!("path {path:?} not under bundle root {dir:?}"))?;
                 let rel_posix = rel
                     .components()
                     .filter_map(|c| match c {
@@ -989,7 +979,7 @@ pub(crate) fn pack_bundle_from_dir(dir: &Path) -> Result<(Vec<u8>, String)> {
                     .collect::<Vec<_>>()
                     .join("/");
                 if rel_posix.is_empty() {
-                    anyhow::bail!("empty relative path produced for {:?}", path);
+                    anyhow::bail!("empty relative path produced for {path:?}");
                 }
                 files.push((rel_posix, path));
             }
@@ -1007,7 +997,7 @@ pub(crate) fn pack_bundle_from_dir(dir: &Path) -> Result<(Vec<u8>, String)> {
         buf.extend_from_slice(rel_bytes);
 
         let content = std::fs::read(abs_path)
-            .with_context(|| format!("failed to read bundle file {:?}", abs_path))?;
+            .with_context(|| format!("failed to read bundle file {abs_path:?}"))?;
         buf.extend_from_slice(&(content.len() as u64).to_le_bytes());
         buf.extend_from_slice(&content);
     }
@@ -1041,17 +1031,14 @@ pub(crate) fn unpack_bundle_into(bytes: &[u8], dir: &Path) -> Result<()> {
     // at most. Reject values that would let a malformed bundle trigger huge
     // allocations.
     if file_count > 1_000_000 {
-        anyhow::bail!(
-            "bundle declares implausibly large file_count {}",
-            file_count
-        );
+        anyhow::bail!("bundle declares implausibly large file_count {file_count}");
     }
 
     std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create bundle extract dir {:?}", dir))?;
+        .with_context(|| format!("failed to create bundle extract dir {dir:?}"))?;
     let dir_canon = dir
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {:?}", dir))?;
+        .with_context(|| format!("failed to canonicalize {dir:?}"))?;
 
     for _ in 0..file_count {
         let rel_len = read_u64_le(bytes, &mut off)? as usize;
@@ -1065,21 +1052,18 @@ pub(crate) fn unpack_bundle_into(bytes: &[u8], dir: &Path) -> Result<()> {
 
         let rel_path = Path::new(rel_str);
         if rel_path.is_absolute() {
-            anyhow::bail!("bundle contains absolute path {:?}", rel_str);
+            anyhow::bail!("bundle contains absolute path {rel_str:?}");
         }
         for component in rel_path.components() {
             match component {
                 Component::Normal(_) => {}
-                _ => anyhow::bail!("bundle contains disallowed path component in {:?}", rel_str),
+                _ => anyhow::bail!("bundle contains disallowed path component in {rel_str:?}"),
             }
         }
 
         let content_len = read_u64_le(bytes, &mut off)? as usize;
         if off + content_len > bytes.len() {
-            anyhow::bail!(
-                "bundle truncated while reading file content for {:?}",
-                rel_str
-            );
+            anyhow::bail!("bundle truncated while reading file content for {rel_str:?}");
         }
         let content = &bytes[off..off + content_len];
         off += content_len;
@@ -1087,18 +1071,14 @@ pub(crate) fn unpack_bundle_into(bytes: &[u8], dir: &Path) -> Result<()> {
         let abs = dir_canon.join(rel_path);
         // Belt-and-suspenders: ensure the joined path still lives under `dir_canon`.
         if !abs.starts_with(&dir_canon) {
-            anyhow::bail!(
-                "bundle file path {:?} would escape extract dir {:?}",
-                abs,
-                dir_canon
-            );
+            anyhow::bail!("bundle file path {abs:?} would escape extract dir {dir_canon:?}");
         }
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create parent dir {:?}", parent))?;
+                .with_context(|| format!("failed to create parent dir {parent:?}"))?;
         }
         std::fs::write(&abs, content)
-            .with_context(|| format!("failed to write bundle file {:?}", abs))?;
+            .with_context(|| format!("failed to write bundle file {abs:?}"))?;
     }
 
     if off != bytes.len() {
@@ -1121,23 +1101,20 @@ fn read_u64_le(bytes: &[u8], off: &mut usize) -> Result<u64> {
 }
 
 fn manifest_pointer_key(index_uuid: &str) -> String {
-    format!("{}/manifest.current.json", index_uuid)
+    format!("{index_uuid}/manifest.current.json")
 }
 
 fn manifest_generation_key(index_uuid: &str, generation: u64) -> String {
     // Zero-padded generations keep the object-store listing naturally sorted.
-    format!("{}/manifests/{:012}.json", index_uuid, generation)
+    format!("{index_uuid}/manifests/{generation:012}.json")
 }
 
 fn normalize_local_root(path: &str) -> Result<PathBuf> {
     if path.starts_with("file://") {
         let url =
-            Url::parse(path).with_context(|| format!("invalid file:// storage URL '{}'", path))?;
+            Url::parse(path).with_context(|| format!("invalid file:// storage URL '{path}'"))?;
         url.to_file_path().map_err(|_| {
-            anyhow::anyhow!(
-                "storage URL '{}' could not be converted to a filesystem path",
-                path
-            )
+            anyhow::anyhow!("storage URL '{path}' could not be converted to a filesystem path")
         })
     } else {
         Ok(PathBuf::from(path))
@@ -1174,10 +1151,10 @@ fn storage_scheme(path: &str) -> StorageScheme {
 /// manifest keys are scoped under that prefix automatically by the
 /// object_store crate's `new_with_prefix` construction.
 fn build_s3_backend(uri: &str) -> Result<Arc<dyn ObjectStore>> {
-    let url = Url::parse(uri).with_context(|| format!("invalid s3:// storage URL '{}'", uri))?;
+    let url = Url::parse(uri).with_context(|| format!("invalid s3:// storage URL '{uri}'"))?;
     let bucket = url
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("s3:// URL '{}' is missing a bucket name", uri))?;
+        .ok_or_else(|| anyhow::anyhow!("s3:// URL '{uri}' is missing a bucket name"))?;
     let prefix = url.path().trim_start_matches('/').to_string();
 
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
@@ -1202,14 +1179,14 @@ fn build_s3_backend(uri: &str) -> Result<Arc<dyn ObjectStore>> {
 
     let s3 = builder
         .build()
-        .with_context(|| format!("failed to build S3 backend for '{}'", uri))?;
+        .with_context(|| format!("failed to build S3 backend for '{uri}'"))?;
 
     if prefix.is_empty() {
         Ok(Arc::new(s3))
     } else {
         // `object_store`'s PrefixStore wraps any ObjectStore with a fixed prefix.
         let prefix_path = ObjectPath::parse(&prefix)
-            .with_context(|| format!("invalid s3 prefix '{}' in URL '{}'", prefix, uri))?;
+            .with_context(|| format!("invalid s3 prefix '{prefix}' in URL '{uri}'"))?;
         let prefixed = object_store::prefix::PrefixStore::new(s3, prefix_path);
         Ok(Arc::new(prefixed))
     }

@@ -75,8 +75,7 @@ pub(super) fn proto_to_field_type(
         "date" | "datetime" | "timestamp" => Ok(crate::cluster::state::FieldType::Date),
         "knn_vector" => Ok(crate::cluster::state::FieldType::KnnVector),
         other => Err(Status::invalid_argument(format!(
-            "unknown field type in cluster state snapshot: {}",
-            other
+            "unknown field type in cluster state snapshot: {other}"
         ))),
     }
 }

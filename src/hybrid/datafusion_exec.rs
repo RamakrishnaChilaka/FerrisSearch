@@ -110,8 +110,7 @@ pub fn direct_sql_input_schema(
             other => {
                 let mapping = mappings.get(other).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "direct SQL streaming requires mapped column [{}] to derive the canonical schema",
-                        other
+                        "direct SQL streaming requires mapped column [{other}] to derive the canonical schema"
                     )
                 })?;
                 Ok(datafusion::arrow::datatypes::Field::new(
@@ -459,9 +458,7 @@ fn merge_data_types(
         }
         _ => {
             return Err(anyhow::anyhow!(
-                "unsupported type merge {:?} vs {:?}",
-                left,
-                right
+                "unsupported type merge {left:?} vs {right:?}"
             ));
         }
     };
@@ -635,9 +632,9 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("price", DataType::Float64, true),
         ]));
-        let ids: Vec<String> = (0..n).map(|i| format!("id-{}", i)).collect();
+        let ids: Vec<String> = (0..n).map(|i| format!("id-{i}")).collect();
         let scores: Vec<f32> = vec![1.0f32; n];
-        let names: Vec<String> = (0..n).map(|i| format!("item-{}", i)).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("item-{i}")).collect();
         let prices: Vec<f64> = (0..n).map(|i| i as f64 * 10.0).collect();
 
         RecordBatch::try_new(
@@ -784,7 +781,7 @@ mod tests {
                         n
                     ])),
                     Arc::new(StringArray::from(
-                        (0..n).map(|i| format!("n-{}", i)).collect::<Vec<_>>(),
+                        (0..n).map(|i| format!("n-{i}")).collect::<Vec<_>>(),
                     )),
                     Arc::new(Float64Array::from(
                         (0..n).map(|i| i as f64).collect::<Vec<_>>(),
@@ -1486,9 +1483,9 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("price", DataType::Utf8, true), // Utf8 instead of Float64
         ]));
-        let ids: Vec<String> = (0..n).map(|i| format!("id-{}", i)).collect();
+        let ids: Vec<String> = (0..n).map(|i| format!("id-{i}")).collect();
         let scores: Vec<f32> = vec![1.0f32; n];
-        let names: Vec<String> = (0..n).map(|i| format!("item-{}", i)).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("item-{i}")).collect();
         let prices: Vec<String> = (0..n).map(|i| format!("{}", i as f64 * 10.0)).collect();
         RecordBatch::try_new(
             schema,
@@ -1509,10 +1506,10 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("price", DataType::Utf8, true),
         ]));
-        let ids: Vec<String> = (0..n).map(|i| format!("bad-{}", i)).collect();
+        let ids: Vec<String> = (0..n).map(|i| format!("bad-{i}")).collect();
         let scores: Vec<f32> = vec![1.0f32; n];
-        let names: Vec<String> = (0..n).map(|i| format!("broken-{}", i)).collect();
-        let prices: Vec<String> = (0..n).map(|i| format!("not-a-number-{}", i)).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("broken-{i}")).collect();
+        let prices: Vec<String> = (0..n).map(|i| format!("not-a-number-{i}")).collect();
         RecordBatch::try_new(
             schema,
             vec![
