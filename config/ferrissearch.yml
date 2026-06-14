@@ -22,5 +22,14 @@ transport_port: 9300
 #       roles: ["admin"]
 #       indices: ["*"]
 
+# Client-facing HTTP API TLS (HTTPS, disabled by default)
+# Requires building with the `http-tls` Cargo feature, e.g.:
+#   cargo build --release --features http-tls
+# Setting http_tls_enabled without that feature is a startup error — the
+# server never silently falls back to plaintext HTTP.
+# http_tls_enabled: false
+# http_tls_cert_file: "/path/to/server.pem"
+# http_tls_key_file: "/path/to/server-key.pem"
+
 # Storage
 # data_dir: "./data/ferrissearch-dev-1"

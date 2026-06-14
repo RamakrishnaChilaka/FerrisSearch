@@ -15,7 +15,7 @@ pub const GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 // ─── TLS support (behind feature flag) ──────────────────────────────────────
 
-#[cfg(feature = "transport-tls")]
+#[cfg(any(feature = "transport-tls", feature = "http-tls"))]
 fn ensure_rustls_crypto_provider() -> anyhow::Result<()> {
     static TLS_CRYPTO_PROVIDER_INIT: std::sync::OnceLock<Option<String>> =
         std::sync::OnceLock::new();
@@ -54,6 +54,25 @@ pub fn load_server_tls_config(
 
     let identity = tonic::transport::Identity::from_pem(cert, key);
     Ok(tonic::transport::ServerTlsConfig::new().identity(identity))
+}
+
+/// Load TLS configuration for the client-facing HTTP (Axum) server from
+/// PEM-encoded cert and key files. Installs the rustls ring crypto provider
+/// before building the config (shared process-wide with transport TLS).
+/// `RustlsConfig::from_pem_file` sets ALPN to h2 + http/1.1 automatically.
+/// Only available when the `http-tls` feature is enabled.
+#[cfg(feature = "http-tls")]
+pub async fn load_http_server_tls_config(
+    cert_path: &str,
+    key_path: &str,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    ensure_rustls_crypto_provider()?;
+
+    axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("failed to load HTTP TLS cert/key ({cert_path}, {key_path}): {e}")
+        })
 }
 
 /// Concrete TLS connector that applies `ClientTlsConfig` to tonic endpoints.

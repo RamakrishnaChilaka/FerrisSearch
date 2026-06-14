@@ -859,6 +859,59 @@ fn resolve_transport_tls_paths_returns_paths_when_feature_enabled() {
     assert_eq!(tls.key, "/tmp/node-key.pem");
 }
 
+#[test]
+fn resolve_http_tls_paths_returns_none_when_disabled() {
+    let config = AppConfig::default();
+    assert!(resolve_http_tls_paths(&config).unwrap().is_none());
+}
+
+#[test]
+fn resolve_http_tls_paths_requires_all_files_when_enabled() {
+    let mut config = AppConfig {
+        http_tls_enabled: true,
+        ..AppConfig::default()
+    };
+
+    let err = resolve_http_tls_paths(&config).unwrap_err();
+    assert!(err.to_string().contains("http_tls_cert_file"));
+
+    config.http_tls_cert_file = Some("/tmp/http.pem".into());
+    let err = resolve_http_tls_paths(&config).unwrap_err();
+    assert!(err.to_string().contains("http_tls_key_file"));
+}
+
+#[cfg(not(feature = "http-tls"))]
+#[test]
+fn resolve_http_tls_paths_requires_http_tls_feature() {
+    let config = AppConfig {
+        http_tls_enabled: true,
+        http_tls_cert_file: Some("/tmp/http.pem".into()),
+        http_tls_key_file: Some("/tmp/http-key.pem".into()),
+        ..AppConfig::default()
+    };
+
+    let err = resolve_http_tls_paths(&config).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("requires building with --features http-tls")
+    );
+}
+
+#[cfg(feature = "http-tls")]
+#[test]
+fn resolve_http_tls_paths_returns_paths_when_feature_enabled() {
+    let config = AppConfig {
+        http_tls_enabled: true,
+        http_tls_cert_file: Some("/tmp/http.pem".into()),
+        http_tls_key_file: Some("/tmp/http-key.pem".into()),
+        ..AppConfig::default()
+    };
+
+    let tls = resolve_http_tls_paths(&config).unwrap().unwrap();
+    assert_eq!(tls.cert, "/tmp/http.pem");
+    assert_eq!(tls.key, "/tmp/http-key.pem");
+}
+
 #[tokio::test]
 async fn try_join_cluster_short_circuits_when_raft_leader() {
     // Bootstrap a single-node Raft so it becomes leader immediately.
