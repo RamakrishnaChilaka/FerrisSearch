@@ -15,8 +15,9 @@ pub struct Node {
 1. `Node::new(config)` — creates Raft instance via `create_raft_instance()` (persisted to `raft.db`)
 2. `Node::start()` spawns THREE concurrent tasks via `tokio::select!`:
    - **gRPC Transport Server** (port 9300) — Raft RPCs + shard ops + replication
-   - **HTTP API Server** (port 9200) — REST endpoints via Axum
+   - **HTTP API Server** (port 9200) — REST endpoints via Axum (HTTPS when `http_tls_enabled` + `--features http-tls`)
    - **Cluster Lifecycle Loop** — runs every 5 seconds
+3. TLS validation is all-or-nothing and resolved up front: `resolve_transport_tls_paths()` (gRPC) and `resolve_http_tls_paths()` (HTTP) both run before any server task is spawned. Enabling `transport_tls_enabled` / `http_tls_enabled` without its Cargo feature (`transport-tls` / `http-tls`) or without cert/key paths fails startup instead of leaving a half-started listener. HTTPS is served via `axum_server::bind_rustls`; plaintext keeps `TcpListener::bind` + `axum::serve`.
 
 ## Seed Hosts Configuration
 - `seed_hosts` must include ALL node transport addresses (e.g., `["127.0.0.1:9300", "127.0.0.1:9301", "127.0.0.1:9302"]`).

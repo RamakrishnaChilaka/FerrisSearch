@@ -190,3 +190,25 @@ transport_tls_ca_file: /path/to/ca.pem
 - Enabling `transport_tls_enabled: true` without compiling `--features transport-tls` must return a startup error. Never silently downgrade to plaintext transport.
 - When `transport_tls_enabled: false` (default), all behavior is identical to pre-TLS code — zero overhead.
 - Integration coverage for the encrypted path lives in `tests/replication_integration.rs` and should be run with `cargo test --test replication_integration --features transport-tls`.
+
+### HTTP TLS (optional, feature-gated)
+The client-facing Axum HTTP API can be served over HTTPS via the `http-tls` Cargo feature flag. Disabled by default.
+```bash
+cargo build --features http-tls
+```
+
+**Config** (`config/ferrissearch.yml` or `FERRISSEARCH_*` env vars):
+```yaml
+http_tls_enabled: true
+http_tls_cert_file: /path/to/http.pem
+http_tls_key_file: /path/to/http-key.pem
+```
+
+**Architecture:**
+- `load_http_server_tls_config(cert, key)` in `transport/mod.rs` (gated `#[cfg(feature = "http-tls")]`) builds the rustls config via `axum-server` and reuses the shared `ensure_rustls_crypto_provider()` (ring) installer — the same crypto provider path as transport TLS. `ensure_rustls_crypto_provider` is cfg'd on `any(feature = "transport-tls", feature = "http-tls")`.
+- `axum-server` is pulled with `default-features = false, features = ["tls-rustls-no-provider"]` to avoid aws-lc-rs/cmake; the `http-tls` feature also enables `tokio-rustls/ring` explicitly so `crypto::ring` does not depend on transitive feature unification from `object_store`/`reqwest`.
+- `node/mod.rs` resolves and validates HTTP TLS paths via `resolve_http_tls_paths()` BEFORE spawning any server task (all-or-nothing startup), then serves HTTPS via `axum_server::bind_rustls(addr, config)` (ALPN h2 + http/1.1). The plaintext path keeps `TcpListener::bind` + `axum::serve`.
+- `resolve_http_tls_paths()` checks `http_tls_cert_file` / `http_tls_key_file` presence BEFORE the `cfg!(feature = "http-tls")` gate (mirrors `resolve_transport_tls_paths`); keep this ordering so the ungated path-required test stays meaningful.
+- Enabling `http_tls_enabled: true` without compiling `--features http-tls` must return a startup error. Never silently downgrade to plaintext HTTP.
+- When `http_tls_enabled: false` (default), all behavior is identical to pre-TLS code — zero overhead.
+- Coverage: config + path-resolution unit tests in `src/config/mod.rs` and `src/node/tests.rs`; build check with `cargo build --features http-tls`.
