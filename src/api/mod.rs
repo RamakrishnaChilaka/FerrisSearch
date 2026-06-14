@@ -5,6 +5,7 @@ pub mod cat;
 pub mod cluster;
 pub mod index;
 pub mod search;
+pub mod security;
 pub mod tasks;
 
 use crate::cluster::ClusterManager;
@@ -319,6 +320,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_update/{id}", post(index::update_document))
         .route("/_sql", post(search::global_sql))
         .route("/_sql/stream", post(search::global_sql_stream))
+        // Security control plane (dynamic API keys + custom roles)
+        .route("/_security/api_key", post(security::create_api_key))
+        .route("/_security/api_key", get(security::list_api_keys))
+        .route("/_security/api_key/{id}", get(security::get_api_key))
+        .route("/_security/api_key/{id}", delete(security::delete_api_key))
+        .route("/_security/role", get(security::list_roles))
+        .route("/_security/role/{name}", put(security::put_role))
+        .route("/_security/role/{name}", get(security::get_role))
+        .route("/_security/role/{name}", delete(security::delete_role))
         // Search
         .route("/{index}/_search", get(search::search_documents))
         .route("/{index}/_search", post(index::search_documents_dsl))

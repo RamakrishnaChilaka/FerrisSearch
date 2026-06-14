@@ -179,7 +179,7 @@ impl Node {
         )
         .await?;
 
-        let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle));
+        let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
         let transport_tls = resolve_transport_tls_paths(&config)?;
 
         // Create transport client — with TLS when feature is enabled and configured
@@ -222,8 +222,9 @@ impl Node {
                 crate::storage::StorageManager::new_in_path(std::path::Path::new(&config.data_dir))?
             }
         });
-        let security_manager = Arc::new(crate::security::SecurityManager::new(
+        let security_manager = Arc::new(crate::security::SecurityManager::with_cluster_state(
             config.security.clone(),
+            state_handle,
         )?);
         let remote_store_reader_cache =
             Arc::new(crate::engine::remote_store::RemoteSplitReaderCache::default());

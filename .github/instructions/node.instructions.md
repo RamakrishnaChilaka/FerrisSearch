@@ -92,3 +92,21 @@ pub struct AppState {
     pub sql_group_by_scan_limit: usize,
 }
 ```
+
+## Shared ClusterState wiring (control-plane consumers)
+The startup `state_handle: Arc<RwLock<ClusterState>>` is created once and **moved** into
+`ClusterManager::with_shared_state(state_handle)`. Any consumer that needs to read
+control-plane config on a hot path (e.g. `SecurityManager` reading dynamic API keys/roles)
+must hold a `.clone()` of that same `Arc` — capture the clone **before** the move:
+
+```rust
+let state_handle = Arc::new(RwLock::new(ClusterState::new(...)));
+let security_manager = SecurityManager::with_cluster_state(
+    config.security.clone(), state_handle.clone(),   // clone BEFORE the move below
+)?;
+let cluster_manager = ClusterManager::with_shared_state(state_handle); // moves original
+```
+
+Both now observe the exact same Raft-applied state under a short read-lock — no extra I/O,
+no polling. Keep a `None`/static constructor (`SecurityManager::new`) so unit tests without
+a cluster state still compile. See `control-plane.instructions.md`.

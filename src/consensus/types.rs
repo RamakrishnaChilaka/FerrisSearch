@@ -3,7 +3,10 @@
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
-use crate::cluster::state::{DynamicMapping, FieldMapping, IndexMetadata, NodeInfo};
+use crate::cluster::state::{
+    DynamicMapping, FieldMapping, IndexMetadata, NodeInfo, SecurityApiKeyRecord,
+    SecurityRoleDefinition,
+};
 
 // ─── Raft Type Config ───────────────────────────────────────────────────────
 
@@ -52,6 +55,14 @@ pub enum ClusterCommand {
         new_fields: std::collections::HashMap<String, FieldMapping>,
         dynamic: DynamicMapping,
     },
+    /// Insert or replace a dynamically-managed API key (stores only the hash).
+    PutApiKey { record: SecurityApiKeyRecord },
+    /// Remove a dynamically-managed API key by id.
+    DeleteApiKey { key_id: String },
+    /// Insert or replace a custom role definition.
+    PutRole { role: SecurityRoleDefinition },
+    /// Remove a custom role definition by name.
+    DeleteRole { name: String },
 }
 
 impl std::fmt::Display for ClusterCommand {
@@ -83,6 +94,14 @@ impl std::fmt::Display for ClusterCommand {
                     new_fields.len()
                 )
             }
+            ClusterCommand::PutApiKey { record } => {
+                write!(f, "PutApiKey({})", record.id)
+            }
+            ClusterCommand::DeleteApiKey { key_id } => {
+                write!(f, "DeleteApiKey({key_id})")
+            }
+            ClusterCommand::PutRole { role } => write!(f, "PutRole({})", role.name),
+            ClusterCommand::DeleteRole { name } => write!(f, "DeleteRole({name})"),
         }
     }
 }
@@ -217,5 +236,113 @@ mod tests {
         } else {
             panic!("Expected CreateIndex");
         }
+    }
+
+    fn sample_api_key() -> SecurityApiKeyRecord {
+        SecurityApiKeyRecord {
+            id: "key-1".into(),
+            name: "ci".into(),
+            hash_sha256: "c".repeat(64),
+            roles: vec!["read".into()],
+            indices: vec!["logs-*".into()],
+            created_at_millis: 1_700_000_000_000,
+        }
+    }
+
+    fn sample_role() -> SecurityRoleDefinition {
+        SecurityRoleDefinition {
+            name: "analyst".into(),
+            cluster: vec!["monitor".into()],
+            indices: vec!["metrics-*".into()],
+            index_privileges: vec!["read".into()],
+        }
+    }
+
+    #[test]
+    fn cluster_command_display_security_variants() {
+        assert_eq!(
+            format!(
+                "{}",
+                ClusterCommand::PutApiKey {
+                    record: sample_api_key()
+                }
+            ),
+            "PutApiKey(key-1)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                ClusterCommand::DeleteApiKey {
+                    key_id: "key-1".into()
+                }
+            ),
+            "DeleteApiKey(key-1)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                ClusterCommand::PutRole {
+                    role: sample_role()
+                }
+            ),
+            "PutRole(analyst)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                ClusterCommand::DeleteRole {
+                    name: "analyst".into()
+                }
+            ),
+            "DeleteRole(analyst)"
+        );
+    }
+
+    #[test]
+    fn put_api_key_command_serde_roundtrip() {
+        let cmd = ClusterCommand::PutApiKey {
+            record: sample_api_key(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: ClusterCommand = serde_json::from_str(&json).unwrap();
+        if let ClusterCommand::PutApiKey { record } = back {
+            assert_eq!(record, sample_api_key());
+        } else {
+            panic!("Expected PutApiKey");
+        }
+    }
+
+    #[test]
+    fn delete_api_key_command_serde_roundtrip() {
+        let cmd = ClusterCommand::DeleteApiKey {
+            key_id: "key-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: ClusterCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ClusterCommand::DeleteApiKey { key_id } if key_id == "key-1"));
+    }
+
+    #[test]
+    fn put_role_command_serde_roundtrip() {
+        let cmd = ClusterCommand::PutRole {
+            role: sample_role(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: ClusterCommand = serde_json::from_str(&json).unwrap();
+        if let ClusterCommand::PutRole { role } = back {
+            assert_eq!(role, sample_role());
+        } else {
+            panic!("Expected PutRole");
+        }
+    }
+
+    #[test]
+    fn delete_role_command_serde_roundtrip() {
+        let cmd = ClusterCommand::DeleteRole {
+            name: "analyst".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: ClusterCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ClusterCommand::DeleteRole { name } if name == "analyst"));
     }
 }

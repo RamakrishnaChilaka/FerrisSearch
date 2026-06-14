@@ -1,5 +1,10 @@
 # Consensus Module — src/consensus/
 
+> Adding a new command? Follow `control-plane.instructions.md` — the canonical
+> end-to-end recipe (ClusterCommand → Display → apply arm + `version` bump → proto
+> → transport server/client → coordinator API handler → serde-default `ClusterState`
+> field). Copy `AddMappings` or the security commands verbatim.
+
 ## Raft Type Configuration (types.rs)
 ```rust
 openraft::declare_raft_types!(
@@ -16,6 +21,13 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `SetMaster { node_id: String }` — set cluster master
 - `UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replicas, settings)
 - `AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
+- `PutApiKey { record: SecurityApiKeyRecord }` — upsert a dynamic API key (stores only the hash) into `ClusterState.api_keys`
+- `DeleteApiKey { key_id: String }` — remove a dynamic API key
+- `PutRole { role: SecurityRoleDefinition }` — upsert a custom role into `ClusterState.roles`
+- `DeleteRole { name: String }` — remove a custom role
+
+Every variant has a `Display` arm (used in logs — never print secrets) with a serde JSON
+roundtrip test in `types.rs`, and an `apply_command` arm in `state_machine.rs`.
 
 ## ClusterResponse
 - `Ok` — command applied successfully
@@ -38,6 +50,13 @@ pub struct ClusterStateMachine {
 | `DeleteIndex` | remove from `state.indices` |
 | `SetMaster` | set `state.master_node` |
 | `UpdateIndex` | replace `shard_routing` in `state.indices` |
+| `AddMappings` | merge `new_fields` into `state.indices[name].mappings` via `.entry().or_insert()` |
+| `PutApiKey` / `DeleteApiKey` | `insert` / `remove` on `state.api_keys` |
+| `PutRole` / `DeleteRole` | `insert` / `remove` on `state.roles` |
+
+**Every apply arm bumps `state.version += 1`** — including idempotent upserts and deletes
+of absent keys (mirrors `DeleteIndex` / `RemoveNode`). `AddNode`/`CreateIndex` bump version
+inside the `state.*` helper they call.
 
 ### Snapshot
 - Format: JSON-serialized `ClusterState`

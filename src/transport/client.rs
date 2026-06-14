@@ -862,6 +862,106 @@ impl TransportClient {
         Ok(())
     }
 
+    /// Forward a dynamic API-key upsert to the Raft leader.
+    pub async fn forward_put_api_key(
+        &self,
+        master: &NodeInfo,
+        record: &crate::cluster::state::SecurityApiKeyRecord,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master for PutApiKey: {e}"))?;
+
+        let record_json = serde_json::to_string(record)
+            .map_err(|e| anyhow::anyhow!("serialize api key record: {e}"))?;
+        let request = tonic::Request::new(PutApiKeyRequest { record_json });
+        let resp = client
+            .put_api_key(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("PutApiKey RPC: {e}"))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
+
+    /// Forward a dynamic API-key deletion to the Raft leader.
+    pub async fn forward_delete_api_key(
+        &self,
+        master: &NodeInfo,
+        key_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master for DeleteApiKey: {e}"))?;
+
+        let request = tonic::Request::new(DeleteApiKeyRequest {
+            key_id: key_id.to_string(),
+        });
+        let resp = client
+            .delete_api_key(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("DeleteApiKey RPC: {e}"))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
+
+    /// Forward a custom-role upsert to the Raft leader.
+    pub async fn forward_put_role(
+        &self,
+        master: &NodeInfo,
+        role: &crate::cluster::state::SecurityRoleDefinition,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master for PutRole: {e}"))?;
+
+        let role_json = serde_json::to_string(role)
+            .map_err(|e| anyhow::anyhow!("serialize role definition: {e}"))?;
+        let request = tonic::Request::new(PutRoleRequest { role_json });
+        let resp = client
+            .put_role(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("PutRole RPC: {e}"))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
+
+    /// Forward a custom-role deletion to the Raft leader.
+    pub async fn forward_delete_role(
+        &self,
+        master: &NodeInfo,
+        name: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master for DeleteRole: {e}"))?;
+
+        let request = tonic::Request::new(DeleteRoleRequest {
+            name: name.to_string(),
+        });
+        let resp = client
+            .delete_role(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("DeleteRole RPC: {e}"))?;
+        let inner = resp.into_inner();
+        if !inner.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
+
     /// Fetch shard doc counts from a remote node.
     /// Returns a map of (index_name, shard_id) → doc_count.
     pub async fn get_shard_stats(

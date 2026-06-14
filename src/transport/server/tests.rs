@@ -233,6 +233,52 @@ fn roundtrip_client_role() {
     assert_eq!(node.roles, vec![NodeRole::Client]);
 }
 
+#[test]
+fn roundtrip_dynamic_security_state() {
+    use crate::cluster::state::{SecurityApiKeyRecord, SecurityRoleDefinition};
+
+    let mut cs = DomainClusterState::new("test".into());
+    cs.api_keys.insert(
+        "key-1".into(),
+        SecurityApiKeyRecord {
+            id: "key-1".into(),
+            name: "ingest-bot".into(),
+            hash_sha256: "a".repeat(64),
+            roles: vec!["write".into()],
+            indices: vec!["logs-*".into()],
+            created_at_millis: 1_700_000_000_000,
+        },
+    );
+    cs.roles.insert(
+        "log-reader".into(),
+        SecurityRoleDefinition {
+            name: "log-reader".into(),
+            cluster: vec!["monitor".into()],
+            indices: vec!["logs-*".into()],
+            index_privileges: vec!["read".into()],
+        },
+    );
+
+    let proto = cluster_state_to_proto(&cs);
+    // Snapshot carries the dynamic security state losslessly.
+    assert_eq!(proto.api_keys_json.len(), 1);
+    assert_eq!(proto.roles_json.len(), 1);
+
+    let restored = proto_to_cluster_state(&proto).unwrap();
+    assert_eq!(restored.api_keys, cs.api_keys);
+    assert_eq!(restored.roles, cs.roles);
+    // The stored value is the hash, never a plaintext secret.
+    assert_eq!(restored.api_keys["key-1"].hash_sha256, "a".repeat(64));
+}
+
+#[test]
+fn proto_to_cluster_state_rejects_malformed_api_key_json() {
+    let mut proto = cluster_state_to_proto(&DomainClusterState::new("test".into()));
+    proto.api_keys_json.push("{not valid json".into());
+    let err = proto_to_cluster_state(&proto).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
 // ── advance_global_checkpoint tests ────────────────────────────────
 
 fn make_checkpoint_engine() -> (tempfile::TempDir, Arc<dyn crate::engine::SearchEngine>) {
@@ -1121,6 +1167,8 @@ fn roundtrip_unknown_field_type_returns_error() {
             settings: None,
             dynamic: String::new(),
         }],
+        api_keys_json: vec![],
+        roles_json: vec![],
     };
 
     let err = proto_to_cluster_state(&proto).unwrap_err();
@@ -1295,6 +1343,8 @@ fn roundtrip_rejects_unknown_non_empty_engine() {
             }),
             dynamic: String::new(),
         }],
+        api_keys_json: vec![],
+        roles_json: vec![],
     };
 
     let err = proto_to_cluster_state(&proto).unwrap_err();

@@ -102,13 +102,15 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterCommand::SetMaster { node_id: String }` — set cluster master (Raft leader)
 - `ClusterCommand::UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replica changes, settings)
 - `ClusterCommand::AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
+- `ClusterCommand::PutApiKey { record }` / `DeleteApiKey { key_id }` — upsert/remove a dynamic API key (hash only) in `ClusterState.api_keys` (dynamic security control plane)
+- `ClusterCommand::PutRole { role }` / `DeleteRole { name }` — upsert/remove a custom role in `ClusterState.roles`. All four mirror the `AddMappings` idiom end-to-end (see `.github/instructions/control-plane.instructions.md`)
 
 ## ClusterResponse
 - `ClusterResponse::Ok` — command applied successfully
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1147 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 75 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1370 total
+- 1178 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 87 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1413 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
 - Real flush/restart regression: `cargo test --test restart_regression`
@@ -198,6 +200,7 @@ pub struct AppState {
 - `SecurityManager` classifies path-based HTTP requests into cluster, index, metrics, and security actions, then inserts the authenticated `Principal` into request extensions for body-routed handlers.
 - Global body-routed endpoints must do their own resource checks after parsing: `POST /_bulk` authorizes each action `_index`, and `POST /_sql` / `/_sql/stream` authorize extracted table names from `DESCRIBE`, `SHOW CREATE TABLE`, and `SELECT ... FROM`.
 - `.ferris_security` is a protected system index created internally by the leader via Raft only when `security.enabled && auto_create_security_index` are explicitly enabled. It uses one primary shard and adaptive replicas (`data_nodes - 1`) reconciled in the leader lifecycle loop. Ordinary index APIs, global bulk, SQL metadata commands, cat endpoints, and `SHOW TABLES` must not expose it.
+- **Dynamic security control plane** (`/_security/*`, `src/api/security.rs`): runtime API-key + custom-role management. SHA-256 hashes + role defs are stored in Raft-replicated `ClusterState.api_keys` / `ClusterState.roles` (NOT the `.ferris_security` Tantivy index) via the `PutApiKey`/`DeleteApiKey`/`PutRole`/`DeleteRole` commands. Plaintext secrets are CSPRNG-generated (`getrandom`), returned once, never persisted/logged. `SecurityManager::with_cluster_state(...)` reads keys/roles from the shared state under a short read-lock (static bootstrap keys checked first, then dynamic). See `.github/instructions/security.instructions.md` and `control-plane.instructions.md`.
 
 ## Core Data Structures (src/cluster/state.rs)
 

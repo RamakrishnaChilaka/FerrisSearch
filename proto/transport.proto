@@ -62,6 +62,12 @@ message ClusterState {
     optional string master_node = 3;
     repeated NodeInfo nodes = 4;
     repeated IndexMetadata indices = 5;
+    // Dynamic security control plane. Carried as JSON so the snapshot stays
+    // lossless without duplicating the record schema in proto. Each entry is a
+    // serialized SecurityApiKeyRecord / SecurityRoleDefinition (hash only,
+    // never a plaintext secret).
+    repeated string api_keys_json = 6;
+    repeated string roles_json = 7;
 }
 
 message JoinRequest {
@@ -329,6 +335,47 @@ message AddMappingsResponse {
     string error = 2;
 }
 
+// ─── Dynamic Security Control Plane (forwarded to leader) ─────────────────────
+// Requests carry the JSON-encoded ClusterState record (or a bare id/name) so the
+// proto surface stays small while still being typed per operation. Responses
+// mirror the AddMappings acknowledge/error convention.
+
+message PutApiKeyRequest {
+    string record_json = 1;  // JSON of SecurityApiKeyRecord
+}
+
+message PutApiKeyResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
+message DeleteApiKeyRequest {
+    string key_id = 1;
+}
+
+message DeleteApiKeyResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
+message PutRoleRequest {
+    string role_json = 1;  // JSON of SecurityRoleDefinition
+}
+
+message PutRoleResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
+message DeleteRoleRequest {
+    string name = 1;
+}
+
+message DeleteRoleResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
 // ─── Shard Stats (for _cat endpoints) ───────────────────────────────────────
 
 message ShardStatsRequest {}
@@ -461,6 +508,12 @@ service InternalTransport {
 
     // Dynamic mapping (forwarded to leader)
     rpc AddMappings(AddMappingsRequest) returns (AddMappingsResponse);
+
+    // Dynamic security control plane (forwarded to leader)
+    rpc PutApiKey(PutApiKeyRequest) returns (PutApiKeyResponse);
+    rpc DeleteApiKey(DeleteApiKeyRequest) returns (DeleteApiKeyResponse);
+    rpc PutRole(PutRoleRequest) returns (PutRoleResponse);
+    rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
 
     // Shard stats (for _cat endpoints)
     rpc GetShardStats(ShardStatsRequest) returns (ShardStatsResponse);

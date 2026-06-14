@@ -1,15 +1,15 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **1147 unit tests** (`cargo test --lib`)
+- **1178 unit tests** (`cargo test --lib`)
 - **68 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
-- **75 REST API integration tests** (`cargo test --test rest_api_integration`)
+- **87 REST API integration tests** (`cargo test --test rest_api_integration`)
 - **6 remote_store S3 integration tests** (`cargo test --test remote_store_s3_integration`) — skipped unless `FERRIS_RUSTFS_ENDPOINT` is set
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 180 assertions across 4 files
-- **1370 total** (`cargo test`)
+- **1413 total** (`cargo test`)
 
 The `remote_store` automated coverage is split between REST integration tests (publish/search/verify behavior with in-process harnesses, including query-string `GET /_search`, match-all `/_count` on shardless indices, publish-time split-summary persistence for pruning, term/range pruning regressions that assert non-candidate splits are not fetched into cache, response-level `remote_store.pruning` counters including unsupported-query no-prune behavior, and SQL EXPLAIN ANALYZE pruning metadata) and `remote_store_s3_integration` (real S3-compatible manifest/object operations via `StorageManager`). That still does not replace a full process-backed RustFS + `./dev_cluster_release.sh --nodes 3` live validation; keep a manual runbook for that flow and an isolated smoke script for the automatable pieces.
 
@@ -51,6 +51,8 @@ cargo test -- test_name                         # Single test by name
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.
+- For any new Raft control-plane mutation (new `ClusterCommand`, new `ClusterState` config field, new forwarded write RPC — see `control-plane.instructions.md`), add all three layers: (1) unit — `types.rs` serde JSON roundtrip per variant, `state_machine.rs` apply test asserting the map changed AND `version` bumped, `cluster/state.rs` `ClusterState` snapshot roundtrip plus an old-snapshot literal missing the field deserializing via `#[serde(default)]`; (2) transport — a direct gRPC test of each RPC (leader applies, non-leader returns `failed_precondition`); (3) coordinator/multi-node — a follower's API handler forwards the write to the leader and the change is observable on the leader (preserve real `raft_node_id`s, route through a non-master node).
+- For the dynamic security control plane specifically, also assert: create→authenticate→revoke→denied, custom-role authz grants only mapped actions, static + dynamic keys coexist, `GET /_security/*` never leaks `hash_sha256`, and a non-admin principal gets 403 on `/_security/*`. Security-enabled REST harnesses must treat HTTP 401 on `GET /` as "server up" during readiness polling (auth rejects the probe).
 - For SQL identifier case-sensitivity fixes, add helper-level canonicalization coverage plus REST regressions for both buffered and streamed SQL endpoints using real mixed-case mapping fields, and cover both unquoted source references and quoted exact-identifier preservation on the residual/DataFusion path.
 - For `ferris-cli` interactive features, test command parsing and completion token boundaries in pure helpers; keep watch-mode behavior factored so the logic is covered without relying on terminal I/O in tests.
 - For `ferris-cli` SQL metadata/footer changes, keep search-stage counts distinct from final SQL row counts, surface the actual `approximate_top_k` state from API metadata when present, and add pure helper coverage for the displayed labels so `matched_hits` is not presented as returned rows.

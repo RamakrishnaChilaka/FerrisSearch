@@ -761,6 +761,40 @@ impl IndexMetadata {
     }
 }
 
+/// A dynamically-managed API key record stored in the Raft-replicated cluster
+/// state. Only the SHA-256 hash of the secret is ever persisted — the plaintext
+/// secret is generated server-side, returned to the caller once, and never stored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityApiKeyRecord {
+    pub id: String,
+    pub name: String,
+    /// 64-character lowercase hex SHA-256 of the secret.
+    pub hash_sha256: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Optional index allow-list patterns. Empty means all indices.
+    #[serde(default)]
+    pub indices: Vec<String>,
+    #[serde(default)]
+    pub created_at_millis: i64,
+}
+
+/// A custom role definition stored in the Raft-replicated cluster state. Maps
+/// privilege strings to the actions the holder may perform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityRoleDefinition {
+    pub name: String,
+    /// Cluster-level privilege names (e.g. "monitor", "state", "admin", "metrics").
+    #[serde(default)]
+    pub cluster: Vec<String>,
+    /// Index patterns the index privileges apply to. Empty means all indices.
+    #[serde(default)]
+    pub indices: Vec<String>,
+    /// Index privilege names: "read", "write", "admin".
+    #[serde(default)]
+    pub index_privileges: Vec<String>,
+}
+
 /// The globally agreed-upon state of the entire cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterState {
@@ -769,6 +803,13 @@ pub struct ClusterState {
     pub master_node: Option<NodeId>,
     pub nodes: HashMap<NodeId, NodeInfo>,
     pub indices: HashMap<String, IndexMetadata>,
+    /// Dynamically-managed API keys, keyed by key id. Snapshotted via serde;
+    /// `#[serde(default)]` keeps older snapshots without this field readable.
+    #[serde(default)]
+    pub api_keys: HashMap<String, SecurityApiKeyRecord>,
+    /// Dynamically-managed custom roles, keyed by role name.
+    #[serde(default)]
+    pub roles: HashMap<String, SecurityRoleDefinition>,
     #[serde(skip, default)]
     pub last_seen: HashMap<NodeId, Instant>,
 }
@@ -781,6 +822,8 @@ impl ClusterState {
             master_node: None,
             nodes: HashMap::new(),
             indices: HashMap::new(),
+            api_keys: HashMap::new(),
+            roles: HashMap::new(),
             last_seen: HashMap::new(),
         }
     }
@@ -2186,5 +2229,94 @@ mod tests {
                        "number_of_replicas":0,"shard_routing":{},"mappings":{},"settings":{}}"#;
         let meta: IndexMetadata = serde_json::from_str(json).unwrap();
         assert_eq!(meta.dynamic, DynamicMapping::False);
+    }
+
+    #[test]
+    fn api_key_record_serde_roundtrip() {
+        let record = SecurityApiKeyRecord {
+            id: "key-1".into(),
+            name: "ci".into(),
+            hash_sha256: "a".repeat(64),
+            roles: vec!["read".into(), "write".into()],
+            indices: vec!["logs-*".into()],
+            created_at_millis: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: SecurityApiKeyRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, back);
+    }
+
+    #[test]
+    fn api_key_record_defaults_for_missing_optional_fields() {
+        // Only the required fields are present; optional fields use serde defaults.
+        let json = r#"{"id":"k","name":"n","hash_sha256":"deadbeef"}"#;
+        let record: SecurityApiKeyRecord = serde_json::from_str(json).unwrap();
+        assert!(record.roles.is_empty());
+        assert!(record.indices.is_empty());
+        assert_eq!(record.created_at_millis, 0);
+    }
+
+    #[test]
+    fn role_definition_serde_roundtrip() {
+        let role = SecurityRoleDefinition {
+            name: "analyst".into(),
+            cluster: vec!["monitor".into()],
+            indices: vec!["metrics-*".into()],
+            index_privileges: vec!["read".into()],
+        };
+        let json = serde_json::to_string(&role).unwrap();
+        let back: SecurityRoleDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(role, back);
+    }
+
+    #[test]
+    fn role_definition_defaults_for_missing_optional_fields() {
+        let json = r#"{"name":"empty"}"#;
+        let role: SecurityRoleDefinition = serde_json::from_str(json).unwrap();
+        assert!(role.cluster.is_empty());
+        assert!(role.indices.is_empty());
+        assert!(role.index_privileges.is_empty());
+    }
+
+    #[test]
+    fn cluster_state_roundtrips_security_fields() {
+        let mut state = ClusterState::new("sec".into());
+        state.api_keys.insert(
+            "key-1".into(),
+            SecurityApiKeyRecord {
+                id: "key-1".into(),
+                name: "admin-key".into(),
+                hash_sha256: "b".repeat(64),
+                roles: vec!["admin".into()],
+                indices: vec![],
+                created_at_millis: 42,
+            },
+        );
+        state.roles.insert(
+            "analyst".into(),
+            SecurityRoleDefinition {
+                name: "analyst".into(),
+                cluster: vec!["monitor".into()],
+                indices: vec!["logs-*".into()],
+                index_privileges: vec!["read".into()],
+            },
+        );
+
+        // Mirrors the Raft snapshot path: serde_json::to_vec(&state) then restore.
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let back: ClusterState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.api_keys, state.api_keys);
+        assert_eq!(back.roles, state.roles);
+    }
+
+    #[test]
+    fn cluster_state_missing_security_fields_default_empty() {
+        // Simulates restoring a snapshot taken before the security fields existed.
+        let json = r#"{"cluster_name":"old","version":7,"master_node":null,
+                       "nodes":{},"indices":{}}"#;
+        let state: ClusterState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.version, 7);
+        assert!(state.api_keys.is_empty());
+        assert!(state.roles.is_empty());
     }
 }
