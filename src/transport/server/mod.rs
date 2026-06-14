@@ -1822,6 +1822,159 @@ impl InternalTransport for TransportService {
         }))
     }
 
+    // ─── Dynamic Security Control Plane ───────────────────────────────────────
+
+    async fn put_api_key(
+        &self,
+        request: Request<PutApiKeyRequest>,
+    ) -> Result<Response<PutApiKeyResponse>, Status> {
+        let req = request.into_inner();
+
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+
+        let record: crate::cluster::state::SecurityApiKeyRecord =
+            serde_json::from_str(&req.record_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid api key record: {e}")))?;
+
+        // Validate at the transport trust boundary before committing to Raft.
+        // The HTTP handler always builds a well-formed record, but a record can
+        // also arrive directly over this RPC, so re-check the security-critical
+        // invariants here (mirrors add_mappings validating its proto payload).
+        if record.id.trim().is_empty() {
+            return Err(Status::invalid_argument("api key record has empty id"));
+        }
+        if record.name.trim().is_empty() {
+            return Err(Status::invalid_argument("api key record has empty name"));
+        }
+        if record.hash_sha256.len() != 64
+            || !record.hash_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(Status::invalid_argument(
+                "api key record hash_sha256 must be a 64-character hex digest",
+            ));
+        }
+        let key_id = record.id.clone();
+
+        let cmd = crate::consensus::types::ClusterCommand::PutApiKey { record };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft PutApiKey failed: {e}")))?;
+
+        info!("gRPC: stored dynamic api key '{key_id}'");
+        Ok(Response::new(PutApiKeyResponse {
+            acknowledged: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn delete_api_key(
+        &self,
+        request: Request<DeleteApiKeyRequest>,
+    ) -> Result<Response<DeleteApiKeyResponse>, Status> {
+        let req = request.into_inner();
+
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+
+        let cmd = crate::consensus::types::ClusterCommand::DeleteApiKey {
+            key_id: req.key_id.clone(),
+        };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft DeleteApiKey failed: {e}")))?;
+
+        info!("gRPC: deleted dynamic api key '{}'", req.key_id);
+        Ok(Response::new(DeleteApiKeyResponse {
+            acknowledged: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn put_role(
+        &self,
+        request: Request<PutRoleRequest>,
+    ) -> Result<Response<PutRoleResponse>, Status> {
+        let req = request.into_inner();
+
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+
+        let role: crate::cluster::state::SecurityRoleDefinition =
+            serde_json::from_str(&req.role_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid role definition: {e}")))?;
+        if role.name.trim().is_empty() {
+            return Err(Status::invalid_argument("role definition has empty name"));
+        }
+        let role_name = role.name.clone();
+
+        let cmd = crate::consensus::types::ClusterCommand::PutRole { role };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft PutRole failed: {e}")))?;
+
+        info!("gRPC: stored custom role '{role_name}'");
+        Ok(Response::new(PutRoleResponse {
+            acknowledged: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn delete_role(
+        &self,
+        request: Request<DeleteRoleRequest>,
+    ) -> Result<Response<DeleteRoleResponse>, Status> {
+        let req = request.into_inner();
+
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+
+        let cmd = crate::consensus::types::ClusterCommand::DeleteRole {
+            name: req.name.clone(),
+        };
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft DeleteRole failed: {e}")))?;
+
+        info!("gRPC: deleted custom role '{}'", req.name);
+        Ok(Response::new(DeleteRoleResponse {
+            acknowledged: true,
+            error: String::new(),
+        }))
+    }
+
     // ─── Shard Stats ──────────────────────────────────────────────────────────
 
     async fn get_shard_stats(

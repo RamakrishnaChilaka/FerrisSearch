@@ -78,10 +78,10 @@ Every SQL response tells you how the planner executed the query:
 - **Vector search** — k-NN via [USearch](https://github.com/unum-cloud/usearch) with hybrid text + vector querying
 - **Generation-based WAL** — durable writes, replica catch-up, background auto-flush, and corruption-safe reopen errors
 - **Stable restarts** — covered by a real three-node flush + restart regression
-- **Core security foundation** — optional API-key HTTP auth with role/index authorization, protected `.ferris_security` system-index metadata with adaptive replicas, and guards on body-routed bulk and SQL endpoints
+- **Core security foundation** — optional API-key HTTP auth with role/index authorization, a dynamic `/_security/*` control plane for runtime API-key and custom-role management (hashes stored in Raft `ClusterState`), protected `.ferris_security` system-index metadata with adaptive replicas, and guards on body-routed bulk and SQL endpoints
 - **CLI and observability** — `ferris-cli`, `EXPLAIN ANALYZE`, Prometheus metrics, planner metadata, and grouped-merge timing breakdowns for grouped SQL queries
 - **Repeatable taxi benchmarks** — `scripts/load_nyc_taxis_20m_bench.sh` rebuilds an isolated January 2025 NYC taxi cluster and runs the frozen hybrid SQL suite in `scripts/nyc_taxi_hybrid_benchmark.sh`
-- **Test depth** — 1370 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, security auth/guard coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
+- **Test depth** — 1413 automated tests, including a real three-node flush + restart regression, async cluster-wide force-merge tracking coverage, distributed `_cat/segments` coverage, dynamic security control-plane + auth/guard coverage, a bulk-body regression guarding benchmark-sized uploads, and object-store-backed remote manifest + bundle coverage (local and S3)
 
 ## Tech Stack
 
@@ -191,6 +191,34 @@ Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variable
 If `transport_tls_enabled: true` is set without compiling `--features transport-tls`, node startup fails instead of silently falling back to plaintext transport. Likewise, if `http_tls_enabled: true` is set without compiling `--features http-tls`, node startup fails instead of silently serving plaintext HTTP.
 
 When `security.enabled: true`, clients send `Authorization: ApiKey <secret>` or `Authorization: Bearer <secret>`. Store only SHA-256 hashes in `security.bootstrap_api_keys`; the plaintext key is never persisted by FerrisSearch.
+
+### Dynamic Security Control Plane (`/_security/*`)
+
+Beyond static bootstrap keys, API keys and custom roles can be managed at runtime. Hashes and role definitions are stored the idiomatic Raft way — directly in the replicated `ClusterState` (the same mechanism as index mappings), so they are strongly consistent, instantly revocable cluster-wide, and snapshotted automatically. The plaintext secret is generated server-side with a CSPRNG, returned **once**, and never persisted or logged (only its SHA-256 hash is stored). Writes follow the coordinator pattern: any node accepts the request and forwards to the Raft leader; reads serve locally.
+
+```bash
+# Create an API key — the response contains the secret EXACTLY ONCE.
+curl -s -XPOST localhost:9200/_security/api_key \
+  -H 'Authorization: ApiKey <admin-secret>' -H 'Content-Type: application/json' \
+  -d '{"name":"ingest-bot","roles":["write"],"indices":["logs-*"]}'
+# => {"id":"4f3c...","name":"ingest-bot","api_key":"<64-hex-secret>","roles":["write"],"indices":["logs-*"],"created":true}
+
+# Use the returned secret on a normal endpoint.
+curl -s localhost:9200/logs-2024/_search -H 'Authorization: ApiKey <64-hex-secret>'
+
+# List key metadata (never returns the hash or secret).
+curl -s localhost:9200/_security/api_key -H 'Authorization: ApiKey <admin-secret>'
+
+# Revoke — denial is immediate and cluster-wide via Raft.
+curl -s -XDELETE localhost:9200/_security/api_key/4f3c... -H 'Authorization: ApiKey <admin-secret>'
+
+# Define a custom role, then issue keys that reference it.
+curl -s -XPUT localhost:9200/_security/role/log-reader \
+  -H 'Authorization: ApiKey <admin-secret>' -H 'Content-Type: application/json' \
+  -d '{"cluster":["monitor"],"indices":["logs-*"],"index_privileges":["read"]}'
+```
+
+All `/_security/*` endpoints require the `SecurityAdmin` privilege (built-in `admin` / `all_access` / `security_admin` roles) when security is enabled.
 
 ## SQL Over Search Results
 
@@ -557,8 +585,8 @@ python3 scripts/search_1gb.py --queries 200 --concurrency 1
 ## Testing
 
 ```bash
-cargo test                                      # All 1370 tests
-cargo test --lib                                # Unit tests (1147)
+cargo test                                      # All 1413 tests
+cargo test --lib                                # Unit tests (1178)
 cargo test --bin ferris-cli                      # CLI tests (68)
 cargo test --test consensus_integration          # Raft consensus (33)
 cargo test --test replication_integration        # Replication (39)
@@ -627,6 +655,8 @@ scripts/           Ingestion and benchmark scripts
 - [x] Restart and rejoin safety guardrails for UUID-based shard data
 - [x] Inter-node gRPC TLS (`--features transport-tls`)
 - [x] Client-facing HTTP TLS / HTTPS (`--features http-tls`)
+- [x] Core security: optional API-key HTTP auth with role/index authorization and protected `.ferris_security` metadata
+- [x] Dynamic security control plane — runtime API-key and custom-role management via `/_security/*`, with hashes and role definitions stored in Raft-replicated `ClusterState` for instant cluster-wide revocation
 
 ### Next
 
@@ -638,6 +668,7 @@ scripts/           Ingestion and benchmark scripts
 - [ ] Streaming fast-field TableProvider — custom DataFusion `TableProvider` reading Tantivy fast fields as streaming Arrow batches (8K rows/batch), eliminating the GROUP BY scan limit entirely
 - [ ] Streaming export / wildcard scan path — support large `SELECT *` and other unbounded result-set queries as block-streamed export-style execution instead of materializing full shard batches on remote nodes and the coordinator
 - [ ] `COUNT(DISTINCT field)`
+- [ ] Security control-plane follow-ups — API-key expiration/TTL, audit logging of `/_security/*` mutations, and per-key last-used tracking
 - [ ] `_msearch` API (batch searches)
 - [x] `search_after` cursor-based pagination
 - [ ] Snapshot and restore
@@ -668,7 +699,7 @@ The coordinator deduplicates inner keys, ignores `NULL`s, and caps the materiali
 ## Current Trade-Offs
 
 - **TLS is opt-in at build time** — client-facing HTTP TLS (`--features http-tls`) and inter-node gRPC TLS (`--features transport-tls`) both exist but are disabled by default and must be compiled in; default builds serve plaintext
-- **Authentication is API-key only and off by default** — optional API-key HTTP auth with role/index authorization exists, but there is no SSO/OIDC/LDAP, no client-certificate auth, and no dynamic key-management API (keys are bootstrapped from config)
+- **Authentication is API-key only and off by default** — optional API-key HTTP auth with role/index authorization exists (including a runtime `/_security/*` control plane for API-key and custom-role management), but there is no SSO/OIDC/LDAP and no client-certificate auth
 - **No `_msearch` yet** — batched search requests are still missing
 - **Large unfiltered analytics are slower than search-aware analytics** — full-table `GROUP BY` is much slower than the filtered grouped-partials path
 - **Not yet proven at hundreds of millions of docs** — the project is heavily tested on millions of documents, but it is not claiming Elasticsearch-scale production mileage yet

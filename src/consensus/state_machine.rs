@@ -80,6 +80,22 @@ impl ClusterStateMachine {
                     state.version += 1;
                 }
             }
+            ClusterCommand::PutApiKey { record } => {
+                state.api_keys.insert(record.id.clone(), record.clone());
+                state.version += 1;
+            }
+            ClusterCommand::DeleteApiKey { key_id } => {
+                state.api_keys.remove(key_id);
+                state.version += 1;
+            }
+            ClusterCommand::PutRole { role } => {
+                state.roles.insert(role.name.clone(), role.clone());
+                state.version += 1;
+            }
+            ClusterCommand::DeleteRole { name } => {
+                state.roles.remove(name);
+                state.version += 1;
+            }
         }
     }
 }
@@ -570,5 +586,114 @@ mod tests {
         // Version should not have been bumped.
         assert_eq!(state.version, 0);
         assert!(!state.indices.contains_key("nonexistent"));
+    }
+
+    fn make_api_key(id: &str) -> crate::cluster::state::SecurityApiKeyRecord {
+        crate::cluster::state::SecurityApiKeyRecord {
+            id: id.into(),
+            name: format!("{id}-name"),
+            hash_sha256: "d".repeat(64),
+            roles: vec!["read".into()],
+            indices: vec![],
+            created_at_millis: 7,
+        }
+    }
+
+    fn make_role(name: &str) -> crate::cluster::state::SecurityRoleDefinition {
+        crate::cluster::state::SecurityRoleDefinition {
+            name: name.into(),
+            cluster: vec!["monitor".into()],
+            indices: vec!["logs-*".into()],
+            index_privileges: vec!["read".into()],
+        }
+    }
+
+    #[test]
+    fn apply_put_api_key_inserts_and_bumps_version() {
+        let sm = ClusterStateMachine::new("test".into());
+        sm.apply_command(&ClusterCommand::PutApiKey {
+            record: make_api_key("key-1"),
+        });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert_eq!(state.version, 1);
+        assert_eq!(state.api_keys["key-1"].name, "key-1-name");
+    }
+
+    #[test]
+    fn apply_put_api_key_replaces_existing() {
+        let sm = ClusterStateMachine::new("test".into());
+        sm.apply_command(&ClusterCommand::PutApiKey {
+            record: make_api_key("key-1"),
+        });
+        let mut updated = make_api_key("key-1");
+        updated.name = "renamed".into();
+        sm.apply_command(&ClusterCommand::PutApiKey { record: updated });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert_eq!(state.version, 2);
+        assert_eq!(state.api_keys.len(), 1);
+        assert_eq!(state.api_keys["key-1"].name, "renamed");
+    }
+
+    #[test]
+    fn apply_delete_api_key_removes_and_bumps_version() {
+        let sm = ClusterStateMachine::new("test".into());
+        sm.apply_command(&ClusterCommand::PutApiKey {
+            record: make_api_key("key-1"),
+        });
+        sm.apply_command(&ClusterCommand::DeleteApiKey {
+            key_id: "key-1".into(),
+        });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert_eq!(state.version, 2);
+        assert!(state.api_keys.is_empty());
+    }
+
+    #[test]
+    fn apply_delete_missing_api_key_still_bumps_version() {
+        // Delete is idempotent like RemoveNode/DeleteIndex — it always bumps version.
+        let sm = ClusterStateMachine::new("test".into());
+        sm.apply_command(&ClusterCommand::DeleteApiKey {
+            key_id: "ghost".into(),
+        });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert_eq!(state.version, 1);
+        assert!(state.api_keys.is_empty());
+    }
+
+    #[test]
+    fn apply_put_role_inserts_and_bumps_version() {
+        let sm = ClusterStateMachine::new("test".into());
+        sm.apply_command(&ClusterCommand::PutRole {
+            role: make_role("analyst"),
+        });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert_eq!(state.version, 1);
+        assert_eq!(state.roles["analyst"].cluster, vec!["monitor".to_string()]);
+    }
+
+    #[test]
+    fn apply_delete_role_removes_and_bumps_version() {
+        let sm = ClusterStateMachine::new("test".into());
+        sm.apply_command(&ClusterCommand::PutRole {
+            role: make_role("analyst"),
+        });
+        sm.apply_command(&ClusterCommand::DeleteRole {
+            name: "analyst".into(),
+        });
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert_eq!(state.version, 2);
+        assert!(state.roles.is_empty());
     }
 }

@@ -220,6 +220,16 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
                 dynamic: idx.dynamic.to_string(),
             })
             .collect(),
+        api_keys_json: s
+            .api_keys
+            .values()
+            .filter_map(|record| serde_json::to_string(record).ok())
+            .collect(),
+        roles_json: s
+            .roles
+            .values()
+            .filter_map(|role| serde_json::to_string(role).ok())
+            .collect(),
     }
 }
 
@@ -288,6 +298,22 @@ pub fn proto_to_cluster_state(
                 })?,
             },
         );
+    }
+    for record_json in &p.api_keys_json {
+        let record: crate::cluster::state::SecurityApiKeyRecord = serde_json::from_str(record_json)
+            .map_err(|e| {
+                Status::invalid_argument(format!(
+                    "invalid api key record in cluster state snapshot: {e}"
+                ))
+            })?;
+        state.api_keys.insert(record.id.clone(), record);
+    }
+    for role_json in &p.roles_json {
+        let role: crate::cluster::state::SecurityRoleDefinition = serde_json::from_str(role_json)
+            .map_err(|e| {
+            Status::invalid_argument(format!("invalid role in cluster state snapshot: {e}"))
+        })?;
+        state.roles.insert(role.name.clone(), role);
     }
     Ok(state)
 }

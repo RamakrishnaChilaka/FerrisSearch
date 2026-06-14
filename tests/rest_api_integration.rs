@@ -5,6 +5,7 @@ use ferrissearch::cluster::state::{
     ClusterState, FieldMapping, FieldType, IndexMetadata, IndexSettings, NodeInfo, NodeRole,
     ShardRoutingEntry,
 };
+use ferrissearch::security::{SecurityApiKeyConfig, SecurityConfig};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::{
@@ -114,13 +115,24 @@ async fn put_json_to_base_url(
     Ok((status, value))
 }
 
+async fn get_json_from_base_url(
+    client: &Client,
+    base_url: &str,
+    path: &str,
+) -> Result<(StatusCode, Value)> {
+    let response = client.get(format!("{base_url}{path}")).send().await?;
+    let status = response.status();
+    let value = response.json().await?;
+    Ok((status, value))
+}
+
 impl RestTestHarness {
     async fn start() -> Result<Self> {
         Self::start_with_column_cache(0, 0).await
     }
 
     async fn start_with_roles(roles: Vec<NodeRole>) -> Result<Self> {
-        Self::start_internal(0, 0, roles).await
+        Self::start_internal(0, 0, roles, None).await
     }
 
     async fn start_with_column_cache(
@@ -131,6 +143,24 @@ impl RestTestHarness {
             column_cache_bytes,
             populate_threshold_percent,
             vec![NodeRole::Master, NodeRole::Data],
+            None,
+        )
+        .await
+    }
+
+    /// Start a single-node harness with security enabled and the given bootstrap
+    /// API keys. The `SecurityManager` shares the same Raft-replicated cluster
+    /// state, so dynamically-created keys/roles are visible on the auth path.
+    async fn start_security_enabled(bootstrap_api_keys: Vec<SecurityApiKeyConfig>) -> Result<Self> {
+        Self::start_internal(
+            0,
+            0,
+            vec![NodeRole::Master, NodeRole::Data],
+            Some(SecurityConfig {
+                enabled: true,
+                auto_create_security_index: false,
+                bootstrap_api_keys,
+            }),
         )
         .await
     }
@@ -139,6 +169,7 @@ impl RestTestHarness {
         column_cache_bytes: u64,
         populate_threshold_percent: u8,
         roles: Vec<NodeRole>,
+        security_config: Option<SecurityConfig>,
     ) -> Result<Self> {
         let temp_dir = tempfile::tempdir()?;
         let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -166,6 +197,10 @@ impl RestTestHarness {
             Some(format!("127.0.0.1:{}", transport_addr.port())),
         )
         .await;
+        // Clone the shared cluster state for the SecurityManager before it is
+        // moved into the ClusterManager, so dynamic API keys/roles applied via
+        // Raft are visible on the authentication path.
+        let security_state = shared_state.clone();
         let manager = ClusterManager::with_shared_state(shared_state);
         manager.update_state(cluster_state);
 
@@ -192,7 +227,14 @@ impl RestTestHarness {
             storage_manager: Arc::new(
                 ferrissearch::storage::StorageManager::new_in_path(temp_dir.path()).unwrap(),
             ),
-            security_manager: Arc::new(ferrissearch::security::SecurityManager::disabled()),
+            security_manager: Arc::new(match security_config {
+                Some(config) => ferrissearch::security::SecurityManager::with_cluster_state(
+                    config,
+                    security_state,
+                )
+                .expect("valid security config"),
+                None => ferrissearch::security::SecurityManager::disabled(),
+            }),
             remote_store_reader_cache: Arc::new(
                 ferrissearch::engine::remote_store::RemoteSplitReaderCache::default(),
             ),
@@ -244,7 +286,9 @@ impl RestTestHarness {
         for _ in 0..50 {
             let http_ready =
                 if let Ok(response) = self.client.get(format!("{}/", self.base_url)).send().await {
-                    response.status() == StatusCode::OK
+                    // A 401 still proves the HTTP server is up (security enabled).
+                    let s = response.status();
+                    s == StatusCode::OK || s == StatusCode::UNAUTHORIZED
                 } else {
                     false
                 };
@@ -362,6 +406,80 @@ impl RestTestHarness {
         let status = response.status();
         let value = response.json().await?;
         Ok((status, value))
+    }
+
+    // ─── Authenticated request helpers (security-enabled harness) ─────────────
+
+    async fn post_json_auth(
+        &self,
+        path: &str,
+        api_key: &str,
+        body: Value,
+    ) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .header("Authorization", format!("ApiKey {api_key}"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json().await?;
+        Ok((status, value))
+    }
+
+    async fn get_json_auth(&self, path: &str, api_key: &str) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .header("Authorization", format!("ApiKey {api_key}"))
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json().await?;
+        Ok((status, value))
+    }
+
+    async fn delete_json_auth(&self, path: &str, api_key: &str) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .delete(format!("{}{}", self.base_url, path))
+            .header("Authorization", format!("ApiKey {api_key}"))
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json().await?;
+        Ok((status, value))
+    }
+
+    async fn put_json_auth(
+        &self,
+        path: &str,
+        api_key: &str,
+        body: Value,
+    ) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .put(format!("{}{}", self.base_url, path))
+            .header("Authorization", format!("ApiKey {api_key}"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json().await?;
+        Ok((status, value))
+    }
+
+    /// GET that returns the raw status without parsing a body — useful for
+    /// asserting auth outcomes on endpoints whose success body is large.
+    async fn get_status_auth(&self, path: &str, api_key: &str) -> Result<StatusCode> {
+        let response = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .header("Authorization", format!("ApiKey {api_key}"))
+            .send()
+            .await?;
+        Ok(response.status())
     }
 }
 
@@ -4461,5 +4579,417 @@ async fn rest_search_after_total_and_aggs_invariant_across_pages() -> Result<()>
     // Without the fix, total2 would shrink to 15 and agg2 to 15.0.
     assert_eq!(total2, 20, "page 2 total must equal page 1 total");
     assert_eq!(agg2, 20.0, "page 2 agg must equal page 1 agg");
+    Ok(())
+}
+
+// ───────────────────────── Security control plane ─────────────────────────
+//
+// Dynamic API-key and custom-role management via `/_security/*`. Secrets are
+// stored as SHA-256 hashes in Raft-replicated ClusterState (the AddMappings
+// idiom); the plaintext secret is returned exactly once and never persisted.
+
+fn bootstrap_admin_key(secret: &str) -> SecurityApiKeyConfig {
+    SecurityApiKeyConfig {
+        id: "bootstrap-admin".into(),
+        name: "bootstrap-admin".into(),
+        hash_sha256: ferrissearch::security::sha256_hex(secret),
+        roles: vec!["admin".into()],
+        indices: vec![],
+    }
+}
+
+#[tokio::test]
+async fn security_api_key_create_use_revoke_lifecycle() -> Result<()> {
+    let admin = "admin-bootstrap-secret-1";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+
+    // Create a dynamic read-only key as the admin.
+    let (status, body) = harness
+        .post_json_auth(
+            "/_security/api_key",
+            admin,
+            json!({ "name": "ci-key", "roles": ["read"] }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let secret = body["api_key"]
+        .as_str()
+        .expect("api_key returned once")
+        .to_string();
+    let id = body["id"].as_str().expect("id").to_string();
+    assert_eq!(body["created"], json!(true));
+    assert_eq!(body["roles"], json!(["read"]));
+
+    // The new key authenticates on a normal endpoint (read grants ClusterMonitor).
+    let health = harness.get_status_auth("/_cluster/health", &secret).await?;
+    assert_eq!(health, StatusCode::OK);
+
+    // Revoke it as the admin.
+    let (del_status, del_body) = harness
+        .delete_json_auth(&format!("/_security/api_key/{id}"), admin)
+        .await?;
+    assert_eq!(del_status, StatusCode::OK, "{del_body}");
+    assert_eq!(del_body["deleted"], json!(true));
+
+    // Revocation is immediate: the secret no longer authenticates.
+    let denied = harness.get_status_auth("/_cluster/health", &secret).await?;
+    assert_eq!(denied, StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_api_key_list_and_get_never_leak_hash() -> Result<()> {
+    let admin = "admin-bootstrap-secret-2";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+
+    let (status, created) = harness
+        .post_json_auth(
+            "/_security/api_key",
+            admin,
+            json!({ "name": "leak-check", "roles": ["read"] }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let (ls, list) = harness.get_json_auth("/_security/api_key", admin).await?;
+    assert_eq!(ls, StatusCode::OK, "{list}");
+    let arr = list["api_keys"].as_array().expect("api_keys array");
+    assert_eq!(arr.len(), 1);
+    let entry = &arr[0];
+    assert_eq!(entry["id"], json!(id));
+    assert_eq!(entry["name"], json!("leak-check"));
+    assert!(
+        entry.get("hash_sha256").is_none(),
+        "list must not leak hash"
+    );
+    assert!(entry.get("api_key").is_none(), "list must not leak secret");
+
+    let (gs, one) = harness
+        .get_json_auth(&format!("/_security/api_key/{id}"), admin)
+        .await?;
+    assert_eq!(gs, StatusCode::OK, "{one}");
+    assert!(one.get("hash_sha256").is_none(), "get must not leak hash");
+    assert!(one.get("api_key").is_none(), "get must not leak secret");
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_non_admin_principal_denied_on_security_endpoints() -> Result<()> {
+    let admin = "admin-bootstrap-secret-3";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+
+    let (status, created) = harness
+        .post_json_auth(
+            "/_security/api_key",
+            admin,
+            json!({ "name": "reader", "roles": ["read"] }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let reader_secret = created["api_key"].as_str().unwrap().to_string();
+
+    // The `read` role lacks SecurityAdmin → 403 on /_security/*.
+    let denied = harness
+        .get_status_auth("/_security/api_key", &reader_secret)
+        .await?;
+    assert_eq!(denied, StatusCode::FORBIDDEN);
+
+    // Missing credentials → 401.
+    let (unauth, _) = harness.get_json("/_security/api_key").await?;
+    assert_eq!(unauth, StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_static_and_dynamic_keys_coexist() -> Result<()> {
+    let admin = "admin-bootstrap-secret-4";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+
+    // Bootstrap (static) key works.
+    assert_eq!(
+        harness.get_status_auth("/_cluster/health", admin).await?,
+        StatusCode::OK
+    );
+
+    // Create a dynamic key; it also works.
+    let (status, created) = harness
+        .post_json_auth(
+            "/_security/api_key",
+            admin,
+            json!({ "name": "dyn", "roles": ["read"] }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let dyn_secret = created["api_key"].as_str().unwrap().to_string();
+    assert_eq!(
+        harness
+            .get_status_auth("/_cluster/health", &dyn_secret)
+            .await?,
+        StatusCode::OK
+    );
+
+    // A bogus key is rejected.
+    assert_eq!(
+        harness
+            .get_status_auth("/_cluster/health", "totally-wrong-secret")
+            .await?,
+        StatusCode::UNAUTHORIZED
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_custom_role_grants_scoped_index_access() -> Result<()> {
+    let admin = "admin-bootstrap-secret-5";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+
+    // Define a custom role limited to logs-* with read privilege.
+    let (rs, rb) = harness
+        .put_json_auth(
+            "/_security/role/logs-reader",
+            admin,
+            json!({ "indices": ["logs-*"], "index_privileges": ["read"] }),
+        )
+        .await?;
+    assert_eq!(rs, StatusCode::OK, "{rb}");
+
+    // Create a matching index as admin, then a key bound to the custom role.
+    let (cs, cb) = harness
+        .put_json_auth(
+            "/logs-app",
+            admin,
+            json!({ "settings": { "number_of_shards": 1, "number_of_replicas": 0 } }),
+        )
+        .await?;
+    assert_eq!(cs, StatusCode::OK, "{cb}");
+
+    let (ks, kb) = harness
+        .post_json_auth(
+            "/_security/api_key",
+            admin,
+            json!({ "name": "logs-key", "roles": ["logs-reader"] }),
+        )
+        .await?;
+    assert_eq!(ks, StatusCode::CREATED, "{kb}");
+    let key = kb["api_key"].as_str().unwrap().to_string();
+
+    // Allowed: search a matching index (authz passes).
+    let allowed = harness.get_status_auth("/logs-app/_search", &key).await?;
+    assert_eq!(
+        allowed,
+        StatusCode::OK,
+        "custom role must allow logs-* read"
+    );
+
+    // Denied: a non-matching index → 403 (index pattern mismatch in the role).
+    let denied = harness
+        .get_status_auth("/other-index/_search", &key)
+        .await?;
+    assert_eq!(
+        denied,
+        StatusCode::FORBIDDEN,
+        "custom role must not allow non-matching indices"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_create_api_key_requires_name() -> Result<()> {
+    let admin = "admin-bootstrap-secret-6";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+    let (status, body) = harness
+        .post_json_auth("/_security/api_key", admin, json!({ "roles": ["read"] }))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_delete_unknown_api_key_returns_404() -> Result<()> {
+    let admin = "admin-bootstrap-secret-7";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+    let (status, body) = harness
+        .delete_json_auth("/_security/api_key/does-not-exist", admin)
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["type"], json!("resource_not_found_exception"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_role_create_get_list_delete() -> Result<()> {
+    let admin = "admin-bootstrap-secret-8";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+
+    let (ps, pb) = harness
+        .put_json_auth(
+            "/_security/role/analytics",
+            admin,
+            json!({
+                "cluster": ["monitor"],
+                "indices": ["metrics-*"],
+                "index_privileges": ["read", "write"]
+            }),
+        )
+        .await?;
+    assert_eq!(ps, StatusCode::OK, "{pb}");
+    assert_eq!(pb["acknowledged"], json!(true));
+
+    let (gs, gb) = harness
+        .get_json_auth("/_security/role/analytics", admin)
+        .await?;
+    assert_eq!(gs, StatusCode::OK, "{gb}");
+    assert_eq!(gb["name"], json!("analytics"));
+    assert_eq!(gb["cluster"], json!(["monitor"]));
+    assert_eq!(gb["indices"], json!(["metrics-*"]));
+    assert_eq!(gb["index_privileges"], json!(["read", "write"]));
+
+    let (lss, lb) = harness.get_json_auth("/_security/role", admin).await?;
+    assert_eq!(lss, StatusCode::OK, "{lb}");
+    assert_eq!(lb["roles"].as_array().unwrap().len(), 1);
+
+    let (ds, db) = harness
+        .delete_json_auth("/_security/role/analytics", admin)
+        .await?;
+    assert_eq!(ds, StatusCode::OK, "{db}");
+    assert_eq!(db["deleted"], json!(true));
+
+    let (gs2, _) = harness
+        .get_json_auth("/_security/role/analytics", admin)
+        .await?;
+    assert_eq!(gs2, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_endpoints_work_when_security_disabled() -> Result<()> {
+    // Handlers must function when security is disabled (consistent with the
+    // rest of the API): no auth header required, secret still returned once.
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .post_json(
+            "/_security/api_key",
+            json!({ "name": "nosec", "roles": ["read"] }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        body["api_key"].as_str().is_some(),
+        "secret returned even when security disabled"
+    );
+
+    let (ls, list) = harness.get_json("/_security/api_key").await?;
+    assert_eq!(ls, StatusCode::OK, "{list}");
+    assert_eq!(list["api_keys"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_put_api_key_forwarded_from_follower_to_leader() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+
+    // POST to node-2 (a follower). The coordinator pattern must forward the
+    // PutApiKey write to the leader (node-1) instead of erroring.
+    let (status, body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
+        "/_security/api_key",
+        json!({ "name": "via-follower", "roles": ["read"] }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().expect("id").to_string();
+    assert!(body["api_key"].as_str().is_some());
+
+    // The leader (node-1) now has the key in its replicated cluster state.
+    let (ls, list) = get_json_from_base_url(
+        &harness.client,
+        &harness.nodes[0].base_url,
+        "/_security/api_key",
+    )
+    .await?;
+    assert_eq!(ls, StatusCode::OK, "{list}");
+    let found = list["api_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k["id"] == json!(id));
+    assert!(found, "leader must have the follower-forwarded key");
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_put_api_key_transport_rpc_applies_to_state() -> Result<()> {
+    use ferrissearch::transport::proto::PutApiKeyRequest;
+
+    // Single-node leader harness. Drive the typed transport RPC directly.
+    let harness = RestTestHarness::start().await?;
+    let mut client =
+        InternalTransportClient::connect(format!("http://{}", harness.transport_addr)).await?;
+
+    let record = ferrissearch::cluster::state::SecurityApiKeyRecord {
+        id: "rpc-key-1".into(),
+        name: "rpc".into(),
+        hash_sha256: ferrissearch::security::sha256_hex("rpc-secret"),
+        roles: vec!["read".into()],
+        indices: vec![],
+        created_at_millis: 123,
+    };
+    let resp = client
+        .put_api_key(tonic::Request::new(PutApiKeyRequest {
+            record_json: serde_json::to_string(&record)?,
+        }))
+        .await?
+        .into_inner();
+    assert!(resp.acknowledged, "ack failed: {}", resp.error);
+    assert!(resp.error.is_empty());
+
+    // The applied key is visible via the HTTP list endpoint (shared state).
+    let (ls, list) = harness.get_json("/_security/api_key").await?;
+    assert_eq!(ls, StatusCode::OK, "{list}");
+    let found = list["api_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k["id"] == json!("rpc-key-1"));
+    assert!(found, "transport-applied key must be visible");
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_put_api_key_transport_rpc_rejects_malformed_hash() -> Result<()> {
+    use ferrissearch::transport::proto::PutApiKeyRequest;
+
+    // The leader must validate the record at the transport trust boundary and
+    // reject a record whose hash is not a 64-char hex digest.
+    let harness = RestTestHarness::start().await?;
+    let mut client =
+        InternalTransportClient::connect(format!("http://{}", harness.transport_addr)).await?;
+
+    let bad = ferrissearch::cluster::state::SecurityApiKeyRecord {
+        id: "bad-key".into(),
+        name: "bad".into(),
+        hash_sha256: "not-a-valid-hash".into(),
+        roles: vec!["read".into()],
+        indices: vec![],
+        created_at_millis: 1,
+    };
+    let status = client
+        .put_api_key(tonic::Request::new(PutApiKeyRequest {
+            record_json: serde_json::to_string(&bad)?,
+        }))
+        .await
+        .expect_err("malformed hash must be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+
+    // Nothing was committed to cluster state.
+    let (ls, list) = harness.get_json("/_security/api_key").await?;
+    assert_eq!(ls, StatusCode::OK, "{list}");
+    assert!(
+        list["api_keys"].as_array().unwrap().is_empty(),
+        "rejected key must not be stored"
+    );
     Ok(())
 }

@@ -8,7 +8,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+use crate::cluster::state::{ClusterState, SecurityRoleDefinition};
 
 pub const SECURITY_INDEX_NAME: &str = ".ferris_security";
 
@@ -88,10 +90,29 @@ pub struct SecurityManager {
     enabled: bool,
     auto_create_security_index: bool,
     api_keys: Vec<ApiKeyRecord>,
+    /// Shared, Raft-replicated cluster state for dynamic API keys/roles. `None`
+    /// for the static-only constructors (`new`/`disabled`) used in unit tests.
+    dynamic_state: Option<Arc<RwLock<ClusterState>>>,
 }
 
 impl SecurityManager {
     pub fn new(config: SecurityConfig) -> anyhow::Result<Self> {
+        Self::build(config, None)
+    }
+
+    /// Like `new`, but also wires the shared cluster state so the manager can
+    /// authenticate dynamically-managed API keys and consult custom roles.
+    pub fn with_cluster_state(
+        config: SecurityConfig,
+        dynamic_state: Arc<RwLock<ClusterState>>,
+    ) -> anyhow::Result<Self> {
+        Self::build(config, Some(dynamic_state))
+    }
+
+    fn build(
+        config: SecurityConfig,
+        dynamic_state: Option<Arc<RwLock<ClusterState>>>,
+    ) -> anyhow::Result<Self> {
         let mut api_keys = Vec::with_capacity(config.bootstrap_api_keys.len());
         for key in config.bootstrap_api_keys {
             let Some(hash_sha256) = normalize_sha256_hash(&key.hash_sha256) else {
@@ -111,7 +132,8 @@ impl SecurityManager {
 
         if config.enabled && api_keys.is_empty() {
             tracing::warn!(
-                "security is enabled but no bootstrap API keys are configured; all HTTP requests will be rejected"
+                "security is enabled but no bootstrap API keys are configured; \
+                 only dynamically-created keys will be accepted"
             );
         }
 
@@ -119,6 +141,7 @@ impl SecurityManager {
             enabled: config.enabled,
             auto_create_security_index: config.auto_create_security_index,
             api_keys,
+            dynamic_state,
         })
     }
 
@@ -127,6 +150,7 @@ impl SecurityManager {
             enabled: false,
             auto_create_security_index: false,
             api_keys: Vec::new(),
+            dynamic_state: None,
         }
     }
 
@@ -140,7 +164,9 @@ impl SecurityManager {
 
     fn authenticate_api_key(&self, api_key: &str) -> Option<Principal> {
         let presented = sha256_hex(api_key);
-        self.api_keys
+        // Static bootstrap keys first (preserves existing behavior).
+        if let Some(principal) = self
+            .api_keys
             .iter()
             .find(|record| constant_time_eq(&presented, &record.hash_sha256))
             .map(|record| Principal {
@@ -149,6 +175,26 @@ impl SecurityManager {
                 roles: record.roles.clone(),
                 indices: record.indices.clone(),
             })
+        {
+            return Some(principal);
+        }
+
+        // Dynamically-managed keys from the Raft-replicated cluster state.
+        if let Some(state) = &self.dynamic_state {
+            let guard = state.read().unwrap_or_else(|e| e.into_inner());
+            for record in guard.api_keys.values() {
+                if constant_time_eq(&presented, &record.hash_sha256) {
+                    return Some(Principal {
+                        name: record.name.clone(),
+                        key_id: record.id.clone(),
+                        roles: record.roles.clone(),
+                        indices: record.indices.clone(),
+                    });
+                }
+            }
+        }
+
+        None
     }
 
     pub fn authorize(&self, principal: &Principal, request: &ClassifiedRequest) -> bool {
@@ -162,10 +208,28 @@ impl SecurityManager {
             return false;
         }
 
-        principal
+        // Built-in role names take precedence (cheap, no lock).
+        if principal
             .roles
             .iter()
             .any(|role| role_allows_action(role, request.action))
+        {
+            return true;
+        }
+
+        // Fall back to dynamically-defined custom roles.
+        if let Some(state) = &self.dynamic_state {
+            let guard = state.read().unwrap_or_else(|e| e.into_inner());
+            for role_name in &principal.roles {
+                if let Some(def) = guard.roles.get(role_name)
+                    && dynamic_role_allows(def, request)
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     pub fn authorize_or_error(
@@ -418,6 +482,68 @@ fn role_allows_action(role: &str, action: SecurityAction) -> bool {
     }
 }
 
+/// Whether a dynamically-defined custom role grants the requested action.
+/// Index actions are additionally gated by the role's own index patterns.
+fn dynamic_role_allows(role: &SecurityRoleDefinition, request: &ClassifiedRequest) -> bool {
+    match request.action {
+        SecurityAction::IndexRead | SecurityAction::IndexWrite | SecurityAction::IndexAdmin => {
+            if let Some(index) = &request.index
+                && !role.indices.is_empty()
+                && !role
+                    .indices
+                    .iter()
+                    .any(|pattern| index_pattern_matches(pattern, index))
+            {
+                return false;
+            }
+            role.index_privileges
+                .iter()
+                .any(|privilege| index_privilege_grants(privilege, request.action))
+        }
+        cluster_action => role
+            .cluster
+            .iter()
+            .any(|privilege| cluster_privilege_grants(privilege, cluster_action)),
+    }
+}
+
+/// Maps an index-privilege string to the index actions it grants. Higher
+/// privileges imply the lower ones (write ⊇ read, admin ⊇ write ⊇ read).
+fn index_privilege_grants(privilege: &str, action: SecurityAction) -> bool {
+    match privilege {
+        "read" => matches!(action, SecurityAction::IndexRead),
+        "write" => matches!(
+            action,
+            SecurityAction::IndexRead | SecurityAction::IndexWrite
+        ),
+        "admin" | "all" => matches!(
+            action,
+            SecurityAction::IndexRead | SecurityAction::IndexWrite | SecurityAction::IndexAdmin
+        ),
+        _ => false,
+    }
+}
+
+/// Maps a cluster-privilege string to the cluster/metrics/security actions it grants.
+fn cluster_privilege_grants(privilege: &str, action: SecurityAction) -> bool {
+    match privilege {
+        "all" => matches!(
+            action,
+            SecurityAction::ClusterMonitor
+                | SecurityAction::ClusterStateRead
+                | SecurityAction::ClusterAdmin
+                | SecurityAction::MetricsRead
+                | SecurityAction::SecurityAdmin
+        ),
+        "monitor" => matches!(action, SecurityAction::ClusterMonitor),
+        "state" => matches!(action, SecurityAction::ClusterStateRead),
+        "admin" => matches!(action, SecurityAction::ClusterAdmin),
+        "metrics" => matches!(action, SecurityAction::MetricsRead),
+        "security" => matches!(action, SecurityAction::SecurityAdmin),
+        _ => false,
+    }
+}
+
 fn extract_api_key(req: &Request<Body>) -> Option<&str> {
     let header_value = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
     header_value
@@ -451,9 +577,14 @@ fn normalize_sha256_hash(hash: &str) -> Option<String> {
 }
 
 pub fn sha256_hex(value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
-    let mut out = String::with_capacity(64);
-    for byte in digest {
+    hex_encode(&Sha256::digest(value.as_bytes()))
+}
+
+/// Lowercase-hex encode arbitrary bytes (used for SHA-256 hashes and for
+/// rendering CSPRNG-generated secrets).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
         out.push(hex_char(byte >> 4));
         out.push(hex_char(byte & 0x0f));
     }
@@ -656,5 +787,203 @@ mod tests {
         assert_eq!(updated.number_of_replicas, 1);
         assert_eq!(updated.shard_routing[&0].replicas, ["node-2"]);
         assert_eq!(updated.shard_routing[&0].unassigned_replicas, 0);
+    }
+
+    // ─── Dynamic control plane (with_cluster_state) ──────────────────────────
+
+    use crate::cluster::state::SecurityApiKeyRecord;
+
+    fn shared_state() -> Arc<RwLock<ClusterState>> {
+        Arc::new(RwLock::new(ClusterState::new("sec-test".into())))
+    }
+
+    fn enabled_config_with_bootstrap() -> SecurityConfig {
+        SecurityConfig {
+            enabled: true,
+            auto_create_security_index: false,
+            bootstrap_api_keys: vec![SecurityApiKeyConfig {
+                id: "boot".into(),
+                name: "bootstrap-admin".into(),
+                hash_sha256: sha256_hex("boot-secret"),
+                roles: vec!["admin".into()],
+                indices: vec![],
+            }],
+        }
+    }
+
+    fn dyn_key(
+        id: &str,
+        secret: &str,
+        roles: Vec<String>,
+        indices: Vec<String>,
+    ) -> SecurityApiKeyRecord {
+        SecurityApiKeyRecord {
+            id: id.into(),
+            name: format!("{id}-name"),
+            hash_sha256: sha256_hex(secret),
+            roles,
+            indices,
+            created_at_millis: 1,
+        }
+    }
+
+    #[test]
+    fn dynamic_key_authenticates_and_static_key_still_works() {
+        let state = shared_state();
+        state.write().unwrap().api_keys.insert(
+            "dyn-1".into(),
+            dyn_key("dyn-1", "dyn-secret", vec!["read".into()], vec![]),
+        );
+        let manager =
+            SecurityManager::with_cluster_state(enabled_config_with_bootstrap(), state).unwrap();
+
+        // Static bootstrap key still authenticates.
+        let boot = manager.authenticate_api_key("boot-secret").unwrap();
+        assert_eq!(boot.key_id, "boot");
+        // Dynamic key authenticates too.
+        let dynamic = manager.authenticate_api_key("dyn-secret").unwrap();
+        assert_eq!(dynamic.key_id, "dyn-1");
+        assert_eq!(dynamic.roles, vec!["read".to_string()]);
+        // Unknown secret is rejected.
+        assert!(manager.authenticate_api_key("nope").is_none());
+    }
+
+    #[test]
+    fn revoking_dynamic_key_removes_authentication() {
+        let state = shared_state();
+        state.write().unwrap().api_keys.insert(
+            "dyn-1".into(),
+            dyn_key("dyn-1", "dyn-secret", vec!["read".into()], vec![]),
+        );
+        let manager =
+            SecurityManager::with_cluster_state(enabled_config_with_bootstrap(), state.clone())
+                .unwrap();
+        assert!(manager.authenticate_api_key("dyn-secret").is_some());
+
+        // Simulate a DeleteApiKey applied via Raft.
+        state.write().unwrap().api_keys.remove("dyn-1");
+        assert!(manager.authenticate_api_key("dyn-secret").is_none());
+    }
+
+    #[test]
+    fn custom_role_grants_index_read_within_pattern() {
+        let state = shared_state();
+        state.write().unwrap().api_keys.insert(
+            "dyn-1".into(),
+            dyn_key("dyn-1", "dyn-secret", vec!["log-reader".into()], vec![]),
+        );
+        state.write().unwrap().roles.insert(
+            "log-reader".into(),
+            SecurityRoleDefinition {
+                name: "log-reader".into(),
+                cluster: vec!["monitor".into()],
+                indices: vec!["logs-*".into()],
+                index_privileges: vec!["read".into()],
+            },
+        );
+        let manager =
+            SecurityManager::with_cluster_state(enabled_config_with_bootstrap(), state).unwrap();
+        let principal = manager.authenticate_api_key("dyn-secret").unwrap();
+
+        // Reading an allowed index works.
+        assert!(manager.authorize(
+            &principal,
+            &ClassifiedRequest {
+                action: SecurityAction::IndexRead,
+                index: Some("logs-2024".into()),
+            }
+        ));
+        // Writing is not granted by a read role.
+        assert!(!manager.authorize(
+            &principal,
+            &ClassifiedRequest {
+                action: SecurityAction::IndexWrite,
+                index: Some("logs-2024".into()),
+            }
+        ));
+        // Reading an index outside the role's pattern is denied.
+        assert!(!manager.authorize(
+            &principal,
+            &ClassifiedRequest {
+                action: SecurityAction::IndexRead,
+                index: Some("metrics-2024".into()),
+            }
+        ));
+        // Cluster monitor privilege is granted.
+        assert!(manager.authorize(
+            &principal,
+            &ClassifiedRequest {
+                action: SecurityAction::ClusterMonitor,
+                index: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn custom_role_admin_privilege_implies_lower_index_actions() {
+        let state = shared_state();
+        state.write().unwrap().api_keys.insert(
+            "dyn-1".into(),
+            dyn_key("dyn-1", "dyn-secret", vec!["idx-admin".into()], vec![]),
+        );
+        state.write().unwrap().roles.insert(
+            "idx-admin".into(),
+            SecurityRoleDefinition {
+                name: "idx-admin".into(),
+                cluster: vec![],
+                indices: vec![], // empty = all indices
+                index_privileges: vec!["admin".into()],
+            },
+        );
+        let manager =
+            SecurityManager::with_cluster_state(enabled_config_with_bootstrap(), state).unwrap();
+        let principal = manager.authenticate_api_key("dyn-secret").unwrap();
+
+        for action in [
+            SecurityAction::IndexRead,
+            SecurityAction::IndexWrite,
+            SecurityAction::IndexAdmin,
+        ] {
+            assert!(manager.authorize(
+                &principal,
+                &ClassifiedRequest {
+                    action,
+                    index: Some("anything".into()),
+                }
+            ));
+        }
+        // No cluster privilege was granted.
+        assert!(!manager.authorize(
+            &principal,
+            &ClassifiedRequest {
+                action: SecurityAction::SecurityAdmin,
+                index: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_custom_role_denies() {
+        let state = shared_state();
+        state.write().unwrap().api_keys.insert(
+            "dyn-1".into(),
+            dyn_key("dyn-1", "dyn-secret", vec!["ghost-role".into()], vec![]),
+        );
+        let manager =
+            SecurityManager::with_cluster_state(enabled_config_with_bootstrap(), state).unwrap();
+        let principal = manager.authenticate_api_key("dyn-secret").unwrap();
+        assert!(!manager.authorize(
+            &principal,
+            &ClassifiedRequest {
+                action: SecurityAction::IndexRead,
+                index: Some("logs".into()),
+            }
+        ));
+    }
+
+    #[test]
+    fn hex_encode_roundtrips_known_bytes() {
+        assert_eq!(hex_encode(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+        assert_eq!(hex_encode(&[]), "");
     }
 }

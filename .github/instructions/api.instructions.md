@@ -76,6 +76,22 @@ pub fn error_response(
 - `SHOW TABLES` filters rows by the authenticated principal's index allow-list when security is enabled.
 - `DESCRIBE`, `SHOW CREATE TABLE`, and `SELECT ... FROM` on `/_sql` and `/_sql/stream` must authorize the extracted table name before reading metadata or executing.
 
+## Dynamic Security Control Plane — src/api/security.rs
+Runtime API-key + custom-role management. Writes use the coordinator pattern (`resolve_leader_or_master` → `forward_*` else `raft_write`); reads serve locally from `cluster_manager.get_state()`. Storage is Raft `ClusterState` (`api_keys`/`roles`), NOT the `.ferris_security` index. See `control-plane.instructions.md` (recipe) and `security.instructions.md` (model).
+
+| HTTP | Path | Handler | Purpose |
+|------|------|---------|---------|
+| POST | `/_security/api_key` | `create_api_key()` | CSPRNG secret → store hash; returns plaintext `api_key` **once** (201) |
+| GET | `/_security/api_key` | `list_api_keys()` | List metadata only — never the hash |
+| GET | `/_security/api_key/{id}` | `get_api_key()` | One key's metadata |
+| DELETE | `/_security/api_key/{id}` | `delete_api_key()` | Revoke dynamic key (404 if absent; bootstrap keys not deletable) |
+| PUT | `/_security/role/{name}` | `put_role()` | Upsert custom role |
+| GET | `/_security/role` / `/{name}` | `list_roles()` / `get_role()` | List/get roles |
+| DELETE | `/_security/role/{name}` | `delete_role()` | Remove custom role |
+
+- Endpoint authz is automatic: `classify_request` maps `/_security/*` → `SecurityAction::SecurityAdmin`, enforced by `auth_middleware`. Handlers still function when security is disabled.
+- Secrets: `getrandom` 32 bytes → `hex_encode` (64 chars); `id = uuid::Uuid::new_v4()`; stored hash = `sha256_hex(secret)`. Never log or persist plaintext.
+
 ## API Handlers
 
 ### Cluster & Catalog — src/api/cat.rs, src/api/cluster.rs (read-only coordinator endpoints)

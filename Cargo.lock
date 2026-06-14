@@ -2162,6 +2162,7 @@ dependencies = [
  "config",
  "datafusion",
  "futures",
+ "getrandom 0.2.17",
  "moka",
  "murmur3",
  "object_store",

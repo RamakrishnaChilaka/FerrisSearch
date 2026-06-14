@@ -37,6 +37,12 @@ DeleteIndex(DeleteIndexRequest) → DeleteIndexResponse
 TransferMaster(TransferMasterRequest) → TransferMasterResponse
 AddMappings(AddMappingsRequest) → AddMappingsResponse
 
+// Dynamic security control plane (forwarded to leader; mirror AddMappings)
+PutApiKey(PutApiKeyRequest) → PutApiKeyResponse         // record_json → {acknowledged,error}
+DeleteApiKey(DeleteApiKeyRequest) → DeleteApiKeyResponse // key_id → {acknowledged,error}
+PutRole(PutRoleRequest) → PutRoleResponse               // role_json → {acknowledged,error}
+DeleteRole(DeleteRoleRequest) → DeleteRoleResponse      // name → {acknowledged,error}
+
 // Shard stats (for _cat endpoints)
 GetShardStats(ShardStatsRequest) → ShardStatsResponse
 GetSegmentStats(SegmentStatsRequest) → SegmentStatsResponse
@@ -118,6 +124,10 @@ pub struct TransportClient {
 | `forward_delete_index()` | Forward index deletion to leader |
 | `forward_update_settings()` | Forward settings update to leader |
 | `forward_transfer_master()` | Forward leadership transfer |
+| `forward_put_api_key()` | Forward dynamic API-key upsert to leader (control plane) |
+| `forward_delete_api_key()` | Forward dynamic API-key deletion to leader (control plane) |
+| `forward_put_role()` | Forward custom-role upsert to leader (control plane) |
+| `forward_delete_role()` | Forward custom-role deletion to leader (control plane) |
 | `forward_index_to_shard()` | Route doc write to shard primary — returns `Err` on shard failure |
 | `forward_delete_to_shard()` | Route doc delete to shard primary — returns `Err` on shard failure |
 | `forward_get_to_shard()` | Route doc get to shard primary |

@@ -16,8 +16,16 @@ IndexSettings { engine: IndexEngine, refresh_interval_ms: Option<u64>, flush_thr
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary, replicas, unassigned_replicas }
 IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, dynamic, settings }
-ClusterState { cluster_name, version, master_node, nodes, indices, last_seen }
+SecurityApiKeyRecord { id, name, hash_sha256, roles, indices, created_at_millis }   // hash only, never plaintext
+SecurityRoleDefinition { name, cluster, indices, index_privileges }                 // custom role
+ClusterState { cluster_name, version, master_node, nodes, indices, last_seen, api_keys, roles }
 ```
+
+### Control-Plane Config Fields (snapshotted for free)
+- `api_keys: HashMap<String, SecurityApiKeyRecord>` (key_id → record) and `roles: HashMap<String, SecurityRoleDefinition>` (role_name → def) hold the dynamic security control plane. Both are `#[serde(default)]` so old snapshots restore, and both are initialized in `ClusterState::new()`.
+- These are mutated only via the `PutApiKey`/`DeleteApiKey`/`PutRole`/`DeleteRole` `ClusterCommand`s — never written directly. See `control-plane.instructions.md` for the recipe and `security.instructions.md` for the security model.
+- Any new small, globally-consistent cluster config belongs here as a `#[serde(default)]` field too. Do NOT store such config as Tantivy docs/shards/WAL.
+- `SecurityApiKeyRecord`/`SecurityRoleDefinition` live in `cluster::state` (not `security` or `consensus`) so `ClusterState` can embed them and `consensus::types` can import them without a circular dependency. They derive `Serialize, Deserialize, Clone, Debug, PartialEq, Eq`.
 
 ### Engine Selection
 - `IndexSettings.engine` is a create-time selector persisted in cluster state, surfaced by `GET /{index}/_settings`, `SHOW TABLES`, and `SHOW CREATE TABLE`
