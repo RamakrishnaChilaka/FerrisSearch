@@ -181,11 +181,14 @@ Configure via `config/ferrissearch.yml` or `FERRISSEARCH_*` environment variable
 | `transport_tls_cert_file` | (unset) | PEM certificate for the gRPC transport server when TLS is enabled |
 | `transport_tls_key_file` | (unset) | PEM private key for the gRPC transport server when TLS is enabled |
 | `transport_tls_ca_file` | (unset) | PEM CA certificate used by transport clients to verify peers |
+| `http_tls_enabled` | `false` | Enable client-facing HTTP API TLS/HTTPS (requires building with `--features http-tls`) |
+| `http_tls_cert_file` | (unset) | PEM certificate for the HTTP API server when TLS is enabled |
+| `http_tls_key_file` | (unset) | PEM private key for the HTTP API server when TLS is enabled |
 | `security.enabled` | `false` | Enable HTTP API authentication and authorization |
 | `security.auto_create_security_index` | `false` | Auto-create protected `.ferris_security` metadata through Raft when explicitly enabled; replicas adapt to `data_nodes - 1` |
 | `security.bootstrap_api_keys` | `[]` | Startup API-key records with `id`, `name`, `hash_sha256`, `roles`, and optional `indices` patterns |
 
-If `transport_tls_enabled: true` is set without compiling `--features transport-tls`, node startup fails instead of silently falling back to plaintext transport.
+If `transport_tls_enabled: true` is set without compiling `--features transport-tls`, node startup fails instead of silently falling back to plaintext transport. Likewise, if `http_tls_enabled: true` is set without compiling `--features http-tls`, node startup fails instead of silently serving plaintext HTTP.
 
 When `security.enabled: true`, clients send `Authorization: ApiKey <secret>` or `Authorization: Bearer <secret>`. Store only SHA-256 hashes in `security.bootstrap_api_keys`; the plaintext key is never persisted by FerrisSearch.
 
@@ -623,6 +626,7 @@ scripts/           Ingestion and benchmark scripts
 - [x] Prometheus metrics and shared column cache for repeated fast-field and grouped-partials queries
 - [x] Restart and rejoin safety guardrails for UUID-based shard data
 - [x] Inter-node gRPC TLS (`--features transport-tls`)
+- [x] Client-facing HTTP TLS / HTTPS (`--features http-tls`)
 
 ### Next
 
@@ -636,7 +640,6 @@ scripts/           Ingestion and benchmark scripts
 - [ ] `COUNT(DISTINCT field)`
 - [ ] `_msearch` API (batch searches)
 - [x] `search_after` cursor-based pagination
-- [ ] HTTP TLS
 - [ ] Snapshot and restore
 - [ ] Index aliases and templates
 - [ ] Parquet sidecar — write Parquet alongside Tantivy segments for 100M+ scale, cross-index joins, external tool integration
@@ -664,8 +667,8 @@ The coordinator deduplicates inner keys, ignores `NULL`s, and caps the materiali
 
 ## Current Trade-Offs
 
-- **No client-facing HTTP TLS yet** — inter-node gRPC TLS exists behind `--features transport-tls`, but the HTTP API is still plaintext
-- **No authentication yet** — there is no built-in access control layer
+- **TLS is opt-in at build time** — client-facing HTTP TLS (`--features http-tls`) and inter-node gRPC TLS (`--features transport-tls`) both exist but are disabled by default and must be compiled in; default builds serve plaintext
+- **Authentication is API-key only and off by default** — optional API-key HTTP auth with role/index authorization exists, but there is no SSO/OIDC/LDAP, no client-certificate auth, and no dynamic key-management API (keys are bootstrapped from config)
 - **No `_msearch` yet** — batched search requests are still missing
 - **Large unfiltered analytics are slower than search-aware analytics** — full-table `GROUP BY` is much slower than the filtered grouped-partials path
 - **Not yet proven at hundreds of millions of docs** — the project is heavily tested on millions of documents, but it is not claiming Elasticsearch-scale production mileage yet

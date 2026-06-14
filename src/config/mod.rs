@@ -104,6 +104,18 @@ pub struct AppConfig {
     /// Required when `transport_tls_enabled` is true.
     #[serde(default)]
     pub transport_tls_ca_file: Option<String>,
+    /// Enable TLS (HTTPS) for the client-facing HTTP API server.
+    /// Requires building with the `http-tls` feature. Default: false.
+    #[serde(default)]
+    pub http_tls_enabled: bool,
+    /// Path to PEM-encoded TLS certificate for the HTTP API server.
+    /// Required when `http_tls_enabled` is true.
+    #[serde(default)]
+    pub http_tls_cert_file: Option<String>,
+    /// Path to PEM-encoded TLS private key for the HTTP API server.
+    /// Required when `http_tls_enabled` is true.
+    #[serde(default)]
+    pub http_tls_key_file: Option<String>,
     /// Optional storage URI for the remote_store engine backend.
     /// When unset, `<data_dir>/_remote_store` is used (local filesystem).
     /// Supported schemes: bare path, `file://`, `s3://<bucket>[/prefix]`.
@@ -161,6 +173,9 @@ impl Default for AppConfig {
             transport_tls_cert_file: None,
             transport_tls_key_file: None,
             transport_tls_ca_file: None,
+            http_tls_enabled: false,
+            http_tls_cert_file: None,
+            http_tls_key_file: None,
             storage_uri: None,
             security: SecurityConfig::default(),
         }
@@ -453,6 +468,49 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert!(!config.transport_tls_enabled);
         assert!(config.transport_tls_cert_file.is_none());
+    }
+
+    #[test]
+    fn http_tls_disabled_by_default() {
+        let config = AppConfig::default();
+        assert!(!config.http_tls_enabled);
+        assert!(config.http_tls_cert_file.is_none());
+        assert!(config.http_tls_key_file.is_none());
+    }
+
+    #[test]
+    fn http_tls_deserializes_when_set() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "http_tls_enabled": true,
+            "http_tls_cert_file": "/path/to/http-cert.pem",
+            "http_tls_key_file": "/path/to/http-key.pem"
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.http_tls_enabled);
+        assert_eq!(
+            config.http_tls_cert_file.as_deref(),
+            Some("/path/to/http-cert.pem")
+        );
+        assert_eq!(
+            config.http_tls_key_file.as_deref(),
+            Some("/path/to/http-key.pem")
+        );
+    }
+
+    #[test]
+    fn http_tls_omitted_defaults_to_disabled() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"]
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.http_tls_enabled);
+        assert!(config.http_tls_cert_file.is_none());
+        assert!(config.http_tls_key_file.is_none());
     }
 
     #[test]

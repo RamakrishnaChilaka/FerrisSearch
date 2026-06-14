@@ -54,13 +54,13 @@ struct TransportTlsPaths<'a> {
     key: &'a str,
 }
 
-fn required_transport_tls_path<'a>(
+fn required_tls_path<'a>(
     field_name: &'static str,
     value: Option<&'a str>,
 ) -> anyhow::Result<&'a str> {
     value
         .filter(|path| !path.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{field_name} is required when transport_tls_enabled=true"))
+        .ok_or_else(|| anyhow::anyhow!("{field_name} is required when TLS is enabled"))
 }
 
 fn resolve_transport_tls_paths(
@@ -71,15 +71,15 @@ fn resolve_transport_tls_paths(
     }
 
     let paths = TransportTlsPaths {
-        ca: required_transport_tls_path(
+        ca: required_tls_path(
             "transport_tls_ca_file",
             config.transport_tls_ca_file.as_deref(),
         )?,
-        cert: required_transport_tls_path(
+        cert: required_tls_path(
             "transport_tls_cert_file",
             config.transport_tls_cert_file.as_deref(),
         )?,
-        key: required_transport_tls_path(
+        key: required_tls_path(
             "transport_tls_key_file",
             config.transport_tls_key_file.as_deref(),
         )?,
@@ -90,6 +90,62 @@ fn resolve_transport_tls_paths(
     }
 
     Ok(Some(paths))
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(feature = "http-tls"), allow(dead_code))]
+struct HttpTlsPaths<'a> {
+    cert: &'a str,
+    key: &'a str,
+}
+
+fn resolve_http_tls_paths(config: &AppConfig) -> anyhow::Result<Option<HttpTlsPaths<'_>>> {
+    if !config.http_tls_enabled {
+        return Ok(None);
+    }
+
+    let paths = HttpTlsPaths {
+        cert: required_tls_path("http_tls_cert_file", config.http_tls_cert_file.as_deref())?,
+        key: required_tls_path("http_tls_key_file", config.http_tls_key_file.as_deref())?,
+    };
+
+    if !cfg!(feature = "http-tls") {
+        anyhow::bail!("http_tls_enabled=true requires building with --features http-tls");
+    }
+
+    Ok(Some(paths))
+}
+
+/// Spawn the HTTPS API server. Loads the rustls config from PEM files and binds
+/// via axum-server. Only compiled when the `http-tls` feature is enabled.
+#[cfg(feature = "http-tls")]
+async fn spawn_https_server(
+    app: axum::Router,
+    addr: SocketAddr,
+    tls: HttpTlsPaths<'_>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let rustls_config = crate::transport::load_http_server_tls_config(tls.cert, tls.key).await?;
+    info!("HTTPS API listening on {addr}");
+    Ok(tokio::spawn(async move {
+        if let Err(e) = axum_server::bind_rustls(addr, rustls_config)
+            .serve(app.into_make_service())
+            .await
+        {
+            tracing::error!("HTTPS server failed: {e}");
+        }
+    }))
+}
+
+/// Stub used when the `http-tls` feature is not compiled in. This is never
+/// reached because `resolve_http_tls_paths` errors first, but it keeps the call
+/// site in `start()` type-checking without the feature.
+#[cfg(not(feature = "http-tls"))]
+async fn spawn_https_server(
+    _app: axum::Router,
+    _addr: SocketAddr,
+    _tls: HttpTlsPaths<'_>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    anyhow::bail!("http_tls_enabled=true requires building with --features http-tls")
 }
 
 fn ping_rejection_requires_rejoin(error: &anyhow::Error) -> bool {
@@ -235,6 +291,9 @@ impl Node {
         let transport_addr = SocketAddr::from(([0, 0, 0, 0], self.config.transport_port));
         info!("gRPC Transport listening on {}", transport_addr);
         let transport_tls = resolve_transport_tls_paths(&self.config)?;
+        // Validate HTTP TLS configuration up front so a misconfigured node fails
+        // before any long-lived server task is spawned (all-or-nothing startup).
+        let http_tls = resolve_http_tls_paths(&self.config)?;
         let mut transport_builder = tonic::transport::Server::builder();
 
         #[cfg(feature = "transport-tls")]
@@ -259,17 +318,22 @@ impl Node {
             }
         });
 
-        // 2. Start HTTP API Server (Port 9200)
+        // 2. Start HTTP API Server (Port 9200) — HTTPS when http-tls is configured
         let app = crate::api::create_router(app_state);
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
-        info!("HTTP API listening on {}", addr);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
 
-        let http_handle = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!("HTTP server failed: {}", e);
+        let http_handle = match http_tls {
+            Some(tls) => spawn_https_server(app, addr, tls).await?,
+            None => {
+                info!("HTTP API listening on {addr}");
+                let listener = tokio::net::TcpListener::bind(addr).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        tracing::error!("HTTP server failed: {e}");
+                    }
+                })
             }
-        });
+        };
 
         // 3. Cluster Discovery & Raft Lifecycle Loop
         let client = self.transport_client.clone();
