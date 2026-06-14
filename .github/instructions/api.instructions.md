@@ -2,6 +2,7 @@
 
 ## Router (src/api/mod.rs)
 Axum router with security, metrics, pretty-JSON middleware, and a Prometheus metrics endpoint.
+The router is served over plaintext HTTP by default, or over HTTPS when `http_tls_enabled` is set and the binary is built with `--features http-tls` (see transport.instructions.md → HTTP TLS). TLS is terminated at the server layer (`axum_server::bind_rustls`), so handlers and middleware are unchanged either way.
 
 ### Middleware
 ```rust

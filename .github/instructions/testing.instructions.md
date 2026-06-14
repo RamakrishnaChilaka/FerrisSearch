@@ -1,7 +1,7 @@
 # Testing Patterns
 
 ## Test Suite Summary
-- **1147 unit tests** (`cargo test --lib`)
+- **1153 unit tests** (`cargo test --lib`)
 - **68 CLI tests** (`cargo test --bin ferris-cli`)
 - **33 consensus integration tests** (`cargo test --test consensus_integration`)
 - **39 replication integration tests** (`cargo test --test replication_integration`)
@@ -9,7 +9,7 @@
 - **6 remote_store S3 integration tests** (`cargo test --test remote_store_s3_integration`) — skipped unless `FERRIS_RUSTFS_ENDPOINT` is set
 - **1 restart regression integration test** (`cargo test --test restart_regression`)
 - **1 SQL correctness harness** (`cargo test --test sql_correctness`) — sqllogictest `.slt` format, 180 assertions across 4 files
-- **1370 total** (`cargo test`)
+- **1376 total** (`cargo test`)
 
 The `remote_store` automated coverage is split between REST integration tests (publish/search/verify behavior with in-process harnesses, including query-string `GET /_search`, match-all `/_count` on shardless indices, publish-time split-summary persistence for pruning, term/range pruning regressions that assert non-candidate splits are not fetched into cache, response-level `remote_store.pruning` counters including unsupported-query no-prune behavior, and SQL EXPLAIN ANALYZE pruning metadata) and `remote_store_s3_integration` (real S3-compatible manifest/object operations via `StorageManager`). That still does not replace a full process-backed RustFS + `./dev_cluster_release.sh --nodes 3` live validation; keep a manual runbook for that flow and an isolated smoke script for the automatable pieces.
 
@@ -58,6 +58,7 @@ cargo test -- test_name                         # Single test by name
 - For streamed `ferris-cli` SQL changes, add pure chunk-boundary NDJSON parsing tests and at least one REST integration test covering the global `POST /_sql/stream` route the console uses.
 - For feature-gated transport TLS changes, run both `cargo test --lib` and `cargo test --lib --features transport-tls`; enabling TLS without the feature must error instead of silently downgrading to plaintext.
 - For transport TLS end-to-end coverage, also run `cargo test --test replication_integration --features transport-tls`.
+- For feature-gated HTTP TLS changes, run both `cargo test --lib` and `cargo test --lib --features http-tls`. `resolve_http_tls_paths()` must require `http_tls_cert_file` / `http_tls_key_file` in both builds and additionally require the `http-tls` feature when `http_tls_enabled` is set. Keep the path-check-before-feature-gate ordering so the ungated `resolve_http_tls_paths_requires_all_files_when_enabled` test stays meaningful, and assert the negative path fails startup with no half-started listener.
 - For SQL fast-field string changes, add regressions for both `sql_record_batch()` and `sql_streaming_batches()` that assert `_id` and keyword values survive the optimized ordinal path.
 - For streamed fast-field scan optimizations, add a value-level regression that integer and date columns survive `sql_streaming_batches()` batch-for-batch against `sql_record_batch()`, not just a schema-equality check.
 - For multi-segment streamed fast-field regressions, force multiple segments up front and assert the segment count before executing the streaming path so the test cannot pass accidentally on a single-segment index.

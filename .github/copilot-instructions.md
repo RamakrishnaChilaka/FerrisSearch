@@ -108,9 +108,10 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterResponse::Error(String)` — application error
 
 ## Test Suite
-- 1147 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 75 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1370 total
+- 1153 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 75 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1376 total
 - Run with: `cargo test`
 - Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
+- Feature-gated HTTP TLS build check: `cargo build --features http-tls` (validated by config + node path-resolution unit tests; enabling `http_tls_enabled` without the feature must fail startup, never downgrade to plaintext)
 - Real flush/restart regression: `cargo test --test restart_regression`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 - SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, history, NDJSON `/_sql/stream` consumption, and grouped-merge timing display when streamed SQL meta includes timings) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
@@ -252,6 +253,9 @@ pub struct AppConfig {
     pub transport_tls_cert_file: Option<String>, // PEM cert for gRPC server
     pub transport_tls_key_file: Option<String>,  // PEM key for gRPC server
     pub transport_tls_ca_file: Option<String>,   // PEM CA for client verification
+    pub http_tls_enabled: bool,                  // default: false (requires http-tls feature)
+    pub http_tls_cert_file: Option<String>,      // PEM cert for the client-facing HTTP/Axum server
+    pub http_tls_key_file: Option<String>,       // PEM key for the client-facing HTTP/Axum server
     pub storage_uri: Option<String>,             // override <data_dir>/_remote_store ; supports file:// and s3://bucket[/prefix]
     pub security: SecurityConfig,                // HTTP authn/authz; disabled by default
 }
@@ -260,6 +264,8 @@ pub struct AppConfig {
 - `translog_durability: "request"` = fsync per write (no data loss); `"async"` = background fsync timer
 - `transport_tls_enabled: true` requires building with `--features transport-tls`; startup must fail on missing CA/cert/key paths or missing feature instead of silently downgrading to plaintext
 - The transport TLS helpers must install the rustls ring crypto provider before building server/client TLS config; otherwise feature builds can panic at runtime.
+- `http_tls_enabled: true` serves the client-facing Axum HTTP API over HTTPS; it requires building with `--features http-tls` and both `http_tls_cert_file` / `http_tls_key_file`. Startup must fail on a missing feature or missing cert/key paths instead of silently downgrading to plaintext.
+- HTTP TLS reuses the same ring crypto provider installer as transport TLS (`ensure_rustls_crypto_provider()`), and `resolve_http_tls_paths()` is validated before any server task is spawned so a misconfiguration leaves no half-started HTTP or gRPC listener. The `http-tls` feature pulls `axum-server` with `tls-rustls-no-provider` (avoids aws-lc-rs/cmake) and enables `tokio-rustls/ring` explicitly.
 
 ## Coordinator Pattern (CRITICAL — read before writing any API handler)
 
