@@ -1,830 +1,188 @@
-# FerrisSearch — Copilot Context
+# FerrisSearch Repository Instructions
 
-## Project Overview
-Distributed search engine in Rust, inspired by OpenSearch/Elasticsearch.
-Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft consensus.
+## Mission And Maturity
 
-## Tech Stack
-- Rust 1.94.0, edition 2024
-- openraft 0.10.0-alpha.17 (features: serde, tokio-rt)
-- Tantivy 0.25.0 (search engine)
-- DataFusion 53 / sqlparser 0.61 (SQL layer)
-- Axum (HTTP API)
-- Tonic 0.13/gRPC (inter-node transport)
-- object_store 0.13.2 (object storage abstraction for the remote_store engine; supports local filesystem and S3/S3-compatible backends via the `aws` feature)
-- Protobuf (proto/transport.proto)
-- redb 3 (persistent Raft log storage — v3 file format, ~15% faster bulk writes, smaller files)
-- jemalloc (global allocator via tikv-jemallocator — reduces post-workload RSS retention vs glibc malloc)
-- rayon (dedicated thread pools for search/write workload isolation; not for Raft heartbeats or other async control-plane tasks)
+FerrisSearch is a pre-1.0 distributed search engine in Rust. It combines Tantivy
+full-text search, columnar SQL execution, vector search, Raft-managed metadata,
+and an experimental object-store-backed read path.
 
-## Architecture
-- **Raft consensus** manages cluster state (leader election, node membership, index metadata).
-- **ClusterState** is the Raft state machine's data — all mutations go through `raft.client_write(ClusterCommand)`.
-- **ClusterManager** wraps `Arc<RwLock<ClusterState>>` shared with the Raft state machine for reads.
-- **TransportService** (gRPC) handles inter-node RPCs including Raft vote/append/snapshot.
-- **ShardManager** manages local Tantivy index shards.
-- Data replication (document-level) still uses gossip/gRPC, separate from Raft.
-- Async control-plane work (Raft heartbeats, master pings, HTTP/gRPC futures) stays on Tokio; blocking shard/disk work on those paths must use Tokio's blocking pool rather than rayon.
+The product direction is an object-store-native search and analytics system
+with a defensible systems-research contribution. The current repository is a
+serious prototype, not yet a production-safe OpenSearch replacement. Preserve
+that distinction in code, documentation, benchmarks, and release claims.
 
-## Key Modules
-- `src/consensus/` — Raft: types.rs (TypeConfig, ClusterCommand, ClusterResponse), store.rs (MemLogStore), disk_store.rs, state_machine.rs, network.rs, mod.rs
-- `src/cluster/` — ClusterManager (manager.rs) + ClusterState (state.rs) + SettingsManager (settings.rs: reactive pub/sub via watch channels)
-- `src/node/mod.rs` — Node struct, startup, Raft bootstrap, lifecycle loop, AppState
-- `src/transport/` — gRPC server (server.rs: Raft RPCs + shard ops + replication) and client (client.rs: forwarding methods)
-- `src/api/` — Axum HTTP handlers: index.rs (index CRUD, doc ops), search.rs (query-string search), cat.rs (catalog), cluster.rs (health, state, transfer_master), mod.rs (router)
-- `src/engine/` — SearchEngine trait (mod.rs), CompositeEngine (composite.rs: Tantivy + USearch), HotEngine (tantivy.rs), VectorIndex (vector.rs: HNSW), routing.rs (Murmur3 shard routing), remote_store.rs (shardless read path; root nodes load manifests, prune splits by manifest field summaries for supported structured filters, expose pruning counters on search and SQL/EXPLAIN ANALYZE responses, schedule split batches to data-node leaves, and leaves reuse node-local cached HotEngine readers over downloaded split bundles)
-- `src/shard/` — ShardManager, ShardKey, IsrTracker, ReplicaCheckpoint
-- `src/search/` — SearchRequest, QueryClause, BoolQuery, aggregations, sort, k-NN
-- `src/security/` — core HTTP security: API-key authentication, action/resource authorization, `.ferris_security` metadata, system-index guards
-- `src/tasks.rs` — TaskManager for async background maintenance tracking (`_forcemerge`, `/_tasks/{task_id}`)
-- `src/wal/` — HotTranslog (generation-based binary WAL), TranslogDurability, WriteAheadLog trait
-- `src/worker.rs` — WorkerPools: dedicated rayon thread pools for search/write isolation
-- `src/replication/` — replicate_write, replicate_bulk (sync to ISR replicas)
-- `src/common/` — `Result<T>` type alias (anyhow), `validate_index_name()`, ISO 8601 date parse/format (`date.rs`)
-- `src/config/` — AppConfig (YAML + env var loading)
-- `src/storage/` — object_store-backed storage abstraction + remote manifest types
-- `proto/transport.proto` — gRPC service definition, all message types
+## Sources Of Truth
 
-## openraft 0.10.0-alpha.17 API Gotchas
-- `Vote::new(term: u64, node_id: u64)` — NOT `Vote::new(LeaderId, bool)`
-- `LeaderId` is at `openraft::impls::leader_id_adv::LeaderId` with public fields `term`, `node_id`
-- `IOFlushed::new()` is `pub(crate)` — use `IOFlushed::noop()` in tests
-- `MemLogStore::get_log_reader()` must return a shared-state handle (not a clone) because the SM worker holds the reader permanently
-- `raft.add_learner(node_id, BasicNode { addr }, blocking)` then `raft.change_membership(voter_set, false)` to add nodes
+Use this precedence when information conflicts:
 
-## Tantivy Field Schema Flags
-- `_id` field uses `(STRING | STORED).set_fast(None)` — enables fast-field columnar access for SQL queries without loading stored docs
-- Numeric fields (Integer, Float, Date) use INDEXED | STORED | FAST (mirrors OpenSearch default doc_values: true)
-- Date fields store epoch milliseconds as i64; ISO 8601 strings are parsed at ingest via `common::date::parse_iso8601_to_epoch_millis()`, `typed_term()` auto-parses string range values against logical Date fields, and mapped Date values surface back out as UTC ISO 8601 strings in `_source`, hits, and SQL rows
-- Keyword and Boolean fields use STRING | STORED + set_fast(None) for dictionary-encoded columnar
-- FAST enables columnar storage - critical for range queries, sorting, and aggregations
-- Without FAST, range queries scan the inverted index (orders of magnitude slower on high-cardinality fields)
+1. Current source code and tests describe implemented behavior.
+2. [`docs/architecture-roadmap.md`](../docs/architecture-roadmap.md) describes
+   intended 12-24 month direction, gates, and non-negotiable invariants.
+3. Path-specific files in [`.github/instructions/`](instructions/) describe
+   subsystem conventions and known traps.
+4. [`docs/next-50-tasks.md`](../docs/next-50-tasks.md) ranks current execution
+   priorities and dependencies; refresh its source evidence before starting.
+5. README and other documents are explanatory and may lag.
 
-## Fast-Field Aggregations (Single-Pass Collector)
-- Aggregations run in the same Tantivy pass as hit collection via custom `AggCollector` (implements `tantivy::collector::Collector`)
-- Hit-returning queries combine collectors as `(TopDocs, Option<AggCollector>, Count)`; agg-only `size=0` queries skip `TopDocs` entirely and run `(Option<AggCollector>, Count)`
-- `AggSegmentCollector::collect(doc, score)` reads fast-field columns and accumulates stats/terms/histogram per segment; string `terms` aggs count ords per segment and resolve ord→string once in `harvest()`
-- Grouped metric aggregate arguments may be nested arithmetic trees over numeric fast fields (`SUM(a + b)`, `AVG((a - b) / a)`). The planner preserves these in `GroupedMetricAgg.field_expr`, and the Tantivy grouped collector batch-reads every leaf column before evaluating the expression per doc.
-- `merge_fruits()` merges per-segment data, returns `HashMap<String, PartialAggResult>` per shard
-- Per-shard partial results are serialized into the gRPC `partial_aggs_json` bytes field with `bincode-next`, then merged at coordinator via `merge_aggregations()`
-- O(matching_docs) with minimal memory; agg-only queries avoid hit materialization and still run in a single query execution pass
-- The shared `ColumnCache` now stores both `tantivy_fast_fields` Arrow arrays and grouped-partials decoded full-segment numeric/string-ordinal columns under one memory budget. Match-all grouped direct scans may populate these entries; filtered grouped collectors may reuse warm entries but must not populate from partial scans.
-- **Shard-level top-K pruning**: When ORDER BY + LIMIT are present on grouped partials, each shard keeps only `(offset + limit) * 3 + 10` buckets (sorted by the ORDER BY metric) before shipping to the coordinator. Uses `select_nth_unstable_by` (O(N) average) on flat-array ordinals BEFORE resolving strings, avoiding ord→string resolution for 99%+ of groups. `ShardTopK { limit, sort_by, sort_function, descending }` on `GroupedMetricsAggParams` carries the hint. This is approximate — the 3× multiplier makes missed global top-K groups extremely unlikely. Disabled when HAVING is present (pruned groups could satisfy HAVING only after cross-shard merge), when ORDER BY has multiple columns (secondary keys not evaluated during pruning), or when ORDER BY references a group column instead of a metric.
-- **StringArena**: Batch ordinal→string resolution uses a contiguous `Vec<u8>` arena instead of N individual heap-allocated Strings. Each resolved string is `(offset, len)` into the arena; only the final `serde_json::Value::String` conversion allocates per-group.
-- **Residual expression tree**: SELECT items wrapping or combining aggregates (ROUND, CAST, +, -, *, /) are pushed to grouped_partials via `ResidualExpr`. Inner aggregates become hidden metrics; the scalar expression is evaluated after cross-shard merge. Supports `ROUND(AVG(x), 2)`, `AVG(x) + AVG(y)`, `SUM(a) / COUNT(*)`, `MAX(x) - MIN(x)`, and arbitrary nesting.
+Do not implement roadmap prose as though it already exists. Do not preserve a
+historical behavior solely because a document claims it is current. Verify
+important claims against source before changing code.
 
-## Tantivy Type Safety Gotchas
-- **NEVER** create `Term` objects directly with `Term::from_field_text/i64/f64` in query building — always use `self.typed_term(field, value)` which checks the schema field type
-- JSON integer `10` on a float field: `serde_json::Number::as_i64()` succeeds before `as_f64()`, creating an `i64` term on an `f64` field → silent 0-hit results. `typed_term()` prevents this.
-- `build_tantivy_doc_inner()` takes `&Schema` to check field types before adding numeric values — prevents indexing `i64` into `f64` fields
-- Tantivy does NOT error on type-mismatched terms — it silently returns 0 results. Always validate.
+## Load Context Progressively
 
-## Arrow Bridge Type Safety
-- `build_record_batch_with_hints(column_store, type_hints)` uses schema-derived type hints to set correct Arrow column types
-- Without type hints, `infer_column_kind()` scans data values and defaults to `Utf8` for empty/all-null columns — this breaks aggregation functions like `avg()`, `sum()` on zero-result queries
-- The fast-field path (`sql_record_batch`) MUST populate `type_hints` from `SqlFieldReader` variants (F64/I64 → Float64, DateMillis → TimestampMillis, Str → Utf8) or the Tantivy schema when no segments exist
-- The fast-field path skips `searcher.doc()` entirely when all requested columns have fast-field readers — reads `_id` from its fast-field column instead of loading stored docs
-- String fast-field SQL paths use a shared `StringFastFieldReader` (`StrColumn` + ordinal `Column<u64>`) so `_id`, selective arrays, and streaming batches read ordinals directly instead of per-doc `term_ords()` iterators
-- The local bitset-streaming `tantivy_fast_fields` path batch-reads doc IDs per Arrow batch via `Column::first_vals()` / `StringFastFieldReader::first_ords_batch()`; do not fall back to per-doc `first()` / `first_text()` loops for numeric, date, `_id`, or keyword columns in streaming execution
-- In the flat `sql_record_batch()` fast path, `_id` now uses the same per-segment array/take/reorder flow as other string fast fields instead of a separate top-doc-order decode/clone loop
-- When the SQL query does not reference `_id` or `_score`, those columns are filled with empty/zero values and fast-field reads for `_id` are skipped entirely (`needs_id`/`needs_score` flags on `QueryPlan`)
-- Zero-column SQL queries such as `SELECT 1 FROM ...` keep one row per hit directly in `sql_record_batch()`; do not overload `needs_score` just to preserve batch cardinality
-- Ungrouped aggregates (`SELECT count(*), avg(price) FROM ...` without GROUP BY) use the grouped partial path with zero group-by columns — no row materialization needed
-- The `materialized_hits_fallback` path uses plain `build_record_batch()` (no hints, data-driven inference only)
-- SELECT aliases must be excluded from `required_columns` — aliases (e.g. `total` from `count(*) AS total`) are not real schema fields and cause `SourceFallback` → Null → Utf8 misclassification
-- Grouped-partials planning rejects duplicate output aliases (for example `SELECT brand AS total, count(*) AS total ... GROUP BY brand`) as ambiguous instead of allowing HAVING, ORDER BY, and output materialization to disagree
+Start here, then open only the guidance relevant to the files being changed.
+For architecture or multi-subsystem work, read the roadmap first; use the
+next-50 backlog for priority and dependency context. For test requirements,
+read `testing.instructions.md`. A detailed registry and maintenance policy
+lives in [`docs/ai-agent-guide.md`](../docs/ai-agent-guide.md).
 
-## Cluster Commands (Raft log entries)
-- `ClusterCommand::AddNode { node: NodeInfo }` — register/update a node in cluster state
-- `ClusterCommand::RemoveNode { node_id: String }` — remove node from cluster + Raft membership
-- `ClusterCommand::CreateIndex { metadata: IndexMetadata }` — create index with shard routing
-- `ClusterCommand::DeleteIndex { index_name: String }` — delete index and all metadata
-- `ClusterCommand::SetMaster { node_id: String }` — set cluster master (Raft leader)
-- `ClusterCommand::UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replica changes, settings)
-- `ClusterCommand::AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
-- `ClusterCommand::PutApiKey { record }` / `DeleteApiKey { key_id }` — upsert/remove a dynamic API key (hash only) in `ClusterState.api_keys` (dynamic security control plane)
-- `ClusterCommand::PutRole { role }` / `DeleteRole { name }` — upsert/remove a custom role in `ClusterState.roles`. All four mirror the `AddMappings` idiom end-to-end (see `.github/instructions/control-plane.instructions.md`)
+| Area | Read before changing |
+|---|---|
+| HTTP APIs | `api.instructions.md` |
+| Cluster metadata and settings | `cluster.instructions.md` |
+| Raft | `consensus.instructions.md` |
+| New Raft-replicated mutations | `control-plane.instructions.md` |
+| Tantivy, vector, SQL engine | `engine.instructions.md`, `tantivy-optimizations.instructions.md` |
+| Hybrid/search-aware SQL | `hybrid.instructions.md` |
+| Node startup and lifecycle | `node.instructions.md` |
+| Replication and recovery | `replication.instructions.md` |
+| Query DSL and aggregation | `search.instructions.md` |
+| Authentication and authorization | `security.instructions.md` |
+| Shard lifecycle | `shard.instructions.md` |
+| Object store and remote reads | `storage.instructions.md` |
+| gRPC and protobuf | `transport.instructions.md` |
+| WAL and sequence ownership | `wal.instructions.md` |
+| Config, workers, tasks, metrics, CI | `operations.instructions.md` |
+| CLI | `cli.instructions.md` |
+| Tests | `testing.instructions.md` |
+| Docs and benchmark claims | `documentation.instructions.md` |
 
-## ClusterResponse
-- `ClusterResponse::Ok` — command applied successfully
-- `ClusterResponse::Error(String)` — application error
+## Architecture At A Glance
 
-## Test Suite
-- 1178 unit tests + 68 CLI tests + 33 consensus integration + 39 replication integration + 87 REST API integration + 6 remote_store S3 integration (skipped unless `FERRIS_RUSTFS_ENDPOINT` is set) + 1 restart regression integration + 1 SQL correctness harness (sqllogictest, 180 assertions) = 1413 total
-- Run with: `cargo test`
-- Feature-gated transport TLS integration coverage: `cargo test --test replication_integration --features transport-tls`
-- Real flush/restart regression: `cargo test --test restart_regression`
-- Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
-- SQL console: `cargo run --bin ferris-cli` (interactive with `Tab` completion, `\watch`, history, NDJSON `/_sql/stream` consumption, and grouped-merge timing display when streamed SQL meta includes timings) or `cargo run --bin ferris-cli -- -c "SHOW TABLES"` (single command)
+- `local_shards`: mutable, shard-owned Tantivy + USearch engines with a
+  generation-based WAL and synchronous replica RPCs.
+- `remote_store`: shardless, immutable split bundles and generation manifests
+  in local or S3-compatible object storage. Roots prune and schedule splits;
+  data-node leaves hydrate and cache split readers. Standard document CRUD is
+  read-only for this engine; publication uses a dedicated endpoint.
+- Raft manages cluster membership, master identity, index metadata, mappings,
+  settings, and dynamic security metadata. Document data is not in the Raft log.
+- Every HTTP node is a coordinator. Leader-only metadata writes and shard-owned
+  operations are forwarded internally rather than exposed as topology errors.
+- Tantivy performs matching, fast-field access, and eligible shard-local
+  partial aggregation. DataFusion performs residual relational work.
 
-## Same-Index Semijoin SQL
-- Supported shape: top-level `expr IN (SELECT key FROM same_index ...)` in `WHERE`
-- MVP limits: same-index only, uncorrelated only, one projected inner key column, no joins/CTEs/`EXISTS`/multi-index subqueries
-- Planner stores a semijoin plan (`outer_key`, `inner_key`, `inner_plan`) and removes the subquery from residual SQL
-- Inner grouped queries may use hidden non-projected support metrics so `HAVING COUNT(*) > ...` or aggregate `ORDER BY` stay on `tantivy_grouped_partials` even when the inner query only projects the key column
-- Coordinator deduplicates inner keys, ignores `NULL`s, allows exactly 50,000 distinct keys, rejects the next distinct key, then lowers the outer predicate into the existing concrete filter path
-- `EXPLAIN` / `EXPLAIN ANALYZE` must show the semijoin key-build stage and include `semijoin_ms` timing when executed
+The roadmap converges mutable ingest and immutable object-store data into one
+lifecycle. Do not create a third independent data model without an approved
+architecture decision.
 
-## Node Lifecycle (Raft-driven)
-- First node: filters self from seed_hosts → bootstraps single-node Raft → `AddNode` + `SetMaster` via client_write
-- Joining node: sends JoinCluster gRPC (with raft_node_id) → leader serializes concurrent joins, validates identity, does `add_learner` for non-voters, applies `AddNode`, then recomputes the latest voter set for `change_membership` (rolling back `AddNode` if promotion fails)
-- Joining node does NOT call `update_state` — Raft log replication propagates state, but `JoinCluster` returns an authoritative snapshot for initial shard reopen/cleanup decisions
-- Nodes reopen locally assigned shards after startup using the authoritative bootstrap/join snapshot when available, keep recovered-node startup assignments fail-closed when their expected UUID dirs are missing, never clear that recovered-startup guard just because authoritative state arrived, allow later assignments to create their shard dirs in the lifecycle loop, and skip orphan cleanup until index UUIDs are known and the expected local shard UUID paths exist
-- Leader lifecycle loop: SetMaster if needed, dead node scan (15s timeout, 20s grace after becoming leader), shard failover (promote best ISR replica to primary for orphaned shards)
-- Security-enabled leaders auto-create the protected `.ferris_security` system index via Raft once data nodes are known and adapt its replica count to `data_nodes - 1` as topology changes.
-- Follower lifecycle loop: pings the master for liveness; if the ping target no longer recognizes this node in cluster state, immediately reruns `JoinCluster` so stale/removed followers can self-heal after transient partitions or leader-side removals
+## Global Correctness Invariants
 
-## Important Design Decisions
-- **Raft is mandatory**: `AppState.raft` is `Arc<RaftInstance>`, not `Option`. All cluster-state mutations go through Raft. There is no non-Raft fallback path.
-- **Coordinator pattern**: see dedicated section below — NEVER return "not the leader" or "send to master" errors
-- `ClusterManager::update_state()` is a full overwrite — only the Raft state machine should call it in production; test harnesses may use it for setup
-- `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft. Populated by `add_node()` and `ping_node()`
-- New leader gets a 20s grace period (`leader_since`) before scanning for dead nodes to avoid false positives
-- Dead node handling: leader removes node from Raft + cluster only after successful membership change, promotes best ISR replica for orphaned primary shards (highest checkpoint wins), increments `unassigned_replicas` for lost replica slots, and refuses removals that would empty the voter set
-- `promote_replica_to(shard_id, node_name)` for targeted promotion; `promote_replica()` as fallback (first available)
-- Shard failover uses existing `UpdateIndex` Raft command — no new command variant needed
-- `raft_node_id` field on NodeInfo is critical for Raft membership changes — must be non-zero for Raft-managed nodes
-- `raft_node_id` must remain unique across node IDs; JoinCluster must reject conflicting identity reuse
-- Transport `ClusterState` snapshots are authoritative startup inputs — proto/domain roundtrips must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` exactly, and must reject unknown field types or unknown non-empty engine strings instead of coercing them
+- **Raft is mandatory for production nodes.** `Node.raft` and `AppState.raft`
+  are `Arc<RaftInstance>`. Only transport test constructors keep Raft optional.
+- **Cluster-state mutations go through Raft.** Followers forward writes to the
+  leader. Never mutate follower state as a fallback.
+- **Every node coordinates.** Do not return "send to master" or "not the
+  leader" for a routable client operation.
+- **Shard data paths use index UUIDs**, never index names:
+  `<data_dir>/<index_uuid>/shard_<id>`.
+- **Primary writes own sequence numbers.** Replica apply and recovery preserve
+  primary-assigned values through explicit-sequence APIs.
+- **Synchronous replication failures are request failures.** Do not turn
+  partial replication into success-shaped responses.
+- **Remote publication is not multi-writer safe yet.** Do not claim otherwise
+  or add unfenced read-modify-write manifest updates.
+- **Wire and storage decoding fails loudly.** Never replace malformed protocol,
+  manifest, snapshot, partial-aggregation, or WAL data with defaults.
+- **Blocking disk and engine work stays off Tokio workers.** Use Tokio's
+  blocking pool for lifecycle I/O and dedicated worker pools for steady-state
+  search/write work. Keep Raft and control-plane futures on Tokio.
+- **Tantivy terms match schema types.** Use the existing typed-term and typed
+  document helpers; mismatches can silently return zero hits.
+- **SQL is search-aware, not row-first.** Prefer pushdown, fast fields, and
+  compact shard-local partials. Keep materialized-hit execution as a
+  compatibility fallback.
+- **Remote and local reads require explicit snapshot semantics.** Until the
+  roadmap protocol exists, avoid claims of cross-engine read-after-write or
+  point-in-time consistency.
+- **Security metadata never stores plaintext secrets.** Protected system
+  indices remain hidden from ordinary APIs and SQL/catalog surfaces.
+- **Errors remain diagnosable.** Preserve underlying causes at API, transport,
+  task, and bulk-item boundaries; do not add broad catches or silent skips.
 
-## Dynamic Settings
-- `PUT /{index}/_settings` and `GET /{index}/_settings` API endpoints
-- `IndexSettings` struct on `IndexMetadata` holds the immutable create-time `engine: IndexEngine` selector plus `refresh_interval_ms: Option<u64>` and `flush_threshold_bytes: Option<u64>`
-- `IndexEngine` values: `LocalShards` (current shard-owned engine) and `RemoteStore` (shardless/object-store engine — read-only today; writes rejected with 501)
-- `engine` is surfaced by `GET /{index}/_settings`, `SHOW TABLES`, and `SHOW CREATE TABLE`, but `PUT /{index}/_settings` must reject changes because engine selection is immutable after index creation
-- `create_index()` / forwarded `CreateIndex` accept both `local_shards` and `remote_store`. `remote_store` indices are shardless (zero shard routing) and reject writes (single/bulk `_doc`, `_update`, `_delete`) with `501 Not Implemented` + `illegal_argument_exception`. `IndexEngine::supports_writes()` gates write handlers; `api::reject_write_if_engine_read_only()` is the shared helper.
-- `SettingsManager` (src/cluster/settings.rs) uses `tokio::sync::watch` channels for reactive pub/sub
-- Consumers subscribe via `watch_refresh_interval()` / `watch_flush_threshold()` and react in `tokio::select!` loops
-- Non-leader nodes forward settings updates to master via gRPC `UpdateSettings` RPC
-- Settings changes go through Raft (`UpdateIndex` command), then `ShardManager::apply_settings()` pushes to `SettingsManager::update()`
-- `flush_threshold_bytes` defaults to 512 MB, `0` disables background auto-flush, and the refresh loop must skip auto-flush while `global_checkpoint == 0` because `flush_with_global_checkpoint(0)` falls back to full WAL truncation
-- Background auto-flush is best-effort: it uses nonblocking flush/save helpers and defers the tick when the shard is busy ingesting or the vector index is already being mutated
-- Refresh/auto-flush ticks must run through Tokio's blocking pool instead of inline on async runtime workers; the maintenance path performs blocking commit/truncate/vector-save work and can otherwise starve Raft heartbeats during multi-shard compaction bursts
-- To add a new reactive setting: add field to `IndexSettings`, add `watch::Sender<T>` to `SettingsManager`, detect changes in `update()`, subscribe in consumer
+## Engineering Workflow
 
-## Dynamic Field Mapping
-- `DynamicMapping` enum: `True` (auto-detect), `False` (body catch-all, default), `Strict` (reject unknown fields)
-- Controlled per-index via `IndexMetadata.dynamic` field, set at create time: `PUT /idx { "mappings": { "dynamic": "true" } }`
-- Type inference: `infer_field_type()` in `src/common/mod.rs` — bool→Boolean, i64→Integer, float→Float, ISO 8601 string→Date, other string→Text, null/array/object→skip
-- `detect_new_fields()` / `detect_new_fields_batch()` compare inferred types against existing `IndexMetadata.mappings`
-- `detect_unknown_fields()` / `detect_unknown_fields_batch()` enforce `DynamicMapping::Strict` for any unknown top-level field, including arrays/objects that inference skips
-- New mappings committed atomically via Raft `AddMappings` command (first-seen type wins, existing fields never overwritten)
-- Schema evolution: `evolve_meta_json_schema()` in `src/engine/tantivy.rs` appends new field entries to Tantivy's stored schema (meta.json) — preserves existing field IDs and order
-- Wired into both single-doc (`index_doc` gRPC handler) and bulk (`bulk_index` gRPC handler) paths; currently-open local shards reopen immediately after a successful mapping commit so the current request indexes against the typed schema
-- `auto_create_index()` uses `DynamicMapping::True` by default for implicit index creation
-- `GET /{index}/_settings` exposes the `dynamic` field
-- Proto roundtrip: `dynamic` stored as string in `IndexMetadata` proto message, `AddMappings` RPC for forwarding to leader
-- `DynamicMapping::Strict` rejects documents with any field not in the explicit mappings (returns gRPC `INVALID_ARGUMENT`)
+1. Inspect the current call path, related tests, and scoped instructions.
+2. State whether the change is current-behavior work or roadmap work. For
+   roadmap work, identify the gate and prerequisite it advances.
+3. Reuse existing helpers and patterns before adding variants or parallel
+   abstractions.
+4. Make the smallest coherent change that covers all relevant surfaces:
+   domain types, persistence, transport, coordinator, observability, and docs.
+5. Add result-level tests, including failure and boundary cases. Distributed
+   behavior requires a distributed or transport-level regression.
+6. Run focused validation, then the repository checks appropriate to the
+   change. Do not update volatile test-count claims.
+7. Reconcile documentation with actual behavior. Keep current capabilities,
+   limitations, benchmark evidence, and future direction visibly separate.
 
-## AppState (shared across all API handlers)
-```rust
-pub struct AppState {
-    pub cluster_manager: Arc<ClusterManager>,
-    pub shard_manager: Arc<ShardManager>,
-    pub transport_client: TransportClient,
-    pub local_node_id: String,
-    pub raft: Arc<RaftInstance>,
-    pub worker_pools: WorkerPools,
-    pub task_manager: Arc<TaskManager>,
-    pub storage_manager: Arc<StorageManager>,
-    pub security_manager: Arc<SecurityManager>,
-    pub sql_group_by_scan_limit: usize,
-    pub sql_approximate_top_k: bool,
-}
-```
-- `storage_manager` is an object_store-backed abstraction with a node-local workdir for split staging and cache. By default storage is rooted at `<data_dir>/_remote_store/` (local filesystem) and cache at `<data_dir>/_remote_store_cache/`. Set `storage_uri` in `AppConfig` to override the storage backend — supports bare path, `file://`, and `s3://<bucket>[/prefix]`. For `s3://`, AWS credentials and endpoint are read from standard env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`). The `remote_store` engine writes split bundles (`<uuid>/splits/<split_id>/bundle`) and manifest generations (`<uuid>/manifests/<gen>.json` + `manifest.current.json`) through this store; publish streams a packed deterministic bundle + sha256 up plus exact split summaries under `field_ranges`/`field_terms`, roots query leaf status over gRPC, prunes supported structured filters against those summaries before scheduling, leaves fetch bundles into node-local caches keyed by split id with a `.done` marker, open-reader cache entries pin those cached artifacts while warm, and post-search reaping drops stale or over-budget split directories without touching pinned readers.
-- `sql_approximate_top_k` currently defaults to `true`; eligible grouped-partials `GROUP BY ... ORDER BY metric LIMIT N` queries use shard-level approximate top-K pruning unless the user disables it in config
+For broad work, use the roadmap's AI-session operating contract: keep scope to
+one coherent work package, document assumptions, protect invariants, and leave
+the next session a verifiable handoff rather than speculative partial wiring.
 
-## Core Security
-- `AppConfig.security` is disabled by default. When enabled, HTTP middleware requires `Authorization: ApiKey <secret>` or `Authorization: Bearer <secret>` and matches the SHA-256 hash against `bootstrap_api_keys`.
-- `SecurityManager` classifies path-based HTTP requests into cluster, index, metrics, and security actions, then inserts the authenticated `Principal` into request extensions for body-routed handlers.
-- Global body-routed endpoints must do their own resource checks after parsing: `POST /_bulk` authorizes each action `_index`, and `POST /_sql` / `/_sql/stream` authorize extracted table names from `DESCRIBE`, `SHOW CREATE TABLE`, and `SELECT ... FROM`.
-- `.ferris_security` is a protected system index created internally by the leader via Raft only when `security.enabled && auto_create_security_index` are explicitly enabled. It uses one primary shard and adaptive replicas (`data_nodes - 1`) reconciled in the leader lifecycle loop. Ordinary index APIs, global bulk, SQL metadata commands, cat endpoints, and `SHOW TABLES` must not expose it.
-- **Dynamic security control plane** (`/_security/*`, `src/api/security.rs`): runtime API-key + custom-role management. SHA-256 hashes + role defs are stored in Raft-replicated `ClusterState.api_keys` / `ClusterState.roles` (NOT the `.ferris_security` Tantivy index) via the `PutApiKey`/`DeleteApiKey`/`PutRole`/`DeleteRole` commands. Plaintext secrets are CSPRNG-generated (`getrandom`), returned once, never persisted/logged. `SecurityManager::with_cluster_state(...)` reads keys/roles from the shared state under a short read-lock (static bootstrap keys checked first, then dynamic). See `.github/instructions/security.instructions.md` and `control-plane.instructions.md`.
+## Validation
 
-## Core Data Structures (src/cluster/state.rs)
+Canonical CI:
 
-### Enums
-- `NodeRole` — `Master`, `Data`, `Client`
-- `ShardState` — `Started` (active), `Unassigned` (needs a node)
-- `FieldType` — `Text`, `Keyword`, `Integer`, `Float`, `Boolean`, `Date`, `KnnVector`
-- `IndexEngine` — `LocalShards` (current shard-owned engine) and `RemoteStore` (shardless object-store engine; read-only today)
-- `DynamicMapping` — `True` (auto-detect), `False` (body catch-all, default), `Strict` (reject unknown)
-
-### Structs
-```
-NodeInfo { id: NodeId, name: String, host: String, transport_port: u16, http_port: u16, roles: Vec<NodeRole>, raft_node_id: u64 }
-FieldMapping { field_type: FieldType, dimension: Option<usize> }  // dimension for knn_vector only
-IndexSettings { engine: IndexEngine, refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64> }  // engine defaults to LocalShards; None settings use cluster defaults (5000ms, 512MB)
-ShardCopy { node_id: Option<NodeId>, state: ShardState }
-ShardRoutingEntry { primary: NodeId, replicas: Vec<NodeId>, unassigned_replicas: u32 }
-IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing: HashMap<u32, ShardRoutingEntry>, mappings: HashMap<String, FieldMapping>, dynamic: DynamicMapping, settings: IndexSettings }
-ClusterState { cluster_name, version: u64, master_node: Option<NodeId>, nodes: HashMap<NodeId, NodeInfo>, indices: HashMap<String, IndexMetadata>, last_seen: HashMap<NodeId, Instant> }
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build
+cargo test
 ```
 
-### Key Methods
-- `IndexMetadata::build_shard_routing(name, num_shards, num_replicas, data_nodes)` — round-robin distribution
-- `IndexMetadata::promote_replica(shard_id)` / `promote_replica_to(shard_id, new_primary)` — shard failover
-- `IndexMetadata::remove_node(node_id) -> Vec<u32>` — returns orphaned primary shard IDs
-- `IndexMetadata::update_number_of_replicas(new_replicas) -> Vec<(u32, String)>` — returns deleted replica slots
-- `IndexMetadata::allocate_unassigned_replicas(data_nodes) -> bool`
-- `ClusterState::add_node(node)`, `remove_node(node_id)`, `ping_node(node_id)`, `add_index(metadata)`
+`./scripts/ci-local.sh` mirrors CI. Start with the narrowest relevant command,
+then widen based on impact. Examples:
 
-## ClusterManager (src/cluster/manager.rs)
-```rust
-pub struct ClusterManager { state: Arc<RwLock<ClusterState>> }
-```
-- `new(cluster_name)` / `with_shared_state(state: Arc<RwLock<ClusterState>>)` — Raft SM shares state
-- `get_state() -> ClusterState` — cloned snapshot (read lock)
-- `add_node(node)`, `ping_node(node_id)`, `update_state(new_state)` — full overwrite, preserves `last_seen`
-
-## Config
-```rust
-pub struct AppConfig {
-    pub node_name: String,              // default: "node-1"
-    pub cluster_name: String,           // default: "ferrissearch"
-    pub http_port: u16,                 // default: 9200
-    pub transport_port: u16,            // default: 9300
-    pub data_dir: String,               // default: "./data"
-    pub seed_hosts: Vec<String>,        // default: ["127.0.0.1:9300"]
-    pub raft_node_id: u64,              // default: 1
-    pub translog_durability: String,    // "request" (default) or "async"
-    pub translog_sync_interval_ms: Option<u64>,  // default: None (5000 if async)
-    pub sql_group_by_scan_limit: usize,          // default: 1_000_000 (0 = unlimited)
-    pub transport_tls_enabled: bool,             // default: false (requires transport-tls feature)
-    pub transport_tls_cert_file: Option<String>, // PEM cert for gRPC server
-    pub transport_tls_key_file: Option<String>,  // PEM key for gRPC server
-    pub transport_tls_ca_file: Option<String>,   // PEM CA for client verification
-    pub storage_uri: Option<String>,             // override <data_dir>/_remote_store ; supports file:// and s3://bucket[/prefix]
-    pub security: SecurityConfig,                // HTTP authn/authz; disabled by default
-}
-```
-- Load order: defaults → `config/ferrissearch.yml` → `FERRISSEARCH_*` env vars
-- `translog_durability: "request"` = fsync per write (no data loss); `"async"` = background fsync timer
-- `transport_tls_enabled: true` requires building with `--features transport-tls`; startup must fail on missing CA/cert/key paths or missing feature instead of silently downgrading to plaintext
-- The transport TLS helpers must install the rustls ring crypto provider before building server/client TLS config; otherwise feature builds can panic at runtime.
-
-## Coordinator Pattern (CRITICAL — read before writing any API handler)
-
-**Every node is a coordinator.** Any HTTP request landing on any node MUST be transparently routed to the correct node. The client should never need to know which node is the leader or which node owns a shard.
-
-### Rules
-1. **NEVER** return errors like "not the leader", "send to master", "SERVICE_UNAVAILABLE/master_not_discovered" from any API handler.
-2. If the handler needs the Raft leader (index CRUD, settings updates, cluster ops), check `raft.is_leader()`:
-   - If leader → execute locally via `raft.client_write(cmd)`
-   - If NOT leader → look up master from `cluster_state.master_node`, forward via gRPC, return the response
-3. If the handler needs a specific shard primary (document index/get/delete), use `calculate_shard()` → look up primary node → forward via gRPC `forward_*_to_shard()`
-4. If the handler is read-only from cluster state (health, cat, get settings) → serve locally, no forwarding needed
-
-### Forwarding implementation pattern
-```rust
-// In the API handler:
-if let Some(ref raft) = state.raft {
-    if !raft.is_leader() {
-        let cs = state.cluster_manager.get_state();
-        let master_id = cs.master_node.as_ref().ok_or(/* SERVICE_UNAVAILABLE only if no master exists at all */)?;
-        let master_node = cs.nodes.get(master_id).ok_or(...)?;
-        match state.transport_client.forward_<operation>(&master_node, ...).await {
-            Ok(resp) => return (StatusCode::OK, Json(resp)),
-            Err(e) => return error_response(INTERNAL_SERVER_ERROR, "forward_exception", ...),
-        }
-    }
-    // Leader path: execute via Raft
-    raft.client_write(cmd).await?;
-}
+```bash
+cargo test --lib
+cargo test --test consensus_integration
+cargo test --test replication_integration
+cargo test --test rest_api_integration
+cargo test --test restart_regression
+cargo test --test sql_correctness
+cargo test --test replication_integration --features transport-tls
 ```
 
-### Existing forwarding gRPC RPCs (proto/transport.proto)
-| RPC | Purpose | Client method |
-|-----|---------|---------------|
-| `CreateIndex` | Forward index creation to leader | `forward_create_index()` |
-| `DeleteIndex` | Forward index deletion to leader | `forward_delete_index()` |
-| `UpdateSettings` | Forward settings update to leader | `forward_update_settings()` |
-| `TransferMaster` | Forward leadership transfer to leader | `forward_transfer_master()` |
-| `AddMappings` | Forward dynamic mapping commit to leader | `forward_add_mappings()` |
-| `IndexDoc` | Route doc write to shard primary | `forward_index_to_shard()` |
-| `DeleteDoc` | Route doc delete to shard primary | `forward_delete_to_shard()` |
-| `GetDoc` | Route doc get to shard primary | `forward_get_to_shard()` |
-| `BulkIndex` | Route bulk write to shard primary | `forward_bulk_to_shard()` |
-| `SearchShard` | Scatter search to remote shards | `forward_search_to_shard()` |
-| `SearchShardDsl` | Scatter DSL search to remote shards | `forward_search_dsl_to_shard()` |
-| `SqlRecordBatch` | Scatter SQL fast-field batch to remote shards (Arrow IPC) | `forward_sql_batch_to_shard()` |
-| `SqlRecordBatchStream` | Stream multiple SQL fast-field batches from a remote shard (Arrow IPC) | `forward_sql_batch_stream_to_shard()` |
-
-`SqlRecordBatchStream` now carries shard-level `total_hits`, `collected_rows`, and actual `streaming_used` metadata on every batch so streamed SQL endpoints can emit accurate NDJSON `meta` frames before draining the remaining live shard stream into DataFusion.
-
-### Adding a new Raft-write API endpoint (checklist)
-1. Add proto messages (`<Op>Request` / `<Op>Response`) to `proto/transport.proto`
-2. Add the RPC to the `InternalTransport` service definition
-3. Add server handler in `src/transport/server.rs` (must check `is_leader()`, execute via Raft)
-4. Add client forwarding method `forward_<op>()` in `src/transport/client.rs`
-5. In the API handler: if not leader → call `forward_<op>()`, else → `raft.client_write()`
-6. **NEVER** return a "not the leader" error — always forward
-
-## API Endpoints
-
-### Cluster & Catalog (read-only, serve locally)
-| HTTP | Path | Handler | Purpose |
-|------|------|---------|--------
-| GET | `/` | `handle_root()` | Node info |
-| GET | `/_cluster/health` | `get_health()` | Cluster health (green/yellow/red) |
-| GET | `/_cluster/state` | `get_state()` | Full cluster state JSON |
-| GET | `/_cat/nodes` | `cat_nodes()` | Tabular node listing (`?v` for headers) |
-| GET | `/_cat/shards` | `cat_shards()` | Shard allocation (prirep=p/r, state, docs, node) |
-| GET | `/_cat/indices` | `cat_indices()` | Index listing (health, shards, docs) |
-| GET | `/_cat/master` | `cat_master()` | Current master node |
-| GET | `/_cat/segments` | `cat_segments()` | Per-segment listing across the cluster (`?local` for local-only) |
-| GET | `/_tasks/{task_id}` | `get_task()` | Background maintenance task status on the owning coordinator |
-
-### Index Management (Raft writes → forward to leader)
-| HTTP | Path | Handler | Purpose |
-|------|------|---------|--------|
-| HEAD | `/{index}` | `index_exists()` | Check if index exists (204/404) |
-| PUT | `/{index}` | `create_index()` | Create index with settings/mappings |
-| DELETE | `/{index}` | `delete_index()` | Delete index and all shards |
-| GET | `/{index}/_settings` | `get_index_settings()` | Get index settings (read-only, local) |
-| PUT | `/{index}/_settings` | `update_index_settings()` | Update settings (forwarded to leader) |
-| POST | `/{index}/_remote_store/publish` | `publish_remote_store_documents()` | Build a split from supplied docs and publish a new manifest generation (remote_store engine only; runs locally on the receiving node; 100K-doc cap per publish) |
-| POST | `/{index}/_remote_store/verify` | `verify_remote_store_splits()` | Recompute sha256 over every published split bundle and compare against the manifest-recorded checksum (remote_store engine only; admin integrity check) |
-| POST | `/_cluster/transfer_master` | `transfer_master()` | Leadership transfer (forwarded) |
-
-### Document Operations (routed to shard primary)
-| HTTP | Path | Handler | Purpose |
-|------|------|---------|--------|
-| POST | `/{index}/_doc` | `index_document()` | Index doc (auto-generate ID) |
-| PUT | `/{index}/_doc/{id}` | `index_document_with_id()` | Index doc with explicit ID |
-| GET | `/{index}/_doc/{id}` | `get_document()` | Retrieve document by ID |
-| DELETE | `/{index}/_doc/{id}` | `delete_document()` | Delete document by ID |
-| POST | `/{index}/_update/{id}` | `update_document()` | Partial document update |
-| POST | `/_bulk` | `bulk_index_global()` | Bulk indexing (no index in path) |
-| POST | `/{index}/_bulk` | `bulk_index()` | Bulk indexing (index in path) |
-
-### Search
-| HTTP | Path | Handler | Purpose |
-|------|------|---------|--------|
-| GET | `/{index}/_search` | `search_documents()` | Query-string search (q=, size, from) |
-| POST | `/{index}/_search` | `search_documents_dsl()` | DSL search (SearchRequest body) |
-| GET/POST | `/{index}/_count` | `count_documents()` | Document count (match_all fast path or query) |
-| POST | `/{index}/_sql` | `search_sql()` | SQL over matched docs (search-aware planning) |
-| POST | `/{index}/_sql/stream` | `search_sql_stream()` | NDJSON SQL stream (`meta` frame then `rows` frames) |
-| POST | `/{index}/_sql/explain` | `explain_sql()` | Explain SQL plan without executing |
-| POST | `/_sql` | `global_sql()` | Global SQL: SHOW TABLES, DESCRIBE, SHOW CREATE TABLE, SELECT (auto-extracts index from FROM) |
-| POST | `/_sql/stream` | `global_sql_stream()` | Global NDJSON SQL stream endpoint |
-
-### Maintenance
-| HTTP | Path | Handler | Purpose |
-|------|------|---------|--------|
-| POST/GET | `/{index}/_refresh` | `refresh_index()` | Refresh all assigned shards cluster-wide |
-| POST/GET | `/{index}/_flush` | `flush_index()` | Flush assigned shards cluster-wide + truncate WAL |
-| POST | `/{index}/_forcemerge` | `force_merge_index()` | Enqueue a background cluster-wide force-merge (`?max_num_segments=N`, default 1) |
-| GET | `/_metrics` | `handle_metrics()` | Prometheus metrics (text exposition format) |
-
-- `fan_out_maintenance()` must dispatch the local node alongside remote nodes in the same per-node fan-out set; do not run local refresh/flush/forcemerge inline before the rest of the dispatch has started.
-- `/{index}/_forcemerge` is asynchronous: nodes enqueue the merge and return immediately, so the REST response is `202 Accepted` with node-start counts, dispatch-failure counts, and a task id instead of final shard success counts.
-- The force-merge task response includes `task.coordinator_node`; `GET /_tasks/{task_id}` must be sent back to that coordinator node because the cluster task record is coordinator-local even though the endpoint aggregates per-node child tasks over gRPC.
-- Per-node maintenance handlers reopen assigned shards with the same fail-closed authoritative UUID-dir checks as read paths. Missing UUID dirs are logged and skipped, not recreated.
-
-### Create Index Body Format
-```json
-{
-        "engine": "local_shards",
-        "settings": { "number_of_shards": 3, "number_of_replicas": 1, "refresh_interval_ms": 5000, "flush_threshold_bytes": 536870912 },
-  "mappings": {
-        "dynamic": "true",
-    "properties": {
-      "title": { "type": "text" },
-      "status": { "type": "keyword" },
-      "embedding": { "type": "knn_vector", "dimension": 768 }
-    }
-  }
-}
-```
-
-- `engine` may be passed either as a string (`"local_shards"` / `"remote_store"`) or as an object (`{"type":"remote_store"}`) in the create body parser. `remote_store` indices are shardless and served from manifests published to the configured object store; `POST /{index}/_search`, query-string `GET /{index}/_search?q=...`, and match-all `GET/POST /{index}/_count` route through the manifest-backed read path, supported `term`/`range` filters prune splits via manifest `field_terms` / `field_ranges` summaries before rendezvous scheduling, inserts via the standard `_doc` / `_bulk` write paths still return 501, and `POST /{index}/_remote_store/publish` builds and uploads split bundles (local or S3) for the queryable read path.
-
-## Search & Query DSL (src/search/mod.rs)
-
-### SearchRequest
-```rust
-pub struct SearchRequest {
-    pub query: QueryClause,                         // default: MatchAll
-    pub size: usize,                                // default: 10
-    pub from: usize,                                // default: 0
-    pub knn: Option<KnnQuery>,                      // optional k-NN
-    pub sort: Vec<SortClause>,                      // default: sort by _score desc
-    pub aggs: HashMap<String, AggregationRequest>,  // aggregations
-    pub search_after: Option<Vec<Value>>,           // optional cursor for deep pagination (size only, requires sort)
-}
-```
-
-### search_after Cursor Pagination
-- OpenSearch/ES-compatible `search_after`: pass the previous page's last hit's `sort` array to fetch the next page.
-- API validation (`POST /{index}/_search` DSL body):
-    - `search_after` requires a non-empty `sort` clause; length must match.
-    - `from` must be `0` (use `size` only — cursor replaces offset pagination).
-    - Sort cannot include `_score` (deterministic numeric/keyword fields only).
-- Engine wraps the user query in a `BooleanQuery` with a strict-inequality filter built from the cursor. For each prefix `i` of the sort, the filter combines equality `TermQuery` on sort keys `[0..i)` with a strict `RangeQuery` on sort key `i` (`Bound::Excluded(cursor[i]), Bound::Unbounded` for Asc, reversed for Desc); prefixes OR'd with `Occur::Should`.
-- Engine returns hits with a top-level `sort: [...]` array (one value per sort clause). Coordinator preserves `sort` through DSL re-enrichment (local + remote shard paths) so clients can feed it back as the next page's cursor.
-- Hits are sorted engine-side (`crate::search::sort_hits`) after Tantivy collection for deterministic intra-K ordering, then annotated with `sort` values before serialization. This makes cursor advancement well-defined even when Tantivy's fast-field collector only orders by the primary sort key.
-- Supported sort fields: numeric fast-fields (Integer/Float/Date). String sort (`_id`, keyword) compiles and filters correctly but does not guarantee global top-K ordering without a custom Tantivy collector (out of scope for current implementation).
-
-### QueryClause Variants
-- `MatchAll(Value)` — match all documents
-- `Match(HashMap<String, Value>)` — full-text match on a field
-- `Term(HashMap<String, Value>)` — exact term match
-- `Wildcard(HashMap<String, Value>)` — wildcard pattern (`*` any, `?` single)
-- `Prefix(HashMap<String, Value>)` — prefix match
-- `Fuzzy(HashMap<String, FuzzyParams>)` — fuzzy match (edit distance 0-2, default 1)
-- `Range(HashMap<String, RangeCondition>)` — range: `{ "gt", "gte", "lt", "lte" }`
-- `Bool(BoolQuery)` — `{ must: [], should: [], must_not: [], filter: [] }`
-
-### k-NN Search
-```rust
-KnnQuery { fields: HashMap<String, KnnParams> }
-KnnParams { vector: Vec<f32>, k: usize, filter: Option<QueryClause> }  // optional pre-filter
-```
-
-### Aggregations
-- `Terms { field, size }` — top-N buckets by value (default size 10)
-- `Stats { field }` — min, max, sum, count, avg
-- `Min/Max/Avg/Sum/ValueCount { field }` — single metric
-- `Histogram { field, interval }` — fixed-interval numeric buckets
-- Per-shard: Tantivy `AggCollector` produces partial results → coordinator: `merge_aggregations()`
-
-### Sort
-- `SortClause::Simple(String)` — `"_score"` or field name
-- `SortClause::Field(HashMap<String, SortOrder>)` — `{ "year": "desc" }`
-
-## Engine Layer
-
-### SearchEngine Trait (src/engine/mod.rs)
-```rust
-pub trait SearchEngine: Send + Sync {
-    fn add_document(&self, doc_id: &str, payload: Value) -> Result<String>;
-    fn add_document_with_seq(&self, doc_id: &str, payload: Value, seq_no: u64) -> Result<String>;
-    fn bulk_add_documents(&self, docs: Vec<(String, Value)>) -> Result<Vec<String>>;
-    fn bulk_add_documents_with_start_seq(&self, docs: Vec<(String, Value)>, start_seq_no: u64) -> Result<Vec<String>>;
-    fn delete_document(&self, doc_id: &str) -> Result<u64>;
-    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64>;
-    fn get_document(&self, doc_id: &str) -> Result<Option<Value>>;
-    fn refresh(&self) -> Result<()>;
-    fn flush(&self) -> Result<()>;
-    fn flush_with_global_checkpoint(&self) -> Result<()>;
-    fn search(&self, query_str: &str) -> Result<Vec<Value>>;
-    fn search_query(&self, req: &SearchRequest) -> Result<(Vec<Value>, usize, HashMap<String, PartialAggResult>)>;
-    fn sql_record_batch(&self, req: &SearchRequest, columns: &[String], needs_id: bool, needs_score: bool) -> Result<Option<SqlBatchResult>>;
-    fn search_knn(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<Value>>;
-    fn search_knn_filtered(&self, field: &str, vector: &[f32], k: usize, filter: Option<&QueryClause>) -> Result<Vec<Value>>;
-    fn doc_count(&self) -> u64;
-    fn local_checkpoint(&self) -> u64;
-    fn update_local_checkpoint(&self, seq_no: u64);
-    fn global_checkpoint(&self) -> u64;
-    fn update_global_checkpoint(&self, checkpoint: u64);
-}
-```
-
-### CompositeEngine (src/engine/composite.rs)
-- Combines HotEngine (Tantivy, full-text) + VectorIndex (USearch, HNSW)
-- `new_with_mappings(data_dir, refresh_interval, mappings, durability)` — creates both engines
-- `start_refresh_loop_reactive(engine, refresh_rx)` — reactive to settings changes via watch channel
-- Auto-detects vectors in payloads and indexes to USearch
-- `rebuild_vectors()` — recovers vector index from persisted Tantivy docs on startup
-
-### HotEngine (src/engine/tantivy.rs)
-- `field_registry: RwLock<FieldRegistry>` — maps field names to Tantivy Field handles
-- Dynamic field creation on first document encounter
-- `"body"` field as catch-all for textual content
-- `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
-- `replay_translog()` — crash recovery from WAL, replaying only entries at or above the persisted committed checkpoint
-
-### VectorIndex (src/engine/vector.rs)
-- USearch HNSW wrapper (connectivity=16, expansion_add=128, expansion_search=64)
-- `add_with_doc_id(doc_id, vector)`, `search(query, k) -> (keys, distances)`
-- Binary persistence: `save(path)` / `open(path, dimensions, metric)`
-- Doc ID ↔ numeric key mapping via `HashMap` + bincode serialization
-
-### Routing (src/engine/routing.rs)
-- `calculate_shard(doc_id, num_shards) -> u32` — Murmur3 hash modulo
-- `route_document(doc_id, metadata) -> Option<NodeId>` — returns primary node for doc
-
-## Shard Management (src/shard/mod.rs)
-
-### ShardManager
-```rust
-pub struct ShardManager {
-    data_dir: PathBuf,
-    shards: RwLock<HashMap<ShardKey, Arc<dyn SearchEngine>>>,
-    settings_managers: RwLock<HashMap<String, Arc<SettingsManager>>>,  // per-index
-    index_uuids: RwLock<HashMap<String, String>>,  // index_name → UUID for on-disk dirs
-    pub isr_tracker: IsrTracker,
-    durability: TranslogDurability,
-}
-```
-
-### UUID-Based Data Directories
-- On-disk path: `<data_dir>/<uuid>/shard_<id>` (NOT `<data_dir>/<index_name>/shard_<id>`)
-- `IndexMetadata.uuid` is a UUID v4 string, auto-generated on index creation
-- Passed to `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)`
-- `close_index_shards()` uses stored UUID mapping to find the directory to delete
-- `cleanup_orphaned_data(known_uuids)` deletes directories not matching any authoritative known index UUID; startup must skip cleanup until index UUIDs are available and the expected UUID directories for locally assigned shards are present
-- Missing UUIDs must fail closed on reopen paths — never synthesize a fresh UUID while reopening an existing cluster index
-- **NEVER** construct shard paths from index names — always use the UUID
-
-### Key Methods
-- `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)` — creates CompositeEngine, starts reactive refresh, rebuilds vectors; requires the authoritative index UUID and must reject empty UUIDs
-- `get_shard(index, shard_id)`, `get_index_shards(index)`, `all_shards()`
-- `close_index_shards(index)` — remove engines, clean ISR, delete directory
-- `apply_settings(index, new_settings)` — notify consumers via watch channels
-
-### ISR Tracking
-```rust
-IsrTracker { replicas: HashMap<ShardKey, HashMap<String, ReplicaCheckpoint>>, max_lag: u64 }
-ReplicaCheckpoint { checkpoint: u64, last_updated: Instant }
-```
-- `update_replica_checkpoint(index, shard_id, node_id, checkpoint)`
-- `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>` — replicas within max_lag
-
-## WAL — Write-Ahead Log (src/wal/mod.rs)
-
-### TranslogDurability
-- `Request` — fsync per write (default, no data loss on crash)
-- `Async { sync_interval_ms }` — background fsync timer (up to sync_interval_ms data loss)
-
-### TranslogEntry & WriteAheadLog Trait
-```rust
-TranslogEntry { seq_no: u64, op: WalOperation, payload: Value }
-
-trait WriteAheadLog: Send + Sync {
-    fn append(&self, op: WalOperation, payload: Value) -> Result<TranslogEntry>;
-    fn append_with_seq(&self, seq_no: u64, op: WalOperation, payload: Value) -> Result<TranslogEntry>;
-    fn append_bulk(&self, ops: &[(WalOperation, Value)]) -> Result<Vec<TranslogEntry>>;
-    fn write_bulk(&self, ops: &[(WalOperation, Value)]) -> Result<()>;
-    fn write_bulk_with_start_seq(&self, start_seq_no: u64, ops: &[(WalOperation, Value)]) -> Result<()>;
-    fn read_all(&self) -> Result<Vec<TranslogEntry>>;
-    fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;  // replica recovery
-    fn truncate(&self) -> Result<()>;       // clear after commit
-    fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;
-    fn last_seq_no(&self) -> u64;
-    fn next_seq_no(&self) -> u64;
-    fn size_bytes(&self) -> Result<u64>;
-    fn for_each_from(&self, min_seq_no: u64, callback: &mut dyn FnMut(TranslogEntry) -> Result<()>) -> Result<u64>;
-}
-```
-
-### HotTranslog (Generation-Based Binary Format)
-- Length-prefixed: `[u32 LE: payload_len][bincode(WireEntry { seq_no, op, payload_json })]`
-- Seq numbers are monotonically increasing, survive generation rolls (persisted in `.seqno` file)
-- On-disk files are `translog-<generation>.bin` plus `translog.manifest`; reopen requires the manifest, trusts it for retained generation metadata, scans only the active generation file, and ignores unrelated non-generation side files
-- Unknown operation tags in persisted entries must surface as reopen/replay errors instead of panicking the node
-- `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only fully obsolete generations whose max seq_no is at or below the checkpoint; mixed generations are retained for replica recovery instead of being rewritten in place
-- `truncate()` rolls to a new empty generation and deletes all older generations
-- `translog.committed` stores the exclusive committed seq_no so restart replay skips already committed entries; replay persists this checkpoint after each intermediate batch commit to stay idempotent across repeated crash recovery
-- Persist the manifest before deleting pruned generation files so crashes never strand retained generations without authoritative metadata
-- Handles partial writes at EOF gracefully (skips/truncates)
-
-### HotEngine Wrapper Locking
-- `HotEngine` wraps the WAL in a separate `Arc<Mutex<dyn WriteAheadLog>>`; poisoned wrapper locks must return `Result` errors on write, refresh, flush, and force-merge paths instead of panicking request handlers
-
-## Replication Protocol (src/replication/mod.rs)
-- `replicate_write(transport_client, cluster_state, index, shard_id, doc_id, payload, op, seq_no)` — sync single write to all replicas
-- `replicate_bulk(transport_client, cluster_state, index, shard_id, docs, start_seq_no)` — batch replication
-- Synchronous: primary waits for ALL ISR replicas before acknowledging client
-- Uses gRPC: `replicate_to_shard()` / `replicate_bulk_to_shard()`
-- Each replica returns `local_checkpoint` after applying
-- Replica recovery: `RecoverReplica` RPC fetches missed ops from primary's WAL via `read_from(checkpoint)`
-
-## Consensus Module (src/consensus/)
-
-### Raft Type Configuration (types.rs)
-```rust
-openraft::declare_raft_types!(
-    pub TypeConfig: D = ClusterCommand, R = ClusterResponse, Node = BasicNode
-);
-type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
-```
-
-### State Machine (state_machine.rs)
-```rust
-ClusterStateMachine { state: Arc<RwLock<ClusterState>>, last_applied: Option<LogId>, last_membership: StoredMembership }
-```
-- Apply: AddNode → `state.add_node()`, RemoveNode → `state.remove_node()`, CreateIndex → `state.add_index()`, DeleteIndex → remove from indices, SetMaster → set master_node, UpdateIndex → replace shard_routing
-- Snapshot format: JSON-serialized ClusterState, ID: `snap-{last_applied_index}`
-
-### Raft Config
-- heartbeat_interval: 1000ms, election_timeout_min: 3000ms, election_timeout_max: 6000ms
-
-### Module Functions
-- `create_raft_instance(node_id, cluster_name, data_dir)` — persistent disk store (production)
-- `create_raft_instance_mem(node_id, cluster_name)` — in-memory (tests only)
-- `bootstrap_single_node(raft, node_id, addr)` — initialize single-node Raft cluster
-
-## gRPC Transport (proto/transport.proto)
-
-### InternalTransport Service — All RPCs
-```
-// Cluster coordination
-JoinCluster(JoinRequest) → JoinResponse
-PublishState(PublishStateRequest) → Empty  // returns UNIMPLEMENTED; Raft manages cluster state
-Ping(PingRequest) → Empty
-
-// Shard document operations
-IndexDoc(ShardDocRequest) → ShardDocResponse
-BulkIndex(ShardBulkRequest) → ShardBulkResponse
-DeleteDoc(ShardDeleteRequest) → ShardDeleteResponse
-GetDoc(ShardGetRequest) → ShardGetResponse
-
-// Shard search
-SearchShard(ShardSearchRequest) → ShardSearchResponse
-SearchShardDsl(ShardSearchDslRequest) → ShardSearchResponse
-
-// Distributed SQL (Arrow IPC)
-SqlRecordBatch(SqlRecordBatchRequest) → SqlRecordBatchResponse
-SqlRecordBatchStream(SqlRecordBatchRequest) → stream SqlRecordBatchResponse
-
-// Replication
-ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse
-ReplicateBulk(ReplicateBulkRequest) → ReplicateBulkResponse
-RecoverReplica(RecoverReplicaRequest) → RecoverReplicaResponse
-
-// Settings + index management (forwarded to leader)
-UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
-CreateIndex(CreateIndexRequest) → CreateIndexResponse
-DeleteIndex(DeleteIndexRequest) → DeleteIndexResponse
-TransferMaster(TransferMasterRequest) → TransferMasterResponse
-
-// Shard stats (for _cat endpoints)
-GetShardStats(ShardStatsRequest) → ShardStatsResponse
-GetSegmentStats(SegmentStatsRequest) → SegmentStatsResponse
-
-// Index maintenance (fan-out from coordinator)
-RefreshIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
-FlushIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
-ForceMergeIndex(ForceMergeRequest) → ForceMergeResponse
-GetTaskStatus(GetTaskStatusRequest) → GetTaskStatusResponse
-
-// Raft consensus (opaque JSON)
-RaftVote(RaftRequest) → RaftReply
-RaftAppendEntries(RaftRequest) → RaftReply
-RaftSnapshot(RaftRequest) → RaftReply
-```
-
-## Validation & Common (src/common/mod.rs)
-- `type Result<T> = std::result::Result<T, anyhow::Error>`
-- `validate_index_name(name)` — not empty, max 255 chars, cannot start with `.` or `_`, lowercase alphanumeric + hyphens + underscores only
-
-## Document Indexing Flow
-1. API handler receives JSON → generate/extract `_id`
-2. `calculate_shard(doc_id, num_shards)` → determine target shard
-3. If shard primary is local → index directly via `engine.add_document()`
-4. If shard primary is remote → forward via gRPC `forward_index_to_shard()`
-5. Primary writes to WAL → indexes in Tantivy + USearch → replicates to all ISR replicas
-6. Return `{ "_id", "_version", "result": "created|updated" }`
-
-## Search Flow (Scatter-Gather)
-1. Coordinator receives `POST /{index}/_search` with SearchRequest body
-2. Look up all shards for the index from cluster state
-3. For local shards → `engine.search_query(req)` directly
-4. For remote shards → scatter via gRPC `forward_search_dsl_to_shard()`
-5. Gather results, merge hits by score, merge aggregations, apply from/size
-6. Return unified `{ "_shards": {...}, "hits": { "total": {...}, "hits": [...] }, "aggregations": {...} }`
-
-## Development Workflow
-When implementing any feature or fix:
-1. **Read first** — understand existing code before changing it
-2. **Implement** — make the code changes
-3. **Unit tests** — cover every code path/branch (empty inputs, edge cases, error paths)
-4. **Integration tests** — if the feature involves Raft, gRPC, or multi-component interaction
-5. **Live test** — spin up a node, exercise the feature via curl, verify output
-6. **Fix bugs found in live test** — add a test for each bug discovered
-7. **Coverage audit** — check every branch in new code has a test; add missing ones
-8. **Update README** — examples, roadmap checkmarks, test counts
-9. **Update copilot-instructions.md** — if architecture or conventions changed
-
-## Hybrid Search + SQL Guidance
-
-If you add a hybrid execution path that mixes full-text search with SQL-style projection, sorting, or aggregation, keep responsibilities separated.
-
-## Fast-Field Access For Hybrid Execution
-
-- Do NOT change Tantivy's fast-field on-disk format to implement search-aware planning, distributed partial execution, or grouped analytics over matched docs.
-- Read fast fields directly from Rust through Tantivy's segment readers:
-    - numeric: `segment_reader.fast_fields().f64(name)` / `.i64(name)`
-    - string/keyword: `segment_reader.fast_fields().str(name)` plus `term_ords(doc)` and `ord_to_str(ord, buf)`
-- For shard-local partial execution, prefer segment-local collectors and column readers over `_source` materialization.
-- For grouped analytics, compute shard-local partials from fast fields, ship compact partial states, and merge at the coordinator. Do not ship full matched rows unless the query needs expressions that cannot run from fast fields.
-- Runtime SQL reporting should keep `execution_mode` at the authoritative high-level path; if a local fast-field fallback uses bitset streaming internally, expose that separately via `streaming_used` instead of inventing a new execution mode.
-- Grouped-partial wire formats must preserve numeric group-key type fidelity across shards. Do not coerce integer group keys into `f64`, or coordinator merge can split logically identical buckets like `0` and `0.0` between local and remote shards.
-- Grouped key encodings must keep SQL `NULL` out-of-band. Never reuse a payload bit pattern such as `u64::MAX` as a null sentinel for signed numeric grouped keys, or real values like `-1` will alias null buckets.
-- Only introduce new storage or sidecar column formats if a required SQL feature cannot be served by Tantivy fast fields or stored fields. Planning and partial aggregation alone are not sufficient reasons.
-
-### Responsibility Split
-- Tantivy handles text matching, ranking, and returns `(doc_id, score)`
-- Arrow holds in-memory columnar batches for matched docs or merged partial states
-- Prefer reading Tantivy fast fields directly for structured SQL columns instead of materializing `_source` into temporary row objects when all needed fields are available columnarly
-- DataFusion handles residual relational work on already-filtered matched docs or merged partial states
-- DataFusion must not become the text-search engine
-
-### What Stays In Tantivy
-- Query planning pushdown for `text_match(...)` predicates (including multiple top-level `AND`ed matches), exact filters, and range filters
-- Ranking and hit collection
-- Fast-field reads for numeric and keyword columns
-- Search-native shard-local partial aggregation over matched docs
-- Searched `CASE` bucket GROUP BY on a single string-backed source field may stay on shard-local partials when every `WHEN` is a literal bounded range on that same field with a literal bucket label; if `ELSE` is present it must also be a literal label. Do not silently widen this to arbitrary expression GROUP BY or to non-string-backed fields that need fallback execution.
-- Compact per-shard partial state production for distributed grouped analytics
-
-### What Stays In DataFusion
-- SQL projection semantics
-- Alias handling and expression evaluation after pushdown
-- Residual predicates that cannot be pushed into Tantivy safely
-- Final `GROUP BY`, `ORDER BY`, and aggregate execution when the query cannot be fully answered from shard-local partial states
-- Final tabular shaping of Arrow batches into SQL result rows
-
-### What This Must NOT Become
-- Do not describe or implement the feature as "SQL over hits".
-- Do not make row-materialized post-processing the normal execution model.
-- Do not treat DataFusion as the default engine for matched documents once a query has already been narrowed by search-aware planning.
-- The target architecture is a true hybrid planner: Tantivy executes search-native work first, shard-local partials are produced where possible, and DataFusion finishes only the remaining relational semantics.
-
-### What To Move Next
-- Keep DataFusion as the residual/final relational executor after Tantivy pushdown, fast-field reads, and shard-local partial execution
-- Reduce fallback to materialized hits to only the cases that require unsupported expressions, wildcard projection, or unavailable columnar data
-- Extend aggregate pushdown beyond the current grouped partial path (`count`, `min`, `max`, `sum`, `avg` for more eligible shapes)
-- Treat `materialized_hits_fallback` as a compatibility path, not the target architecture
-
-### Critical Invariants
-- `doc_id` must equal the row index in any columnar representation used for hybrid execution
-- Direct lookup should remain `column[doc_id as usize]`; avoid extra maps and indirection unless there is a proven need
-- `_score` must be represented as a normal Arrow/DataFusion column so SQL can sort or aggregate over it
-- Simple structured predicates (`=`, `>`, `>=`, `<`, `<=`) should be pushed into Tantivy `Term`/`Range` queries before DataFusion sees the rows
-
-### Required Comments To Anchor Generation
-When creating new hybrid-search modules, add explicit comments like these near the core flow:
-
-```rust
-// CRITICAL DESIGN:
-// doc_id is the row index in all columnar arrays
-// Do not introduce mappings or indirection
-// Access pattern must be: column[doc_id]
-```
-
-```rust
-// IMPORTANT:
-// Treat '_score' as a normal column in Arrow
-// so that SQL can sort and filter using it.
-```
-
-```rust
-// Execution pipeline:
-// 1. Run Tantivy search -> Vec<(doc_id, score)>
-// 2. Fetch column values using doc_id
-// 3. Build Arrow arrays
-// 4. Run DataFusion for aggregation/sorting
-```
-
-```rust
-// IMPORTANT:
-// DataFusion is only used for aggregation and sorting
-// It should NOT handle text search
-```
-
-```rust
-// IMPORTANT:
-// Prefer shard-local partial states over shipping matched rows
-// to the coordinator for grouped analytics.
-```
-
-```rust
-// IMPORTANT:
-// The goal is not SQL over hits.
-// The goal is search-aware planning with residual SQL execution.
-```
-
-### Suggested Implementation Order
-1. Tantivy search executor returning `Vec<(u32, f32)>`
-2. Column store with direct `doc_id -> row index` semantics
-3. Arrow `RecordBatch` bridge that includes `_score`
-4. DataFusion execution for projection, sort, `avg`, and `count`
-5. Query planner that splits `text_match(...)` from SQL-style operations
-6. Shard-local partial aggregation on fast fields for `GROUP BY` / `COUNT` / `SUM` / `MIN` / `MAX` / `AVG`
-7. Coordinator merge of compact partial states before any fallback to row materialization
-
-### Copilot Review Standard
-Generated code is acceptable only if it preserves the invariants above and avoids unnecessary copying. Prefer slices, iterators, builders, and cache-friendly access patterns over collecting intermediate vectors unless materialization is required by the API boundary.
-
-## Vector Search Plan
-Uses USearch (C++ with Rust bindings) for HNSW-based approximate nearest neighbor search.
-
-Architecture per shard:
-- Tantivy index — full-text (inverted index, BM25)
-- USearch index — vector (HNSW graph, cosine/L2/IP)
-- WAL — crash recovery for both
-
-Implementation phases:
-1. **Foundation** — Add usearch dep, create VectorIndex wrapper, knn_vector field type in mappings, index/search vectors on single shard
-2. **Distribution** — Wire into shard manager, scatter-gather for knn across shards, gRPC forwarding for vector queries
-3. **Hybrid search** — Combine BM25 + vector similarity scores in one query, from/size, pre-filtering with bool/range
-
-API (OpenSearch k-NN compatible):
-- Index: `PUT /my-index/_doc/1` with `{"embedding": [0.1, 0.2, ...], "title": "..."}`
-- Search: `POST /my-index/_search` with `{"knn": {"embedding": {"vector": [0.1, ...], "k": 10}}}`
-- Hybrid: `{"query": {"match": ...}, "knn": {"embedding": {...}}}`
+Tests that depend on external S3-compatible storage may be environment-gated;
+do not report a skipped external-service suite as exercised.
+
+## Repository Map
+
+| Path | Responsibility |
+|---|---|
+| `src/api/` | Axum REST API, coordination, SQL endpoints |
+| `src/cluster/` | Cluster state, routing metadata, reactive settings |
+| `src/consensus/` | openraft types, state machine, persistent Raft store |
+| `src/engine/` | Tantivy, vector, hybrid SQL, remote split execution |
+| `src/node/` | Startup, bootstrap/join, lifecycle, server wiring |
+| `src/replication/` | Primary-to-replica fan-out |
+| `src/security/` | HTTP authn/authz and dynamic security reads |
+| `src/shard/` | Local engine ownership, UUID paths, ISR tracking |
+| `src/storage/` | Object-store abstraction, manifests, bundles, cache |
+| `src/transport/`, `proto/` | Internal gRPC protocol and clients |
+| `src/wal/` | Generation-based translog and recovery reads |
+| `tests/` | Integration, restart, SQL logic, and object-store coverage |
+| `docs/` | Architecture, operations, evidence, and roadmap |
+
+`src/indexing/` is currently a placeholder; do not describe it as a completed
+ingest subsystem.
+
+## Documentation And Product Claims
+
+Use "OpenSearch-style REST API subset" unless a tested compatibility matrix
+supports a narrower claim. Qualify benchmark numbers with hardware, dataset,
+query, build profile, and reproduction commands. Never turn roadmap targets
+into present-tense features. When behavior or architecture changes, update the
+roadmap/backlog only if priorities or gates changed, not to record routine
+implementation detail.

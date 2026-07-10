@@ -1,3 +1,8 @@
+---
+description: "Use for node construction, bootstrap and join, lifecycle reconciliation, server startup, and recovery scheduling."
+applyTo: "src/node/**"
+---
+
 # Node Module — src/node/mod.rs
 
 ## Node Struct
@@ -7,7 +12,11 @@ pub struct Node {
     pub cluster_manager: Arc<ClusterManager>,
     pub transport_client: TransportClient,
     pub shard_manager: Arc<ShardManager>,
-    pub raft: Option<Arc<RaftInstance>>,
+    pub raft: Arc<RaftInstance>,
+    pub task_manager: Arc<TaskManager>,
+    pub storage_manager: Arc<StorageManager>,
+    pub security_manager: Arc<SecurityManager>,
+    pub remote_store_reader_cache: Arc<RemoteSplitReaderCache>,
 }
 ```
 
@@ -86,12 +95,21 @@ pub struct AppState {
     pub cluster_manager: Arc<ClusterManager>,
     pub shard_manager: Arc<ShardManager>,
     pub transport_client: TransportClient,
-    pub local_node_id: String,
-    pub raft: Option<Arc<RaftInstance>>,
+    pub local_node_id: NodeId,
+    pub raft: Arc<RaftInstance>,
     pub worker_pools: WorkerPools,
+    pub task_manager: Arc<TaskManager>,
+    pub storage_manager: Arc<StorageManager>,
+    pub security_manager: Arc<SecurityManager>,
+    pub remote_store_reader_cache: Arc<RemoteSplitReaderCache>,
     pub sql_group_by_scan_limit: usize,
+    pub sql_approximate_top_k: bool,
 }
 ```
+
+`Node.raft` and `AppState.raft` are mandatory. The optional Raft field in
+`TransportService` exists for isolated transport tests and must not be copied
+back into production node or API state.
 
 ## Shared ClusterState wiring (control-plane consumers)
 The startup `state_handle: Arc<RwLock<ClusterState>>` is created once and **moved** into

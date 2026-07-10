@@ -1,3 +1,8 @@
+---
+description: "Use for search request types, Query DSL, sorting, cursor pagination, aggregations, and hybrid result semantics."
+applyTo: "src/search/**,src/api/search/**"
+---
+
 # Search Module — src/search/mod.rs
 
 ## SearchRequest

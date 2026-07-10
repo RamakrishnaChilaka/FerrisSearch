@@ -1,3 +1,8 @@
+---
+description: "Use for Tantivy fast-field SQL streaming, batching, segment readers, and bounded-memory query execution."
+applyTo: "src/engine/tantivy.rs,src/api/search/**,src/hybrid/**,src/transport/**"
+---
+
 # Tantivy SQL Streaming Architecture
 
 ## Goal

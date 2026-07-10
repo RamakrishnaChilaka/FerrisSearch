@@ -169,7 +169,7 @@ pub enum IndexEngine {
     /// Current engine: local shard ownership backed by Tantivy + USearch.
     #[default]
     LocalShards,
-    /// Future engine: shardless immutable artifacts stored in remote object storage.
+    /// Shardless immutable split artifacts stored in remote object storage.
     RemoteStore,
 }
 
@@ -201,8 +201,8 @@ impl IndexEngine {
         matches!(self, Self::LocalShards)
     }
 
-    /// Whether the engine currently accepts write/ingest operations.
-    /// The `remote_store` engine is read-only until a publish path lands.
+    /// Whether the engine accepts ordinary document CRUD operations.
+    /// `remote_store` ingestion uses its dedicated split publication path.
     pub fn supports_writes(&self) -> bool {
         matches!(self, Self::LocalShards)
     }
@@ -249,11 +249,11 @@ impl std::fmt::Display for IndexEngine {
     }
 }
 
-/// Engine-specific settings for the future `remote_store` execution path.
+/// Engine-specific metadata and cache settings for `remote_store`.
 ///
-/// These values are metadata-only in the current implementation. They are
-/// parsed, serialized, and preserved across transport snapshots, but they do
-/// not alter `local_shards` behavior.
+/// These values do not alter `local_shards`. The current remote read path uses
+/// the split-cache budget; other pointer/config fields remain preserved
+/// metadata until their corresponding protocol stages consume them.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RemoteStoreSettings {
     /// Base object-store URI for remote artifacts.
@@ -313,21 +313,13 @@ impl RemoteStoreSettings {
 
 /// Per-index settings that control engine behavior.
 ///
-/// Settings are divided into two categories:
+/// Common shard-maintenance settings and remote-store metadata share this
+/// structure, but each engine consumes only the settings relevant to its
+/// execution path.
 ///
-/// **Common settings** — apply regardless of engine type:
-/// - `refresh_interval_ms`: how often the index reader is reloaded
-///
-/// **Shard-based engine settings** — only apply when using the default
-/// shard-based engine (Tantivy + USearch). When moving to a shardless
-/// engine (e.g. Quickwit-style immutable splits), these fields will not
-/// apply and engine-specific settings (split policy, merge scheduler,
-/// retention, object store config) will be added here instead.
-///
-/// The `number_of_shards` and `number_of_replicas` fields live on
-/// `IndexMetadata` directly because they are structural — they determine
-/// shard routing and cluster topology. For a shardless engine, those
-/// fields and `shard_routing` would be absent.
+/// `number_of_shards` and `number_of_replicas` remain on `IndexMetadata`
+/// because they define `local_shards` topology. A `remote_store` index sets
+/// both to zero and keeps `shard_routing` empty.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct IndexSettings {
     /// Immutable engine selector chosen at index creation time.
@@ -343,8 +335,9 @@ pub struct IndexSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flush_threshold_bytes: Option<u64>,
     // ── Remote-store engine settings ───────────────────────────────
-    /// Optional `remote_store` configuration. Preserved in cluster state and
-    /// transport snapshots even though the execution path is not enabled yet.
+    /// Optional `remote_store` configuration preserved in cluster state and
+    /// transport snapshots. Only fields consumed by the current read path have
+    /// runtime effects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_store: Option<RemoteStoreSettings>,
 }
@@ -448,8 +441,7 @@ pub struct IndexMetadata {
     /// Controls auto-detection of unmapped fields. Default: `False` (legacy).
     #[serde(default)]
     pub dynamic: DynamicMapping,
-    /// Per-index dynamic settings. Controls refresh interval, and will hold
-    /// engine-specific configuration when shardless mode is added.
+    /// Per-index dynamic and engine-specific settings.
     #[serde(default)]
     pub settings: IndexSettings,
 }

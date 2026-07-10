@@ -1,5 +1,12 @@
 # Remote Store 1-Pager
 
+> [!WARNING]
+> This is a historical implementation plan from an earlier `remote_store` stage. Its
+> status checklist and proposed object layout are not current: root/leaf fan-out, packed
+> split bundles, cache hydration, reader reuse, and structured split pruning now exist.
+> Inspect source for current behavior and use
+> [the strategic architecture roadmap](architecture-roadmap.md) for future direction.
+
 ## Current Status (April 2026)
 
 - ✅ `IndexEngine::{LocalShards, RemoteStore}` wired end-to-end; both engines are creatable.
@@ -113,7 +120,7 @@ struct SplitTimeRange {
 
 FerrisSearch terms for the read path:
 
-1. `src/api/search.rs` branches on `index.settings.engine`. `local_shards` stays on the current shard planner; `remote_store` goes to a remote manifest planner before any shard routing.
+1. `src/api/search/mod.rs` branches on `index.settings.engine`. `local_shards` stays on the current shard planner; `remote_store` goes to a remote manifest planner before any shard routing.
 2. The ingress coordinator chooses a root-capable node. If the landing node is root-capable, it keeps the request; otherwise it forwards internally. This preserves the client-facing coordinator pattern while allowing dedicated execution roles.
 3. The root fetches `manifest.current.json`, then the immutable manifest generation from `src/storage/`, using ETag or generation-aware caching.
 4. The root prunes candidate splits by `time_range`, `tags`, and query/index scope. There is no `shard_routing` lookup on this path.
@@ -160,6 +167,6 @@ This makes the steady-state execution model: object store -> leaf-local hydrated
 - `src/storage/`: object-store trait, manifest fetcher, local artifact cache, stale-split reaper, and cache metadata needed by the scheduler.
 - `Cargo.toml`: add `object_store` when the real storage client lands, starting with the local filesystem backend in tests and dev.
 - `src/engine/`: `RemoteSplitReader` implementing the read side of `SearchEngine`.
-- `src/api/search.rs`: branch on engine before shard routing, choose a root-capable node, build a remote split plan, and merge leaf responses.
-- `proto/transport.proto`, `src/transport/client.rs`, and `src/transport/server.rs`: add batched root-to-leaf RPCs for remote split DSL and SQL execution.
+- `src/api/search/mod.rs`: branch on engine before shard routing, choose a root-capable node, build a remote split plan, and merge leaf responses.
+- `proto/transport.proto`, `src/transport/client.rs`, and `src/transport/server/mod.rs`: add batched root-to-leaf RPCs for remote split DSL and SQL execution.
 - `src/node/` and `src/cluster/`: advertise root and leaf capability, surface node health/load signals, and feed them into rendezvous-based split scheduling.

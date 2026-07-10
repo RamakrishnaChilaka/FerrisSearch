@@ -1,5 +1,11 @@
 # FerrisSearch Architecture
 
+> [!NOTE]
+> This diagram documents the original `local_shards`-centered structure and is not a
+> complete current or future architecture description. Inspect source for current
+> behavior and use [the strategic architecture roadmap](architecture-roadmap.md) for the
+> canonical product direction, engine convergence plan, invariants, and release gates.
+
 ```mermaid
 classDiagram
     class SearchEngine {

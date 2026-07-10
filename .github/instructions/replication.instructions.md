@@ -1,3 +1,8 @@
+---
+description: "Use for primary-to-replica fan-out, sequence ownership, checkpoints, ISR tracking, and replica recovery."
+applyTo: "src/replication/**"
+---
+
 # Replication Module — src/replication/mod.rs
 
 ## Replication Functions

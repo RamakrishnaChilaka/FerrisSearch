@@ -1252,9 +1252,10 @@ pub async fn get_index_settings(
 ///
 /// This endpoint is only valid for indices created with `engine: remote_store`.
 /// Any other engine is rejected with 400. The publish is executed locally on
-/// the node that receives the request because the object-store root today is
-/// backed by each node's local filesystem; cross-node publish requires a
-/// shared remote object store (S3/Azure/GCS) and is tracked in the roadmap.
+/// the node that receives the request. Multi-node readers therefore require
+/// every node to use the same shared object-store root; local filesystem roots
+/// are suitable only when all work stays on that node, while S3-compatible
+/// storage provides a shared backend.
 pub async fn publish_remote_store_documents(
     State(state): State<AppState>,
     Path(index_name): Path<crate::common::IndexName>,

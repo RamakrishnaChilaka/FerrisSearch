@@ -1,3 +1,8 @@
+---
+description: "Use for the generation-based translog, sequence allocation, durability, truncation, corruption handling, and replay."
+applyTo: "src/wal/**"
+---
+
 # WAL Module — src/wal/mod.rs
 
 ## TranslogDurability
