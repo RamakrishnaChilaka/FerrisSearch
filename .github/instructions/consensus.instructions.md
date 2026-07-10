@@ -1,3 +1,8 @@
+---
+description: "Use for openraft configuration, commands, the cluster state machine, snapshots, and persistent or in-memory Raft storage."
+applyTo: "src/consensus/**"
+---
+
 # Consensus Module — src/consensus/
 
 > Adding a new command? Follow `control-plane.instructions.md` — the canonical

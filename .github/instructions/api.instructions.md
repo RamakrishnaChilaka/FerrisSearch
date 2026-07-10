@@ -1,3 +1,8 @@
+---
+description: "Use for Axum routing, HTTP coordination, document APIs, search and SQL endpoints, maintenance, errors, security middleware, and metrics."
+applyTo: "src/api/**"
+---
+
 # API Module — src/api/
 
 ## Router (src/api/mod.rs)
@@ -34,7 +39,7 @@ async fn metrics_middleware(req: Request<Body>, next: Next) -> Response
 
 ### Metrics Placement Rules
 - **HTTP-level latency**: `INDEX_LATENCY_SECONDS` and `SEARCH_LATENCY_SECONDS` use RAII `start_timer()` at the top of API handlers. These measure full request wall-clock time including routing, forwarding, and replication — NOT engine-level latency.
-- **Engine-level counters**: `DOCS_INDEXED_TOTAL` and `BULK_DOCS_TOTAL` are incremented in the gRPC transport handler (`src/transport/server.rs`) after the engine write succeeds. This counts actual documents written, not API requests.
+- **Engine-level counters**: `DOCS_INDEXED_TOTAL` and `BULK_DOCS_TOTAL` are incremented in the gRPC transport handler (`src/transport/server/mod.rs`) after the engine write succeeds. This counts actual documents written, not API requests.
 - **SQL counters**: `SQL_QUERIES_TOTAL` (with `mode` label) must be incremented on ALL exit paths from `execute_sql_query()` — including `count_star_fast` and `tantivy_grouped_partials` early returns. The `_sql_timer` histogram uses RAII drop so it auto-observes on all paths.
 - **Bulk requests**: `BULK_REQUESTS_TOTAL` is incremented once per bulk API call in the HTTP handler. `BULK_DOCS_TOTAL` is incremented per-document in the gRPC handler.
 - **Search queries**: `SEARCH_QUERIES_TOTAL` is incremented after successful distributed search in both `search_documents()` and `search_documents_dsl()`.
@@ -126,7 +131,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 - The fan-out uses concurrent `tokio::spawn` for each remote node, with graceful degradation (failed RPCs are silently skipped, showing `0`).
 - Distributed `_cat/shards` doc counts are also per copy: primary and replica rows must read from the reporting node's `(node_id, index, shard_id)` entry, not a shard-global count shared across all copies.
 - `_cat/segments?local` must skip remote shard copies entirely and only inspect locally open engines. The default distributed path must preserve segment-level granularity rather than collapsing one row per shard.
-### Index Management — src/api/index.rs (Raft writes → forward to leader)
+### Index Management — src/api/index/mod.rs (Raft writes → forward to leader)
 | HTTP | Path | Handler |
 |------|------|---------|
 | HEAD | `/{index}` | `index_exists()` — 204 or 404 |
@@ -147,7 +152,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 - When an API handler needs to reopen local shards, use `ShardManager::open_shard_with_settings_blocking()` rather than calling the synchronous shard-open helper inline on an async task.
 - Read and maintenance paths must fail closed when the authoritative shard UUID path is missing. Do not create a fresh shard directory on `/_search`, `/_count`, SQL, or maintenance fan-out just because a local reopen is needed.
 
-### Document Operations — src/api/index.rs (routed to shard primary)
+### Document Operations — src/api/index/mod.rs (routed to shard primary)
 | HTTP | Path | Handler |
 |------|------|---------|
 | POST | `/{index}/_doc` | `index_document()` — auto-generate ID |
@@ -161,7 +166,7 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 Bulk routes intentionally disable Axum's default buffered request-body limit so benchmark-sized NDJSON payloads reach the handler. When changing router composition or middleware layering, preserve large-body support on `POST /_bulk` and `POST /{index}/_bulk` or benchmark loaders will fail with `413 Failed to buffer the request body` before any item-level handling occurs.
 `bulk_index_global()` must validate raw action `_index` values with `IndexName::new()`, reject `.ferris_security`, and enforce the authenticated principal's index permissions per item before metadata lookup or auto-create.
 
-### Search — src/api/search.rs
+### Search — src/api/search/mod.rs
 | HTTP | Path | Handler |
 |------|------|---------|
 | GET | `/{index}/_search` | `search_documents()` — query-string (q=, size, from) |
@@ -220,7 +225,7 @@ For `remote_store` indices, `GET /{index}/_search?q=...`, SQL materialized searc
 - `explain_sql(analyze=true)` must treat JSON serialization failures as API errors, not panic paths.
 - The `count_star_fast` metadata path should batch remote `GetShardStats` fan-out per node, not per shard, since one RPC already returns all shard stats for that node.
 
-### Maintenance — src/api/index.rs
+### Maintenance — src/api/index/maintenance.rs
 | HTTP | Path | Handler |
 |------|------|---------|
 | POST/GET | `/{index}/_refresh` | `refresh_index()` — fans out to all nodes |

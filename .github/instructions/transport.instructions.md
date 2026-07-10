@@ -1,3 +1,8 @@
+---
+description: "Use for internal gRPC services and clients, protobuf evolution, forwarding, streaming SQL, limits, and transport TLS."
+applyTo: "src/transport/**,proto/transport.proto"
+---
+
 # Transport Module — src/transport/
 
 ## gRPC Service Definition (proto/transport.proto)
@@ -59,7 +64,7 @@ RaftAppendEntries(RaftRequest) → RaftReply
 RaftSnapshot(RaftRequest) → RaftReply
 ```
 
-## TransportService (src/transport/server.rs)
+## TransportService (src/transport/server/mod.rs)
 ```rust
 pub struct TransportService {
     pub cluster_manager: Arc<ClusterManager>,
@@ -68,7 +73,10 @@ pub struct TransportService {
     pub storage_manager: Arc<StorageManager>,
     pub remote_store_reader_cache: Arc<RemoteSplitReaderCache>,
     pub raft: Option<Arc<RaftInstance>>,
-    pub local_node_id: String,  // filters locally-assigned shards
+    pub local_node_id: NodeId,  // filters locally-assigned shards
+    pub worker_pools: WorkerPools,
+    pub task_manager: Arc<TaskManager>,
+    join_lock: Arc<tokio::sync::Mutex<()>>,
 }
 ```
 Implements `InternalTransport` trait. All RPC handlers check Raft leadership or route to the correct shard.
@@ -78,7 +86,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - `get_segment_stats` only reports on **already-open** shards via `all_shards()` and returns every segment row from `segment_infos()` for each local shard copy
 - `refresh_index` / `flush_index` reopen assigned shards with the same read-side UUID-dir guard as `get_or_open_search_shard()`, then run the engine refresh/flush on the write pool; missing authoritative UUID dirs are logged and skipped rather than creating fresh shard data
 - The maintenance helper only operates on shards where `primary == local_node_id` or the node is in `replicas` — orphaned shards are skipped
-- The `local_node_id` field is required by the constructors: `create_transport_service(cm, sm, tc, local_node_id)` and `create_transport_service_with_raft(cm, sm, tc, raft, local_node_id)`
+- The constructors require a local node ID and task manager; production uses
+  `create_transport_service_with_raft_and_storage()`, while
+  `create_transport_service_for_test()` supplies isolated defaults.
 
 ### Key Handler Patterns
 - **join_cluster**: If leader → serialize concurrent joins, validate `node_id` / `raft_node_id`, register the transport address with `add_learner()` for non-voters, apply `AddNode`, then recompute the latest full voter set before `change_membership()`. If promotion fails, roll back the `AddNode`. If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
@@ -102,7 +112,7 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Shard writes MUST fail on replication failure**: The `index_doc`, `bulk_index`, and `delete_doc` handlers must return `success: false` when `replicate_write()` / `replicate_bulk()` returns `Err`. Logging the error and returning `success: true` violates the synchronous replication contract.
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc`, `replicate_bulk`, and recovery replay must call the explicit-seq engine methods. Do not route replicated writes through local seq allocation APIs.
 - **Write-side shard reopen MUST validate metadata**: `get_or_open_shard()` must return `NOT_FOUND` when the index or shard is absent from cluster state. It must NEVER create a shard with empty mappings/default settings on write or replication paths.
-- **Shard reopen on gRPC paths MUST be async-safe**: `get_or_open_shard()` / `get_or_open_search_shard()` are async helpers and must use `open_shard_with_settings_blocking()` so shard recovery/open does not block tonic's async tasks. Likewise, leader-side delete/publish-state cleanup must use `close_index_shards_blocking()`.
+- **Shard reopen on gRPC paths MUST be async-safe**: `get_or_open_shard()` / `get_or_open_search_shard()` are async helpers and must use `open_shard_with_settings_blocking()` so shard recovery/open does not block tonic's async tasks. Likewise, leader-side delete cleanup must use `close_index_shards_blocking_with_reason()`.
 - **Read-side shard reopen MUST fail closed on UUID mismatch**: `get_or_open_search_shard()` must reject empty UUIDs and missing expected UUID directories instead of creating a fresh shard on a read path.
 - **Transport serialization must fail loudly**: gRPC handlers and clients must not use `unwrap_or_default()` for protocol payloads (`source_json`, `payload_json`, `partial_aggs_json`, Raft snapshot fields). Serialization or decode failures must surface as RPC errors, not empty payloads or silently dropped hits.
 - **Raft snapshot RPCs must require all fields**: missing `vote`, `meta`, or `data` in `RaftSnapshot` is `INVALID_ARGUMENT`, not a defaulted empty snapshot.

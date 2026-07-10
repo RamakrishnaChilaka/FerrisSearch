@@ -1,3 +1,8 @@
+---
+description: "Use for shard ownership, UUID-backed data paths, open and close scheduling, settings application, and ISR state."
+applyTo: "src/shard/**"
+---
+
 # Shard Module — src/shard/mod.rs
 
 ## ShardManager

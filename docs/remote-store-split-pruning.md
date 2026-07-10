@@ -286,7 +286,8 @@ Richer future analysis blocks can add manifest generation and pruning reasons wi
 }
 ```
 
-The richer explain/analyze surface is described separately in [docs/explain-analyze-output.md](docs/explain-analyze-output.md).
+The richer explain/analyze surface is described separately in
+[`explain-analyze-output.md`](explain-analyze-output.md).
 
 ## Code Seams
 

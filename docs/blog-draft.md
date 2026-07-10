@@ -69,7 +69,7 @@ FerrisSearch is that exploration.
 
 ## What Is FerrisSearch?
 
-FerrisSearch is a distributed search engine written in Rust. It has OpenSearch-compatible REST APIs, Raft consensus for cluster state, and a hybrid SQL layer that runs analytics directly on search results.
+FerrisSearch is a distributed search engine written in Rust. It has an OpenSearch-style REST API subset, Raft consensus for cluster state, and a hybrid SQL layer that runs analytics directly on search results.
 
 It's ~30,000 lines of Rust. No JVM, no extra services, no separate analytics database. Single binary.
 

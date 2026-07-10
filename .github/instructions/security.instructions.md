@@ -1,3 +1,8 @@
+---
+description: "Use for HTTP authentication, authorization, protected system-index behavior, and dynamic security control-plane APIs."
+applyTo: "src/security/**,src/api/security.rs,src/api/mod.rs"
+---
+
 # Security Module — src/security/
 
 Use when changing HTTP authentication, authorization, protected system-index behavior, body-routed global endpoints, or security configuration.

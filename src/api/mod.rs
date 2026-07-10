@@ -1,5 +1,6 @@
 //! HTTP REST API Layer.
-//! Long-term goal: Implement OpenSearch-compatible REST APIs for searching, indexing, and cluster management.
+//! Provides an OpenSearch-style REST API subset for searching, indexing, and
+//! cluster management.
 
 pub mod cat;
 pub mod cluster;
@@ -74,7 +75,7 @@ pub struct AppState {
     pub sql_approximate_top_k: bool,
 }
 
-/// Build a consistent OpenSearch-compatible error response.
+/// Build a consistent OpenSearch-style error response.
 pub fn error_response(
     status: StatusCode,
     error_type: &str,

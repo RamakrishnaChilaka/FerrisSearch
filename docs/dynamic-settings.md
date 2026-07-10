@@ -1,6 +1,18 @@
 # Dynamic Settings
 
-FerrisSearch supports modifying index-level settings at runtime without rebuilding or recreating the index. Changes propagate through Raft consensus and are reactively applied to running shard engines via `tokio::sync::watch` channels.
+FerrisSearch supports modifying selected index-level settings without rebuilding
+or recreating the index. The authoritative metadata propagates through Raft.
+Request-path nodes apply changed engine settings locally through
+`tokio::sync::watch` channels.
+
+> [!WARNING]
+> Raft replication currently updates `ClusterState` on every node, but it does
+> not itself notify every follower's already-open shard engines. The HTTP
+> receiver and leader RPC handler update their local watchers; other followers
+> consume the new settings when a shard is subsequently opened, but an
+> already-open engine can retain its previous runtime value. Do not treat this
+> path as cluster-wide reactive application until that gap has a multi-node
+> regression.
 
 ## Architecture
 
@@ -12,36 +24,36 @@ PUT /{index}/_settings (any node)
       └── (if follower) ──► gRPC ForwardUpdateSettings ──► leader
                                 │
                                 ▼
-                      State machine apply
+                      Raft state machine apply
+                      (metadata on every node)
                                 │
                                 ▼
+                 Request-path node applies locally
                       ShardManager::apply_settings()
                                 │
                                 ▼
                       SettingsManager::update()
                                 │
-                      ┌─────────┴─────────┐
-                      ▼                   ▼
-              watch::Sender          (future channels)
-              refresh_interval       translog_durability, etc.
-                      │
-                      ▼
-              CompositeEngine
-              refresh loop wakes up
-              and adjusts interval
+                   ┌────────────┴────────────┐
+                   ▼                         ▼
+       refresh-interval watcher    flush-threshold watcher
 ```
 
-Each index has a `SettingsManager` that holds `watch::Sender<T>` channels. Consumers (the refresh loop, WAL, etc.) subscribe via `watch::Receiver<T>` and use `tokio::select!` to react when a value changes.
+Each locally opened index has a `SettingsManager` that holds
+`watch::Sender<T>` channels. Engine refresh and auto-flush loops subscribe via
+`watch::Receiver<T>`.
 
 ## Supported Settings
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `index.refresh_interval_ms` | `u64 \| null` | `5000` | How often new documents become searchable (ms). Set to `null` to reset to default. |
+| `index.flush_threshold_bytes` | `u64 \| null` | `536870912` | WAL size threshold for background flush. `0` disables auto-flush; `null` restores the default. |
 | `index.number_of_replicas` | `u32` | — | Number of replica copies per shard. Increasing adds unassigned replicas; decreasing removes assigned ones. |
 
 **Immutable settings** (rejected with `400 Bad Request`):
 - `index.number_of_shards` — cannot be changed after index creation.
+- `index.engine` — engine selection is fixed at index creation.
 
 ## API Reference
 
@@ -68,14 +80,18 @@ curl -s 'http://localhost:9200/movies/_settings' | python3 -m json.tool
             "index": {
                 "number_of_shards": 3,
                 "number_of_replicas": 1,
-                "refresh_interval_ms": null
+                "engine": "local_shards",
+                "refresh_interval_ms": null,
+                "flush_threshold_bytes": null,
+                "dynamic": "false"
             }
         }
     }
 }
 ```
 
-A `null` value for `refresh_interval_ms` means the cluster default (5000ms) is in effect.
+A `null` refresh interval or flush threshold means its engine default is in
+effect.
 
 ### Update Index Settings
 
@@ -168,7 +184,12 @@ curl -X PUT 'http://localhost:9200/movies/_settings' \
 
 ## Forwarding Behavior
 
-Settings updates can be sent to **any node** in the cluster. If the receiving node is not the Raft leader, it transparently forwards the request to the current master via the `UpdateSettings` gRPC RPC. The master applies the change through Raft, and log replication propagates it to all followers.
+Settings updates can be sent to **any node** in the cluster. If the receiving
+node is not the Raft leader, it transparently forwards the request to the
+leader through the `UpdateSettings` gRPC RPC. The leader commits the metadata
+through Raft, and log replication propagates it to all followers. As noted
+above, that metadata propagation is currently broader than the local
+watch-channel notification path.
 
 ## Adding a New Reactive Setting
 
@@ -176,4 +197,6 @@ Settings updates can be sent to **any node** in the cluster. If the receiving no
 2. Add a `watch::Sender<T>` field and `watch_*()` accessor to `SettingsManager` in `src/cluster/settings.rs`
 3. In `SettingsManager::update()`, detect changes and call `send()` on the new channel
 4. In the consumer (engine, WAL, etc.), subscribe via `watch_*()` and react in a `tokio::select!` loop
-5. Add parsing to `update_index_settings` in `src/api/index.rs` and the gRPC handler in `src/transport/server.rs`
+5. Add parsing to `update_index_settings` in `src/api/index/mod.rs` and the gRPC handler in `src/transport/server/mod.rs`
+6. Preserve the field through Raft/transport snapshots and prove every node
+   applies the committed value to already-open engines

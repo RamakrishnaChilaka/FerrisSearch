@@ -11,10 +11,10 @@
 //! PUT /{index}/_settings
 //!       │
 //!       ▼
-//!   Raft commit → state machine apply → ClusterState updated
+//!   Raft commit → state machine apply → ClusterState updated on every node
 //!       │
 //!       ▼
-//!   ShardManager::apply_settings(index, new_settings)
+//!   Request handler → local ShardManager::apply_settings(index, new_settings)
 //!       │
 //!       ▼
 //!   SettingsManager::update(new_values)
@@ -25,6 +25,10 @@
 //!       │         └── WAL switches mode
 //!       └── (future) more consumers...
 //! ```
+//!
+//! The current request handlers notify engines only on the HTTP receiver and
+//! leader RPC node. Raft replication alone does not notify already-open engines
+//! on every follower; callers must not assume cluster-wide reactive application.
 //!
 //! ## Adding a new reactive setting
 //!

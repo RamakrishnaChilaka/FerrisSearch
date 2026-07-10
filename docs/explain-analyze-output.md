@@ -256,7 +256,8 @@ The richer future analysis block should still answer:
 - how much of the candidate set was already warm
 - which leaves were scheduled and why
 
-This is intentionally aligned with [docs/remote-store-split-pruning.md](docs/remote-store-split-pruning.md).
+This is intentionally aligned with
+[`remote-store-split-pruning.md`](remote-store-split-pruning.md).
 
 ## Backward Compatibility
 
