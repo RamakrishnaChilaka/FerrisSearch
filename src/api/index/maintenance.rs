@@ -11,6 +11,22 @@ pub(super) struct ForceMergeDispatchResult {
     pub dispatch_failures: HashMap<String, String>,
 }
 
+fn parse_force_merge_max_num_segments(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<u32, (StatusCode, Json<Value>)> {
+    let Some(raw_value) = params.get("max_num_segments") else {
+        return Ok(1);
+    };
+    match raw_value.parse::<u32>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "[max_num_segments] must be an integer between 1 and 4294967295",
+        )),
+    }
+}
+
 pub async fn refresh_index(
     State(state): State<AppState>,
     Path(index_name): Path<crate::common::IndexName>,
@@ -81,16 +97,15 @@ pub async fn force_merge_index(
         );
     }
 
-    let max_num_segments: usize = params
-        .get("max_num_segments")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    let max_num_segments = match parse_force_merge_max_num_segments(&params) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     let dispatch = enqueue_force_merge_tasks(&state, &index_name, max_num_segments).await;
     let task_id = state.task_manager.create_cluster_force_merge(
         index_name.as_str(),
-        max_num_segments,
+        max_num_segments as usize,
         dispatch.node_tasks.clone(),
         dispatch.dispatch_failures.clone(),
     );
@@ -143,7 +158,7 @@ pub(super) fn maintenance_fanout_concurrency(targets: usize) -> usize {
 pub(super) async fn enqueue_force_merge_tasks(
     state: &AppState,
     index_name: &str,
-    max_num_segments: usize,
+    max_num_segments: u32,
 ) -> ForceMergeDispatchResult {
     let cs = state.cluster_manager.get_state();
     let mut total_nodes = 0u32;
@@ -157,10 +172,9 @@ pub(super) async fn enqueue_force_merge_tasks(
             state.cluster_manager.clone(),
             state.shard_manager.clone(),
             state.task_manager.clone(),
-            state.worker_pools.clone(),
             state.local_node_id.clone(),
             idx,
-            max_num_segments,
+            max_num_segments as usize,
         )
     };
 
@@ -178,7 +192,7 @@ pub(super) async fn enqueue_force_merge_tasks(
         let idx = index_name.to_string();
         remote_jobs.push(async move {
             let result = client
-                .forward_force_merge(&node, &idx, max_num_segments as u32)
+                .forward_force_merge(&node, &idx, max_num_segments)
                 .await;
             (node.id.clone(), idx, result)
         });
@@ -232,11 +246,10 @@ pub(super) async fn fan_out_maintenance(
     let spawn_local = |idx: String, dispatch_op: MaintenanceDispatchOp| {
         let cm = state.cluster_manager.clone();
         let sm = state.shard_manager.clone();
-        let wp = state.worker_pools.clone();
         let nid = state.local_node_id.clone();
         spawn_maintenance_job(async move {
             Ok::<(u32, u32), anyhow::Error>(
-                run_maintenance_on_assigned_shards_async(cm, sm, wp, nid, idx, dispatch_op).await,
+                run_maintenance_on_assigned_shards_async(cm, sm, nid, idx, dispatch_op).await,
             )
         })
     };
@@ -254,10 +267,17 @@ pub(super) async fn fan_out_maintenance(
         jobs.push(spawn_maintenance_job(async move {
             match op {
                 MaintenanceDispatchOp::Flush => client.forward_flush(&node, &idx).await,
-                MaintenanceDispatchOp::ForceMerge(max_segments) => client
-                    .forward_force_merge(&node, &idx, max_segments as u32)
-                    .await
-                    .map(|_| (0, 0)),
+                MaintenanceDispatchOp::ForceMerge(max_segments) => {
+                    let max_segments = u32::try_from(max_segments).map_err(|_| {
+                        anyhow::anyhow!(
+                            "max_num_segments {max_segments} exceeds the transport limit"
+                        )
+                    })?;
+                    client
+                        .forward_force_merge(&node, &idx, max_segments)
+                        .await
+                        .map(|_| (0, 0))
+                }
                 MaintenanceDispatchOp::Refresh => client.forward_refresh(&node, &idx).await,
             }
         }));

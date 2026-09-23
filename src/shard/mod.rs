@@ -219,6 +219,11 @@ impl ShardManager {
         self.column_cache.entry_count()
     }
 
+    /// Configured maximum capacity of the shared column cache.
+    pub fn column_cache_max_capacity(&self) -> u64 {
+        self.column_cache.max_capacity()
+    }
+
     /// Open or create the engine for a specific shard.
     /// Uses CompositeEngine which handles both text and vector indexing.
     /// Generates a random UUID for the on-disk directory (suitable for tests).
@@ -532,6 +537,20 @@ impl ShardManager {
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
             .cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_shard_for_test(
+        &self,
+        index: &str,
+        shard_id: u32,
+        engine: Arc<dyn SearchEngine>,
+    ) {
+        let key = ShardKey::new(index, shard_id);
+        self.shards
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, engine);
     }
 
     /// Return all local shard engines for a given index.

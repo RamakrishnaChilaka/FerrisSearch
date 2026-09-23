@@ -494,11 +494,15 @@ pub async fn bulk_index_global(
             .map(|doc| doc.index_name.to_string())
             .collect();
         for index_name in affected_indices {
-            for (_, engine) in state.shard_manager.get_index_shards(&index_name) {
-                let _ = state
-                    .worker_pools
-                    .spawn_write(move || engine.refresh())
-                    .await;
+            for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
+                if let Err(error) = refresh_engine_after_write(engine).await {
+                    tracing::error!(
+                        "Post-write refresh failed for {}/{}: {}",
+                        index_name,
+                        shard_id,
+                        error
+                    );
+                }
             }
         }
     }
@@ -598,11 +602,15 @@ pub async fn bulk_index(
 
     // ?refresh=true: commit + reload all affected shards so docs are immediately searchable
     if refresh_param.should_refresh() {
-        for (_, engine) in state.shard_manager.get_index_shards(&index_name) {
-            let _ = state
-                .worker_pools
-                .spawn_write(move || engine.refresh())
-                .await;
+        for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
+            if let Err(error) = refresh_engine_after_write(engine).await {
+                tracing::error!(
+                    "Post-write refresh failed for {}/{}: {}",
+                    index_name,
+                    shard_id,
+                    error
+                );
+            }
         }
     }
 

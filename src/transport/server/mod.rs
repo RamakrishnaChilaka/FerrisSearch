@@ -76,7 +76,6 @@ pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
     task_manager: Arc<crate::tasks::TaskManager>,
-    worker_pools: crate::worker::WorkerPools,
     local_node_id: String,
     index_name: String,
     max_num_segments: usize,
@@ -89,7 +88,6 @@ pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
         let result = std::panic::AssertUnwindSafe(run_maintenance_on_assigned_shards_async(
             cluster_manager,
             shard_manager,
-            worker_pools,
             local_node_id,
             index_name.clone(),
             MaintenanceDispatchOp::ForceMerge(max_num_segments),
@@ -180,7 +178,6 @@ async fn get_or_open_read_shard(
 pub(crate) async fn run_maintenance_on_assigned_shards_async(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
-    worker_pools: crate::worker::WorkerPools,
     local_node_id: String,
     index_name: String,
     op: MaintenanceDispatchOp,
@@ -227,17 +224,16 @@ pub(crate) async fn run_maintenance_on_assigned_shards_async(
             }
         };
 
-        let result = worker_pools
-            .spawn_write(move || match op {
-                MaintenanceDispatchOp::Refresh => engine.refresh(),
-                MaintenanceDispatchOp::Flush => engine.flush_with_global_checkpoint(),
-                MaintenanceDispatchOp::ForceMerge(max_segments) => engine.force_merge(max_segments),
-            })
-            .await;
+        let result = crate::worker::spawn_engine_maintenance(op.label(), move || match op {
+            MaintenanceDispatchOp::Refresh => engine.refresh(),
+            MaintenanceDispatchOp::Flush => engine.flush_with_global_checkpoint(),
+            MaintenanceDispatchOp::ForceMerge(max_segments) => engine.force_merge(max_segments),
+        })
+        .await;
 
         match result {
-            Ok(Ok(_)) => successful += 1,
-            Ok(Err(e)) | Err(e) => {
+            Ok(()) => successful += 1,
+            Err(e) => {
                 tracing::error!(
                     "Maintenance {} failed on {}/{}: {}",
                     op.label(),
@@ -2071,7 +2067,6 @@ impl InternalTransport for TransportService {
         let (successful, failed) = run_maintenance_on_assigned_shards_async(
             self.cluster_manager.clone(),
             self.shard_manager.clone(),
-            self.worker_pools.clone(),
             self.local_node_id.clone(),
             index_name,
             MaintenanceDispatchOp::Refresh,
@@ -2091,7 +2086,6 @@ impl InternalTransport for TransportService {
         let (successful, failed) = run_maintenance_on_assigned_shards_async(
             self.cluster_manager.clone(),
             self.shard_manager.clone(),
-            self.worker_pools.clone(),
             self.local_node_id.clone(),
             index_name,
             MaintenanceDispatchOp::Flush,
@@ -2108,12 +2102,16 @@ impl InternalTransport for TransportService {
         request: Request<ForceMergeRequest>,
     ) -> Result<Response<ForceMergeResponse>, Status> {
         let inner = request.into_inner();
-        let max_segments = (inner.max_num_segments as usize).max(1);
+        if inner.max_num_segments == 0 {
+            return Err(Status::invalid_argument(
+                "max_num_segments must be at least 1",
+            ));
+        }
+        let max_segments = inner.max_num_segments as usize;
         let task_id = enqueue_force_merge_task_on_assigned_shards(
             self.cluster_manager.clone(),
             self.shard_manager.clone(),
             self.task_manager.clone(),
-            self.worker_pools.clone(),
             self.local_node_id.clone(),
             inner.index_name,
             max_segments,

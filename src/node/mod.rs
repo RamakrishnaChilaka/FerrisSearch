@@ -32,7 +32,7 @@ use anyhow::Context;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct Node {
     pub config: AppConfig,
@@ -170,6 +170,30 @@ fn follower_join_retry_remaining(
 
 impl Node {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
+        let column_cache_percent = config.column_cache_size_percent;
+        let column_cache_budget = tokio::task::spawn_blocking(move || {
+            crate::engine::column_cache::resolve_column_cache_budget(column_cache_percent)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("column-cache memory detection task failed: {error}"))??;
+        for diagnostic in &column_cache_budget.diagnostics {
+            warn!(reason = %diagnostic, "Column-cache memory detection fallback");
+        }
+        info!(
+            configured_percent = column_cache_budget.configured_percent,
+            source = column_cache_budget.source_label(),
+            host_memory_bytes = ?column_cache_budget.host_memory_bytes,
+            cgroup_version = ?column_cache_budget.cgroup_version.map(|version| version.as_str()),
+            cgroup_limit_bytes = ?column_cache_budget.cgroup_limit_bytes,
+            effective_memory_bytes = ?column_cache_budget.effective_memory_bytes,
+            cache_budget_bytes = column_cache_budget.cache_bytes,
+            "Resolved shared column-cache budget"
+        );
+        crate::metrics::set_column_cache_budget_metrics(
+            column_cache_budget.effective_memory_bytes,
+            column_cache_budget.cache_bytes,
+        );
+
         // Create Raft consensus instance — the state machine owns the
         // authoritative ClusterState, so ClusterManager shares it.
         let (raft, state_handle) = crate::consensus::create_raft_instance(
@@ -206,7 +230,7 @@ impl Node {
             &config.data_dir,
             durability,
             Arc::new(crate::engine::column_cache::ColumnCache::new(
-                crate::engine::column_cache::compute_cache_bytes(config.column_cache_size_percent),
+                column_cache_budget.cache_bytes,
                 config.column_cache_populate_threshold,
             )),
         ));

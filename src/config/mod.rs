@@ -60,7 +60,9 @@ pub struct AppConfig {
     /// Defaults to 5000ms if unset.
     #[serde(default)]
     pub translog_sync_interval_ms: Option<u64>,
-    /// Percentage of system memory to use for the column cache (0-100).
+    /// Percentage of effective memory to use for the column cache (0-100,
+    /// capped at 90). On Linux, effective memory is host MemTotal capped by
+    /// visible finite cgroup v2 memory.max or v1 memory.limit_in_bytes values.
     /// Caches both Arrow arrays for SQL fast-field reads and grouped-partials
     /// decoded full-segment columns.
     /// Default: 10. Set to 0 to disable.

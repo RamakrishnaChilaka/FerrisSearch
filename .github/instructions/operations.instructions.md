@@ -18,6 +18,9 @@ defaults for new fields so older config files continue to load.
 - `storage_uri` selects local, `file://`, or S3-compatible object storage.
 - `0` values can be meaningful: disabled column cache, unlimited SQL group scan,
   or disabled auto-flush. Do not collapse zero into missing.
+- `column_cache_size_percent` is capped at 90 and applies to effective memory:
+  host physical memory capped by visible finite cgroup hard limits. It does not
+  bound total process memory.
 - Never log credentials, API keys, private-key contents, or auth headers.
 
 When adding config, cover default, YAML, environment, invalid, and
@@ -30,9 +33,14 @@ operator-facing fields.
   heartbeats, timers, and coordination.
 - Tokio's blocking pool owns bounded lifecycle/file operations that must be
   awaited: shard open/close, orphan cleanup, blocking Raft database work,
-  process/procfs metric collection, and translog fsync.
+  process/procfs metric collection, startup cgroup-memory discovery, and
+  translog fsync. Blocking refresh, flush, and force-merge waits also belong
+  here because shard-local maintenance exclusion can outlive a steady-state
+  write operation.
 - `WorkerPools` owns dedicated rayon pools for steady-state search and write
-  engine work. Do not run Raft or network futures on rayon.
+  engine work. Document writes and replica applies stay on the write pool;
+  maintenance waits must not consume it. Do not run Raft or network futures on
+  rayon.
 - Avoid nested rayon use. Grouped segment scans deliberately use scoped OS
   threads where nested pool use could deadlock.
 - Background maintenance is not automatically low priority just because it was
@@ -70,6 +78,9 @@ Do not run the local operation inline before remote dispatch begins.
 - Gauges for deleted resources must be reset or removed so stale series do not
   survive.
 - Metrics gathering that reads files or procfs runs off the async worker.
+- Startup sets `ferrissearch_column_cache_effective_memory_bytes` and
+  `ferrissearch_column_cache_budget_bytes`; zero effective memory denotes an
+  explicitly disabled cache, not a total-process memory ceiling.
 - Preserve SQL execution-mode and remote pruning visibility when refactoring
   response metadata.
 

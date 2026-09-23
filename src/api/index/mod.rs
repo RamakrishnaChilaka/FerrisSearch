@@ -282,6 +282,12 @@ impl RefreshParam {
     }
 }
 
+async fn refresh_engine_after_write(
+    engine: Arc<dyn crate::engine::SearchEngine>,
+) -> crate::common::Result<()> {
+    crate::worker::spawn_engine_maintenance("post-write refresh", move || engine.refresh()).await
+}
+
 /// HEAD /{index} — Check if an index exists.
 pub async fn index_exists(
     State(state): State<AppState>,
@@ -528,11 +534,14 @@ pub async fn index_document(
         Ok(res) => {
             if refresh_param.should_refresh()
                 && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
+                && let Err(error) = refresh_engine_after_write(engine).await
             {
-                let _ = state
-                    .worker_pools
-                    .spawn_write(move || engine.refresh())
-                    .await;
+                tracing::error!(
+                    "Post-write refresh failed for {}/{}: {}",
+                    index_name,
+                    shard_id,
+                    error
+                );
             }
             (StatusCode::CREATED, Json(res))
         }
@@ -605,11 +614,14 @@ pub async fn index_document_with_id(
         Ok(res) => {
             if refresh_param.should_refresh()
                 && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
+                && let Err(error) = refresh_engine_after_write(engine).await
             {
-                let _ = state
-                    .worker_pools
-                    .spawn_write(move || engine.refresh())
-                    .await;
+                tracing::error!(
+                    "Post-write refresh failed for {}/{}: {}",
+                    index_name,
+                    shard_id,
+                    error
+                );
             }
             (StatusCode::CREATED, Json(res))
         }

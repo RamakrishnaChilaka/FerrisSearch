@@ -93,7 +93,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 ### Shard Stats & Maintenance
 - `get_shard_stats` only reports on **already-open** shards via `all_shards()` — it does NOT reopen shards from disk
 - `get_segment_stats` only reports on **already-open** shards via `all_shards()` and returns every segment row from `segment_infos()` for each local shard copy
-- `refresh_index` / `flush_index` reopen assigned shards with the same read-side UUID-dir guard as `get_or_open_search_shard()`, then run the engine refresh/flush on the write pool; missing authoritative UUID dirs are logged and skipped rather than creating fresh shard data
+- `refresh_index` / `flush_index` reopen assigned shards with the same read-side UUID-dir guard as `get_or_open_search_shard()`, then run the engine refresh/flush on Tokio's blocking pool; missing authoritative UUID dirs are logged and skipped rather than creating fresh shard data
+- `force_merge_index` rejects `max_num_segments = 0` with
+  `INVALID_ARGUMENT`; valid requests still return immediately after enqueueing
+  node-local background work.
 - The maintenance helper only operates on shards where `primary == local_node_id` or the node is in `replicas` — orphaned shards are skipped
 - The constructors require a local node ID and task manager; production uses
   `create_transport_service_with_raft_and_storage()`, while
@@ -211,9 +214,10 @@ these values from a later checkpoint.
 ### Worker Pool Integration
 All blocking engine calls in `TransportService` handlers are dispatched to dedicated rayon thread pools via `self.worker_pools.spawn_search()` / `self.worker_pools.spawn_write()`:
 - **Search pool** (`search-N` threads): `get_doc`, `search_shard`, `search_shard_dsl`, `sql_record_batch`, `sql_record_batch_stream`, `recover_replica` (WAL I/O)
-- **Write pool** (`write-N` threads): `index_doc`, `bulk_index`, `delete_doc`, `replicate_doc`, `replicate_bulk`, `refresh_index`, `flush_index`
+- **Write pool** (`write-N` threads): `index_doc`, `bulk_index`, `delete_doc`, `replicate_doc`, `replicate_bulk`
 - The `TransportService` struct holds `worker_pools: WorkerPools` initialized in `create_transport_service*()` constructors.
-- Shard open/close/reopen are separate from engine work: use Tokio blocking-pool wrappers for those filesystem/Tantivy recovery steps before dispatching the steady-state engine call onto rayon. This includes maintenance RPCs — reopen first, then refresh/flush on the write pool.
+- Shard open/close/reopen are separate from engine work: use Tokio blocking-pool wrappers for those filesystem/Tantivy recovery steps before dispatching steady-state search/write work onto rayon.
+- Refresh, checkpoint-aware flush, and force merge use Tokio's blocking pool after any reopen. Their shard-local maintenance lock may be held through long compaction, so they must not occupy the fixed write pool or starve unrelated writes and replica applies.
 
 ### Transport TLS (optional, feature-gated)
 Inter-node gRPC can be encrypted via the `transport-tls` Cargo feature flag. Disabled by default.

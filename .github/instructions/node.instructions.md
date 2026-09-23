@@ -21,7 +21,9 @@ pub struct Node {
 ```
 
 ## Startup Sequence (`Node::new()` → `Node::start()`)
-1. `Node::new(config)` — creates Raft instance via `create_raft_instance()` (persisted to `raft.db`)
+1. `Node::new(config)` — resolves the shared column-cache budget on Tokio's
+   blocking pool, then creates the Raft instance via `create_raft_instance()`
+   (persisted to `raft.db`)
 2. `Node::start()` spawns THREE concurrent tasks via `tokio::select!`:
    - **gRPC Transport Server** (port 9300) — Raft RPCs + shard ops + replication
    - **HTTP API Server** (port 9200) — REST endpoints via Axum

@@ -11,6 +11,24 @@
 
 use std::sync::Arc;
 
+/// Run blocking engine maintenance on Tokio's blocking pool.
+///
+/// Refresh, flush, and force merge may wait on shard-local maintenance locks
+/// for a long time. Keeping those waits off the fixed Rayon write pool prevents
+/// one shard's maintenance from starving unrelated writes and replica applies.
+pub async fn spawn_engine_maintenance<F, R>(
+    operation: &'static str,
+    f: F,
+) -> crate::common::Result<R>
+where
+    F: FnOnce() -> crate::common::Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|error| anyhow::anyhow!("{operation} blocking task failed: {error}"))?
+}
+
 /// Dedicated thread pools for CPU-bound engine operations.
 ///
 /// Search and write operations run on physically separate OS threads.
@@ -172,5 +190,16 @@ mod tests {
         let pools = WorkerPools::default_for_system();
         assert!(pools.search_pool_size() >= 2);
         assert!(pools.write_pool_size() >= 2);
+    }
+
+    #[tokio::test]
+    async fn engine_maintenance_preserves_operation_errors() {
+        let error = spawn_engine_maintenance("refresh", || {
+            Err::<(), _>(anyhow::anyhow!("refresh failed"))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "refresh failed");
     }
 }
