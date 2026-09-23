@@ -39,7 +39,8 @@ impl ShardKey {
 /// Per-replica checkpoint info for ISR tracking.
 #[derive(Debug, Clone)]
 pub struct ReplicaCheckpoint {
-    /// The replica's last known local checkpoint (highest contiguous seq_no).
+    /// The replica's last known applied sequence high-water mark.
+    /// This tracker does not prove contiguous application below the watermark.
     pub checkpoint: u64,
     /// When we last heard from this replica.
     pub last_updated: std::time::Instant,

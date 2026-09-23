@@ -102,6 +102,7 @@ message ShardDocResponse {
     bool success = 1;
     string doc_id = 2;
     string error = 3;         // empty on success
+    optional uint64 seq_no = 4;
 }
 
 message ShardDeleteRequest {
@@ -114,6 +115,7 @@ message ShardDeleteResponse {
     bool success = 1;
     uint64 deleted = 2;
     string error = 3;
+    optional uint64 seq_no = 4;
 }
 
 message ShardGetRequest {
@@ -138,6 +140,7 @@ message ShardBulkResponse {
     bool success = 1;
     repeated string doc_ids = 2;
     string error = 3;
+    optional uint64 start_seq_no = 4; // absent for an empty batch
 }
 
 message ShardSearchRequest {

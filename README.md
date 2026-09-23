@@ -224,7 +224,11 @@ docker run --rm -p 9200:9200 -p 9300:9300 ferrissearch
   and `match_all`
 - Numeric/date sorting and `search_after` cursor pagination, with documented
   tie limitations
-- Terms, stats, min, max, average, sum, value-count, and histogram aggregations
+- Terms, stats, min, max, average, sum, value-count, and histogram aggregations;
+  numeric terms preserve full signed-integer bucket identity
+- Declared keyword fields support nested scalar arrays: values are flattened,
+  coerced to text, deduplicated per document, and preserved unchanged in
+  `_source`; object elements are rejected
 - Search-aware SQL with `text_match`, structured filter pushdown, grouping,
   `HAVING`, sorting, limit/offset, residual expressions, and same-index
   uncorrelated `IN (SELECT key ...)` semijoins
@@ -242,6 +246,10 @@ SQL responses expose the current execution path:
 | `tantivy_grouped_partials` | Search-native shard-local partial aggregation |
 | `materialized_hits_fallback` | Compatibility path for unsupported columnar shapes |
 
+Keyword arrays are searchable and aggregate correctly through the Query DSL.
+Direct SQL fast-field readers are still scalar-first; FerrisSearch does not yet
+claim general SQL ARRAY values or `UNNEST` support.
+
 `sql_approximate_top_k` currently defaults to `true`. Eligible grouped
 `ORDER BY metric LIMIT N` queries may prune shard-local buckets approximately;
 responses and EXPLAIN metadata disclose activation. Set it to `false` when exact
@@ -253,7 +261,9 @@ coordinator-side merge semantics are required.
   settings, and dynamic security metadata
 - Primary/replica shard routing over gRPC
 - Generation-based binary translog with request or asynchronous durability
-- Replica sequence preservation, checkpoint tracking, and WAL catch-up
+- Primary write receipts propagated to REST `_seq_no` responses, including bulk
+  ranges, with replica WAL sequence preservation
+- Monotonic sequence high-watermark tracking and WAL catch-up
 - UUID-backed shard data directories and process-backed restart regression
 - Separate rayon pools for search and write engine work
 - Blocking wrappers for filesystem/recovery work on async call paths
@@ -331,8 +341,11 @@ production ready**. The most important limits are:
 
 - A primary can mutate before replica acknowledgement fails; write retry and
   acknowledgement semantics need a formal contract.
-- Client-visible version/sequence/primary-epoch metadata and optimistic
-  concurrency control are incomplete.
+- `_seq_no` now reports the primary WAL assignment, but `_version` and
+  `_primary_term` compatibility fields remain placeholders. Gap-aware
+  checkpoints, primary epochs, idempotent retries, `if_seq_no` /
+  `if_primary_term`, and complete optimistic concurrency control are still
+  missing.
 - Replica bootstrap needs snapshot-plus-streamed-WAL recovery.
 - Remote manifest publication is serialized only inside one process; there is
   no cross-process compare-and-set or writer fencing.
@@ -375,6 +388,7 @@ scripts. Existing results are exploratory single-machine measurements—not
 service-level promises or proof of production scale.
 
 - [Benchmark notes and reproduction](docs/benchmarks.md)
+- [Terms aggregation optimization benchmark](docs/terms-aggregation-benchmark-2026-09-22.md)
 - [NYC Taxi hybrid benchmark](docs/nyc-taxi-hybrid-benchmark.md)
 - [Remote-store pruning design and evidence](docs/remote-store-split-pruning.md)
 - [EXPLAIN ANALYZE output design](docs/explain-analyze-output.md)
@@ -432,6 +446,7 @@ Read:
 | [Dynamic settings](docs/dynamic-settings.md) | Refresh and flush-threshold behavior |
 | [Vector search](docs/vector-search.md) | Current vector architecture and examples |
 | [Benchmarks](docs/benchmarks.md) | Historical measurements and reproduction notes |
+| [Dependency review](docs/dependency-review-2026-09-22.md) | Point-in-time direct dependency assessment and deferred migrations |
 
 `docs/architecture.md` and `docs/remote-store-one-pager.md` are historical
 context; they do not override current source or the strategic roadmap.

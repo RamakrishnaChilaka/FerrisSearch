@@ -801,6 +801,102 @@ async fn create_products_index(harness: &RestTestHarness) -> Result<()> {
     create_products_index_named(harness, "products").await
 }
 
+#[tokio::test]
+async fn rest_keyword_arrays_and_write_receipts_are_preserved() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json(
+            "/array-receipts",
+            json!({
+                "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+                "mappings": {"dynamic": "strict", "properties": {"tags": {"type": "keyword"}}}
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let source = json!({"tags": ["b", "a", "a", null]});
+    let (status, first) = harness
+        .put_json("/array-receipts/_doc/one?refresh=true", source.clone())
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(first["_seq_no"], json!(0));
+    let (status, stored) = harness.get_json("/array-receipts/_doc/one").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored["_source"], source);
+
+    let (status, rejected) = harness
+        .put_json(
+            "/array-receipts/_doc/invalid",
+            json!({"tags": ["valid", {"bad": "object"}]}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+    assert!(
+        rejected["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("tags")
+    );
+    let bulk = concat!(
+        "{\"index\":{\"_id\":\"two\"}}\n{\"tags\":[\"b\"]}\n",
+        "{\"index\":{\"_id\":\"three\"}}\n{\"tags\":[\"a\"]}\n"
+    );
+    let (status, response) = harness
+        .post_ndjson("/array-receipts/_bulk?refresh=true", bulk)
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["errors"], json!(false), "{response}");
+    assert_eq!(response["items"][0]["index"]["_seq_no"], json!(1));
+    assert_eq!(response["items"][1]["index"]["_seq_no"], json!(2));
+    let (_, aggregate) = harness
+        .post_json(
+            "/array-receipts/_search",
+            json!({
+                "size": 0, "aggs": {"tags": {"terms": {"field": "tags", "size": 10}}}
+            }),
+        )
+        .await?;
+    let buckets: std::collections::BTreeMap<_, _> = aggregate["aggregations"]["tags"]["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|bucket| {
+            (
+                bucket["key"].as_str().unwrap().to_string(),
+                bucket["doc_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        buckets,
+        std::collections::BTreeMap::from([("a".into(), 2), ("b".into(), 2)])
+    );
+    let (_, invalid_bulk) = harness
+        .post_ndjson(
+            "/array-receipts/_bulk",
+            "{\"index\":{\"_id\":\"invalid-bulk\"}}\n{\"tags\":[{\"bad\":\"object\"}]}\n",
+        )
+        .await?;
+    assert_eq!(invalid_bulk["errors"], json!(true));
+    assert_eq!(invalid_bulk["items"][0]["index"]["status"], json!(400));
+    assert_eq!(
+        invalid_bulk["items"][0]["index"]["error"]["type"],
+        json!("mapper_parsing_exception")
+    );
+    let (status, updated) = harness
+        .post_json(
+            "/array-receipts/_update/three",
+            json!({"doc": {"tags": ["c"]}}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["_seq_no"], json!(3));
+    let (status, deleted) = harness.delete_json("/array-receipts/_doc/two").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deleted["_seq_no"], json!(4));
+    Ok(())
+}
+
 async fn create_products_index_named(harness: &RestTestHarness, index_name: &str) -> Result<()> {
     let (status, body) = harness
         .put_json(
@@ -3630,6 +3726,286 @@ async fn remote_store_term_filter_prunes_unmatched_split_before_cache_fetch() ->
 }
 
 #[tokio::test]
+async fn remote_store_keyword_arrays_are_summarized_without_false_negative_pruning() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/remoteprunekeywordarray",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "tags": { "type": "keyword" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remoteprunekeywordarray/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "scalar", "tags": "x" },
+                    {
+                        "_id": "array",
+                        "tags": [["y", "z", null], 7, true, ["y", false, 7]]
+                    }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+    let matching_split_id = publish_body["split_id"]
+        .as_str()
+        .expect("matching split id")
+        .to_string();
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remoteprunekeywordarray/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "other", "tags": "other" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+    let pruned_split_id = publish_body["split_id"]
+        .as_str()
+        .expect("pruned split id")
+        .to_string();
+
+    for value in [json!("y"), json!(7), json!(true), json!(false)] {
+        let (search_status, search_body) = harness
+            .post_json(
+                "/remoteprunekeywordarray/_search",
+                json!({
+                    "query": { "term": { "tags": value } }
+                }),
+            )
+            .await?;
+        assert_eq!(search_status, StatusCode::OK, "{search_body}");
+        assert_eq!(
+            search_body["hits"]["total"]["value"],
+            json!(1),
+            "{search_body}"
+        );
+        assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("array"));
+        assert_eq!(
+            search_body["remote_store"]["pruning"],
+            json!({
+                "published_splits": 2,
+                "candidate_splits": 1,
+                "pruned_splits": 1,
+                "assigned_splits": 1
+            })
+        );
+    }
+
+    let metadata = harness
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("remoteprunekeywordarray")
+        .cloned()
+        .expect("index metadata should exist");
+    let manifest = harness
+        .app_state
+        .storage_manager
+        .load_current_manifest(
+            metadata.uuid.as_str(),
+            Some(&ferrissearch::storage::compute_schema_hash(
+                &metadata.mappings,
+            )),
+        )
+        .await?
+        .expect("manifest should exist after publish");
+    let matching_split = manifest
+        .published_splits()
+        .find(|split| split.split_id == matching_split_id)
+        .expect("matching split should exist");
+    let pruned_split = manifest
+        .published_splits()
+        .find(|split| split.split_id == pruned_split_id)
+        .expect("pruned split should exist");
+
+    assert_eq!(
+        matching_split.field_terms["tags"].values,
+        vec!["7", "false", "true", "x", "y", "z"]
+    );
+    assert_eq!(pruned_split.field_terms["tags"].values, vec!["other"]);
+    assert!(
+        harness
+            .app_state
+            .storage_manager
+            .cached_split_status(
+                metadata.uuid.as_str(),
+                &matching_split.split_id,
+                &matching_split.checksum,
+            )
+            .artifact_cached
+    );
+    assert!(
+        !harness
+            .app_state
+            .storage_manager
+            .cached_split_status(
+                metadata.uuid.as_str(),
+                &pruned_split.split_id,
+                &pruned_split.checksum,
+            )
+            .artifact_cached,
+        "nonmatching split should be pruned before cache fetch"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_capped_keyword_array_summary_keeps_the_split_conservatively() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    let (status, body) = harness
+        .put_json(
+            "/remoteprunekeywordcap",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "tags": { "type": "keyword" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let array_values: Vec<Value> = (0..=64).map(|idx| json!(format!("value-{idx}"))).collect();
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remoteprunekeywordcap/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "anchor", "tags": "anchor" },
+                    { "_id": "capped", "tags": array_values }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+    let capped_split_id = publish_body["split_id"]
+        .as_str()
+        .expect("capped split id")
+        .to_string();
+
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/remoteprunekeywordcap/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "other", "tags": "other" }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::OK, "{publish_body}");
+    let pruned_split_id = publish_body["split_id"]
+        .as_str()
+        .expect("pruned split id")
+        .to_string();
+
+    let (search_status, search_body) = harness
+        .post_json(
+            "/remoteprunekeywordcap/_search",
+            json!({
+                "query": { "term": { "tags": "value-64" } }
+            }),
+        )
+        .await?;
+    assert_eq!(search_status, StatusCode::OK, "{search_body}");
+    assert_eq!(
+        search_body["hits"]["total"]["value"],
+        json!(1),
+        "{search_body}"
+    );
+    assert_eq!(search_body["hits"]["hits"][0]["_id"], json!("capped"));
+    assert_eq!(
+        search_body["remote_store"]["pruning"],
+        json!({
+            "published_splits": 2,
+            "candidate_splits": 1,
+            "pruned_splits": 1,
+            "assigned_splits": 1
+        })
+    );
+
+    let metadata = harness
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("remoteprunekeywordcap")
+        .cloned()
+        .expect("index metadata should exist");
+    let manifest = harness
+        .app_state
+        .storage_manager
+        .load_current_manifest(
+            metadata.uuid.as_str(),
+            Some(&ferrissearch::storage::compute_schema_hash(
+                &metadata.mappings,
+            )),
+        )
+        .await?
+        .expect("manifest should exist after publish");
+    let capped_split = manifest
+        .published_splits()
+        .find(|split| split.split_id == capped_split_id)
+        .expect("capped split should exist");
+    let pruned_split = manifest
+        .published_splits()
+        .find(|split| split.split_id == pruned_split_id)
+        .expect("pruned split should exist");
+
+    assert!(
+        !capped_split.field_terms.contains_key("tags"),
+        "an incomplete capped summary must be omitted"
+    );
+    assert_eq!(pruned_split.field_terms["tags"].values, vec!["other"]);
+    assert!(
+        harness
+            .app_state
+            .storage_manager
+            .cached_split_status(
+                metadata.uuid.as_str(),
+                &capped_split.split_id,
+                &capped_split.checksum,
+            )
+            .artifact_cached
+    );
+    assert!(
+        !harness
+            .app_state
+            .storage_manager
+            .cached_split_status(
+                metadata.uuid.as_str(),
+                &pruned_split.split_id,
+                &pruned_split.checksum,
+            )
+            .artifact_cached,
+        "the exact nonmatching split should still be pruned"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_store_range_filter_prunes_unmatched_split_before_cache_fetch() -> Result<()> {
     let harness = RestTestHarness::start().await?;
 
@@ -4007,6 +4383,72 @@ async fn remote_store_publish_rejects_empty_docs_array() -> Result<()> {
     assert_eq!(
         publish_body["error"]["type"],
         json!("illegal_argument_exception")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_store_publish_rejects_keyword_objects_without_publishing() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/pubinvalidkeyword",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "tags": { "type": "keyword" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let metadata = harness
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("pubinvalidkeyword")
+        .cloned()
+        .expect("index metadata should exist");
+    let (publish_status, publish_body) = harness
+        .post_json(
+            "/pubinvalidkeyword/_remote_store/publish",
+            json!({
+                "docs": [
+                    { "_id": "valid", "tags": ["ok"] },
+                    { "_id": "invalid", "tags": ["ok", { "nested": "invalid" }] }
+                ]
+            }),
+        )
+        .await?;
+    assert_eq!(publish_status, StatusCode::BAD_REQUEST, "{publish_body}");
+    assert_eq!(
+        publish_body["error"]["type"],
+        json!("mapper_parsing_exception")
+    );
+    assert!(
+        publish_body["error"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("field [tags]")),
+        "expected field-specific validation error, got {publish_body}"
+    );
+
+    let manifest = harness
+        .app_state
+        .storage_manager
+        .load_current_manifest(
+            metadata.uuid.as_str(),
+            Some(&ferrissearch::storage::compute_schema_hash(
+                &metadata.mappings,
+            )),
+        )
+        .await?;
+    assert!(
+        manifest.is_none(),
+        "invalid publication must not publish a manifest"
     );
     Ok(())
 }

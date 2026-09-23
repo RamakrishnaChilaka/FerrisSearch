@@ -29,6 +29,7 @@ pub trait WriteAheadLog: Send + Sync {
     fn append_with_seq(&self, seq_no: u64, op: WalOperation, payload: Value) -> Result<TranslogEntry>;
     fn append_bulk(&self, ops: &[(WalOperation, Value)]) -> Result<Vec<TranslogEntry>>;
     fn write_bulk(&self, ops: &[(WalOperation, Value)]) -> Result<()>;
+    fn write_bulk_with_receipt(&self, ops: &[(WalOperation, Value)]) -> Result<Option<u64>>;
     fn write_bulk_with_start_seq(&self, start_seq_no: u64, ops: &[(WalOperation, Value)]) -> Result<()>;
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;  // replica recovery
@@ -56,6 +57,12 @@ pub trait WriteAheadLog: Send + Sync {
 
 ## Key Behaviors
 - `append()` returns the assigned seq_no in the TranslogEntry
+- `write_bulk_with_receipt()` returns the first sequence reserved under the WAL
+  lock; the input length determines its contiguous range. Empty input returns
+  `None` without allocating a sequence. `write_bulk()` is the discard-receipt
+  compatibility wrapper.
+- Primary sequence exhaustion and overflowing explicit bulk ranges must fail
+  before any bytes are written; never wrap or reuse a saturated allocator value.
 - `append_with_seq()` persists a caller-supplied seq_no and advances the local allocator past it
 - `write_bulk_with_start_seq()` persists contiguous caller-supplied seq_nos for replica/recovery bulk apply
 - `read_from(seq_no)` scans all generations in order and returns entries with seq_no > the given value (used for replica recovery)
@@ -74,3 +81,6 @@ pub trait WriteAheadLog: Send + Sync {
 - Primary-originated writes use `append()` / `append_bulk()` and allocate new seq_nos locally
 - Replica apply and recovery replay MUST use `append_with_seq()` / `write_bulk_with_start_seq()` so all shard copies persist the primary's seq space
 - Never let a replica invent fresh WAL seq_nos for a replicated operation — this breaks failover and `read_from()` semantics
+- Carry primary-assigned receipts through the engine and transport layers.
+  Reading the allocator/checkpoint again after releasing the write lock cannot
+  recover the identity of an earlier operation.

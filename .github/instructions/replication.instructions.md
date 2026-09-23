@@ -32,9 +32,10 @@ pub async fn replicate_bulk(
 
 ## Replication Flow (Primary → Replicas)
 1. Client writes to primary shard
-2. Primary writes to WAL → assigns monotonic `seq_no`
+2. Primary writes to WAL → assigns monotonic `seq_no` or contiguous bulk range
 3. Primary indexes in Tantivy + USearch, updates local checkpoint
-4. Primary calls `replicate_write()` / `replicate_bulk()`
+4. The engine returns an operation-owned receipt; the primary calls
+   `replicate_write()` / `replicate_bulk()` with those exact values
 5. gRPC sends to ALL replicas concurrently via `tokio::spawn` + `join_all` (fan-out)
 6. Each replica: applies the write using the primary-provided seq_no, persists that exact seq_no in its WAL, updates its local checkpoint, returns checkpoint
 7. Primary updates ISR tracker with returned checkpoints
@@ -63,3 +64,9 @@ pub async fn replicate_bulk(
 - ISR tracking is on the primary via `ShardManager.isr_tracker`
 - Primary shard handlers (`index_doc`, `bulk_index`, `delete_doc`) MUST return `success: false` when replication fails — never swallow replication errors
 - **Primary owns seq numbers**: replica WAL entries must preserve the seq_no assigned by the primary; never allocate replica-local seq_nos for replicated or recovered operations
+- Never derive an operation's sequence from `last_seq_no()` or a checkpoint after
+  releasing the primary write lock. Concurrent writes can advance both before
+  replication begins.
+- Current local/global checkpoints are monotonic high-water marks. They are not
+  a gap-free applied-prefix protocol and do not add idempotent retry handling,
+  primary-epoch fencing, or a new failover ordering model.

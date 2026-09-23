@@ -15,6 +15,24 @@ use std::sync::Arc;
 
 use crate::api::{raft_write, resolve_leader_or_master};
 
+fn is_document_validation_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == tonic::Code::InvalidArgument)
+}
+
+fn document_write_error_response(
+    operation: &str,
+    error: anyhow::Error,
+) -> (StatusCode, Json<Value>) {
+    let (status, error_type) = if is_document_validation_error(&error) {
+        (StatusCode::BAD_REQUEST, "mapper_parsing_exception")
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "forward_exception")
+    };
+    crate::api::error_response(status, error_type, format!("{operation} failed: {error}"))
+}
+
 mod bulk;
 mod maintenance;
 
@@ -518,11 +536,7 @@ pub async fn index_document(
             }
             (StatusCode::CREATED, Json(res))
         }
-        Err(e) => crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "forward_exception",
-            format!("Forward failed: {e}"),
-        ),
+        Err(e) => document_write_error_response("Forward", e),
     }
 }
 
@@ -599,11 +613,7 @@ pub async fn index_document_with_id(
             }
             (StatusCode::CREATED, Json(res))
         }
-        Err(e) => crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "forward_exception",
-            format!("Forward failed: {e}"),
-        ),
+        Err(e) => document_write_error_response("Forward", e),
     }
 }
 
@@ -1129,17 +1139,11 @@ pub async fn update_document(
         .forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &merged)
         .await
     {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "_index": index_name, "_id": doc_id, "_shard": shard_id, "result": "updated"
-            })),
-        ),
-        Err(e) => crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "forward_exception",
-            format!("Update failed: {e}"),
-        ),
+        Ok(mut response) => {
+            response["result"] = serde_json::json!("updated");
+            (StatusCode::OK, Json(response))
+        }
+        Err(e) => document_write_error_response("Update", e),
     }
 }
 

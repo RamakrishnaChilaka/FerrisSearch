@@ -145,6 +145,10 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 
 `create_index()`, `get_index_settings()`, and `update_index_settings()` must keep `refresh_interval_ms` and `flush_threshold_bytes` in sync end-to-end across HTTP parsing, gRPC forwarding, and Raft state updates. `GET /{index}/_settings` must return both fields when set. `flush_threshold_bytes: 0` is a valid disable value and must not be treated as "missing".
 `engine` is a create-time immutable selector. `create_index()` accepts `engine: "local_shards"` (or an object form with `type`) and persists it through Raft/transport metadata. `GET /{index}/_settings` must expose the engine. `PUT /{index}/_settings` must reject engine changes. `remote_store` reads must route through the dedicated manifest + split execution path, while write-style `_doc` / `_bulk` / `_update` / `_delete` requests still fail with `501 Not Implemented` instead of falling through shard-routing code.
+`publish_remote_store_documents()` applies the same mapped-keyword validation as
+normal CRUD before publishing any bundle or manifest. Keyword object values
+return a field-specific `400 mapper_parsing_exception`; they are not build
+failures and must not publish partial data.
 `AppState.raft` is `Arc<RaftInstance>`, not `Option` — Raft is always present. Index-management handlers use `state.raft` directly without unwrapping.
 
 ### Local Shard Reopen Rule
@@ -165,6 +169,24 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 
 Bulk routes intentionally disable Axum's default buffered request-body limit so benchmark-sized NDJSON payloads reach the handler. When changing router composition or middleware layering, preserve large-body support on `POST /_bulk` and `POST /{index}/_bulk` or benchmark loaders will fail with `413 Failed to buffer the request body` before any item-level handling occurs.
 `bulk_index_global()` must validate raw action `_index` values with `IndexName::new()`, reject `.ferris_security`, and enforce the authenticated principal's index permissions per item before metadata lookup or auto-create.
+
+Successful index, update, delete, and bulk item responses expose the actual
+primary WAL-assigned `_seq_no`; sequence zero is valid. Bulk finalization must
+apply each target receipt by request-order offset, not by document-ID lookup,
+because duplicate IDs can appear in one batch. Missing or inconsistent target
+receipts are item failures, never `_seq_no: 0` fallbacks.
+
+This does not implement full OpenSearch write concurrency semantics.
+`_version` / `_primary_term` values that appear in compatibility response shapes
+remain placeholders, and `if_seq_no` / `if_primary_term`, primary epochs,
+idempotent retries, and complete optimistic concurrency control are not yet
+implemented.
+
+Declared keyword fields accept nested arrays of string/number/boolean scalars,
+flatten and coerce them to text for indexing, ignore nulls, and deduplicate a
+value within one document while preserving `_source`. Object values fail as
+`400 mapper_parsing_exception`; validate the whole shard batch before any WAL
+or writer mutation.
 
 ### Search — src/api/search/mod.rs
 | HTTP | Path | Handler |
@@ -274,6 +296,9 @@ Document and bulk handlers auto-create missing indices via `auto_create_index()`
 
 ## Bulk Error Reporting
 - `bulk_index()` and `bulk_index_global()` must preserve the underlying shard forwarding error string in failed item responses. Do not collapse intermittent write or replication failures into a generic "Failed to index to shard" reason, because the ingest clients need the original message to diagnose flaky bulk errors.
+- Transport `INVALID_ARGUMENT` failures from keyword/object validation map to
+  item-level `400 mapper_parsing_exception`; infrastructure and replication
+  failures remain diagnosable 5xx item errors.
 
 All four auto-create callsites use this shared helper:
 - `index_document()` (POST `/{index}/_doc`)

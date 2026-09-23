@@ -488,15 +488,15 @@ impl InternalTransport for TransportService {
             let doc_id = doc_id.clone();
             let payload = payload.clone();
             self.worker_pools
-                .spawn_write(move || engine.add_document(&doc_id, payload))
+                .spawn_write(move || engine.add_document_with_receipt(&doc_id, payload))
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
         };
 
         match write_result {
-            Ok(id) => {
-                // Get the seq_no assigned by the WAL during add_document
-                let seq_no = engine.local_checkpoint();
+            Ok(receipt) => {
+                let id = receipt.doc_id;
+                let seq_no = receipt.seq_no;
 
                 // Replicate to replica shards with seq_no
                 let cs = self.cluster_manager.get_state();
@@ -531,6 +531,7 @@ impl InternalTransport for TransportService {
                             success: false,
                             doc_id: id,
                             error: format!("Replication failed: {}", errors.join("; ")),
+                            seq_no: Some(seq_no),
                         }));
                     }
                 }
@@ -539,12 +540,17 @@ impl InternalTransport for TransportService {
                     success: true,
                     doc_id: id,
                     error: String::new(),
+                    seq_no: Some(seq_no),
                 }))
+            }
+            Err(e) if e.is::<crate::engine::DocumentValidationError>() => {
+                Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) => Ok(Response::new(ShardDocResponse {
                 success: false,
                 doc_id: String::new(),
                 error: e.to_string(),
+                seq_no: None,
             })),
         }
     }
@@ -589,17 +595,30 @@ impl InternalTransport for TransportService {
             let engine = engine.clone();
             let docs_for_write = docs.clone();
             self.worker_pools
-                .spawn_write(move || engine.bulk_add_documents(docs_for_write))
+                .spawn_write(move || engine.bulk_add_documents_with_receipt(docs_for_write))
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
         };
 
         match write_result {
-            Ok(ids) => {
-                let seq_no = engine.local_checkpoint();
+            Ok(receipt) => {
+                let last_seq_no = receipt
+                    .last_seq_no()
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let ids = receipt.doc_ids;
+                let Some(start_seq_no) = receipt.start_seq_no else {
+                    return Ok(Response::new(ShardBulkResponse {
+                        success: true,
+                        doc_ids: ids,
+                        error: String::new(),
+                        start_seq_no: None,
+                    }));
+                };
+                let seq_no = last_seq_no.ok_or_else(|| {
+                    Status::internal("non-empty bulk receipt has no last sequence")
+                })?;
                 // Replicate to replica shards
                 let cs = self.cluster_manager.get_state();
-                let start_seq_no = seq_no.saturating_sub(ids.len().saturating_sub(1) as u64);
                 match crate::replication::replicate_bulk(
                     &self.transport_client,
                     &cs,
@@ -629,6 +648,7 @@ impl InternalTransport for TransportService {
                             success: false,
                             doc_ids: ids,
                             error: format!("Replication failed: {}", errors.join("; ")),
+                            start_seq_no: Some(start_seq_no),
                         }));
                     }
                 }
@@ -638,12 +658,17 @@ impl InternalTransport for TransportService {
                     success: true,
                     doc_ids: ids,
                     error: String::new(),
+                    start_seq_no: Some(start_seq_no),
                 }))
+            }
+            Err(e) if e.is::<crate::engine::DocumentValidationError>() => {
+                Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) => Ok(Response::new(ShardBulkResponse {
                 success: false,
                 doc_ids: vec![],
                 error: e.to_string(),
+                start_seq_no: None,
             })),
         }
     }
@@ -665,14 +690,15 @@ impl InternalTransport for TransportService {
             let engine = engine.clone();
             let doc_id = req.doc_id.clone();
             self.worker_pools
-                .spawn_write(move || engine.delete_document(&doc_id))
+                .spawn_write(move || engine.delete_document_with_receipt(&doc_id))
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
         };
 
         match delete_result {
-            Ok(deleted) => {
-                let seq_no = engine.local_checkpoint();
+            Ok(receipt) => {
+                let deleted = receipt.deleted;
+                let seq_no = receipt.seq_no;
                 // Replicate delete to replica shards
                 let cs = self.cluster_manager.get_state();
                 match crate::replication::replicate_write(
@@ -706,6 +732,7 @@ impl InternalTransport for TransportService {
                             success: false,
                             deleted,
                             error: format!("Replication failed: {}", errors.join("; ")),
+                            seq_no: Some(seq_no),
                         }));
                     }
                 }
@@ -713,12 +740,14 @@ impl InternalTransport for TransportService {
                     success: true,
                     deleted,
                     error: String::new(),
+                    seq_no: Some(seq_no),
                 }))
             }
             Err(e) => Ok(Response::new(ShardDeleteResponse {
                 success: false,
                 deleted: 0,
                 error: e.to_string(),
+                seq_no: None,
             })),
         }
     }
@@ -1346,16 +1375,35 @@ impl InternalTransport for TransportService {
             req.shard_id
         );
 
+        let Some(first) = req.ops.first() else {
+            return Ok(Response::new(ReplicateBulkResponse {
+                success: true,
+                error: String::new(),
+                local_checkpoint: engine.local_checkpoint(),
+            }));
+        };
+        let start_seq_no = first.seq_no;
         let mut docs = Vec::with_capacity(req.ops.len());
-        for op in &req.ops {
+        for (offset, op) in req.ops.iter().enumerate() {
+            let expected_seq = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
+                Status::invalid_argument("bulk replication sequence range overflows")
+            })?;
+            if op.seq_no != expected_seq {
+                return Err(Status::invalid_argument(
+                    "bulk replication sequences must be contiguous and ordered",
+                ));
+            }
+            if op.op != "index" {
+                return Err(Status::invalid_argument(
+                    "bulk replication only supports index operations",
+                ));
+            }
             let payload: serde_json::Value =
                 serde_json::from_slice(&op.payload_json).map_err(|e| {
                     Status::invalid_argument(format!("invalid JSON in bulk replicate: {e}"))
                 })?;
             docs.push((op.doc_id.clone(), payload));
         }
-
-        let start_seq_no = req.ops.first().map(|op| op.seq_no).unwrap_or(0);
 
         let write_result = {
             let engine = engine.clone();
@@ -2296,9 +2344,9 @@ impl TransportService {
         .await
     }
 
-    /// Compute and advance the global checkpoint for a shard.
-    /// The global checkpoint is min(primary_checkpoint, all_replica_checkpoints).
-    /// Only advances (never goes backward).
+    /// Compute and advance the current replicated high-water mark for a shard.
+    /// This uses the minimum observed primary/replica watermark and is monotonic,
+    /// but it does not prove that every lower sequence has been applied.
     fn advance_global_checkpoint(
         engine: &Arc<dyn crate::engine::SearchEngine>,
         primary_checkpoint: u64,

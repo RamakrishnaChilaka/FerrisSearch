@@ -32,10 +32,16 @@ use serde_json::Value;
 use crate::api::AppState;
 use crate::api::index::{DistributedDslSearchResult, RemoteStoreSearchStats};
 use crate::cluster::state::{FieldMapping, FieldType, IndexMetadata};
-use crate::engine::SearchEngine;
+use crate::engine::tantivy::{canonical_keyword_scalar, visit_indexed_keyword_values};
+use crate::engine::{DocumentValidationError, SearchEngine};
 use crate::search::{PartialAggResult, QueryClause, RangeCondition, SearchRequest};
 
 const REMOTE_STORE_TERM_SUMMARY_CAP: usize = 64;
+
+type SplitFieldSummaries = (
+    BTreeMap<String, crate::storage::SplitFieldRange>,
+    BTreeMap<String, crate::storage::SplitFieldTerms>,
+);
 
 /// Process-local cache for open remote_store split readers.
 pub struct RemoteSplitReaderCache {
@@ -356,7 +362,7 @@ fn range_field_kind(field_type: &FieldType) -> Option<RangeFieldKind> {
 
 fn canonical_term_summary_value(field_type: &FieldType, value: &Value) -> Option<String> {
     match field_type {
-        FieldType::Keyword => value.as_str().map(ToOwned::to_owned),
+        FieldType::Keyword => canonical_keyword_scalar(value).map(|value| value.into_owned()),
         FieldType::Boolean => match value {
             Value::Bool(boolean) => Some(boolean.to_string()),
             Value::String(text) if text.eq_ignore_ascii_case("true") => Some("true".into()),
@@ -552,10 +558,7 @@ impl TermSummaryAccumulator {
 fn build_split_field_summaries(
     docs: &[Value],
     mappings: &HashMap<String, FieldMapping>,
-) -> (
-    BTreeMap<String, crate::storage::SplitFieldRange>,
-    BTreeMap<String, crate::storage::SplitFieldTerms>,
-) {
+) -> Result<SplitFieldSummaries, DocumentValidationError> {
     let mut range_summaries: HashMap<String, RangeSummaryAccumulator> = HashMap::new();
     let mut term_summaries: HashMap<String, TermSummaryAccumulator> = HashMap::new();
 
@@ -567,6 +570,13 @@ fn build_split_field_summaries(
             let Some(mapping) = mappings.get(field) else {
                 continue;
             };
+            if matches!(mapping.field_type, FieldType::Keyword) {
+                let summary = term_summaries.entry(field.clone()).or_default();
+                visit_indexed_keyword_values(field, value, &mut |value| {
+                    summary.observe(value.into_owned());
+                })?;
+                continue;
+            }
             if let Some(kind) = range_field_kind(&mapping.field_type)
                 && let Some(summary_value) = canonical_range_summary_value(kind, value)
             {
@@ -593,7 +603,7 @@ fn build_split_field_summaries(
         .into_iter()
         .filter_map(|(field, summary)| summary.into_manifest().map(|summary| (field, summary)))
         .collect();
-    (field_ranges, field_terms)
+    Ok((field_ranges, field_terms))
 }
 
 impl RemoteSplitReaderCache {
@@ -1332,7 +1342,16 @@ pub(crate) async fn publish_docs(
         ));
     }
 
-    let (field_ranges, field_terms) = build_split_field_summaries(&docs, &metadata.mappings);
+    let (field_ranges, field_terms) = match build_split_field_summaries(&docs, &metadata.mappings) {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            return Err(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "mapper_parsing_exception",
+                error,
+            ));
+        }
+    };
 
     let index_uuid = metadata.uuid.as_str().to_string();
     let split_id = uuid::Uuid::new_v4().to_string();
@@ -1388,6 +1407,13 @@ pub(crate) async fn publish_docs(
         Err(join_err) => Err(anyhow::anyhow!(join_err)),
     } {
         let _ = std::fs::remove_dir_all(&staging_dir);
+        if e.is::<DocumentValidationError>() {
+            return Err(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "mapper_parsing_exception",
+                e,
+            ));
+        }
         tracing::error!(
             "remote_store: split build failed for {} split_id {}: {}",
             index_name,
@@ -2040,7 +2066,7 @@ mod tests {
                 "title": "ignored text field"
             }),
             serde_json::json!({
-                "status": "warn",
+                "status": ["warn", ["queued", 7, true, null], "warn"],
                 "active": false,
                 "count": 9,
                 "price": 2.5,
@@ -2048,7 +2074,7 @@ mod tests {
             }),
         ];
 
-        let (field_ranges, field_terms) = build_split_field_summaries(&docs, &mappings);
+        let (field_ranges, field_terms) = build_split_field_summaries(&docs, &mappings).unwrap();
 
         assert_eq!(field_ranges["count"].min, "5");
         assert_eq!(field_ranges["count"].max, "9");
@@ -2066,7 +2092,10 @@ mod tests {
                 .unwrap()
                 .to_string()
         );
-        assert_eq!(field_terms["status"].values, vec!["error", "warn"]);
+        assert_eq!(
+            field_terms["status"].values,
+            vec!["7", "error", "queued", "true", "warn"]
+        );
         assert_eq!(field_terms["active"].values, vec!["false", "true"]);
         assert!(!field_terms.contains_key("title"));
     }
@@ -2080,11 +2109,15 @@ mod tests {
                 dimension: None,
             },
         )]);
-        let docs: Vec<_> = (0..=REMOTE_STORE_TERM_SUMMARY_CAP)
-            .map(|idx| serde_json::json!({ "status": format!("value-{idx}") }))
+        let values: Vec<_> = (0..=REMOTE_STORE_TERM_SUMMARY_CAP)
+            .map(|idx| serde_json::json!(format!("value-{idx}")))
             .collect();
+        let docs = vec![
+            serde_json::json!({ "status": "anchor" }),
+            serde_json::json!({ "status": values }),
+        ];
 
-        let (_field_ranges, field_terms) = build_split_field_summaries(&docs, &mappings);
+        let (_field_ranges, field_terms) = build_split_field_summaries(&docs, &mappings).unwrap();
 
         assert!(!field_terms.contains_key("status"));
     }

@@ -150,7 +150,15 @@ pub trait WriteAheadLog: Send + Sync {
 
     /// Write multiple operations to WAL with a single fsync, without constructing
     /// return entries. Faster than `append_bulk` when the caller doesn't need the entries.
-    fn write_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<()>;
+    fn write_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<()> {
+        self.write_bulk_with_receipt(ops).map(|_| ())
+    }
+
+    /// Return the first sequence allocated under the WAL lock, or None for an empty batch.
+    fn write_bulk_with_receipt(
+        &self,
+        ops: &[(WalOperation, serde_json::Value)],
+    ) -> Result<Option<u64>>;
 
     /// Write multiple operations with caller-supplied contiguous sequence numbers.
     fn write_bulk_with_start_seq(
@@ -904,6 +912,9 @@ impl WriteAheadLog for HotTranslog {
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let seq_no = state.next_seq_no;
+        let next_seq_no = seq_no
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
         let frame = encode_entry_borrowed(seq_no, op, &payload)?;
         state.active_file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
@@ -912,7 +923,7 @@ impl WriteAheadLog for HotTranslog {
         let generation = &mut state.generations[generation_index];
         generation.observe_seq(seq_no);
         generation.size_bytes += frame.len() as u64;
-        state.next_seq_no = state.next_seq_no.saturating_add(1);
+        state.next_seq_no = next_seq_no;
 
         let entry = TranslogEntry {
             seq_no,
@@ -954,6 +965,9 @@ impl WriteAheadLog for HotTranslog {
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let start_seq_no = state.next_seq_no;
+        let next_seq_no = start_seq_no
+            .checked_add(ops.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
         let mut entries = Vec::with_capacity(ops.len());
         let mut buf = Vec::with_capacity(ops.len() * 200);
         let mut last_seq_no = None;
@@ -978,16 +992,25 @@ impl WriteAheadLog for HotTranslog {
             generation.observe_seq(start_seq_no);
             generation.observe_seq(last_seq_no);
             generation.size_bytes += buf.len() as u64;
-            state.next_seq_no = last_seq_no.saturating_add(1);
+            state.next_seq_no = next_seq_no;
         }
 
         Ok(entries)
     }
 
-    fn write_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<()> {
+    fn write_bulk_with_receipt(
+        &self,
+        ops: &[(WalOperation, serde_json::Value)],
+    ) -> Result<Option<u64>> {
+        if ops.is_empty() {
+            return Ok(None);
+        }
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let start_seq_no = state.next_seq_no;
+        let next_seq_no = start_seq_no
+            .checked_add(ops.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
         let mut buf = Vec::with_capacity(ops.len() * 200);
         let mut last_seq_no = None;
 
@@ -1006,10 +1029,10 @@ impl WriteAheadLog for HotTranslog {
             generation.observe_seq(start_seq_no);
             generation.observe_seq(last_seq_no);
             generation.size_bytes += buf.len() as u64;
-            state.next_seq_no = last_seq_no.saturating_add(1);
+            state.next_seq_no = next_seq_no;
         }
 
-        Ok(())
+        Ok(Some(start_seq_no))
     }
 
     fn write_bulk_with_start_seq(
@@ -1017,6 +1040,11 @@ impl WriteAheadLog for HotTranslog {
         start_seq_no: u64,
         ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<()> {
+        if !ops.is_empty() {
+            start_seq_no
+                .checked_add((ops.len() - 1) as u64)
+                .ok_or_else(|| anyhow::anyhow!("replica WAL sequence range overflows"))?;
+        }
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let mut buf = Vec::with_capacity(ops.len() * 200);
@@ -1237,6 +1265,62 @@ mod tests {
         let entries = tl.read_all().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].payload["title"], "hello");
+    }
+
+    #[test]
+    fn write_bulk_receipt_is_the_reserved_start_sequence() {
+        let (_directory, wal) = open_translog();
+        wal.append(WalOperation::Index, serde_json::json!({"id": "first"}))
+            .unwrap();
+        let start = wal
+            .write_bulk_with_receipt(&[
+                (WalOperation::Index, serde_json::json!({"id": "second"})),
+                (WalOperation::Delete, serde_json::json!({"id": "third"})),
+            ])
+            .unwrap();
+        assert_eq!(start, Some(1));
+        assert_eq!(wal.write_bulk_with_receipt(&[]).unwrap(), None);
+        assert_eq!(wal.next_seq_no(), 3);
+        wal.append(WalOperation::Index, serde_json::json!({"id": "later"}))
+            .unwrap();
+        assert_eq!(start, Some(1));
+        assert_eq!(
+            wal.read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn sequence_overflow_fails_before_writing_wal_bytes() {
+        let (_directory, wal) = open_translog();
+        recover_lock(&wal.state, "test").next_seq_no = u64::MAX;
+        assert!(
+            wal.append(WalOperation::Index, serde_json::json!({}))
+                .is_err()
+        );
+        assert!(
+            wal.write_bulk_with_receipt(&[(WalOperation::Index, serde_json::json!({}))])
+                .is_err()
+        );
+        assert!(
+            wal.append_bulk(&[(WalOperation::Index, serde_json::json!({}))])
+                .is_err()
+        );
+        assert!(
+            wal.write_bulk_with_start_seq(
+                u64::MAX,
+                &[
+                    (WalOperation::Index, serde_json::json!({})),
+                    (WalOperation::Index, serde_json::json!({})),
+                ],
+            )
+            .is_err()
+        );
+        assert!(wal.read_all().unwrap().is_empty());
     }
 
     #[test]

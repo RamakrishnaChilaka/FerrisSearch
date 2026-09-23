@@ -11,6 +11,41 @@ use datafusion::arrow::record_batch::RecordBatch;
 pub use self::composite::CompositeEngine;
 pub use self::tantivy::HotEngine;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct DocumentValidationError(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexWriteReceipt {
+    pub doc_id: String,
+    pub seq_no: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkWriteReceipt {
+    pub doc_ids: Vec<String>,
+    pub start_seq_no: Option<u64>,
+}
+
+impl BulkWriteReceipt {
+    pub fn last_seq_no(&self) -> Result<Option<u64>> {
+        match (self.start_seq_no, self.doc_ids.len()) {
+            (None, 0) => Ok(None),
+            (Some(start), count) if count > 0 => start
+                .checked_add((count - 1) as u64)
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("bulk write sequence range overflows")),
+            _ => anyhow::bail!("bulk write receipt has inconsistent sequence metadata"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteWriteReceipt {
+    pub deleted: u64,
+    pub seq_no: u64,
+}
+
 /// Per-segment metadata for diagnostics and monitoring.
 pub struct SegmentInfo {
     pub segment_id: String,
@@ -66,7 +101,15 @@ impl SqlStreamingBatchHandle {
 pub trait SearchEngine: Send + Sync {
     /// Index a single document with a given ID. Returns the document ID.
     /// Implementations should handle both text and vector fields.
-    fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String>;
+    fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String> {
+        Ok(self.add_document_with_receipt(doc_id, payload)?.doc_id)
+    }
+
+    fn add_document_with_receipt(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<IndexWriteReceipt>;
 
     /// Index a single document using a caller-supplied sequence number.
     /// Replica/recovery paths use this so WAL entries preserve primary-assigned seq_nos.
@@ -74,30 +117,35 @@ pub trait SearchEngine: Send + Sync {
         &self,
         doc_id: &str,
         payload: serde_json::Value,
-        _seq_no: u64,
-    ) -> Result<String> {
-        self.add_document(doc_id, payload)
-    }
+        seq_no: u64,
+    ) -> Result<String>;
 
     /// Bulk-index documents. Each tuple is (doc_id, payload). Returns document IDs.
-    fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>>;
+    fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
+        Ok(self.bulk_add_documents_with_receipt(docs)?.doc_ids)
+    }
+
+    fn bulk_add_documents_with_receipt(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+    ) -> Result<BulkWriteReceipt>;
 
     /// Bulk-index documents using caller-supplied contiguous sequence numbers.
     fn bulk_add_documents_with_start_seq(
         &self,
         docs: Vec<(String, serde_json::Value)>,
-        _start_seq_no: u64,
-    ) -> Result<Vec<String>> {
-        self.bulk_add_documents(docs)
-    }
+        start_seq_no: u64,
+    ) -> Result<Vec<String>>;
 
     /// Delete a document by its `_id`. Returns the number of deleted documents.
-    fn delete_document(&self, doc_id: &str) -> Result<u64>;
+    fn delete_document(&self, doc_id: &str) -> Result<u64> {
+        Ok(self.delete_document_with_receipt(doc_id)?.deleted)
+    }
+
+    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<DeleteWriteReceipt>;
 
     /// Delete a document using a caller-supplied sequence number.
-    fn delete_document_with_seq(&self, doc_id: &str, _seq_no: u64) -> Result<u64> {
-        self.delete_document(doc_id)
-    }
+    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64>;
 
     /// Retrieve a document by its `_id`. Returns the `_source` JSON if found.
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>>;
@@ -223,7 +271,8 @@ pub trait SearchEngine: Send + Sync {
     /// Returns the number of searchable documents.
     fn doc_count(&self) -> u64;
 
-    /// Get the local checkpoint: highest contiguous seq_no applied to this shard copy.
+    /// Get the local checkpoint: highest observed seq_no applied to this shard copy.
+    /// This is currently a high-water mark, not a contiguous-prefix proof.
     /// Returns 0 if no seq_no tracking is configured (backward compat).
     fn local_checkpoint(&self) -> u64 {
         0
@@ -240,4 +289,43 @@ pub trait SearchEngine: Send + Sync {
 
     /// Update the global checkpoint (called by primary after collecting replica checkpoints).
     fn update_global_checkpoint(&self, _checkpoint: u64) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BulkWriteReceipt;
+
+    #[test]
+    fn bulk_receipts_distinguish_zero_from_missing_sequences() {
+        let receipt = BulkWriteReceipt {
+            doc_ids: vec!["a".into(), "b".into()],
+            start_seq_no: Some(0),
+        };
+        assert_eq!(receipt.last_seq_no().unwrap(), Some(1));
+        assert!(
+            BulkWriteReceipt {
+                doc_ids: vec!["a".into()],
+                start_seq_no: None,
+            }
+            .last_seq_no()
+            .is_err()
+        );
+        assert!(
+            BulkWriteReceipt {
+                doc_ids: vec!["a".into(), "b".into()],
+                start_seq_no: Some(u64::MAX),
+            }
+            .last_seq_no()
+            .is_err()
+        );
+        assert_eq!(
+            BulkWriteReceipt {
+                doc_ids: vec![],
+                start_seq_no: None,
+            }
+            .last_seq_no()
+            .unwrap(),
+            None
+        );
+    }
 }

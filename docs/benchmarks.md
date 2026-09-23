@@ -1,5 +1,10 @@
 # FerrisSearch Benchmarks
 
+The [September 22, 2026 terms aggregation benchmark](terms-aggregation-benchmark-2026-09-22.md)
+compares the bounded dense ordinal counter against the preserved unchanged
+release binary on byte-identical Tantivy segments, with a high-cardinality
+sparse control and exact-result checks.
+
 Two environments tested: a cloud dev box (WSL2) and a consumer desktop (bare metal).
 Both run 3-node local clusters with 3 shards and 0 replicas.
 

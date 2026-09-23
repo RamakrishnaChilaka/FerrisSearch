@@ -86,8 +86,9 @@ architecture decision.
   leader" for a routable client operation.
 - **Shard data paths use index UUIDs**, never index names:
   `<data_dir>/<index_uuid>/shard_<id>`.
-- **Primary writes own sequence numbers.** Replica apply and recovery preserve
-  primary-assigned values through explicit-sequence APIs.
+- **Primary writes own sequence numbers.** Carry the WAL-assigned sequence or
+  batch range with the operation result; never infer it from a later shared
+  checkpoint. Replica apply and recovery preserve these values.
 - **Synchronous replication failures are request failures.** Do not turn
   partial replication into success-shaped responses.
 - **Remote publication is not multi-writer safe yet.** Do not claim otherwise
@@ -98,7 +99,8 @@ architecture decision.
   blocking pool for lifecycle I/O and dedicated worker pools for steady-state
   search/write work. Keep Raft and control-plane futures on Tokio.
 - **Tantivy terms match schema types.** Use the existing typed-term and typed
-  document helpers; mismatches can silently return zero hits.
+  document helpers. Numeric bucket identity must preserve integer precision;
+  do not round integer keys through floating-point representations.
 - **SQL is search-aware, not row-first.** Prefer pushdown, fast fields, and
   compact shard-local partials. Keep materialized-hit execution as a
   compatibility fallback.
@@ -112,19 +114,27 @@ architecture decision.
 
 ## Engineering Workflow
 
-1. Inspect the current call path, related tests, and scoped instructions.
-2. State whether the change is current-behavior work or roadmap work. For
-   roadmap work, identify the gate and prerequisite it advances.
-3. Reuse existing helpers and patterns before adding variants or parallel
-   abstractions.
-4. Make the smallest coherent change that covers all relevant surfaces:
-   domain types, persistence, transport, coordinator, observability, and docs.
-5. Add result-level tests, including failure and boundary cases. Distributed
-   behavior requires a distributed or transport-level regression.
-6. Run focused validation, then the repository checks appropriate to the
-   change. Do not update volatile test-count claims.
-7. Reconcile documentation with actual behavior. Keep current capabilities,
-   limitations, benchmark evidence, and future direction visibly separate.
+Inquiry, diagnosis, review, and planning are read-only unless changes are
+requested. For implementation, keep the approved scope and reuse authorization
+already given; ask only when a wrong assumption would materially affect behavior,
+compatibility, or verification. Preserve unrelated work and do not publish it.
+
+1. Trace the current call path, callers, tests, and matching scoped instructions.
+   Search symbols and headings before reading large files; do not reload
+   unchanged guidance or unrelated subsystems.
+2. Identify current-behavior work versus roadmap work. Roadmap work must name
+   its gate, prerequisites, and success evidence.
+3. Reuse existing helpers before introducing another implementation. Avoid
+   speculative cleanup, abstractions, or dependency upgrades.
+4. Make one coherent change across the necessary domain, persistence, transport,
+   coordinator, error, and documentation surfaces.
+5. Prove result-level behavior, including boundaries and failures. Concurrent
+   writes need operation-identity checks; distributed behavior needs transport
+   or multi-node coverage, not only local planner assertions.
+6. Choose verification from the final diff and affected boundaries. Profile
+   performance hypotheses and compare equivalent workloads before claiming gains.
+7. Update the owning instructions when their contract changes. Keep implemented
+   behavior, limitations, measured evidence, and future direction separate.
 
 For broad work, use the roadmap's AI-session operating contract: keep scope to
 one coherent work package, document assumptions, protect invariants, and leave
@@ -132,7 +142,21 @@ the next session a verifiable handoff rather than speculative partial wiring.
 
 ## Validation
 
-Canonical CI:
+Choose checks by risk; do not run a full Rust gate for unrelated prose changes.
+
+| Change | Verification |
+|---|---|
+| Docs or instructions only | `git diff --check` and relevant link/instruction checks |
+| Localized Rust behavior | Formatting and the narrowest result-level regression |
+| Public traits, persistence, transport, or concurrency | Compile affected consumers/features and add boundary-level regressions |
+| Broad cross-module Rust changes | Focused checks first, then the canonical CI checks below |
+
+Do not weaken assertions, ignore failures, or suppress lints to obtain a pass.
+Rerun checks affected by subsequent edits, not equivalent successful commands
+over an unchanged diff. Review findings need a concrete failure or violated
+contract; a missing test is a coverage gap, not proof of a runtime defect.
+
+Canonical CI remains:
 
 ```bash
 cargo fmt --check
