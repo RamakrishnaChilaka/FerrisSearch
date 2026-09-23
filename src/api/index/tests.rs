@@ -426,7 +426,9 @@ fn finalize_bulk_items_preserves_shard_error_reason() {
     }];
     let failed_targets = HashMap::from([(
         ("idx".to_string(), "node-1".to_string(), 0),
-        "Shard bulk index failed: Replication failed: replica node-2 timed out".to_string(),
+        Err(bulk::BulkTargetFailure::internal(
+            "Shard bulk index failed: Replication failed: replica node-2 timed out".to_string(),
+        )),
     )]);
 
     let items = finalize_bulk_items(vec![None], routed_docs, &failed_targets);
@@ -437,6 +439,57 @@ fn finalize_bulk_items_preserves_shard_error_reason() {
     assert_eq!(
         items[0]["index"]["error"]["reason"],
         "Shard bulk index failed: Replication failed: replica node-2 timed out"
+    );
+}
+
+#[test]
+fn finalize_bulk_items_preserves_receipts_across_targets_and_duplicate_ids() {
+    let documents = [
+        (0, "a", 0, "same"),
+        (1, "b", 1, "other"),
+        (2, "a", 0, "same"),
+    ];
+    let routed = documents
+        .into_iter()
+        .map(|(position, index, shard_id, doc_id)| RoutedBulkDoc {
+            position,
+            index_name: index.into(),
+            doc_id: doc_id.into(),
+            payload: serde_json::json!({}),
+            shard_id,
+            node_id: "node-1".into(),
+        })
+        .collect();
+    let outcomes = HashMap::from([
+        (("a".to_string(), "node-1".to_string(), 0), Ok(10)),
+        (("b".to_string(), "node-1".to_string(), 1), Ok(20)),
+    ]);
+    let items = finalize_bulk_items(vec![None, None, None], routed, &outcomes);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["index"]["_seq_no"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![10, 20, 11]
+    );
+    assert!(items.iter().all(|item| item["index"]["status"] == 201));
+}
+
+#[test]
+fn finalize_bulk_items_fails_when_primary_receipt_is_missing() {
+    let routed = vec![RoutedBulkDoc {
+        position: 0,
+        index_name: "idx".into(),
+        doc_id: "doc".into(),
+        payload: serde_json::json!({}),
+        shard_id: 0,
+        node_id: "node-1".into(),
+    }];
+    let items = finalize_bulk_items(vec![None], routed, &HashMap::new());
+    assert_eq!(items[0]["index"]["status"], 500);
+    assert_eq!(
+        items[0]["index"]["error"]["reason"],
+        "missing primary bulk write receipt"
     );
 }
 

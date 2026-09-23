@@ -82,6 +82,23 @@ pub struct KnnParams {
 3. Coordinator: `merge_aggregations()` combines per-shard partial results
 4. Returned in response under `"aggregations"` key
 
+### Terms Correctness And Counter Bounds
+- Numeric terms preserve typed identity until harvest: signed integers never
+  pass through `f64`, and floats normalize signed zero and NaN identity without
+  saturating large integral values to `i64`.
+- String terms use a bounded dense ordinal counter only when the segment
+  dictionary has at most 1024 terms; larger dictionaries use the sparse map.
+  Do not allocate a cardinality-sized unbounded vector.
+- Invalid ordinals or dictionary decode failures fail the query instead of
+  returning partial buckets.
+- Declared keyword arrays are flattened/coerced at ingest and deduplicated per
+  document, so one document contributes at most once to a given terms bucket.
+  This does not imply SQL ARRAY values or `UNNEST`; direct SQL readers remain
+  scalar-first.
+- Remote-store keyword term summaries use those same canonical indexed values.
+  A summary is eligible to prune only when it contains the complete distinct
+  set; missing or cap-exceeded summaries must keep the split.
+
 ## Sort
 - `SortClause::Simple(String)` — `"_score"` or field name
 - `SortClause::Field(HashMap<String, SortOrder>)` — `{ "year": "desc" }`

@@ -15,10 +15,13 @@ Each shard has a **CompositeEngine** that wraps two sub-engines:
 pub trait SearchEngine: Send + Sync {
     // Document operations
     fn add_document(&self, doc_id: &str, payload: Value) -> Result<String>;
+    fn add_document_with_receipt(&self, doc_id: &str, payload: Value) -> Result<IndexWriteReceipt>;
     fn add_document_with_seq(&self, doc_id: &str, payload: Value, seq_no: u64) -> Result<String>;
     fn bulk_add_documents(&self, docs: Vec<(String, Value)>) -> Result<Vec<String>>;
+    fn bulk_add_documents_with_receipt(&self, docs: Vec<(String, Value)>) -> Result<BulkWriteReceipt>;
     fn bulk_add_documents_with_start_seq(&self, docs: Vec<(String, Value)>, start_seq_no: u64) -> Result<Vec<String>>;
     fn delete_document(&self, doc_id: &str) -> Result<u64>;
+    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<DeleteWriteReceipt>;
     fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64>;
     fn get_document(&self, doc_id: &str) -> Result<Option<Value>>;
 
@@ -54,6 +57,14 @@ pub trait SearchEngine: Send + Sync {
 - `add_document()` / `bulk_add_documents()` / `delete_document()` are for local primary-originated writes that allocate new WAL seq_nos
 - `*_with_seq` methods are for replica apply and recovery replay only
 - Replica/recovery code MUST preserve the primary-assigned seq_no when writing to WAL; do not route replicated operations through the local-allocation methods
+- Primary transport handlers must use the receipt-returning methods. The legacy
+  ID/count methods delegate to them and intentionally discard only the receipt.
+- A receipt belongs to its operation, even if another write advances a checkpoint
+  before replication. Never reconstruct its sequence from `last_seq_no()` or
+  `local_checkpoint()`.
+- A non-empty bulk receipt has a contiguous WAL-reserved start; an empty batch
+  has no assigned sequence. Explicit-sequence methods are required implementations,
+  not defaults that allocate new primary sequences.
 
 ## CompositeEngine (src/engine/composite.rs)
 ```rust
@@ -65,7 +76,11 @@ pub struct CompositeEngine {
     global_cp: AtomicU64,    // global checkpoint (primary only)
 }
 ```
-- `CompositeEngine` updates its local checkpoint from the explicit seq in replica/recovery paths and from `text.last_seq_no()` for local primary writes
+- `CompositeEngine` updates its local checkpoint from explicit replica/recovery
+  sequences or primary write receipts. Global-checkpoint updates are atomic and
+  monotonic so late acknowledgements cannot regress progress.
+- Local checkpoints remain highest-observed sequence watermarks; receipt
+  attribution does not add gap tracking, retry deduplication, or primary fencing.
 
 ### Constructors
 - `new(data_dir, refresh_interval)` — default refresh loop (static interval)
@@ -96,7 +111,7 @@ tokio::select! {
 
 ## RemoteStore Engine (src/engine/remote_store.rs)
 - `remote_store` is a shardless read path. Root nodes load the published manifest for an index, query per-leaf cache/load status over gRPC, and batch split assignments to data-node leaves.
-- Newly published splits persist exact manifest summaries under `field_ranges` (mapped integer/float/date min/max) and `field_terms` (small exact mapped keyword/boolean distinct sets). Root-side search prunes published splits against those summaries for supported `term` and `range` filters before rendezvous scheduling; missing or unsupported metadata must keep the split. GET/POST search responses and SQL/EXPLAIN ANALYZE paths that execute through remote_store expose `remote_store.pruning` counters for published, candidate, pruned, and assigned split counts.
+- Newly published splits persist exact manifest summaries under `field_ranges` (mapped integer/float/date min/max) and `field_terms` (small exact mapped keyword/boolean distinct sets). Keyword summaries must reuse `HotEngine`'s index-time recursive flatten/coerce/null-skip semantics; exceeding the distinct-value cap omits the entire field summary instead of publishing a partial set. Root-side search prunes published splits against those summaries for supported `term` and `range` filters before rendezvous scheduling; missing or unsupported metadata must keep the split. GET/POST search responses and SQL/EXPLAIN ANALYZE paths that execute through remote_store expose `remote_store.pruning` counters for published, candidate, pruned, and assigned split counts.
 - Leaf selection uses rendezvous ranking over `(index_uuid, manifest_generation, split_id, node_id)`, then chooses among the top-ranked candidates by `reader_cached` > `artifact_cached` > lower `inflight_bytes` > lower `queue_depth`.
 - Leaves use `RemoteSplitReaderCache` to reuse open `HotEngine` readers across requests. Reader entries pin the underlying cached split directory for as long as the reader stays live.
 - `StorageManager::cached_split_status()` reports warm-artifact state, `begin_remote_store_batch()` / `remote_store_load_snapshot()` publish live load signals, and `reap_split_cache()` removes stale or over-budget split directories after batches while leaving pinned artifacts intact.
@@ -131,6 +146,19 @@ Integer and Float fields get all three: INDEXED | STORED | FAST.
 Keyword and Boolean fields get: STRING | STORED + FAST (set_fast(None) for dictionary-encoded columnar).
 Without FAST, range queries scan the inverted index (slow on high-cardinality fields).
 With FAST, Tantivy reads a columnar structure - orders of magnitude faster for range queries, sorting, and aggregations.
+
+### Keyword Values
+- Declared keyword fields accept scalar strings/numbers/booleans, nulls, and
+  nested arrays of those values. Flatten for indexing, coerce scalars to text,
+  skip nulls, and deduplicate values within a document. Preserve `_source`.
+- Validate keyword objects before any WAL append or writer mutation, including
+  the entire shard batch and explicit-sequence paths. Replay must surface invalid
+  values rather than silently omit indexed data.
+- Numeric keyword arrays are not vector fields. Keep them out of the legacy
+  automatic vector-detection path.
+- Query DSL terms buckets count matching documents once per keyword value.
+  SQL's direct columnar readers remain scalar-first; this does not introduce
+  SQL array expressions or `UNNEST` semantics.
 
 ### Fast-Field Aggregations (Single-Pass Collector)
 Aggregations run in the same Tantivy search pass as hit collection via `AggCollector` -- a custom
@@ -169,6 +197,16 @@ for agg-only `size=0` requests. When no aggs are requested, `None` adds zero ove
 - `AggCollector` implements `Collector` -- `for_segment()` opens fast-field columns per segment
 - `AggSegmentCollector` implements `SegmentCollector` -- `collect(doc, score)` reads column values and accumulates
 - String `terms` aggs count term ords per segment in `collect()`, then resolve ord→string once in `harvest()`
+- Use bounded dense ordinal counters for small dictionaries, with a sparse
+  fallback for larger dictionaries. Do not allocate an unbounded vector from
+  field cardinality or truncate partial buckets before coordinator merging.
+- Choose the dense/sparse strategy once per segment and keep them as specialized
+  collector variants. Do not add another per-document enum dispatch to the
+  sparse `HashMap` hot loop.
+- Numeric term keys retain their underlying integer/float representation until
+  harvest. Never cast integer keys to `f64` or integral floats to `i64`.
+- Invalid ordinals and dictionary read failures propagate as query errors;
+  harvesting must not silently drop their buckets.
 - `harvest()` returns per-segment data, `merge_fruits()` merges across segments into `HashMap<String, PartialAggResult>`
 
 ### Grouped Metrics Collector (Ordinal-Based)
@@ -292,6 +330,10 @@ Falls back to per-doc stored-doc reading when any column requires `SourceFallbac
 - `route_document(doc_id, metadata) -> Option<NodeId>` — returns primary node for doc
 
 ## Checkpoint Semantics
-- **Local checkpoint**: highest contiguous seq_no applied on this replica/primary
-- **Global checkpoint**: min of all in-sync replicas' local checkpoints (primary only)
+- **Local checkpoint**: highest observed seq_no applied on this replica/primary
+- **Global checkpoint**: monotonic minimum of the primary and acknowledged
+  replica high-water marks
+- These are currently watermarks, not gap-aware contiguous-prefix proofs.
+  Receipt propagation does not add retry deduplication, primary epochs, or
+  failover fencing.
 - `flush_with_global_checkpoint()`: retains WAL entries above global_cp for replica recovery

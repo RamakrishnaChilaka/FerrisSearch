@@ -20,7 +20,26 @@ pub(super) struct RoutedBulkDoc {
 
 pub(super) type BulkTargetKey = (String, String, u32);
 
-fn bulk_success_item(index_name: &str, doc_id: &str) -> Value {
+#[derive(Debug)]
+pub(super) struct BulkTargetFailure {
+    pub status: StatusCode,
+    pub error_type: &'static str,
+    pub reason: String,
+}
+
+impl BulkTargetFailure {
+    pub(super) fn internal(reason: String) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error_type: "shard_failure",
+            reason,
+        }
+    }
+}
+
+type BulkTargetResults = HashMap<BulkTargetKey, Result<u64, BulkTargetFailure>>;
+
+fn bulk_success_item(index_name: &str, doc_id: &str, seq_no: u64) -> Value {
     serde_json::json!({
         "index": {
             "_index": index_name,
@@ -29,7 +48,7 @@ fn bulk_success_item(index_name: &str, doc_id: &str) -> Value {
             "result": "created",
             "status": 201,
             "_shards": { "total": 1, "successful": 1, "failed": 0 },
-            "_seq_no": 0,
+            "_seq_no": seq_no,
             "_primary_term": 1
         }
     })
@@ -106,7 +125,7 @@ async fn forward_bulk_batches(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
     routed_docs: &[RoutedBulkDoc],
-) -> HashMap<BulkTargetKey, String> {
+) -> BulkTargetResults {
     let mut shard_batches: HashMap<BulkTargetKey, Vec<(String, Value)>> = HashMap::new();
     for doc in routed_docs {
         shard_batches
@@ -121,7 +140,7 @@ async fn forward_bulk_batches(
 
     let mut futures = Vec::new();
     let mut shard_keys = Vec::new();
-    let mut failed_targets = HashMap::new();
+    let mut outcomes = HashMap::new();
 
     for ((index_name, node_id, shard_id), batch) in shard_batches {
         if let Some(node_info) = cluster_state.nodes.get(&node_id) {
@@ -129,15 +148,20 @@ async fn forward_bulk_batches(
             let node_info = node_info.clone();
             let batch_index = index_name.to_string();
             futures.push(tokio::spawn(async move {
-                client
+                let receipt = client
                     .forward_bulk_to_shard(&node_info, &batch_index, shard_id, &batch)
-                    .await
+                    .await?;
+                receipt.start_seq_no.ok_or_else(|| {
+                    anyhow::anyhow!("non-empty bulk batch has no assigned starting sequence")
+                })
             }));
             shard_keys.push((index_name, node_id, shard_id));
         } else {
-            failed_targets.insert(
+            outcomes.insert(
                 (index_name, node_id, shard_id),
-                "Primary node missing from cluster state".to_string(),
+                Err(BulkTargetFailure::internal(
+                    "Primary node missing from cluster state".to_string(),
+                )),
             );
         }
     }
@@ -145,40 +169,77 @@ async fn forward_bulk_batches(
     let results = join_all(futures).await;
     for (key, result) in shard_keys.into_iter().zip(results) {
         match result {
-            Ok(Ok(_)) => {}
+            Ok(Ok(start_seq_no)) => {
+                outcomes.insert(key, Ok(start_seq_no));
+            }
             Ok(Err(e)) => {
-                failed_targets.insert(key, e.to_string());
+                let failure = if is_document_validation_error(&e) {
+                    BulkTargetFailure {
+                        status: StatusCode::BAD_REQUEST,
+                        error_type: "mapper_parsing_exception",
+                        reason: e.to_string(),
+                    }
+                } else {
+                    BulkTargetFailure::internal(e.to_string())
+                };
+                outcomes.insert(key, Err(failure));
             }
             Err(join_err) => {
-                failed_targets.insert(key, format!("bulk forwarding task failed: {join_err}"));
+                outcomes.insert(
+                    key,
+                    Err(BulkTargetFailure::internal(format!(
+                        "bulk forwarding task failed: {join_err}"
+                    ))),
+                );
             }
         }
     }
 
-    failed_targets
+    outcomes
 }
 
 pub(super) fn finalize_bulk_items(
     mut item_results: Vec<Option<Value>>,
     routed_docs: Vec<RoutedBulkDoc>,
-    failed_targets: &HashMap<BulkTargetKey, String>,
+    outcomes: &BulkTargetResults,
 ) -> Vec<Value> {
+    let mut offsets: HashMap<BulkTargetKey, u64> = HashMap::new();
     for doc in routed_docs {
         let target = (
             doc.index_name.to_string(),
             doc.node_id.clone(),
             doc.shard_id,
         );
-        let item = if let Some(reason) = failed_targets.get(&target) {
-            bulk_error_item(
+        let item = match outcomes.get(&target) {
+            Some(Err(failure)) => bulk_error_item(
+                Some(&doc.index_name),
+                &doc.doc_id,
+                failure.status,
+                failure.error_type,
+                &failure.reason,
+            ),
+            Some(Ok(start_seq_no)) => {
+                let offset = offsets.entry(target).or_default();
+                let seq_no = start_seq_no.checked_add(*offset);
+                *offset += 1;
+                match seq_no {
+                    Some(seq_no) => bulk_success_item(&doc.index_name, &doc.doc_id, seq_no),
+                    None => bulk_error_item(
+                        Some(&doc.index_name),
+                        &doc.doc_id,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "shard_failure",
+                        "primary bulk sequence range overflows",
+                    ),
+                }
+            }
+            None => bulk_error_item(
                 Some(&doc.index_name),
                 &doc.doc_id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "shard_failure",
-                reason,
-            )
-        } else {
-            bulk_success_item(&doc.index_name, &doc.doc_id)
+                "missing primary bulk write receipt",
+            ),
         };
         item_results[doc.position] = Some(item);
     }
@@ -421,8 +482,8 @@ pub async fn bulk_index_global(
         }
     }
 
-    let failed_targets = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
-    if !failed_targets.is_empty() {
+    let outcomes = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
+    if outcomes.values().any(Result::is_err) {
         has_errors = true;
     }
 
@@ -442,7 +503,10 @@ pub async fn bulk_index_global(
         }
     }
 
-    let all_items = finalize_bulk_items(item_results, routed_docs, &failed_targets);
+    let all_items = finalize_bulk_items(item_results, routed_docs, &outcomes);
+    has_errors |= all_items
+        .iter()
+        .any(|item| item["index"].get("error").is_some());
 
     (
         StatusCode::OK,
@@ -527,8 +591,8 @@ pub async fn bulk_index(
         }
     }
 
-    let failed_targets = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
-    if !failed_targets.is_empty() {
+    let outcomes = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
+    if outcomes.values().any(Result::is_err) {
         has_errors = true;
     }
 
@@ -542,7 +606,10 @@ pub async fn bulk_index(
         }
     }
 
-    let items = finalize_bulk_items(item_results, routed_docs, &failed_targets);
+    let items = finalize_bulk_items(item_results, routed_docs, &outcomes);
+    has_errors |= items
+        .iter()
+        .any(|item| item["index"].get("error").is_some());
 
     (
         StatusCode::OK,

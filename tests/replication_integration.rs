@@ -384,6 +384,43 @@ async fn index_and_get_document_via_grpc() {
     assert_eq!(source["score"], 42);
 }
 
+#[tokio::test]
+async fn transport_client_accepts_server_generated_document_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("transport-client-auto-id".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "auto-id-index");
+
+    let addr = start_grpc_server(cm, sm).await;
+    let node = DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: addr.port(),
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    };
+
+    let response = TransportClient::new()
+        .forward_index_to_shard(
+            &node,
+            "auto-id-index",
+            0,
+            "",
+            &serde_json::json!({"message": "generated through transport client"}),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response["_id"]
+            .as_str()
+            .is_some_and(|doc_id| !doc_id.is_empty())
+    );
+    assert_eq!(response["_seq_no"], 0);
+}
+
 #[cfg(feature = "transport-tls")]
 #[tokio::test]
 async fn index_and_get_document_via_grpc_with_tls() {
@@ -2391,6 +2428,209 @@ async fn primary_write_advances_global_checkpoint() {
             .isr_tracker
             .in_sync_replicas("gc-idx", 0, primary_engine.local_checkpoint());
     assert!(!isr.is_empty(), "ISR should contain the replica node");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("receipt-cluster".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("receipt-cluster".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let index = "receipt-index";
+    setup_two_node_cluster_state(&primary_cm, &replica_cm, index, replica_addr.port());
+    for manager in [&primary_cm, &replica_cm] {
+        let mut state = manager.get_state();
+        let metadata = state.indices.get_mut(index).unwrap();
+        metadata.dynamic = ferrissearch::cluster::state::DynamicMapping::Strict;
+        metadata.mappings.insert(
+            "message".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        manager.update_state(state);
+    }
+    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let mut client = connect_client(primary_addr).await;
+    let seed = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: index.into(),
+            shard_id: 0,
+            doc_id: "seed".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"message": "seed"})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(seed.success, "{}", seed.error);
+    assert_eq!(seed.seq_no, Some(0));
+
+    let jobs = (0..24).map(|number| {
+        let mut client = client.clone();
+        async move {
+            match number % 3 {
+                0 => {
+                    let id = format!("single-{number}");
+                    let response = client
+                        .index_doc(tonic::Request::new(ShardDocRequest {
+                            index_name: index.into(),
+                            shard_id: 0,
+                            doc_id: id.clone(),
+                            payload_json: serde_json::to_vec(&serde_json::json!({"message": id}))
+                                .unwrap(),
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert!(response.success, "{}", response.error);
+                    vec![(
+                        response.seq_no.unwrap(),
+                        ("index".to_string(), response.doc_id),
+                    )]
+                }
+                1 => {
+                    let ids: Vec<_> = (0..3).map(|item| format!("bulk-{number}-{item}")).collect();
+                    let response = client
+                        .bulk_index(tonic::Request::new(ShardBulkRequest {
+                            index_name: index.into(),
+                            shard_id: 0,
+                            documents_json: ids
+                                .iter()
+                                .map(|id| {
+                                    serde_json::to_vec(&serde_json::json!({
+                                        "_doc_id": id,
+                                        "_source": {"message": id}
+                                    }))
+                                    .unwrap()
+                                })
+                                .collect(),
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert!(response.success, "{}", response.error);
+                    assert_eq!(response.doc_ids, ids);
+                    let start = response.start_seq_no.unwrap();
+                    response
+                        .doc_ids
+                        .into_iter()
+                        .enumerate()
+                        .map(|(offset, id)| (start + offset as u64, ("index".to_string(), id)))
+                        .collect()
+                }
+                _ => {
+                    let id = format!("delete-{number}");
+                    let response = client
+                        .delete_doc(tonic::Request::new(ShardDeleteRequest {
+                            index_name: index.into(),
+                            shard_id: 0,
+                            doc_id: id.clone(),
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert!(response.success, "{}", response.error);
+                    vec![(response.seq_no.unwrap(), ("delete".to_string(), id))]
+                }
+            }
+        }
+    });
+    let results = tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(jobs))
+        .await
+        .unwrap();
+    let mut receipts =
+        std::collections::BTreeMap::from([(0, ("index".to_string(), "seed".to_string()))]);
+    for (seq_no, identity) in results.into_iter().flatten() {
+        assert!(
+            receipts.insert(seq_no, identity).is_none(),
+            "duplicate sequence {seq_no}"
+        );
+    }
+    assert_eq!(
+        receipts.keys().copied().collect::<Vec<_>>(),
+        (0..41).collect::<Vec<_>>()
+    );
+    for directory in [primary_dir.path(), replica_dir.path()] {
+        let wal =
+            HotTranslog::open(directory.join(format!("{index}-uuid")).join("shard_0")).unwrap();
+        let entries = wal.read_all().unwrap();
+        assert_eq!(entries.len(), receipts.len());
+        let actual: std::collections::BTreeMap<_, _> = entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.seq_no,
+                    (
+                        entry.op.as_str().to_string(),
+                        entry.payload["_doc_id"].as_str().unwrap().to_string(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual.len(),
+            receipts.len(),
+            "WAL has duplicate sequence identities"
+        );
+        assert_eq!(actual, receipts);
+    }
+    assert_eq!(
+        primary_sm.get_shard(index, 0).unwrap().global_checkpoint(),
+        40
+    );
+}
+
+#[tokio::test]
+async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ClusterManager::new("replica-validation".into()));
+    let shards = Arc::new(ShardManager::new(directory.path(), Duration::from_secs(60)));
+    let index = "replica-validation";
+    setup_single_node_cluster_state(&manager, index);
+    let address = start_grpc_server(manager, shards.clone()).await;
+    let mut client = connect_client(address).await;
+    let operation = |seq_no, op: &str| ReplicateDocRequest {
+        index_name: index.into(),
+        shard_id: 0,
+        doc_id: format!("doc-{seq_no}"),
+        payload_json: serde_json::to_vec(&serde_json::json!({"body": "value"})).unwrap(),
+        op: op.to_string(),
+        seq_no,
+    };
+    for ops in [
+        vec![operation(10, "index"), operation(12, "index")],
+        vec![operation(u64::MAX, "index"), operation(0, "index")],
+        vec![operation(0, "delete")],
+    ] {
+        let error = client
+            .replicate_bulk(tonic::Request::new(ReplicateBulkRequest {
+                index_name: index.into(),
+                shard_id: 0,
+                ops,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    let wal = HotTranslog::open(
+        directory
+            .path()
+            .join(format!("{index}-uuid"))
+            .join("shard_0"),
+    )
+    .unwrap();
+    assert!(wal.read_all().unwrap().is_empty());
+    assert_eq!(shards.get_shard(index, 0).unwrap().doc_count(), 0);
 }
 
 #[tokio::test]

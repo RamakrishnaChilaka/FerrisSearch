@@ -255,16 +255,7 @@ impl TransportClient {
             doc_id: doc_id.to_string(),
         });
         let response = client.index_doc(request).await?.into_inner();
-        if response.success {
-            Ok(serde_json::json!({
-                "_index": index_name,
-                "_id": response.doc_id,
-                "_shard": shard_id,
-                "result": "created"
-            }))
-        } else {
-            Err(anyhow::anyhow!("Shard index failed: {}", response.error))
-        }
+        decode_shard_doc_response(index_name, shard_id, doc_id, response)
     }
 
     /// Forward a bulk batch to a specific shard on a node
@@ -274,7 +265,7 @@ impl TransportClient {
         index_name: &str,
         shard_id: u32,
         docs: &[(String, serde_json::Value)],
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<crate::engine::BulkWriteReceipt, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let documents_json: Vec<Vec<u8>> = docs
             .iter()
@@ -295,18 +286,7 @@ impl TransportClient {
             documents_json,
         });
         let response = client.bulk_index(request).await?.into_inner();
-        if response.success {
-            Ok(serde_json::json!({
-                "took": 0,
-                "errors": false,
-                "items": response.doc_ids.iter().map(|id| serde_json::json!({ "index": { "_id": id, "result": "created" } })).collect::<Vec<_>>()
-            }))
-        } else {
-            Err(anyhow::anyhow!(
-                "Shard bulk index failed: {}",
-                response.error
-            ))
-        }
+        decode_shard_bulk_response(docs, response)
     }
 
     /// Forward a delete operation to a specific shard on a node
@@ -324,16 +304,7 @@ impl TransportClient {
             doc_id: doc_id.to_string(),
         });
         let response = client.delete_doc(request).await?.into_inner();
-        if response.success {
-            Ok(serde_json::json!({
-                "_index": index_name,
-                "_id": doc_id,
-                "_shard": shard_id,
-                "result": "deleted"
-            }))
-        } else {
-            Err(anyhow::anyhow!("Delete failed: {}", response.error))
-        }
+        decode_shard_delete_response(index_name, shard_id, doc_id, response)
     }
 
     /// Forward a get-by-ID request to a specific shard on a node
@@ -1118,6 +1089,82 @@ impl TransportClient {
     }
 }
 
+fn decode_shard_doc_response(
+    index_name: &str,
+    shard_id: u32,
+    expected_doc_id: &str,
+    response: ShardDocResponse,
+) -> Result<serde_json::Value, anyhow::Error> {
+    if !response.success {
+        anyhow::bail!("Shard index failed: {}", response.error);
+    }
+    if response.doc_id.is_empty() {
+        anyhow::bail!("successful shard index response returned an empty document id");
+    }
+    if !expected_doc_id.is_empty() && response.doc_id != expected_doc_id {
+        anyhow::bail!(
+            "successful shard index response returned document id '{}' instead of '{}'",
+            response.doc_id,
+            expected_doc_id
+        );
+    }
+    let seq_no = response.seq_no.ok_or_else(|| {
+        anyhow::anyhow!("successful shard index response is missing its assigned sequence")
+    })?;
+    Ok(serde_json::json!({
+        "_index": index_name,
+        "_id": response.doc_id,
+        "_shard": shard_id,
+        "_seq_no": seq_no,
+        "result": "created"
+    }))
+}
+
+fn decode_shard_bulk_response(
+    docs: &[(String, serde_json::Value)],
+    response: ShardBulkResponse,
+) -> Result<crate::engine::BulkWriteReceipt, anyhow::Error> {
+    if !response.success {
+        anyhow::bail!("Shard bulk index failed: {}", response.error);
+    }
+    if response.doc_ids.len() != docs.len()
+        || response
+            .doc_ids
+            .iter()
+            .zip(docs)
+            .any(|(id, (expected, _))| id != expected)
+    {
+        anyhow::bail!("successful shard bulk response has inconsistent document identities");
+    }
+    let receipt = crate::engine::BulkWriteReceipt {
+        doc_ids: response.doc_ids,
+        start_seq_no: response.start_seq_no,
+    };
+    receipt.last_seq_no()?;
+    Ok(receipt)
+}
+
+fn decode_shard_delete_response(
+    index_name: &str,
+    shard_id: u32,
+    doc_id: &str,
+    response: ShardDeleteResponse,
+) -> Result<serde_json::Value, anyhow::Error> {
+    if !response.success {
+        anyhow::bail!("Delete failed: {}", response.error);
+    }
+    let seq_no = response.seq_no.ok_or_else(|| {
+        anyhow::anyhow!("successful shard delete response is missing its assigned sequence")
+    })?;
+    Ok(serde_json::json!({
+        "_index": index_name,
+        "_id": doc_id,
+        "_shard": shard_id,
+        "_seq_no": seq_no,
+        "result": "deleted"
+    }))
+}
+
 #[derive(Debug)]
 struct DecodedSqlBatchResponse {
     batch: RecordBatch,
@@ -1276,6 +1323,162 @@ mod tests {
         };
 
         assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn shard_doc_response_decoder_accepts_server_generated_id() {
+        let index = decode_shard_doc_response(
+            "idx",
+            0,
+            "",
+            ShardDocResponse {
+                success: true,
+                doc_id: "generated".into(),
+                error: String::new(),
+                seq_no: Some(0),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(index["_id"], "generated");
+        assert_eq!(index["_seq_no"], 0);
+    }
+
+    #[test]
+    fn shard_doc_response_decoder_rejects_empty_success_id() {
+        for expected_doc_id in ["", "doc"] {
+            assert!(
+                decode_shard_doc_response(
+                    "idx",
+                    0,
+                    expected_doc_id,
+                    ShardDocResponse {
+                        success: true,
+                        doc_id: String::new(),
+                        error: String::new(),
+                        seq_no: Some(0),
+                    },
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn write_response_decoders_require_operation_receipts() {
+        let index = decode_shard_doc_response(
+            "idx",
+            0,
+            "doc",
+            ShardDocResponse {
+                success: true,
+                doc_id: "doc".into(),
+                error: String::new(),
+                seq_no: Some(0),
+            },
+        )
+        .unwrap();
+        assert_eq!(index["_seq_no"], 0);
+        assert!(
+            decode_shard_doc_response(
+                "idx",
+                0,
+                "doc",
+                ShardDocResponse {
+                    success: true,
+                    doc_id: "doc".into(),
+                    error: String::new(),
+                    seq_no: None,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            decode_shard_doc_response(
+                "idx",
+                0,
+                "doc",
+                ShardDocResponse {
+                    success: true,
+                    doc_id: "other".into(),
+                    error: String::new(),
+                    seq_no: Some(0),
+                },
+            )
+            .is_err()
+        );
+
+        let docs = vec![
+            ("a".to_string(), serde_json::json!({})),
+            ("b".to_string(), serde_json::json!({})),
+        ];
+        let bulk = decode_shard_bulk_response(
+            &docs,
+            ShardBulkResponse {
+                success: true,
+                doc_ids: vec!["a".into(), "b".into()],
+                error: String::new(),
+                start_seq_no: Some(0),
+            },
+        )
+        .unwrap();
+        assert_eq!(bulk.last_seq_no().unwrap(), Some(1));
+        for response in [
+            ShardBulkResponse {
+                success: true,
+                doc_ids: vec!["a".into(), "b".into()],
+                error: String::new(),
+                start_seq_no: None,
+            },
+            ShardBulkResponse {
+                success: true,
+                doc_ids: vec!["b".into(), "a".into()],
+                error: String::new(),
+                start_seq_no: Some(0),
+            },
+        ] {
+            assert!(decode_shard_bulk_response(&docs, response).is_err());
+        }
+        assert!(
+            decode_shard_bulk_response(
+                &[],
+                ShardBulkResponse {
+                    success: true,
+                    doc_ids: vec![],
+                    error: String::new(),
+                    start_seq_no: Some(0),
+                },
+            )
+            .is_err()
+        );
+
+        let delete = decode_shard_delete_response(
+            "idx",
+            0,
+            "doc",
+            ShardDeleteResponse {
+                success: true,
+                deleted: 1,
+                error: String::new(),
+                seq_no: Some(0),
+            },
+        )
+        .unwrap();
+        assert_eq!(delete["_seq_no"], 0);
+        assert!(
+            decode_shard_delete_response(
+                "idx",
+                0,
+                "doc",
+                ShardDeleteResponse {
+                    success: true,
+                    deleted: 1,
+                    error: String::new(),
+                    seq_no: None,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]

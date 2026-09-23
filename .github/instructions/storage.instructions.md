@@ -68,6 +68,10 @@ best-effort fallbacks.
 - Field summaries are pruning aids, not truth. Missing, capped, unknown, or
   unsupported summaries must keep a split; they must never cause false-negative
   pruning.
+- Mapped keyword `field_terms` summaries must use the same recursive
+  flattening, string/number/boolean coercion, null skipping, and per-field
+  deduplication as `HotEngine` indexing. If every distinct value cannot fit
+  within the summary cap, omit that field's summary entirely.
 - Any future multi-writer protocol needs conditional pointer publication,
   monotonic writer fencing, idempotent operation identity, and crash evidence.
   A process mutex or "last generation + 1" is not sufficient.

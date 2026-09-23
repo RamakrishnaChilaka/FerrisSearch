@@ -22,9 +22,10 @@ pub struct CompositeEngine {
     text: HotEngine,
     vector: RwLock<Option<VectorIndex>>,
     data_dir: std::path::PathBuf,
-    /// Local checkpoint: highest contiguous seq_no applied to this shard copy.
+    /// Local checkpoint: highest observed seq_no applied to this shard copy.
+    /// This is a high-water mark, not a contiguous-prefix proof.
     checkpoint: std::sync::atomic::AtomicU64,
-    /// Global checkpoint: min of all in-sync replica checkpoints (primary only).
+    /// Monotonic replicated high-water mark (primary only).
     global_cp: std::sync::atomic::AtomicU64,
     /// Shared column cache for fast-field Arrow arrays.
     #[allow(dead_code)]
@@ -265,8 +266,10 @@ impl CompositeEngine {
     /// Extract and index vector fields from a document payload.
     fn index_vectors(&self, doc_id: &str, payload: &serde_json::Value) {
         if let Some(obj) = payload.as_object() {
-            for (_field, value) in obj {
-                if let Some(arr) = value.as_array() {
+            for (field, value) in obj {
+                if let Some(arr) = value.as_array()
+                    && !self.text.is_keyword_field(field)
+                {
                     let floats: Option<Vec<f32>> =
                         arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
                     if let Some(vec) = floats
@@ -352,11 +355,17 @@ impl CompositeEngine {
 }
 
 impl SearchEngine for CompositeEngine {
-    fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String> {
-        let id = self.text.add_document(doc_id, payload.clone())?;
-        self.index_vectors(&id, &payload);
-        self.update_local_checkpoint(self.text.last_seq_no());
-        Ok(id)
+    fn add_document_with_receipt(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<super::IndexWriteReceipt> {
+        let receipt = self
+            .text
+            .add_document_with_receipt(doc_id, payload.clone())?;
+        self.index_vectors(&receipt.doc_id, &payload);
+        self.update_local_checkpoint(receipt.seq_no);
+        Ok(receipt)
     }
 
     fn add_document_with_seq(
@@ -373,14 +382,19 @@ impl SearchEngine for CompositeEngine {
         Ok(id)
     }
 
-    fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
+    fn bulk_add_documents_with_receipt(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+    ) -> Result<super::BulkWriteReceipt> {
         // Extract vector fields before passing docs to text engine (avoids cloning)
         let mut vec_fields: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
         for (_, payload) in &docs {
             let mut found = None;
             if let Some(obj) = payload.as_object() {
-                for (_field, value) in obj {
-                    if let Some(arr) = value.as_array() {
+                for (field, value) in obj {
+                    if let Some(arr) = value.as_array()
+                        && !self.text.is_keyword_field(field)
+                    {
                         let floats: Option<Vec<f32>> =
                             arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
                         if let Some(ref vec) = floats
@@ -395,12 +409,12 @@ impl SearchEngine for CompositeEngine {
             vec_fields.push(found);
         }
 
-        let ids = self.text.bulk_add_documents(docs)?;
+        let receipt = self.text.bulk_add_documents_with_receipt(docs)?;
 
         // Collect (doc_id, vector) pairs and bulk-add to vector index
         let mut vec_batch: Vec<(String, Vec<f32>)> = Vec::new();
         for (i, vec_opt) in vec_fields.into_iter().enumerate() {
-            if let (Some(id), Some(vec)) = (ids.get(i), vec_opt)
+            if let (Some(id), Some(vec)) = (receipt.doc_ids.get(i), vec_opt)
                 && self.ensure_vector_index(vec.len()).is_ok()
             {
                 vec_batch.push((id.clone(), vec));
@@ -418,8 +432,10 @@ impl SearchEngine for CompositeEngine {
                 }
             }
         }
-        self.update_local_checkpoint(self.text.last_seq_no());
-        Ok(ids)
+        if let Some(last_seq_no) = receipt.last_seq_no()? {
+            self.update_local_checkpoint(last_seq_no);
+        }
+        Ok(receipt)
     }
 
     fn bulk_add_documents_with_start_seq(
@@ -431,8 +447,10 @@ impl SearchEngine for CompositeEngine {
         for (_, payload) in &docs {
             let mut found = None;
             if let Some(obj) = payload.as_object() {
-                for (_field, value) in obj {
-                    if let Some(arr) = value.as_array() {
+                for (field, value) in obj {
+                    if let Some(arr) = value.as_array()
+                        && !self.text.is_keyword_field(field)
+                    {
                         let floats: Option<Vec<f32>> =
                             arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
                         if let Some(ref vec) = floats
@@ -473,12 +491,12 @@ impl SearchEngine for CompositeEngine {
         }
 
         if !ids.is_empty() {
-            self.update_local_checkpoint(start_seq_no + ids.len() as u64 - 1);
+            self.update_local_checkpoint(start_seq_no + (ids.len() - 1) as u64);
         }
         Ok(ids)
     }
 
-    fn delete_document(&self, doc_id: &str) -> Result<u64> {
+    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<super::DeleteWriteReceipt> {
         // Remove from vector index if present
         let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
         if let Some(ref vi) = *guard {
@@ -486,9 +504,9 @@ impl SearchEngine for CompositeEngine {
             let _ = vi.remove(key); // ignore errors on missing keys
         }
         drop(guard);
-        let result = self.text.delete_document(doc_id)?;
-        self.update_local_checkpoint(self.text.last_seq_no());
-        Ok(result)
+        let receipt = self.text.delete_document_with_receipt(doc_id)?;
+        self.update_local_checkpoint(receipt.seq_no);
+        Ok(receipt)
     }
 
     fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
@@ -662,7 +680,7 @@ impl SearchEngine for CompositeEngine {
 
     fn update_global_checkpoint(&self, checkpoint: u64) {
         self.global_cp
-            .store(checkpoint, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(checkpoint, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1580,13 +1598,84 @@ mod tests {
     }
 
     #[test]
-    fn update_global_checkpoint_can_overwrite() {
+    fn update_global_checkpoint_never_regresses() {
         let (_dir, engine) = create_engine();
         engine.update_global_checkpoint(10);
         assert_eq!(engine.global_checkpoint(), 10);
 
-        // store semantics — can go lower (advance_global_checkpoint prevents this)
         engine.update_global_checkpoint(5);
-        assert_eq!(engine.global_checkpoint(), 5);
+        assert_eq!(engine.global_checkpoint(), 10);
+    }
+
+    #[test]
+    fn primary_receipts_survive_later_writes_and_empty_batches() {
+        let (_dir, engine) = create_engine();
+        let engine = Arc::new(engine);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_engine = engine.clone();
+        let writer_barrier = barrier.clone();
+        let first = std::thread::spawn(move || {
+            let receipt = writer_engine
+                .add_document_with_receipt("first", json!({"body": "first"}))
+                .unwrap();
+            writer_barrier.wait();
+            writer_barrier.wait();
+            assert_eq!(writer_engine.local_checkpoint(), 3);
+            receipt
+        });
+        barrier.wait();
+        let batch = engine
+            .bulk_add_documents_with_receipt(vec![
+                ("second".into(), json!({"body": "second"})),
+                ("third".into(), json!({"body": "third"})),
+            ])
+            .unwrap();
+        assert_eq!(batch.start_seq_no, Some(1));
+        assert_eq!(batch.last_seq_no().unwrap(), Some(2));
+        let deleted = engine.delete_document_with_receipt("second").unwrap();
+        assert_eq!(deleted.seq_no, 3);
+        let empty = engine.bulk_add_documents_with_receipt(vec![]).unwrap();
+        assert_eq!(empty.start_seq_no, None);
+        assert_eq!(engine.local_checkpoint(), 3);
+        barrier.wait();
+        assert_eq!(first.join().unwrap().seq_no, 0);
+        assert_eq!(
+            engine
+                .add_document_with_receipt("fourth", json!({"body": "fourth"}))
+                .unwrap()
+                .seq_no,
+            4
+        );
+    }
+
+    #[test]
+    fn numeric_keyword_arrays_do_not_create_vector_indexes() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let directory = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new_with_mappings(
+            directory.path(),
+            Duration::from_secs(60),
+            &std::collections::HashMap::from([(
+                "tags".into(),
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            )]),
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        engine.add_document("one", json!({"tags": [1, 2]})).unwrap();
+        engine
+            .bulk_add_documents(vec![("two".into(), json!({"tags": [3, 4]}))])
+            .unwrap();
+        engine
+            .bulk_add_documents_with_start_seq(
+                vec![("replica".into(), json!({"tags": [5, 6]}))],
+                10,
+            )
+            .unwrap();
+        assert!(engine.vector.read().unwrap().is_none());
     }
 }

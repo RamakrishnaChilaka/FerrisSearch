@@ -92,3 +92,8 @@ pub struct ReplicaCheckpoint {
 2. Each replica returns its `local_checkpoint` after applying
 3. Primary calls `update_replica_checkpoints()` with returned values
 4. Leader uses `replica_checkpoints()` during shard failover to pick best replica (highest checkpoint)
+
+The current checkpoint values are highest-observed sequence watermarks, not
+proof that every lower sequence was applied. Do not describe ISR tracking,
+global checkpoint updates, or recovery as gap-aware until an explicit
+contiguous-prefix protocol exists.

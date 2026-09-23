@@ -1,6 +1,7 @@
 use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -49,6 +50,43 @@ pub struct HotEngine {
 
 const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 10_000;
 const TANTIVY_WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) fn canonical_keyword_scalar(value: &serde_json::Value) -> Option<Cow<'_, str>> {
+    match value {
+        serde_json::Value::String(text) => Some(Cow::Borrowed(text)),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+            Some(Cow::Owned(value.to_string()))
+        }
+        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            None
+        }
+    }
+}
+
+pub(crate) fn visit_indexed_keyword_values<'a>(
+    field_name: &str,
+    value: &'a serde_json::Value,
+    visitor: &mut impl FnMut(Cow<'a, str>),
+) -> std::result::Result<(), super::DocumentValidationError> {
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Array(values) => {
+            for value in values {
+                visit_indexed_keyword_values(field_name, value, visitor)?;
+            }
+        }
+        serde_json::Value::Object(_) => {
+            return Err(super::DocumentValidationError(format!(
+                "field [{field_name}] is a keyword field and cannot index object values"
+            )));
+        }
+        value => visitor(
+            canonical_keyword_scalar(value)
+                .expect("non-null keyword scalar should have a canonical text value"),
+        ),
+    }
+    Ok(())
+}
 
 /// Add a single mapped field to a Tantivy `SchemaBuilder`.
 fn add_mapping_field_to_schema(
@@ -972,7 +1010,48 @@ impl HotEngine {
     /// When typed fields exist in the registry, values are indexed into their
     /// proper field types. All text values also go into the "body" catch-all
     /// for backward-compatible `?q=` query string searches.
-    fn build_tantivy_doc(&self, doc_id: &str, payload: &serde_json::Value) -> TantivyDocument {
+    pub(crate) fn is_keyword_field(&self, name: &str) -> bool {
+        matches!(
+            self.field_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .field_types
+                .get(name),
+            Some(crate::cluster::state::FieldType::Keyword)
+        )
+    }
+
+    fn validate_keyword_documents<'a>(
+        &self,
+        documents: impl IntoIterator<Item = &'a serde_json::Value>,
+    ) -> Result<()> {
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for document in documents {
+            if let Some(object) = document.as_object() {
+                for (field_name, value) in object {
+                    if matches!(
+                        value,
+                        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+                    ) && matches!(
+                        registry.field_types.get(field_name),
+                        Some(crate::cluster::state::FieldType::Keyword)
+                    ) {
+                        visit_indexed_keyword_values(field_name, value, &mut |_| {})?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn build_tantivy_doc(
+        &self,
+        doc_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<TantivyDocument> {
         let registry = self
             .field_registry
             .read()
@@ -987,7 +1066,7 @@ impl HotEngine {
         schema: &Schema,
         doc_id: &str,
         payload: &serde_json::Value,
-    ) -> TantivyDocument {
+    ) -> Result<TantivyDocument> {
         let mut doc = TantivyDocument::new();
 
         // Store the document ID
@@ -1010,9 +1089,7 @@ impl HotEngine {
         });
         let source_value = normalized_source.as_ref().unwrap_or(payload);
 
-        if let Ok(json_str) = serde_json::to_string(source_value) {
-            doc.add_text(registry.source_field, json_str);
-        }
+        doc.add_text(registry.source_field, serde_json::to_string(source_value)?);
 
         let body_field = *registry.fields.get("body").expect("body field must exist");
 
@@ -1026,6 +1103,27 @@ impl HotEngine {
                     && field != body_field
                 {
                     let logical_field_type = registry.field_types.get(key.as_str());
+                    if matches!(
+                        logical_field_type,
+                        Some(crate::cluster::state::FieldType::Keyword)
+                    ) {
+                        let mut seen = value
+                            .is_array()
+                            .then(std::collections::HashSet::<String>::new);
+                        visit_indexed_keyword_values(key, value, &mut |text| {
+                            if let Some(seen) = &mut seen
+                                && !seen.insert(text.to_string())
+                            {
+                                return;
+                            }
+                            doc.add_text(field, text.as_ref());
+                            if !body_buf.is_empty() {
+                                body_buf.push(' ');
+                            }
+                            body_buf.push_str(text.as_ref());
+                        })?;
+                        continue;
+                    }
                     match value {
                         serde_json::Value::String(s) => match logical_field_type {
                             Some(crate::cluster::state::FieldType::Date) => {
@@ -1111,7 +1209,7 @@ impl HotEngine {
             doc.add_text(body_field, s);
         }
 
-        doc
+        Ok(doc)
     }
 
     /// Replays pending translog entries into the Tantivy buffer in a streaming
@@ -1151,7 +1249,7 @@ impl HotEngine {
                 // Delete-before-add (upsert) so replay is idempotent even if
                 // a previous replay was interrupted after an intermediate commit.
                 writer.delete_term(Term::from_field_text(id_field, doc_id));
-                let doc = self.build_tantivy_doc(doc_id, source);
+                let doc = self.build_tantivy_doc(doc_id, source)?;
                 writer.add_document(doc)?;
 
                 last_seq = entry.seq_no;
@@ -1993,7 +2091,51 @@ enum NumCol {
     CachedI64(std::sync::Arc<[Option<i64>]>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum NumericTermKey {
+    Integer(i64),
+    Float(u64),
+}
+
+impl NumericTermKey {
+    fn float(value: f64) -> Self {
+        let value = if value == 0.0 {
+            0.0
+        } else if value.is_nan() {
+            f64::NAN
+        } else {
+            value
+        };
+        Self::Float(value.to_bits())
+    }
+
+    fn into_string(self) -> String {
+        match self {
+            Self::Integer(value) => value.to_string(),
+            Self::Float(bits) => f64::from_bits(bits).to_string(),
+        }
+    }
+}
+
 impl NumCol {
+    #[inline]
+    fn first_term_key(&self, doc: u32) -> Option<NumericTermKey> {
+        match self {
+            Self::F64(column) => column.first(doc).map(NumericTermKey::float),
+            Self::I64(column) => column.first(doc).map(NumericTermKey::Integer),
+            Self::CachedF64(values) => values
+                .get(doc as usize)
+                .copied()
+                .flatten()
+                .map(NumericTermKey::float),
+            Self::CachedI64(values) => values
+                .get(doc as usize)
+                .copied()
+                .flatten()
+                .map(NumericTermKey::Integer),
+        }
+    }
+
     #[inline]
     fn first_f64(&self, doc: u32) -> Option<f64> {
         match self {
@@ -4520,6 +4662,29 @@ struct ResolvedAggSpec {
     kind: AggKind,
 }
 
+const DENSE_TERMS_ORDINAL_LIMIT: usize = 1024;
+
+fn resolve_term_ordinals(
+    column: &tantivy::columnar::StrColumn,
+    counts: impl IntoIterator<Item = (u64, u64)>,
+    capacity: usize,
+) -> tantivy::Result<HashMap<String, u64>> {
+    let mut resolved = HashMap::with_capacity(capacity);
+    let mut text = String::new();
+    for (ordinal, count) in counts {
+        text.clear();
+        if !column.ord_to_str(ordinal, &mut text)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("term ordinal {ordinal} is absent from the string dictionary"),
+            )
+            .into());
+        }
+        *resolved.entry(text.clone()).or_insert(0) += count;
+    }
+    Ok(resolved)
+}
+
 enum SegmentAggEntry {
     NumericStats {
         column: NumCol,
@@ -4533,13 +4698,18 @@ enum SegmentAggEntry {
         interval: f64,
         buckets: std::collections::HashMap<i64, u64>,
     },
-    TermsStr {
+    TermsStrDense {
         column: tantivy::columnar::StrColumn,
-        counts: std::collections::HashMap<u64, u64>,
+        counts: Vec<u64>,
+        invalid_ordinal: Option<u64>,
+    },
+    TermsStrSparse {
+        column: tantivy::columnar::StrColumn,
+        counts: HashMap<u64, u64>,
     },
     TermsNum {
         column: NumCol,
-        counts: std::collections::HashMap<String, u64>,
+        counts: std::collections::HashMap<NumericTermKey, u64>,
     },
     Skip,
 }
@@ -4632,9 +4802,18 @@ impl tantivy::collector::Collector for AggCollector {
                 }
                 AggKind::Terms => {
                     if let Ok(Some(str_col)) = ff.str(&spec.field_name) {
-                        SegmentAggEntry::TermsStr {
-                            column: str_col,
-                            counts: std::collections::HashMap::new(),
+                        let dictionary_size = str_col.num_terms();
+                        if dictionary_size <= DENSE_TERMS_ORDINAL_LIMIT {
+                            SegmentAggEntry::TermsStrDense {
+                                column: str_col,
+                                counts: vec![0; dictionary_size],
+                                invalid_ordinal: None,
+                            }
+                        } else {
+                            SegmentAggEntry::TermsStrSparse {
+                                column: str_col,
+                                counts: HashMap::new(),
+                            }
                         }
                     } else if let Some(num_col) =
                         open_num_col(&self.schema, ff, &spec.field_name, None)
@@ -4659,12 +4838,12 @@ impl tantivy::collector::Collector for AggCollector {
 
     fn merge_fruits(
         &self,
-        segment_fruits: Vec<Vec<(String, SegmentAggData)>>,
+        segment_fruits: Vec<tantivy::Result<Vec<(String, SegmentAggData)>>>,
     ) -> tantivy::Result<Self::Fruit> {
         let mut merged: std::collections::HashMap<String, SegmentAggData> =
             std::collections::HashMap::new();
         for fruit in segment_fruits {
-            for (name, data) in fruit {
+            for (name, data) in fruit? {
                 merged
                     .entry(name)
                     .and_modify(|e| merge_segment_data(e, &data))
@@ -4682,7 +4861,7 @@ impl tantivy::collector::Collector for AggCollector {
 }
 
 impl tantivy::collector::SegmentCollector for AggSegmentCollector {
-    type Fruit = Vec<(String, SegmentAggData)>;
+    type Fruit = tantivy::Result<Vec<(String, SegmentAggData)>>;
 
     #[inline]
     fn collect(&mut self, doc: tantivy::DocId, _score: tantivy::Score) {
@@ -4715,18 +4894,29 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
                         *buckets.entry((val / *interval).floor() as i64).or_insert(0) += 1;
                     }
                 }
-                SegmentAggEntry::TermsStr { column, counts } => {
+                SegmentAggEntry::TermsStrDense {
+                    column,
+                    counts,
+                    invalid_ordinal,
+                } => {
                     for ord in column.term_ords(doc) {
-                        *counts.entry(ord).or_insert(0) += 1;
+                        if let Some(count) = usize::try_from(ord)
+                            .ok()
+                            .and_then(|ordinal| counts.get_mut(ordinal))
+                        {
+                            *count += 1;
+                        } else {
+                            *invalid_ordinal = Some(ord);
+                        }
+                    }
+                }
+                SegmentAggEntry::TermsStrSparse { column, counts } => {
+                    for ord in column.term_ords(doc) {
+                        *counts.entry(ord).or_default() += 1;
                     }
                 }
                 SegmentAggEntry::TermsNum { column, counts } => {
-                    if let Some(val) = column.first_f64(doc) {
-                        let key = if val.fract() == 0.0 {
-                            format!("{}", val as i64)
-                        } else {
-                            format!("{val}")
-                        };
+                    if let Some(key) = column.first_term_key(doc) {
                         *counts.entry(key).or_insert(0) += 1;
                     }
                 }
@@ -4736,56 +4926,89 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
     }
 
     fn harvest(self) -> Self::Fruit {
-        self.entries
-            .into_iter()
-            .filter_map(|(name, entry)| {
-                let data = match entry {
-                    SegmentAggEntry::NumericStats {
-                        count,
-                        sum,
-                        min,
-                        max,
-                        ..
-                    } => SegmentAggData::Stats {
-                        count,
-                        sum,
-                        min,
-                        max,
-                    },
-                    SegmentAggEntry::Histogram {
-                        interval, buckets, ..
-                    } => SegmentAggData::Histogram { interval, buckets },
-                    SegmentAggEntry::TermsStr { column, counts } => {
-                        let mut resolved = std::collections::HashMap::with_capacity(counts.len());
-                        let mut s = String::new();
-                        for (ord, count) in counts {
-                            s.clear();
-                            if column.ord_to_str(ord, &mut s).unwrap_or(false) {
-                                *resolved.entry(s.clone()).or_insert(0) += count;
-                            }
-                        }
-                        SegmentAggData::Terms { counts: resolved }
+        let mut fruits = Vec::with_capacity(self.entries.len());
+        for (name, entry) in self.entries {
+            let data = match entry {
+                SegmentAggEntry::NumericStats {
+                    count,
+                    sum,
+                    min,
+                    max,
+                    ..
+                } => SegmentAggData::Stats {
+                    count,
+                    sum,
+                    min,
+                    max,
+                },
+                SegmentAggEntry::Histogram {
+                    interval, buckets, ..
+                } => SegmentAggData::Histogram { interval, buckets },
+                SegmentAggEntry::TermsStrDense {
+                    column,
+                    counts,
+                    invalid_ordinal,
+                } => {
+                    if let Some(ordinal) = invalid_ordinal {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "term ordinal {ordinal} exceeds dictionary size {}",
+                                counts.len()
+                            ),
+                        )
+                        .into());
                     }
-                    SegmentAggEntry::TermsNum { counts, .. } => SegmentAggData::Terms { counts },
-                    SegmentAggEntry::Skip => return None,
-                };
-                Some((name, data))
-            })
-            .collect()
+                    let observed = counts.iter().filter(|count| **count > 0).count();
+                    SegmentAggData::Terms {
+                        counts: resolve_term_ordinals(
+                            &column,
+                            counts
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(ordinal, count)| {
+                                    (count > 0).then_some((ordinal as u64, count))
+                                }),
+                            observed,
+                        )?,
+                    }
+                }
+                SegmentAggEntry::TermsStrSparse { column, counts } => {
+                    let observed = counts.len();
+                    SegmentAggData::Terms {
+                        counts: resolve_term_ordinals(&column, counts, observed)?,
+                    }
+                }
+                SegmentAggEntry::TermsNum { counts, .. } => SegmentAggData::Terms {
+                    counts: counts
+                        .into_iter()
+                        .map(|(key, count)| (key.into_string(), count))
+                        .collect(),
+                },
+                SegmentAggEntry::Skip => continue,
+            };
+            fruits.push((name, data));
+        }
+        Ok(fruits)
     }
 }
 
 impl super::SearchEngine for HotEngine {
-    fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String> {
+    fn add_document_with_receipt(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<super::IndexWriteReceipt> {
+        self.validate_keyword_documents(std::iter::once(&payload))?;
         // Keep WAL append and the corresponding writer mutation in one critical
         // section so refresh/flush cannot commit past a translog entry that has
         // not yet been applied to the Tantivy writer.
-        self.with_translog("document indexing", |tl| {
+        let seq_no = self.with_translog("document indexing", |tl| {
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
                 "_source": payload
             });
-            tl.append(crate::wal::WalOperation::Index, wal_entry)?;
+            let receipt = tl.append(crate::wal::WalOperation::Index, wal_entry)?;
 
             // 2. Delete any existing doc with same _id (upsert semantics)
             let id_field = self
@@ -4797,12 +5020,15 @@ impl super::SearchEngine for HotEngine {
             writer.delete_term(Term::from_field_text(id_field, doc_id));
 
             // 3. Write to Tantivy in-memory buffer
-            let doc = self.build_tantivy_doc(doc_id, &payload);
+            let doc = self.build_tantivy_doc(doc_id, &payload)?;
             writer.add_document(doc)?;
-            Ok(())
+            Ok(receipt.seq_no)
         })?;
 
-        Ok(doc_id.to_string())
+        Ok(super::IndexWriteReceipt {
+            doc_id: doc_id.to_string(),
+            seq_no,
+        })
     }
 
     fn add_document_with_seq(
@@ -4811,6 +5037,7 @@ impl super::SearchEngine for HotEngine {
         payload: serde_json::Value,
         seq_no: u64,
     ) -> Result<String> {
+        self.validate_keyword_documents(std::iter::once(&payload))?;
         self.with_translog("replica document indexing", |tl| {
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
@@ -4826,7 +5053,7 @@ impl super::SearchEngine for HotEngine {
             let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
             writer.delete_term(Term::from_field_text(id_field, doc_id));
 
-            let doc = self.build_tantivy_doc(doc_id, &payload);
+            let doc = self.build_tantivy_doc(doc_id, &payload)?;
             writer.add_document(doc)?;
             Ok(())
         })?;
@@ -4834,7 +5061,11 @@ impl super::SearchEngine for HotEngine {
         Ok(doc_id.to_string())
     }
 
-    fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
+    fn bulk_add_documents_with_receipt(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+    ) -> Result<super::BulkWriteReceipt> {
+        self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
         // Keep WAL persistence and writer mutation serialized with refresh/flush.
         let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
             .iter()
@@ -4846,8 +5077,8 @@ impl super::SearchEngine for HotEngine {
             })
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
-        self.with_translog("bulk indexing", |tl| {
-            tl.write_bulk(&ops)?;
+        let start_seq_no = self.with_translog("bulk indexing", |tl| {
+            let start_seq_no = tl.write_bulk_with_receipt(&ops)?;
 
             // 2. Write all docs to Tantivy in-memory buffer under one lock
             // Acquire registry once for the entire batch (not per-doc)
@@ -4858,15 +5089,22 @@ impl super::SearchEngine for HotEngine {
             let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
             for (doc_id, payload) in &docs {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-                let doc =
-                    Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload);
+                let doc = Self::build_tantivy_doc_inner(
+                    &registry,
+                    &self.index.schema(),
+                    doc_id,
+                    payload,
+                )?;
                 writer.add_document(doc)?;
                 doc_ids.push(doc_id.clone());
             }
-            Ok(())
+            Ok(start_seq_no)
         })?;
 
-        Ok(doc_ids)
+        Ok(super::BulkWriteReceipt {
+            doc_ids,
+            start_seq_no,
+        })
     }
 
     fn bulk_add_documents_with_start_seq(
@@ -4874,6 +5112,7 @@ impl super::SearchEngine for HotEngine {
         docs: Vec<(String, serde_json::Value)>,
         start_seq_no: u64,
     ) -> Result<Vec<String>> {
+        self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
         let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
             .iter()
             .map(|(id, p)| {
@@ -4894,8 +5133,12 @@ impl super::SearchEngine for HotEngine {
             let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
             for (doc_id, payload) in &docs {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-                let doc =
-                    Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload);
+                let doc = Self::build_tantivy_doc_inner(
+                    &registry,
+                    &self.index.schema(),
+                    doc_id,
+                    payload,
+                )?;
                 writer.add_document(doc)?;
                 doc_ids.push(doc_id.clone());
             }
@@ -4905,9 +5148,9 @@ impl super::SearchEngine for HotEngine {
         Ok(doc_ids)
     }
 
-    fn delete_document(&self, doc_id: &str) -> Result<u64> {
-        self.with_translog("document delete", |tl| {
-            tl.append(
+    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<super::DeleteWriteReceipt> {
+        let seq_no = self.with_translog("document delete", |tl| {
+            let receipt = tl.append(
                 crate::wal::WalOperation::Delete,
                 serde_json::json!({ "_doc_id": doc_id }),
             )?;
@@ -4922,9 +5165,9 @@ impl super::SearchEngine for HotEngine {
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             // delete_term returns an OpStamp, not a count — we report 1 optimistically
             let _ = opstamp;
-            Ok(())
+            Ok(receipt.seq_no)
         })?;
-        Ok(1)
+        Ok(super::DeleteWriteReceipt { deleted: 1, seq_no })
     }
 
     fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
@@ -6168,6 +6411,274 @@ mod tests {
         );
     }
 
+    fn terms_counts(engine: &HotEngine, field: &str, query: QueryClause) -> HashMap<String, u64> {
+        let request: SearchRequest = serde_json::from_value(json!({
+            "query": query,
+            "size": 0,
+            "aggs": {"values": {"terms": {"field": field, "size": 100}}}
+        }))
+        .unwrap();
+        let (_, _, partials) = engine.search_query(&request).unwrap();
+        let crate::search::PartialAggResult::Terms { buckets } = &partials["values"] else {
+            panic!("expected terms buckets");
+        };
+        buckets
+            .iter()
+            .map(|bucket| (bucket.key.clone(), bucket.doc_count))
+            .collect()
+    }
+
+    #[test]
+    fn terms_integer_keys_preserve_full_i64_precision() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "value".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        )]));
+        let values = [
+            i64::MIN,
+            -(1_i64 << 53) - 1,
+            -(1_i64 << 53),
+            -1,
+            0,
+            1,
+            1_i64 << 53,
+            (1_i64 << 53) + 1,
+            i64::MAX,
+        ];
+        for (id, value) in values.iter().enumerate() {
+            engine
+                .add_document(&id.to_string(), json!({"value": value}))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+        let counts = terms_counts(&engine, "value", QueryClause::MatchAll(json!({})));
+        assert_eq!(
+            counts,
+            values
+                .into_iter()
+                .map(|value| (value.to_string(), 1))
+                .collect()
+        );
+    }
+
+    #[test]
+    fn terms_float_keys_do_not_saturate_to_i64() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "value".to_string(),
+            FieldMapping {
+                field_type: FieldType::Float,
+                dimension: None,
+            },
+        )]));
+        let values = [1e20_f64, 1e21, -1e20, -1e21, 0.0, -0.0, 1.5];
+        for (id, value) in values.iter().enumerate() {
+            engine
+                .add_document(&id.to_string(), json!({"value": value}))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+        let counts = terms_counts(&engine, "value", QueryClause::MatchAll(json!({})));
+        assert_eq!(
+            counts,
+            HashMap::from([
+                (1e20_f64.to_string(), 1),
+                (1e21_f64.to_string(), 1),
+                ((-1e20_f64).to_string(), 1),
+                ((-1e21_f64).to_string(), 1),
+                ("0".to_string(), 2),
+                ("1.5".to_string(), 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn keyword_arrays_are_searchable_and_count_documents_once() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mappings = HashMap::from([(
+            "tags".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]);
+        let (dir, engine) = create_engine_with_mappings(mappings.clone());
+        let documents = [
+            json!({"tags": ["b", "a", "a", null]}),
+            json!({"tags": ["b"]}),
+            json!({"tags": []}),
+            json!({"tags": null}),
+            json!({"tags": "a"}),
+        ];
+        for (id, document) in documents.iter().enumerate() {
+            engine
+                .add_document(&id.to_string(), document.clone())
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("0").unwrap(),
+            Some(documents[0].clone())
+        );
+        assert_eq!(
+            terms_counts(&engine, "tags", QueryClause::MatchAll(json!({}))),
+            HashMap::from([("a".to_string(), 2), ("b".to_string(), 2)])
+        );
+        let query = QueryClause::Term(HashMap::from([("tags".to_string(), json!("b"))]));
+        assert_eq!(
+            terms_counts(&engine, "tags", query),
+            HashMap::from([("a".to_string(), 1), ("b".to_string(), 2)])
+        );
+
+        engine.flush().unwrap();
+        drop(engine);
+        let reopened = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        assert_eq!(
+            terms_counts(&reopened, "tags", QueryClause::MatchAll(json!({}))),
+            HashMap::from([("a".to_string(), 2), ("b".to_string(), 2)])
+        );
+        assert_eq!(
+            reopened.get_document("0").unwrap(),
+            Some(documents[0].clone())
+        );
+    }
+
+    #[test]
+    fn keyword_arrays_flatten_and_coerce_scalar_values() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "tags".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]));
+        let source = json!({"tags": [["a", 1, true], ["a", "1", null], false]});
+        engine.add_document("one", source.clone()).unwrap();
+        engine.add_document("two", json!({"tags": 42})).unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.get_document("one").unwrap(), Some(source));
+        assert_eq!(
+            terms_counts(&engine, "tags", QueryClause::MatchAll(json!({}))),
+            ["a", "1", "true", "false", "42"]
+                .into_iter()
+                .map(|value| (value.to_string(), 1))
+                .collect()
+        );
+    }
+
+    #[test]
+    fn terms_dense_and_sparse_counters_preserve_all_buckets() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "tags".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]));
+        let distinct = DENSE_TERMS_ORDINAL_LIMIT + 17;
+        let docs: Vec<_> = (0..distinct)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    json!({"tags": [format!("tag-{id}"), "shared"]}),
+                )
+            })
+            .collect();
+        engine.bulk_add_documents(docs).unwrap();
+        engine.refresh().unwrap();
+        engine.force_merge(1).unwrap();
+        let searcher = engine.reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let column = searcher.segment_readers()[0]
+            .fast_fields()
+            .str("tags")
+            .unwrap()
+            .unwrap();
+        assert!(column.num_terms() > DENSE_TERMS_ORDINAL_LIMIT);
+        let counts = terms_counts(&engine, "tags", QueryClause::MatchAll(json!({})));
+        assert_eq!(counts.len(), distinct + 1);
+        assert_eq!(counts["shared"], distinct as u64);
+        for id in 0..distinct {
+            assert_eq!(counts[&format!("tag-{id}")], 1);
+        }
+
+        assert_eq!(
+            resolve_term_ordinals(&column, [(0, 2)], 1).unwrap(),
+            HashMap::from([("shared".to_string(), 2)])
+        );
+    }
+
+    #[test]
+    fn terms_invalid_ordinal_returns_an_error_instead_of_partial_counts() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "tag".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]));
+        engine.add_document("one", json!({"tag": "a"})).unwrap();
+        engine.refresh().unwrap();
+        let searcher = engine.reader.searcher();
+        let column = searcher.segment_readers()[0]
+            .fast_fields()
+            .str("tag")
+            .unwrap()
+            .unwrap();
+        assert!(resolve_term_ordinals(&column, [(u64::MAX, 1)], 1).is_err());
+    }
+
+    #[test]
+    fn keyword_objects_are_rejected_before_wal_or_writer_mutation() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "tags".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]));
+        let invalid = json!({"tags": ["valid", {"nested": "invalid"}]});
+        let error = engine.add_document("one", invalid.clone()).unwrap_err();
+        assert!(error.is::<super::super::DocumentValidationError>());
+        assert!(error.to_string().contains("tags"));
+        assert!(
+            engine
+                .bulk_add_documents(vec![
+                    ("valid".to_string(), json!({"tags": ["a"]})),
+                    ("invalid".to_string(), invalid.clone()),
+                ])
+                .is_err()
+        );
+        assert!(
+            engine
+                .add_document_with_seq("replica", invalid, 42)
+                .is_err()
+        );
+        assert_eq!(
+            engine
+                .with_translog("keyword validation test", |wal| Ok(wal.next_seq_no()))
+                .unwrap(),
+            0
+        );
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 0);
+    }
+
     // ── search ──────────────────────────────────────────────────────────
 
     #[test]
@@ -6496,6 +7007,41 @@ mod tests {
             "document should be recovered from translog replay"
         );
         assert_eq!(doc.unwrap()["recovered"], true);
+    }
+
+    #[test]
+    fn translog_replay_rejects_invalid_keyword_objects() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let dir = tempfile::tempdir().unwrap();
+        let wal = HotTranslog::open(dir.path()).unwrap();
+        wal.append(
+            crate::wal::WalOperation::Index,
+            json!({
+                "_doc_id": "invalid",
+                "_source": {"tags": ["valid", {"nested": "invalid"}]}
+            }),
+        )
+        .unwrap();
+        drop(wal);
+
+        let mappings = HashMap::from([(
+            "tags".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]);
+        let error = match HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        ) {
+            Ok(_) => panic!("invalid replayed keyword value should fail startup"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("tags"));
     }
 
     #[test]

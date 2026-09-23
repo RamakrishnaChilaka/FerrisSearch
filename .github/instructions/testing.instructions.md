@@ -19,7 +19,7 @@ Do not hard-code suite or assertion counts in instructions or README. They
 become stale after ordinary test additions; report the command and observed
 result from the current run instead.
 
-The `remote_store` automated coverage is split between REST integration tests (publish/search/verify behavior with in-process harnesses, including query-string `GET /_search`, match-all `/_count` on shardless indices, publish-time split-summary persistence for pruning, term/range pruning regressions that assert non-candidate splits are not fetched into cache, response-level `remote_store.pruning` counters including unsupported-query no-prune behavior, and SQL EXPLAIN ANALYZE pruning metadata) and `remote_store_s3_integration` (real S3-compatible manifest/object operations via `StorageManager`). That still does not replace a full process-backed RustFS + `./dev_cluster_release.sh --nodes 3` live validation; keep a manual runbook for that flow and an isolated smoke script for the automatable pieces.
+The `remote_store` automated coverage is split between REST integration tests (publish/search/verify behavior with in-process harnesses, including query-string `GET /_search`, match-all `/_count` on shardless indices, publish-time split-summary persistence for pruning, keyword-array/coercion and cap-exceeded no-prune behavior, field-specific invalid-keyword publication rejection without a manifest, term/range pruning regressions that assert non-candidate splits are not fetched into cache, response-level `remote_store.pruning` counters including unsupported-query no-prune behavior, and SQL EXPLAIN ANALYZE pruning metadata) and `remote_store_s3_integration` (real S3-compatible manifest/object operations via `StorageManager`). That still does not replace a full process-backed RustFS + `./dev_cluster_release.sh --nodes 3` live validation; keep a manual runbook for that flow and an isolated smoke script for the automatable pieces.
 
 ## Running Tests
 ```bash
@@ -45,6 +45,17 @@ cargo test -- test_name                         # Single test by name
 - The current multi-node REST harness uses isolated in-memory Raft instances, so any `remote_store` regression that depends on leaf-side index metadata lookups needs a direct transport-level test in addition to any REST harness fan-out assertion.
 - For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
 - For WAL corruption hardening, add regressions that an unknown operation tag in the active generation returns `Err` on reopen instead of panicking, and that an internal active-generation mismatch fails before append writes bytes.
+- For primary sequence ownership changes, cover sequence zero versus missing
+  optional wire fields, empty/non-empty bulk receipt consistency, document-ID
+  order, concurrent single/bulk/delete identities across primary and replica
+  WALs, and allocation/range overflow before WAL bytes are written.
+- For mapped keyword arrays, cover nested flattening, scalar coercion, nulls,
+  duplicate values counting once, `_source` preservation, reopen/replay, numeric
+  arrays not becoming vectors, and object rejection before any single, bulk, or
+  explicit-sequence WAL/writer mutation.
+- For terms collector changes, exercise exact large integer/float bucket keys,
+  both sides of the bounded dense/sparse threshold, filtered results, and
+  invalid ordinal/dictionary failures rather than only plan selection.
 - For HotEngine WAL-wrapper hardening, add unit tests that poisoned translog wrapper locks return `Err` on write and maintenance paths, and that grouped segment worker panics are surfaced as ordinary query errors.
 - For WAL auto-flush or replay changes, add regressions for disabled thresholds (`flush_threshold_bytes = 0`), zero global checkpoint safety (no auto-truncate), and stale `translog.committed` checkpoints that force a replayed suffix after a prior batch commit.
 - For auto-flush concurrency changes, add regressions proving maintenance ticks defer instead of blocking when the text flush path or vector persistence path is already busy.
