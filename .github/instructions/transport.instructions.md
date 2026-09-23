@@ -73,6 +73,19 @@ receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
 
+### Runtime And Code Generation
+
+- Keep the Tonic runtime, Prost codec, generated service code, and optional
+  rich-error types on one coordinated release line. The current manifest uses
+  `tonic`, `tonic-prost`, `tonic-types`, and `tonic-prost-build` 0.14.6 with
+  Prost 0.14.4.
+- `build.rs` compiles `proto/transport.proto` through
+  `tonic_prost_build::compile_protos()`. Generated clients and servers refer to
+  `tonic_prost::ProstCodec`; do not hand-edit generated files under `target/`.
+- Preserve `tonic/tls-ring` when changing transport features, and validate both
+  default plaintext transport and `transport-tls` integration before accepting
+  another coordinated stack change.
+
 ## TransportService (src/transport/server/mod.rs)
 ```rust
 pub struct TransportService {

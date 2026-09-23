@@ -22,6 +22,12 @@ dependency migration.
 | bincode-next | 3.0.0-rc.5 | 3.1.1 | WAL/snapshot durable-format compatibility must be proven before changing the codec. |
 | rustyline | 15.0.0 | 18.0.1 | CLI API/behavior migration should be separate from engine correctness work. |
 
+> **Follow-up (2026-09-23):** The previously separated Tonic/Prost migration
+> was completed as a narrow CI compatibility fix. The coordinated stack is now
+> Tonic, `tonic-prost`, `tonic-types`, and `tonic-prost-build` 0.14.6 with
+> Prost 0.14.4; plaintext and feature-gated TLS transport remain required
+> validation. The table above remains the point-in-time September 22 review.
+
 Other major-line candidates also need scoped review rather than blind updates,
 including `comfy-table` 8, `getrandom` 0.4, `sha2` 0.11,
 `tikv-jemallocator` 0.7, and `zstd` 0.14.

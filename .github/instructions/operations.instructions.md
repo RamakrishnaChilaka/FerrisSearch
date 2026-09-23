@@ -119,6 +119,12 @@ S3-compatible tests remain explicitly gated and must report skip vs pass
 accurately. Development cluster scripts must give every node a unique data
 directory, HTTP port, transport port, Raft ID, and complete seed-host list.
 
+GitHub Actions installs the moving stable Rust toolchain. When CI reports a
+compiler-specific lint failure, reproduce the exact runner version with
+`cargo +<version>` for format, Clippy, build, and tests; do not change the
+developer's global default toolchain or weaken `-D warnings` to match an older
+local compiler.
+
 Operational changes need failure tests: port conflicts, missing files, invalid
 URIs, feature mismatches, exhausted queues/budgets, task failures, and shutdown
 or restart behavior.
