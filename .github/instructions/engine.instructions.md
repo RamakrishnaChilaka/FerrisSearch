@@ -130,9 +130,32 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - Replay must stay idempotent across repeated crash recovery: delete-before-add on `_id`, commit in batches, and persist `translog.committed` after each intermediate batch commit
 - `translog_size_bytes()` exposes the current WAL size for the auto-flush loop
 - The Tantivy `IndexWriter` heap budget is intentionally capped at 64 MiB per shard. Multi-shard restart/open paths must not reserve the old 512 MiB-per-shard budget or nodes with many local shards can OOM before recovery completes.
+- Force merge is serialized only within one `HotEngine`. It temporarily installs
+  `NoMergePolicy`, commits, consumes the writer to drain already-scheduled
+  Tantivy merges, reopens the writer, performs the manual merge without holding
+  a lock needed by merge completion, and restores the prior automatic policy on
+  success or failure. Refresh and flush share the same shard-local maintenance
+  lock so they cannot invalidate the requested final segment bound.
+- `force_merge(0)` is invalid. Successful force merge must verify the final
+  searchable segment count is at most the requested positive bound while
+  preserving document values, deletes, and the committed WAL watermark.
 - `rebuild_vectors()` is only called when the index has `KnnVector` fields in its mappings. The shard manager gates this check; the composite engine's `rebuild_vectors()` itself is still a 100K-doc MatchAll scan, so never call it unconditionally.
 - Even the legacy `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used directly; never run Tantivy commit/reload inline on an async interval task
 - Replica/recovery writes use `append_with_seq()` / `write_bulk_with_start_seq()` under the hood so persisted WAL seq_nos match the primary's numbering
+
+### Shared Column Cache Budget
+- `resolve_column_cache_budget()` is a blocking startup probe. On Linux it reads
+  host `MemTotal`, maps `/proc/self/cgroup` through `/proc/self/mountinfo`, and
+  takes the tightest visible finite cgroup v2 `memory.max` or cgroup v1
+  `memory.limit_in_bytes` across the current cgroup and its visible ancestors.
+- Respect mount roots, cgroup namespaces, and nested paths; never walk above the
+  selected cgroup mount. `memory.high` and v1 soft limits are reclaim signals,
+  not hard allocation caps, and must not size this cache.
+- Missing/unavailable controls may fall back with a startup diagnostic.
+  Malformed authoritative procfs, mount mapping, or hard-limit values are
+  startup errors. A configured percentage of `0` disables the cache without
+  probing host or cgroup files.
+- The cache capacity is one component budget, not a total-process memory bound.
 
 ### Field Schema Flags
 Numeric fields use three Tantivy flags (mirrors OpenSearch default doc_values: true):

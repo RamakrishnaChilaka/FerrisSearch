@@ -65,7 +65,10 @@ normalized prepared-data archive SHA-256 is
 
 Force merge was not used. The existing asynchronous force-merge path failed
 with the already-deferred Tantivy `SegmentManager` error during preparation;
-this work does not change that subsystem.
+the preserved benchmark therefore remains evidence from the pre-fix path.
+Current source now drains already-scheduled automatic merges and serializes
+force merges per shard, but this historical run was not repeated and is not new
+performance evidence.
 
 ## Requests
 

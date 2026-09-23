@@ -805,6 +805,20 @@ fn resolve_transport_tls_paths_returns_none_when_disabled() {
     assert!(resolve_transport_tls_paths(&config).unwrap().is_none());
 }
 
+#[tokio::test]
+async fn node_new_wires_disabled_column_cache_budget() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        data_dir: data_dir.path().to_string_lossy().into_owned(),
+        column_cache_size_percent: 0,
+        ..AppConfig::default()
+    };
+
+    let node = Node::new(config).await.unwrap();
+
+    assert_eq!(node.shard_manager.column_cache_max_capacity(), 0);
+}
+
 #[test]
 fn resolve_transport_tls_paths_requires_all_files_when_enabled() {
     let mut config = AppConfig {

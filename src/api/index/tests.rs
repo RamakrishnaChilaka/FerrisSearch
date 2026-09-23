@@ -741,6 +741,34 @@ async fn force_merge_http_returns_accepted_response() {
     assert_eq!(body["_nodes"]["failed"], 0);
 }
 
+#[tokio::test]
+async fn force_merge_http_rejects_invalid_segment_targets() {
+    let mut cluster_state = ClusterState::new("test-cluster".into());
+    cluster_state.add_index(make_test_metadata(Some("node-1")));
+    let (_tmp, state) = make_test_app_state(cluster_state).await;
+
+    for invalid in ["0", "not-a-number", "4294967296"] {
+        let (status, Json(body)) = force_merge_index(
+            State(state.clone()),
+            Path(crate::common::IndexName::new("idx").unwrap()),
+            Query(HashMap::from([(
+                "max_num_segments".to_string(),
+                invalid.to_string(),
+            )])),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("between 1 and 4294967295")
+        );
+    }
+}
+
 #[test]
 fn maintenance_fanout_concurrency_keeps_flush_parallel() {
     assert_eq!(maintenance_fanout_concurrency(3), 3);

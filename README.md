@@ -270,7 +270,7 @@ coordinator-side merge semantics are required.
 
 ### Operations and security
 
-- Index settings, refresh, flush, asynchronous force merge, and task status
+- Index settings, refresh, flush, asynchronous shard-local force merge, and task status
 - Cluster health/state and `_cat` node, index, shard, master, and segment views
 - Prometheus metrics and `EXPLAIN ANALYZE`
 - Optional HTTP API-key authentication with role/index authorization
@@ -279,6 +279,18 @@ coordinator-side merge semantics are required.
 
 Security is disabled by default. FerrisSearch stores API-key hashes, never
 plaintext secrets; dynamically generated secrets are returned only once.
+
+On Linux, `column_cache_size_percent` is applied to host physical memory capped
+by visible finite cgroup v2 `memory.max` or cgroup v1
+`memory.limit_in_bytes` values, including tighter visible ancestors. Startup
+exports `ferrissearch_column_cache_effective_memory_bytes` and
+`ferrissearch_column_cache_budget_bytes`. This is only the shared column-cache
+capacity; it is not a total-process memory limit.
+
+Force merge keeps its asynchronous `202 Accepted` task lifecycle. A valid
+`max_num_segments` is at least 1; each shard drains already-scheduled automatic
+Tantivy merges, performs the requested merge under shard-local maintenance
+coordination, and then restores its automatic merge policy.
 
 ### Experimental remote-store reads
 

@@ -4,7 +4,7 @@ use crate::cluster::state::{
     ClusterState as DomainClusterState, FieldMapping, FieldType,
     IndexMetadata as DomainIndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
 };
-use crate::engine::{CompositeEngine, SearchEngine};
+use crate::engine::{CompositeEngine, SearchEngine, tantivy::HotEngine};
 use crate::shard::ShardManager;
 use serde_json::json;
 use std::collections::HashMap;
@@ -862,6 +862,140 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
     assert!(service.shard_manager.get_shard("maint-idx", 0).is_some());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let maintenance_dir = dir.path().join("maintenance-shard");
+    let write_dir = dir.path().join("write-shard");
+    std::fs::create_dir_all(&maintenance_dir).unwrap();
+    std::fs::create_dir_all(&write_dir).unwrap();
+
+    let maintenance_engine =
+        Arc::new(HotEngine::new(&maintenance_dir, Duration::from_secs(60)).unwrap());
+    let write_engine = Arc::new(HotEngine::new(&write_dir, Duration::from_secs(60)).unwrap());
+
+    let (refresh_started_tx, refresh_started_rx) = tokio::sync::oneshot::channel();
+    maintenance_engine.notify_before_refresh_writer_for_test(refresh_started_tx);
+
+    let (writer_locked_tx, writer_locked_rx) = tokio::sync::oneshot::channel();
+    let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+    let locked_engine = maintenance_engine.clone();
+    let writer_thread = std::thread::spawn(move || {
+        let _writer = locked_engine.writer_lock_for_test();
+        let _ = writer_locked_tx.send(());
+        release_writer_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test must release the blocked maintenance writer");
+    });
+    tokio::time::timeout(Duration::from_secs(5), writer_locked_rx)
+        .await
+        .expect("writer lock acquisition should be bounded")
+        .expect("writer lock holder should signal readiness");
+
+    let shard_manager = Arc::new(ShardManager::new(
+        dir.path().join("shards"),
+        Duration::from_secs(60),
+    ));
+    shard_manager.insert_shard_for_test("maintenance-idx", 0, maintenance_engine);
+    shard_manager.insert_shard_for_test("write-idx", 0, write_engine.clone());
+
+    let mut cluster_state = DomainClusterState::new("maintenance-pool-cluster".into());
+    for (index_name, index_uuid) in [
+        ("maintenance-idx", "maintenance-uuid"),
+        ("write-idx", "write-uuid"),
+    ] {
+        cluster_state.add_index(DomainIndexMetadata {
+            name: index_name.into(),
+            uuid: crate::cluster::state::IndexUuid::new(index_uuid),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "node-1".into(),
+                    replicas: vec![],
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: crate::cluster::state::IndexSettings::default(),
+        });
+    }
+    let manager = ClusterManager::new(cluster_state.cluster_name.clone());
+    manager.update_state(cluster_state);
+
+    let service = TransportService {
+        cluster_manager: Arc::new(manager),
+        shard_manager,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(1, 1),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        join_lock: new_join_lock(),
+    };
+
+    let refresh_service = service.clone();
+    let refresh_task = tokio::spawn(async move {
+        refresh_service
+            .refresh_index(Request::new(IndexMaintenanceRequest {
+                index_name: "maintenance-idx".into(),
+            }))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), refresh_started_rx)
+        .await
+        .expect("refresh should reach the blocked writer")
+        .expect("refresh start signal should be delivered");
+
+    let replica_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        service.replicate_doc(Request::new(ReplicateDocRequest {
+            index_name: "write-idx".into(),
+            shard_id: 0,
+            op: "index".into(),
+            doc_id: "replica-doc".into(),
+            payload_json: serde_json::to_vec(&json!({"value": "written"})).unwrap(),
+            seq_no: 7,
+        })),
+    )
+    .await;
+
+    release_writer_tx
+        .send(())
+        .expect("blocked maintenance writer should still be waiting");
+    let refresh_result = tokio::time::timeout(Duration::from_secs(5), refresh_task).await;
+    writer_thread.join().unwrap();
+
+    let replica_response = replica_result
+        .expect("replica apply must not wait for unrelated maintenance")
+        .expect("replica apply RPC should succeed")
+        .into_inner();
+    assert!(replica_response.success, "{}", replica_response.error);
+
+    let refresh_response = refresh_result
+        .expect("refresh should complete after releasing the writer")
+        .expect("refresh task should not panic")
+        .expect("refresh RPC should succeed")
+        .into_inner();
+    assert_eq!(refresh_response.successful_shards, 1);
+    assert_eq!(refresh_response.failed_shards, 0);
+
+    crate::worker::spawn_engine_maintenance("test visibility refresh", {
+        let write_engine = write_engine.clone();
+        move || write_engine.refresh()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        write_engine.get_document("replica-doc").unwrap().unwrap()["value"],
+        "written"
+    );
+}
+
 #[tokio::test]
 async fn force_merge_rpc_returns_immediately_after_enqueue() {
     let dir = tempfile::tempdir().unwrap();
@@ -901,6 +1035,15 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         join_lock: new_join_lock(),
     };
+
+    let error = service
+        .force_merge_index(Request::new(ForceMergeRequest {
+            index_name: "force-merge-idx".into(),
+            max_num_segments: 0,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
     let response = service
         .force_merge_index(Request::new(ForceMergeRequest {

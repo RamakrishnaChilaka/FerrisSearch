@@ -1,15 +1,17 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tantivy::collector::{Count, TopDocs};
+use tantivy::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 use tantivy::query::QueryParser;
 use tantivy::schema::{FAST, Field, STORED, STRING, Schema, TEXT, Value};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, SegmentMeta, TantivyDocument, Term};
 
 use super::SearchEngine;
 use crate::wal::{HotTranslog, TranslogDurability, WriteAheadLog};
@@ -30,12 +32,84 @@ struct FieldRegistry {
     date_fields: Vec<String>,
 }
 
+struct WriterState {
+    writer: Option<IndexWriter>,
+    failure: Option<String>,
+}
+
+impl WriterState {
+    fn ready(writer: IndexWriter) -> Self {
+        Self {
+            writer: Some(writer),
+            failure: None,
+        }
+    }
+
+    fn writer_mut(&mut self, context: &str) -> Result<&mut IndexWriter> {
+        self.writer.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Tantivy writer is unavailable during {context}: {}",
+                self.failure
+                    .as_deref()
+                    .unwrap_or("writer reinitialization is incomplete")
+            )
+        })
+    }
+
+    fn take(&mut self, context: &str) -> Result<IndexWriter> {
+        self.writer.take().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Tantivy writer is unavailable during {context}: {}",
+                self.failure
+                    .as_deref()
+                    .unwrap_or("writer reinitialization is incomplete")
+            )
+        })
+    }
+
+    fn replace(&mut self, writer: IndexWriter) {
+        self.writer = Some(writer);
+        self.failure = None;
+    }
+
+    fn fail(&mut self, error: impl Into<String>) {
+        self.writer = None;
+        self.failure = Some(error.into());
+    }
+}
+
+#[derive(Clone)]
+struct SharedMergePolicy(Arc<dyn MergePolicy>);
+
+impl fmt::Debug for SharedMergePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SharedMergePolicy")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl MergePolicy for SharedMergePolicy {
+    fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
+        self.0.compute_merge_candidates(segments)
+    }
+}
+
 /// Hot engine — Tantivy-backed search engine where all data lives in
 /// memory-mapped segments for maximum query performance.
 pub struct HotEngine {
     index: Index,
     reader: IndexReader,
-    writer: Arc<RwLock<IndexWriter>>,
+    writer: Arc<RwLock<WriterState>>,
+    maintenance_lock: Mutex<()>,
+    automatic_merge_policy: RwLock<Arc<dyn MergePolicy>>,
+    #[cfg(test)]
+    force_merge_entry_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    force_merge_before_wait_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    refresh_before_writer_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     field_registry: RwLock<FieldRegistry>,
     /// The per-index refresh interval (e.g. 5s default, matches OpenSearch's index.refresh_interval)
     pub refresh_interval: Duration,
@@ -50,6 +124,58 @@ pub struct HotEngine {
 
 const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 10_000;
 const TANTIVY_WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
+
+struct AutomaticMergePolicyRestore<'a> {
+    engine: &'a HotEngine,
+    armed: bool,
+}
+
+impl AutomaticMergePolicyRestore<'_> {
+    fn restore(mut self) -> Result<()> {
+        let result = self.engine.restore_automatic_merge_policy();
+        self.armed = false;
+        result
+    }
+}
+
+impl Drop for AutomaticMergePolicyRestore<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self.engine.restore_automatic_merge_policy()
+        {
+            tracing::error!(
+                "Failed to restore Tantivy automatic merge policy after force merge: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct WriterLockForTest<'a> {
+    guard: std::sync::RwLockWriteGuard<'a, WriterState>,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for WriterLockForTest<'_> {
+    type Target = IndexWriter;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .writer
+            .as_ref()
+            .expect("test writer lock requires an available writer")
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for WriterLockForTest<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .writer
+            .as_mut()
+            .expect("test writer lock requires an available writer")
+    }
+}
 
 pub(crate) fn canonical_keyword_scalar(value: &serde_json::Value) -> Option<Cow<'_, str>> {
     match value {
@@ -296,6 +422,7 @@ impl HotEngine {
         // Keep the per-shard writer heap modest so nodes reopening many local shards
         // do not reserve multiple GiB before they can finish recovery.
         let writer = index.writer(TANTIVY_WRITER_HEAP_BYTES)?;
+        let automatic_merge_policy = writer.get_merge_policy();
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -320,7 +447,15 @@ impl HotEngine {
         let engine = Self {
             index,
             reader,
-            writer: Arc::new(RwLock::new(writer)),
+            writer: Arc::new(RwLock::new(WriterState::ready(writer))),
+            maintenance_lock: Mutex::new(()),
+            automatic_merge_policy: RwLock::new(automatic_merge_policy),
+            #[cfg(test)]
+            force_merge_entry_barrier: Mutex::new(None),
+            #[cfg(test)]
+            force_merge_before_wait_sender: Mutex::new(None),
+            #[cfg(test)]
+            refresh_before_writer_sender: Mutex::new(None),
             field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
@@ -362,6 +497,99 @@ impl HotEngine {
             }
         };
         f(&*tl)
+    }
+
+    fn maintenance_guard(&self, context: &str) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.maintenance_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance lock poisoned during {context}"))
+    }
+
+    fn pause_and_drain_automatic_merges(&self) -> Result<()> {
+        let automatic_policy = self
+            .automatic_merge_policy
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut writer_state = self
+            .writer
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+
+        {
+            let writer = writer_state.writer_mut("force-merge preparation")?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            if let Err(error) = writer.commit() {
+                writer.set_merge_policy(Box::new(SharedMergePolicy(automatic_policy)));
+                return Err(error).context("failed to commit before draining Tantivy merges");
+            }
+        }
+
+        let writer = writer_state.take("force-merge merge-thread drain")?;
+        #[cfg(test)]
+        if let Some(sender) = self
+            .force_merge_before_wait_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+        }
+        let wait_result = writer.wait_merging_threads();
+        let replacement = match self.index.writer(TANTIVY_WRITER_HEAP_BYTES) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let message = format!(
+                    "failed to reopen Tantivy writer after draining merge threads: {error}"
+                );
+                writer_state.fail(message.clone());
+                return Err(anyhow::anyhow!(message));
+            }
+        };
+        replacement.set_merge_policy(Box::new(NoMergePolicy));
+        writer_state.replace(replacement);
+
+        if let Err(error) = wait_result {
+            writer_state
+                .writer_mut("automatic merge-policy restoration")?
+                .set_merge_policy(Box::new(SharedMergePolicy(automatic_policy)));
+            return Err(error).context("failed while draining Tantivy merge threads");
+        }
+
+        Ok(())
+    }
+
+    fn restore_automatic_merge_policy(&self) -> Result<()> {
+        let automatic_policy = self
+            .automatic_merge_policy
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut writer_state = self
+            .writer
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        writer_state
+            .writer_mut("automatic merge-policy restoration")?
+            .set_merge_policy(Box::new(SharedMergePolicy(automatic_policy)));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_merge_policy_for_test(&self, policy: Box<dyn MergePolicy>) -> Result<()> {
+        let policy: Arc<dyn MergePolicy> = Arc::from(policy);
+        *self
+            .automatic_merge_policy
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = policy.clone();
+        let mut writer_state = self
+            .writer
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        writer_state
+            .writer_mut("test merge-policy update")?
+            .set_merge_policy(Box::new(SharedMergePolicy(policy)));
+        Ok(())
     }
 
     /// Get (or lazily register) a field by name.
@@ -1229,7 +1457,8 @@ impl HotEngine {
             .id_field;
 
         self.with_translog("startup translog replay", |tl| {
-            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("startup translog replay")?;
 
             tl.for_each_from(committed_next_seq, &mut |entry| {
                 if replayed == 0 {
@@ -1322,10 +1551,21 @@ impl HotEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn writer_lock_for_test(
+    pub(crate) fn writer_lock_for_test(&self) -> WriterLockForTest<'_> {
+        WriterLockForTest {
+            guard: self.writer.write().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_before_refresh_writer_for_test(
         &self,
-    ) -> std::sync::RwLockWriteGuard<'_, tantivy::IndexWriter> {
-        self.writer.write().unwrap_or_else(|e| e.into_inner())
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        *self
+            .refresh_before_writer_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
     }
 
     /// Shared search execution helper — returns _id + _source from each hit.
@@ -1589,6 +1829,13 @@ impl HotEngine {
     /// Returns `Ok(false)` when a foreground write or another commit path is
     /// already holding the required locks, so ingestion is not blocked.
     pub fn try_flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<bool> {
+        let _maintenance = match self.maintenance_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                anyhow::bail!("maintenance lock poisoned during checkpoint-aware flush")
+            }
+        };
         let tl = match self.translog.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
@@ -1600,13 +1847,14 @@ impl HotEngine {
         // Keep the existing writer-lock recovery policy here. A poisoned
         // translog lock makes the WAL retention boundary ambiguous; a poisoned
         // writer lock does not.
-        let mut writer = match self.writer.try_write() {
+        let mut writer_state = match self.writer.try_write() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
+        let writer = writer_state.writer_mut("checkpoint-aware flush")?;
         writer.commit()?;
-        drop(writer);
+        drop(writer_state);
         self.reader.reload()?;
         self.persist_committed_next_seq_no(committed_next_seq)?;
         if global_checkpoint > 0 {
@@ -1618,11 +1866,13 @@ impl HotEngine {
     }
 
     pub fn flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<()> {
+        let _maintenance = self.maintenance_guard("checkpoint-aware flush")?;
         self.with_translog("checkpoint-aware flush", |tl| {
             let committed_next_seq = tl.next_seq_no();
-            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("checkpoint-aware flush")?;
             writer.commit()?;
-            drop(writer);
+            drop(writer_state);
             self.reader.reload()?;
             self.persist_committed_next_seq_no(committed_next_seq)?;
             if global_checkpoint > 0 {
@@ -5016,7 +5266,8 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("document indexing")?;
             writer.delete_term(Term::from_field_text(id_field, doc_id));
 
             // 3. Write to Tantivy in-memory buffer
@@ -5050,7 +5301,8 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("replica document indexing")?;
             writer.delete_term(Term::from_field_text(id_field, doc_id));
 
             let doc = self.build_tantivy_doc(doc_id, &payload)?;
@@ -5086,7 +5338,8 @@ impl super::SearchEngine for HotEngine {
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("bulk indexing")?;
             for (doc_id, payload) in &docs {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
                 let doc = Self::build_tantivy_doc_inner(
@@ -5130,7 +5383,8 @@ impl super::SearchEngine for HotEngine {
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("replica bulk indexing")?;
             for (doc_id, payload) in &docs {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
                 let doc = Self::build_tantivy_doc_inner(
@@ -5161,7 +5415,8 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("document delete")?;
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             // delete_term returns an OpStamp, not a count — we report 1 optimistically
             let _ = opstamp;
@@ -5183,7 +5438,8 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("replica document delete")?;
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             let _ = opstamp;
             Ok(())
@@ -5215,9 +5471,20 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn refresh(&self) -> Result<()> {
+        let _maintenance = self.maintenance_guard("refresh")?;
         let committed_next_seq = self.with_translog("refresh", |tl| {
             let next_seq = tl.next_seq_no();
-            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            if let Some(sender) = self
+                .refresh_before_writer_sender
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("refresh")?;
             writer.commit()?;
             Ok(next_seq)
         })?;
@@ -5227,11 +5494,13 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn flush(&self) -> Result<()> {
+        let _maintenance = self.maintenance_guard("flush")?;
         self.with_translog("flush", |tl| {
             let committed_next_seq = tl.next_seq_no();
-            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("flush")?;
             writer.commit()?;
-            drop(writer); // release lock before reader reload
+            drop(writer_state); // release lock before reader reload
             self.reader.reload()?;
             self.persist_committed_next_seq_no(committed_next_seq)?;
             tl.truncate()?;
@@ -5240,33 +5509,74 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn force_merge(&self, max_num_segments: usize) -> Result<()> {
-        // Commit first so all buffered docs are in segments.
-        let committed_next_seq = self.with_translog("force merge", |tl| {
-            let next_seq = tl.next_seq_no();
-            let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            writer.commit()?;
-            Ok(next_seq)
-        })?;
-        self.persist_committed_next_seq_no(committed_next_seq)?;
-        self.reader.reload()?;
-
-        // Iteratively merge until we have at most max_num_segments.
-        loop {
-            let segment_ids = self.index.searchable_segment_ids()?;
-            if segment_ids.len() <= max_num_segments {
-                break;
-            }
-
-            let future = {
-                let mut writer = self.writer.write().unwrap_or_else(|e| e.into_inner());
-                writer.merge(&segment_ids)
-            };
-            // Block until the merge completes (writer lock released).
-            let _: Option<tantivy::SegmentMeta> = future.wait()?;
-            self.reader.reload()?;
+        if max_num_segments == 0 {
+            anyhow::bail!("max_num_segments must be at least 1");
         }
 
-        Ok(())
+        #[cfg(test)]
+        if let Some(barrier) = {
+            self.force_merge_entry_barrier
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        } {
+            barrier.wait();
+        }
+
+        let _maintenance = self.maintenance_guard("force merge")?;
+        let committed_next_seq = self.with_translog("force merge", |translog| {
+            let next_seq = translog.next_seq_no();
+            self.pause_and_drain_automatic_merges()?;
+            Ok(next_seq)
+        })?;
+        let restore_policy = AutomaticMergePolicyRestore {
+            engine: self,
+            armed: true,
+        };
+
+        let merge_result = (|| {
+            self.persist_committed_next_seq_no(committed_next_seq)?;
+            self.reader.reload()?;
+
+            loop {
+                let segment_ids = self.index.searchable_segment_ids()?;
+                if segment_ids.len() <= max_num_segments {
+                    break;
+                }
+
+                let future = {
+                    let mut writer_state = self
+                        .writer
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner());
+                    writer_state.writer_mut("force merge")?.merge(&segment_ids)
+                };
+                let _: Option<tantivy::SegmentMeta> = future
+                    .wait()
+                    .context("Tantivy force-merge operation failed")?;
+                self.reader.reload()?;
+            }
+
+            let final_segment_count = self.index.searchable_segment_ids()?.len();
+            if final_segment_count > max_num_segments {
+                anyhow::bail!(
+                    "force merge completed with {final_segment_count} segments, above requested maximum {max_num_segments}"
+                );
+            }
+            Ok(())
+        })();
+        let restore_result = restore_policy.restore();
+
+        match (merge_result, restore_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => {
+                Err(error).context("force merge completed but merge-policy restoration failed")
+            }
+            (Err(merge_error), Err(restore_error)) => Err(anyhow::anyhow!(
+                "force merge failed: {merge_error:#}; merge-policy restoration also failed: {restore_error:#}"
+            )),
+        }
     }
 
     fn segment_infos(&self) -> Vec<super::SegmentInfo> {
@@ -6148,13 +6458,178 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
     use std::time::Duration;
+    use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
+    use tantivy::directory::{
+        Directory, FileHandle, RamDirectory, WatchCallback, WatchHandle, WritePtr,
+    };
+
+    const TEST_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+    const MERGE_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Helper: create a HotEngine backed by a temp directory.
     fn create_engine() -> (tempfile::TempDir, HotEngine) {
         let dir = tempfile::tempdir().unwrap();
         let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
         (dir, engine)
+    }
+
+    struct MergeWriteGate {
+        armed: AtomicBool,
+        entered_sender: Sender<()>,
+        release_receiver: Mutex<Receiver<()>>,
+    }
+
+    impl MergeWriteGate {
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        fn wait_if_armed(&self) -> std::io::Result<()> {
+            let is_merge_thread = std::thread::current()
+                .name()
+                .is_some_and(|name| name.starts_with("merge_thread_"));
+            if !is_merge_thread || !self.armed.swap(false, Ordering::SeqCst) {
+                return Ok(());
+            }
+
+            self.entered_sender.send(()).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("merge-start receiver dropped: {error}"),
+                )
+            })?;
+            self.release_receiver
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(MERGE_GATE_TIMEOUT)
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("timed out waiting to release blocked merge: {error}"),
+                    )
+                })?;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingMergeDirectory {
+        inner: RamDirectory,
+        gate: Arc<MergeWriteGate>,
+    }
+
+    impl fmt::Debug for BlockingMergeDirectory {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("BlockingMergeDirectory")
+        }
+    }
+
+    impl Directory for BlockingMergeDirectory {
+        fn get_file_handle(
+            &self,
+            path: &Path,
+        ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
+            self.inner.get_file_handle(path)
+        }
+
+        fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
+            self.inner.delete(path)
+        }
+
+        fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
+            self.inner.exists(path)
+        }
+
+        fn open_write(&self, path: &Path) -> std::result::Result<WritePtr, OpenWriteError> {
+            self.gate
+                .wait_if_armed()
+                .map_err(|error| OpenWriteError::wrap_io_error(error, path.to_path_buf()))?;
+            self.inner.open_write(path)
+        }
+
+        fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
+            self.inner.atomic_read(path)
+        }
+
+        fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            self.inner.atomic_write(path, data)
+        }
+
+        fn sync_directory(&self) -> std::io::Result<()> {
+            self.inner.sync_directory()
+        }
+
+        fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+            self.inner.watch(watch_callback)
+        }
+    }
+
+    fn create_engine_with_blocked_merge() -> (
+        tempfile::TempDir,
+        HotEngine,
+        Arc<MergeWriteGate>,
+        Receiver<()>,
+        Sender<()>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let gate = Arc::new(MergeWriteGate {
+            armed: AtomicBool::new(false),
+            entered_sender,
+            release_receiver: Mutex::new(release_receiver),
+        });
+        let directory = BlockingMergeDirectory {
+            inner: RamDirectory::create(),
+            gate: gate.clone(),
+        };
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
+        schema_builder.add_text_field("_source", STORED);
+        schema_builder.add_text_field("body", TEXT | STORED);
+        let index = Index::open_or_create(directory, schema_builder.build()).unwrap();
+        let schema = index.schema();
+        let id_field = schema.get_field("_id").unwrap();
+        let source_field = schema.get_field("_source").unwrap();
+        let body_field = schema.get_field("body").unwrap();
+        let writer = index.writer(TANTIVY_WRITER_HEAP_BYTES).unwrap();
+        let automatic_merge_policy = writer.get_merge_policy();
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .unwrap();
+        let translog =
+            HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
+        let committed_seq_no_path = dir.path().join("translog.committed");
+
+        let engine = HotEngine {
+            index,
+            reader,
+            writer: Arc::new(RwLock::new(WriterState::ready(writer))),
+            maintenance_lock: Mutex::new(()),
+            automatic_merge_policy: RwLock::new(automatic_merge_policy),
+            force_merge_entry_barrier: Mutex::new(None),
+            force_merge_before_wait_sender: Mutex::new(None),
+            refresh_before_writer_sender: Mutex::new(None),
+            field_registry: RwLock::new(FieldRegistry {
+                id_field,
+                source_field,
+                fields: HashMap::from([("body".to_string(), body_field)]),
+                field_types: HashMap::new(),
+                date_fields: Vec::new(),
+            }),
+            refresh_interval: Duration::from_secs(60),
+            translog: Arc::new(Mutex::new(translog)),
+            committed_seq_no_path,
+            column_cache: Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        };
+
+        (dir, engine, gate, entered_receiver, release_sender)
     }
 
     // ── schema evolution ────────────────────────────────────────────────
@@ -8634,7 +9109,8 @@ mod tests {
         drop(registry);
 
         {
-            let mut writer = engine.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = engine.writer.write().unwrap_or_else(|e| e.into_inner());
+            let writer = writer_state.writer_mut("legacy date test").unwrap();
             writer.add_document(doc).unwrap();
             writer.commit().unwrap();
         }
@@ -9663,7 +10139,7 @@ mod tests {
         let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
 
         engine.add_document("d1", json!({"x": 1})).unwrap();
-        let _writer = engine.writer.write().unwrap_or_else(|e| e.into_inner());
+        let _writer = engine.writer_lock_for_test();
 
         let flushed = engine.try_flush_with_global_checkpoint(1).unwrap();
         assert!(!flushed);
@@ -9915,6 +10391,263 @@ mod tests {
             "expected at most 3 segments after force_merge(3), got {after}"
         );
         assert_eq!(engine.doc_count(), 20);
+    }
+
+    #[test]
+    fn concurrent_force_merges_do_not_race_segment_replacement() {
+        let (_dir, engine) = create_engine();
+        engine
+            .set_merge_policy_for_test(Box::new(NoMergePolicy))
+            .unwrap();
+
+        for i in 0..8 {
+            engine
+                .add_document(
+                    &format!("d{i}"),
+                    json!({"ordinal": i, "value": format!("value-{i}")}),
+                )
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+        engine
+            .add_document("d3", json!({"ordinal": 303, "value": "updated"}))
+            .unwrap();
+        engine.delete_document("d5").unwrap();
+        engine.refresh().unwrap();
+
+        let engine = Arc::new(engine);
+        *engine
+            .force_merge_entry_barrier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(std::sync::Barrier::new(2)));
+
+        let first_engine = engine.clone();
+        let first = std::thread::spawn(move || first_engine.force_merge(1));
+        let second_engine = engine.clone();
+        let second = std::thread::spawn(move || second_engine.force_merge(1));
+
+        let first_result = first.join().unwrap();
+        let second_result = second.join().unwrap();
+        assert!(
+            first_result.is_ok() && second_result.is_ok(),
+            "both overlapping force merges must succeed: first={first_result:?}, second={second_result:?}"
+        );
+        assert_eq!(engine.index.searchable_segment_ids().unwrap().len(), 1);
+        assert_eq!(engine.doc_count(), 7);
+        assert!(engine.get_document("d5").unwrap().is_none());
+        for i in 0..8 {
+            if i == 5 {
+                continue;
+            }
+            let document = engine
+                .get_document(&format!("d{i}"))
+                .unwrap()
+                .expect("surviving document must remain readable");
+            if i == 3 {
+                assert_eq!(document["ordinal"], 303);
+                assert_eq!(document["value"], "updated");
+            } else {
+                assert_eq!(document["ordinal"], i);
+                assert_eq!(document["value"], format!("value-{i}"));
+            }
+        }
+    }
+
+    #[test]
+    fn force_merge_drains_in_flight_automatic_merge_before_manual_compaction() {
+        #[derive(Debug)]
+        struct OneShotMergeAllPolicy {
+            calls: Arc<AtomicUsize>,
+            candidates: Arc<AtomicUsize>,
+        }
+
+        impl MergePolicy for OneShotMergeAllPolicy {
+            fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if segments.len() > 1
+                    && self
+                        .candidates
+                        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    return vec![MergeCandidate(
+                        segments.iter().map(SegmentMeta::id).collect(),
+                    )];
+                }
+                Vec::new()
+            }
+        }
+
+        let (_dir, engine, merge_gate, merge_started, release_merge) =
+            create_engine_with_blocked_merge();
+        engine
+            .set_merge_policy_for_test(Box::new(NoMergePolicy))
+            .unwrap();
+        for i in 0..8 {
+            engine
+                .add_document(
+                    &format!("d{i}"),
+                    json!({"ordinal": i, "value": format!("value-{i}")}),
+                )
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        let policy_calls = Arc::new(AtomicUsize::new(0));
+        let automatic_candidates = Arc::new(AtomicUsize::new(0));
+        engine
+            .set_merge_policy_for_test(Box::new(OneShotMergeAllPolicy {
+                calls: policy_calls.clone(),
+                candidates: automatic_candidates.clone(),
+            }))
+            .unwrap();
+        merge_gate.arm();
+        engine
+            .add_document("d8", json!({"ordinal": 8, "value": "value-8"}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        merge_started
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .expect("automatic merge must reach the merge-thread write boundary");
+        assert_eq!(
+            automatic_candidates.load(Ordering::SeqCst),
+            1,
+            "the blocked merge must come from the automatic merge policy"
+        );
+
+        engine
+            .add_document("d3", json!({"ordinal": 303, "value": "updated"}))
+            .unwrap();
+        engine.delete_document("d5").unwrap();
+        let expected_next_seq = engine
+            .with_translog("automatic force-merge test", |wal| Ok(wal.next_seq_no()))
+            .unwrap();
+        let checkpoint_before_force_merge = engine.load_committed_next_seq_no().unwrap();
+        assert!(
+            checkpoint_before_force_merge < expected_next_seq,
+            "the force merge must commit the update and delete queued while the automatic merge is blocked"
+        );
+
+        let engine = Arc::new(engine);
+        let (before_wait_sender, before_wait_receiver) = mpsc::channel();
+        *engine
+            .force_merge_before_wait_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(before_wait_sender);
+        let (result_sender, result_receiver) = mpsc::channel();
+        let force_merge_engine = engine.clone();
+        let force_merge_thread = std::thread::spawn(move || {
+            let _ = result_sender.send(force_merge_engine.force_merge(1));
+        });
+
+        if let Err(error) = before_wait_receiver.recv_timeout(TEST_SYNC_TIMEOUT) {
+            let _ = release_merge.send(());
+            panic!("force merge did not reach the automatic-merge drain boundary: {error}");
+        }
+        let early_result = result_receiver.try_recv();
+        release_merge
+            .send(())
+            .expect("blocked automatic merge must still be waiting for release");
+        assert!(
+            matches!(early_result, Err(TryRecvError::Empty)),
+            "force merge must not complete before the in-flight automatic merge is released: {early_result:?}"
+        );
+
+        let force_merge_result = result_receiver
+            .recv_timeout(MERGE_GATE_TIMEOUT)
+            .expect("force merge must complete after the automatic merge is released");
+        force_merge_result.unwrap();
+        force_merge_thread.join().unwrap();
+
+        assert_eq!(engine.index.searchable_segment_ids().unwrap().len(), 1);
+        assert_eq!(engine.doc_count(), 8);
+        assert_eq!(
+            engine.load_committed_next_seq_no().unwrap(),
+            expected_next_seq,
+            "force merge must persist the exact committed WAL watermark"
+        );
+        assert!(engine.get_document("d5").unwrap().is_none());
+        for i in 0..=8 {
+            if i == 5 {
+                continue;
+            }
+            let document = engine
+                .get_document(&format!("d{i}"))
+                .unwrap()
+                .expect("surviving document must remain readable");
+            if i == 3 {
+                assert_eq!(document["ordinal"], 303);
+                assert_eq!(document["value"], "updated");
+            } else {
+                assert_eq!(document["ordinal"], i);
+                assert_eq!(document["value"], format!("value-{i}"));
+            }
+        }
+
+        let calls_after_force_merge = policy_calls.load(Ordering::SeqCst);
+        engine
+            .add_document("after", json!({"value": "after"}))
+            .unwrap();
+        engine.refresh().unwrap();
+        assert!(
+            policy_calls.load(Ordering::SeqCst) > calls_after_force_merge,
+            "the original automatic merge policy must be active after force merge"
+        );
+    }
+
+    #[test]
+    fn force_merge_restores_automatic_merge_policy() {
+        #[derive(Debug)]
+        struct CountingMergePolicy(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl MergePolicy for CountingMergePolicy {
+            fn compute_merge_candidates(&self, _segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            }
+        }
+
+        let (_dir, engine) = create_engine();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        engine
+            .set_merge_policy_for_test(Box::new(CountingMergePolicy(calls.clone())))
+            .unwrap();
+        for i in 0..3 {
+            engine
+                .add_document(&format!("before-{i}"), json!({"value": i}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+
+        engine.force_merge(1).unwrap();
+        let calls_after_force_merge = calls.load(std::sync::atomic::Ordering::SeqCst);
+        engine
+            .add_document("after", json!({"value": "after"}))
+            .unwrap();
+        engine.refresh().unwrap();
+
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > calls_after_force_merge,
+            "the original automatic merge policy must be active after force merge"
+        );
+    }
+
+    #[test]
+    fn force_merge_rejects_zero_segments_without_mutation() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let before_segments = engine.index.searchable_segment_ids().unwrap();
+
+        let error = engine.force_merge(0).unwrap_err();
+
+        assert!(error.to_string().contains("at least 1"));
+        assert_eq!(
+            engine.index.searchable_segment_ids().unwrap(),
+            before_segments
+        );
+        assert_eq!(engine.get_document("d1").unwrap().unwrap()["value"], 1);
     }
 
     #[test]

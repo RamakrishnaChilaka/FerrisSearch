@@ -59,9 +59,17 @@ cargo test -- test_name                         # Single test by name
 - For HotEngine WAL-wrapper hardening, add unit tests that poisoned translog wrapper locks return `Err` on write and maintenance paths, and that grouped segment worker panics are surfaced as ordinary query errors.
 - For WAL auto-flush or replay changes, add regressions for disabled thresholds (`flush_threshold_bytes = 0`), zero global checkpoint safety (no auto-truncate), and stale `translog.committed` checkpoints that force a replayed suffix after a prior batch commit.
 - For auto-flush concurrency changes, add regressions proving maintenance ticks defer instead of blocking when the text flush path or vector persistence path is already busy.
-- For maintenance scheduling changes, add a `#[tokio::test(flavor = "current_thread")]` regression that blocks the Tantivy writer lock from another thread and proves the async runtime still makes progress while the maintenance tick waits.
+- For maintenance scheduling changes, add a `#[tokio::test(flavor = "current_thread")]` regression that blocks a real Tantivy maintenance path with bounded synchronization and proves an unrelated write or replica apply still completes on the fixed write pool. Also preserve post-write `refresh=true` visibility and maintenance error propagation.
 - For refresh/flush fan-out changes, add one regression that the coordinator still dispatches its local node through the per-node maintenance path, plus a transport regression that maintenance reopens persisted assigned shards but refuses to create missing UUID directories.
 - For asynchronous `/{index}/_forcemerge` changes, add one API regression that the handler returns `202 Accepted` immediately and one transport regression that the gRPC force-merge RPC returns after enqueueing background work instead of waiting for segment compaction to finish.
+- For force-merge coordination changes, deterministically overlap calls with a
+  barrier, assert the final segment bound and exact document values/deletes,
+  verify automatic merge-policy restoration, and cover zero/invalid bounds at
+  engine, HTTP, and transport surfaces.
+- For container-aware cache sizing, use fixture procfs/cgroupfs trees covering
+  cgroup v2 and v1, tighter ancestors, unlimited and missing controllers,
+  nested/namespaced mount roots, malformed authoritative values/mappings, and
+  the zero-disabled path. Also cover startup cache wiring and exported gauges.
 - For async maintenance task-tracking changes, add one REST/API regression that `POST /{index}/_forcemerge` returns a task id and `GET /_tasks/{task_id}` reaches a terminal state, plus one transport regression that `GetTaskStatus` returns the node-local snapshot for a queued/running/completed task.
 - For async scheduling changes around shard open/close, orphan cleanup, translog fsync, redb-backed Raft storage, or other blocking wrappers, add a `#[tokio::test(flavor = "current_thread")]` regression that holds the relevant lock or resource from another thread and proves the runtime still advances while the wrapper waits.
 - For index UUID / orphan-cleanup fixes, add a regression that an auto-created index opens its local shard with the same UUID stored in cluster state, plus a restart-path regression that missing expected UUID directories cause cleanup to bail out instead of deleting unknown shard data.

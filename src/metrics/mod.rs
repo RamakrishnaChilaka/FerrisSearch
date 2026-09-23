@@ -298,6 +298,41 @@ pub static PROCESS_START_TIME_SECONDS: LazyLock<Gauge> = LazyLock::new(|| {
     gauge
 });
 
+pub static COLUMN_CACHE_EFFECTIVE_MEMORY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "ferrissearch_column_cache_effective_memory_bytes",
+        "Host memory after applicable hard cgroup caps used to size the column cache; 0 when the cache is disabled",
+    )
+    .expect("metric: column_cache_effective_memory_bytes");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: column_cache_effective_memory_bytes");
+    gauge
+});
+
+pub static COLUMN_CACHE_BUDGET_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "ferrissearch_column_cache_budget_bytes",
+        "Configured maximum weighted capacity of the shared column cache in bytes",
+    )
+    .expect("metric: column_cache_budget_bytes");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: column_cache_budget_bytes");
+    gauge
+});
+
+fn set_column_cache_budget_gauges(
+    effective_memory_gauge: &IntGauge,
+    cache_budget_gauge: &IntGauge,
+    effective_memory_bytes: Option<u64>,
+    cache_budget_bytes: u64,
+) {
+    let as_gauge = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    effective_memory_gauge.set(as_gauge(effective_memory_bytes.unwrap_or(0)));
+    cache_budget_gauge.set(as_gauge(cache_budget_bytes));
+}
+
 // ── Snapshot helpers ────────────────────────────────────────────────
 
 fn initialize_metrics() {
@@ -322,6 +357,20 @@ fn initialize_metrics() {
     let _ = &*PROCESS_OPEN_FDS;
     let _ = &*PROCESS_THREADS;
     let _ = &*PROCESS_START_TIME_SECONDS;
+    let _ = &*COLUMN_CACHE_EFFECTIVE_MEMORY_BYTES;
+    let _ = &*COLUMN_CACHE_BUDGET_BYTES;
+}
+
+pub fn set_column_cache_budget_metrics(
+    effective_memory_bytes: Option<u64>,
+    cache_budget_bytes: u64,
+) {
+    set_column_cache_budget_gauges(
+        &COLUMN_CACHE_EFFECTIVE_MEMORY_BYTES,
+        &COLUMN_CACHE_BUDGET_BYTES,
+        effective_memory_bytes,
+        cache_budget_bytes,
+    );
 }
 
 /// Update process-level metrics by reading from /proc/self.
@@ -481,6 +530,73 @@ mod tests {
         assert!(output.contains("process_resident_memory_bytes"));
         assert!(output.contains("process_open_fds"));
         assert!(output.contains("process_threads"));
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("ferrissearch_column_cache_effective_memory_bytes "))
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("ferrissearch_column_cache_budget_bytes "))
+        );
+    }
+
+    #[test]
+    fn column_cache_budget_metrics_encode_values_in_isolated_registry() {
+        let registry = Registry::new();
+        let effective_memory_gauge = IntGauge::new(
+            "ferrissearch_column_cache_effective_memory_bytes",
+            "Host memory after applicable hard cgroup caps used to size the column cache; 0 when the cache is disabled",
+        )
+        .unwrap();
+        let cache_budget_gauge = IntGauge::new(
+            "ferrissearch_column_cache_budget_bytes",
+            "Configured maximum weighted capacity of the shared column cache in bytes",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(effective_memory_gauge.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(cache_budget_gauge.clone()))
+            .unwrap();
+
+        let encode = || {
+            let mut buffer = Vec::new();
+            TextEncoder::new()
+                .encode(&registry.gather(), &mut buffer)
+                .unwrap();
+            String::from_utf8(buffer).unwrap()
+        };
+        let has_sample = |output: &str, expected: &str| output.lines().any(|line| line == expected);
+
+        set_column_cache_budget_gauges(
+            &effective_memory_gauge,
+            &cache_budget_gauge,
+            Some(2 * 1024 * 1024 * 1024),
+            214_748_364,
+        );
+        let enabled_output = encode();
+        assert!(has_sample(
+            &enabled_output,
+            "ferrissearch_column_cache_effective_memory_bytes 2147483648"
+        ));
+        assert!(has_sample(
+            &enabled_output,
+            "ferrissearch_column_cache_budget_bytes 214748364"
+        ));
+
+        set_column_cache_budget_gauges(&effective_memory_gauge, &cache_budget_gauge, None, 0);
+        let disabled_output = encode();
+        assert!(has_sample(
+            &disabled_output,
+            "ferrissearch_column_cache_effective_memory_bytes 0"
+        ));
+        assert!(has_sample(
+            &disabled_output,
+            "ferrissearch_column_cache_budget_bytes 0"
+        ));
     }
 
     #[test]

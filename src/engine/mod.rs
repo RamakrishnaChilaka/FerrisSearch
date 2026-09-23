@@ -163,7 +163,7 @@ pub trait SearchEngine: Send + Sync {
         self.flush()
     }
 
-    /// Force-merge segments down to at most `max_num_segments`.
+    /// Force-merge segments down to at most `max_num_segments` (which must be at least 1).
     /// Commits first to ensure all buffered docs are on disk, then merges.
     fn force_merge(&self, max_num_segments: usize) -> Result<()>;
 

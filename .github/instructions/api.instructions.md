@@ -150,6 +150,10 @@ normal CRUD before publishing any bundle or manifest. Keyword object values
 return a field-specific `400 mapper_parsing_exception`; they are not build
 failures and must not publish partial data.
 `AppState.raft` is `Arc<RaftInstance>`, not `Option` — Raft is always present. Index-management handlers use `state.raft` directly without unwrapping.
+`POST /{index}/_forcemerge` keeps its asynchronous `202 Accepted` task
+lifecycle. `max_num_segments` defaults to `1` and must parse as an integer in
+the inclusive range `1..=u32::MAX`; invalid, zero, negative, and overflowing
+values return `400 illegal_argument_exception` without enqueueing work.
 
 ### Local Shard Reopen Rule
 - `ensure_local_index_shards_open()` is async and must be awaited by search/count/SQL read paths.
@@ -257,7 +261,7 @@ For `remote_store` indices, `GET /{index}/_search?q=...`, SQL materialized searc
 ### Refresh/Flush Fan-Out
 Both `refresh_index()` and `flush_index()` fan out to ALL nodes via `fan_out_maintenance()`:
 - **Local node**: dispatched alongside remote nodes in the same per-node task set; do not run local maintenance inline before the rest of the fan-out is launched
-- **Per-node maintenance**: each node reopens its assigned shards with the same read-side UUID-dir guard used by transport read paths, then runs refresh/flush on the write pool
+- **Per-node maintenance**: each node reopens its assigned shards with the same read-side UUID-dir guard used by transport read paths, then runs refresh/flush on Tokio's blocking pool so a shard-local maintenance wait cannot consume the bounded write pool
 - **Remote fan-out**: refresh and flush both dispatch remote nodes concurrently; localhost and remote targets must go through the same per-node fan-out behavior
 - The maintenance helper checks the routing table — only shards where this node is primary or replica are operated on (orphaned shards are skipped)
 - Missing authoritative UUID directories on a maintenance path are logged and skipped; they must not create fresh shard data
@@ -279,6 +283,8 @@ pub struct RefreshParam { pub refresh: Option<String> }
 // ?refresh=true or ?refresh (empty) → forces refresh after write
 ```
 Used by: index, update, delete, bulk endpoints.
+Post-write refresh waits use Tokio's blocking pool; the document and replica
+write itself remains on the dedicated write pool.
 
 ## Bulk Index Parsing
 `parse_bulk_ndjson(text)` supports:
