@@ -82,14 +82,22 @@ pub struct Node {
 - Recovery replay must not allocate fresh local WAL seq_nos on the recovering replica
 
 ## Shard Failover Algorithm (leader only)
-1. `IndexMetadata::remove_node(dead_node)` → returns orphaned primary shard IDs
+1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every
+   replica list, increments `unassigned_replicas` on each affected shard, and
+   returns orphaned primary shard IDs. Mixed primary/replica roles are accounted
+   independently per shard, never gated by aggregate index state.
 2. For each orphaned primary:
    - Query `isr_tracker.replica_checkpoints(index, shard_id)` for all replicas
    - Find replica with **highest checkpoint** (most up-to-date data)
    - Call `IndexMetadata::promote_replica_to(shard_id, best_replica_node)`
    - Increment `unassigned_replicas` for the lost replica slot
-3. For replicas on the dead node: increment `unassigned_replicas`
-4. Issue `UpdateIndex` Raft command to persist routing changes
+3. Issue `UpdateIndex` through Raft when any replica slot was removed or any
+   primary was promoted.
+4. Re-read committed cluster state before processing another dead node so
+   sequential removals do not reuse stale routing or double-count slots.
+
+This accounting fix does not change promotion eligibility, acknowledgement
+membership, replica admission, or recovery safety.
 
 ## AppState (shared across all API handlers)
 ```rust

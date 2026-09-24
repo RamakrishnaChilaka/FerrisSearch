@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
+use ferrissearch::engine::routing::calculate_shard;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ const CLUSTER_NAME: &str = "restart-regression-cluster";
 const DOC_COUNT: usize = 12_000;
 const BATCH_SIZE: usize = 500;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const FAILOVER_TIMEOUT: Duration = Duration::from_secs(90);
 const DOC_BODY: &str = "restart regression payload restart regression payload restart regression payload restart regression payload restart regression payload restart regression payload restart regression payload restart regression payload";
 
 #[derive(Clone)]
@@ -34,6 +37,13 @@ impl NodeConfig {
 struct NodeProcess {
     config: NodeConfig,
     child: Child,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RoutingSnapshot {
+    primary: String,
+    replicas: Vec<String>,
+    unassigned_replicas: u32,
 }
 
 impl NodeProcess {
@@ -189,7 +199,11 @@ impl RestartClusterHarness {
         path: &str,
         body: Option<Value>,
     ) -> Result<(StatusCode, Value)> {
-        let url = format!("{}{}", self.nodes[0].config.base_url(), path);
+        let coordinator = self
+            .nodes
+            .first()
+            .context("no running node is available as an HTTP coordinator")?;
+        let url = format!("{}{}", coordinator.config.base_url(), path);
         let builder = self.client.request(method, url);
         let builder = if let Some(body) = body {
             builder.json(&body)
@@ -203,7 +217,11 @@ impl RestartClusterHarness {
     }
 
     async fn post_ndjson(&self, path: &str, body: String) -> Result<(StatusCode, Value)> {
-        let url = format!("{}{}", self.nodes[0].config.base_url(), path);
+        let coordinator = self
+            .nodes
+            .first()
+            .context("no running node is available as an HTTP coordinator")?;
+        let url = format!("{}{}", coordinator.config.base_url(), path);
         let response = self
             .client
             .post(url)
@@ -214,6 +232,32 @@ impl RestartClusterHarness {
         let status = response.status();
         let value = response.json().await?;
         Ok((status, value))
+    }
+
+    async fn request_text(&self, path: &str) -> Result<(StatusCode, String)> {
+        let coordinator = self
+            .nodes
+            .first()
+            .context("no running node is available as an HTTP coordinator")?;
+        let response = self
+            .client
+            .get(format!("{}{}", coordinator.config.base_url(), path))
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        Ok((status, text))
+    }
+
+    fn stop_node(&mut self, node_id: &str) -> Result<NodeProcess> {
+        let position = self
+            .nodes
+            .iter()
+            .position(|node| node.config.name == node_id)
+            .with_context(|| format!("node {node_id} is not running in the harness"))?;
+        let mut node = self.nodes.remove(position);
+        node.stop()?;
+        Ok(node)
     }
 
     async fn wait_for_cluster_state(
@@ -238,7 +282,7 @@ impl RestartClusterHarness {
                     .unwrap_or(0);
                 let index_ready = expected_index
                     .is_none_or(|index_name| state["indices"].get(index_name).is_some());
-                if nodes_len >= expected_nodes && index_ready {
+                if nodes_len == expected_nodes && index_ready {
                     return Ok(state);
                 }
             }
@@ -248,6 +292,109 @@ impl RestartClusterHarness {
                     "cluster did not reach {} nodes with index {:?}\n{}",
                     expected_nodes,
                     expected_index,
+                    self.logs_summary()
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_index_shards(
+        &mut self,
+        index_name: &str,
+        expected_started: usize,
+        expected_unassigned: usize,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            for node in &mut self.nodes {
+                node.ensure_running()?;
+            }
+
+            if let Ok((status, text)) = self.request_text("/_cat/shards?v").await
+                && status == StatusCode::OK
+            {
+                let rows = text
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| {
+                        let columns = line.split_whitespace().collect::<Vec<_>>();
+                        (columns.first().copied() == Some(index_name)).then_some(columns)
+                    })
+                    .collect::<Vec<_>>();
+                let started = rows
+                    .iter()
+                    .filter(|columns| columns.get(3).copied() == Some("STARTED"))
+                    .count();
+                let unassigned = rows
+                    .iter()
+                    .filter(|columns| columns.get(3).copied() == Some("UNASSIGNED"))
+                    .count();
+
+                if rows.len() == expected_started + expected_unassigned
+                    && started == expected_started
+                    && unassigned == expected_unassigned
+                {
+                    return Ok(());
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "shards for {index_name} did not reach {expected_started} STARTED and {expected_unassigned} UNASSIGNED copies\n{}",
+                    self.logs_summary()
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_node_loss_accounting(
+        &mut self,
+        index_name: &str,
+        dead_node: &str,
+    ) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
+        loop {
+            for node in &mut self.nodes {
+                node.ensure_running()?;
+            }
+
+            if let Ok((status, state)) = self
+                .request_json(Method::GET, "/_cluster/state", None)
+                .await
+                && status == StatusCode::OK
+            {
+                let nodes = state["nodes"].as_object();
+                let master = state["master_node"].as_str();
+                let routing = routing_snapshot(&state, index_name);
+                let accounted = routing.as_ref().is_ok_and(|shards| {
+                    shards.len() == 3
+                        && shards.values().all(|entry| {
+                            entry.primary != dead_node
+                                && !entry.replicas.iter().any(|node| node == dead_node)
+                                && entry.replicas.len() == 1
+                                && entry.unassigned_replicas == 1
+                        })
+                });
+
+                if nodes.is_some_and(|nodes| {
+                    nodes.len() == 2
+                        && !nodes.contains_key(dead_node)
+                        && master
+                            .is_some_and(|master| master != dead_node && nodes.contains_key(master))
+                }) && accounted
+                {
+                    return Ok(state);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "cluster did not remove {dead_node} and account one lost copy per shard within {FAILOVER_TIMEOUT:?}\n{}",
                     self.logs_summary()
                 );
             }
@@ -285,7 +432,7 @@ impl RestartClusterHarness {
         }
     }
 
-    async fn create_index(&mut self) -> Result<String> {
+    async fn create_index(&mut self, number_of_replicas: u32) -> Result<String> {
         let (status, body) = self
             .request_json(
                 Method::PUT,
@@ -293,7 +440,7 @@ impl RestartClusterHarness {
                 Some(json!({
                     "settings": {
                         "number_of_shards": 3,
-                        "number_of_replicas": 0,
+                        "number_of_replicas": number_of_replicas,
                         "refresh_interval_ms": 60000
                     },
                     "mappings": {
@@ -319,6 +466,62 @@ impl RestartClusterHarness {
             .context("cluster state is missing index uuid")?
             .to_string();
         Ok(uuid)
+    }
+
+    async fn put_document(&self, doc_id: &str, source: Value) -> Result<Value> {
+        let (status, body) = self
+            .request_json(
+                Method::PUT,
+                &format!("/{INDEX_NAME}/_doc/{doc_id}"),
+                Some(source),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "index {doc_id}: {body}");
+        assert_eq!(body["_id"], json!(doc_id), "index receipt: {body}");
+        assert!(
+            body["_seq_no"].as_u64().is_some(),
+            "index receipt is missing _seq_no: {body}"
+        );
+        Ok(body)
+    }
+
+    async fn delete_document(&self, doc_id: &str) -> Result<Value> {
+        let (status, body) = self
+            .request_json(
+                Method::DELETE,
+                &format!("/{INDEX_NAME}/_doc/{doc_id}"),
+                None,
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "delete {doc_id}: {body}");
+        assert_eq!(body["result"], json!("deleted"), "delete receipt: {body}");
+        assert!(
+            body["_seq_no"].as_u64().is_some(),
+            "delete receipt is missing _seq_no: {body}"
+        );
+        Ok(body)
+    }
+
+    async fn get_document(&self, doc_id: &str) -> Result<(StatusCode, Value)> {
+        self.request_json(Method::GET, &format!("/{INDEX_NAME}/_doc/{doc_id}"), None)
+            .await
+    }
+
+    async fn refresh_index(&self) -> Result<()> {
+        let (status, body) = self
+            .request_json(
+                Method::POST,
+                &format!("/{INDEX_NAME}/_refresh"),
+                Some(json!({})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "refresh failed: {body}");
+        assert_eq!(
+            body["_shards"]["failed"],
+            json!(0),
+            "refresh reported failures: {body}"
+        );
+        Ok(())
     }
 
     async fn bulk_index_documents(&self, doc_count: usize) -> Result<()> {
@@ -454,6 +657,59 @@ fn reserve_port() -> u16 {
     listener.local_addr().expect("port addr").port()
 }
 
+fn routing_snapshot(
+    cluster_state: &Value,
+    index_name: &str,
+) -> Result<BTreeMap<u32, RoutingSnapshot>> {
+    let routing = cluster_state["indices"][index_name]["shard_routing"]
+        .as_object()
+        .with_context(|| format!("cluster state is missing routing for {index_name}"))?;
+    routing
+        .iter()
+        .map(|(shard_id, entry)| {
+            let shard_id = shard_id
+                .parse::<u32>()
+                .with_context(|| format!("invalid shard id {shard_id}"))?;
+            let primary = entry["primary"]
+                .as_str()
+                .with_context(|| format!("shard {shard_id} is missing primary"))?
+                .to_string();
+            let replicas = entry["replicas"]
+                .as_array()
+                .with_context(|| format!("shard {shard_id} is missing replicas"))?
+                .iter()
+                .map(|node| {
+                    node.as_str()
+                        .with_context(|| format!("shard {shard_id} has a non-string replica"))
+                        .map(str::to_string)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let unassigned_replicas = entry["unassigned_replicas"]
+                .as_u64()
+                .with_context(|| format!("shard {shard_id} is missing unassigned_replicas"))?
+                as u32;
+            Ok((
+                shard_id,
+                RoutingSnapshot {
+                    primary,
+                    replicas,
+                    unassigned_replicas,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn document_id_for_shard(prefix: &str, shard_id: u32) -> String {
+    for suffix in 0..10_000 {
+        let candidate = format!("{prefix}-{suffix}");
+        if calculate_shard(&candidate, 3) == shard_id {
+            return candidate;
+        }
+    }
+    panic!("could not find a document ID for shard {shard_id}");
+}
+
 async fn wait_for_http_ready(client: &Client, node: &mut NodeProcess) -> Result<()> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
@@ -514,7 +770,7 @@ async fn wait_for_single_node_bootstrap(client: &Client, node: &mut NodeProcess)
 #[tokio::test]
 async fn three_node_flush_restart_preserves_uuid_dirs_and_document_count() -> Result<()> {
     let mut harness = RestartClusterHarness::start().await?;
-    let index_uuid = harness.create_index().await?;
+    let index_uuid = harness.create_index(0).await?;
 
     harness.bulk_index_documents(DOC_COUNT).await?;
     harness.flush_index().await?;
@@ -536,6 +792,194 @@ async fn three_node_flush_restart_preserves_uuid_dirs_and_document_count() -> Re
     harness.assert_expected_shard_dirs_exist(&cluster_state_after_restart, &index_uuid)?;
     harness.wait_for_count(DOC_COUNT).await?;
     harness.assert_no_delete_reasons_in_logs();
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_role_node_loss_accounts_every_shard_and_preserves_acknowledged_data() -> Result<()> {
+    let mut harness = RestartClusterHarness::start().await?;
+    let index_uuid = harness.create_index(2).await?;
+    harness
+        .wait_for_index_shards(INDEX_NAME, 9, 0, READY_TIMEOUT)
+        .await?;
+
+    let cluster_state_before = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    let routing_before = routing_snapshot(&cluster_state_before, INDEX_NAME)?;
+    assert_eq!(routing_before.len(), 3);
+    assert_eq!(
+        cluster_state_before["indices"][INDEX_NAME]["number_of_replicas"],
+        json!(2)
+    );
+    assert_eq!(
+        cluster_state_before["indices"][INDEX_NAME]["uuid"],
+        json!(index_uuid)
+    );
+    for routing in routing_before.values() {
+        assert_eq!(routing.replicas.len(), 2);
+        assert_eq!(routing.unassigned_replicas, 0);
+    }
+
+    let dead_node = cluster_state_before["master_node"]
+        .as_str()
+        .context("cluster state is missing the elected master")?
+        .to_string();
+    let promoted_shards = routing_before
+        .iter()
+        .filter_map(|(shard_id, routing)| (routing.primary == dead_node).then_some(*shard_id))
+        .collect::<Vec<_>>();
+    let replica_shards = routing_before
+        .iter()
+        .filter_map(|(shard_id, routing)| {
+            routing
+                .replicas
+                .iter()
+                .any(|node| node == &dead_node)
+                .then_some(*shard_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        promoted_shards.len(),
+        1,
+        "each node must own one primary in the 3-shard round-robin routing"
+    );
+    assert_eq!(
+        replica_shards.len(),
+        2,
+        "the failed node must be a replica for the other two shards"
+    );
+    let promoted_shard = promoted_shards[0];
+
+    let mut expected_documents = BTreeMap::new();
+    for shard_id in 0..3 {
+        let doc_id = document_id_for_shard("acknowledged", shard_id);
+        let source = json!({
+            "title": format!("acknowledged shard {shard_id}"),
+            "author": format!("author-{shard_id}"),
+            "payload": format!("preserved-value-{shard_id}"),
+            "n": shard_id,
+        });
+        harness.put_document(&doc_id, source.clone()).await?;
+        expected_documents.insert(doc_id, source);
+    }
+
+    let deleted_doc_id = document_id_for_shard("acknowledged-delete", promoted_shard);
+    harness
+        .put_document(
+            &deleted_doc_id,
+            json!({
+                "title": "delete before failover",
+                "author": "delete-test",
+                "payload": "must remain deleted",
+                "n": 99,
+            }),
+        )
+        .await?;
+    harness.delete_document(&deleted_doc_id).await?;
+    harness.refresh_index().await?;
+
+    for (doc_id, expected_source) in &expected_documents {
+        let (status, body) = harness.get_document(doc_id).await?;
+        assert_eq!(status, StatusCode::OK, "get {doc_id}: {body}");
+        assert_eq!(&body["_source"], expected_source, "get {doc_id}: {body}");
+    }
+    let (deleted_status, deleted_body) = harness.get_document(&deleted_doc_id).await?;
+    assert_eq!(deleted_status, StatusCode::NOT_FOUND, "{deleted_body}");
+    assert_eq!(deleted_body["found"], json!(false));
+
+    let _stopped_node = harness.stop_node(&dead_node)?;
+    let cluster_state_after = harness
+        .wait_for_node_loss_accounting(INDEX_NAME, &dead_node)
+        .await?;
+    harness
+        .wait_for_index_shards(INDEX_NAME, 6, 3, READY_TIMEOUT)
+        .await?;
+
+    assert_eq!(
+        cluster_state_after["indices"][INDEX_NAME]["uuid"],
+        json!(index_uuid)
+    );
+    assert_eq!(
+        cluster_state_after["indices"][INDEX_NAME]["number_of_replicas"],
+        json!(2)
+    );
+    let routing_after = routing_snapshot(&cluster_state_after, INDEX_NAME)?;
+    let mut observed_promotions = 0;
+    for (shard_id, before) in &routing_before {
+        let after = &routing_after[shard_id];
+        assert_ne!(after.primary, dead_node);
+        assert!(!after.replicas.iter().any(|node| node == &dead_node));
+        assert_eq!(after.replicas.len(), 1);
+        assert_eq!(after.unassigned_replicas, 1);
+
+        let expected_survivors = std::iter::once(&before.primary)
+            .chain(before.replicas.iter())
+            .filter(|node| node.as_str() != dead_node)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let actual_survivors = std::iter::once(&after.primary)
+            .chain(after.replicas.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_survivors, expected_survivors,
+            "shard {shard_id} must retain exactly its two surviving copies"
+        );
+
+        if before.primary == dead_node {
+            observed_promotions += 1;
+            assert!(
+                before.replicas.contains(&after.primary),
+                "shard {shard_id} primary must be promoted from a surviving replica"
+            );
+        } else {
+            assert_eq!(
+                after.primary, before.primary,
+                "replica-only loss must not replace shard {shard_id}'s primary"
+            );
+        }
+    }
+    assert_eq!(observed_promotions, 1);
+
+    let (health_status, health) = harness
+        .request_json(Method::GET, "/_cluster/health", None)
+        .await?;
+    assert_eq!(health_status, StatusCode::OK, "{health}");
+    assert_eq!(health["number_of_nodes"], json!(2));
+    assert_eq!(health["status"], json!("yellow"));
+    assert_eq!(health["unassigned_shards"], json!(3));
+
+    for (doc_id, expected_source) in &expected_documents {
+        let (status, body) = harness.get_document(doc_id).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "get after failover {doc_id}: {body}"
+        );
+        assert_eq!(
+            &body["_source"], expected_source,
+            "get after failover {doc_id}: {body}"
+        );
+    }
+    let (deleted_status, deleted_body) = harness.get_document(&deleted_doc_id).await?;
+    assert_eq!(deleted_status, StatusCode::NOT_FOUND, "{deleted_body}");
+    assert_eq!(deleted_body["found"], json!(false));
+
+    let post_failover_id = document_id_for_shard("post-promotion-write", promoted_shard);
+    let post_failover_source = json!({
+        "title": "write through promoted primary",
+        "author": "failover-test",
+        "payload": "post-promotion-value",
+        "n": 100,
+    });
+    harness
+        .put_document(&post_failover_id, post_failover_source.clone())
+        .await?;
+    harness.refresh_index().await?;
+    let (status, body) = harness.get_document(&post_failover_id).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_shard"], json!(promoted_shard));
+    assert_eq!(body["_source"], post_failover_source);
 
     Ok(())
 }

@@ -69,7 +69,7 @@ fn unassigned_replica_count(&self) -> u32
 fn build_shard_routing(name, num_shards, num_replicas, data_nodes) -> Self  // round-robin
 
 // Node removal & failover
-fn remove_node(&mut self, node_id: &NodeId) -> Vec<u32>  // returns orphaned primary shard IDs
+fn remove_node(&mut self, node_id: &NodeId) -> Vec<u32>  // removes replicas, increments each shard's lost replica slots, returns orphaned primary shard IDs
 fn promote_replica(&mut self, shard_id: u32) -> bool   // promote first available replica
 fn promote_replica_to(&mut self, shard_id: u32, new_primary: &str) -> bool  // targeted promotion
 

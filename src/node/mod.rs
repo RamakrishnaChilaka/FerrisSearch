@@ -585,8 +585,12 @@ impl Node {
                             // 3. For lost replicas: increment unassigned count for re-allocation
                             for idx_meta in fresh_state.indices.values() {
                                 let mut updated = idx_meta.clone();
+                                let lost_replica_slot = idx_meta
+                                    .shard_routing
+                                    .values()
+                                    .any(|routing| routing.replicas.contains(dead));
                                 let orphaned_primaries = updated.remove_node(dead);
-                                let mut changed = false;
+                                let mut changed = lost_replica_slot;
 
                                 for shard_id in &orphaned_primaries {
                                     // Pick the best replica from ISR (highest checkpoint)
@@ -631,20 +635,6 @@ impl Node {
                                             idx_meta.name,
                                             shard_id
                                         );
-                                    }
-                                }
-
-                                // If dead node was a replica (not primary), its slot was removed by remove_node.
-                                // Increment unassigned_replicas so the allocator can reassign it.
-                                if orphaned_primaries.is_empty() {
-                                    // Dead node was a replica for some shards in this index
-                                    for (shard_id, routing) in &idx_meta.shard_routing {
-                                        if routing.replicas.contains(dead)
-                                            && let Some(r) = updated.shard_routing.get_mut(shard_id)
-                                        {
-                                            r.unassigned_replicas += 1;
-                                            changed = true;
-                                        }
                                     }
                                 }
 

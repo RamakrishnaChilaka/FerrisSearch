@@ -688,11 +688,6 @@ async fn update_index_removes_dead_replica_and_marks_unassigned() {
     let orphaned = updated.remove_node(&"node-B".to_string());
     assert!(orphaned.is_empty(), "node-B was only a replica");
 
-    // Mark the lost replica slot as unassigned
-    if let Some(routing) = updated.shard_routing.get_mut(&0) {
-        routing.unassigned_replicas += 1;
-    }
-
     raft.client_write(ClusterCommand::UpdateIndex { metadata: updated })
         .await
         .unwrap();
