@@ -701,12 +701,18 @@ impl IndexMetadata {
         false
     }
 
-    /// Remove a node from all shard routing entries (both primary and replica).
-    /// Returns shard IDs where this node was the primary (need promotion or reassignment).
+    /// Remove a node from all shard routing entries.
+    ///
+    /// Replica assignments are removed and counted as unassigned per shard.
+    /// Primary assignments remain in place until the caller selects a promotion.
+    /// Returns shard IDs where this node was the primary.
     pub fn remove_node(&mut self, node_id: &NodeId) -> Vec<u32> {
         let mut orphaned_primaries = Vec::new();
         for (shard_id, routing) in &mut self.shard_routing {
+            let replicas_before = routing.replicas.len();
             routing.replicas.retain(|n| n != node_id);
+            routing.unassigned_replicas +=
+                (replicas_before.saturating_sub(routing.replicas.len())) as u32;
             if routing.primary == *node_id {
                 orphaned_primaries.push(*shard_id);
             }
@@ -1043,6 +1049,7 @@ mod tests {
         let orphaned = meta.remove_node(&"node-A".into());
         assert_eq!(orphaned, vec![0]); // shard 0 lost its primary
         assert!(meta.shard_routing[&1].replicas.is_empty()); // removed from replicas
+        assert_eq!(meta.shard_routing[&1].unassigned_replicas, 1);
     }
 
     // ── IndexMetadata accessor tests ────────────────────────────────────
@@ -1172,49 +1179,161 @@ mod tests {
     }
 
     #[test]
-    fn remove_node_from_multiple_roles() {
-        let mut meta = IndexMetadata {
-            name: "idx".into(),
-            uuid: IndexUuid::new("test-uuid"),
-            number_of_shards: 3,
-            number_of_replicas: 1,
-            shard_routing: HashMap::new(),
-            mappings: std::collections::HashMap::new(),
-            dynamic: Default::default(),
-            settings: crate::cluster::state::IndexSettings::default(),
-        };
-        meta.shard_routing.insert(
-            0,
-            ShardRoutingEntry {
-                primary: "node-A".into(),
-                replicas: vec!["node-B".into()],
-                unassigned_replicas: 0,
-            },
-        );
-        meta.shard_routing.insert(
-            1,
-            ShardRoutingEntry {
-                primary: "node-B".into(),
-                replicas: vec!["node-A".into()],
-                unassigned_replicas: 0,
-            },
-        );
-        meta.shard_routing.insert(
+    fn remove_node_accounts_mixed_primary_and_replica_roles_per_shard() {
+        let mut meta = IndexMetadata::build_shard_routing(
+            "idx",
+            4,
             2,
-            ShardRoutingEntry {
-                primary: "node-A".into(),
-                replicas: vec!["node-C".into()],
-                unassigned_replicas: 0,
-            },
+            &["node-A".into(), "node-B".into(), "node-C".into()],
         );
 
         let mut orphaned = meta.remove_node(&"node-A".into());
         orphaned.sort();
-        assert_eq!(orphaned, vec![0, 2]); // primary of shards 0 and 2
-        // Removed from shard 1 replicas
-        assert!(meta.shard_routing[&1].replicas.is_empty());
-        // Shard 2 replica (node-C) is untouched
-        assert_eq!(meta.shard_routing[&2].replicas, vec!["node-C".to_string()]);
+        assert_eq!(orphaned, vec![0, 3]);
+
+        for shard_id in orphaned {
+            assert!(meta.promote_replica_to(shard_id, "node-C"));
+            meta.shard_routing
+                .get_mut(&shard_id)
+                .unwrap()
+                .unassigned_replicas += 1;
+        }
+
+        assert_eq!(meta.shard_routing[&0].primary, "node-C");
+        assert_eq!(meta.shard_routing[&0].replicas, ["node-B"]);
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 1);
+
+        assert_eq!(meta.shard_routing[&1].primary, "node-B");
+        assert_eq!(meta.shard_routing[&1].replicas, ["node-C"]);
+        assert_eq!(meta.shard_routing[&1].unassigned_replicas, 1);
+
+        assert_eq!(meta.shard_routing[&2].primary, "node-C");
+        assert_eq!(meta.shard_routing[&2].replicas, ["node-B"]);
+        assert_eq!(meta.shard_routing[&2].unassigned_replicas, 1);
+
+        assert_eq!(meta.shard_routing[&3].primary, "node-C");
+        assert_eq!(meta.shard_routing[&3].replicas, ["node-B"]);
+        assert_eq!(meta.shard_routing[&3].unassigned_replicas, 1);
+    }
+
+    #[test]
+    fn sequential_node_removals_use_updated_routing_without_double_counting() {
+        let original_uuid = IndexUuid::new("routing-sequence-uuid");
+        let original_settings = IndexSettings {
+            refresh_interval_ms: Some(1234),
+            flush_threshold_bytes: Some(5678),
+            ..Default::default()
+        };
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            uuid: original_uuid.clone(),
+            number_of_shards: 4,
+            number_of_replicas: 2,
+            shard_routing: HashMap::from([
+                (
+                    0,
+                    ShardRoutingEntry {
+                        primary: "node-A".into(),
+                        replicas: vec!["node-B".into(), "node-C".into()],
+                        unassigned_replicas: 0,
+                    },
+                ),
+                (
+                    1,
+                    ShardRoutingEntry {
+                        primary: "node-B".into(),
+                        replicas: vec!["node-C".into(), "node-A".into()],
+                        unassigned_replicas: 0,
+                    },
+                ),
+                (
+                    2,
+                    ShardRoutingEntry {
+                        primary: "node-C".into(),
+                        replicas: vec!["node-A".into(), "node-B".into()],
+                        unassigned_replicas: 0,
+                    },
+                ),
+                (
+                    3,
+                    ShardRoutingEntry {
+                        primary: "node-D".into(),
+                        replicas: vec!["node-E".into(), "node-F".into()],
+                        unassigned_replicas: 0,
+                    },
+                ),
+            ]),
+            mappings: HashMap::from([(
+                "kind".into(),
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            )]),
+            dynamic: DynamicMapping::Strict,
+            settings: original_settings.clone(),
+        };
+
+        let first_orphaned = meta.remove_node(&"node-A".into());
+        assert_eq!(first_orphaned, vec![0]);
+        assert!(meta.promote_replica_to(0, "node-C"));
+        meta.shard_routing.get_mut(&0).unwrap().unassigned_replicas += 1;
+
+        let second_orphaned = meta.remove_node(&"node-B".into());
+        assert_eq!(second_orphaned, vec![1]);
+        assert!(meta.promote_replica_to(1, "node-C"));
+        meta.shard_routing.get_mut(&1).unwrap().unassigned_replicas += 1;
+
+        for shard_id in 0..=2 {
+            let routing = &meta.shard_routing[&shard_id];
+            assert_eq!(routing.primary, "node-C");
+            assert!(routing.replicas.is_empty());
+            assert_eq!(routing.unassigned_replicas, 2);
+        }
+        assert_eq!(meta.shard_routing[&3].primary, "node-D");
+        assert_eq!(meta.shard_routing[&3].replicas, ["node-E", "node-F"]);
+        assert_eq!(meta.shard_routing[&3].unassigned_replicas, 0);
+        assert_eq!(meta.uuid, original_uuid);
+        assert_eq!(meta.settings, original_settings);
+        assert_eq!(meta.dynamic, DynamicMapping::Strict);
+        assert_eq!(
+            meta.mappings["kind"].field_type,
+            FieldType::Keyword,
+            "unaffected mappings must remain intact"
+        );
+
+        let after_two_removals = serde_json::to_value(&meta).unwrap();
+        assert!(meta.remove_node(&"node-A".into()).is_empty());
+        assert_eq!(
+            serde_json::to_value(&meta).unwrap(),
+            after_two_removals,
+            "reprocessing an already removed node must be a no-op"
+        );
+    }
+
+    #[test]
+    fn removing_primary_without_replicas_does_not_create_replica_slots() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("test-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "node-A".into(),
+                    replicas: vec![],
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        };
+
+        assert_eq!(meta.remove_node(&"node-A".into()), vec![0]);
+        assert!(!meta.promote_replica(0));
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 0);
     }
 
     #[test]
@@ -1620,6 +1739,7 @@ mod tests {
 
         // shard 1's replicas should no longer include node-A
         assert!(meta.shard_routing[&1].replicas.is_empty());
+        assert_eq!(meta.shard_routing[&1].unassigned_replicas, 1);
 
         // Promote for shard 0
         assert!(meta.promote_replica(0));
@@ -1628,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_node_returns_empty_for_replica_only() {
+    fn remove_node_accounts_replica_only_loss() {
         let mut meta = IndexMetadata {
             name: "idx".into(),
             uuid: IndexUuid::new("test-uuid"),
@@ -1652,6 +1772,7 @@ mod tests {
         let orphaned = meta.remove_node(&"node-B".to_string());
         assert!(orphaned.is_empty());
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-C".to_string()]);
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 1);
     }
 
     // ── IndexSettings ───────────────────────────────────────────────

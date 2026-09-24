@@ -70,3 +70,11 @@ pub async fn replicate_bulk(
 - Current local/global checkpoints are monotonic high-water marks. They are not
   a gap-free applied-prefix protocol and do not add idempotent retry handling,
   primary-epoch fencing, or a new failover ordering model.
+
+## Proposed Recovery Work
+
+For recovery-protocol changes, read
+[`docs/recovery-protocol.md`](../../docs/recovery-protocol.md) and its
+[`acceptance matrix`](../../docs/recovery-acceptance-matrix.md). They are proposed
+contracts, not implemented behavior. Keep changes scoped to one dependency-aware
+package and do not describe partial fencing/checkpoint/recovery work as parity.

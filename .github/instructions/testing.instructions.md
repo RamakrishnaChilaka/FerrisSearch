@@ -125,6 +125,10 @@ cargo test -- test_name                         # Single test by name
 - Spawns real `ferrissearch` processes via `CARGO_BIN_EXE_ferrissearch`
 - Builds a real 3-node Raft cluster with isolated tempdirs and log files
 - Exercises create -> bulk index -> flush -> restart-all -> verify count and UUID-backed shard directories
+- Exercises bounded mixed-role master loss with 3 shards and 2 replicas, then
+  verifies per-shard lost-copy accounting, real promotion, exact acknowledged
+  values/deletes, and a write routed to the promoted shard. This is not safe
+  replica rejoin/admission coverage.
 - Asserts destructive delete reasons do not appear in logs during the preserved-data workflow
 
 ## Test Helper Patterns
