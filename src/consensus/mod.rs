@@ -20,7 +20,7 @@ use crate::cluster::state::ClusterState;
 use disk_store::DiskLogStore;
 use state_machine::ClusterStateMachine;
 use store::MemLogStore;
-use types::RaftInstance;
+use types::{ClusterCommand, RaftInstance};
 
 pub(crate) const RAFT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 pub(crate) const RAFT_ELECTION_TIMEOUT_MIN_MS: u64 = 3_000;
@@ -102,6 +102,17 @@ pub async fn bootstrap_single_node(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bootstrap Raft cluster: {e}"))?;
     Ok(())
+}
+
+pub async fn client_write_checked(
+    raft: &RaftInstance,
+    command: ClusterCommand,
+) -> Result<(), String> {
+    let response = raft
+        .client_write(command)
+        .await
+        .map_err(|error| error.to_string())?;
+    response.data.into_result()
 }
 
 #[cfg(test)]

@@ -228,6 +228,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-1".into(),
+                primary_term: 1,
                 replicas,
                 in_sync_replicas,
                 unassigned_replicas: 0,

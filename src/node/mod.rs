@@ -644,11 +644,11 @@ impl Node {
                                 }
 
                                 if changed
-                                    && let Err(e) = raft
-                                        .client_write(ClusterCommand::UpdateIndex {
-                                            metadata: updated,
-                                        })
-                                        .await
+                                    && let Err(e) = crate::consensus::client_write_checked(
+                                        raft,
+                                        ClusterCommand::UpdateIndex { metadata: updated },
+                                    )
+                                    .await
                                 {
                                     tracing::error!(
                                         "Failed to update shard routing for '{}' after node death: {}",
@@ -725,9 +725,11 @@ impl Node {
                                         "Creating protected security system index {}",
                                         crate::security::SECURITY_INDEX_NAME
                                     );
-                                    if let Err(e) = raft
-                                        .client_write(ClusterCommand::CreateIndex { metadata })
-                                        .await
+                                    if let Err(e) = crate::consensus::client_write_checked(
+                                        raft,
+                                        ClusterCommand::CreateIndex { metadata },
+                                    )
+                                    .await
                                     {
                                         tracing::error!(
                                             "Failed to create security system index via Raft: {}",
@@ -756,9 +758,11 @@ impl Node {
                                 crate::security::SECURITY_INDEX_NAME,
                                 updated.number_of_replicas
                             );
-                            if let Err(e) = raft
-                                .client_write(ClusterCommand::UpdateIndex { metadata: updated })
-                                .await
+                            if let Err(e) = crate::consensus::client_write_checked(
+                                raft,
+                                ClusterCommand::UpdateIndex { metadata: updated },
+                            )
+                            .await
                             {
                                 tracing::error!(
                                     "Failed to adapt security system index replicas via Raft: {}",
@@ -776,11 +780,11 @@ impl Node {
                                         updated.name,
                                         updated.unassigned_replica_count()
                                     );
-                                    if let Err(e) = raft
-                                        .client_write(ClusterCommand::UpdateIndex {
-                                            metadata: updated,
-                                        })
-                                        .await
+                                    if let Err(e) = crate::consensus::client_write_checked(
+                                        raft,
+                                        ClusterCommand::UpdateIndex { metadata: updated },
+                                    )
+                                    .await
                                     {
                                         tracing::error!(
                                             "Failed to update shard routing via Raft: {}",

@@ -20,6 +20,7 @@ message ShardAssignment {
     repeated string replica_node_ids = 3; // replica nodes
     uint32 unassigned_replicas = 4;
     repeated string in_sync_replica_node_ids = 5; // authoritative replicas
+    uint64 primary_term = 6;
 }
 
 message FieldMappingEntry {
@@ -295,6 +296,33 @@ message UpdateSettingsResponse {
     string error = 2;         // non-empty on failure
 }
 
+message MarkReplicaInSyncRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    string replica_node_id = 4;
+    string primary_node_id = 5;
+    uint64 primary_term = 6;
+}
+
+message MarkReplicaInSyncResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
+message ActivatePrimaryRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    string primary_node_id = 4;
+    uint64 expected_term = 5;
+}
+
+message ActivatePrimaryResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
 // ─── Index Management (forwarded to leader) ─────────────────────────────────
 
 message CreateIndexRequest {
@@ -502,6 +530,8 @@ service InternalTransport {
 
     // Dynamic settings (forwarded to leader)
     rpc UpdateSettings(UpdateSettingsRequest) returns (UpdateSettingsResponse);
+    rpc MarkReplicaInSync(MarkReplicaInSyncRequest) returns (MarkReplicaInSyncResponse);
+    rpc ActivatePrimary(ActivatePrimaryRequest) returns (ActivatePrimaryResponse);
 
     // Index management (forwarded to leader)
     rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);

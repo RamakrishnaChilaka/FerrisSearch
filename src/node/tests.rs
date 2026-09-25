@@ -15,6 +15,7 @@ async fn open_local_assigned_shards_opens_unopened_local_shards() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec!["node-2".into()],
             in_sync_replicas: vec!["node-2".into()],
             unassigned_replicas: 0,
@@ -54,6 +55,7 @@ fn open_local_assigned_shards_skips_missing_expected_uuid_dir_for_recovered_assi
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -92,6 +94,7 @@ async fn open_local_assigned_shards_creates_missing_dir_for_new_assignment() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -131,6 +134,7 @@ async fn recovered_node_only_guards_assignments_from_local_recovered_state() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -169,6 +173,7 @@ async fn recovered_startup_shards_remain_guarded_across_reopen_attempts() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -216,6 +221,7 @@ async fn open_local_assigned_shards_blocking_does_not_starve_runtime() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -313,6 +319,7 @@ fn cleanup_orphaned_data_if_authoritative_keeps_known_uuid_dirs() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -353,6 +360,7 @@ fn cleanup_orphaned_data_if_authoritative_skips_when_local_uuid_dir_missing() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -408,6 +416,7 @@ fn cleanup_skips_when_uuid_dir_was_freshly_created() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -459,6 +468,7 @@ fn cleanup_runs_when_uuid_dir_was_pre_existing() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -508,6 +518,7 @@ fn two_restart_recovery_sequence_preserves_old_data_and_never_creates_fresh_uuid
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,

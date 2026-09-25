@@ -49,6 +49,10 @@ pub struct ShardCopy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardRoutingEntry {
     pub primary: NodeId,
+    /// Monotonic authority epoch for the shard primary. Legacy snapshots
+    /// deserialize to zero and must be activated before serving writes.
+    #[serde(default)]
+    pub primary_term: u64,
     pub replicas: Vec<NodeId>,
     /// Replica copies that are authoritative for acknowledgements and promotion.
     /// The primary is implicitly authoritative and must not appear here.
@@ -60,6 +64,28 @@ pub struct ShardRoutingEntry {
 }
 
 impl ShardRoutingEntry {
+    /// Validate primary/replica assignment and authoritative membership.
+    pub fn validate_membership(&self) -> Result<(), String> {
+        if self.primary.is_empty() {
+            return Err("primary node id cannot be empty".to_string());
+        }
+
+        let mut assigned = std::collections::HashSet::new();
+        for node_id in &self.replicas {
+            if node_id == &self.primary {
+                return Err(format!(
+                    "primary node '{}' cannot also be a replica",
+                    self.primary
+                ));
+            }
+            if !assigned.insert(node_id) {
+                return Err(format!("duplicate replica assignment '{node_id}'"));
+            }
+        }
+
+        self.validate_in_sync_replicas()
+    }
+
     /// Validate authoritative replica membership independently of assignment.
     pub fn validate_in_sync_replicas(&self) -> Result<(), String> {
         let mut seen = std::collections::HashSet::new();
@@ -645,6 +671,7 @@ impl IndexMetadata {
                 shard_id,
                 ShardRoutingEntry {
                     primary: primary_node,
+                    primary_term: 1,
                     in_sync_replicas: replicas.clone(),
                     replicas,
                     unassigned_replicas: unassigned,
@@ -1057,6 +1084,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into(), "node-C".into()],
                 in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
@@ -1088,6 +1116,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec![],
                 in_sync_replicas: vec![],
                 unassigned_replicas: 0,
@@ -1113,6 +1142,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into()],
                 in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
@@ -1122,6 +1152,7 @@ mod tests {
             1,
             ShardRoutingEntry {
                 primary: "node-B".into(),
+                primary_term: 1,
                 replicas: vec!["node-A".into()],
                 in_sync_replicas: vec!["node-A".into()],
                 unassigned_replicas: 0,
@@ -1153,6 +1184,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into()],
                 in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
@@ -1162,6 +1194,7 @@ mod tests {
             1,
             ShardRoutingEntry {
                 primary: "node-B".into(),
+                primary_term: 1,
                 replicas: vec!["node-A".into()],
                 in_sync_replicas: vec!["node-A".into()],
                 unassigned_replicas: 0,
@@ -1188,6 +1221,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into(), "node-C".into()],
                 in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
@@ -1234,6 +1268,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into(), "node-C".into()],
                 in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
@@ -1331,6 +1366,7 @@ mod tests {
                     0,
                     ShardRoutingEntry {
                         primary: "node-A".into(),
+                        primary_term: 1,
                         replicas: vec!["node-B".into(), "node-C".into()],
                         in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                         unassigned_replicas: 0,
@@ -1340,6 +1376,7 @@ mod tests {
                     1,
                     ShardRoutingEntry {
                         primary: "node-B".into(),
+                        primary_term: 1,
                         replicas: vec!["node-C".into(), "node-A".into()],
                         in_sync_replicas: vec!["node-C".into(), "node-A".into()],
                         unassigned_replicas: 0,
@@ -1349,6 +1386,7 @@ mod tests {
                     2,
                     ShardRoutingEntry {
                         primary: "node-C".into(),
+                        primary_term: 1,
                         replicas: vec!["node-A".into(), "node-B".into()],
                         in_sync_replicas: vec!["node-A".into(), "node-B".into()],
                         unassigned_replicas: 0,
@@ -1358,6 +1396,7 @@ mod tests {
                     3,
                     ShardRoutingEntry {
                         primary: "node-D".into(),
+                        primary_term: 1,
                         replicas: vec!["node-E".into(), "node-F".into()],
                         in_sync_replicas: vec!["node-E".into(), "node-F".into()],
                         unassigned_replicas: 0,
@@ -1428,6 +1467,7 @@ mod tests {
                 0,
                 ShardRoutingEntry {
                     primary: "node-A".into(),
+                    primary_term: 1,
                     replicas: vec![],
                     in_sync_replicas: vec![],
                     unassigned_replicas: 0,
@@ -1459,6 +1499,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into()],
                 in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
@@ -1623,6 +1664,7 @@ mod tests {
         let meta =
             IndexMetadata::build_shard_routing("test", 1, 4, &["node-1".into(), "node-2".into()]);
         let routing = &meta.shard_routing[&0];
+        assert_eq!(routing.primary_term, 1);
         assert_eq!(routing.replicas, ["node-2"]);
         assert_eq!(routing.in_sync_replicas, ["node-2"]);
         assert_eq!(routing.unassigned_replicas, 3);
@@ -1650,12 +1692,14 @@ mod tests {
     fn shard_state_serde_roundtrip() {
         let entry = ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec!["node-2".into()],
             in_sync_replicas: vec!["node-2".into()],
             unassigned_replicas: 1,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let entry2: ShardRoutingEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry2.primary_term, 1);
         assert_eq!(entry2.unassigned_replicas, 1);
         assert_eq!(entry2.replicas, vec!["node-2".to_string()]);
         assert_eq!(entry2.in_sync_replicas, vec!["node-2".to_string()]);
@@ -1665,6 +1709,10 @@ mod tests {
     fn legacy_shard_routing_defaults_to_no_in_sync_replicas_and_is_not_promotable() {
         let json = r#"{"primary":"node-1","replicas":["node-2"]}"#;
         let entry: ShardRoutingEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            entry.primary_term, 0,
+            "legacy snapshots must require primary activation"
+        );
         assert_eq!(
             entry.unassigned_replicas, 0,
             "missing field should default to 0"
@@ -1702,6 +1750,7 @@ mod tests {
         ] {
             let routing = ShardRoutingEntry {
                 primary: "node-1".into(),
+                primary_term: 1,
                 replicas: vec!["node-2".into()],
                 in_sync_replicas,
                 unassigned_replicas: 0,
@@ -1807,6 +1856,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into(), "node-C".into()],
                 in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
@@ -1836,6 +1886,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into()],
                 in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
@@ -1860,6 +1911,7 @@ mod tests {
                 0,
                 ShardRoutingEntry {
                     primary: "node-A".into(),
+                    primary_term: 1,
                     replicas: vec!["node-stale".into(), "node-B".into(), "node-C".into()],
                     in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                     unassigned_replicas: 0,
@@ -1894,6 +1946,7 @@ mod tests {
                 0,
                 ShardRoutingEntry {
                     primary: "node-A".into(),
+                    primary_term: 1,
                     replicas: vec!["node-stale".into(), "node-B".into()],
                     in_sync_replicas: vec!["node-B".into()],
                     unassigned_replicas: 0,
@@ -1930,6 +1983,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into()],
                 in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
@@ -1957,6 +2011,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into()],
                 in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
@@ -1966,6 +2021,7 @@ mod tests {
             1,
             ShardRoutingEntry {
                 primary: "node-B".into(),
+                primary_term: 1,
                 replicas: vec!["node-A".into()],
                 in_sync_replicas: vec!["node-A".into()],
                 unassigned_replicas: 0,
@@ -2003,6 +2059,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec!["node-B".into(), "node-C".into()],
                 in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
@@ -2334,6 +2391,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "A".into(),
+                primary_term: 1,
                 replicas: vec![],
                 in_sync_replicas: vec![],
                 unassigned_replicas: 0,
@@ -2343,6 +2401,7 @@ mod tests {
             1,
             ShardRoutingEntry {
                 primary: "B".into(),
+                primary_term: 1,
                 replicas: vec![],
                 in_sync_replicas: vec![],
                 unassigned_replicas: 0,
@@ -2372,6 +2431,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "A".into(),
+                primary_term: 1,
                 replicas: vec!["B".into(), "C".into()],
                 in_sync_replicas: vec!["B".into()],
                 unassigned_replicas: 0,
@@ -2404,6 +2464,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "A".into(),
+                primary_term: 1,
                 replicas: vec!["B".into()],
                 in_sync_replicas: vec!["B".into()],
                 unassigned_replicas: 2,
@@ -2435,6 +2496,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "A".into(),
+                primary_term: 1,
                 replicas: vec!["B".into()],
                 in_sync_replicas: vec!["B".into()],
                 unassigned_replicas: 0,
@@ -2464,6 +2526,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "A".into(),
+                primary_term: 1,
                 replicas: vec!["B".into(), "C".into()],
                 in_sync_replicas: vec!["B".into(), "C".into()],
                 unassigned_replicas: 0,
@@ -2494,6 +2557,7 @@ mod tests {
                 s,
                 ShardRoutingEntry {
                     primary: "A".into(),
+                    primary_term: 1,
                     replicas: vec!["B".into()],
                     in_sync_replicas: vec!["B".into()],
                     unassigned_replicas: 0,

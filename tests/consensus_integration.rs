@@ -10,7 +10,8 @@ use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::{
-    JoinRequest, NodeInfo as ProtoNodeInfo, internal_transport_client::InternalTransportClient,
+    ActivatePrimaryRequest, JoinRequest, MarkReplicaInSyncRequest, NodeInfo as ProtoNodeInfo,
+    ShardDocRequest, internal_transport_client::InternalTransportClient,
 };
 use ferrissearch::transport::server::create_transport_service_with_raft;
 
@@ -40,6 +41,7 @@ fn make_index(name: &str) -> IndexMetadata {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -66,6 +68,36 @@ async fn wait_for_leader(raft: &consensus::types::RaftInstance) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("Raft node did not become leader within 5 seconds");
+}
+
+async fn start_raft_grpc_server_with_shard_manager(
+    raft: Arc<consensus::types::RaftInstance>,
+    state_handle: Arc<std::sync::RwLock<ferrissearch::cluster::state::ClusterState>>,
+    shard_manager: Arc<ShardManager>,
+    local_node_id: &str,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle));
+    let service = create_transport_service_with_raft(
+        cluster_manager,
+        shard_manager,
+        TransportClient::new(),
+        raft,
+        Arc::new(ferrissearch::tasks::TaskManager::new()),
+        local_node_id.into(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+    });
+    (addr, handle)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -670,6 +702,94 @@ async fn update_index_promotes_replica_after_primary_death() {
 }
 
 #[tokio::test]
+async fn conditional_membership_rejects_stale_promotion_and_old_primary_term() {
+    let (raft, state_handle) =
+        consensus::create_raft_instance_mem(1, "conditional-membership".into())
+            .await
+            .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19322".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let mut metadata = make_index("conditional");
+    metadata.number_of_replicas = 1;
+    metadata.shard_routing.get_mut(&0).unwrap().replicas = vec!["node-2".into()];
+    let index_uuid = metadata.uuid.to_string();
+    let create = raft
+        .client_write(ClusterCommand::CreateIndex {
+            metadata: metadata.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(create.data, ClusterResponse::Ok);
+
+    let mut stale_promotion = metadata.clone();
+    {
+        let routing = stale_promotion.shard_routing.get_mut(&0).unwrap();
+        routing.primary = "node-2".into();
+        routing.replicas.clear();
+    }
+    let rejected = raft
+        .client_write(ClusterCommand::UpdateIndex {
+            metadata: stale_promotion,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        rejected.data,
+        ClusterResponse::Error(error) if error.contains("out-of-sync replica")
+    ));
+
+    let activated = raft
+        .client_write(ClusterCommand::ActivatePrimary {
+            index_name: "conditional".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            expected_term: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(activated.data, ClusterResponse::Ok);
+
+    let stale_admission = raft
+        .client_write(ClusterCommand::MarkReplicaInSync {
+            index_name: "conditional".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            replica: "node-2".into(),
+            primary: "node-1".into(),
+            primary_term: 1,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale_admission.data,
+        ClusterResponse::Error(error) if error.contains("primary term mismatch")
+    ));
+
+    let admitted = raft
+        .client_write(ClusterCommand::MarkReplicaInSync {
+            index_name: "conditional".into(),
+            index_uuid,
+            shard_id: 0,
+            replica: "node-2".into(),
+            primary: "node-1".into(),
+            primary_term: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(admitted.data, ClusterResponse::Ok);
+
+    let state = state_handle.read().unwrap();
+    let routing = &state.indices["conditional"].shard_routing[&0];
+    assert_eq!(routing.primary, "node-1");
+    assert_eq!(routing.primary_term, 2);
+    assert_eq!(routing.in_sync_replicas, ["node-2"]);
+}
+
+#[tokio::test]
 async fn update_index_removes_dead_replica_and_marks_unassigned() {
     let (raft, state_handle) = consensus::create_raft_instance_mem(1, "replica-death".into())
         .await
@@ -983,6 +1103,185 @@ async fn grpc_create_index_on_leader() {
     let state = state_handle.read().unwrap();
     assert!(state.indices.contains_key("grpc-idx"));
     assert_eq!(state.indices["grpc-idx"].number_of_shards, 2);
+}
+
+#[tokio::test]
+async fn grpc_conditional_membership_rpcs_apply_on_leader() {
+    let (raft, state_handle) =
+        consensus::create_raft_instance_mem(1, "grpc-conditional-membership".into())
+            .await
+            .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19365".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let mut metadata = make_index("grpc-conditional");
+    metadata.number_of_replicas = 1;
+    metadata.shard_routing.get_mut(&0).unwrap().replicas = vec!["node-2".into()];
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+
+    let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+
+    let activated = client
+        .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
+            index_name: "grpc-conditional".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary_node_id: "node-1".into(),
+            expected_term: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(activated.acknowledged, "{}", activated.error);
+
+    let admitted = client
+        .mark_replica_in_sync(tonic::Request::new(MarkReplicaInSyncRequest {
+            index_name: "grpc-conditional".into(),
+            index_uuid,
+            shard_id: 0,
+            replica_node_id: "node-2".into(),
+            primary_node_id: "node-1".into(),
+            primary_term: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(admitted.acknowledged, "{}", admitted.error);
+
+    let state = state_handle.read().unwrap();
+    let routing = &state.indices["grpc-conditional"].shard_routing[&0];
+    assert_eq!(routing.primary_term, 2);
+    assert_eq!(routing.in_sync_replicas, ["node-2"]);
+}
+
+#[tokio::test]
+async fn grpc_conditional_membership_rpcs_reject_non_leader() {
+    let (raft, state_handle) =
+        consensus::create_raft_instance_mem(2, "grpc-conditional-follower".into())
+            .await
+            .unwrap();
+    let addr = start_raft_follower_grpc_server(raft, state_handle, "node-2").await;
+    let mut client = connect_grpc(addr).await;
+
+    let activate_error = client
+        .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
+            index_name: "idx".into(),
+            index_uuid: "uuid".into(),
+            shard_id: 0,
+            primary_node_id: "node-2".into(),
+            expected_term: 1,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(activate_error.code(), tonic::Code::FailedPrecondition);
+
+    let mark_error = client
+        .mark_replica_in_sync(tonic::Request::new(MarkReplicaInSyncRequest {
+            index_name: "idx".into(),
+            index_uuid: "uuid".into(),
+            shard_id: 0,
+            replica_node_id: "node-3".into(),
+            primary_node_id: "node-2".into(),
+            primary_term: 1,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(mark_error.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn first_write_after_transport_restart_reactivates_primary() {
+    let (raft, state_handle) =
+        consensus::create_raft_instance_mem(1, "transport-restart-activation".into())
+            .await
+            .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19366".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex {
+            metadata: make_index("restart-activation"),
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let (first_addr, first_server) = start_raft_grpc_server_with_shard_manager(
+        raft.clone(),
+        state_handle.clone(),
+        shard_manager.clone(),
+        "node-1",
+    )
+    .await;
+    let mut first_client = connect_grpc(first_addr).await;
+
+    for doc_id in ["first", "same-incarnation"] {
+        let response = first_client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "restart-activation".into(),
+                shard_id: 0,
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": doc_id})).unwrap(),
+                doc_id: doc_id.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+    }
+    assert_eq!(
+        state_handle.read().unwrap().indices["restart-activation"].shard_routing[&0].primary_term,
+        2,
+        "one process incarnation must activate exactly once"
+    );
+
+    drop(first_client);
+    first_server.abort();
+    let _ = first_server.await;
+
+    let (second_addr, second_server) = start_raft_grpc_server_with_shard_manager(
+        raft,
+        state_handle.clone(),
+        shard_manager,
+        "node-1",
+    )
+    .await;
+    let mut second_client = connect_grpc(second_addr).await;
+    let response = second_client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "restart-activation".into(),
+            shard_id: 0,
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": "after-restart"}))
+                .unwrap(),
+            doc_id: "after-restart".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+    assert_eq!(
+        state_handle.read().unwrap().indices["restart-activation"].shard_routing[&0].primary_term,
+        3,
+        "a new process incarnation must obtain a new primary term"
+    );
+
+    second_server.abort();
+    let _ = second_server.await;
 }
 
 #[tokio::test]

@@ -10,9 +10,9 @@ use crate::transport::proto::*;
 use crate::wal::WriteAheadLog;
 use futures::{FutureExt, Stream, stream};
 use openraft::type_config::async_runtime::WatchReceiver;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, trace};
@@ -33,6 +33,7 @@ pub struct TransportService {
     pub worker_pools: crate::worker::WorkerPools,
     /// Tracks asynchronous background tasks running on this node.
     pub task_manager: Arc<crate::tasks::TaskManager>,
+    primary_activation_state: Arc<PrimaryActivationState>,
     /// Serializes leader-side JoinCluster handling so concurrent joins cannot
     /// race identity validation or submit stale full voter sets.
     join_lock: Arc<Mutex<()>>,
@@ -46,6 +47,16 @@ pub struct RemoteStoreTransportResources {
 
 fn new_join_lock() -> Arc<Mutex<()>> {
     Arc::new(Mutex::new(()))
+}
+
+#[derive(Default)]
+struct PrimaryActivationState {
+    activated_terms: RwLock<HashMap<(String, u32), u64>>,
+    activation_lock: Mutex<()>,
+}
+
+fn new_primary_activation_state() -> Arc<PrimaryActivationState> {
+    Arc::new(PrimaryActivationState::default())
 }
 
 #[derive(Clone, Copy)]
@@ -456,6 +467,18 @@ impl InternalTransport for TransportService {
     ) -> Result<Response<ShardDocResponse>, Status> {
         let req = request.into_inner();
 
+        if let Err(error) = self
+            .ensure_primary_activated(&req.index_name, req.shard_id)
+            .await
+        {
+            return Ok(Response::new(ShardDocResponse {
+                success: false,
+                doc_id: req.doc_id,
+                error,
+                seq_no: None,
+            }));
+        }
+
         let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
             .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
 
@@ -556,6 +579,18 @@ impl InternalTransport for TransportService {
         request: Request<ShardBulkRequest>,
     ) -> Result<Response<ShardBulkResponse>, Status> {
         let req = request.into_inner();
+
+        if let Err(error) = self
+            .ensure_primary_activated(&req.index_name, req.shard_id)
+            .await
+        {
+            return Ok(Response::new(ShardBulkResponse {
+                success: false,
+                doc_ids: Vec::new(),
+                error,
+                start_seq_no: None,
+            }));
+        }
 
         let mut docs: Vec<(String, serde_json::Value)> =
             Vec::with_capacity(req.documents_json.len());
@@ -674,6 +709,17 @@ impl InternalTransport for TransportService {
         request: Request<ShardDeleteRequest>,
     ) -> Result<Response<ShardDeleteResponse>, Status> {
         let req = request.into_inner();
+        if let Err(error) = self
+            .ensure_primary_activated(&req.index_name, req.shard_id)
+            .await
+        {
+            return Ok(Response::new(ShardDeleteResponse {
+                success: false,
+                deleted: 0,
+                error,
+                seq_no: None,
+            }));
+        }
         let engine = self
             .get_or_open_shard(&req.index_name, req.shard_id)
             .await?;
@@ -1613,7 +1659,7 @@ impl InternalTransport for TransportService {
         let cmd = crate::consensus::types::ClusterCommand::UpdateIndex {
             metadata: metadata.clone(),
         };
-        raft.client_write(cmd)
+        crate::consensus::client_write_checked(raft, cmd)
             .await
             .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
 
@@ -1626,6 +1672,91 @@ impl InternalTransport for TransportService {
             acknowledged: true,
             error: String::new(),
         }))
+    }
+
+    async fn mark_replica_in_sync(
+        &self,
+        request: Request<MarkReplicaInSyncRequest>,
+    ) -> Result<Response<MarkReplicaInSyncResponse>, Status> {
+        let req = request.into_inner();
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+
+        let command = crate::consensus::types::ClusterCommand::MarkReplicaInSync {
+            index_name: req.index_name,
+            index_uuid: req.index_uuid,
+            shard_id: req.shard_id,
+            replica: req.replica_node_id,
+            primary: req.primary_node_id,
+            primary_term: req.primary_term,
+        };
+        let response = raft
+            .client_write(command)
+            .await
+            .map_err(|error| Status::internal(format!("Raft MarkReplicaInSync failed: {error}")))?;
+        match response.data {
+            crate::consensus::types::ClusterResponse::Ok => {
+                Ok(Response::new(MarkReplicaInSyncResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                }))
+            }
+            crate::consensus::types::ClusterResponse::Error(error) => {
+                Ok(Response::new(MarkReplicaInSyncResponse {
+                    acknowledged: false,
+                    error,
+                }))
+            }
+        }
+    }
+
+    async fn activate_primary(
+        &self,
+        request: Request<ActivatePrimaryRequest>,
+    ) -> Result<Response<ActivatePrimaryResponse>, Status> {
+        let req = request.into_inner();
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+
+        let command = crate::consensus::types::ClusterCommand::ActivatePrimary {
+            index_name: req.index_name,
+            index_uuid: req.index_uuid,
+            shard_id: req.shard_id,
+            primary: req.primary_node_id,
+            expected_term: req.expected_term,
+        };
+        let response = raft
+            .client_write(command)
+            .await
+            .map_err(|error| Status::internal(format!("Raft ActivatePrimary failed: {error}")))?;
+        match response.data {
+            crate::consensus::types::ClusterResponse::Ok => {
+                Ok(Response::new(ActivatePrimaryResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                }))
+            }
+            crate::consensus::types::ClusterResponse::Error(error) => {
+                Ok(Response::new(ActivatePrimaryResponse {
+                    acknowledged: false,
+                    error,
+                }))
+            }
+        }
     }
 
     // ─── Index Management RPCs ──────────────────────────────────────────────
@@ -1679,7 +1810,7 @@ impl InternalTransport for TransportService {
         let num_replicas = metadata.number_of_replicas;
 
         let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
-        raft.client_write(cmd)
+        crate::consensus::client_write_checked(raft, cmd)
             .await
             .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
 
@@ -2254,6 +2385,147 @@ impl InternalTransport for TransportService {
 }
 
 impl TransportService {
+    fn primary_routing(&self, index_name: &str, shard_id: u32) -> Result<(String, u64), String> {
+        let cluster_state = self.cluster_manager.get_state();
+        let metadata = cluster_state
+            .indices
+            .get(index_name)
+            .ok_or_else(|| format!("index [{index_name}] is not present in local cluster state"))?;
+        let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
+            format!("shard [{index_name}][{shard_id}] is not present in local cluster state")
+        })?;
+        if routing.primary != self.local_node_id {
+            return Err(format!(
+                "node [{}] is not the primary for shard [{index_name}][{shard_id}] at term {}; retry after refreshing shard routing",
+                self.local_node_id, routing.primary_term
+            ));
+        }
+        Ok((metadata.uuid.to_string(), routing.primary_term))
+    }
+
+    async fn ensure_primary_activated(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Result<(), String> {
+        let (index_uuid, current_term) = self.primary_routing(index_name, shard_id)?;
+        if self.raft.is_none() {
+            return Ok(());
+        }
+
+        let key = (index_uuid.clone(), shard_id);
+        if self
+            .primary_activation_state
+            .activated_terms
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .is_some_and(|term| *term == current_term)
+        {
+            return Ok(());
+        }
+
+        let _activation_guard = self.primary_activation_state.activation_lock.lock().await;
+        let (index_uuid, expected_term) = self.primary_routing(index_name, shard_id)?;
+        let key = (index_uuid.clone(), shard_id);
+        if self
+            .primary_activation_state
+            .activated_terms
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .is_some_and(|term| *term == expected_term)
+        {
+            return Ok(());
+        }
+
+        let raft = self
+            .raft
+            .as_ref()
+            .expect("Raft presence checked before primary activation");
+        if raft.is_leader() {
+            let response = raft
+                .client_write(crate::consensus::types::ClusterCommand::ActivatePrimary {
+                    index_name: index_name.to_string(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id,
+                    primary: self.local_node_id.clone(),
+                    expected_term,
+                })
+                .await
+                .map_err(|error| format!("primary activation Raft write failed: {error}"))?;
+            response
+                .data
+                .into_result()
+                .map_err(|error| format!("primary activation was rejected: {error}"))?;
+        } else {
+            let cluster_state = self.cluster_manager.get_state();
+            let master_id = cluster_state
+                .master_node
+                .as_ref()
+                .ok_or_else(|| "no Raft leader is known for primary activation".to_string())?;
+            let master = cluster_state.nodes.get(master_id).ok_or_else(|| {
+                format!("Raft leader '{master_id}' is absent from local cluster state")
+            })?;
+            self.transport_client
+                .forward_activate_primary(
+                    master,
+                    index_name,
+                    &index_uuid,
+                    shard_id,
+                    &self.local_node_id,
+                    expected_term,
+                )
+                .await
+                .map_err(|error| format!("primary activation forward failed: {error}"))?;
+        }
+
+        let activated_term = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    let cluster_state = self.cluster_manager.get_state();
+                    let metadata = cluster_state.indices.get(index_name).ok_or_else(|| {
+                        format!("index [{index_name}] disappeared during primary activation")
+                    })?;
+                    if metadata.uuid.as_str() != index_uuid {
+                        return Err(format!(
+                            "index [{index_name}] was replaced during primary activation"
+                        ));
+                    }
+                    let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
+                        format!(
+                            "shard [{index_name}][{shard_id}] disappeared during primary activation"
+                        )
+                    })?;
+                    if routing.primary != self.local_node_id {
+                        return Err(format!(
+                            "node [{}] lost primary assignment for shard [{index_name}][{shard_id}] during activation",
+                            self.local_node_id
+                        ));
+                    }
+                    if routing.primary_term > expected_term {
+                        return Ok(routing.primary_term);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out waiting for primary activation of shard [{index_name}][{shard_id}]"
+            )
+        })??;
+
+        self.primary_activation_state
+            .activated_terms
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, activated_term);
+        Ok(())
+    }
+
     #[allow(clippy::result_large_err)]
     fn ensure_authoritative_shard_uuid(
         &self,
@@ -2630,6 +2902,7 @@ pub fn create_transport_service_for_test(
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),
         task_manager,
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)
@@ -2686,6 +2959,7 @@ pub fn create_transport_service_with_raft_and_storage(
         local_node_id,
         worker_pools: crate::worker::WorkerPools::default_for_system(),
         task_manager,
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)

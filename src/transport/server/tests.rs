@@ -50,6 +50,7 @@ fn make_full_cluster_state() -> DomainClusterState {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 7,
             replicas: vec!["node-2".into()],
             in_sync_replicas: vec!["node-2".into()],
             unassigned_replicas: 0,
@@ -59,6 +60,7 @@ fn make_full_cluster_state() -> DomainClusterState {
         1,
         ShardRoutingEntry {
             primary: "node-2".into(),
+            primary_term: 11,
             replicas: vec!["node-1".into()],
             in_sync_replicas: vec!["node-1".into()],
             unassigned_replicas: 1,
@@ -148,11 +150,13 @@ fn roundtrip_preserves_shard_routing() {
 
     let shard0 = idx.shard_routing.get(&0).unwrap();
     assert_eq!(shard0.primary, "node-1");
+    assert_eq!(shard0.primary_term, 7);
     assert_eq!(shard0.replicas, vec!["node-2".to_string()]);
     assert_eq!(shard0.in_sync_replicas, vec!["node-2".to_string()]);
 
     let shard1 = idx.shard_routing.get(&1).unwrap();
     assert_eq!(shard1.primary, "node-2");
+    assert_eq!(shard1.primary_term, 11);
     assert_eq!(shard1.replicas, vec!["node-1".to_string()]);
     assert_eq!(shard1.in_sync_replicas, vec!["node-1".to_string()]);
     assert_eq!(shard1.unassigned_replicas, 1);
@@ -182,6 +186,19 @@ fn cluster_state_snapshot_without_in_sync_membership_fails_closed() {
         restored.indices["products"].shard_routing[&0]
             .in_sync_replicas
             .is_empty()
+    );
+}
+
+#[test]
+fn cluster_state_snapshot_without_primary_term_preserves_legacy_zero() {
+    let original = make_full_cluster_state();
+    let mut proto = cluster_state_to_proto(&original);
+    shard_assignment_mut(&mut proto, 0).primary_term = 0;
+
+    let restored = proto_to_cluster_state(&proto).unwrap();
+    assert_eq!(
+        restored.indices["products"].shard_routing[&0].primary_term,
+        0
     );
 }
 
@@ -263,6 +280,7 @@ fn roundtrip_index_with_no_replicas() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -445,6 +463,7 @@ async fn get_or_open_search_shard_reopens_persisted_shard_via_metadata() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -473,6 +492,7 @@ async fn get_or_open_search_shard_reopens_persisted_shard_via_metadata() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -505,6 +525,7 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -533,6 +554,7 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -568,6 +590,7 @@ async fn get_shard_stats_only_reports_open_shards() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -605,6 +628,7 @@ async fn get_segment_stats_only_reports_open_shard_segments() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -634,6 +658,7 @@ async fn get_or_open_search_shard_returns_not_found_for_unknown_shard() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -658,6 +683,7 @@ async fn get_or_open_shard_returns_not_found_for_unknown_shard() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -692,6 +718,7 @@ async fn ping_rejects_unregistered_source_node() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -729,6 +756,7 @@ async fn ping_updates_last_seen_for_registered_source_node() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -758,6 +786,7 @@ async fn maintenance_skips_orphaned_shards() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -767,6 +796,7 @@ async fn maintenance_skips_orphaned_shards() {
         1,
         ShardRoutingEntry {
             primary: "node-2".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -776,6 +806,7 @@ async fn maintenance_skips_orphaned_shards() {
         2,
         ShardRoutingEntry {
             primary: "node-3".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -805,6 +836,7 @@ async fn maintenance_skips_orphaned_shards() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -831,6 +863,7 @@ async fn maintenance_includes_replica_shards() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -840,6 +873,7 @@ async fn maintenance_includes_replica_shards() {
         1,
         ShardRoutingEntry {
             primary: "node-2".into(),
+            primary_term: 1,
             replicas: vec!["node-1".into()],
             in_sync_replicas: vec!["node-1".into()],
             unassigned_replicas: 0,
@@ -869,6 +903,7 @@ async fn maintenance_includes_replica_shards() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -899,6 +934,7 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -928,6 +964,7 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -995,6 +1032,7 @@ async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
                 0,
                 ShardRoutingEntry {
                     primary: "node-1".into(),
+                    primary_term: 1,
                     replicas: vec![],
                     in_sync_replicas: vec![],
                     unassigned_replicas: 0,
@@ -1018,6 +1056,7 @@ async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(1, 1),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1088,6 +1127,7 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -1117,6 +1157,7 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1160,6 +1201,7 @@ async fn get_task_status_rpc_returns_local_force_merge_snapshot() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
     let task_id = service
@@ -1188,6 +1230,7 @@ async fn force_merge_task_counts_missing_assigned_shard_as_failure() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -1217,6 +1260,7 @@ async fn force_merge_task_counts_missing_assigned_shard_as_failure() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1261,6 +1305,7 @@ async fn flush_index_refuses_to_create_missing_uuid_dir() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -1290,6 +1335,7 @@ async fn flush_index_refuses_to_create_missing_uuid_dir() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1427,6 +1473,7 @@ fn roundtrip_preserves_dynamic_mapping_true() {
         0,
         ShardRoutingEntry {
             primary: "n1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -1460,6 +1507,7 @@ fn roundtrip_preserves_dynamic_mapping_strict() {
         0,
         ShardRoutingEntry {
             primary: "n1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -1493,6 +1541,7 @@ fn roundtrip_empty_dynamic_defaults_to_false() {
         0,
         ShardRoutingEntry {
             primary: "n1".into(),
+            primary_term: 1,
             replicas: vec![],
             in_sync_replicas: vec![],
             unassigned_replicas: 0,
@@ -1626,6 +1675,7 @@ async fn create_index_returns_internal_when_no_data_nodes_are_available() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1663,6 +1713,7 @@ async fn search_remote_store_splits_requires_local_index_metadata() {
         local_node_id: "node-1".into(),
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
         join_lock: new_join_lock(),
     };
 

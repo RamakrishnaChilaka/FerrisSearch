@@ -38,31 +38,211 @@ impl ClusterStateMachine {
         self.state.clone()
     }
 
-    fn apply_command(&self, cmd: &ClusterCommand) {
+    fn apply_command(&self, cmd: &ClusterCommand) -> ClusterResponse {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         match cmd {
             ClusterCommand::AddNode { node } => {
                 state.add_node(node.clone());
+                ClusterResponse::Ok
             }
             ClusterCommand::RemoveNode { node_id } => {
                 state.remove_node(node_id);
+                ClusterResponse::Ok
             }
             ClusterCommand::CreateIndex { metadata } => {
+                if metadata.shard_routing.len() != metadata.number_of_shards as usize {
+                    return ClusterResponse::Error(format!(
+                        "index '{}' has {} shard routing entries but declares {} shards",
+                        metadata.name,
+                        metadata.shard_routing.len(),
+                        metadata.number_of_shards
+                    ));
+                }
+                for shard_id in 0..metadata.number_of_shards {
+                    let Some(routing) = metadata.shard_routing.get(&shard_id) else {
+                        return ClusterResponse::Error(format!(
+                            "index '{}' is missing routing for shard {}",
+                            metadata.name, shard_id
+                        ));
+                    };
+                    if routing.primary_term == 0 {
+                        return ClusterResponse::Error(format!(
+                            "index '{}' shard {} must start with primary term at least 1",
+                            metadata.name, shard_id
+                        ));
+                    }
+                    if let Err(reason) = routing.validate_membership() {
+                        return ClusterResponse::Error(format!(
+                            "invalid routing for index '{}' shard {}: {}",
+                            metadata.name, shard_id, reason
+                        ));
+                    }
+                }
                 state.add_index(metadata.clone());
+                ClusterResponse::Ok
             }
             ClusterCommand::DeleteIndex { index_name } => {
                 state.indices.remove(index_name);
                 state.version += 1;
+                ClusterResponse::Ok
             }
             ClusterCommand::SetMaster { node_id } => {
                 state.master_node = Some(node_id.clone());
                 state.version += 1;
+                ClusterResponse::Ok
             }
             ClusterCommand::UpdateIndex { metadata } => {
-                state
-                    .indices
-                    .insert(metadata.name.clone(), metadata.clone());
+                let Some(current) = state.indices.get(&metadata.name).cloned() else {
+                    return ClusterResponse::Error(format!(
+                        "index '{}' does not exist",
+                        metadata.name
+                    ));
+                };
+                if current.uuid != metadata.uuid {
+                    return ClusterResponse::Error(format!(
+                        "index '{}' UUID mismatch: expected {}, got {}",
+                        metadata.name, current.uuid, metadata.uuid
+                    ));
+                }
+                if current.number_of_shards != metadata.number_of_shards
+                    || current.shard_routing.len() != metadata.shard_routing.len()
+                {
+                    return ClusterResponse::Error(format!(
+                        "index '{}' shard topology cannot be replaced by UpdateIndex",
+                        metadata.name
+                    ));
+                }
+
+                let mut updated = metadata.clone();
+                for (shard_id, current_routing) in &current.shard_routing {
+                    let Some(next_routing) = updated.shard_routing.get_mut(shard_id) else {
+                        return ClusterResponse::Error(format!(
+                            "index '{}' update is missing shard {}",
+                            metadata.name, shard_id
+                        ));
+                    };
+
+                    next_routing.in_sync_replicas = current_routing
+                        .in_sync_replicas
+                        .iter()
+                        .filter(|replica| next_routing.replicas.contains(replica))
+                        .cloned()
+                        .collect();
+
+                    if next_routing.primary != current_routing.primary {
+                        if !current_routing.is_replica_in_sync(&next_routing.primary) {
+                            return ClusterResponse::Error(format!(
+                                "cannot promote out-of-sync replica '{}' for index '{}' shard {}",
+                                next_routing.primary, metadata.name, shard_id
+                            ));
+                        }
+                        let Some(next_term) = current_routing.primary_term.checked_add(1) else {
+                            return ClusterResponse::Error(format!(
+                                "primary term exhausted for index '{}' shard {}",
+                                metadata.name, shard_id
+                            ));
+                        };
+                        next_routing.primary_term = next_term;
+                        next_routing
+                            .in_sync_replicas
+                            .retain(|replica| replica != &next_routing.primary);
+                    } else {
+                        next_routing.primary_term = current_routing.primary_term;
+                    }
+
+                    if let Err(reason) = next_routing.validate_membership() {
+                        return ClusterResponse::Error(format!(
+                            "invalid routing update for index '{}' shard {}: {}",
+                            metadata.name, shard_id, reason
+                        ));
+                    }
+                }
+
+                state.indices.insert(metadata.name.clone(), updated);
                 state.version += 1;
+                ClusterResponse::Ok
+            }
+            ClusterCommand::MarkReplicaInSync {
+                index_name,
+                index_uuid,
+                shard_id,
+                replica,
+                primary,
+                primary_term,
+            } => {
+                let Some(metadata) = state.indices.get_mut(index_name) else {
+                    return ClusterResponse::Error(format!("index '{index_name}' does not exist"));
+                };
+                if metadata.uuid.as_str() != index_uuid {
+                    return ClusterResponse::Error(format!("index '{index_name}' UUID mismatch"));
+                }
+                let Some(routing) = metadata.shard_routing.get_mut(shard_id) else {
+                    return ClusterResponse::Error(format!(
+                        "index '{index_name}' has no shard {shard_id}"
+                    ));
+                };
+                if &routing.primary != primary {
+                    return ClusterResponse::Error(format!(
+                        "primary mismatch for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if routing.primary_term != *primary_term {
+                    return ClusterResponse::Error(format!(
+                        "primary term mismatch for index '{index_name}' shard {shard_id}: expected {}, got {}",
+                        routing.primary_term, primary_term
+                    ));
+                }
+                if !routing.replicas.contains(replica) {
+                    return ClusterResponse::Error(format!(
+                        "replica '{replica}' is not assigned to index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if routing.is_replica_in_sync(replica) {
+                    return ClusterResponse::Error(format!(
+                        "replica '{replica}' is already in sync for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                routing.in_sync_replicas.push(replica.clone());
+                state.version += 1;
+                ClusterResponse::Ok
+            }
+            ClusterCommand::ActivatePrimary {
+                index_name,
+                index_uuid,
+                shard_id,
+                primary,
+                expected_term,
+            } => {
+                let Some(metadata) = state.indices.get_mut(index_name) else {
+                    return ClusterResponse::Error(format!("index '{index_name}' does not exist"));
+                };
+                if metadata.uuid.as_str() != index_uuid {
+                    return ClusterResponse::Error(format!("index '{index_name}' UUID mismatch"));
+                }
+                let Some(routing) = metadata.shard_routing.get_mut(shard_id) else {
+                    return ClusterResponse::Error(format!(
+                        "index '{index_name}' has no shard {shard_id}"
+                    ));
+                };
+                if &routing.primary != primary {
+                    return ClusterResponse::Error(format!(
+                        "primary mismatch for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if routing.primary_term != *expected_term {
+                    return ClusterResponse::Error(format!(
+                        "primary term mismatch for index '{index_name}' shard {shard_id}: expected {}, got {}",
+                        routing.primary_term, expected_term
+                    ));
+                }
+                let Some(next_term) = routing.primary_term.checked_add(1) else {
+                    return ClusterResponse::Error(format!(
+                        "primary term exhausted for index '{index_name}' shard {shard_id}"
+                    ));
+                };
+                routing.primary_term = next_term;
+                state.version += 1;
+                ClusterResponse::Ok
             }
             ClusterCommand::AddMappings {
                 index_name,
@@ -79,22 +259,27 @@ impl ClusterStateMachine {
                     existing.dynamic = dynamic.clone();
                     state.version += 1;
                 }
+                ClusterResponse::Ok
             }
             ClusterCommand::PutApiKey { record } => {
                 state.api_keys.insert(record.id.clone(), record.clone());
                 state.version += 1;
+                ClusterResponse::Ok
             }
             ClusterCommand::DeleteApiKey { key_id } => {
                 state.api_keys.remove(key_id);
                 state.version += 1;
+                ClusterResponse::Ok
             }
             ClusterCommand::PutRole { role } => {
                 state.roles.insert(role.name.clone(), role.clone());
                 state.version += 1;
+                ClusterResponse::Ok
             }
             ClusterCommand::DeleteRole { name } => {
                 state.roles.remove(name);
                 state.version += 1;
+                ClusterResponse::Ok
             }
         }
     }
@@ -128,10 +313,7 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
 
             let response = match entry.payload {
                 EntryPayload::Blank => ClusterResponse::Ok,
-                EntryPayload::Normal(cmd) => {
-                    self.apply_command(&cmd);
-                    ClusterResponse::Ok
-                }
+                EntryPayload::Normal(cmd) => self.apply_command(&cmd),
                 EntryPayload::Membership(ref mem) => {
                     self.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
                     ClusterResponse::Ok
@@ -249,6 +431,7 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-1".into(),
+                primary_term: 1,
                 replicas: vec![],
                 in_sync_replicas: vec![],
                 unassigned_replicas: 0,
@@ -318,7 +501,8 @@ mod tests {
     fn apply_create_index_command() {
         let sm = ClusterStateMachine::new("test".into());
         let idx = make_index("my-index");
-        sm.apply_command(&ClusterCommand::CreateIndex { metadata: idx });
+        let response = sm.apply_command(&ClusterCommand::CreateIndex { metadata: idx });
+        assert_eq!(response, ClusterResponse::Ok);
 
         let handle = sm.state_handle();
         let state = handle.read().unwrap();
@@ -356,13 +540,247 @@ mod tests {
         assert_eq!(idx.unassigned_replica_count(), 0);
 
         // Apply UpdateIndex
-        sm.apply_command(&ClusterCommand::UpdateIndex { metadata: idx });
+        let response = sm.apply_command(&ClusterCommand::UpdateIndex { metadata: idx });
+        assert_eq!(response, ClusterResponse::Ok);
 
         let handle = sm.state_handle();
         let state = handle.read().unwrap();
         let updated = &state.indices["products"];
         assert_eq!(updated.unassigned_replica_count(), 0);
         assert_eq!(updated.shard_routing[&0].replicas.len(), 2);
+    }
+
+    #[test]
+    fn create_index_rejects_zero_primary_term() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("legacy");
+        metadata.shard_routing.get_mut(&0).unwrap().primary_term = 0;
+
+        let response = sm.apply_command(&ClusterCommand::CreateIndex { metadata });
+
+        assert!(matches!(
+            response,
+            ClusterResponse::Error(error) if error.contains("primary term at least 1")
+        ));
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert!(!state.indices.contains_key("legacy"));
+        assert_eq!(state.version, 0);
+    }
+
+    #[test]
+    fn update_index_cannot_add_in_sync_members() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("idx");
+        metadata.number_of_replicas = 1;
+        metadata.shard_routing.get_mut(&0).unwrap().replicas = vec!["node-2".into()];
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::CreateIndex {
+                metadata: metadata.clone(),
+            }),
+            ClusterResponse::Ok
+        );
+
+        metadata.shard_routing.get_mut(&0).unwrap().in_sync_replicas = vec!["node-2".into()];
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::UpdateIndex { metadata }),
+            ClusterResponse::Ok
+        );
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        assert!(
+            state.indices["idx"].shard_routing[&0]
+                .in_sync_replicas
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn update_index_rejects_out_of_sync_primary_without_partial_apply() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("idx");
+        metadata.number_of_replicas = 1;
+        metadata.shard_routing.get_mut(&0).unwrap().replicas = vec!["node-2".into()];
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::CreateIndex {
+                metadata: metadata.clone(),
+            }),
+            ClusterResponse::Ok
+        );
+
+        let version_before = sm.state_handle().read().unwrap().version;
+        let routing = metadata.shard_routing.get_mut(&0).unwrap();
+        routing.primary = "node-2".into();
+        routing.replicas.clear();
+        routing.primary_term = 99;
+        metadata.settings.refresh_interval_ms = Some(1234);
+
+        let response = sm.apply_command(&ClusterCommand::UpdateIndex { metadata });
+
+        assert!(matches!(
+            response,
+            ClusterResponse::Error(error) if error.contains("out-of-sync replica")
+        ));
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        let current = &state.indices["idx"];
+        assert_eq!(current.shard_routing[&0].primary, "node-1");
+        assert_eq!(current.shard_routing[&0].primary_term, 1);
+        assert_eq!(current.settings.refresh_interval_ms, None);
+        assert_eq!(state.version, version_before);
+    }
+
+    #[test]
+    fn update_index_promotes_in_sync_primary_and_computes_next_term() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("idx");
+        metadata.number_of_replicas = 2;
+        {
+            let routing = metadata.shard_routing.get_mut(&0).unwrap();
+            routing.primary_term = 7;
+            routing.replicas = vec!["node-2".into(), "node-3".into()];
+            routing.in_sync_replicas = routing.replicas.clone();
+        }
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::CreateIndex {
+                metadata: metadata.clone(),
+            }),
+            ClusterResponse::Ok
+        );
+
+        assert!(metadata.promote_replica_to(0, "node-2"));
+        metadata.shard_routing.get_mut(&0).unwrap().primary_term = 999;
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::UpdateIndex { metadata }),
+            ClusterResponse::Ok
+        );
+
+        let handle = sm.state_handle();
+        let state = handle.read().unwrap();
+        let routing = &state.indices["idx"].shard_routing[&0];
+        assert_eq!(routing.primary, "node-2");
+        assert_eq!(routing.primary_term, 8);
+        assert_eq!(routing.replicas, ["node-3"]);
+        assert_eq!(routing.in_sync_replicas, ["node-3"]);
+    }
+
+    #[test]
+    fn mark_replica_in_sync_enforces_all_compare_and_set_fields() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("idx");
+        metadata.number_of_replicas = 1;
+        {
+            let routing = metadata.shard_routing.get_mut(&0).unwrap();
+            routing.primary_term = 3;
+            routing.replicas = vec!["node-2".into()];
+        }
+        let index_uuid = metadata.uuid.to_string();
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::CreateIndex { metadata }),
+            ClusterResponse::Ok
+        );
+        let version_before = sm.state_handle().read().unwrap().version;
+
+        for command in [
+            ClusterCommand::MarkReplicaInSync {
+                index_name: "idx".into(),
+                index_uuid: "wrong".into(),
+                shard_id: 0,
+                replica: "node-2".into(),
+                primary: "node-1".into(),
+                primary_term: 3,
+            },
+            ClusterCommand::MarkReplicaInSync {
+                index_name: "idx".into(),
+                index_uuid: index_uuid.clone(),
+                shard_id: 0,
+                replica: "node-2".into(),
+                primary: "wrong".into(),
+                primary_term: 3,
+            },
+            ClusterCommand::MarkReplicaInSync {
+                index_name: "idx".into(),
+                index_uuid: index_uuid.clone(),
+                shard_id: 0,
+                replica: "node-2".into(),
+                primary: "node-1".into(),
+                primary_term: 2,
+            },
+            ClusterCommand::MarkReplicaInSync {
+                index_name: "idx".into(),
+                index_uuid: index_uuid.clone(),
+                shard_id: 0,
+                replica: "node-3".into(),
+                primary: "node-1".into(),
+                primary_term: 3,
+            },
+        ] {
+            assert!(matches!(
+                sm.apply_command(&command),
+                ClusterResponse::Error(_)
+            ));
+        }
+        assert_eq!(sm.state_handle().read().unwrap().version, version_before);
+
+        let command = ClusterCommand::MarkReplicaInSync {
+            index_name: "idx".into(),
+            index_uuid,
+            shard_id: 0,
+            replica: "node-2".into(),
+            primary: "node-1".into(),
+            primary_term: 3,
+        };
+        assert_eq!(sm.apply_command(&command), ClusterResponse::Ok);
+        assert_eq!(
+            sm.state_handle().read().unwrap().indices["idx"].shard_routing[&0].in_sync_replicas,
+            ["node-2"]
+        );
+        assert!(matches!(
+            sm.apply_command(&command),
+            ClusterResponse::Error(error) if error.contains("already in sync")
+        ));
+    }
+
+    #[test]
+    fn activate_primary_enforces_compare_and_set_and_advances_once() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("idx");
+        metadata.shard_routing.get_mut(&0).unwrap().primary_term = 4;
+        let index_uuid = metadata.uuid.to_string();
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::CreateIndex { metadata }),
+            ClusterResponse::Ok
+        );
+
+        let stale = ClusterCommand::ActivatePrimary {
+            index_name: "idx".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            expected_term: 3,
+        };
+        assert!(matches!(
+            sm.apply_command(&stale),
+            ClusterResponse::Error(error) if error.contains("primary term mismatch")
+        ));
+
+        let command = ClusterCommand::ActivatePrimary {
+            index_name: "idx".into(),
+            index_uuid,
+            shard_id: 0,
+            primary: "node-1".into(),
+            expected_term: 4,
+        };
+        assert_eq!(sm.apply_command(&command), ClusterResponse::Ok);
+        assert_eq!(
+            sm.state_handle().read().unwrap().indices["idx"].shard_routing[&0].primary_term,
+            5
+        );
+        assert!(matches!(
+            sm.apply_command(&command),
+            ClusterResponse::Error(error) if error.contains("primary term mismatch")
+        ));
     }
 
     #[test]

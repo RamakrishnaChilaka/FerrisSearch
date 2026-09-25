@@ -143,13 +143,15 @@ pub(crate) async fn raft_write(
     state: &AppState,
     cmd: crate::consensus::types::ClusterCommand,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    state.raft.client_write(cmd).await.map_err(|e| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "raft_write_exception",
-            format!("Raft write failed: {e}"),
-        )
-    })?;
+    crate::consensus::client_write_checked(&state.raft, cmd)
+        .await
+        .map_err(|e| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "raft_write_exception",
+                format!("Raft write failed: {e}"),
+            )
+        })?;
     Ok(())
 }
 

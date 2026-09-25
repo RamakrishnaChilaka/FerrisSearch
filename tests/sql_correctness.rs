@@ -132,6 +132,7 @@ impl FerrisDB {
             0,
             ShardRoutingEntry {
                 primary: "node-1".into(),
+                primary_term: 1,
                 replicas: vec![],
                 in_sync_replicas: vec![],
                 unassigned_replicas: 0,

@@ -718,6 +718,62 @@ impl TransportClient {
         Ok(())
     }
 
+    pub async fn forward_mark_replica_in_sync(
+        &self,
+        master: &NodeInfo,
+        request: MarkReplicaInSyncRequest,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
+        let response = client
+            .mark_replica_in_sync(tonic::Request::new(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("MarkReplicaInSync RPC: {e}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.acknowledged {
+            return Err(anyhow::anyhow!("MarkReplicaInSync was not acknowledged"));
+        }
+        Ok(())
+    }
+
+    pub async fn forward_activate_primary(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+        index_uuid: &str,
+        shard_id: u32,
+        primary_node_id: &str,
+        expected_term: u64,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
+        let response = client
+            .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
+                index_name: index_name.to_string(),
+                index_uuid: index_uuid.to_string(),
+                shard_id,
+                primary_node_id: primary_node_id.to_string(),
+                expected_term,
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("ActivatePrimary RPC: {e}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.acknowledged {
+            return Err(anyhow::anyhow!("ActivatePrimary was not acknowledged"));
+        }
+        Ok(())
+    }
+
     /// Forward an index creation request to the master node via gRPC.
     /// The master parses the body, builds metadata, and commits via Raft.
     pub async fn forward_create_index(
