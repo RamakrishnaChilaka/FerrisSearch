@@ -88,6 +88,13 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > and pins are process-local and expire after ten minutes. The
 > [September 25 evidence record](recovery-acceptance-matrix.md#bounded-file-recovery-evidence-record-september-25-2026)
 > names the exact executable subset.
+>
+> **Availability correction — September 25, 2026:** primary engine replacement
+> now aborts safe pre-finalize source sessions before Tantivy reopen. Targets
+> that sent completion but cannot yet order the membership result persist a
+> finalized-awaiting-membership state, remain open, and accept live replication.
+> They are closed and marked for a new recovery only after definitive rejection;
+> admission or promotion clears the pending marker without replacing the copy.
 
 ## 3. Reference Protocols And Intentional Differences
 

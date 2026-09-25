@@ -165,12 +165,16 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc` and
   `replicate_bulk` must call the explicit-seq engine methods. Do not route
   replicated writes through local seq allocation APIs.
-- **Recovering targets reject live replica apply** until finalization succeeds.
-  The in-progress marker also prevents an installed partial shard from being
-  reopened after restart.
+- **Installing targets reject live replica apply.** A finalized target awaiting
+  membership accepts live apply and remains open; its durable pending marker is
+  reconciled to admitted/promoted or definitively rejected state after restart.
+  The in-progress marker still prevents a partial install from being opened.
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.
+- Before dynamic-mapping reopen, abort the shard's safe pre-finalize source
+  session and wait for cleanup. Never remove the shard-map engine while a
+  source-session `Arc` still owns its Tantivy writer/directory lock.
 - **Successful write responses MUST carry valid receipts**: zero is a valid
   sequence, not a missing-value sentinel. Clients must reject successful
   single/delete responses without `seq_no`. A single index response must match

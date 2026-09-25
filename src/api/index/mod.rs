@@ -1539,11 +1539,22 @@ pub async fn delete_index(
 
     let cluster_state = state.cluster_manager.get_state();
 
-    if !cluster_state.indices.contains_key(index_name.as_str()) {
+    let Some(index_metadata) = cluster_state.indices.get(index_name.as_str()) else {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
             format!("no such index [{index_name}]"),
+        );
+    };
+    if let Err(error) = state
+        .shard_manager
+        .abort_source_recoveries_for_index(&index_metadata.uuid)
+        .await
+    {
+        return crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "peer_recovery_cleanup_exception",
+            format!("Failed to stop peer recovery before deleting [{index_name}]: {error}"),
         );
     }
 

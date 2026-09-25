@@ -1,6 +1,7 @@
 use super::TransportService;
 use crate::consensus::types::ClusterCommand;
 use crate::engine::{PeerRecoveryFileMetadata, PeerRecoveryOpsBatch, SearchEngine};
+use crate::shard::SourceRecoverySessionCleanup;
 use crate::transport::proto::{
     CompleteFinalizeRecoveryRequest, CompleteFinalizeRecoveryResponse,
     FetchRecoveryFileChunkRequest, FetchRecoveryFileChunkResponse, FetchRecoveryOpsRequest,
@@ -33,7 +34,7 @@ struct SourceRegistry {
     active_shards: HashMap<ShardIdentity, Option<String>>,
 }
 
-pub(super) struct PeerRecoveryTransportState {
+pub(crate) struct PeerRecoveryTransportState {
     registry: Mutex<SourceRegistry>,
     write_barriers: Mutex<ShardWriteBarrierMap>,
 }
@@ -108,6 +109,89 @@ impl PeerRecoveryTransportState {
         }
         session
     }
+
+    async fn abort_shard_session(&self, index_uuid: &str, shard_id: u32) -> anyhow::Result<bool> {
+        let key = (index_uuid.to_string(), shard_id);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let active_session = self.registry.lock().await.active_shards.get(&key).cloned();
+            let Some(active_session) = active_session else {
+                return Ok(false);
+            };
+            let Some(session_id) = active_session else {
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out waiting for peer recovery snapshot setup before engine replacement"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            let session = {
+                self.registry
+                    .lock()
+                    .await
+                    .sessions
+                    .get(&session_id)
+                    .cloned()
+            };
+            let Some(session) = session else {
+                self.registry.lock().await.active_shards.remove(&key);
+                continue;
+            };
+            {
+                let session = session.lock().await;
+                if session.finalize_preparing
+                    || session.barrier_guard.is_some()
+                    || session.settlement_running
+                {
+                    anyhow::bail!(
+                        "cannot replace a primary engine while peer recovery admission is active"
+                    );
+                }
+            }
+            if let Some(session) = self.remove_session(&session_id).await {
+                cleanup_session(session).await;
+            }
+            return Ok(true);
+        }
+    }
+
+    async fn abort_index_sessions(&self, index_uuid: &str) -> anyhow::Result<usize> {
+        let keys = self
+            .registry
+            .lock()
+            .await
+            .active_shards
+            .keys()
+            .filter(|(uuid, _)| uuid == index_uuid)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut aborted = 0usize;
+        for (_, shard_id) in keys {
+            aborted += usize::from(self.abort_shard_session(index_uuid, shard_id).await?);
+        }
+        Ok(aborted)
+    }
+}
+
+impl SourceRecoverySessionCleanup for PeerRecoveryTransportState {
+    fn abort_shard<'a>(
+        &'a self,
+        index_uuid: &'a str,
+        shard_id: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(self.abort_shard_session(index_uuid, shard_id))
+    }
+
+    fn abort_index<'a>(
+        &'a self,
+        index_uuid: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>>
+    {
+        Box::pin(self.abort_index_sessions(index_uuid))
+    }
 }
 
 pub(super) fn new_peer_recovery_transport_state() -> Arc<PeerRecoveryTransportState> {
@@ -134,6 +218,7 @@ struct SourceSession {
     barrier_next_seq_no: Option<u64>,
     barrier_guard: Option<OwnedRwLockWriteGuard<()>>,
     finalize_deadline: Option<Instant>,
+    finalize_preparing: bool,
     settlement_running: bool,
 }
 
@@ -433,7 +518,9 @@ impl TransportService {
             let existing = self.source_session(&existing_session_id).await?;
             let replaceable = {
                 let existing = existing.lock().await;
-                existing.barrier_guard.is_none() && !existing.settlement_running
+                !existing.finalize_preparing
+                    && existing.barrier_guard.is_none()
+                    && !existing.settlement_running
             };
             if !replaceable {
                 return Err(Status::already_exists(
@@ -552,6 +639,7 @@ impl TransportService {
             barrier_next_seq_no: None,
             barrier_guard: None,
             finalize_deadline: None,
+            finalize_preparing: false,
             settlement_running: false,
         }));
         {
@@ -695,6 +783,12 @@ impl TransportService {
                     "peer recovery settlement is already running",
                 ));
             }
+            if session.finalize_preparing || session.barrier_guard.is_some() {
+                return Err(Status::already_exists(
+                    "peer recovery finalization is already being prepared",
+                ));
+            }
+            session.finalize_preparing = true;
             session.last_activity = Instant::now();
             (
                 (session.index_uuid.clone(), session.shard_id),
@@ -703,9 +797,16 @@ impl TransportService {
         };
 
         let barrier = self.peer_recovery_state.barrier(key).await;
-        let guard = tokio::time::timeout(FINALIZE_BARRIER_TIMEOUT, barrier.write_owned())
-            .await
-            .map_err(|_| Status::deadline_exceeded("timed out acquiring peer recovery barrier"))?;
+        let guard =
+            match tokio::time::timeout(FINALIZE_BARRIER_TIMEOUT, barrier.write_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    session.lock().await.finalize_preparing = false;
+                    return Err(Status::deadline_exceeded(
+                        "timed out acquiring peer recovery barrier",
+                    ));
+                }
+            };
 
         {
             let session_guard = session.lock().await;
@@ -722,12 +823,26 @@ impl TransportService {
         let batch = tokio::task::spawn_blocking(move || {
             engine.peer_recovery_ops(applied_next_seq_no, MAX_RECOVERY_OPS, MAX_RECOVERY_OP_BYTES)
         })
-        .await
-        .map_err(|error| Status::internal(format!("finalize ops task failed: {error}")))?
-        .map_err(|error| Status::internal(format!("read finalize operations: {error}")))?;
+        .await;
+        let batch = match batch {
+            Ok(Ok(batch)) => batch,
+            Ok(Err(error)) => {
+                session.lock().await.finalize_preparing = false;
+                return Err(Status::internal(format!(
+                    "read finalize operations: {error}"
+                )));
+            }
+            Err(error) => {
+                session.lock().await.finalize_preparing = false;
+                return Err(Status::internal(format!(
+                    "finalize ops task failed: {error}"
+                )));
+            }
+        };
         let barrier_next_seq_no = batch.primary_next_seq_no;
         if !batch.complete {
             drop(guard);
+            session.lock().await.finalize_preparing = false;
             return Ok(PrepareFinalizeRecoveryResponse {
                 operations: Vec::new(),
                 barrier_next_seq_no,
@@ -736,9 +851,16 @@ impl TransportService {
                 error: String::new(),
             });
         }
-        let operations = recovery_ops(batch)?;
+        let operations = match recovery_ops(batch) {
+            Ok(operations) => operations,
+            Err(error) => {
+                session.lock().await.finalize_preparing = false;
+                return Err(error);
+            }
+        };
         {
             let mut session = session.lock().await;
+            session.finalize_preparing = false;
             session.barrier_next_seq_no = Some(barrier_next_seq_no);
             session.barrier_guard = Some(guard);
             session.finalize_deadline = Some(Instant::now() + FINALIZE_BARRIER_TIMEOUT);
@@ -938,6 +1060,7 @@ mod tests {
                 barrier_next_seq_no: None,
                 barrier_guard: None,
                 finalize_deadline: None,
+                finalize_preparing: false,
                 settlement_running: false,
             })),
         );
@@ -1032,6 +1155,7 @@ mod tests {
                 barrier_next_seq_no: None,
                 barrier_guard: None,
                 finalize_deadline: None,
+                finalize_preparing: false,
                 settlement_running: false,
             })),
         );

@@ -53,6 +53,11 @@ pub async fn replicate_bulk(
 - The target wipes only its out-of-sync copy, persists
   `PEER_RECOVERY_IN_PROGRESS`, validates bounded chunks and SHA-256 hashes,
   initializes an empty WAL at `B`, and opens with schema-wipe fallback disabled.
+- After sending completion, the target persists
+  `PEER_RECOVERY_AWAITING_MEMBERSHIP`, keeps the caught-up engine open, and
+  accepts live replica apply while local membership is unresolved. Reconcile
+  clears this state on admission/promotion and only writes the destructive
+  in-progress marker after definitive rejection.
 - Catch-up applies explicit primary sequence numbers. A final exclusive shard
   write barrier establishes `H`; the target applies through `H`, then the
   primary submits `MarkReplicaInSync(primary, term)` and observes local
@@ -79,6 +84,10 @@ pub async fn replicate_bulk(
 - Primary write handlers hold the shard's shared write-barrier guard from
   before engine mutation through synchronous replication. Finalization holds
   the exclusive guard.
+- Dynamic-mapping reopen and async index close abort safe pre-finalize source
+  sessions and await pin/snapshot/engine-Arc cleanup before replacing or
+  deleting the primary engine. Encountering an admitting/settling source
+  session on the shared-write path is a logic error and must fail the operation.
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates but cannot grant membership.

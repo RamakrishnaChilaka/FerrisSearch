@@ -61,6 +61,16 @@ must fail closed. Finalization opens under the per-shard lock with schema reset
 disabled, verifies the exact committed file set, and removes the marker only
 after the engine is ready to publish.
 
+After CompleteFinalize is sent, `PEER_RECOVERY_AWAITING_MEMBERSHIP` preserves
+the caught-up copy across target restart. This marker permits open and live
+replica apply. Reconcile removes it without closing the engine when the node is
+in-sync or promoted; only definitive UUID/assignment/primary-term rejection
+closes the engine and restores `PEER_RECOVERY_IN_PROGRESS`.
+
+`ShardManager::reopen_shard()` and async index-close wrappers invoke the
+registered source-session cleanup hook before replacing engines. Cleanup must
+drop the session's engine `Arc` and WAL pin before Tantivy reopen.
+
 ### Async Scheduling Rule
 - `open_shard_with_settings()`, `close_index_shards()`, and `cleanup_orphaned_data()` are synchronous helpers for already-blocking contexts and tests.
 - Any Tokio call site must use the `*_blocking()` wrappers so shard startup/rebuild/delete work does not stall unrelated async tasks.

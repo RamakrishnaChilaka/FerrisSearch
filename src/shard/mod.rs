@@ -7,8 +7,10 @@ use crate::cluster::state::IndexSettings;
 use crate::engine::{CompositeEngine, SearchEngine};
 use crate::wal::{HotTranslog, TranslogDurability};
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -16,6 +18,33 @@ pub const SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX: &str = "api_delete_index";
 pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_delete_index_rpc";
 pub const SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP: &str = "orphan_cleanup_unknown_uuid";
 pub const PEER_RECOVERY_IN_PROGRESS_MARKER: &str = "PEER_RECOVERY_IN_PROGRESS";
+pub const PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER: &str = "PEER_RECOVERY_AWAITING_MEMBERSHIP";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerRecoveryAwaitingMembership {
+    pub index_uuid: String,
+    pub primary_node_id: String,
+    pub primary_term: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRecoveryTargetState {
+    Recovering,
+    FinalizedAwaitingMembership(PeerRecoveryAwaitingMembership),
+}
+
+pub(crate) trait SourceRecoverySessionCleanup: Send + Sync {
+    fn abort_shard<'a>(
+        &'a self,
+        index_uuid: &'a str,
+        shard_id: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
+
+    fn abort_index<'a>(
+        &'a self,
+        index_uuid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>>;
+}
 
 pub struct PeerRecoveryTargetInstall {
     pub index: String,
@@ -180,7 +209,8 @@ pub struct ShardManager {
     /// Serializes concurrent open attempts for the same shard key so only
     /// one thread performs the expensive CompositeEngine creation at a time.
     open_locks: Mutex<HashMap<ShardKey, Arc<Mutex<()>>>>,
-    peer_recovery_targets: RwLock<HashSet<ShardKey>>,
+    peer_recovery_targets: RwLock<HashMap<ShardKey, PeerRecoveryTargetState>>,
+    source_recovery_cleanup: RwLock<Option<Arc<dyn SourceRecoverySessionCleanup>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
     pub isr_tracker: IsrTracker,
     /// Translog durability mode for new shards.
@@ -218,7 +248,8 @@ impl ShardManager {
             settings_managers: RwLock::new(HashMap::new()),
             index_uuids: RwLock::new(HashMap::new()),
             open_locks: Mutex::new(HashMap::new()),
-            peer_recovery_targets: RwLock::new(HashSet::new()),
+            peer_recovery_targets: RwLock::new(HashMap::new()),
+            source_recovery_cleanup: RwLock::new(None),
             isr_tracker: IsrTracker::new(1000),
             durability,
             column_cache,
@@ -238,6 +269,47 @@ impl ShardManager {
     /// Configured maximum capacity of the shared column cache.
     pub fn column_cache_max_capacity(&self) -> u64 {
         self.column_cache.max_capacity()
+    }
+
+    pub(crate) fn register_source_recovery_cleanup(
+        &self,
+        cleanup: Arc<dyn SourceRecoverySessionCleanup>,
+    ) {
+        *self
+            .source_recovery_cleanup
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(cleanup);
+    }
+
+    pub(crate) async fn abort_source_recovery_for_shard(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+    ) -> Result<bool> {
+        let cleanup = self
+            .source_recovery_cleanup
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        match cleanup {
+            Some(cleanup) => cleanup.abort_shard(index_uuid, shard_id).await,
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn abort_source_recoveries_for_index(
+        &self,
+        index_uuid: &str,
+    ) -> Result<usize> {
+        let cleanup = self
+            .source_recovery_cleanup
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        match cleanup {
+            Some(cleanup) => cleanup.abort_index(index_uuid).await,
+            None => Ok(0),
+        }
     }
 
     /// Open or create the engine for a specific shard.
@@ -393,6 +465,19 @@ impl ShardManager {
         if shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists() {
             anyhow::bail!("shard {index}/{shard_id} has an incomplete peer recovery installation");
         }
+        let awaiting_membership_path = shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER);
+        let awaiting_membership = if awaiting_membership_path.exists() {
+            let pending: PeerRecoveryAwaitingMembership =
+                serde_json::from_slice(&std::fs::read(&awaiting_membership_path)?)?;
+            if pending.index_uuid != index_uuid {
+                anyhow::bail!(
+                    "peer recovery awaiting-membership marker UUID does not match shard metadata"
+                );
+            }
+            Some(pending)
+        } else {
+            None
+        };
 
         // Fast path: shard already open.
         {
@@ -471,7 +556,17 @@ impl ShardManager {
 
         let dyn_engine: Arc<dyn SearchEngine> = engine;
         let mut shards = self.shards.write().unwrap_or_else(|e| e.into_inner());
-        shards.insert(key, dyn_engine.clone());
+        shards.insert(key.clone(), dyn_engine.clone());
+        drop(shards);
+        if let Some(pending) = awaiting_membership {
+            self.peer_recovery_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    key,
+                    PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
+                );
+        }
         Ok(dyn_engine)
     }
 
@@ -514,13 +609,23 @@ impl ShardManager {
     }
 
     pub fn begin_peer_recovery_target(&self, index: &str, shard_id: u32) -> bool {
-        self.peer_recovery_targets
+        let key = ShardKey::new(index, shard_id);
+        let mut targets = self
+            .peer_recovery_targets
             .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(ShardKey::new(index, shard_id))
+            .unwrap_or_else(|e| e.into_inner());
+        if let std::collections::hash_map::Entry::Vacant(entry) = targets.entry(key) {
+            entry.insert(PeerRecoveryTargetState::Recovering);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn end_peer_recovery_target(&self, index: &str, shard_id: u32) {
+        if let Some(shard_dir) = self.shard_data_dir(index, shard_id) {
+            let _ = std::fs::remove_file(shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER));
+        }
         self.peer_recovery_targets
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -531,7 +636,112 @@ impl ShardManager {
         self.peer_recovery_targets
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&ShardKey::new(index, shard_id))
+            .contains_key(&ShardKey::new(index, shard_id))
+    }
+
+    pub fn rejects_live_replication(&self, index: &str, shard_id: u32) -> bool {
+        matches!(
+            self.peer_recovery_targets
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&ShardKey::new(index, shard_id)),
+            Some(PeerRecoveryTargetState::Recovering)
+        )
+    }
+
+    pub fn peer_recovery_target_states(&self) -> Vec<(ShardKey, PeerRecoveryTargetState)> {
+        self.peer_recovery_targets
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(key, state)| (key.clone(), state.clone()))
+            .collect()
+    }
+
+    pub async fn mark_peer_recovery_awaiting_membership_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        pending: PeerRecoveryAwaitingMembership,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = ShardKey::new(&index, shard_id);
+            if !matches!(
+                shard_manager
+                    .peer_recovery_targets
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&key),
+                Some(PeerRecoveryTargetState::Recovering)
+            ) {
+                anyhow::bail!(
+                    "peer recovery target is not in the recovering state before completion"
+                );
+            }
+            let shard_dir = shard_manager
+                .data_dir
+                .join(&pending.index_uuid)
+                .join(format!("shard_{shard_id}"));
+            let marker_path = shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER);
+            let temporary_path = marker_path.with_extension("tmp");
+            let bytes = serde_json::to_vec(&pending)?;
+            let mut marker = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary_path)?;
+            use std::io::Write;
+            marker.write_all(&bytes)?;
+            marker.sync_all()?;
+            std::fs::rename(&temporary_path, &marker_path)?;
+            std::fs::File::open(&shard_dir)?.sync_all()?;
+            shard_manager
+                .peer_recovery_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    key,
+                    PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
+                );
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "blocking peer recovery awaiting-membership publication failed: {error}"
+            )
+        })?
+    }
+
+    pub async fn clear_peer_recovery_awaiting_membership_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let shard_dir = shard_manager
+                .data_dir
+                .join(index_uuid)
+                .join(format!("shard_{shard_id}"));
+            match std::fs::remove_file(shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER)) {
+                Ok(()) => std::fs::File::open(&shard_dir)?.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            shard_manager
+                .peer_recovery_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&ShardKey::new(&index, shard_id));
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("blocking peer recovery awaiting-membership cleanup failed: {error}")
+        })?
     }
 
     pub async fn prepare_peer_recovery_target_blocking(
@@ -688,11 +898,21 @@ impl ShardManager {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
+            shard_manager
+                .peer_recovery_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
             let shard_dir = shard_manager
                 .data_dir
                 .join(index_uuid)
                 .join(format!("shard_{shard_id}"));
             std::fs::create_dir_all(&shard_dir)?;
+            match std::fs::remove_file(shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             let marker = std::fs::File::create(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER))?;
             marker.sync_all()?;
             std::fs::File::open(shard_dir)?.sync_all()?;
@@ -715,6 +935,8 @@ impl ShardManager {
         settings: IndexSettings,
         index_uuid: String,
     ) -> Result<Arc<dyn SearchEngine>> {
+        self.abort_source_recovery_for_shard(&index_uuid, shard_id)
+            .await?;
         let key = ShardKey::new(&index, shard_id);
 
         // Serialize with other open/reopen attempts for the same shard.
@@ -914,6 +1136,9 @@ impl ShardManager {
         index: String,
         reason: &'static str,
     ) -> Result<()> {
+        if let Some(index_uuid) = self.index_uuid(&index) {
+            self.abort_source_recoveries_for_index(&index_uuid).await?;
+        }
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             shard_manager.close_index_shards_with_reason(&index, reason)

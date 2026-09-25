@@ -85,6 +85,11 @@ pub struct Node {
 - A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
   Successful finalization clears the in-memory target gate only after the
   primary reports settled admission.
+- Completion timeout is not rejection. A caught-up target persists a
+  finalized-awaiting-membership marker, accepts live replication, and is
+  excluded from new recovery scheduling until local ordered state says
+  admitted/promoted or definitively rejected. This state is reconstructed when
+  the target restarts.
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every

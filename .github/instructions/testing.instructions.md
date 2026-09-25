@@ -89,6 +89,10 @@ cargo test -- test_name                         # Single test by name
   and live post-admission replication. Process coverage must include added
   replica recovery with concurrent acknowledged writes, recovery disabled via
   per-node config, and stale same-directory replica rejoin before failover.
+- Availability regressions must also cover dynamic-mapping reopen with an
+  active source session, completion timeout remaining non-destructive, pending
+  target restart followed by promotion, and definitive term rejection
+  restoring the destructive recovery marker.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.

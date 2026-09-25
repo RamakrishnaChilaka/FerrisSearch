@@ -1395,7 +1395,7 @@ impl InternalTransport for TransportService {
         let req = request.into_inner();
         if self
             .shard_manager
-            .is_peer_recovery_target(&req.index_name, req.shard_id)
+            .rejects_live_replication(&req.index_name, req.shard_id)
         {
             return Ok(Response::new(ReplicateDocResponse {
                 success: false,
@@ -1463,7 +1463,7 @@ impl InternalTransport for TransportService {
         let req = request.into_inner();
         if self
             .shard_manager
-            .is_peer_recovery_target(&req.index_name, req.shard_id)
+            .rejects_live_replication(&req.index_name, req.shard_id)
         {
             return Ok(Response::new(ReplicateBulkResponse {
                 success: false,
@@ -1967,9 +1967,17 @@ impl InternalTransport for TransportService {
         }
 
         let cluster_state = self.cluster_manager.get_state();
-        if !cluster_state.indices.contains_key(index_name) {
+        let Some(index_metadata) = cluster_state.indices.get(index_name) else {
             return Err(Status::not_found(format!("no such index [{index_name}]")));
-        }
+        };
+        self.shard_manager
+            .abort_source_recoveries_for_index(&index_metadata.uuid)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "failed to stop peer recovery before deleting index '{index_name}': {error}"
+                ))
+            })?;
 
         let cmd = crate::consensus::types::ClusterCommand::DeleteIndex {
             index_name: index_name.clone(),
@@ -3003,6 +3011,8 @@ pub fn create_transport_service_for_test(
             |error| panic!("create default test remote_store storage manager: {error}"),
         ),
     );
+    let peer_recovery_state = peer_recovery::new_peer_recovery_transport_state();
+    shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
     let service = TransportService {
         cluster_manager,
         shard_manager,
@@ -3016,7 +3026,7 @@ pub fn create_transport_service_for_test(
         worker_pools: crate::worker::WorkerPools::default_for_system(),
         task_manager,
         primary_activation_state: new_primary_activation_state(),
-        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        peer_recovery_state,
         join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)
@@ -3063,6 +3073,8 @@ pub fn create_transport_service_with_raft_and_storage(
     remote_store_resources: RemoteStoreTransportResources,
     local_node_id: String,
 ) -> InternalTransportServer<TransportService> {
+    let peer_recovery_state = peer_recovery::new_peer_recovery_transport_state();
+    shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
     let service = TransportService {
         cluster_manager,
         shard_manager,
@@ -3074,7 +3086,7 @@ pub fn create_transport_service_with_raft_and_storage(
         worker_pools: crate::worker::WorkerPools::default_for_system(),
         task_manager,
         primary_activation_state: new_primary_activation_state(),
-        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        peer_recovery_state,
         join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)
