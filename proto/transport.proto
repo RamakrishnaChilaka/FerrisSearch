@@ -19,6 +19,7 @@ message ShardAssignment {
     string node_id = 2;          // primary node
     repeated string replica_node_ids = 3; // replica nodes
     uint32 unassigned_replicas = 4;
+    repeated string in_sync_replica_node_ids = 5; // authoritative replicas
 }
 
 message FieldMappingEntry {

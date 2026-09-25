@@ -1,6 +1,6 @@
 # Recovery Protocol Acceptance Matrix
 
-> **Status: Proposed protocol acceptance; limited RP-1 coverage is recorded below.**
+> **Status: Proposed protocol acceptance; limited RP-1 and in-sync tracking coverage is recorded below.**
 >
 > **Date:** September 24, 2026.
 >
@@ -148,6 +148,17 @@ acknowledgement policy, or production parity.
 | F09 | Delay sequence s, deliver s+1, lag global-prefix propagation, then crash the primary at each ack boundary. | No success above an unresolved gap; promotion preserves the candidate's own durable acknowledged history even when the known global prefix is lower. | T, P |
 | F10 | Give an old eligible replica a conflicting tail and an older snapshot; crash/supersede promotion during reconciliation, including conflicting peer records where the candidate lacks a position. | No authoritative copy is destructively rolled back before committed exclusion/activation. Missing-candidate conflicts use the declared no-op/exclusion rule; every later eligible promotion preserves acknowledged history. | F, P |
 | F11 | Crash a primary with non-conflicting in-flight records spread across survivors; restart a reporting peer and deliver old-term work; after promotion, lose the new primary's shard storage while retaining metadata quorum. Also exercise genuine conflicts separately. | Durable peer fences reject delayed old-term work; new incarnation requires a fresh report. Normal tails preserve redundancy by append-only resync. Genuine-conflict fallback enforces the selected minimum and reports unavailable after loss of the only eligible copy. | T, F, P |
+
+### PR In-Sync Tracking Evidence Record (September 24, 2026)
+
+This record covers only authoritative replica eligibility, acknowledgement
+targeting, status, and fail-closed promotion on base
+`e0c6509106d64d2c51ed86858cc3dc187457d979`. It is not RP-3 certification.
+
+| ID | Implemented evidence | Current limit |
+|---|---|---|
+| F04 (partial) | `cluster::state::tests::promotion_refuses_out_of_sync_replica_even_with_higher_checkpoint`, `promotion_fallback_skips_out_of_sync_replica_in_routing_order`, and strict cluster-snapshot membership tests in `transport::server::tests`; `update_index_promotes_replica_after_primary_death` preserves an eligible promotion through Raft. | Eligibility is authoritative by node ID, but allocation IDs, primary terms, conditional routing generations, contiguous-prefix proof, and stale-primary/apply fencing are not implemented. |
+| F07 (core) | Process-backed `out_of_sync_replica_is_not_promoted_and_primary_rejoin_restores_acknowledged_data` in `tests/restart_regression.rs` reproduces the preserved 20 writes -> flush -> 5 writes -> add replica -> 1 write schedule. It verifies the assigned replica stays out of sync/`INITIALIZING`, primary loss leaves routing unpromoted and health red, GET fails instead of returning a false not-found, and all 26 exact acknowledged values return after the original primary rejoins. Replication integration tests prove out-of-sync copies receive no live writes while unreachable in-sync copies still fail writes. | There is no automatic file recovery or admission yet, so later-added replicas do not restore redundancy. Forced stale-primary recovery tooling, primary terms/fencing, conditional CAS, restarted-replica gap semantics, the asynchronous durability contract, and vector recovery remain unverified. |
 
 ## M. Membership And Acknowledgement Sets
 

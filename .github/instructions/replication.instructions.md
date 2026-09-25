@@ -36,18 +36,25 @@ pub async fn replicate_bulk(
 3. Primary indexes in Tantivy + USearch, updates local checkpoint
 4. The engine returns an operation-owned receipt; the primary calls
    `replicate_write()` / `replicate_bulk()` with those exact values
-5. gRPC sends to ALL replicas concurrently via `tokio::spawn` + `join_all` (fan-out)
+5. gRPC sends only to replicas in the Raft-authoritative
+   `ShardRoutingEntry.in_sync_replicas` set, concurrently via `tokio::spawn` +
+   `join_all` (fan-out)
 6. Each replica: applies the write using the primary-provided seq_no, persists that exact seq_no in its WAL, updates its local checkpoint, returns checkpoint
 7. Primary updates ISR tracker with returned checkpoints
 8. Primary computes global checkpoint (min of all replica checkpoints)
-9. Write acknowledged to client **only after all replicas confirm**
+9. Write acknowledged to client **only after every in-sync replica confirms**
 
-## Replica Recovery Flow
-1. Recovering replica sends `RecoverReplica` gRPC with its `local_checkpoint` (e.g., 100)
-2. Primary calls `WAL.read_from(100)` → returns all entries with seq_no > 100
-3. Primary sends entries in `RecoverReplicaResponse.operations`
-4. Replica replays operations sequentially using the seq_no carried in each recovered op, updating its local checkpoint in the same shared seq space
-5. After replay, replica is caught up and joins ISR
+## Current Recovery Limit
+- Newly allocated replicas are assigned but out of sync. They receive no live
+  writes, do not participate in acknowledgements, and are not promotable.
+- The follower lifecycle no longer invokes partial WAL-suffix recovery. A
+  retained suffix cannot reconstruct files truncated by flush, and replay onto
+  a live copy can race newer writes.
+- `RecoverReplica` still exposes bounded test/transport behavior, but no
+  production lifecycle path uses it or treats its checkpoint as admission.
+- File snapshot transfer, WAL suffix catch-up, a final write barrier, and
+  conditional in-sync admission are deferred recovery work. Until then,
+  increasing replicas does not restore durable redundancy.
 
 ## gRPC RPCs Used
 | RPC | Purpose |
@@ -57,11 +64,13 @@ pub async fn replicate_bulk(
 | `RecoverReplica` | Fetch missed operations from primary's WAL |
 
 ## Key Design Decisions
-- **Synchronous replication**: primary waits for ALL ISR replicas before ACK
+- **Synchronous replication**: primary waits for every authoritative in-sync replica before ACK
 - **Concurrent fan-out**: replicas are contacted in parallel via `tokio::spawn` + `join_all` — write latency = max(replica RTTs), not sum
-- Replicas are identified by node_id in `ShardRoutingEntry.replicas`
+- Assigned replicas are in `ShardRoutingEntry.replicas`; required
+  acknowledgement targets are in `ShardRoutingEntry.in_sync_replicas`
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
-- ISR tracking is on the primary via `ShardManager.isr_tracker`
+- `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
+  authoritative candidates but cannot grant membership.
 - Primary shard handlers (`index_doc`, `bulk_index`, `delete_doc`) MUST return `success: false` when replication fails — never swallow replication errors
 - **Primary owns seq numbers**: replica WAL entries must preserve the seq_no assigned by the primary; never allocate replica-local seq_nos for replicated or recovered operations
 - Never derive an operation's sequence from `last_seq_no()` or a checkpoint after

@@ -117,12 +117,18 @@ Runtime API-key + custom-role management. Writes use the coordinator pattern (`r
 ### Shard Display State
 The `_cat/shards` endpoint shows three possible shard states:
 - **`STARTED`**: The shard engine is open and serving docs.
-- **`INITIALIZING`**: The shard is assigned to a live node but the shard engine isn't open yet (e.g., the shard is still being reopened from disk during startup). Other shards on the same node may already be `STARTED`.
+- **`INITIALIZING`**: The shard is assigned to a live node but either is not in
+  the authoritative in-sync set or its engine is not open yet. An out-of-sync
+  replica remains `INITIALIZING` even if an empty local engine has opened.
 - **`UNASSIGNED`**: The assigned node doesn't exist in the cluster (node left or shard not yet placed).
 
 State is determined by `shard_display_state()` — a single function used for both primaries and replicas. In distributed mode (default), the state is derived from whether the assigned node reported that specific shard copy in the `collect_shard_doc_counts()` fan-out results. The fan-out map is keyed by `(node_id, index, shard_id)`, not just `(index, shard_id)`, so one started copy must not make another assigned-but-unopened copy appear `STARTED`. In `?local` mode, it checks whether `shard_manager.get_shard()` returns the engine.
 
-`INITIALIZING` is a runtime observation, NOT a cluster state change. The `ShardState` enum (`Started` / `Unassigned`) represents the Raft-managed allocation intent. The display state is the intersection of allocation intent + shard engine availability.
+Replica in-sync membership is Raft metadata; engine availability remains a
+runtime observation. The `ShardState` enum (`Started` / `Unassigned`) represents
+allocation intent. `_cat/indices` and `/_cluster/health` are yellow for any
+unassigned or assigned-out-of-sync replica and red when a primary's node is
+missing.
 
 ### Cat Endpoint Fan-Out Collection
 By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `GetShardStats` to collect real doc counts (mirrors OpenSearch behavior). `_cat/segments` also fans out to all nodes via `GetSegmentStats` and must list every segment row reported by each started shard copy in the cluster.

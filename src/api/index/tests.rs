@@ -186,6 +186,7 @@ fn make_test_metadata(primary: Option<&str>) -> IndexMetadata {
             ShardRoutingEntry {
                 primary: primary.to_string(),
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );

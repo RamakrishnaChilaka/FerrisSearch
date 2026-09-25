@@ -66,7 +66,7 @@ pub struct ShardKey {
 }
 ```
 
-## ISR Tracking (In-Sync Replica)
+## Replica Checkpoint Tracking
 ```rust
 pub struct IsrTracker {
     replicas: RwLock<HashMap<ShardKey, HashMap<String, ReplicaCheckpoint>>>,
@@ -83,15 +83,18 @@ pub struct ReplicaCheckpoint {
 - `update_replica_checkpoint(index, shard_id, replica_node_id, checkpoint)`
 - `update_replica_checkpoints(index, shard_id, checkpoints: &[(String, u64)])`
 - `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>`
-  - A replica is "in-sync" if `primary_checkpoint - replica_checkpoint <= max_lag`
+  - Returns a legacy lag-based diagnostic view only; it does not grant
+    authoritative in-sync membership
 - `replica_checkpoints(index, shard_id) -> Vec<(String, u64)>`
 - `remove_shard(index, shard_id)`, `remove_index(index)`
 
-### How ISR is Used
-1. Primary writes to WAL + engine → replicates to all replicas
+### How Checkpoint Observations Are Used
+1. Primary writes to WAL + engine → replicates to the Raft-authoritative
+   `ShardRoutingEntry.in_sync_replicas`
 2. Each replica returns its `local_checkpoint` after applying
 3. Primary calls `update_replica_checkpoints()` with returned values
-4. Leader uses `replica_checkpoints()` during shard failover to pick best replica (highest checkpoint)
+4. Leader may use `replica_checkpoints()` to rank only candidates already in
+   the authoritative in-sync set
 
 The current checkpoint values are highest-observed sequence watermarks, not
 proof that every lower sequence was applied. Do not describe ISR tracking,

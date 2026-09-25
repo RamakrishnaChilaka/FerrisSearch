@@ -210,6 +210,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "n1".into(),
                 replicas: vec!["n2".into()],
+                in_sync_replicas: vec!["n2".into()],
                 unassigned_replicas: 0,
             },
         );

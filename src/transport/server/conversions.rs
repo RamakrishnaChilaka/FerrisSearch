@@ -205,6 +205,7 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
                         node_id: routing.primary.clone(),
                         replica_node_ids: routing.replicas.clone(),
                         unassigned_replicas: routing.unassigned_replicas,
+                        in_sync_replica_node_ids: routing.in_sync_replicas.clone(),
                     })
                     .collect(),
                 mappings: idx
@@ -247,14 +248,19 @@ pub fn proto_to_cluster_state(
     for idx in &p.indices {
         let mut shard_routing = std::collections::HashMap::new();
         for sa in &idx.shards {
-            shard_routing.insert(
-                sa.shard_id,
-                crate::cluster::state::ShardRoutingEntry {
-                    primary: sa.node_id.clone(),
-                    replicas: sa.replica_node_ids.clone(),
-                    unassigned_replicas: sa.unassigned_replicas,
-                },
-            );
+            let routing = crate::cluster::state::ShardRoutingEntry {
+                primary: sa.node_id.clone(),
+                replicas: sa.replica_node_ids.clone(),
+                in_sync_replicas: sa.in_sync_replica_node_ids.clone(),
+                unassigned_replicas: sa.unassigned_replicas,
+            };
+            routing.validate_in_sync_replicas().map_err(|reason| {
+                Status::invalid_argument(format!(
+                    "invalid in-sync replica membership for index '{}' shard {}: {}",
+                    idx.name, sa.shard_id, reason
+                ))
+            })?;
+            shard_routing.insert(sa.shard_id, routing);
         }
         let mut mappings = std::collections::HashMap::new();
         for mapping in &idx.mappings {

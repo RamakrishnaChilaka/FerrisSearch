@@ -15,7 +15,7 @@ use crate::shard::ShardManager;
 use crate::transport::client::TransportClient;
 use crate::wal::TranslogDurability;
 
-use lifecycle::{apply_recovery_ops, remote_seed_hosts, try_join_cluster};
+use lifecycle::{remote_seed_hosts, try_join_cluster};
 use reconciliation::{
     build_guarded_startup_shards, cleanup_orphaned_data_if_authoritative_blocking,
     open_local_assigned_shards_blocking, should_retry_cluster_join, snapshot_uuid_dirs,
@@ -581,7 +581,7 @@ impl Node {
                             // ── Shard failover: promote replicas for orphaned primaries ──
                             // Before removing the node, handle shard routing updates:
                             // 1. Find all indices where the dead node hosts a primary or replica
-                            // 2. For orphaned primaries: pick best replica (highest checkpoint) and promote
+                            // 2. For orphaned primaries: rank only authoritative in-sync replicas
                             // 3. For lost replicas: increment unassigned count for re-allocation
                             for idx_meta in fresh_state.indices.values() {
                                 let mut updated = idx_meta.clone();
@@ -593,32 +593,36 @@ impl Node {
                                 let mut changed = lost_replica_slot;
 
                                 for shard_id in &orphaned_primaries {
-                                    // Pick the best replica from ISR (highest checkpoint)
+                                    // Prefer the highest observed checkpoint, but only
+                                    // among Raft-authoritative in-sync candidates.
                                     let cps = manager_clone
                                         .isr_tracker
                                         .replica_checkpoints(&idx_meta.name, *shard_id);
 
-                                    let promoted = if let Some((best_node, best_cp)) = cps
-                                        .iter()
-                                        .filter(|(nid, _)| nid != dead)
-                                        .max_by_key(|(_, cp)| *cp)
+                                    let promoted = if let Some(candidate) =
+                                        updated.select_promotion_candidate(*shard_id, &cps)
                                     {
-                                        tracing::info!(
-                                            "Promoting replica '{}' (checkpoint={}) to primary for {}/shard_{}",
-                                            best_node,
-                                            best_cp,
-                                            idx_meta.name,
-                                            shard_id
-                                        );
-                                        updated.promote_replica_to(*shard_id, best_node)
+                                        if let Some((_, checkpoint)) =
+                                            cps.iter().find(|(node_id, _)| node_id == &candidate)
+                                        {
+                                            tracing::info!(
+                                                "Promoting in-sync replica '{}' (checkpoint={}) to primary for {}/shard_{}",
+                                                candidate,
+                                                checkpoint,
+                                                idx_meta.name,
+                                                shard_id
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                "Promoting first in-sync replica '{}' for {}/shard_{} (no checkpoint observation)",
+                                                candidate,
+                                                idx_meta.name,
+                                                shard_id
+                                            );
+                                        }
+                                        updated.promote_replica_to(*shard_id, &candidate)
                                     } else {
-                                        // No ISR data — fall back to first available replica
-                                        tracing::info!(
-                                            "Promoting first available replica for {}/shard_{} (no ISR data)",
-                                            idx_meta.name,
-                                            shard_id
-                                        );
-                                        updated.promote_replica(*shard_id)
+                                        false
                                     };
 
                                     if promoted {
@@ -631,9 +635,10 @@ impl Node {
                                         }
                                     } else {
                                         tracing::error!(
-                                            "No replicas available to promote for {}/shard_{} — shard is unavailable!",
+                                            "No in-sync copy survives for {}/shard_{}; refusing promotion and leaving primary '{}' unchanged",
                                             idx_meta.name,
-                                            shard_id
+                                            shard_id,
+                                            updated.shard_routing[shard_id].primary
                                         );
                                     }
                                 }
@@ -917,65 +922,6 @@ impl Node {
                                         join_pre_existing,
                                     )
                                     .await;
-                            }
-                        }
-
-                        // ── Replica recovery ────────────────────────
-                        // Check if we host any replica shards that need translog-based recovery.
-                        // For each shard where we are a replica, compare our local checkpoint
-                        // against the primary and request missing operations if behind.
-                        for idx_meta in state.indices.values() {
-                            for (shard_id, routing) in &idx_meta.shard_routing {
-                                // Only process shards where we are a replica
-                                if !routing.replicas.contains(&local_id) {
-                                    continue;
-                                }
-                                let primary_node = match state.nodes.get(&routing.primary) {
-                                    Some(n) => n,
-                                    None => continue,
-                                };
-
-                                // Check if we have the shard open and get its checkpoint
-                                let engine =
-                                    match manager_clone.get_shard(&idx_meta.name, *shard_id) {
-                                        Some(e) => e,
-                                        None => continue, // shard not open yet
-                                    };
-
-                                let local_cp = engine.local_checkpoint();
-                                if local_cp == 0 {
-                                    // Never received any data — request full recovery
-                                    match client
-                                        .request_recovery(
-                                            primary_node,
-                                            &idx_meta.name,
-                                            *shard_id,
-                                            0,
-                                        )
-                                        .await
-                                    {
-                                        Ok(result) => {
-                                            if !result.operations.is_empty() {
-                                                apply_recovery_ops(&engine, &result.operations);
-                                                tracing::info!(
-                                                    "Replica recovery for {}/shard_{}: applied {} ops (primary at {})",
-                                                    idx_meta.name,
-                                                    shard_id,
-                                                    result.ops_replayed,
-                                                    result.primary_checkpoint
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Recovery request for {}/shard_{} failed: {}",
-                                                idx_meta.name,
-                                                shard_id,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
                             }
                         }
                     }

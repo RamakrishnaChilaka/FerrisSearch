@@ -176,6 +176,7 @@ async fn auto_create_index(
         crate::cluster::state::ShardRoutingEntry {
             primary: state.local_node_id.clone(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );

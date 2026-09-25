@@ -659,8 +659,10 @@ impl TransportClient {
         }
     }
 
-    /// Request recovery from the primary: send our local checkpoint,
-    /// primary returns translog entries for replay.
+    /// Request a retained WAL suffix from the primary.
+    ///
+    /// The node lifecycle does not use this partial response for replica
+    /// recovery or in-sync admission; complete file recovery is still pending.
     pub async fn request_recovery(
         &self,
         primary_node: &NodeInfo,

@@ -41,6 +41,7 @@ fn make_index(name: &str) -> IndexMetadata {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -658,6 +659,11 @@ async fn update_index_promotes_replica_after_primary_death() {
         "node-B should remain as replica"
     );
     assert_eq!(
+        state.indices["promo"].shard_routing[&0].in_sync_replicas,
+        vec!["node-B".to_string()],
+        "the promoted copy must leave the replica in-sync set"
+    );
+    assert_eq!(
         state.indices["promo"].shard_routing[&0].unassigned_replicas, 1,
         "one replica slot lost (was node-A's promotion + dead node)"
     );
@@ -699,6 +705,12 @@ async fn update_index_removes_dead_replica_and_marks_unassigned() {
             .replicas
             .is_empty(),
         "node-B should be removed"
+    );
+    assert!(
+        state.indices["rdeath"].shard_routing[&0]
+            .in_sync_replicas
+            .is_empty(),
+        "dead replicas must leave the authoritative set"
     );
     assert_eq!(
         state.indices["rdeath"].shard_routing[&0].unassigned_replicas, 1,

@@ -1,15 +1,15 @@
 //! Primary-replica replication logic.
 //!
 //! After a primary shard writes to its local WAL + engine, it replicates
-//! the operation to all replica shards via gRPC. Replication is synchronous
+//! the operation to all authoritative in-sync replica shards via gRPC. Replication is synchronous
 //! (write is only acknowledged after all in-sync replicas confirm).
 
 use crate::cluster::state::ClusterState;
 use crate::transport::TransportClient;
 use tracing::error;
 
-/// Replicate a single document write to all replica nodes for a shard.
-/// Returns Ok(replica_checkpoints) if all replicas acknowledged, Err with details otherwise.
+/// Replicate a single document write to all in-sync replica nodes for a shard.
+/// Returns Ok(replica_checkpoints) if all in-sync replicas acknowledged, Err otherwise.
 /// The returned Vec contains (node_id, local_checkpoint) for each replica.
 /// Replication is performed concurrently (fan-out) — latency = max(replica RTTs).
 #[allow(clippy::too_many_arguments)]
@@ -28,12 +28,12 @@ pub async fn replicate_write(
         None => return Ok(vec![]), // no index metadata, nothing to replicate
     };
 
-    let replica_node_ids = metadata.replica_nodes(shard_id);
+    let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
     if replica_node_ids.is_empty() {
         return Ok(vec![]);
     }
 
-    // Build futures for concurrent replication to all replicas
+    // Build futures for concurrent replication to all in-sync replicas
     let mut futures = Vec::with_capacity(replica_node_ids.len());
 
     for replica_node_id in &replica_node_ids {
@@ -98,7 +98,7 @@ pub async fn replicate_write(
     }
 }
 
-/// Replicate a bulk set of writes to all replica nodes for a shard.
+/// Replicate a bulk set of writes to all in-sync replica nodes for a shard.
 /// Returns Ok(replica_checkpoints) with (node_id, local_checkpoint) for each replica.
 /// Replication is performed concurrently (fan-out) — latency = max(replica RTTs).
 pub async fn replicate_bulk(
@@ -114,14 +114,14 @@ pub async fn replicate_bulk(
         None => return Ok(vec![]),
     };
 
-    let replica_node_ids = metadata.replica_nodes(shard_id);
+    let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
     if replica_node_ids.is_empty() {
         return Ok(vec![]);
     }
 
     let docs_owned: Vec<(String, serde_json::Value)> = docs.to_vec();
 
-    // Build futures for concurrent replication to all replicas
+    // Build futures for concurrent replication to all in-sync replicas
     let mut futures = Vec::with_capacity(replica_node_ids.len());
 
     for replica_node_id in &replica_node_ids {
@@ -213,12 +213,23 @@ mod tests {
     }
 
     fn add_index_with_routing(cs: &mut ClusterState, name: &str, replicas: Vec<String>) {
+        let in_sync_replicas = replicas.clone();
+        add_index_with_membership(cs, name, replicas, in_sync_replicas);
+    }
+
+    fn add_index_with_membership(
+        cs: &mut ClusterState,
+        name: &str,
+        replicas: Vec<String>,
+        in_sync_replicas: Vec<String>,
+    ) {
         let mut shard_routing = HashMap::new();
         shard_routing.insert(
             0,
             ShardRoutingEntry {
                 primary: "node-1".into(),
                 replicas,
+                in_sync_replicas,
                 unassigned_replicas: 0,
             },
         );
@@ -252,6 +263,26 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_ignores_unreachable_out_of_sync_replica() {
+        let client = TransportClient::new();
+        let mut cs = make_cluster_state_with_nodes();
+        add_index_with_membership(&mut cs, "test-idx", vec!["node-2".into()], vec![]);
+        let checkpoints = replicate_write(
+            &client,
+            &cs,
+            "test-idx",
+            0,
+            "doc1",
+            &serde_json::json!({"field": "value"}),
+            "index",
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(checkpoints.is_empty());
     }
 
     #[tokio::test]
@@ -379,6 +410,18 @@ mod tests {
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
         let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bulk_ignores_unreachable_out_of_sync_replica() {
+        let client = TransportClient::new();
+        let mut cs = make_cluster_state_with_nodes();
+        add_index_with_membership(&mut cs, "test-idx", vec!["node-2".into()], vec![]);
+        let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
+        let checkpoints = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0)
+            .await
+            .unwrap();
+        assert!(checkpoints.is_empty());
     }
 
     #[tokio::test]

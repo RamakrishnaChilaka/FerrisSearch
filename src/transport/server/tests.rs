@@ -51,6 +51,7 @@ fn make_full_cluster_state() -> DomainClusterState {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec!["node-2".into()],
+            in_sync_replicas: vec!["node-2".into()],
             unassigned_replicas: 0,
         },
     );
@@ -59,6 +60,7 @@ fn make_full_cluster_state() -> DomainClusterState {
         ShardRoutingEntry {
             primary: "node-2".into(),
             replicas: vec!["node-1".into()],
+            in_sync_replicas: vec!["node-1".into()],
             unassigned_replicas: 1,
         },
     );
@@ -147,11 +149,82 @@ fn roundtrip_preserves_shard_routing() {
     let shard0 = idx.shard_routing.get(&0).unwrap();
     assert_eq!(shard0.primary, "node-1");
     assert_eq!(shard0.replicas, vec!["node-2".to_string()]);
+    assert_eq!(shard0.in_sync_replicas, vec!["node-2".to_string()]);
 
     let shard1 = idx.shard_routing.get(&1).unwrap();
     assert_eq!(shard1.primary, "node-2");
     assert_eq!(shard1.replicas, vec!["node-1".to_string()]);
+    assert_eq!(shard1.in_sync_replicas, vec!["node-1".to_string()]);
     assert_eq!(shard1.unassigned_replicas, 1);
+}
+
+fn shard_assignment_mut(
+    state: &mut crate::transport::proto::ClusterState,
+    shard_id: u32,
+) -> &mut crate::transport::proto::ShardAssignment {
+    state.indices[0]
+        .shards
+        .iter_mut()
+        .find(|assignment| assignment.shard_id == shard_id)
+        .unwrap()
+}
+
+#[test]
+fn cluster_state_snapshot_without_in_sync_membership_fails_closed() {
+    let original = make_full_cluster_state();
+    let mut proto = cluster_state_to_proto(&original);
+    shard_assignment_mut(&mut proto, 0)
+        .in_sync_replica_node_ids
+        .clear();
+
+    let restored = proto_to_cluster_state(&proto).unwrap();
+    assert!(
+        restored.indices["products"].shard_routing[&0]
+            .in_sync_replicas
+            .is_empty()
+    );
+}
+
+#[test]
+fn cluster_state_snapshot_rejects_in_sync_primary() {
+    let original = make_full_cluster_state();
+    let mut proto = cluster_state_to_proto(&original);
+    shard_assignment_mut(&mut proto, 0).in_sync_replica_node_ids = vec!["node-1".into()];
+
+    let error = proto_to_cluster_state(&proto).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("cannot also be an in-sync replica")
+    );
+}
+
+#[test]
+fn cluster_state_snapshot_rejects_unassigned_in_sync_node() {
+    let original = make_full_cluster_state();
+    let mut proto = cluster_state_to_proto(&original);
+    shard_assignment_mut(&mut proto, 0).in_sync_replica_node_ids = vec!["node-3".into()];
+
+    let error = proto_to_cluster_state(&proto).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("is not present in the replica assignments")
+    );
+}
+
+#[test]
+fn cluster_state_snapshot_rejects_duplicate_in_sync_node() {
+    let original = make_full_cluster_state();
+    let mut proto = cluster_state_to_proto(&original);
+    shard_assignment_mut(&mut proto, 0).in_sync_replica_node_ids =
+        vec!["node-2".into(), "node-2".into()];
+
+    let error = proto_to_cluster_state(&proto).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("duplicate in-sync replica"));
 }
 
 #[test]
@@ -191,6 +264,7 @@ fn roundtrip_index_with_no_replicas() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -372,6 +446,7 @@ async fn get_or_open_search_shard_reopens_persisted_shard_via_metadata() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -431,6 +506,7 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -683,6 +759,7 @@ async fn maintenance_skips_orphaned_shards() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -691,6 +768,7 @@ async fn maintenance_skips_orphaned_shards() {
         ShardRoutingEntry {
             primary: "node-2".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -699,6 +777,7 @@ async fn maintenance_skips_orphaned_shards() {
         ShardRoutingEntry {
             primary: "node-3".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -753,6 +832,7 @@ async fn maintenance_includes_replica_shards() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -761,6 +841,7 @@ async fn maintenance_includes_replica_shards() {
         ShardRoutingEntry {
             primary: "node-2".into(),
             replicas: vec!["node-1".into()],
+            in_sync_replicas: vec!["node-1".into()],
             unassigned_replicas: 0,
         },
     );
@@ -819,6 +900,7 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -914,6 +996,7 @@ async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
                 ShardRoutingEntry {
                     primary: "node-1".into(),
                     replicas: vec![],
+                    in_sync_replicas: vec![],
                     unassigned_replicas: 0,
                 },
             )]),
@@ -1006,6 +1089,7 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1105,6 +1189,7 @@ async fn force_merge_task_counts_missing_assigned_shard_as_failure() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1177,6 +1262,7 @@ async fn flush_index_refuses_to_create_missing_uuid_dir() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1342,6 +1428,7 @@ fn roundtrip_preserves_dynamic_mapping_true() {
         ShardRoutingEntry {
             primary: "n1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1374,6 +1461,7 @@ fn roundtrip_preserves_dynamic_mapping_strict() {
         ShardRoutingEntry {
             primary: "n1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1406,6 +1494,7 @@ fn roundtrip_empty_dynamic_defaults_to_false() {
         ShardRoutingEntry {
             primary: "n1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );

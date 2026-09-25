@@ -59,6 +59,7 @@ fn make_sql_metadata(index: &str) -> IndexMetadata {
         ShardRoutingEntry {
             primary: "node-1".to_string(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1155,6 +1156,7 @@ async fn group_by_text_field_returns_error() {
         ShardRoutingEntry {
             primary: "node-1".to_string(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1377,6 +1379,7 @@ fn remote_count_targets_groups_shards_per_node() {
         ShardRoutingEntry {
             primary: "node-2".to_string(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1385,6 +1388,7 @@ fn remote_count_targets_groups_shards_per_node() {
         ShardRoutingEntry {
             primary: "node-2".to_string(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1393,6 +1397,7 @@ fn remote_count_targets_groups_shards_per_node() {
         ShardRoutingEntry {
             primary: "node-3".to_string(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );

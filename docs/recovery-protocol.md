@@ -61,6 +61,14 @@ changes. The [restart regression](../tests/restart_regression.rs) restarts the
 cluster and checks data preservation. These do not establish a complete
 partition, stale-primary, divergent-history, and interrupted-recovery contract.
 
+> **Implementation note — September 24, 2026:** the first in-sync tracking
+> package now stores replica eligibility in Raft routing metadata, targets live
+> writes only to that set, refuses promotion when no in-sync copy survives, and
+> removes the follower's unsafe partial WAL-suffix replay. Later-added replicas
+> remain out of sync until file recovery and conditional admission are
+> implemented. See the
+> [PR in-sync tracking evidence record](recovery-acceptance-matrix.md#pr-in-sync-tracking-evidence-record-september-24-2026).
+
 ## 3. Reference Protocols And Intentional Differences
 
 | Reference | Relevant property | FerrisSearch target |

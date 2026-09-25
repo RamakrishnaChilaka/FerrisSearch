@@ -166,18 +166,22 @@ pub async fn cat_nodes(State(state): State<AppState>, params: Query<CatParams>) 
 
 /// Determine the display state for a shard assigned to `node_id`.
 /// - `UNASSIGNED` — the assigned node doesn't exist in the cluster
-/// - `INITIALIZING` — the node exists but the engine isn't open yet (shard not in doc_counts)
+/// - `INITIALIZING` — the copy is out of sync or its engine isn't open yet
 /// - `STARTED` — the node exists and the engine is serving docs
 fn shard_display_state(
     node_id: &str,
     index: &str,
     shard_id: u32,
+    in_sync: bool,
     cs: &crate::cluster::state::ClusterState,
     doc_counts: &Option<ShardCopyDocCounts>,
     state: &AppState,
 ) -> &'static str {
     if !cs.nodes.contains_key(node_id) {
         return "UNASSIGNED";
+    }
+    if !in_sync {
+        return "INITIALIZING";
     }
     match doc_counts {
         Some(m) => {
@@ -200,6 +204,26 @@ fn shard_display_state(
             }
         }
     }
+}
+
+fn index_health(
+    metadata: &crate::cluster::state::IndexMetadata,
+    data_node_ids: &std::collections::HashSet<&String>,
+) -> &'static str {
+    for routing in metadata.shard_routing.values() {
+        if !data_node_ids.contains(&routing.primary) {
+            return "red";
+        }
+        if routing.unassigned_replicas > 0 {
+            return "yellow";
+        }
+        for replica in &routing.replicas {
+            if !data_node_ids.contains(replica) || !routing.is_replica_in_sync(replica) {
+                return "yellow";
+            }
+        }
+    }
+    "green"
 }
 
 /// GET /_cat/shards — tabular shard listing
@@ -247,6 +271,7 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
                 &routing.primary,
                 idx_name,
                 shard_id,
+                true,
                 &cs,
                 &doc_counts,
                 &state,
@@ -275,6 +300,7 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
                     replica_node_id,
                     idx_name,
                     shard_id,
+                    routing.is_replica_in_sync(replica_node_id),
                     &cs,
                     &doc_counts,
                     &state,
@@ -318,29 +344,12 @@ pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>
         Some(collect_shard_doc_counts(&state).await)
     };
 
-    let health_fn = |idx_name: &str| -> &'static str {
-        let meta = match cs.indices.get(idx_name) {
-            Some(m) => m,
-            None => return "red",
-        };
-        let data_node_ids: std::collections::HashSet<&String> = cs
-            .nodes
-            .values()
-            .filter(|n| n.roles.contains(&NodeRole::Data))
-            .map(|n| &n.id)
-            .collect();
-        for routing in meta.shard_routing.values() {
-            if !data_node_ids.contains(&routing.primary) {
-                return "yellow";
-            }
-            for replica in &routing.replicas {
-                if !data_node_ids.contains(replica) {
-                    return "yellow";
-                }
-            }
-        }
-        "green"
-    };
+    let data_node_ids: std::collections::HashSet<&String> = cs
+        .nodes
+        .values()
+        .filter(|n| n.roles.contains(&NodeRole::Data))
+        .map(|n| &n.id)
+        .collect();
 
     let mut out = String::new();
     if wants_headers(&params) {
@@ -361,7 +370,7 @@ pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>
         }
 
         let meta = &cs.indices[idx_name];
-        let health = health_fn(idx_name);
+        let health = index_health(meta, &data_node_ids);
 
         let total_docs: u64 = match &doc_counts {
             Some(m) => (0..meta.number_of_shards)
@@ -590,6 +599,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-1".into(),
                 replicas: vec!["node-2".into()],
+                in_sync_replicas: vec!["node-2".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -663,6 +673,7 @@ mod tests {
                 "node-1",
                 "idx",
                 0,
+                true,
                 &cluster_state,
                 &Some(doc_counts.clone()),
                 &app_state,
@@ -674,12 +685,119 @@ mod tests {
                 "node-2",
                 "idx",
                 0,
+                true,
                 &cluster_state,
                 &Some(doc_counts),
                 &app_state,
             ),
             "INITIALIZING"
         );
+    }
+
+    #[tokio::test]
+    async fn shard_display_state_keeps_out_of_sync_copy_initializing_even_when_open() {
+        let (_dir, app_state) = make_app_state("node-1").await;
+        let cluster_state = make_cluster_state();
+        let mut doc_counts = ShardCopyDocCounts::new();
+        doc_counts.insert(("node-2".into(), "idx".into(), 0), 12);
+
+        assert_eq!(
+            shard_display_state(
+                "node-2",
+                "idx",
+                0,
+                false,
+                &cluster_state,
+                &Some(doc_counts),
+                &app_state,
+            ),
+            "INITIALIZING"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_display_state_reports_missing_assigned_node_as_unassigned() {
+        let (_dir, app_state) = make_app_state("node-1").await;
+        let cluster_state = make_cluster_state();
+
+        assert_eq!(
+            shard_display_state(
+                "missing-node",
+                "idx",
+                0,
+                true,
+                &cluster_state,
+                &Some(ShardCopyDocCounts::new()),
+                &app_state,
+            ),
+            "UNASSIGNED"
+        );
+    }
+
+    #[tokio::test]
+    async fn cat_shards_marks_out_of_sync_and_unassigned_replica_rows() {
+        let (_dir, app_state) = make_app_state("node-1").await;
+        let mut cluster_state = make_cluster_state();
+        let routing = cluster_state
+            .indices
+            .get_mut("idx")
+            .unwrap()
+            .shard_routing
+            .get_mut(&0)
+            .unwrap();
+        routing.in_sync_replicas.clear();
+        routing.unassigned_replicas = 1;
+        app_state.cluster_manager.update_state(cluster_state);
+        app_state.shard_manager.open_shard("idx", 0).unwrap();
+
+        let response = cat_shards(
+            State(app_state),
+            Query(CatParams {
+                v: Some(String::new()),
+                local: Some(String::new()),
+            }),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let states = text
+            .lines()
+            .skip(1)
+            .map(|line| line.split_whitespace().nth(3).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(states, ["STARTED", "INITIALIZING", "UNASSIGNED"]);
+    }
+
+    #[test]
+    fn cat_index_health_distinguishes_in_sync_out_of_sync_unassigned_and_missing_primary() {
+        let state = make_cluster_state();
+        let data_node_ids = state.nodes.keys().collect();
+        let metadata = state.indices["idx"].clone();
+        assert_eq!(index_health(&metadata, &data_node_ids), "green");
+
+        let mut out_of_sync = metadata.clone();
+        out_of_sync
+            .shard_routing
+            .get_mut(&0)
+            .unwrap()
+            .in_sync_replicas
+            .clear();
+        assert_eq!(index_health(&out_of_sync, &data_node_ids), "yellow");
+
+        let mut unassigned = metadata.clone();
+        unassigned
+            .shard_routing
+            .get_mut(&0)
+            .unwrap()
+            .unassigned_replicas = 1;
+        assert_eq!(index_health(&unassigned, &data_node_ids), "yellow");
+
+        let mut missing_primary = metadata;
+        missing_primary.shard_routing.get_mut(&0).unwrap().primary = "missing-node".into();
+        assert_eq!(index_health(&missing_primary, &data_node_ids), "red");
     }
 
     #[tokio::test]
@@ -706,6 +824,7 @@ mod tests {
                     ShardRoutingEntry {
                         primary: "node-1".into(),
                         replicas: vec![],
+                        in_sync_replicas: vec![],
                         unassigned_replicas: 0,
                     },
                 ),
@@ -714,6 +833,7 @@ mod tests {
                     ShardRoutingEntry {
                         primary: "node-2".into(),
                         replicas: vec![],
+                        in_sync_replicas: vec![],
                         unassigned_replicas: 0,
                     },
                 ),

@@ -46,14 +46,16 @@ pub struct ReplicaCheckpoint {
     pub last_updated: std::time::Instant,
 }
 
-/// Tracks in-sync replicas for all primary shards on this node.
-/// A replica is considered "in-sync" if its checkpoint is within
-/// `max_lag` of the primary's local checkpoint.
+/// Tracks replica checkpoint observations for primary shards on this node.
+///
+/// Raft routing metadata owns authoritative in-sync membership. The lag-based
+/// view here is diagnostic only and cannot grant acknowledgement or promotion
+/// eligibility.
 pub struct IsrTracker {
     /// Per-shard, per-replica checkpoint tracking.
     /// Key: ShardKey, Value: HashMap<replica_node_id, ReplicaCheckpoint>
     replicas: RwLock<HashMap<ShardKey, HashMap<String, ReplicaCheckpoint>>>,
-    /// Maximum allowed seq_no lag for a replica to be considered in-sync.
+    /// Maximum allowed seq_no lag for the diagnostic lag-eligible view.
     max_lag: u64,
 }
 
@@ -107,8 +109,8 @@ impl IsrTracker {
         }
     }
 
-    /// Get the set of in-sync replica node IDs for a shard.
-    /// A replica is in-sync if its checkpoint is within `max_lag` of the primary checkpoint.
+    /// Get replica node IDs whose observed checkpoint is within `max_lag`.
+    /// This is not the authoritative in-sync set.
     pub fn in_sync_replicas(
         &self,
         index: &str,

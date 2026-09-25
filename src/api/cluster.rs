@@ -15,8 +15,8 @@ pub struct ClusterHealth {
 }
 
 /// Compute cluster health status based on shard allocation.
-/// - "green": all primary and replica shards are assigned
-/// - "yellow": all primaries assigned, but some replicas are unassigned
+/// - "green": all primaries exist and all desired replicas are assigned and in sync
+/// - "yellow": all primaries exist, but some replicas are unassigned or out of sync
 /// - "red": no data nodes, or a primary shard is assigned to a missing node
 fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
     let data_node_ids: std::collections::HashSet<&String> = cs
@@ -46,9 +46,9 @@ fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
             if !data_node_ids.contains(&routing.primary) {
                 primary_missing = true;
             }
-            // Replica assigned to a node that no longer exists → unassigned
+            // Missing or out-of-sync replicas are unavailable copies.
             for replica in &routing.replicas {
-                if !data_node_ids.contains(replica) {
+                if !data_node_ids.contains(replica) || !routing.is_replica_in_sync(replica) {
                     total_unassigned += 1;
                 }
             }
@@ -183,4 +183,77 @@ pub async fn transfer_master(
             "message": format!("Leadership transfer initiated to node '{}'", req.node_id)
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::state::{
+        IndexMetadata, IndexSettings, IndexUuid, NodeInfo, NodeRole, ShardRoutingEntry,
+    };
+    use std::collections::HashMap;
+
+    fn health_state(routing: ShardRoutingEntry) -> ClusterState {
+        let mut state = ClusterState::new("health".into());
+        for node_id in ["node-1", "node-2"] {
+            state.add_node(NodeInfo {
+                id: node_id.into(),
+                name: node_id.into(),
+                host: "127.0.0.1".into(),
+                transport_port: 9300,
+                http_port: 9200,
+                roles: vec![NodeRole::Data],
+                raft_node_id: 0,
+            });
+        }
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("health-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(0, routing)]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        });
+        state
+    }
+
+    fn in_sync_routing() -> ShardRoutingEntry {
+        ShardRoutingEntry {
+            primary: "node-1".into(),
+            replicas: vec!["node-2".into()],
+            in_sync_replicas: vec!["node-2".into()],
+            unassigned_replicas: 0,
+        }
+    }
+
+    #[test]
+    fn health_is_green_when_all_assigned_replicas_are_in_sync() {
+        assert_eq!(
+            compute_health_status(&health_state(in_sync_routing())),
+            ("green", 0)
+        );
+    }
+
+    #[test]
+    fn health_is_yellow_and_counts_assigned_out_of_sync_replica() {
+        let mut routing = in_sync_routing();
+        routing.in_sync_replicas.clear();
+        assert_eq!(compute_health_status(&health_state(routing)), ("yellow", 1));
+    }
+
+    #[test]
+    fn health_is_yellow_and_counts_unassigned_replica_slot() {
+        let mut routing = in_sync_routing();
+        routing.unassigned_replicas = 1;
+        assert_eq!(compute_health_status(&health_state(routing)), ("yellow", 1));
+    }
+
+    #[test]
+    fn health_is_red_when_primary_node_is_missing() {
+        let mut routing = in_sync_routing();
+        routing.primary = "missing-node".into();
+        assert_eq!(compute_health_status(&health_state(routing)), ("red", 0));
+    }
 }

@@ -232,6 +232,7 @@ fn setup_single_node_cluster_state(cm: &ClusterManager, index_name: &str) {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -269,6 +270,7 @@ fn setup_multi_shard_single_node_cluster_state(cm: &ClusterManager, index_name: 
             ShardRoutingEntry {
                 primary: "node-1".into(),
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -292,6 +294,22 @@ fn setup_two_node_cluster_state(
     replica_cm: &ClusterManager,
     index_name: &str,
     replica_port: u16,
+) {
+    setup_two_node_cluster_state_with_membership(
+        primary_cm,
+        replica_cm,
+        index_name,
+        replica_port,
+        true,
+    );
+}
+
+fn setup_two_node_cluster_state_with_membership(
+    primary_cm: &ClusterManager,
+    replica_cm: &ClusterManager,
+    index_name: &str,
+    replica_port: u16,
+    replica_in_sync: bool,
 ) {
     let mut cs = primary_cm.get_state();
     cs.add_node(DomainNodeInfo {
@@ -319,6 +337,10 @@ fn setup_two_node_cluster_state(
         ShardRoutingEntry {
             primary: "primary-node".into(),
             replicas: vec!["replica-node".into()],
+            in_sync_replicas: replica_in_sync
+                .then(|| "replica-node".to_string())
+                .into_iter()
+                .collect(),
             unassigned_replicas: 0,
         },
     );
@@ -816,6 +838,119 @@ async fn primary_write_replicates_to_replica_node() {
 }
 
 #[tokio::test]
+async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("out-of-sync".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("out-of-sync".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    setup_two_node_cluster_state_with_membership(
+        &primary_cm,
+        &replica_cm,
+        "out-of-sync-idx",
+        replica_addr.port(),
+        false,
+    );
+
+    let primary_addr = start_grpc_server(primary_cm.clone(), primary_sm).await;
+    let mut client = connect_client(primary_addr).await;
+
+    let first = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "out-of-sync-idx".into(),
+            shard_id: 0,
+            doc_id: "not-replicated".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        first.success,
+        "out-of-sync replica blocked write: {}",
+        first.error
+    );
+    assert!(
+        replica_sm.get_shard("out-of-sync-idx", 0).is_none(),
+        "an out-of-sync replica must not receive or open for live replication"
+    );
+
+    let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unreachable_port = unused_listener.local_addr().unwrap().port();
+    drop(unused_listener);
+    let mut state = primary_cm.get_state();
+    state.nodes.get_mut("replica-node").unwrap().transport_port = unreachable_port;
+    primary_cm.update_state(state);
+
+    let second = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "out-of-sync-idx".into(),
+            shard_id: 0,
+            doc_id: "still-acknowledged".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 2})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        second.success,
+        "unreachable out-of-sync replica blocked write: {}",
+        second.error
+    );
+    assert!(replica_sm.get_shard("out-of-sync-idx", 0).is_none());
+}
+
+#[tokio::test]
+async fn unreachable_in_sync_replica_still_fails_live_write() {
+    let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unreachable_port = unused_listener.local_addr().unwrap().port();
+    drop(unused_listener);
+
+    let replica_cm = Arc::new(ClusterManager::new("required-replica".into()));
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("required-replica".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &replica_cm,
+        "required-replica-idx",
+        unreachable_port,
+    );
+
+    let primary_addr = start_grpc_server(primary_cm, primary_sm).await;
+    let mut client = connect_client(primary_addr).await;
+    let response = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "required-replica-idx".into(),
+            shard_id: 0,
+            doc_id: "must-fail".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!response.success);
+    assert!(
+        response.error.contains("Replication failed"),
+        "{}",
+        response.error
+    );
+}
+
+#[tokio::test]
 async fn primary_delete_replicates_to_replica_node() {
     let replica_dir = tempfile::tempdir().unwrap();
     let replica_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
@@ -1036,6 +1171,7 @@ async fn search_shard_reopens_persisted_shard_after_restart() {
             ShardRoutingEntry {
                 primary: "node-1".into(),
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -1164,6 +1300,7 @@ async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
             ShardRoutingEntry {
                 primary: "node-1".into(),
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -1251,6 +1388,7 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1347,6 +1485,7 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
             ShardRoutingEntry {
                 primary: "node-1".into(),
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -1449,6 +1588,7 @@ async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1575,6 +1715,7 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );

@@ -50,9 +50,41 @@ pub struct ShardCopy {
 pub struct ShardRoutingEntry {
     pub primary: NodeId,
     pub replicas: Vec<NodeId>,
+    /// Replica copies that are authoritative for acknowledgements and promotion.
+    /// The primary is implicitly authoritative and must not appear here.
+    #[serde(default)]
+    pub in_sync_replicas: Vec<NodeId>,
     /// Replica copies that couldn't be assigned (not enough distinct nodes).
     #[serde(default)]
     pub unassigned_replicas: u32,
+}
+
+impl ShardRoutingEntry {
+    /// Validate authoritative replica membership independently of assignment.
+    pub fn validate_in_sync_replicas(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for node_id in &self.in_sync_replicas {
+            if node_id == &self.primary {
+                return Err(format!(
+                    "primary node '{}' cannot also be an in-sync replica",
+                    self.primary
+                ));
+            }
+            if !self.replicas.contains(node_id) {
+                return Err(format!(
+                    "in-sync replica '{node_id}' is not present in the replica assignments"
+                ));
+            }
+            if !seen.insert(node_id) {
+                return Err(format!("duplicate in-sync replica '{node_id}'"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_replica_in_sync(&self, node_id: &str) -> bool {
+        self.in_sync_replicas.iter().any(|node| node == node_id)
+    }
 }
 
 /// The type of a mapped field in an index.
@@ -603,7 +635,7 @@ impl IndexMetadata {
             for r in 0..num_replicas {
                 let replica_idx = ((shard_id as usize) + 1 + (r as usize)) % data_nodes.len();
                 let replica_node = &data_nodes[replica_idx];
-                if *replica_node != primary_node {
+                if *replica_node != primary_node && !replicas.contains(replica_node) {
                     replicas.push(replica_node.clone());
                 } else {
                     unassigned += 1;
@@ -613,6 +645,7 @@ impl IndexMetadata {
                 shard_id,
                 ShardRoutingEntry {
                     primary: primary_node,
+                    in_sync_replicas: replicas.clone(),
                     replicas,
                     unassigned_replicas: unassigned,
                 },
@@ -675,30 +708,64 @@ impl IndexMetadata {
             .unwrap_or_default()
     }
 
-    /// Promote the first replica to primary for a given shard.
+    /// Get authoritative replica nodes for a given shard.
+    pub fn in_sync_replica_nodes(&self, shard_id: u32) -> Vec<&NodeId> {
+        self.shard_routing
+            .get(&shard_id)
+            .map(|r| r.in_sync_replicas.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Select a promotion candidate from the authoritative in-sync set.
+    ///
+    /// A reported checkpoint can rank only an already-eligible replica. If no
+    /// eligible replica has a checkpoint observation, routing order is used.
+    pub fn select_promotion_candidate(
+        &self,
+        shard_id: u32,
+        replica_checkpoints: &[(String, u64)],
+    ) -> Option<NodeId> {
+        let routing = self.shard_routing.get(&shard_id)?;
+        replica_checkpoints
+            .iter()
+            .filter(|(node_id, _)| routing.is_replica_in_sync(node_id))
+            .max_by_key(|(_, checkpoint)| *checkpoint)
+            .map(|(node_id, _)| node_id.clone())
+            .or_else(|| routing.in_sync_replicas.first().cloned())
+    }
+
+    /// Promote the first in-sync replica to primary for a given shard.
     /// Returns true if promotion occurred.
     pub fn promote_replica(&mut self, shard_id: u32) -> bool {
         if let Some(routing) = self.shard_routing.get_mut(&shard_id)
-            && let Some(new_primary) = routing.replicas.first().cloned()
+            && let Some(new_primary) = routing.in_sync_replicas.first().cloned()
         {
-            routing.primary = new_primary;
-            routing.replicas.remove(0);
-            return true;
+            return Self::promote_routing_replica_to(routing, &new_primary);
         }
         false
     }
 
     /// Promote a specific replica to primary for a given shard.
-    /// The chosen replica is removed from the replicas list and becomes primary.
+    /// The chosen replica must be in sync. It is removed from both replica
+    /// collections and becomes the implicitly-authoritative primary.
     /// Returns true if promotion occurred.
     pub fn promote_replica_to(&mut self, shard_id: u32, new_primary: &str) -> bool {
-        if let Some(routing) = self.shard_routing.get_mut(&shard_id)
-            && let Some(pos) = routing.replicas.iter().position(|n| n == new_primary)
-        {
-            routing.primary = routing.replicas.remove(pos);
-            return true;
+        if let Some(routing) = self.shard_routing.get_mut(&shard_id) {
+            return Self::promote_routing_replica_to(routing, new_primary);
         }
         false
+    }
+
+    fn promote_routing_replica_to(routing: &mut ShardRoutingEntry, new_primary: &str) -> bool {
+        if !routing.is_replica_in_sync(new_primary) {
+            return false;
+        }
+        let Some(pos) = routing.replicas.iter().position(|node| node == new_primary) else {
+            return false;
+        };
+        routing.primary = routing.replicas.remove(pos);
+        routing.in_sync_replicas.retain(|node| node != new_primary);
+        true
     }
 
     /// Remove a node from all shard routing entries.
@@ -711,6 +778,7 @@ impl IndexMetadata {
         for (shard_id, routing) in &mut self.shard_routing {
             let replicas_before = routing.replicas.len();
             routing.replicas.retain(|n| n != node_id);
+            routing.in_sync_replicas.retain(|n| n != node_id);
             routing.unassigned_replicas +=
                 (replicas_before.saturating_sub(routing.replicas.len())) as u32;
             if routing.primary == *node_id {
@@ -746,11 +814,17 @@ impl IndexMetadata {
                 let can_reduce_unassigned =
                     routing.unassigned_replicas.min(old_replicas - new_replicas);
                 routing.unassigned_replicas -= can_reduce_unassigned;
-                // Then, if still over-replicated, remove assigned replicas
+                // Then remove assigned replicas, preferring copies that are not
+                // authoritative before reducing the in-sync set.
                 while routing.replicas.len() > total_desired {
-                    if let Some(node) = routing.replicas.pop() {
-                        removed.push((*shard_id, node));
-                    }
+                    let remove_pos = routing
+                        .replicas
+                        .iter()
+                        .rposition(|node| !routing.is_replica_in_sync(node))
+                        .unwrap_or(routing.replicas.len() - 1);
+                    let node = routing.replicas.remove(remove_pos);
+                    routing.in_sync_replicas.retain(|member| member != &node);
+                    removed.push((*shard_id, node));
                 }
             }
         }
@@ -984,6 +1058,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into(), "node-C".into()],
+                in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -991,6 +1066,10 @@ mod tests {
         assert!(meta.promote_replica(0));
         assert_eq!(meta.shard_routing[&0].primary, "node-B");
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-C".to_string()]);
+        assert_eq!(
+            meta.shard_routing[&0].in_sync_replicas,
+            vec!["node-C".to_string()]
+        );
     }
 
     #[test]
@@ -1010,6 +1089,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -1034,6 +1114,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into()],
+                in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1042,6 +1123,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-B".into(),
                 replicas: vec!["node-A".into()],
+                in_sync_replicas: vec!["node-A".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1049,6 +1131,7 @@ mod tests {
         let orphaned = meta.remove_node(&"node-A".into());
         assert_eq!(orphaned, vec![0]); // shard 0 lost its primary
         assert!(meta.shard_routing[&1].replicas.is_empty()); // removed from replicas
+        assert!(meta.shard_routing[&1].in_sync_replicas.is_empty());
         assert_eq!(meta.shard_routing[&1].unassigned_replicas, 1);
     }
 
@@ -1071,6 +1154,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into()],
+                in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1079,6 +1163,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-B".into(),
                 replicas: vec!["node-A".into()],
+                in_sync_replicas: vec!["node-A".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1104,6 +1189,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into(), "node-C".into()],
+                in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1111,6 +1197,10 @@ mod tests {
         assert_eq!(replicas.len(), 2);
         assert!(replicas.contains(&&"node-B".to_string()));
         assert!(replicas.contains(&&"node-C".to_string()));
+        let in_sync_replicas = meta.in_sync_replica_nodes(0);
+        assert_eq!(in_sync_replicas.len(), 2);
+        assert!(in_sync_replicas.contains(&&"node-B".to_string()));
+        assert!(in_sync_replicas.contains(&&"node-C".to_string()));
     }
 
     #[test]
@@ -1145,6 +1235,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into(), "node-C".into()],
+                in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1153,11 +1244,13 @@ mod tests {
         assert!(meta.promote_replica(0));
         assert_eq!(meta.shard_routing[&0].primary, "node-B");
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-C".to_string()]);
+        assert_eq!(meta.shard_routing[&0].in_sync_replicas, ["node-C"]);
 
         // Second promotion: C becomes primary
         assert!(meta.promote_replica(0));
         assert_eq!(meta.shard_routing[&0].primary, "node-C");
         assert!(meta.shard_routing[&0].replicas.is_empty());
+        assert!(meta.shard_routing[&0].in_sync_replicas.is_empty());
 
         // Third promotion: fails, no more replicas
         assert!(!meta.promote_replica(0));
@@ -1201,18 +1294,22 @@ mod tests {
 
         assert_eq!(meta.shard_routing[&0].primary, "node-C");
         assert_eq!(meta.shard_routing[&0].replicas, ["node-B"]);
+        assert_eq!(meta.shard_routing[&0].in_sync_replicas, ["node-B"]);
         assert_eq!(meta.shard_routing[&0].unassigned_replicas, 1);
 
         assert_eq!(meta.shard_routing[&1].primary, "node-B");
         assert_eq!(meta.shard_routing[&1].replicas, ["node-C"]);
+        assert_eq!(meta.shard_routing[&1].in_sync_replicas, ["node-C"]);
         assert_eq!(meta.shard_routing[&1].unassigned_replicas, 1);
 
         assert_eq!(meta.shard_routing[&2].primary, "node-C");
         assert_eq!(meta.shard_routing[&2].replicas, ["node-B"]);
+        assert_eq!(meta.shard_routing[&2].in_sync_replicas, ["node-B"]);
         assert_eq!(meta.shard_routing[&2].unassigned_replicas, 1);
 
         assert_eq!(meta.shard_routing[&3].primary, "node-C");
         assert_eq!(meta.shard_routing[&3].replicas, ["node-B"]);
+        assert_eq!(meta.shard_routing[&3].in_sync_replicas, ["node-B"]);
         assert_eq!(meta.shard_routing[&3].unassigned_replicas, 1);
     }
 
@@ -1235,6 +1332,7 @@ mod tests {
                     ShardRoutingEntry {
                         primary: "node-A".into(),
                         replicas: vec!["node-B".into(), "node-C".into()],
+                        in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                         unassigned_replicas: 0,
                     },
                 ),
@@ -1243,6 +1341,7 @@ mod tests {
                     ShardRoutingEntry {
                         primary: "node-B".into(),
                         replicas: vec!["node-C".into(), "node-A".into()],
+                        in_sync_replicas: vec!["node-C".into(), "node-A".into()],
                         unassigned_replicas: 0,
                     },
                 ),
@@ -1251,6 +1350,7 @@ mod tests {
                     ShardRoutingEntry {
                         primary: "node-C".into(),
                         replicas: vec!["node-A".into(), "node-B".into()],
+                        in_sync_replicas: vec!["node-A".into(), "node-B".into()],
                         unassigned_replicas: 0,
                     },
                 ),
@@ -1259,6 +1359,7 @@ mod tests {
                     ShardRoutingEntry {
                         primary: "node-D".into(),
                         replicas: vec!["node-E".into(), "node-F".into()],
+                        in_sync_replicas: vec!["node-E".into(), "node-F".into()],
                         unassigned_replicas: 0,
                     },
                 ),
@@ -1288,10 +1389,15 @@ mod tests {
             let routing = &meta.shard_routing[&shard_id];
             assert_eq!(routing.primary, "node-C");
             assert!(routing.replicas.is_empty());
+            assert!(routing.in_sync_replicas.is_empty());
             assert_eq!(routing.unassigned_replicas, 2);
         }
         assert_eq!(meta.shard_routing[&3].primary, "node-D");
         assert_eq!(meta.shard_routing[&3].replicas, ["node-E", "node-F"]);
+        assert_eq!(
+            meta.shard_routing[&3].in_sync_replicas,
+            ["node-E", "node-F"]
+        );
         assert_eq!(meta.shard_routing[&3].unassigned_replicas, 0);
         assert_eq!(meta.uuid, original_uuid);
         assert_eq!(meta.settings, original_settings);
@@ -1323,6 +1429,7 @@ mod tests {
                 ShardRoutingEntry {
                     primary: "node-A".into(),
                     replicas: vec![],
+                    in_sync_replicas: vec![],
                     unassigned_replicas: 0,
                 },
             )]),
@@ -1353,6 +1460,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into()],
+                in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1478,6 +1586,7 @@ mod tests {
         let routing = &meta.shard_routing[&0];
         assert_eq!(routing.primary, "node-1");
         assert_eq!(routing.replicas, vec!["node-2".to_string()]);
+        assert_eq!(routing.in_sync_replicas, vec!["node-2".to_string()]);
         assert_eq!(routing.unassigned_replicas, 0);
         assert_eq!(meta.unassigned_replica_count(), 0);
     }
@@ -1505,7 +1614,19 @@ mod tests {
         );
         let routing = &meta.shard_routing[&0];
         assert_eq!(routing.replicas.len(), 2);
+        assert_eq!(routing.in_sync_replicas, routing.replicas);
         assert_eq!(routing.unassigned_replicas, 0);
+    }
+
+    #[test]
+    fn build_shard_routing_never_duplicates_replica_assignments() {
+        let meta =
+            IndexMetadata::build_shard_routing("test", 1, 4, &["node-1".into(), "node-2".into()]);
+        let routing = &meta.shard_routing[&0];
+        assert_eq!(routing.replicas, ["node-2"]);
+        assert_eq!(routing.in_sync_replicas, ["node-2"]);
+        assert_eq!(routing.unassigned_replicas, 3);
+        routing.validate_in_sync_replicas().unwrap();
     }
 
     #[test]
@@ -1530,22 +1651,64 @@ mod tests {
         let entry = ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec!["node-2".into()],
+            in_sync_replicas: vec!["node-2".into()],
             unassigned_replicas: 1,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let entry2: ShardRoutingEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(entry2.unassigned_replicas, 1);
         assert_eq!(entry2.replicas, vec!["node-2".to_string()]);
+        assert_eq!(entry2.in_sync_replicas, vec!["node-2".to_string()]);
     }
 
     #[test]
-    fn shard_routing_without_unassigned_field_defaults_to_zero() {
+    fn legacy_shard_routing_defaults_to_no_in_sync_replicas_and_is_not_promotable() {
         let json = r#"{"primary":"node-1","replicas":["node-2"]}"#;
         let entry: ShardRoutingEntry = serde_json::from_str(json).unwrap();
         assert_eq!(
             entry.unassigned_replicas, 0,
             "missing field should default to 0"
         );
+        assert!(
+            entry.in_sync_replicas.is_empty(),
+            "legacy snapshots must fail closed instead of granting promotion eligibility"
+        );
+
+        let mut metadata = IndexMetadata {
+            name: "legacy".into(),
+            uuid: IndexUuid::new("legacy-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(0, entry)]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        };
+        assert!(!metadata.promote_replica(0));
+    }
+
+    #[test]
+    fn in_sync_replica_invariants_reject_primary_unknown_and_duplicate_nodes() {
+        for (in_sync_replicas, expected) in [
+            (vec!["node-1".into()], "cannot also be an in-sync replica"),
+            (
+                vec!["node-3".into()],
+                "is not present in the replica assignments",
+            ),
+            (
+                vec!["node-2".into(), "node-2".into()],
+                "duplicate in-sync replica",
+            ),
+        ] {
+            let routing = ShardRoutingEntry {
+                primary: "node-1".into(),
+                replicas: vec!["node-2".into()],
+                in_sync_replicas,
+                unassigned_replicas: 0,
+            };
+            let error = routing.validate_in_sync_replicas().unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     // ── Shard allocator tests ───────────────────────────────────────────
@@ -1560,6 +1723,10 @@ mod tests {
         let changed = meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]);
         assert!(changed);
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-2".to_string()]);
+        assert!(
+            meta.shard_routing[&0].in_sync_replicas.is_empty(),
+            "new assignments must remain out of sync until file recovery admits them"
+        );
         assert_eq!(
             meta.shard_routing[&0].unassigned_replicas, 1,
             "1 still unassigned (need 3rd node)"
@@ -1576,6 +1743,7 @@ mod tests {
             meta.allocate_unassigned_replicas(&["node-1".into(), "node-2".into(), "node-3".into()]);
         assert!(changed);
         assert_eq!(meta.shard_routing[&0].replicas.len(), 2);
+        assert!(meta.shard_routing[&0].in_sync_replicas.is_empty());
         assert_eq!(meta.shard_routing[&0].unassigned_replicas, 0);
         assert_eq!(meta.unassigned_replica_count(), 0);
     }
@@ -1640,6 +1808,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into(), "node-C".into()],
+                in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1648,6 +1817,7 @@ mod tests {
         assert!(meta.promote_replica_to(0, "node-C"));
         assert_eq!(meta.shard_routing[&0].primary, "node-C");
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-B".to_string()]);
+        assert_eq!(meta.shard_routing[&0].in_sync_replicas, ["node-B"]);
     }
 
     #[test]
@@ -1667,6 +1837,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into()],
+                in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1676,6 +1847,71 @@ mod tests {
             meta.shard_routing[&0].primary, "node-A",
             "primary should not change"
         );
+    }
+
+    #[test]
+    fn promotion_refuses_out_of_sync_replica_even_with_higher_checkpoint() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("test-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 3,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "node-A".into(),
+                    replicas: vec!["node-stale".into(), "node-B".into(), "node-C".into()],
+                    in_sync_replicas: vec!["node-B".into(), "node-C".into()],
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        };
+        let checkpoints = vec![
+            ("node-stale".to_string(), 1_000),
+            ("node-B".to_string(), 10),
+            ("node-C".to_string(), 20),
+        ];
+
+        assert_eq!(
+            meta.select_promotion_candidate(0, &checkpoints),
+            Some("node-C".to_string())
+        );
+        assert!(!meta.promote_replica_to(0, "node-stale"));
+        assert_eq!(meta.shard_routing[&0].primary, "node-A");
+    }
+
+    #[test]
+    fn promotion_fallback_skips_out_of_sync_replica_in_routing_order() {
+        let mut meta = IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("test-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 2,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "node-A".into(),
+                    replicas: vec!["node-stale".into(), "node-B".into()],
+                    in_sync_replicas: vec!["node-B".into()],
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        };
+
+        assert_eq!(
+            meta.select_promotion_candidate(0, &[]),
+            Some("node-B".to_string())
+        );
+        assert!(meta.promote_replica(0));
+        assert_eq!(meta.shard_routing[&0].primary, "node-B");
+        assert_eq!(meta.shard_routing[&0].replicas, ["node-stale"]);
+        assert!(meta.shard_routing[&0].in_sync_replicas.is_empty());
     }
 
     #[test]
@@ -1695,6 +1931,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into()],
+                in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1721,6 +1958,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into()],
+                in_sync_replicas: vec!["node-B".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1729,6 +1967,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-B".into(),
                 replicas: vec!["node-A".into()],
+                in_sync_replicas: vec!["node-A".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1739,6 +1978,7 @@ mod tests {
 
         // shard 1's replicas should no longer include node-A
         assert!(meta.shard_routing[&1].replicas.is_empty());
+        assert!(meta.shard_routing[&1].in_sync_replicas.is_empty());
         assert_eq!(meta.shard_routing[&1].unassigned_replicas, 1);
 
         // Promote for shard 0
@@ -1764,6 +2004,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "node-A".into(),
                 replicas: vec!["node-B".into(), "node-C".into()],
+                in_sync_replicas: vec!["node-B".into(), "node-C".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -1772,6 +2013,7 @@ mod tests {
         let orphaned = meta.remove_node(&"node-B".to_string());
         assert!(orphaned.is_empty());
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-C".to_string()]);
+        assert_eq!(meta.shard_routing[&0].in_sync_replicas, ["node-C"]);
         assert_eq!(meta.shard_routing[&0].unassigned_replicas, 1);
     }
 
@@ -2093,6 +2335,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "A".into(),
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -2101,6 +2344,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "B".into(),
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -2129,6 +2373,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "A".into(),
                 replicas: vec!["B".into(), "C".into()],
+                in_sync_replicas: vec!["B".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -2136,8 +2381,10 @@ mod tests {
         let removed = meta.update_number_of_replicas(1);
         assert_eq!(meta.number_of_replicas, 1);
         assert_eq!(meta.shard_routing[&0].replicas.len(), 1);
+        assert_eq!(meta.shard_routing[&0].replicas, ["B"]);
+        assert_eq!(meta.shard_routing[&0].in_sync_replicas, ["B"]);
         assert_eq!(removed.len(), 1);
-        // Last replica is removed first (vec::pop)
+        // The out-of-sync replica is removed before the authoritative copy.
         assert_eq!(removed[0], (0, "C".to_string()));
     }
 
@@ -2158,6 +2405,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "A".into(),
                 replicas: vec!["B".into()],
+                in_sync_replicas: vec!["B".into()],
                 unassigned_replicas: 2,
             },
         );
@@ -2167,6 +2415,7 @@ mod tests {
         assert_eq!(meta.number_of_replicas, 1);
         assert_eq!(meta.shard_routing[&0].unassigned_replicas, 0);
         assert_eq!(meta.shard_routing[&0].replicas.len(), 1);
+        assert_eq!(meta.shard_routing[&0].in_sync_replicas, ["B"]);
         assert!(removed.is_empty());
     }
 
@@ -2187,6 +2436,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "A".into(),
                 replicas: vec!["B".into()],
+                in_sync_replicas: vec!["B".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -2194,6 +2444,7 @@ mod tests {
         let removed = meta.update_number_of_replicas(1);
         assert!(removed.is_empty());
         assert_eq!(meta.shard_routing[&0].replicas.len(), 1);
+        assert_eq!(meta.shard_routing[&0].in_sync_replicas, ["B"]);
         assert_eq!(meta.shard_routing[&0].unassigned_replicas, 0);
     }
 
@@ -2214,6 +2465,7 @@ mod tests {
             ShardRoutingEntry {
                 primary: "A".into(),
                 replicas: vec!["B".into(), "C".into()],
+                in_sync_replicas: vec!["B".into(), "C".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -2221,6 +2473,7 @@ mod tests {
         let removed = meta.update_number_of_replicas(0);
         assert_eq!(meta.number_of_replicas, 0);
         assert!(meta.shard_routing[&0].replicas.is_empty());
+        assert!(meta.shard_routing[&0].in_sync_replicas.is_empty());
         assert_eq!(removed.len(), 2);
     }
 
@@ -2242,6 +2495,7 @@ mod tests {
                 ShardRoutingEntry {
                     primary: "A".into(),
                     replicas: vec!["B".into()],
+                    in_sync_replicas: vec!["B".into()],
                     unassigned_replicas: 0,
                 },
             );
@@ -2251,6 +2505,7 @@ mod tests {
         assert_eq!(removed.len(), 3);
         for s in 0..3 {
             assert!(meta.shard_routing[&s].replicas.is_empty());
+            assert!(meta.shard_routing[&s].in_sync_replicas.is_empty());
         }
     }
 

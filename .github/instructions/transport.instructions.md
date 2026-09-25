@@ -73,6 +73,12 @@ receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
 
+`ShardAssignment.in_sync_replica_node_ids` carries the authoritative replica
+acknowledgement/promotion set in JoinCluster snapshots. Conversion must preserve
+it losslessly and reject duplicate IDs, the primary ID, or any ID absent from
+`replica_node_ids` with `INVALID_ARGUMENT`. An absent field from pre-1.0 peers
+decodes as empty and therefore non-promotable.
+
 ### Runtime And Code Generation
 
 - Keep the Tonic runtime, Prost codec, generated service code, and optional
@@ -121,15 +127,18 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **ping**: Returns `NOT_FOUND` when `source_node_id` is absent from cluster state. A successful ping means the target still recognizes the caller as a registered cluster node and has refreshed `last_seen`; a rejected ping is the follower's signal to re-run `JoinCluster`.
 - **index_doc / bulk_index / delete_doc**: Look up shard in ShardManager, execute
   the receipt-returning engine operation, replicate the receipt's exact sequence
-  or range to all replicas, and return it to the caller. **Returns
+  or range to all authoritative in-sync replicas, and return it to the caller. **Returns
   `success: false` if replication fails** — write is only acknowledged after all
-  ISR replicas confirm (synchronous replication contract).
+  in-sync replicas confirm (synchronous replication contract). Assigned
+  out-of-sync replicas receive no live writes and cannot fail the request.
 - **replicate_doc / replicate_bulk**: Apply to local replica engine using the
   seq_no supplied by the primary, persist that same seq_no in the replica WAL,
   return the current local high-water mark. Bulk apply rejects empty-range
   overflow, non-contiguous/out-of-order sequences, and non-index operations
   before mutation.
-- **recover_replica**: Read WAL entries via `read_from()`, return operations
+- **recover_replica**: Read WAL entries via `read_from()`, return operations.
+  The RPC remains available for transport tests but the node lifecycle does not
+  use this partial suffix as recovery or admission.
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **get_remote_store_leaf_status**: Report whether the local node is root/leaf-capable plus per-split artifact/reader warmth and current `StorageManager` load counters
 - **search_remote_store_splits**: Validate the remote_store index/UUID, batch split execution through the shared leaf helper, and return per-split hits, totals, partial aggs, and per-split errors
@@ -143,7 +152,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **ping MUST reject unknown nodes**: `Ping` is not just a transport liveness check. If `source_node_id` is absent from cluster state, return `NOT_FOUND` instead of silently succeeding, or removed/stale nodes will keep serving an old cluster view forever and never trigger `JoinCluster` recovery.
 - **Join identity MUST be unique and stable**: `raft_node_id` cannot be reused by a different logical node, and an existing `node_id` cannot silently switch to a different `raft_node_id`. Reject the join instead of mutating membership.
 - **Shard writes MUST fail on replication failure**: The `index_doc`, `bulk_index`, and `delete_doc` handlers must return `success: false` when `replicate_write()` / `replicate_bulk()` returns `Err`. Logging the error and returning `success: true` violates the synchronous replication contract.
-- **Replica apply MUST preserve primary seq_nos**: `replicate_doc`, `replicate_bulk`, and recovery replay must call the explicit-seq engine methods. Do not route replicated writes through local seq allocation APIs.
+- **Replica apply MUST preserve primary seq_nos**: `replicate_doc` and
+  `replicate_bulk` must call the explicit-seq engine methods. Do not route
+  replicated writes through local seq allocation APIs.
 - **Successful write responses MUST carry valid receipts**: zero is a valid
   sequence, not a missing-value sentinel. Clients must reject successful
   single/delete responses without `seq_no`. A single index response must match
@@ -157,7 +168,13 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Read-side shard reopen MUST fail closed on UUID mismatch**: `get_or_open_search_shard()` must reject empty UUIDs and missing expected UUID directories instead of creating a fresh shard on a read path.
 - **Transport serialization must fail loudly**: gRPC handlers and clients must not use `unwrap_or_default()` for protocol payloads (`source_json`, `payload_json`, `partial_aggs_json`, Raft snapshot fields). Serialization or decode failures must surface as RPC errors, not empty payloads or silently dropped hits.
 - **Raft snapshot RPCs must require all fields**: missing `vote`, `meta`, or `data` in `RaftSnapshot` is `INVALID_ARGUMENT`, not a defaulted empty snapshot.
-- **ClusterState transport snapshots must be lossless**: startup consumes `JoinCluster` snapshots for shard reopen and orphan cleanup, so proto/domain conversion must preserve `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and `uuid` exactly. Never synthesize defaults or new UUIDs during roundtrip, and reject unknown field types or unknown non-empty engine strings instead of coercing them.
+- **ClusterState transport snapshots must be lossless**: startup consumes
+  `JoinCluster` snapshots for shard reopen and orphan cleanup, so proto/domain
+  conversion must preserve `raft_node_id`, `unassigned_replicas`,
+  `in_sync_replicas`, index `mappings`, index `settings`, and `uuid` exactly.
+  Never synthesize defaults or new UUIDs during roundtrip, and reject invalid
+  in-sync membership, unknown field types, or unknown non-empty engine strings
+  instead of coercing them.
 
 ## TransportClient (src/transport/client.rs)
 ```rust

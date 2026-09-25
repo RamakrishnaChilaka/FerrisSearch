@@ -700,6 +700,7 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
         ShardRoutingEntry {
             primary: "node-1".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -708,6 +709,7 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
         ShardRoutingEntry {
             primary: "node-2".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -716,6 +718,7 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
         ShardRoutingEntry {
             primary: "node-3".into(),
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );

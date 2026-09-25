@@ -741,6 +741,10 @@ mod tests {
         );
         assert_eq!(metadata.shard_routing[&0].primary, "node-1");
         assert_eq!(metadata.shard_routing[&0].replicas, ["node-2", "node-3"]);
+        assert_eq!(
+            metadata.shard_routing[&0].in_sync_replicas,
+            ["node-2", "node-3"]
+        );
         assert!(metadata.mappings.contains_key("doc_type"));
         assert!(metadata.mappings.contains_key("payload"));
     }
@@ -769,6 +773,10 @@ mod tests {
 
         assert_eq!(updated.number_of_replicas, 2);
         assert_eq!(updated.shard_routing[&0].replicas, ["node-2", "node-3"]);
+        assert!(
+            updated.shard_routing[&0].in_sync_replicas.is_empty(),
+            "security replicas added after creation require file recovery before admission"
+        );
         assert_eq!(updated.shard_routing[&0].unassigned_replicas, 0);
     }
 
@@ -786,6 +794,7 @@ mod tests {
 
         assert_eq!(updated.number_of_replicas, 1);
         assert_eq!(updated.shard_routing[&0].replicas, ["node-2"]);
+        assert_eq!(updated.shard_routing[&0].in_sync_replicas, ["node-2"]);
         assert_eq!(updated.shard_routing[&0].unassigned_replicas, 0);
     }
 
