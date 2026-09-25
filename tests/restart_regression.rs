@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
 use ferrissearch::engine::routing::calculate_shard;
+use ferrissearch::transport::proto::ShardGetRequest;
+use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,8 +9,10 @@ use std::fs::{self, OpenOptions};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::sync::OwnedMutexGuard;
 
 const INDEX_NAME: &str = "restart-regression";
 const CLUSTER_NAME: &str = "restart-regression-cluster";
@@ -26,6 +30,7 @@ struct NodeConfig {
     http_port: u16,
     transport_port: u16,
     raft_node_id: u64,
+    max_concurrent_peer_recoveries: Option<usize>,
 }
 
 impl NodeConfig {
@@ -82,6 +87,12 @@ impl NodeProcess {
             .env("FERRISSEARCH_COLUMN_CACHE_SIZE_PERCENT", "0")
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        if let Some(limit) = config.max_concurrent_peer_recoveries {
+            cmd.env(
+                "FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES",
+                limit.to_string(),
+            );
+        }
 
         let child = cmd
             .spawn()
@@ -120,6 +131,7 @@ impl NodeProcess {
 }
 
 struct RestartClusterHarness {
+    _process_guard: OwnedMutexGuard<()>,
     _temp_dir: TempDir,
     client: Client,
     seed_hosts: String,
@@ -128,15 +140,29 @@ struct RestartClusterHarness {
 
 impl RestartClusterHarness {
     async fn start() -> Result<Self> {
+        Self::start_with_peer_recovery_limit(None).await
+    }
+
+    async fn start_with_peer_recovery_limit(limit: Option<usize>) -> Result<Self> {
+        let process_guard = process_test_lock().clone().lock_owned().await;
         let temp_dir = tempfile::tempdir()?;
+        let port_reservations = (0..6)
+            .map(|_| TcpListener::bind("127.0.0.1:0"))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let ports = port_reservations
+            .iter()
+            .map(|listener| listener.local_addr().map(|address| address.port()))
+            .collect::<std::io::Result<Vec<_>>>()?;
         let node_configs: Vec<NodeConfig> = (1..=3)
-            .map(|idx| NodeConfig {
+            .enumerate()
+            .map(|(position, idx)| NodeConfig {
                 name: format!("node-{idx}"),
                 data_dir: temp_dir.path().join(format!("node-{idx}")),
                 log_path: temp_dir.path().join(format!("node-{idx}.log")),
-                http_port: reserve_port(),
-                transport_port: reserve_port(),
+                http_port: ports[position * 2],
+                transport_port: ports[position * 2 + 1],
                 raft_node_id: idx as u64,
+                max_concurrent_peer_recoveries: limit,
             })
             .collect();
 
@@ -145,6 +171,7 @@ impl RestartClusterHarness {
             .map(|cfg| format!("127.0.0.1:{}", cfg.transport_port))
             .collect::<Vec<_>>()
             .join(",");
+        drop(port_reservations);
 
         let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
         let mut nodes = Vec::new();
@@ -161,6 +188,7 @@ impl RestartClusterHarness {
         }
 
         let mut harness = Self {
+            _process_guard: process_guard,
             _temp_dir: temp_dir,
             client,
             seed_hosts,
@@ -620,6 +648,7 @@ impl RestartClusterHarness {
             for node in &mut self.nodes {
                 node.ensure_running()?;
             }
+
             if let Ok((status, state)) = self
                 .request_json(Method::GET, "/_cluster/state", None)
                 .await
@@ -636,6 +665,95 @@ impl RestartClusterHarness {
             if tokio::time::Instant::now() >= deadline {
                 bail!(
                     "replica was not assigned out of sync within {READY_TIMEOUT:?}\n{}",
+                    self.logs_summary()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_in_sync_replicas(
+        &mut self,
+        expected_replicas: usize,
+    ) -> Result<(Value, RoutingSnapshot)> {
+        let deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
+        loop {
+            for node in &mut self.nodes {
+                node.ensure_running()?;
+            }
+            if let Ok((status, state)) = self
+                .request_json(Method::GET, "/_cluster/state", None)
+                .await
+                && status == StatusCode::OK
+                && let Ok(routing) = routing_snapshot(&state, INDEX_NAME)
+                && let Some(shard) = routing.get(&0)
+                && shard.replicas.len() == expected_replicas
+                && shard.in_sync_replicas.len() == expected_replicas
+                && shard
+                    .replicas
+                    .iter()
+                    .all(|replica| shard.in_sync_replicas.contains(replica))
+                && shard.unassigned_replicas == 0
+            {
+                return Ok((state, shard.clone()));
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "replicas did not become in sync within {FAILOVER_TIMEOUT:?}\n{}",
+                    self.logs_summary()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_primary_promotion(&mut self, old_primary: &str) -> Result<RoutingSnapshot> {
+        let deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
+        loop {
+            for node in &mut self.nodes {
+                node.ensure_running()?;
+            }
+            if let Ok((status, state)) = self
+                .request_json(Method::GET, "/_cluster/state", None)
+                .await
+                && status == StatusCode::OK
+                && state["nodes"]
+                    .as_object()
+                    .is_some_and(|nodes| !nodes.contains_key(old_primary))
+                && let Ok(routing) = routing_snapshot(&state, INDEX_NAME)
+                && let Some(shard) = routing.get(&0)
+                && shard.primary != old_primary
+            {
+                return Ok(shard.clone());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "primary {old_primary} was not promoted within {FAILOVER_TIMEOUT:?}\n{}",
+                    self.logs_summary()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_green(&mut self) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
+        loop {
+            for node in &mut self.nodes {
+                node.ensure_running()?;
+            }
+            if let Ok((status, health)) = self
+                .request_json(Method::GET, "/_cluster/health", None)
+                .await
+                && status == StatusCode::OK
+                && health["status"] == json!("green")
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "cluster did not become green within {FAILOVER_TIMEOUT:?}\n{}",
                     self.logs_summary()
                 );
             }
@@ -795,9 +913,9 @@ impl Drop for RestartClusterHarness {
     }
 }
 
-fn reserve_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
-    listener.local_addr().expect("port addr").port()
+fn process_test_lock() -> &'static Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
 }
 
 fn routing_snapshot(
@@ -863,6 +981,24 @@ fn expected_document(doc_id: usize) -> Value {
         "payload": DOC_BODY,
         "n": doc_id,
     })
+}
+
+async fn get_local_document(node: &NodeConfig, doc_id: &str) -> Result<Option<Value>> {
+    let mut client =
+        InternalTransportClient::connect(format!("http://127.0.0.1:{}", node.transport_port))
+            .await?;
+    let response = client
+        .get_doc(tonic::Request::new(ShardGetRequest {
+            index_name: INDEX_NAME.into(),
+            shard_id: 0,
+            doc_id: doc_id.into(),
+        }))
+        .await?
+        .into_inner();
+    if !response.found {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&response.source_json)?))
 }
 
 fn document_id_for_shard(prefix: &str, shard_id: u32) -> String {
@@ -962,8 +1098,7 @@ async fn three_node_flush_restart_preserves_uuid_dirs_and_document_count() -> Re
 }
 
 #[tokio::test]
-async fn out_of_sync_replica_is_not_promoted_and_primary_rejoin_restores_acknowledged_data()
--> Result<()> {
+async fn added_replica_recovers_files_and_survives_primary_loss() -> Result<()> {
     let mut harness = RestartClusterHarness::start().await?;
     harness.create_index_with_shards(1, 0).await?;
     harness
@@ -980,6 +1115,81 @@ async fn out_of_sync_replica_is_not_promoted_and_primary_rejoin_restores_acknowl
     let primary = routing_snapshot(&before_replica, INDEX_NAME)?[&0]
         .primary
         .clone();
+    harness.update_replica_count(1).await?;
+    let (_assigned_state, assigned) = harness.wait_for_out_of_sync_replica().await?;
+    let replica = assigned.replicas[0].clone();
+    assert_ne!(primary, replica);
+
+    let mut next_doc = 25usize;
+    let recovery_deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
+    loop {
+        let state = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+        let routing = routing_snapshot(&state, INDEX_NAME)?;
+        if routing[&0]
+            .in_sync_replicas
+            .iter()
+            .any(|node| node == &replica)
+        {
+            break;
+        }
+        harness
+            .put_document(&format!("doc-{next_doc}"), expected_document(next_doc))
+            .await?;
+        next_doc += 1;
+        assert!(
+            tokio::time::Instant::now() < recovery_deadline,
+            "peer recovery did not finish while concurrent writes continued\n{}",
+            harness.logs_summary()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        next_doc > 25,
+        "the test must acknowledge a write during recovery"
+    );
+    harness.wait_for_in_sync_replicas(1).await?;
+    harness.wait_for_green().await?;
+
+    let _stopped_primary = harness.stop_node(&primary)?;
+    let promoted = harness.wait_for_primary_promotion(&primary).await?;
+    assert_eq!(promoted.primary, replica);
+    harness.wait_for_exact_documents(next_doc).await?;
+
+    harness
+        .put_document(&format!("doc-{next_doc}"), expected_document(next_doc))
+        .await?;
+    harness.wait_for_exact_documents(next_doc + 1).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_recovery_disabled_replica_is_not_promoted_and_primary_rejoin_restores_data()
+-> Result<()> {
+    let mut harness = RestartClusterHarness::start_with_peer_recovery_limit(Some(0)).await?;
+    harness.create_index_with_shards(1, 0).await?;
+    harness
+        .wait_for_index_shards(INDEX_NAME, 1, 0, READY_TIMEOUT)
+        .await?;
+
+    let initial_state = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    let primary = routing_snapshot(&initial_state, INDEX_NAME)?[&0]
+        .primary
+        .clone();
+    let mut primary_process = harness.stop_node(&primary)?;
+    primary_process.config.max_concurrent_peer_recoveries = Some(2);
+    harness.restart_node(primary_process).await?;
+
+    harness.bulk_index_document_range(0, 20).await?;
+    harness.refresh_index().await?;
+    harness.flush_index_copies(1).await?;
+    harness.bulk_index_document_range(20, 25).await?;
+    harness.refresh_index().await?;
+
+    let before_replica = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    assert_eq!(
+        routing_snapshot(&before_replica, INDEX_NAME)?[&0].primary,
+        primary
+    );
 
     harness.update_replica_count(1).await?;
     let (_assigned_state, assigned) = harness.wait_for_out_of_sync_replica().await?;
@@ -1074,6 +1284,68 @@ async fn out_of_sync_replica_is_not_promoted_and_primary_rejoin_restores_acknowl
     assert_eq!(health_status, StatusCode::OK, "{health}");
     assert_eq!(health["status"], json!("yellow"));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejoining_stale_replica_is_recovered_before_primary_failover() -> Result<()> {
+    let mut harness = RestartClusterHarness::start().await?;
+    harness.create_index_with_shards(1, 2).await?;
+    harness
+        .wait_for_index_shards(INDEX_NAME, 3, 0, READY_TIMEOUT)
+        .await?;
+    harness.bulk_index_document_range(0, 20).await?;
+    harness.refresh_index().await?;
+    harness.flush_index_copies(3).await?;
+
+    let before_loss = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    let routing_before = routing_snapshot(&before_loss, INDEX_NAME)?;
+    let primary = routing_before[&0].primary.clone();
+    let stale_replica = routing_before[&0].replicas[0].clone();
+    let stopped_replica = harness.stop_node(&stale_replica)?;
+
+    let removal_deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
+    loop {
+        let state = harness.wait_for_cluster_state(2, Some(INDEX_NAME)).await?;
+        let routing = routing_snapshot(&state, INDEX_NAME)?;
+        if routing[&0].replicas.len() == 1
+            && routing[&0].in_sync_replicas.len() == 1
+            && routing[&0].unassigned_replicas == 1
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= removal_deadline {
+            bail!(
+                "stopped replica was not removed from routing\n{}",
+                harness.logs_summary()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    harness.bulk_index_document_range(20, 25).await?;
+    harness.refresh_index().await?;
+    let stale_config = stopped_replica.config.clone();
+    harness.restart_node(stopped_replica).await?;
+    harness.wait_for_in_sync_replicas(2).await?;
+    harness.wait_for_green().await?;
+    harness.refresh_index().await?;
+
+    for doc_id in 0..25 {
+        assert_eq!(
+            get_local_document(&stale_config, &format!("doc-{doc_id}")).await?,
+            Some(expected_document(doc_id)),
+            "rejoined replica is missing doc-{doc_id}"
+        );
+    }
+
+    let _stopped_primary = harness.stop_node(&primary)?;
+    harness.wait_for_primary_promotion(&primary).await?;
+    harness.wait_for_exact_documents(25).await?;
+    harness
+        .put_document("doc-25", expected_document(25))
+        .await?;
+    harness.wait_for_exact_documents(26).await?;
     Ok(())
 }
 

@@ -142,6 +142,14 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - `rebuild_vectors()` is only called when the index has `KnnVector` fields in its mappings. The shard manager gates this check; the composite engine's `rebuild_vectors()` itself is still a 100K-doc MatchAll scan, so never call it unconditionally.
 - Even the legacy `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used directly; never run Tantivy commit/reload inline on an async interval task
 - Replica/recovery writes use `append_with_seq()` / `write_bulk_with_start_seq()` under the hood so persisted WAL seq_nos match the primary's numbering
+- Peer snapshot creation holds maintenance then translog then writer locks,
+  commits exactly through `B = next_seq_no`, durably persists
+  `translog.committed`, registers the WAL pin before releasing the translog
+  lock, and hard-links the existing committed segment components plus
+  `meta.json`/`.managed.json`. Tantivy's `SegmentMeta::list_files()` can name
+  optional absent components; transfer only files that actually exist.
+- Snapshot hashes run after lock release. Unlocked byte-copy fallback is
+  forbidden when hard links are unavailable.
 
 ### Shared Column Cache Budget
 - `resolve_column_cache_budget()` is a blocking startup probe. On Linux it reads

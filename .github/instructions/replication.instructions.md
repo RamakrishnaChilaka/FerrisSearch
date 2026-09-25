@@ -44,17 +44,22 @@ pub async fn replicate_bulk(
 8. Primary computes global checkpoint (min of all replica checkpoints)
 9. Write acknowledged to client **only after every in-sync replica confirms**
 
-## Current Recovery Limit
-- Newly allocated replicas are assigned but out of sync. They receive no live
-  writes, do not participate in acknowledgements, and are not promotable.
-- The follower lifecycle no longer invokes partial WAL-suffix recovery. A
-  retained suffix cannot reconstruct files truncated by flush, and replay onto
-  a live copy can race newer writes.
-- `RecoverReplica` still exposes bounded test/transport behavior, but no
-  production lifecycle path uses it or treats its checkpoint as admission.
-- File snapshot transfer, WAL suffix catch-up, a final write barrier, and
-  conditional in-sync admission are deferred recovery work. Until then,
-  increasing replicas does not restore durable redundancy.
+## File-Based Peer Recovery
+- Every node drives recovery for assigned local replicas absent from
+  `in_sync_replicas`; metadata-leader role does not disable the driver.
+- The primary commits under the translog lock, captures boundary `B`, registers
+  a WAL retention pin before releasing that lock, and hard-links the existing
+  committed Tantivy files into a per-session directory.
+- The target wipes only its out-of-sync copy, persists
+  `PEER_RECOVERY_IN_PROGRESS`, validates bounded chunks and SHA-256 hashes,
+  initializes an empty WAL at `B`, and opens with schema-wipe fallback disabled.
+- Catch-up applies explicit primary sequence numbers. A final exclusive shard
+  write barrier establishes `H`; the target applies through `H`, then the
+  primary submits `MarkReplicaInSync(primary, term)` and observes local
+  membership before releasing writes.
+- Admission uncertainty remains write-blocking until membership is observed or
+  `ActivatePrimary` commits a term bump that makes the stale admission
+  impossible. `RecoverReplica` remains a legacy isolated transport API.
 
 ## gRPC RPCs Used
 | RPC | Purpose |
@@ -62,12 +67,18 @@ pub async fn replicate_bulk(
 | `ReplicateDoc` | Single document replication to replica |
 | `ReplicateBulk` | Batch document replication to replica |
 | `RecoverReplica` | Fetch missed operations from primary's WAL |
+| `StartPeerRecovery` / `FetchRecoveryFileChunk` | Create and transfer the pinned file snapshot |
+| `FetchRecoveryOps` | Fetch bounded ordered WAL suffix batches |
+| `PrepareFinalizeRecovery` / `CompleteFinalizeRecovery` | Establish the final barrier and conditionally admit the target |
 
 ## Key Design Decisions
 - **Synchronous replication**: primary waits for every authoritative in-sync replica before ACK
 - **Concurrent fan-out**: replicas are contacted in parallel via `tokio::spawn` + `join_all` — write latency = max(replica RTTs), not sum
 - Assigned replicas are in `ShardRoutingEntry.replicas`; required
   acknowledgement targets are in `ShardRoutingEntry.in_sync_replicas`
+- Primary write handlers hold the shard's shared write-barrier guard from
+  before engine mutation through synchronous replication. Finalization holds
+  the exclusive guard.
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates but cannot grant membership.

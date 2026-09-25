@@ -682,6 +682,30 @@ impl SearchEngine for CompositeEngine {
         self.global_cp
             .fetch_max(checkpoint, std::sync::atomic::Ordering::Relaxed);
     }
+
+    fn create_peer_recovery_snapshot(
+        &self,
+        snapshot_dir: &std::path::Path,
+    ) -> Result<super::PeerRecoverySnapshot> {
+        self.text.create_peer_recovery_snapshot(snapshot_dir)
+    }
+
+    fn release_peer_recovery_pin(&self, pin_id: u64) -> Result<()> {
+        self.text.release_peer_recovery_pin(pin_id)
+    }
+
+    fn peer_recovery_ops(
+        &self,
+        min_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<super::PeerRecoveryOpsBatch> {
+        self.text.peer_recovery_ops(min_seq_no, max_ops, max_bytes)
+    }
+
+    fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
+        self.text.peer_recovery_commit_files()
+    }
 }
 
 #[cfg(test)]

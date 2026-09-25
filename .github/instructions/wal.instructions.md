@@ -39,6 +39,9 @@ pub trait WriteAheadLog: Send + Sync {
     fn next_seq_no(&self) -> u64;
     fn size_bytes(&self) -> Result<u64>;  // auto-flush threshold check
     fn for_each_from(&self, min_seq_no: u64, callback: &mut dyn FnMut(TranslogEntry) -> Result<()>) -> Result<u64>;  // streaming replay
+    fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64>;
+    fn release_retention_pin(&self, pin_id: u64) -> Result<()>;
+    fn min_retention_pin(&self) -> Option<u64>;
 }
 ```
 
@@ -70,6 +73,14 @@ pub trait WriteAheadLog: Send + Sync {
 - `size_bytes()` returns the summed size of all retained generations so the engine can trigger checkpoint-aware auto-flush
 - `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only generations whose max seq_no is ≤ the checkpoint; it does NOT rewrite mixed generations in place
 - `truncate()` rolls to a new empty generation and deletes all older generations
+- Recovery retention pins protect every operation at or above their exclusive
+  boundary. Both `truncate()` and `truncate_below()` prune only below the
+  lowest active pin; a pin at zero prevents history pruning.
+- `read_bounded_range()` reads an inclusive/exclusive sequence window without
+  opening an append writer and reports whether the bounded response reached
+  the captured head.
+- `initialize_empty_at()` creates the empty target WAL/high-water state at a
+  file snapshot's exclusive boundary.
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths
 - Async durability: background task fsyncs every `sync_interval_ms` via Tokio's blocking pool — never call `File::sync_data()` inline on an async worker
 - Reopen requires `translog.manifest`; it trusts persisted metadata for old generations, removes stray generation files not listed in the manifest, ignores unrelated non-generation side files, and scans only the active generation file to recover the allocator high-water mark

@@ -493,6 +493,7 @@ async fn get_or_open_search_shard_reopens_persisted_shard_via_metadata() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -555,6 +556,7 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -591,6 +593,7 @@ async fn get_shard_stats_only_reports_open_shards() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -629,6 +632,7 @@ async fn get_segment_stats_only_reports_open_shard_segments() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -659,6 +663,7 @@ async fn get_or_open_search_shard_returns_not_found_for_unknown_shard() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -684,6 +689,7 @@ async fn get_or_open_shard_returns_not_found_for_unknown_shard() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -719,6 +725,7 @@ async fn ping_rejects_unregistered_source_node() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -757,6 +764,7 @@ async fn ping_updates_last_seen_for_registered_source_node() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -837,6 +845,7 @@ async fn maintenance_skips_orphaned_shards() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -904,6 +913,7 @@ async fn maintenance_includes_replica_shards() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -965,6 +975,7 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1057,6 +1068,7 @@ async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
         worker_pools: crate::worker::WorkerPools::new(1, 1),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1158,6 +1170,7 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1202,6 +1215,7 @@ async fn get_task_status_rpc_returns_local_force_merge_snapshot() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
     let task_id = service
@@ -1261,6 +1275,7 @@ async fn force_merge_task_counts_missing_assigned_shard_as_failure() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1336,6 +1351,7 @@ async fn flush_index_refuses_to_create_missing_uuid_dir() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1676,6 +1692,7 @@ async fn create_index_returns_internal_when_no_data_nodes_are_available() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 
@@ -1714,6 +1731,7 @@ async fn search_remote_store_splits_requires_local_index_metadata() {
         worker_pools: crate::worker::WorkerPools::new(2, 2),
         task_manager: Arc::new(crate::tasks::TaskManager::new()),
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
 

@@ -75,16 +75,16 @@ pub struct Node {
 - Do not clear the recovered startup-assignment guard after bootstrap or rejoin. Authoritative cluster state confirms shard ownership, not the continued existence of the local shard data; only assignments that were never part of the recovered local state may create fresh UUID directories later in the lifecycle loop.
 - Later shard assignments may create their UUID directories during the lifecycle loop so new primaries/replicas can come online after startup.
 
-## Current Replica Recovery Limit
-- The follower lifecycle does not replay the primary's retained WAL onto newly
-  assigned replicas. The old `local_checkpoint == 0` suffix replay was removed
-  because a flush can truncate required history and live replay can race newer
-  writes.
-- Later-added replicas stay out of `ShardRoutingEntry.in_sync_replicas`, receive
-  no live replication traffic, and remain non-promotable until snapshot-plus-WAL
-  recovery and conditional admission are implemented.
-- The `RecoverReplica` transport API remains for isolated transport coverage;
-  it is not a lifecycle recovery or admission mechanism.
+## Peer Recovery Driver
+- The lifecycle loop schedules recovery on every node for each local
+  `local_shards` replica assignment absent from `in_sync_replicas`.
+- `max_concurrent_peer_recoveries` bounds target sessions per node (default 2,
+  `0` disables); failures back off from 5 seconds to 60 seconds.
+- File download, fsync, shard close/open, vector rebuild, and recovery apply run
+  through Tokio's blocking facilities rather than the fixed search/write pools.
+- A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
+  Successful finalization clears the in-memory target gate only after the
+  primary reports settled admission.
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every
@@ -108,8 +108,10 @@ pub struct Node {
 4. Re-read committed cluster state before processing another dead node so
    sequential removals do not reuse stale routing or double-count slots.
 
-This is not term fencing or conditional per-shard routing. Concurrent stale
-whole-index `UpdateIndex` races remain future recovery-protocol work.
+Promotion changes increment the state-machine-owned shard term. A promoted or
+restarted primary still activates once per process before its first write.
+Whole-index `UpdateIndex` races beyond the enforced routing rules remain future
+work.
 
 ## AppState (shared across all API handlers)
 ```rust

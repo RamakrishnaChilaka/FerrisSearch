@@ -200,6 +200,15 @@ pub trait WriteAheadLog: Send + Sync {
         min_seq_no: u64,
         callback: &mut dyn FnMut(TranslogEntry) -> Result<()>,
     ) -> Result<u64>;
+
+    /// Pin every operation at or above `min_seq_no` against truncation.
+    fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64>;
+
+    /// Release a previously registered retention pin.
+    fn release_retention_pin(&self, pin_id: u64) -> Result<()>;
+
+    /// Return the lowest currently pinned sequence boundary.
+    fn min_retention_pin(&self) -> Option<u64>;
 }
 
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
@@ -247,34 +256,37 @@ fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
 /// Stream through all length-prefixed entries from a reader, calling `callback`
 /// for each decoded entry without accumulating them in memory. Stops at EOF or
 /// a partial frame.
+fn read_next_entry<R: Read>(reader: &mut R) -> Result<Option<(TranslogEntry, usize)>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let payload_len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload_buf = vec![0u8; payload_len];
+    match reader.read_exact(&mut payload_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            tracing::warn!(
+                "Translog has partial entry at end, ignoring {} bytes",
+                payload_len
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let (wire, _): (WireEntry, _) =
+        bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
+    Ok(Some((wire.into_translog()?, 4 + payload_len)))
+}
+
 fn decode_entries_streaming<R: Read>(
     reader: &mut R,
     mut callback: impl FnMut(TranslogEntry) -> Result<()>,
 ) -> Result<()> {
-    let mut len_buf = [0u8; 4];
-    loop {
-        match reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-        let payload_len = u32::from_le_bytes(len_buf) as usize;
-        let mut payload_buf = vec![0u8; payload_len];
-        match reader.read_exact(&mut payload_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Partial entry at end of file — truncated write, skip it
-                tracing::warn!(
-                    "Translog has partial entry at end, ignoring {} bytes",
-                    payload_len
-                );
-                break;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        let (wire, _): (WireEntry, _) =
-            bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
-        callback(wire.into_translog()?)?;
+    while let Some((entry, _)) = read_next_entry(reader)? {
+        callback(entry)?;
     }
     Ok(())
 }
@@ -435,6 +447,8 @@ struct TranslogState {
     active_generation_id: u64,
     active_file: File,
     generations: Vec<GenerationInfo>,
+    next_retention_pin_id: u64,
+    retention_pins: std::collections::BTreeMap<u64, u64>,
 }
 
 impl TranslogState {
@@ -689,7 +703,11 @@ impl HotTranslog {
         // Load the persisted high-water mark (survives truncation)
         let persisted_seq = if seq_no_path.exists() {
             let s = fs::read_to_string(&seq_no_path)?;
-            s.trim().parse::<u64>().unwrap_or(0)
+            s.trim().parse::<u64>().map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid translog sequence high-water mark {seq_no_path:?}: {error}"
+                )
+            })?
         } else {
             0
         };
@@ -777,6 +795,8 @@ impl HotTranslog {
                 active_generation_id,
                 active_file,
                 generations,
+                next_retention_pin_id: 1,
+                retention_pins: std::collections::BTreeMap::new(),
             })),
             data_dir: data_dir.to_path_buf(),
             manifest_path,
@@ -788,6 +808,104 @@ impl HotTranslog {
     /// Get the current (next) sequence number without incrementing.
     pub fn current_seq_no(&self) -> u64 {
         recover_lock(&self.state, "state").next_seq_no
+    }
+
+    /// Initialize a freshly prepared shard directory with an empty translog
+    /// whose next sequence number is `next_seq_no`.
+    pub fn initialize_empty_at<P: AsRef<Path>>(
+        data_dir: P,
+        durability: TranslogDurability,
+        next_seq_no: u64,
+    ) -> Result<()> {
+        let translog = Self::open_with_durability(data_dir, durability)?;
+        {
+            let mut state = recover_lock(&translog.state, "state");
+            if state.generations.len() != 1
+                || state.generations[0].first_seq_no.is_some()
+                || state.generations[0].last_seq_no.is_some()
+            {
+                anyhow::bail!("cannot initialize a non-empty translog at a recovery boundary");
+            }
+            state.next_seq_no = next_seq_no;
+        }
+        translog.persist_seq_no_high_watermark(next_seq_no)?;
+        let seq_file = File::open(&translog.seq_no_path)?;
+        seq_file.sync_all()?;
+        Ok(())
+    }
+
+    /// Read a bounded ordered range from the persisted translog without
+    /// opening an append writer. `end_seq_no` is exclusive.
+    pub fn read_bounded_range<P: AsRef<Path>>(
+        data_dir: P,
+        min_seq_no: u64,
+        end_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TranslogEntry>, bool)> {
+        if max_ops == 0 || max_bytes == 0 {
+            anyhow::bail!("bounded translog read requires non-zero limits");
+        }
+        if min_seq_no >= end_seq_no {
+            return Ok((Vec::new(), true));
+        }
+
+        let data_dir = data_dir.as_ref();
+        let manifest = load_translog_manifest(data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("translog manifest is missing"))?;
+        let mut generations = generations_from_manifest(data_dir, &manifest)?;
+        let active_generation = generations
+            .iter_mut()
+            .find(|generation| generation.id == manifest.active_generation_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "translog manifest active generation {} is missing",
+                    manifest.active_generation_id
+                )
+            })?;
+        let active_scan = scan_generation_from_path(&active_generation.path)?;
+        active_generation.first_seq_no = active_scan.first_seq_no;
+        active_generation.last_seq_no = active_scan.last_seq_no;
+        active_generation.size_bytes = fs::metadata(&active_generation.path)?.len();
+        let mut entries = Vec::new();
+        let mut bytes = 0usize;
+
+        for generation in generations.into_iter().filter(|generation| {
+            generation
+                .last_seq_no
+                .is_some_and(|last| last >= min_seq_no)
+                && generation
+                    .first_seq_no
+                    .is_none_or(|first| first < end_seq_no)
+        }) {
+            let file = File::open(&generation.path)?;
+            let mut reader = BufReader::new(file);
+            while let Some((entry, frame_bytes)) = read_next_entry(&mut reader)? {
+                if entry.seq_no < min_seq_no {
+                    continue;
+                }
+                if entry.seq_no >= end_seq_no {
+                    return Ok((entries, true));
+                }
+                if entries.len() >= max_ops
+                    || bytes
+                        .checked_add(frame_bytes)
+                        .is_none_or(|total| total > max_bytes)
+                {
+                    if entries.is_empty() {
+                        anyhow::bail!(
+                            "translog operation at seq_no {} exceeds the recovery byte limit",
+                            entry.seq_no
+                        );
+                    }
+                    return Ok((entries, false));
+                }
+                bytes += frame_bytes;
+                entries.push(entry);
+            }
+        }
+
+        Ok((entries, true))
     }
 
     /// Start a background task that periodically fsyncs the translog file.
@@ -855,17 +973,27 @@ impl HotTranslog {
         global_checkpoint: Option<u64>,
     ) -> Vec<GenerationInfo> {
         let active_generation_id = state.active_generation_id;
+        let min_pin = state.retention_pins.values().copied().min();
         let mut kept = Vec::with_capacity(state.generations.len());
         let mut removed = Vec::new();
 
         for generation in state.generations.drain(..) {
             let should_remove = generation.id != active_generation_id
-                && match global_checkpoint {
-                    Some(global_checkpoint) => generation
+                && match (global_checkpoint, min_pin) {
+                    (_, Some(0)) => false,
+                    (Some(global_checkpoint), Some(min_pin)) => generation
+                        .last_seq_no
+                        .map(|last_seq_no| last_seq_no <= global_checkpoint.min(min_pin - 1))
+                        .unwrap_or(true),
+                    (None, Some(min_pin)) => generation
+                        .last_seq_no
+                        .map(|last_seq_no| last_seq_no < min_pin)
+                        .unwrap_or(true),
+                    (Some(global_checkpoint), None) => generation
                         .last_seq_no
                         .map(|last_seq_no| last_seq_no <= global_checkpoint)
                         .unwrap_or(true),
-                    None => true,
+                    (None, None) => true,
                 };
 
             if should_remove {
@@ -1213,6 +1341,38 @@ impl WriteAheadLog for HotTranslog {
         }
 
         Ok(count)
+    }
+
+    fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64> {
+        let mut state = recover_lock(&self.state, "state");
+        if min_seq_no > state.next_seq_no {
+            anyhow::bail!(
+                "cannot pin translog at {} beyond next sequence {}",
+                min_seq_no,
+                state.next_seq_no
+            );
+        }
+        let pin_id = state.next_retention_pin_id;
+        state.next_retention_pin_id = pin_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("translog retention pin space exhausted"))?;
+        state.retention_pins.insert(pin_id, min_seq_no);
+        Ok(pin_id)
+    }
+
+    fn release_retention_pin(&self, pin_id: u64) -> Result<()> {
+        recover_lock(&self.state, "state")
+            .retention_pins
+            .remove(&pin_id);
+        Ok(())
+    }
+
+    fn min_retention_pin(&self) -> Option<u64> {
+        recover_lock(&self.state, "state")
+            .retention_pins
+            .values()
+            .copied()
+            .min()
     }
 }
 
@@ -1585,7 +1745,119 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    #[test]
+    fn bounded_range_read_reports_completion_and_limits() {
+        let (dir, tl) = open_translog();
+        for value in 0..5 {
+            tl.append(WalOperation::Index, json!({"value": value}))
+                .unwrap();
+        }
+
+        let (first, complete) =
+            HotTranslog::read_bounded_range(dir.path(), 1, 5, 2, usize::MAX).unwrap();
+        assert_eq!(
+            first.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(!complete);
+
+        let (second, complete) =
+            HotTranslog::read_bounded_range(dir.path(), 3, 5, 10, usize::MAX).unwrap();
+        assert_eq!(
+            second.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert!(complete);
+
+        let error = HotTranslog::read_bounded_range(dir.path(), 0, 5, 1, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the recovery byte limit")
+        );
+    }
+
+    #[test]
+    fn initialize_empty_at_sets_recovery_sequence_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        HotTranslog::initialize_empty_at(dir.path(), TranslogDurability::Request, 7).unwrap();
+
+        let translog = HotTranslog::open(dir.path()).unwrap();
+        assert_eq!(translog.next_seq_no(), 7);
+        assert!(translog.read_all().unwrap().is_empty());
+        assert_eq!(
+            translog
+                .append(WalOperation::Index, json!({"value": 7}))
+                .unwrap()
+                .seq_no,
+            7
+        );
+    }
+
     // ── truncate_below ──────────────────────────────────────────────────
+
+    #[test]
+    fn retention_pin_bounds_checkpoint_and_full_truncation() {
+        let (_dir, translog) = open_translog();
+        translog
+            .append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        translog
+            .append(WalOperation::Index, json!({"value": 1}))
+            .unwrap();
+        translog.truncate_below(0).unwrap();
+        translog
+            .append(WalOperation::Index, json!({"value": 2}))
+            .unwrap();
+        translog
+            .append(WalOperation::Index, json!({"value": 3}))
+            .unwrap();
+
+        let pin = translog.register_retention_pin(2).unwrap();
+        assert_eq!(translog.min_retention_pin(), Some(2));
+        translog.truncate_below(u64::MAX).unwrap();
+        assert_eq!(
+            translog
+                .read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+
+        translog.truncate().unwrap();
+        assert_eq!(
+            translog
+                .read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+
+        translog.release_retention_pin(pin).unwrap();
+        assert_eq!(translog.min_retention_pin(), None);
+        translog.truncate().unwrap();
+        assert!(translog.read_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn zero_retention_pin_prevents_pruning_any_history() {
+        let (_dir, translog) = open_translog();
+        translog
+            .append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        let pin = translog.register_retention_pin(0).unwrap();
+
+        translog.truncate().unwrap();
+        assert_eq!(translog.read_all().unwrap()[0].seq_no, 0);
+
+        translog.release_retention_pin(pin).unwrap();
+        translog.truncate().unwrap();
+        assert!(translog.read_all().unwrap().is_empty());
+    }
 
     #[test]
     fn truncate_below_keeps_mixed_generation_until_future_roll() {

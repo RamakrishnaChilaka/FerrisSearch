@@ -75,6 +75,10 @@ pub struct AppConfig {
     /// Default: 5. Set to 0 to always populate. Set to 100 to never eagerly populate.
     #[serde(default = "default_column_cache_populate_threshold")]
     pub column_cache_populate_threshold: u8,
+    /// Maximum concurrent target-side peer recoveries on this node.
+    /// Default: 2. Set to 0 to disable peer recovery.
+    #[serde(default = "default_max_concurrent_peer_recoveries")]
+    pub max_concurrent_peer_recoveries: usize,
     /// Maximum docs to scan for GROUP BY queries that fall back to the
     /// tantivy_fast_fields path (expression GROUP BY, STDDEV_POP, etc.).
     /// Default: 1,000,000. Set to 0 for unlimited.
@@ -147,6 +151,10 @@ fn default_column_cache_populate_threshold() -> u8 {
     5
 }
 
+fn default_max_concurrent_peer_recoveries() -> usize {
+    2
+}
+
 fn default_sql_group_by_scan_limit() -> usize {
     1_000_000
 }
@@ -169,6 +177,7 @@ impl Default for AppConfig {
             translog_sync_interval_ms: None,
             column_cache_size_percent: 10,
             column_cache_populate_threshold: 5,
+            max_concurrent_peer_recoveries: 2,
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: true,
             transport_tls_enabled: false,
@@ -198,6 +207,10 @@ impl AppConfig {
             .set_default("seed_hosts", default.seed_hosts)?
             .set_default("raft_node_id", default.raft_node_id)?
             .set_default("translog_durability", default.translog_durability)?
+            .set_default(
+                "max_concurrent_peer_recoveries",
+                default.max_concurrent_peer_recoveries as u64,
+            )?
             .add_source(File::with_name("config/ferrissearch").required(false))
             .add_source(Environment::with_prefix("FERRISSEARCH"));
 
@@ -396,6 +409,7 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.column_cache_size_percent, 10);
         assert_eq!(config.column_cache_populate_threshold, 5);
+        assert_eq!(config.max_concurrent_peer_recoveries, 2);
     }
 
     #[test]
@@ -422,6 +436,19 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.column_cache_size_percent, 10);
         assert_eq!(config.column_cache_populate_threshold, 5);
+        assert_eq!(config.max_concurrent_peer_recoveries, 2);
+    }
+
+    #[test]
+    fn peer_recovery_concurrency_deserializes_and_zero_is_preserved() {
+        let json = r#"{
+            "node_name": "n1", "cluster_name": "test", "http_port": 9200,
+            "transport_port": 9300, "data_dir": "./data",
+            "seed_hosts": ["127.0.0.1:9300"],
+            "max_concurrent_peer_recoveries": 0
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_concurrent_peer_recoveries, 0);
     }
 
     #[test]

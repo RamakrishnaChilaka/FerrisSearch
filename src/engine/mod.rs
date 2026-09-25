@@ -46,6 +46,25 @@ pub struct DeleteWriteReceipt {
     pub seq_no: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRecoveryFileMetadata {
+    pub name: String,
+    pub length: u64,
+    pub sha256: String,
+}
+
+pub struct PeerRecoverySnapshot {
+    pub snapshot_next_seq_no: u64,
+    pub retention_pin_id: u64,
+    pub files: Vec<PeerRecoveryFileMetadata>,
+}
+
+pub struct PeerRecoveryOpsBatch {
+    pub operations: Vec<crate::wal::TranslogEntry>,
+    pub primary_next_seq_no: u64,
+    pub complete: bool,
+}
+
 /// Per-segment metadata for diagnostics and monitoring.
 pub struct SegmentInfo {
     pub segment_id: String,
@@ -289,6 +308,30 @@ pub trait SearchEngine: Send + Sync {
 
     /// Update the global checkpoint (called by primary after collecting replica checkpoints).
     fn update_global_checkpoint(&self, _checkpoint: u64) {}
+
+    fn create_peer_recovery_snapshot(
+        &self,
+        _snapshot_dir: &std::path::Path,
+    ) -> Result<PeerRecoverySnapshot> {
+        anyhow::bail!("peer recovery snapshots are not supported by this engine")
+    }
+
+    fn release_peer_recovery_pin(&self, _pin_id: u64) -> Result<()> {
+        anyhow::bail!("peer recovery retention pins are not supported by this engine")
+    }
+
+    fn peer_recovery_ops(
+        &self,
+        _min_seq_no: u64,
+        _max_ops: usize,
+        _max_bytes: usize,
+    ) -> Result<PeerRecoveryOpsBatch> {
+        anyhow::bail!("peer recovery operation streaming is not supported by this engine")
+    }
+
+    fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
+        anyhow::bail!("peer recovery commit inspection is not supported by this engine")
+    }
 }
 
 #[cfg(test)]

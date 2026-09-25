@@ -93,6 +93,11 @@ architecture decision.
   and automatic promotion use only `ShardRoutingEntry.in_sync_replicas`; an
   assigned but out-of-sync copy is never promotable. If no in-sync copy
   survives, keep the shard unavailable rather than promoting stale data.
+- **Peer recovery admission is barriered and conditional.** A target installs a
+  committed Tantivy file snapshot, replays the pinned WAL suffix, reaches the
+  primary's exclusive write-barrier head, and enters the in-sync set only
+  through a `(primary, primary_term)` Raft compare-and-set. Never release an
+  unresolved admission barrier by guessing whether membership committed.
 - **Synchronous replication failures are request failures.** Do not turn
   partial replication into success-shaped responses.
 - **Remote publication is not multi-writer safe yet.** Do not claim otherwise

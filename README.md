@@ -263,7 +263,10 @@ coordinator-side merge semantics are required.
 - Generation-based binary translog with request or asynchronous durability
 - Primary write receipts propagated to REST `_seq_no` responses, including bulk
   ranges, with replica WAL sequence preservation
-- Monotonic sequence high-watermark tracking and WAL catch-up
+- Monotonic sequence high-watermark tracking
+- Bounded file-based peer recovery for later-added/rejoining replicas:
+  committed Tantivy files, pinned WAL suffix, final write barrier, and
+  conditional in-sync admission
 - UUID-backed shard data directories and process-backed restart regression
 - Separate rayon pools for search and write engine work
 - Blocking wrappers for filesystem/recovery work on async call paths
@@ -286,6 +289,11 @@ by visible finite cgroup v2 `memory.max` or cgroup v1
 exports `ferrissearch_column_cache_effective_memory_bytes` and
 `ferrissearch_column_cache_budget_bytes`. This is only the shared column-cache
 capacity; it is not a total-process memory limit.
+
+`max_concurrent_peer_recoveries` limits target-side recovery sessions per node
+(default `2`, maximum `64`). Set it to `0`, or set
+`FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES=0`, to keep assigned replicas
+`INITIALIZING` without automatic recovery.
 
 Force merge keeps its asynchronous `202 Accepted` task lifecycle. A valid
 `max_num_segments` is at least 1; each shard drains already-scheduled automatic

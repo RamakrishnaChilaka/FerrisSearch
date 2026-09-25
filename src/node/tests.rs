@@ -5,6 +5,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::test]
+async fn node_rejects_excessive_peer_recovery_concurrency() {
+    let config = crate::config::AppConfig {
+        max_concurrent_peer_recoveries: 65,
+        ..Default::default()
+    };
+    let error = match Node::new(config).await {
+        Ok(_) => panic!("excessive peer recovery concurrency must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("max_concurrent_peer_recoveries must be between 0 and 64")
+    );
+}
+
+#[tokio::test]
 async fn open_local_assigned_shards_opens_unopened_local_shards() {
     let dir = tempfile::tempdir().unwrap();
     let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));

@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
+use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -110,6 +112,10 @@ pub struct HotEngine {
     force_merge_before_wait_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     refresh_before_writer_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
+    #[cfg(test)]
+    peer_recovery_snapshot_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     field_registry: RwLock<FieldRegistry>,
     /// The per-index refresh interval (e.g. 5s default, matches OpenSearch's index.refresh_interval)
     pub refresh_interval: Duration,
@@ -300,6 +306,56 @@ fn evolve_meta_json_schema(
     Ok(())
 }
 
+fn validate_existing_schema_mappings(
+    meta_json_path: &Path,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(meta_json_path)?;
+    let meta: serde_json::Value = serde_json::from_str(&raw)?;
+    let stored_schema: Schema = serde_json::from_value(
+        meta.get("schema")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("meta.json missing 'schema' array"))?,
+    )?;
+
+    for (name, mapping) in mappings {
+        if matches!(
+            mapping.field_type,
+            crate::cluster::state::FieldType::KnnVector
+        ) {
+            continue;
+        }
+        let Ok(field) = stored_schema.get_field(name) else {
+            continue;
+        };
+        let field_type = stored_schema.get_field_entry(field).field_type();
+        let matches_mapping = match (&mapping.field_type, field_type) {
+            (crate::cluster::state::FieldType::Text, tantivy::schema::FieldType::Str(options)) => {
+                options
+                    .get_indexing_options()
+                    .is_some_and(|indexing| indexing.tokenizer() != "raw")
+            }
+            (
+                crate::cluster::state::FieldType::Keyword
+                | crate::cluster::state::FieldType::Boolean,
+                tantivy::schema::FieldType::Str(options),
+            ) => options
+                .get_indexing_options()
+                .is_some_and(|indexing| indexing.tokenizer() == "raw"),
+            (
+                crate::cluster::state::FieldType::Integer | crate::cluster::state::FieldType::Date,
+                tantivy::schema::FieldType::I64(_),
+            ) => true,
+            (crate::cluster::state::FieldType::Float, tantivy::schema::FieldType::F64(_)) => true,
+            _ => false,
+        };
+        if !matches_mapping {
+            anyhow::bail!("schema does not match authoritative mappings for field '{name}'");
+        }
+    }
+    Ok(())
+}
+
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -362,6 +418,7 @@ impl HotEngine {
         // new mapped fields before opening.  This preserves the existing field
         // order (and thus Field handle IDs) and only appends.
         if index_exists {
+            validate_existing_schema_mappings(&meta_json_path, mappings)?;
             evolve_meta_json_schema(&meta_json_path, mappings)?;
         }
 
@@ -456,6 +513,10 @@ impl HotEngine {
             force_merge_before_wait_sender: Mutex::new(None),
             #[cfg(test)]
             refresh_before_writer_sender: Mutex::new(None),
+            #[cfg(test)]
+            peer_recovery_snapshot_ready_sender: Mutex::new(None),
+            #[cfg(test)]
+            peer_recovery_snapshot_release_receiver: Mutex::new(None),
             field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
@@ -1520,12 +1581,92 @@ impl HotEngine {
             return Ok(0);
         }
         let s = std::fs::read_to_string(&self.committed_seq_no_path)?;
-        Ok(s.trim().parse::<u64>().unwrap_or(0))
+        s.trim().parse::<u64>().map_err(|error| {
+            anyhow::anyhow!(
+                "invalid committed translog checkpoint {:?}: {}",
+                self.committed_seq_no_path,
+                error
+            )
+        })
     }
 
     fn persist_committed_next_seq_no(&self, next_seq_no: u64) -> Result<()> {
         std::fs::write(&self.committed_seq_no_path, next_seq_no.to_string())?;
         Ok(())
+    }
+
+    fn persist_committed_next_seq_no_durable(&self, next_seq_no: u64) -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.committed_seq_no_path)?;
+        write!(file, "{next_seq_no}")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn peer_recovery_file_names(&self) -> Result<Vec<String>> {
+        let index_path = self
+            .committed_seq_no_path
+            .parent()
+            .expect("committed checkpoint path has a parent")
+            .join("index");
+        let mut paths: std::collections::HashSet<PathBuf> = self
+            .index
+            .searchable_segment_metas()?
+            .into_iter()
+            .flat_map(|segment| segment.list_files())
+            .filter(|path| index_path.join(path).is_file())
+            .collect();
+        paths.insert(PathBuf::from("meta.json"));
+
+        if index_path.join(".managed.json").exists() {
+            paths.insert(PathBuf::from(".managed.json"));
+        }
+
+        let mut names = Vec::with_capacity(paths.len());
+        for path in paths {
+            if path.components().count() != 1 {
+                anyhow::bail!("Tantivy committed file path {path:?} is not a plain file name");
+            }
+            names.push(
+                path.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("Tantivy file name is not UTF-8"))?
+                    .to_string(),
+            );
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn hash_peer_recovery_file(path: &Path) -> Result<super::PeerRecoveryFileMetadata> {
+        let mut file = std::fs::File::open(path)?;
+        let length = file.metadata()?.len();
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let sha256 = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("peer recovery file name is not UTF-8"))?
+            .to_string();
+        Ok(super::PeerRecoveryFileMetadata {
+            name,
+            length,
+            sha256,
+        })
     }
 
     /// Starts the per-index background refresh loop.
@@ -5792,6 +5933,136 @@ impl super::SearchEngine for HotEngine {
         )?))
     }
 
+    fn create_peer_recovery_snapshot(
+        &self,
+        snapshot_dir: &Path,
+    ) -> Result<super::PeerRecoverySnapshot> {
+        if snapshot_dir.exists() {
+            anyhow::bail!("peer recovery snapshot directory already exists: {snapshot_dir:?}");
+        }
+        std::fs::create_dir_all(snapshot_dir)?;
+
+        let _maintenance = self.maintenance_guard("peer recovery snapshot")?;
+        let (snapshot_next_seq_no, retention_pin_id, file_names) =
+            self.with_translog("peer recovery snapshot", |translog| {
+                let snapshot_next_seq_no = translog.next_seq_no();
+                let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+                writer_state
+                    .writer_mut("peer recovery snapshot")?
+                    .commit()?;
+                drop(writer_state);
+                self.persist_committed_next_seq_no_durable(snapshot_next_seq_no)?;
+                let retention_pin_id =
+                    translog.register_retention_pin(snapshot_next_seq_no)?;
+
+                let result = (|| {
+                    let file_names = self.peer_recovery_file_names()?;
+                    let index_path = self
+                        .committed_seq_no_path
+                        .parent()
+                        .expect("committed checkpoint path has a parent")
+                        .join("index");
+                    for name in &file_names {
+                        let source = index_path.join(name);
+                        let destination = snapshot_dir.join(name);
+                        std::fs::hard_link(&source, &destination).with_context(|| {
+                            format!(
+                                "hard-link peer recovery file {source:?} to {destination:?}; unlocked copies are not permitted"
+                            )
+                        })?;
+                    }
+                    std::fs::File::open(snapshot_dir)?.sync_all()?;
+                    Ok(file_names)
+                })();
+
+                match result {
+                    Ok(file_names) => {
+                        Ok((snapshot_next_seq_no, retention_pin_id, file_names))
+                    }
+                    Err(error) => {
+                        let _ = translog.release_retention_pin(retention_pin_id);
+                        let _ = std::fs::remove_dir_all(snapshot_dir);
+                        Err(error)
+                    }
+                }
+            })?;
+
+        #[cfg(test)]
+        if let Some(sender) = self
+            .peer_recovery_snapshot_ready_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = sender.send(snapshot_next_seq_no);
+        }
+        #[cfg(test)]
+        if let Some(receiver) = self
+            .peer_recovery_snapshot_release_receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = receiver.recv();
+        }
+
+        let files = file_names
+            .into_iter()
+            .map(|name| Self::hash_peer_recovery_file(&snapshot_dir.join(name)))
+            .collect::<Result<Vec<_>>>();
+        let files = match files {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = self.release_peer_recovery_pin(retention_pin_id);
+                let _ = std::fs::remove_dir_all(snapshot_dir);
+                return Err(error);
+            }
+        };
+
+        Ok(super::PeerRecoverySnapshot {
+            snapshot_next_seq_no,
+            retention_pin_id,
+            files,
+        })
+    }
+
+    fn release_peer_recovery_pin(&self, pin_id: u64) -> Result<()> {
+        self.with_translog("peer recovery pin release", |translog| {
+            translog.release_retention_pin(pin_id)
+        })
+    }
+
+    fn peer_recovery_ops(
+        &self,
+        min_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<super::PeerRecoveryOpsBatch> {
+        let primary_next_seq_no = self.with_translog("peer recovery head read", |translog| {
+            Ok(translog.next_seq_no())
+        })?;
+        let data_dir = self
+            .committed_seq_no_path
+            .parent()
+            .expect("committed checkpoint path has a parent");
+        let (operations, complete) = HotTranslog::read_bounded_range(
+            data_dir,
+            min_seq_no,
+            primary_next_seq_no,
+            max_ops,
+            max_bytes,
+        )?;
+        Ok(super::PeerRecoveryOpsBatch {
+            operations,
+            primary_next_seq_no,
+            complete,
+        })
+    }
+
+    fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
+        self.peer_recovery_file_names()
+    }
+
     fn doc_count(&self) -> u64 {
         self.reader.searcher().num_docs()
     }
@@ -6616,6 +6887,8 @@ mod tests {
             force_merge_entry_barrier: Mutex::new(None),
             force_merge_before_wait_sender: Mutex::new(None),
             refresh_before_writer_sender: Mutex::new(None),
+            peer_recovery_snapshot_ready_sender: Mutex::new(None),
+            peer_recovery_snapshot_release_receiver: Mutex::new(None),
             field_registry: RwLock::new(FieldRegistry {
                 id_field,
                 source_field,
@@ -10119,6 +10392,124 @@ mod tests {
         // Docs still searchable (committed)
         engine.refresh().unwrap();
         assert_eq!(engine.doc_count(), 2);
+    }
+
+    #[test]
+    fn peer_recovery_snapshot_has_exact_boundary_and_retained_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap());
+        engine.add_document("d0", json!({"value": 0})).unwrap();
+        engine.add_document("d1", json!({"value": 1})).unwrap();
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *engine.peer_recovery_snapshot_ready_sender.lock().unwrap() = Some(ready_tx);
+        *engine
+            .peer_recovery_snapshot_release_receiver
+            .lock()
+            .unwrap() = Some(release_rx);
+        let snapshot_dir = dir.path().join("peer-recovery").join("session");
+        let snapshot_engine = engine.clone();
+        let snapshot_dir_for_thread = snapshot_dir.clone();
+        let snapshot_handle = std::thread::spawn(move || {
+            snapshot_engine.create_peer_recovery_snapshot(&snapshot_dir_for_thread)
+        });
+
+        assert_eq!(
+            ready_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap(),
+            2,
+            "snapshot boundary must be captured before the concurrent write"
+        );
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let writer_engine = engine.clone();
+        let writer_handle = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let result = writer_engine.add_document_with_receipt("d2", json!({"value": 2}));
+            completed_tx.send(()).unwrap();
+            result
+        });
+        attempted_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        completed_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        release_tx.send(()).unwrap();
+        let write_receipt = writer_handle.join().unwrap().unwrap();
+        let snapshot = snapshot_handle.join().unwrap().unwrap();
+        assert_eq!(snapshot.snapshot_next_seq_no, 2);
+        assert_eq!(write_receipt.seq_no, 2);
+
+        let snapshot_index =
+            Index::open(tantivy::directory::MmapDirectory::open(&snapshot_dir).unwrap()).unwrap();
+        let snapshot_reader = snapshot_index.reader().unwrap();
+        assert_eq!(snapshot_reader.searcher().num_docs(), 2);
+
+        let suffix = engine.peer_recovery_ops(2, 16, 1024 * 1024).unwrap();
+        assert!(suffix.complete);
+        assert_eq!(suffix.primary_next_seq_no, 3);
+        assert_eq!(
+            suffix
+                .operations
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        engine
+            .release_peer_recovery_pin(snapshot.retention_pin_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn peer_recovery_pin_is_respected_by_every_flush_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.add_document("base", json!({"value": 0})).unwrap();
+        let snapshot_dir = dir.path().join("peer-recovery").join("session");
+        let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+        assert_eq!(snapshot.snapshot_next_seq_no, 1);
+
+        let assert_retained = |expected: &[u64]| {
+            let batch = engine
+                .peer_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
+                .unwrap();
+            assert_eq!(
+                batch
+                    .operations
+                    .iter()
+                    .map(|entry| entry.seq_no)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        };
+
+        engine.add_document("flush", json!({"value": 1})).unwrap();
+        engine.flush().unwrap();
+        assert_retained(&[1]);
+
+        engine
+            .add_document("checkpoint", json!({"value": 2}))
+            .unwrap();
+        engine.flush_with_global_checkpoint(u64::MAX).unwrap();
+        assert_retained(&[1, 2]);
+
+        engine.add_document("zero", json!({"value": 3})).unwrap();
+        engine.flush_with_global_checkpoint(0).unwrap();
+        assert_retained(&[1, 2, 3]);
+
+        engine.add_document("try", json!({"value": 4})).unwrap();
+        assert!(engine.try_flush_with_global_checkpoint(u64::MAX).unwrap());
+        assert_retained(&[1, 2, 3, 4]);
+
+        engine
+            .release_peer_recovery_pin(snapshot.retention_pin_id)
+            .unwrap();
+        engine.flush().unwrap();
+        assert!(
+            engine
+                .peer_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
+                .unwrap()
+                .operations
+                .is_empty()
+        );
     }
 
     #[test]

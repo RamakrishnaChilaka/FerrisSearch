@@ -5,9 +5,9 @@
 use crate::cluster::settings::SettingsManager;
 use crate::cluster::state::IndexSettings;
 use crate::engine::{CompositeEngine, SearchEngine};
-use crate::wal::TranslogDurability;
+use crate::wal::{HotTranslog, TranslogDurability};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -15,6 +15,18 @@ use std::time::Duration;
 pub const SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX: &str = "api_delete_index";
 pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_delete_index_rpc";
 pub const SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP: &str = "orphan_cleanup_unknown_uuid";
+pub const PEER_RECOVERY_IN_PROGRESS_MARKER: &str = "PEER_RECOVERY_IN_PROGRESS";
+
+pub struct PeerRecoveryTargetInstall {
+    pub index: String,
+    pub shard_id: u32,
+    pub mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+    pub settings: IndexSettings,
+    pub index_uuid: String,
+    pub shard_dir: PathBuf,
+    pub snapshot_next_seq_no: u64,
+    pub expected_files: Vec<String>,
+}
 
 /// Key uniquely identifying a shard: (index_name, shard_id)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -168,6 +180,7 @@ pub struct ShardManager {
     /// Serializes concurrent open attempts for the same shard key so only
     /// one thread performs the expensive CompositeEngine creation at a time.
     open_locks: Mutex<HashMap<ShardKey, Arc<Mutex<()>>>>,
+    peer_recovery_targets: RwLock<HashSet<ShardKey>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
     pub isr_tracker: IsrTracker,
     /// Translog durability mode for new shards.
@@ -205,6 +218,7 @@ impl ShardManager {
             settings_managers: RwLock::new(HashMap::new()),
             index_uuids: RwLock::new(HashMap::new()),
             open_locks: Mutex::new(HashMap::new()),
+            peer_recovery_targets: RwLock::new(HashSet::new()),
             isr_tracker: IsrTracker::new(1000),
             durability,
             column_cache,
@@ -288,6 +302,7 @@ impl ShardManager {
         shard_dir: &std::path::Path,
         refresh_interval: Duration,
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        allow_schema_reset: bool,
     ) -> Result<Arc<CompositeEngine>> {
         const LOCK_BUSY_RETRIES: usize = 50;
         const LOCK_BUSY_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -304,7 +319,10 @@ impl ShardManager {
                 Ok(engine) => return Ok(Arc::new(engine)),
                 Err(err) => {
                     let err_msg = err.to_string();
-                    if err_msg.contains("schema does not match") && !cleaned_stale_schema {
+                    if allow_schema_reset
+                        && err_msg.contains("schema does not match")
+                        && !cleaned_stale_schema
+                    {
                         tracing::warn!(
                             "Schema mismatch for {}/shard_{}, removing stale data and retrying",
                             index,
@@ -344,7 +362,37 @@ impl ShardManager {
         settings: &IndexSettings,
         index_uuid: &str,
     ) -> Result<Arc<dyn SearchEngine>> {
+        self.open_shard_with_settings_mode(index, shard_id, mappings, settings, index_uuid, true)
+    }
+
+    pub fn open_shard_with_settings_strict(
+        &self,
+        index: &str,
+        shard_id: u32,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: &IndexSettings,
+        index_uuid: &str,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        self.open_shard_with_settings_mode(index, shard_id, mappings, settings, index_uuid, false)
+    }
+
+    fn open_shard_with_settings_mode(
+        &self,
+        index: &str,
+        shard_id: u32,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: &IndexSettings,
+        index_uuid: &str,
+        allow_schema_reset: bool,
+    ) -> Result<Arc<dyn SearchEngine>> {
         let key = ShardKey::new(index, shard_id);
+        let shard_dir = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"));
+        if shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists() {
+            anyhow::bail!("shard {index}/{shard_id} has an incomplete peer recovery installation");
+        }
 
         // Fast path: shard already open.
         {
@@ -373,7 +421,6 @@ impl ShardManager {
         }
 
         self.register_index_uuid(index, index_uuid);
-        let uuid = index_uuid.to_string();
 
         // Ensure a settings manager exists for this index
         let settings_mgr = self.ensure_settings_manager(index, settings);
@@ -381,11 +428,20 @@ impl ShardManager {
         let refresh_rx = settings_mgr.watch_refresh_interval();
         let flush_threshold_rx = settings_mgr.watch_flush_threshold();
 
-        let shard_dir = self.data_dir.join(&uuid).join(format!("shard_{shard_id}"));
         std::fs::create_dir_all(&shard_dir)?;
+        let stale_snapshot_dir = shard_dir.join("peer-recovery");
+        if stale_snapshot_dir.exists() {
+            Self::remove_dir_all_with_retry(&stale_snapshot_dir)?;
+        }
 
-        let engine =
-            self.open_composite_engine(index, shard_id, &shard_dir, refresh_interval, mappings)?;
+        let engine = self.open_composite_engine(
+            index,
+            shard_id,
+            &shard_dir,
+            refresh_interval,
+            mappings,
+            allow_schema_reset,
+        )?;
         CompositeEngine::start_refresh_loop_reactive(
             engine.clone(),
             refresh_rx,
@@ -437,6 +493,213 @@ impl ShardManager {
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking shard open task failed: {e}"))?
+    }
+
+    pub async fn open_shard_with_settings_strict_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: IndexSettings,
+        index_uuid: impl Into<String> + Send + 'static,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let shard_manager = self.clone();
+        let uuid_str = index_uuid.into();
+        tokio::task::spawn_blocking(move || {
+            shard_manager
+                .open_shard_with_settings_strict(&index, shard_id, &mappings, &settings, &uuid_str)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking strict shard open task failed: {e}"))?
+    }
+
+    pub fn begin_peer_recovery_target(&self, index: &str, shard_id: u32) -> bool {
+        self.peer_recovery_targets
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ShardKey::new(index, shard_id))
+    }
+
+    pub fn end_peer_recovery_target(&self, index: &str, shard_id: u32) {
+        self.peer_recovery_targets
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ShardKey::new(index, shard_id));
+    }
+
+    pub fn is_peer_recovery_target(&self, index: &str, shard_id: u32) -> bool {
+        self.peer_recovery_targets
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&ShardKey::new(index, shard_id))
+    }
+
+    pub async fn prepare_peer_recovery_target_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+    ) -> Result<PathBuf> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = ShardKey::new(&index, shard_id);
+            let per_shard_lock = {
+                let mut locks = shard_manager
+                    .open_locks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                locks.entry(key.clone()).or_default().clone()
+            };
+            let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+            shard_manager
+                .shards
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            shard_manager.isr_tracker.remove_shard(&index, shard_id);
+            shard_manager.register_index_uuid(&index, &index_uuid);
+
+            let shard_dir = shard_manager
+                .data_dir
+                .join(&index_uuid)
+                .join(format!("shard_{shard_id}"));
+            if shard_dir.exists() {
+                Self::remove_dir_all_with_retry(&shard_dir)?;
+            }
+            std::fs::create_dir_all(shard_dir.join("index"))?;
+            let marker_path = shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER);
+            let marker = std::fs::File::create(&marker_path)?;
+            marker.sync_all()?;
+            std::fs::File::open(&shard_dir)?.sync_all()?;
+            Ok(shard_dir)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking peer recovery target preparation failed: {e}"))?
+    }
+
+    pub async fn finalize_peer_recovery_target_blocking(
+        self: &Arc<Self>,
+        install: PeerRecoveryTargetInstall,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let PeerRecoveryTargetInstall {
+                index,
+                shard_id,
+                mappings,
+                settings,
+                index_uuid,
+                shard_dir,
+                snapshot_next_seq_no,
+                mut expected_files,
+            } = install;
+            let key = ShardKey::new(&index, shard_id);
+            let per_shard_lock = {
+                let mut locks = shard_manager
+                    .open_locks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                locks.entry(key.clone()).or_default().clone()
+            };
+            let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if !shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists() {
+                anyhow::bail!("peer recovery marker disappeared before install finalization");
+            }
+
+            HotTranslog::initialize_empty_at(
+                &shard_dir,
+                shard_manager.durability,
+                snapshot_next_seq_no,
+            )?;
+            let committed_path = shard_dir.join("translog.committed");
+            let mut committed = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&committed_path)?;
+            use std::io::Write;
+            write!(committed, "{snapshot_next_seq_no}")?;
+            committed.sync_all()?;
+            std::fs::File::open(shard_dir.join("index"))?.sync_all()?;
+
+            shard_manager.register_index_uuid(&index, &index_uuid);
+            let settings_manager = shard_manager.ensure_settings_manager(&index, &settings);
+            let refresh_interval = settings_manager.refresh_interval();
+            let refresh_rx = settings_manager.watch_refresh_interval();
+            let flush_threshold_rx = settings_manager.watch_flush_threshold();
+            let engine = shard_manager.open_composite_engine(
+                &index,
+                shard_id,
+                &shard_dir,
+                refresh_interval,
+                &mappings,
+                false,
+            )?;
+            let mut actual_files = engine.peer_recovery_commit_files()?;
+            expected_files.sort();
+            actual_files.sort();
+            if actual_files != expected_files {
+                anyhow::bail!(
+                    "installed peer recovery commit file set does not match the source snapshot"
+                );
+            }
+
+            let has_vectors = mappings.values().any(|mapping| {
+                matches!(
+                    mapping.field_type,
+                    crate::cluster::state::FieldType::KnnVector
+                )
+            });
+            if has_vectors {
+                engine.rebuild_vectors()?;
+            }
+
+            std::fs::remove_file(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER))?;
+            std::fs::File::open(&shard_dir)?.sync_all()?;
+
+            CompositeEngine::start_refresh_loop_reactive(
+                engine.clone(),
+                refresh_rx,
+                flush_threshold_rx,
+            );
+            let dynamic_engine: Arc<dyn SearchEngine> = engine;
+            shard_manager
+                .shards
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, dynamic_engine.clone());
+            Ok(dynamic_engine)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking peer recovery target finalization failed: {e}"))?
+    }
+
+    pub async fn abort_peer_recovery_target_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = ShardKey::new(&index, shard_id);
+            shard_manager
+                .shards
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            let shard_dir = shard_manager
+                .data_dir
+                .join(index_uuid)
+                .join(format!("shard_{shard_id}"));
+            std::fs::create_dir_all(&shard_dir)?;
+            let marker = std::fs::File::create(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER))?;
+            marker.sync_all()?;
+            std::fs::File::open(shard_dir)?.sync_all()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking peer recovery abort failed: {e}"))?
     }
 
     /// Close an existing shard engine and reopen it with updated mappings.
@@ -505,6 +768,7 @@ impl ShardManager {
                 &shard_dir,
                 refresh_interval,
                 &mappings,
+                true,
             )?;
             CompositeEngine::start_refresh_loop_reactive(
                 engine.clone(),
@@ -1290,5 +1554,152 @@ mod tests {
             known_uuid.exists(),
             "known UUID directories must be retained"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_recovery_marker_blocks_normal_shard_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let shard_dir = manager
+            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into())
+            .await
+            .unwrap();
+
+        assert!(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists());
+        let error = match manager.open_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+        ) {
+            Ok(_) => panic!("normal shard open must reject an in-progress recovery marker"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete peer recovery installation")
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_recovery_open_refuses_schema_mismatch_without_wiping() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard_dir = dir.path().join("uuid-1").join("shard_0");
+        let original_mappings = HashMap::from([(
+            "value".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        {
+            let engine = CompositeEngine::new_with_mappings(
+                &shard_dir,
+                Duration::from_secs(60),
+                &original_mappings,
+                TranslogDurability::Request,
+                Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0)),
+            )
+            .unwrap();
+            engine
+                .add_document("doc-1", json!({"value": "preserved"}))
+                .unwrap();
+            engine.refresh().unwrap();
+        }
+        let meta_before = std::fs::read(shard_dir.join("index/meta.json")).unwrap();
+
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let incompatible = HashMap::from([(
+            "value".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        )]);
+        let error = match manager.open_shard_with_settings_strict(
+            "idx",
+            0,
+            &incompatible,
+            &IndexSettings::default(),
+            "uuid-1",
+        ) {
+            Ok(_) => panic!("strict recovery open must reject an incompatible schema"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("schema does not match"));
+        assert_eq!(
+            std::fs::read(shard_dir.join("index/meta.json")).unwrap(),
+            meta_before,
+            "strict recovery open must not invoke the schema-mismatch wipe fallback"
+        );
+
+        let reopened = manager
+            .open_shard_with_settings_strict(
+                "idx",
+                0,
+                &original_mappings,
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.get_document("doc-1").unwrap().unwrap()["value"],
+            json!("preserved")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalized_peer_recovery_install_opens_exact_snapshot() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = CompositeEngine::new(source_dir.path(), Duration::from_secs(60)).unwrap();
+        source.add_document("doc-1", json!({"value": 1})).unwrap();
+        source.add_document("doc-2", json!({"value": 2})).unwrap();
+        let snapshot_dir = source_dir.path().join("peer-recovery/session");
+        let snapshot = source.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(
+            target_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let shard_dir = manager
+            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into())
+            .await
+            .unwrap();
+        for file in &snapshot.files {
+            let destination = shard_dir.join("index").join(&file.name);
+            std::fs::copy(snapshot_dir.join(&file.name), &destination).unwrap();
+            std::fs::File::open(destination)
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+
+        let engine = manager
+            .finalize_peer_recovery_target_blocking(PeerRecoveryTargetInstall {
+                index: "idx".into(),
+                shard_id: 0,
+                mappings: HashMap::new(),
+                settings: IndexSettings::default(),
+                index_uuid: "uuid-1".into(),
+                shard_dir: shard_dir.clone(),
+                snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+                expected_files: snapshot
+                    .files
+                    .iter()
+                    .map(|file| file.name.clone())
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(engine.doc_count(), 2);
+        assert!(!shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists());
+        source
+            .release_peer_recovery_pin(snapshot.retention_pin_id)
+            .unwrap();
     }
 }

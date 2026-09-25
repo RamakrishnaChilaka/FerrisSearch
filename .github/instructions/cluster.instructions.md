@@ -21,7 +21,7 @@ FieldMapping { field_type, dimension }  // dimension for knn_vector only
 RemoteStoreSettings { object_store_uri, manifest_path, manifest_generation, manifest_checksum, manifest_refresh_ms, hotcache_bytes, split_cache_bytes }
 IndexSettings { engine: IndexEngine, refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64>, remote_store: Option<RemoteStoreSettings> }  // engine defaults to LocalShards
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
-ShardRoutingEntry { primary, replicas, in_sync_replicas, unassigned_replicas }
+ShardRoutingEntry { primary, primary_term, replicas, in_sync_replicas, unassigned_replicas }
 IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, dynamic, settings }
 SecurityApiKeyRecord { id, name, hash_sha256, roles, indices, created_at_millis }   // hash only, never plaintext
 SecurityRoleDefinition { name, cluster, indices, index_privileges }                 // custom role
@@ -95,6 +95,16 @@ fn allocate_unassigned_replicas(&mut self, data_nodes: &[String]) -> bool
   promotable.
 - Missing `in_sync_replicas` in pre-1.0 serde metadata defaults to empty. This
   deliberately fails closed; legacy replicas do not inherit eligibility.
+- `primary_term` is per shard, starts at 1 for new indices, and defaults to 0
+  only when reading legacy pre-term metadata. `UpdateIndex` cannot set it:
+  unchanged primaries preserve the current term and accepted primary changes
+  increment it in the Raft state machine.
+- `UpdateIndex` can only remove in-sync members by intersecting the current set
+  with the submitted replica assignments. It cannot add members. A primary
+  change is accepted only when the candidate is in the current in-sync set.
+- `MarkReplicaInSync` and `ActivatePrimary` are UUID/primary/term conditional
+  Raft commands. Recovery admission and per-process primary activation must use
+  them instead of replacing routing metadata directly.
 - Node removal deletes that node from both replica collections while preserving
   per-shard lost-slot accounting. Replica-count decreases remove unassigned
   slots first, then assigned out-of-sync copies before in-sync copies.

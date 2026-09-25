@@ -69,6 +69,26 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > implemented. See the
 > [PR in-sync tracking evidence record](recovery-acceptance-matrix.md#pr-in-sync-tracking-evidence-record-september-24-2026).
 
+> **Implementation note — September 25, 2026:** a bounded file-based peer
+> recovery subset now gives later-added and rejoining replicas a committed
+> Tantivy file snapshot, a source-side WAL pin at exclusive boundary `B`,
+> bounded suffix transfer, an exclusive final write barrier, and
+> `(primary, primary_term)` conditional in-sync admission. Restarted/promoted
+> primaries activate through a conditional term bump before their first write.
+> Target installation uses `PEER_RECOVERY_IN_PROGRESS`, strict schema open, and
+> SHA-256 validation; hard links are required on the source. Tantivy
+> `SegmentMeta::list_files()` includes optional absent components, so the
+> snapshot manifest contains the existing committed components plus
+> `meta.json` and `.managed.json`.
+>
+> This is not full RP-3/RP-5: checkpoints remain high-water marks rather than
+> contiguous prefixes; there are no history/allocation IDs, replica-side term
+> fencing, operation-only path selection, resumable chunks, compression, or
+> complete vector transfer (the existing rebuild cap remains). Source sessions
+> and pins are process-local and expire after ten minutes. The
+> [September 25 evidence record](recovery-acceptance-matrix.md#bounded-file-recovery-evidence-record-september-25-2026)
+> names the exact executable subset.
+
 ## 3. Reference Protocols And Intentional Differences
 
 | Reference | Relevant property | FerrisSearch target |

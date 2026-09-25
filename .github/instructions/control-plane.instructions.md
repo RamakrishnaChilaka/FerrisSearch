@@ -17,6 +17,13 @@ Tantivy index.
 > (`PutApiKey` / `DeleteApiKey` / `PutRole` / `DeleteRole`) are the reference
 > implementations. Do not invent a new storage or replication path.
 
+Conditional shard-authority commands (`MarkReplicaInSync` and
+`ActivatePrimary`) return `ClusterResponse::Error` when their UUID/primary/term
+compare-and-set fails. Callers must inspect `client_write(...).data`; an
+OpenRaft transport success is not proof that the application command applied.
+Rejected conditional commands perform no partial mutation and do not bump the
+cluster-state version.
+
 ## When to use this recipe (vs. the data path)
 
 | Use the control-plane (this recipe) | Use the data path (docs/shards/WAL) |

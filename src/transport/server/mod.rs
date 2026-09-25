@@ -34,6 +34,7 @@ pub struct TransportService {
     /// Tracks asynchronous background tasks running on this node.
     pub task_manager: Arc<crate::tasks::TaskManager>,
     primary_activation_state: Arc<PrimaryActivationState>,
+    peer_recovery_state: Arc<peer_recovery::PeerRecoveryTransportState>,
     /// Serializes leader-side JoinCluster handling so concurrent joins cannot
     /// race identity validation or submit stale full voter sets.
     join_lock: Arc<Mutex<()>>,
@@ -261,6 +262,8 @@ pub(crate) async fn run_maintenance_on_assigned_shards_async(
 }
 
 pub mod conversions;
+mod peer_recovery;
+pub(crate) use peer_recovery::{MAX_RECOVERY_FILE_CHUNK_BYTES, MAX_RECOVERY_OPS};
 
 pub use conversions::cluster_state_to_proto;
 pub use conversions::proto_to_cluster_state;
@@ -478,6 +481,20 @@ impl InternalTransport for TransportService {
                 seq_no: None,
             }));
         }
+        let _write_guard = match self
+            .peer_recovery_write_guard(&req.index_name, req.shard_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(Response::new(ShardDocResponse {
+                    success: false,
+                    doc_id: req.doc_id,
+                    error,
+                    seq_no: None,
+                }));
+            }
+        };
 
         let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
             .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
@@ -591,6 +608,20 @@ impl InternalTransport for TransportService {
                 start_seq_no: None,
             }));
         }
+        let _write_guard = match self
+            .peer_recovery_write_guard(&req.index_name, req.shard_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(Response::new(ShardBulkResponse {
+                    success: false,
+                    doc_ids: Vec::new(),
+                    error,
+                    start_seq_no: None,
+                }));
+            }
+        };
 
         let mut docs: Vec<(String, serde_json::Value)> =
             Vec::with_capacity(req.documents_json.len());
@@ -720,6 +751,20 @@ impl InternalTransport for TransportService {
                 seq_no: None,
             }));
         }
+        let _write_guard = match self
+            .peer_recovery_write_guard(&req.index_name, req.shard_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(Response::new(ShardDeleteResponse {
+                    success: false,
+                    deleted: 0,
+                    error,
+                    seq_no: None,
+                }));
+            }
+        };
         let engine = self
             .get_or_open_shard(&req.index_name, req.shard_id)
             .await?;
@@ -1348,6 +1393,16 @@ impl InternalTransport for TransportService {
         request: Request<ReplicateDocRequest>,
     ) -> Result<Response<ReplicateDocResponse>, Status> {
         let req = request.into_inner();
+        if self
+            .shard_manager
+            .is_peer_recovery_target(&req.index_name, req.shard_id)
+        {
+            return Ok(Response::new(ReplicateDocResponse {
+                success: false,
+                error: "replica is installing a peer recovery snapshot".to_string(),
+                local_checkpoint: 0,
+            }));
+        }
         let engine = self
             .get_or_open_shard(&req.index_name, req.shard_id)
             .await?;
@@ -1406,6 +1461,16 @@ impl InternalTransport for TransportService {
         request: Request<ReplicateBulkRequest>,
     ) -> Result<Response<ReplicateBulkResponse>, Status> {
         let req = request.into_inner();
+        if self
+            .shard_manager
+            .is_peer_recovery_target(&req.index_name, req.shard_id)
+        {
+            return Ok(Response::new(ReplicateBulkResponse {
+                success: false,
+                error: "replica is installing a peer recovery snapshot".to_string(),
+                local_checkpoint: 0,
+            }));
+        }
         let engine = self
             .get_or_open_shard(&req.index_name, req.shard_id)
             .await?;
@@ -1573,6 +1638,54 @@ impl InternalTransport for TransportService {
             primary_checkpoint: engine.local_checkpoint(),
             operations,
         }))
+    }
+
+    async fn start_peer_recovery(
+        &self,
+        request: Request<StartPeerRecoveryRequest>,
+    ) -> Result<Response<StartPeerRecoveryResponse>, Status> {
+        Ok(Response::new(
+            self.start_peer_recovery_inner(request.into_inner()).await?,
+        ))
+    }
+
+    async fn fetch_recovery_file_chunk(
+        &self,
+        request: Request<FetchRecoveryFileChunkRequest>,
+    ) -> Result<Response<FetchRecoveryFileChunkResponse>, Status> {
+        Ok(Response::new(
+            self.fetch_recovery_file_chunk_inner(request.into_inner())
+                .await?,
+        ))
+    }
+
+    async fn fetch_recovery_ops(
+        &self,
+        request: Request<FetchRecoveryOpsRequest>,
+    ) -> Result<Response<FetchRecoveryOpsResponse>, Status> {
+        Ok(Response::new(
+            self.fetch_recovery_ops_inner(request.into_inner()).await?,
+        ))
+    }
+
+    async fn prepare_finalize_recovery(
+        &self,
+        request: Request<PrepareFinalizeRecoveryRequest>,
+    ) -> Result<Response<PrepareFinalizeRecoveryResponse>, Status> {
+        Ok(Response::new(
+            self.prepare_finalize_recovery_inner(request.into_inner())
+                .await?,
+        ))
+    }
+
+    async fn complete_finalize_recovery(
+        &self,
+        request: Request<CompleteFinalizeRecoveryRequest>,
+    ) -> Result<Response<CompleteFinalizeRecoveryResponse>, Status> {
+        Ok(Response::new(
+            self.complete_finalize_recovery_inner(request.into_inner())
+                .await?,
+        ))
     }
 
     // ─── Dynamic Settings ─────────────────────────────────────────────────────
@@ -2903,6 +3016,7 @@ pub fn create_transport_service_for_test(
         worker_pools: crate::worker::WorkerPools::default_for_system(),
         task_manager,
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)
@@ -2960,6 +3074,7 @@ pub fn create_transport_service_with_raft_and_storage(
         worker_pools: crate::worker::WorkerPools::default_for_system(),
         task_manager,
         primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
     InternalTransportServer::new(service)

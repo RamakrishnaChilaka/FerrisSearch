@@ -22,6 +22,8 @@ pub struct ShardManager {
 - `open_shard_with_mappings(index, shard_id, mappings)` — with field type info, reuses the same generated per-index UUID for local/test helpers
 - `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)` — with UUID, SettingsManager + reactive refresh loop + vector rebuild
 - `open_shard_with_settings_blocking(index, shard_id, mappings, settings, index_uuid)` — async-safe Tokio wrapper for shard open/recovery work
+- `open_shard_with_settings_strict*()` — recovery install open that never invokes the schema-mismatch wipe fallback
+- `prepare_peer_recovery_target_blocking()` / `finalize_peer_recovery_target_blocking()` — close and wipe one out-of-sync copy, persist the marker, initialize WAL state, verify the commit files, and publish the opened engine
 - `get_shard(index, shard_id) -> Option<Arc<dyn SearchEngine>>`
 - `get_index_shards(index) -> Vec<(u32, Arc<dyn SearchEngine>)>`
 - `all_shards() -> Vec<(ShardKey, Arc<dyn SearchEngine>)>`
@@ -52,6 +54,12 @@ pub struct ShardManager {
 4. Start `CompositeEngine::start_refresh_loop_reactive()` — responds to setting changes
 5. Call `engine.rebuild_vectors()` only when `mappings` contains `KnnVector` fields — skip the expensive 100K-doc MatchAll query for non-vector indices to prevent OOM during multi-shard restart
 6. Handle schema mismatch by wiping orphaned directories and retrying
+
+Peer-recovery install is the exception to step 6: while
+`PEER_RECOVERY_IN_PROGRESS` exists, ordinary open/search/replica-apply paths
+must fail closed. Finalization opens under the per-shard lock with schema reset
+disabled, verifies the exact committed file set, and removes the marker only
+after the engine is ready to publish.
 
 ### Async Scheduling Rule
 - `open_shard_with_settings()`, `close_index_shards()`, and `cleanup_orphaned_data()` are synchronous helpers for already-blocking contexts and tests.

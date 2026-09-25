@@ -82,6 +82,13 @@ cargo test -- test_name                         # Single test by name
   targeting. Add a real three-process flush -> allocate replica -> primary loss
   -> red shard -> original-primary rejoin regression that verifies exact
   acknowledged values.
+- For file-based peer recovery, cover WAL pins on every truncation path,
+  exact snapshot boundary under concurrent writes, marker/strict-open
+  semantics, file name/offset/length/hash validation, ordered bounded operation
+  apply, session expiry, stale term/session rejection, final barrier admission,
+  and live post-admission replication. Process coverage must include added
+  replica recovery with concurrent acknowledged writes, recovery disabled via
+  per-node config, and stale same-directory replica rejoin before failover.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.

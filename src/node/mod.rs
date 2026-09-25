@@ -2,6 +2,7 @@
 //! Manages node lifecycle including startup, shutdown, and Raft consensus.
 
 mod lifecycle;
+mod peer_recovery;
 mod reconciliation;
 
 #[cfg(test)]
@@ -170,6 +171,9 @@ fn follower_join_retry_remaining(
 
 impl Node {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
+        if config.max_concurrent_peer_recoveries > 64 {
+            anyhow::bail!("max_concurrent_peer_recoveries must be between 0 and 64");
+        }
         let column_cache_percent = config.column_cache_size_percent;
         let column_cache_budget = tokio::task::spawn_blocking(move || {
             crate::engine::column_cache::resolve_column_cache_budget(column_cache_percent)
@@ -369,6 +373,8 @@ impl Node {
         let raft_node_id = self.config.raft_node_id;
         let manager_clone = self.shard_manager.clone();
         let security_manager = self.security_manager.clone();
+        let peer_recovery_driver =
+            peer_recovery::PeerRecoveryDriver::new(self.config.max_concurrent_peer_recoveries);
         let remote_seeds = remote_seed_hosts(&seed_hosts, local_node.transport_port);
 
         tokio::spawn(async move {
@@ -523,6 +529,13 @@ impl Node {
                     guarded_missing_startup_shards.clone(),
                 )
                 .await;
+                peer_recovery_driver.reconcile(
+                    &state,
+                    &local_id,
+                    manager.clone(),
+                    manager_clone.clone(),
+                    client.clone(),
+                );
 
                 if !orphan_cleanup_done {
                     orphan_cleanup_done = cleanup_orphaned_data_if_authoritative_blocking(

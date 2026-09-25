@@ -34,6 +34,11 @@ SqlRecordBatchStream(SqlRecordBatchRequest) → stream SqlRecordBatchResponse
 ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse
 ReplicateBulk(ReplicateBulkRequest) → ReplicateBulkResponse
 RecoverReplica(RecoverReplicaRequest) → RecoverReplicaResponse
+StartPeerRecovery(StartPeerRecoveryRequest) → StartPeerRecoveryResponse
+FetchRecoveryFileChunk(FetchRecoveryFileChunkRequest) → FetchRecoveryFileChunkResponse
+FetchRecoveryOps(FetchRecoveryOpsRequest) → FetchRecoveryOpsResponse
+PrepareFinalizeRecovery(PrepareFinalizeRecoveryRequest) → PrepareFinalizeRecoveryResponse
+CompleteFinalizeRecovery(CompleteFinalizeRecoveryRequest) → CompleteFinalizeRecoveryResponse
 
 // Forwarded to leader
 UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
@@ -139,6 +144,11 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **recover_replica**: Read WAL entries via `read_from()`, return operations.
   The RPC remains available for transport tests but the node lifecycle does not
   use this partial suffix as recovery or admission.
+- **peer recovery RPCs**: source sessions are UUID/target/primary-term bound,
+  file chunks are at most 1 MiB, operation batches are bounded by count and
+  bytes, and stale authority aborts the session. Prepare holds the exclusive
+  shard write barrier; Complete keeps it until conditional membership is
+  observed or a term bump settles the outcome.
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **get_remote_store_leaf_status**: Report whether the local node is root/leaf-capable plus per-split artifact/reader warmth and current `StorageManager` load counters
 - **search_remote_store_splits**: Validate the remote_store index/UUID, batch split execution through the shared leaf helper, and return per-split hits, totals, partial aggs, and per-split errors
@@ -155,6 +165,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc` and
   `replicate_bulk` must call the explicit-seq engine methods. Do not route
   replicated writes through local seq allocation APIs.
+- **Recovering targets reject live replica apply** until finalization succeeds.
+  The in-progress marker also prevents an installed partial shard from being
+  reopened after restart.
+- **Primary handlers hold the shared recovery barrier** from before engine
+  mutation through replication and read the authoritative in-sync targets
+  inside that guard.
 - **Successful write responses MUST carry valid receipts**: zero is a valid
   sequence, not a missing-value sentinel. Clients must reject successful
   single/delete responses without `seq_no`. A single index response must match

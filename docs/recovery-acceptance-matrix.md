@@ -1,6 +1,6 @@
 # Recovery Protocol Acceptance Matrix
 
-> **Status: Proposed protocol acceptance; limited RP-1 and in-sync tracking coverage is recorded below.**
+> **Status: Proposed protocol acceptance; limited RP-1, in-sync tracking, primary-term, and bounded file-recovery coverage is recorded below.**
 >
 > **Date:** September 24, 2026.
 >
@@ -158,7 +158,22 @@ targeting, status, and fail-closed promotion on base
 | ID | Implemented evidence | Current limit |
 |---|---|---|
 | F04 (partial) | `cluster::state::tests::promotion_refuses_out_of_sync_replica_even_with_higher_checkpoint`, `promotion_fallback_skips_out_of_sync_replica_in_routing_order`, and strict cluster-snapshot membership tests in `transport::server::tests`; `update_index_promotes_replica_after_primary_death` preserves an eligible promotion through Raft. | Eligibility is authoritative by node ID, but allocation IDs, primary terms, conditional routing generations, contiguous-prefix proof, and stale-primary/apply fencing are not implemented. |
-| F07 (core) | Process-backed `out_of_sync_replica_is_not_promoted_and_primary_rejoin_restores_acknowledged_data` in `tests/restart_regression.rs` reproduces the preserved 20 writes -> flush -> 5 writes -> add replica -> 1 write schedule. It verifies the assigned replica stays out of sync/`INITIALIZING`, primary loss leaves routing unpromoted and health red, GET fails instead of returning a false not-found, and all 26 exact acknowledged values return after the original primary rejoins. Replication integration tests prove out-of-sync copies receive no live writes while unreachable in-sync copies still fail writes. | There is no automatic file recovery or admission yet, so later-added replicas do not restore redundancy. Forced stale-primary recovery tooling, primary terms/fencing, conditional CAS, restarted-replica gap semantics, the asynchronous durability contract, and vector recovery remain unverified. |
+| F07 (core) | Process-backed `peer_recovery_disabled_replica_is_not_promoted_and_primary_rejoin_restores_data` in `tests/restart_regression.rs` preserves the September 24 fail-closed schedule with automatic recovery explicitly disabled on prospective replica nodes. It verifies the assigned replica stays out of sync/`INITIALIZING`, primary loss leaves routing unpromoted and health red, GET fails instead of returning a false not-found, and all exact acknowledged values return after the original primary rejoins. | Automatic recovery is now covered separately below. Forced stale-primary recovery tooling, contiguous-prefix checkpoints, the asynchronous durability contract, and complete vector recovery remain unverified. |
+
+### Bounded File Recovery Evidence Record (September 25, 2026)
+
+This record supersedes only the "no automatic file recovery" limit in the
+September 24 entry. It remains a bounded subset, not certification of the full
+proposed protocol or production parity.
+
+| ID | Implemented evidence | Current limit |
+|---|---|---|
+| A02, R01, R02, R08 (partial) | Real-gRPC/real-engine `node::peer_recovery::tests::file_recovery_copies_flushed_state_catches_up_and_admits_target`; process-backed `added_replica_recovers_files_and_survives_primary_loss` and `rejoining_stale_replica_is_recovered_before_primary_failover`. They cover 20 writes, flush, five writes, concurrent acknowledged writes/deletes, file install, suffix replay, admission, exact values, rejoin with stale same-directory data, primary loss, and one post-failover write. | Snapshot-plus-suffix only; no verified common-history operation-only path, resumable transfer, allocation/history identity, or contiguous-prefix proof. |
+| H01, H02, H03 (partial) | `wal::tests::retention_pin_bounds_checkpoint_and_full_truncation`, `zero_retention_pin_prevents_pruning_any_history`, `engine::tantivy::tests::peer_recovery_pin_is_respected_by_every_flush_path`, and `peer_recovery_snapshot_has_exact_boundary_and_retained_suffix`. Pin registration occurs under the translog lock before snapshot release; every current truncation path respects the minimum pin. | Pins are in-memory, time-bounded to the source session, and not byte-budgeted or transferred across source failure. H02 is snapshot fallback for new/stale copies, not negotiated path selection. |
+| M04, M07 (partial) | Primary handlers hold a shared per-shard write guard through replication; `PrepareFinalizeRecovery` takes the exclusive guard and `CompleteFinalizeRecovery` observes committed membership before release. Unknown admission retries under the barrier and uses `ActivatePrimary` to make the stale command impossible. Phase-A real-Raft `conditional_membership_rejects_stale_promotion_and_old_primary_term` fences an old-term admission. | No configuration generation or transition ID; settlement is term-based and process-local. Replica apply still lacks full stale-primary term fencing. |
+| S01, S04, S05, S08 (partial) | `peer_recovery_snapshot_has_exact_boundary_and_retained_suffix`, `shard::tests::peer_recovery_marker_blocks_normal_shard_open`, `finalized_peer_recovery_install_opens_exact_snapshot`, `strict_recovery_open_refuses_schema_mismatch_without_wiping`, `recovery_file_names_reject_traversal_and_separators`, and `corrupted_recovery_file_checksum_is_rejected`. | Install replaces only an out-of-sync copy and uses a persistent marker rather than a retained previous generation. Source hard links must be supported; vector state is rebuilt under the existing cap. |
+| O02, O04, O05 (partial) | Per-node `max_concurrent_peer_recoveries` (default 2, zero disables, max 64), bounded 1 MiB chunks, bounded operation batches, 5–60 second backoff, ten-minute session expiry, Tokio blocking-pool file/engine work, and `expired_source_session_releases_pin_and_snapshot`. | No byte reservation, throttling, resumable progress, unified admission governor, or persisted session recovery. |
+| F07 (retained) | `peer_recovery_disabled_replica_is_not_promoted_and_primary_rejoin_restores_data` sets `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES=0` on prospective replica nodes and preserves the fail-closed red-shard/original-primary-return behavior. | Forced stale-primary recovery remains unsupported. |
 
 ## M. Membership And Acknowledgement Sets
 
