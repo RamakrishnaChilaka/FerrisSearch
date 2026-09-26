@@ -208,18 +208,23 @@ SourceObservation(target) ==
 TargetObservation(target) ==
     LET local == views[target]
         allocationMatches ==
-            \/ ~AllocationIds
-            \/ /\ pendingAllocation[target] > 0
-               /\ local.allocations[target] = pendingAllocation[target]
+            /\ pendingAllocation[target] > 0
+            /\ local.allocations[target] = pendingAllocation[target]
     IN
-    CASE /\ (target = local.primary \/ target \in local.inSync)
-         /\ allocationMatches -> "Admitted"
-      [] /\ AllocationIds
-         /\ ~allocationMatches -> "Rejected"
-      [] /\ target \in local.replicas
-         /\ local.primary = pendingPrimary[target]
-         /\ local.term <= pendingTerm[target] -> "Unknown"
-      [] OTHER -> "Rejected"
+    IF AllocationIds
+    THEN
+        CASE target = local.primary -> "Admitted"
+          [] /\ target \in local.inSync
+             /\ allocationMatches -> "Admitted"
+          [] \/ local.allocations[target] = 0
+             \/ ~allocationMatches -> "Rejected"
+          [] OTHER -> "Unknown"
+    ELSE
+        CASE target = local.primary \/ target \in local.inSync -> "Admitted"
+          [] /\ target \in local.replicas
+             /\ local.primary = pendingPrimary[target]
+             /\ local.term <= pendingTerm[target] -> "Unknown"
+          [] OTHER -> "Rejected"
 
 ClearSession(target) ==
     /\ sessionPhase' = [sessionPhase EXCEPT ![target] = "None"]
@@ -247,6 +252,9 @@ ClearSession(target) ==
 \* src/transport/server/peer_recovery.rs::start_peer_recovery_inner.
 \* Start is asynchronous and pollable; the target is not destructive yet.
 StartRecovery(target, source) ==
+    LET targetAllocation == views[target].allocations[target]
+        sourceAllocation == views[source].allocations[target]
+    IN
     /\ EnableRecovery
     /\ recoveryAttempts < MaxRecoveries
     /\ target \in Nodes
@@ -261,6 +269,13 @@ StartRecovery(target, source) ==
     /\ views[source].term = activated[source]
     /\ target \in views[source].replicas
     /\ target \notin views[source].inSync
+    \* Allocation-aware StartPeerRecovery carries the target-observed ID.
+    \* The source rejects a stale request until both views name the same
+    \* current assignment, after which the target retries.
+    /\ IF AllocationIds
+          THEN /\ targetAllocation > 0
+               /\ targetAllocation = sourceAllocation
+          ELSE TRUE
     /\ sessionPhase' = [sessionPhase EXCEPT ![target] = "Starting"]
     /\ sessionSource' = [sessionSource EXCEPT ![target] = source]
     /\ sessionSourceEpoch' =
@@ -269,7 +284,8 @@ StartRecovery(target, source) ==
           [sessionTerm EXCEPT ![target] = views[source].term]
     /\ sessionAllocation' =
           [sessionAllocation EXCEPT
-              ![target] = views[source].allocations[target]]
+              ![target] =
+                  IF AllocationIds THEN targetAllocation ELSE sourceAllocation]
     /\ recoveryAttempts' = recoveryAttempts + 1
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, sessionBoundary, sessionCursor,

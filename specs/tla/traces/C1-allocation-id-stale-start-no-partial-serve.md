@@ -39,3 +39,7 @@ With that handshake, this trace cannot start until `n3` has applied the new
 allocation ID 5. Because applied views do not regress, the later local
 observation cannot mistake the old ID 1 for a newer conflicting assignment.
 A subsequent missing or changed ID remains a definitive rejection.
+
+The model now implements that target-to-source handshake. Under the same
+three-node crash/rejoin bounds, `MC_C1_ABA_fixed.cfg` explores 713,208 distinct
+states to depth 45 without a safety violation.

@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 126 and seed 4279239164414181388 with 12 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 94945] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 55 and seed 2989810526546325862 with 4 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 96378] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
@@ -18,14 +18,14 @@ Semantic processing of module ShardReplication
 Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
-Starting... (2026-09-26 15:15:03)
+Starting... (2026-09-26 15:31:19)
 Computing initial states...
 Computed 2 initial states...
 Computed 4 initial states...
 Computed 8 initial states...
 Computed 16 initial states...
-Finished computing initial states: 18 states generated, with 3 of them distinct at 2026-09-26 15:15:03.
-Progress(22) at 2026-09-26 15:15:06: 104,136 states generated (104,136 s/min), 36,468 distinct states found (36,468 ds/min), 10,395 states left on queue.
+Finished computing initial states: 18 states generated, with 3 of them distinct at 2026-09-26 15:31:20.
+Progress(16) at 2026-09-26 15:31:23: 12,228 states generated (12,228 s/min), 4,448 distinct states found (4,448 ds/min), 1,050 states left on queue.
 Error: Invariant NoPartialServe is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -51,12 +51,14 @@ State 1: <Initial predicate>
   inSync |-> {n2},
   replicas |-> {n2, n3},
   unassigned |-> 0,
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
   members |-> {n1, n2, n3},
   term |-> 1 ]
 /\ faultsStopped = FALSE
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
 /\ writePrimary = << >>
 /\ writeSeq = << >>
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pins = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
@@ -75,6 +77,7 @@ State 1: <Initial predicate>
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ activationPending = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ nextWrite = 1
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "None")
 /\ recoveryAttempts = 0
 /\ writeTarget = << >>
@@ -98,6 +101,7 @@ State 1: <Initial predicate>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n2 :>
@@ -105,6 +109,7 @@ State 1: <Initial predicate>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -112,6 +117,7 @@ State 1: <Initial predicate>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
@@ -121,6 +127,7 @@ State 1: <Initial predicate>
 
 State 2: <Next line 14, col 8 to line 15, col 29 of module Invariants>
 /\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> n1)
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Starting")
 /\ recoveryAttempts = 1
 /\ sessionTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
@@ -153,36 +160,36 @@ State 8: <Next line 14, col 8 to line 15, col 29 of module Invariants>
 State 9: <Next line 14, col 8 to line 15, col 29 of module Invariants>
 /\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> n1)
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "AwaitingComplete")
 /\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "Pending")
 
-State 10: <Next line 14, col 8 to line 15, col 29 of module Invariants>
-/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
-/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Settling")
-
-State 11: <Crash line 46, col 5 to line 80, col 43 of module Faults>
+State 10: <Crash line 46, col 5 to line 80, col 43 of module Faults>
 /\ crashCount = 1
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> FALSE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> FALSE)
 
-State 12: <SuspectAndRemove line 218, col 5 to line 244, col 30 of module Faults>
+State 11: <SuspectAndRemove line 225, col 5 to line 251, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
     target |-> n3,
     actor |-> n1,
     newReplicas |-> {n2},
     newPrimary |-> n1,
     newUnassigned |-> 1,
+    newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
     expectedPrimary |-> "NO_NODE",
-    expectedTerm |-> 0 ] }
+    expectedTerm |-> 0,
+    expectedAllocation |-> 0 ] }
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RoutingProposed")
 
-State 13: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+State 12: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ pendingRaft = {}
 /\ applied = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 0)
 /\ routing = [ primary |-> n1,
   inSync |-> {n2},
   replicas |-> {n2},
   unassigned |-> 1,
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
   members |-> {n1, n2, n3},
   term |-> 1 ]
 /\ raftLog = << [ state |->
@@ -190,6 +197,7 @@ State 13: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -200,13 +208,16 @@ State 13: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
+           newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ] >>
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ] >>
 /\ views = ( n1 :>
       [ primary |-> n1,
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n2 :>
@@ -214,6 +225,7 @@ State 13: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -221,24 +233,27 @@ State 13: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] )
+
+State 13: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Settling")
 
 State 14: <Restart line 83, col 5 to line 100, col 46 of module Faults>
 /\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 
-State 15: <ObserveRoutingAccepted line 247, col 5 to line 253, col 53 of module Faults>
-/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RoutingCommitted")
-
-State 16: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+State 15: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ applied = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 1)
 /\ views = ( n1 :>
       [ primary |-> n1,
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n2 :>
@@ -246,6 +261,7 @@ State 16: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -253,28 +269,35 @@ State 16: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
-State 17: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+State 16: <Next line 14, col 8 to line 15, col 29 of module Invariants>
 /\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
 /\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "InstallMarker")
 
-State 18: <ChangeRaftMembership line 282, col 5 to line 293, col 37 of module Faults>
+State 17: <ObserveRoutingAccepted line 254, col 5 to line 260, col 53 of module Faults>
+/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RoutingCommitted")
+
+State 18: <ChangeRaftMembership line 289, col 5 to line 300, col 37 of module Faults>
 /\ raftVoters = {n1, n2}
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "MembershipRemoved")
 
-State 19: <ProposeRemoveNode line 301, col 5 to line 320, col 30 of module Faults>
+State 19: <ProposeRemoveNode line 308, col 5 to line 327, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "RemoveNode",
     target |-> n3,
     actor |-> n1,
     newReplicas |-> {},
     newPrimary |-> "NO_NODE",
     newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
     expectedPrimary |-> "NO_NODE",
-    expectedTerm |-> 0 ] }
+    expectedTerm |-> 0,
+    expectedAllocation |-> 0 ] }
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RemoveProposed")
 
 State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
@@ -284,6 +307,7 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
   inSync |-> {n2},
   replicas |-> {n2},
   unassigned |-> 1,
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
   members |-> {n1, n2},
   term |-> 1 ]
 /\ raftLog = << [ state |->
@@ -291,6 +315,7 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -301,13 +326,16 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
+           newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -318,13 +346,16 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ] >>
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ] >>
 /\ views = ( n1 :>
       [ primary |-> n1,
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2},
         term |-> 1 ] @@
   n2 :>
@@ -332,6 +363,7 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -339,21 +371,24 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
-State 21: <ObserveNodeRemoved line 323, col 5 to line 329, col 53 of module Faults>
+State 21: <ObserveNodeRemoved line 330, col 5 to line 336, col 53 of module Faults>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Removed")
 
-State 22: <Rejoin line 337, col 5 to line 353, col 30 of module Faults>
+State 22: <Rejoin line 345, col 5 to line 361, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "AddNode",
     target |-> n3,
     actor |-> n3,
     newReplicas |-> {},
     newPrimary |-> "NO_NODE",
     newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
     expectedPrimary |-> "NO_NODE",
-    expectedTerm |-> 0 ] }
+    expectedTerm |-> 0,
+    expectedAllocation |-> 0 ] }
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RejoinProposed")
 
 State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
@@ -364,6 +399,7 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
   inSync |-> {n2},
   replicas |-> {n2},
   unassigned |-> 1,
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
   members |-> {n1, n2, n3},
   term |-> 1 ]
 /\ raftLog = << [ state |->
@@ -371,6 +407,7 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -381,13 +418,16 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
+           newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -398,13 +438,16 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -415,13 +458,16 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ] >>
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ] >>
 /\ views = ( n1 :>
       [ primary |-> n1,
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n2 :>
@@ -429,6 +475,7 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -436,21 +483,24 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
-State 24: <ObserveRejoin line 356, col 5 to line 363, col 53 of module Faults>
+State 24: <ObserveRejoin line 364, col 5 to line 371, col 53 of module Faults>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Rejoined")
 
-State 25: <AllocateAfterLifecycle line 376, col 5 to line 397, col 30 of module Faults>
+State 25: <AllocateAfterLifecycle line 388, col 5 to line 410, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
     target |-> n3,
     actor |-> n1,
     newReplicas |-> {n2, n3},
     newPrimary |-> n1,
     newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
     expectedPrimary |-> "NO_NODE",
-    expectedTerm |-> 0 ] }
+    expectedTerm |-> 0,
+    expectedAllocation |-> 0 ] }
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "AllocationProposed")
 
 State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
@@ -460,6 +510,7 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
   inSync |-> {n2},
   replicas |-> {n2, n3},
   unassigned |-> 0,
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
   members |-> {n1, n2, n3},
   term |-> 1 ]
 /\ raftLog = << [ state |->
@@ -467,6 +518,7 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -477,13 +529,16 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
+           newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -494,13 +549,16 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -511,13 +569,16 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2, n3},
            unassigned |-> 0,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -528,13 +589,16 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {n2, n3},
            newPrimary |-> n1,
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ] >>
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ] >>
 /\ views = ( n1 :>
       [ primary |-> n1,
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n2 :>
@@ -542,6 +606,7 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -549,6 +614,7 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
@@ -559,8 +625,10 @@ State 27: <Next line 14, col 8 to line 15, col 29 of module Invariants>
     newReplicas |-> {},
     newPrimary |-> n1,
     newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
     expectedPrimary |-> n1,
-    expectedTerm |-> 1 ] }
+    expectedTerm |-> 1,
+    expectedAllocation |-> 1 ] }
 /\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
 
 State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
@@ -586,12 +654,14 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
   inSync |-> {n2, n3},
   replicas |-> {n2, n3},
   unassigned |-> 0,
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
   members |-> {n1, n2, n3},
   term |-> 1 ]
 /\ faultsStopped = FALSE
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
 /\ writePrimary = << >>
 /\ writeSeq = << >>
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pins = (n1 :> {0} @@ n2 :> {} @@ n3 :> {})
 /\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ exclusiveHolder = (n1 :> n3 @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
@@ -610,6 +680,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ activationPending = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ nextWrite = 1
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Settling")
 /\ recoveryAttempts = 1
 /\ writeTarget = << >>
@@ -629,6 +700,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -639,13 +711,16 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
+           newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -656,13 +731,16 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2},
            unassigned |-> 1,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -673,13 +751,16 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2},
            replicas |-> {n2, n3},
            unassigned |-> 0,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -690,13 +771,16 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {n2, n3},
            newPrimary |-> n1,
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0 ] ],
+           expectedTerm |-> 0,
+           expectedAllocation |-> 0 ] ],
    [ state |->
          [ primary |-> n1,
            inSync |-> {n2, n3},
            replicas |-> {n2, n3},
            unassigned |-> 0,
+           allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
            members |-> {n1, n2, n3},
            term |-> 1 ],
      accepted |-> TRUE,
@@ -707,8 +791,10 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
            newReplicas |-> {},
            newPrimary |-> n1,
            newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> n1,
-           expectedTerm |-> 1 ] ] >>
+           expectedTerm |-> 1,
+           expectedAllocation |-> 1 ] ] >>
 /\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "InstallMarker")
 /\ messages = {}
 /\ ackMembershipSafe = TRUE
@@ -717,6 +803,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n2 :>
@@ -724,6 +811,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -731,6 +819,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         inSync |-> {n2},
         replicas |-> {n2},
         unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
@@ -738,7 +827,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "AllocationProposed")
 /\ writeWait = << >>
 
-508910 states generated, 156340 distinct states found, 27808 states left on queue.
+462191 states generated, 143638 distinct states found, 27272 states left on queue.
 The depth of the complete state graph search is 28.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 7 and the 95th percentile is 3).
-Finished in 09s at (2026-09-26 15:15:11)
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 8 and the 95th percentile is 3).
+Finished in 25s at (2026-09-26 15:31:43)
