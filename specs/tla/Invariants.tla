@@ -27,6 +27,39 @@ RoutingWellFormed ==
     /\ \A entry \in {raftLog[i] : i \in 1..Len(raftLog)} :
            RoutingWellFormedValue(entry.state)
 
+InitializationMonotonic ==
+    \A position \in 1..Len(raftLog) :
+        IF position = 1
+        THEN InitialInitialized => raftLog[position].state.initialized
+        ELSE raftLog[position - 1].state.initialized
+             => raftLog[position].state.initialized
+
+InitializationBeforeAcknowledgement ==
+    acked = {} \/ routing.initialized
+
+PriorAllocation(position, node) ==
+    IF position = 1
+    THEN 1
+    ELSE raftLog[position - 1].state.allocations[node]
+
+StaleFailShardCopyRejected ==
+    \A position \in 1..Len(raftLog) :
+        LET entry == raftLog[position]
+            command == entry.command
+        IN IF command.kind = "FailShardCopy"
+           THEN /\ command.expectedAllocation # 0
+                /\ command.expectedAllocation
+                   # PriorAllocation(position, command.target)
+                => ~entry.accepted
+           ELSE TRUE
+
+RedShardRejectsWrites ==
+    routing.allocations[routing.primary] = 0 =>
+        \A writeId \in WriteIds :
+            /\ writeStatus[writeId] = "Routed"
+            /\ writeTarget[writeId] = routing.primary
+            => ~CanPrimaryAccept(writeId)
+
 NoAckedLoss ==
     \A writeId \in acked :
         /\ IF copyExists[routing.primary]

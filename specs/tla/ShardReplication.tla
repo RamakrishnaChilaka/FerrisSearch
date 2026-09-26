@@ -1,9 +1,9 @@
 -------------------------- MODULE ShardReplication --------------------------
-\* One FerrisSearch local_shards shard.  Term values are normalized so Init is
-\* the state immediately after the initial primary has activated at term 1.
-\* Promotion increments to term 2 and the promoted primary activates at term 3.
-\* Equality, ordering, and conditional-commit behavior match the Rust terms;
-\* only the omitted bootstrap increment is renumbered.
+\* One FerrisSearch local_shards shard.  Most configurations begin immediately
+\* after the initial primary has activated at normalized term 1.  G1
+\* configurations begin at CreateIndex with initialized = FALSE and exercise
+\* the first activation explicitly.  Promotion and activation preserve the
+\* implemented relative term ordering.
 
 EXTENDS RaftLog
 
@@ -18,6 +18,7 @@ CONSTANTS
     MaxAllocationId,
     FaultMode,
     InitialOutOfSync,
+    InitialInitialized,
     EnableRecovery,
     AllocationIds,
     ReplicaFencing,
@@ -125,9 +126,15 @@ RoutingWellFormedValue(r) ==
     /\ r.unassigned \in 0..Cardinality(Nodes)
     /\ r.members \subseteq Nodes
     /\ r.allocations \in [Nodes -> 0..MaxAllocationId]
+    /\ r.initialized \in BOOLEAN
+    /\ ~r.initialized => r.inSync = {}
+    \* A cleared primary allocation represents a red shard.  No in-sync
+    \* promotion candidate may remain in that state.
+    /\ r.allocations[r.primary] = 0 => r.inSync = {}
     /\ \A node \in Nodes :
-           (node = r.primary \/ node \in r.replicas)
-           <=> r.allocations[node] > 0
+           IF node = r.primary
+           THEN node \notin r.replicas
+           ELSE (node \in r.replicas) <=> r.allocations[node] > 0
 
 LatestWriteForDoc(writeSet, doc) ==
     LET candidates == {w \in writeSet : writeDoc[w] = doc}
@@ -178,6 +185,7 @@ ReplicaMessageValid(message) ==
     IN
     /\ message.indexUuid = copyUuid[replica]
     /\ message.indexUuid = IndexUuid
+    /\ views[replica].initialized
     /\ IF AllocationIds
           THEN /\ message.targetAllocation > 0
                /\ message.targetAllocation = copyAllocation[replica]
@@ -215,19 +223,25 @@ ReplicationInit ==
               initialAllocations == [node \in Nodes |-> 1]
               initialRouting ==
                   RoutingState(initialPrimary, 1, initialReplicas,
-                               initialInSync, 0, Nodes, initialAllocations)
+                               initialInSync, 0, Nodes, initialAllocations,
+                               InitialInitialized)
           IN
-          /\ IF InitialOutOfSync
-                THEN Cardinality(initialInSync) =
-                     Cardinality(initialReplicas) - 1
-                ELSE initialInSync = initialReplicas
+          /\ IF InitialInitialized
+                THEN IF InitialOutOfSync
+                     THEN Cardinality(initialInSync) =
+                          Cardinality(initialReplicas) - 1
+                     ELSE initialInSync = initialReplicas
+                ELSE initialInSync = {}
           /\ routing = initialRouting
           /\ RaftInit(initialRouting, initialLeader)
           /\ alive = [n \in Nodes |-> TRUE]
           /\ epoch = [n \in Nodes |-> 0]
           /\ raftConnected = [n \in Nodes |-> TRUE]
           /\ activated =
-                [n \in Nodes |-> IF n = initialPrimary THEN 1 ELSE NoTerm]
+                [n \in Nodes |->
+                    IF InitialInitialized /\ n = initialPrimary
+                    THEN 1
+                    ELSE NoTerm]
           /\ activationPending = [n \in Nodes |-> NoTerm]
           /\ nextWrite = 1
           /\ writeStatus = [w \in WriteIds |-> "Unused"]
@@ -247,15 +261,25 @@ ReplicationInit ==
           /\ committed = [n \in Nodes |-> 0]
           /\ truncBelow = [n \in Nodes |-> 0]
           /\ pins = [n \in Nodes |-> {}]
-          /\ copyExists = [n \in Nodes |-> TRUE]
+          /\ copyExists = [n \in Nodes |-> InitialInitialized]
           /\ copyAllocation =
-                [n \in Nodes |-> initialRouting.allocations[n]]
-          /\ copyUuid = [n \in Nodes |-> IndexUuid]
+                [n \in Nodes |->
+                    IF InitialInitialized
+                    THEN initialRouting.allocations[n]
+                    ELSE 0]
+          /\ copyUuid =
+                [n \in Nodes |->
+                    IF InitialInitialized THEN IndexUuid ELSE NoIndexUuid]
           /\ replicaFence =
-                [n \in Nodes |-> IF ReplicaFencing THEN 1 ELSE 0]
+                [n \in Nodes |->
+                    IF InitialInitialized /\ ReplicaFencing THEN 1 ELSE 0]
           /\ durableReplicaFence =
                 [n \in Nodes |->
-                    IF ReplicaFencing /\ DurableReplicaFence THEN 1 ELSE 0]
+                    IF InitialInitialized
+                       /\ ReplicaFencing
+                       /\ DurableReplicaFence
+                    THEN 1
+                    ELSE 0]
           /\ copyMode = [n \in Nodes |-> "Active"]
           /\ installMarker = [n \in Nodes |-> FALSE]
           /\ messages = {}
@@ -306,6 +330,8 @@ CanPrimaryAccept(writeId) ==
     /\ copyExists[primaryNode]
     /\ copyUuid[primaryNode] = IndexUuid
     /\ CopyAssignmentValid(primaryNode)
+    /\ views[primaryNode].initialized
+    /\ views[primaryNode].allocations[primaryNode] > 0
     /\ IF ReplicaFencing
           THEN replicaFence[primaryNode] >= views[primaryNode].term
           ELSE TRUE
@@ -565,19 +591,26 @@ DeliverReplicaNack(message) ==
             exclusiveHolder, acked, promotionSafe, admissionSafe,
             ackMembershipSafe, ApplySafetyVars, termMonotonic>>
 
-ActivateCommand(primaryNode, expectedPrimaryTerm) ==
+ActivateCommand(primaryNode, expectedPrimaryTerm, expectedAllocationId) ==
     RaftCommand("ActivatePrimary", primaryNode, primaryNode, primaryNode,
-                expectedPrimaryTerm, primaryNode, {}, 0, 0,
+                expectedPrimaryTerm, primaryNode, {}, 0,
+                expectedAllocationId,
                 EmptyAllocations)
 
 \* src/transport/server/mod.rs::ensure_primary_activated
 ProposeActivate(primaryNode) ==
     LET local == views[primaryNode]
-        command == ActivateCommand(primaryNode, local.term)
+        command ==
+            ActivateCommand(primaryNode, local.term,
+                            local.allocations[primaryNode])
     IN
     /\ primaryNode \in Nodes
     /\ CanReachRaft(primaryNode)
     /\ local.primary = primaryNode
+    /\ local.allocations[primaryNode] > 0
+    /\ copyExists[primaryNode]
+    /\ copyUuid[primaryNode] = IndexUuid
+    /\ CopyAssignmentValid(primaryNode)
     /\ local.term < MaxTerm
     /\ activated[primaryNode] # local.term
     /\ activationPending[primaryNode] = NoTerm
@@ -602,6 +635,8 @@ ObserveActivation(primaryNode) ==
     /\ expected # NoTerm
     /\ local.primary = primaryNode
     /\ local.term > expected
+    /\ local.initialized
+    /\ local.allocations[primaryNode] = copyAllocation[primaryNode]
     /\ activated' = [activated EXCEPT ![primaryNode] = local.term]
     /\ activationPending' =
           [activationPending EXCEPT ![primaryNode] = NoTerm]
@@ -634,6 +669,7 @@ CancelActivation(primaryNode) ==
     /\ expected # NoTerm
     /\ \/ local.primary # primaryNode
        \/ local.term > expected + 1
+       \/ local.allocations[primaryNode] # copyAllocation[primaryNode]
     /\ activationPending' =
           [activationPending EXCEPT ![primaryNode] = NoTerm]
     /\ UNCHANGED
@@ -655,26 +691,84 @@ UpdateRoutingAccepted(current, command) ==
         proposed ==
             RoutingState(command.newPrimary, nextTerm, command.newReplicas,
                          nextInSync, command.newUnassigned, current.members,
-                         command.newAllocations)
+                         command.newAllocations, current.initialized)
     IN
     /\ command.newPrimary \in Nodes
     /\ command.newReplicas \subseteq Nodes
     /\ command.newUnassigned \in 0..Cardinality(Nodes)
+    /\ command.newAllocations[command.newPrimary] > 0
     /\ IF command.newPrimary # current.primary
           THEN /\ command.newPrimary \in current.inSync
                /\ current.term < MaxTerm
           ELSE TRUE
     /\ RoutingWellFormedValue(proposed)
 
+SurvivingInSync(current, failedNode) ==
+    current.inSync \ {failedNode}
+
+\* IndexMetadata::select_promotion_candidate is abstracted as a deterministic
+\* choice because checkpoint ranking is outside this bounded state.
+FailurePromotionCandidate(current, failedNode) ==
+    CHOOSE candidate \in SurvivingInSync(current, failedNode) : TRUE
+
+\* ClusterStateMachine::apply_command for ClusterCommand::FailShardCopy.
+FailShardCopyAccepted(current, command) ==
+    /\ AllocationIds
+    /\ current.initialized
+    /\ command.target \in Nodes
+    /\ \/ command.target = current.primary
+       \/ command.target \in current.replicas
+    /\ command.expectedAllocation > 0
+    /\ command.expectedAllocation =
+       current.allocations[command.target]
+    /\ current.unassigned < Cardinality(Nodes)
+    /\ IF command.target = current.primary
+          /\ SurvivingInSync(current, command.target) # {}
+       THEN current.term < MaxTerm
+       ELSE TRUE
+
+AfterFailShardCopy(current, failedNode) ==
+    LET failedPrimary == failedNode = current.primary
+        survivors == SurvivingInSync(current, failedNode)
+        canPromote == failedPrimary /\ survivors # {}
+        nextPrimary ==
+            IF canPromote
+            THEN FailurePromotionCandidate(current, failedNode)
+            ELSE current.primary
+        nextReplicas ==
+            IF canPromote
+            THEN current.replicas \ {nextPrimary}
+            ELSE IF failedPrimary
+                 THEN current.replicas
+                 ELSE current.replicas \ {failedNode}
+        nextInSync ==
+            IF canPromote
+            THEN survivors \ {nextPrimary}
+            ELSE current.inSync \ {failedNode}
+        nextTerm == IF canPromote THEN current.term + 1 ELSE current.term
+        nextAllocations ==
+            [current.allocations EXCEPT ![failedNode] = 0]
+    IN RoutingState(nextPrimary, nextTerm, nextReplicas, nextInSync,
+                    current.unassigned + 1, current.members,
+                    nextAllocations, current.initialized)
+
 CommandAccepted(current, command) ==
     CASE command.kind = "ActivatePrimary" ->
             /\ command.target = current.primary
             /\ command.expectedPrimary = current.primary
             /\ command.expectedTerm = current.term
+            /\ current.allocations[current.primary] > 0
+            /\ IF AllocationIds
+                  THEN /\ command.expectedAllocation > 0
+                       /\ command.expectedAllocation =
+                          current.allocations[current.primary]
+                  ELSE TRUE
             /\ current.term < MaxTerm
       [] command.kind = "UpdateRouting" ->
             UpdateRoutingAccepted(current, command)
       [] command.kind = "MarkReplicaInSync" ->
+            /\ current.initialized
+            /\ current.allocations[current.primary] > 0
             /\ command.target \in current.replicas
             /\ command.target \notin current.inSync
             /\ command.expectedPrimary = current.primary
@@ -684,6 +778,8 @@ CommandAccepted(current, command) ==
                        /\ command.expectedAllocation =
                           current.allocations[command.target]
                   ELSE TRUE
+      [] command.kind = "FailShardCopy" ->
+            FailShardCopyAccepted(current, command)
       [] command.kind = "RemoveNode" -> command.target \in current.members
       [] command.kind = "AddNode" ->
             /\ command.target \in Nodes
@@ -694,7 +790,7 @@ AfterAcceptedCommand(current, command) ==
     CASE command.kind = "ActivatePrimary" ->
             RoutingState(current.primary, current.term + 1, current.replicas,
                          current.inSync, current.unassigned, current.members,
-                         current.allocations)
+                         current.allocations, TRUE)
       [] command.kind = "UpdateRouting" ->
             LET nextTerm ==
                     IF command.newPrimary # current.primary
@@ -706,22 +802,24 @@ AfterAcceptedCommand(current, command) ==
             IN RoutingState(command.newPrimary, nextTerm,
                             command.newReplicas, nextInSync,
                             command.newUnassigned, current.members,
-                            command.newAllocations)
+                            command.newAllocations, current.initialized)
       [] command.kind = "MarkReplicaInSync" ->
             RoutingState(current.primary, current.term, current.replicas,
                          current.inSync \cup {command.target},
                          current.unassigned, current.members,
-                         current.allocations)
+                         current.allocations, current.initialized)
+      [] command.kind = "FailShardCopy" ->
+            AfterFailShardCopy(current, command.target)
       [] command.kind = "RemoveNode" ->
             RoutingState(current.primary, current.term, current.replicas,
                          current.inSync, current.unassigned,
                          current.members \ {command.target},
-                         current.allocations)
+                         current.allocations, current.initialized)
       [] command.kind = "AddNode" ->
             RoutingState(current.primary, current.term, current.replicas,
                          current.inSync, current.unassigned,
                          current.members \cup {command.target},
-                         current.allocations)
+                         current.allocations, current.initialized)
       [] OTHER -> current
 
 AfterCommand(current, command) ==
@@ -736,7 +834,6 @@ CommitRaft(command) ==
         after == AfterCommand(routing, command)
         promoted ==
             /\ accepted
-            /\ command.kind = "UpdateRouting"
             /\ after.primary # routing.primary
         admitted ==
             /\ accepted
@@ -761,6 +858,7 @@ CommitRaft(command) ==
               ![raftLeader] =
                   IF ReplicaFencing
                      /\ after.primary = raftLeader
+                     /\ after.allocations[raftLeader] > 0
                      /\ @ < after.term
                   THEN after.term
                   ELSE @]
@@ -770,6 +868,7 @@ CommitRaft(command) ==
                   IF ReplicaFencing
                      /\ DurableReplicaFence
                      /\ after.primary = raftLeader
+                     /\ after.allocations[raftLeader] > 0
                      /\ @ < after.term
                   THEN after.term
                   ELSE @]
@@ -804,6 +903,7 @@ DeliverView(node) ==
               ![node] =
                   IF ReplicaFencing
                      /\ nextView.primary = node
+                     /\ nextView.allocations[node] > 0
                      /\ @ < nextView.term
                   THEN nextView.term
                   ELSE @]
@@ -813,6 +913,7 @@ DeliverView(node) ==
                   IF ReplicaFencing
                      /\ DurableReplicaFence
                      /\ nextView.primary = node
+                     /\ nextView.allocations[node] > 0
                      /\ @ < nextView.term
                   THEN nextView.term
                   ELSE @]
@@ -829,6 +930,7 @@ DeliverView(node) ==
 ReplicationTypeOK ==
     /\ WriteKinds # {}
     /\ WriteKinds \subseteq AllWriteKinds
+    /\ InitialInitialized \in BOOLEAN
     /\ routing \in RoutingType
     /\ RoutingWellFormedValue(routing)
     /\ alive \in [Nodes -> BOOLEAN]

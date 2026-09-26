@@ -194,6 +194,62 @@ CommittedAllocation(node) ==
         /\ raftLog[position].accepted
         /\ node \in raftLog[position].state.replicas
 
+FailShardCopyCommand(node, allocationId) ==
+    RaftCommand("FailShardCopy", node, node, NoNode, NoTerm, NoNode, {}, 0,
+                allocationId, EmptyAllocations)
+
+LocalCopyMatchesView(node, local) ==
+    /\ copyExists[node]
+    /\ copyUuid[node] = IndexUuid
+    /\ copyAllocation[node] > 0
+    /\ copyAllocation[node] = local.allocations[node]
+
+CopyFailureReportRequired(node) ==
+    LET local == views[node]
+        assigned ==
+            /\ local.allocations[node] > 0
+            /\ (node = local.primary \/ node \in local.replicas)
+        authoritative ==
+            \/ node = local.primary
+            \/ node \in local.inSync
+        failedInstall == installMarker[node]
+    IN
+    /\ AllocationIds
+    /\ local.initialized
+    /\ assigned
+    /\ ~LocalCopyMatchesView(node, local)
+    \* A newly allocated out-of-sync replica is intentionally missing or may
+    \* retain an old copy until recovery replaces it.  Authoritative copies
+    \* and failed installs report; ordinary recovery targets do not churn.
+    /\ (authoritative \/ failedInstall)
+
+\* Proposed node::reconciliation::open_local_assigned_shards failure handling,
+\* TransportService::fail_shard_copy, and
+\* TransportClient::forward_fail_shard_copy.  The request carries the
+\* target-observed allocation ID; ClusterStateMachine::apply_command performs
+\* the exact match.
+ReportShardCopyFailure(node) ==
+    LET local == views[node]
+        command ==
+            FailShardCopyCommand(node, local.allocations[node])
+    IN
+    /\ node \in Nodes
+    /\ alive[node]
+    /\ CanReachRaft(node)
+    /\ CopyFailureReportRequired(node)
+    /\ QueueRaft(command)
+    /\ UNCHANGED
+          <<routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
+            messages, sharedHolders, exclusiveHolder, acked, failed,
+            promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
+            crashCount, partitionCount, diskLost, faultsStopped,
+            lifecyclePhase, PeerRecoveryVars>>
+
 \* openraft leader election abstraction.  Election details are delegated to
 \* openraft; the model elects one connected live voter only after the previous
 \* leader is absent and only when a live voter majority exists.
@@ -414,6 +470,7 @@ AllocateAfterLifecycle(leader, target) ==
     /\ alive[target]
     /\ lifecyclePhase[target] \in {"Idle", "Rejoined"}
     /\ local.unassigned > 0
+    /\ local.allocations[local.primary] > 0
     /\ target \in local.members
     /\ target # local.primary
     /\ target \notin local.replicas
@@ -484,7 +541,7 @@ Flush(node) ==
 \* C3 fault: the process identity survives while its shard disk is destroyed.
 DiskLoss(node) ==
     /\ ~faultsStopped
-    /\ FaultMode = "C3"
+    /\ FaultMode \in {"C3", "G1", "G2"}
     /\ node \in Nodes
     /\ ~alive[node]
     /\ copyExists[node]
@@ -511,25 +568,42 @@ DiskLoss(node) ==
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
             partitionCount, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
 
-\* C3 abstraction of an assigned same-name node opening a newly empty local
-\* copy without an allocation identity.  Recovery can subsequently replace it,
-\* but metadata still considers an old in-sync assignment authoritative.
+\* node::reconciliation::open_local_assigned_shards and
+\* ShardManager::open_assigned_shard_with_settings.  Without allocation IDs
+\* this preserves the C3 implementation-faithful empty-store behavior.  With
+\* allocation IDs, G1 permits a fresh empty copy only for the initial
+\* CreateIndex allocation observed before first activation.  Later out-of-sync
+\* assignments are populated only by InstallSnapshot.
 OpenAssignedEmptyCopy(node) ==
-    /\ ~faultsStopped
-    /\ FaultMode = "C3"
+    LET local == views[node]
+        assigned ==
+            /\ local.allocations[node] > 0
+            /\ (node = local.primary \/ node \in local.replicas)
+        initialCreateIndexAllocation ==
+            /\ ~local.initialized
+            /\ local.allocations[node] = 1
+    IN
     /\ node \in Nodes
     /\ alive[node]
     /\ ~copyExists[node]
-    /\ node = routing.primary \/ node \in routing.replicas
     /\ IF AllocationIds
-          THEN /\ copyAllocation[node] > 0
-               /\ copyAllocation[node] = routing.allocations[node]
-          ELSE TRUE
+          THEN /\ assigned
+               /\ initialCreateIndexAllocation
+          ELSE node = routing.primary \/ node \in routing.replicas
     /\ copyExists' = [copyExists EXCEPT ![node] = TRUE]
+    /\ copyAllocation' =
+          [copyAllocation EXCEPT
+              ![node] = IF AllocationIds THEN local.allocations[node] ELSE 0]
     /\ copyUuid' = [copyUuid EXCEPT ![node] = IndexUuid]
-    /\ replicaFence' = [replicaFence EXCEPT ![node] = 0]
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![node] = IF ReplicaFencing THEN local.term ELSE 0]
     /\ durableReplicaFence' =
-          [durableReplicaFence EXCEPT ![node] = 0]
+          [durableReplicaFence EXCEPT
+              ![node] =
+                  IF ReplicaFencing /\ DurableReplicaFence
+                  THEN local.term
+                  ELSE 0]
     /\ copyMode' = [copyMode EXCEPT ![node] = "Active"]
     /\ installMarker' = [installMarker EXCEPT ![node] = FALSE]
     /\ UNCHANGED
@@ -537,7 +611,7 @@ OpenAssignedEmptyCopy(node) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyAllocation, messages, sharedHolders,
+            committed, truncBelow, pins, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
             faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -572,6 +646,7 @@ FaultCoreNext ==
            AllocateAfterLifecycle(leader, target)
     \/ \E target \in Nodes : ObserveAllocationAccepted(target)
     \/ \E target \in Nodes : ObserveAllocationRejected(target)
+    \/ \E node \in Nodes : ReportShardCopyFailure(node)
     \/ \E node \in Nodes : Flush(node)
     \/ \E node \in Nodes : DiskLoss(node)
     \/ \E node \in Nodes : OpenAssignedEmptyCopy(node)

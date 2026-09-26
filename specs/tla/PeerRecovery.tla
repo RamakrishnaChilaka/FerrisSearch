@@ -672,8 +672,9 @@ ProposeMarkInSync(target) ==
 
 SettlementBumpCommand(target) ==
     LET source == sessionSource[target]
+        sourceAllocation == views[source].allocations[source]
     IN RaftCommand("ActivatePrimary", source, source, source,
-                   sessionTerm[target], source, {}, 0, 0,
+                   sessionTerm[target], source, {}, 0, sourceAllocation,
                    EmptyAllocations)
 
 \* After the settlement deadline, ActivatePrimary is used as a conditional

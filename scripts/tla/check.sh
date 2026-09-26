@@ -75,6 +75,11 @@ default_configs=(
     c3
     c3-allocation-ids
     c4
+    g1-empty-store
+    g2-replica
+    g2-primary
+    g2-primary-red
+    g2-liveness
     l1
     l2
 )
@@ -100,6 +105,11 @@ fence-durable           pass: durable replica fence survives restart
 c3                      expected NoAckedLoss violation: same-name empty disk
 c3-allocation-ids       pass: empty disk fails closed on missing local identity
 c4                      expected NoAckedLoss violation: asynchronous durability
+g1-empty-store          pass: pre-activation empty-store disk loss is harmless
+g2-replica              pass: in-sync replica disk loss and copy failure
+g2-primary              pass: primary disk loss promotes an in-sync replica
+g2-primary-red          pass: primary disk loss without a survivor stays red
+g2-liveness             pass: fair failure report, stale rejection, and recovery
 l1                      pass: fair fault-free recovery liveness
 l2                      pass: fair recovery after one crash and restart
 fixed-crash             pass: exhaustive full fixed design with one crash
@@ -189,6 +199,31 @@ run_config() {
             module="MC_C4.tla"
             cfg="MC_C4.cfg"
             expected="NoAckedLoss"
+            ;;
+        g1-empty-store|MC_G1_EmptyStore)
+            module="MC_G1_EmptyStore.tla"
+            cfg="MC_G1_EmptyStore.cfg"
+            expected="pass"
+            ;;
+        g2-replica|MC_G2_Replica)
+            module="MC_G2_CopyFailure.tla"
+            cfg="MC_G2_Replica.cfg"
+            expected="pass"
+            ;;
+        g2-primary|MC_G2_Primary)
+            module="MC_G2_CopyFailure.tla"
+            cfg="MC_G2_Primary.cfg"
+            expected="pass"
+            ;;
+        g2-primary-red|MC_G2_PrimaryRed)
+            module="MC_G2_CopyFailure.tla"
+            cfg="MC_G2_PrimaryRed.cfg"
+            expected="pass"
+            ;;
+        g2-liveness|MC_G2_Liveness)
+            module="MC_G2_Liveness.tla"
+            cfg="MC_G2_Liveness.cfg"
+            expected="pass"
             ;;
         l1|MC_L1)
             module="MC_L1.tla"

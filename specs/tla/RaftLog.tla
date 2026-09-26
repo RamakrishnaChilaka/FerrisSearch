@@ -17,14 +17,15 @@ NoNode == "NO_NODE"
 NoTerm == 0
 
 RoutingState(primaryNode, primaryTerm, replicaNodes, inSyncNodes,
-             unassignedCount, memberNodes, allocationMap) ==
+             unassignedCount, memberNodes, allocationMap, initializedFlag) ==
     [primary   |-> primaryNode,
      term      |-> primaryTerm,
      replicas  |-> replicaNodes,
      inSync    |-> inSyncNodes,
      unassigned|-> unassignedCount,
      members   |-> memberNodes,
-     allocations |-> allocationMap]
+     allocations |-> allocationMap,
+     initialized |-> initializedFlag]
 
 EmptyAllocations == [node \in Nodes |-> 0]
 
@@ -93,7 +94,8 @@ RoutingType ==
      inSync     : SUBSET Nodes,
      unassigned : Nat,
      members    : SUBSET Nodes,
-     allocations: [Nodes -> Nat]]
+     allocations: [Nodes -> Nat],
+     initialized: BOOLEAN]
 
 RaftTypeOK ==
     /\ raftLog \in Seq(
