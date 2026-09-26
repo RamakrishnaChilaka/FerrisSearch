@@ -587,8 +587,8 @@ ProposeMarkInSync(target) ==
     IN
     /\ sessionPhase[target] = "Settling"
     /\ sessionSettlementRunning[target]
-    /\ ~sessionMarkSubmitted[target]
     /\ SourceObservation(target) = "Pending"
+    /\ CanReachRaft(sessionSource[target])
     /\ QueueRaft(command)
     /\ sessionMarkSubmitted' =
           [sessionMarkSubmitted EXCEPT ![target] = TRUE]
@@ -621,6 +621,7 @@ SettlementDeadline(target) ==
     /\ sessionMarkSubmitted[target]
     /\ ~sessionBumpSubmitted[target]
     /\ SourceObservation(target) = "Pending"
+    /\ CanReachRaft(sessionSource[target])
     /\ QueueRaft(command)
     /\ sessionBumpSubmitted' =
           [sessionBumpSubmitted EXCEPT ![target] = TRUE]
@@ -757,6 +758,7 @@ ExpireFinalizeWithoutMark(target) ==
     /\ sessionPhase[target] \in {"Finalizing", "AwaitingComplete"}
     /\ ~sessionMarkSubmitted[target]
     /\ exclusiveHolder[source] = target
+    /\ CanReachRaft(source)
     /\ QueueRaft(command)
     /\ exclusiveHolder' =
           [exclusiveHolder EXCEPT ![source] = NoNode]

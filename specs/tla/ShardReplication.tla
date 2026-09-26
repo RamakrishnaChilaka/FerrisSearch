@@ -138,56 +138,76 @@ WriteMessages(writeId) ==
 BlocksLiveReplication(node) ==
     copyMode[node] \in {"Recovering", "InstallMarker"}
 
+LiveConnectedVoters ==
+    {node \in raftVoters : alive[node] /\ raftConnected[node]}
+
+RaftQuorumSize ==
+    (Cardinality(raftVoters) \div 2) + 1
+
+HasRaftQuorum ==
+    Cardinality(LiveConnectedVoters) >= RaftQuorumSize
+
+LeaderCanCommit ==
+    /\ raftLeader \in LiveConnectedVoters
+    /\ HasRaftQuorum
+
+CanReachRaft(node) ==
+    /\ node \in Nodes
+    /\ alive[node]
+    /\ raftConnected[node]
+    /\ LeaderCanCommit
+
 ReplicationInit ==
     \E initialPrimary \in Nodes :
       \E initialInSync \in SUBSET (Nodes \ {initialPrimary}) :
-        LET initialReplicas == Nodes \ {initialPrimary}
-            initialRouting ==
-                RoutingState(initialPrimary, 1, initialReplicas, initialInSync,
-                             0, Nodes)
-        IN
-        /\ IF InitialOutOfSync
-              THEN Cardinality(initialInSync) =
-                   Cardinality(initialReplicas) - 1
-              ELSE initialInSync = initialReplicas
-        /\ routing = initialRouting
-        /\ RaftInit(initialRouting)
-        /\ alive = [n \in Nodes |-> TRUE]
-        /\ epoch = [n \in Nodes |-> 0]
-        /\ raftConnected = [n \in Nodes |-> TRUE]
-        /\ activated =
-              [n \in Nodes |-> IF n = initialPrimary THEN 1 ELSE NoTerm]
-        /\ activationPending = [n \in Nodes |-> NoTerm]
-        /\ nextWrite = 1
-        /\ writeStatus = [w \in WriteIds |-> "Unused"]
-        /\ writeDoc = [w \in WriteIds |-> DefaultDoc]
-        /\ writeKind = [w \in WriteIds |-> "Put"]
-        /\ writeTarget = [w \in WriteIds |-> NoNode]
-        /\ writePrimary = [w \in WriteIds |-> NoNode]
-        /\ writeEpoch = [w \in WriteIds |-> 0]
-        /\ writeSeq = [w \in WriteIds |-> 0]
-        /\ writeTerm = [w \in WriteIds |-> NoTerm]
-        /\ writeRequired = [w \in WriteIds |-> {}]
-        /\ writeWait = [w \in WriteIds |-> {}]
-        /\ ops = [n \in Nodes |-> {}]
-        /\ durableOps = [n \in Nodes |-> {}]
-        /\ docValue = [n \in Nodes |-> [d \in Docs |-> NoWrite]]
-        /\ nextSeq = [n \in Nodes |-> 0]
-        /\ committed = [n \in Nodes |-> 0]
-        /\ truncBelow = [n \in Nodes |-> 0]
-        /\ pins = [n \in Nodes |-> {}]
-        /\ copyExists = [n \in Nodes |-> TRUE]
-        /\ copyMode = [n \in Nodes |-> "Active"]
-        /\ installMarker = [n \in Nodes |-> FALSE]
-        /\ messages = {}
-        /\ sharedHolders = [n \in Nodes |-> {}]
-        /\ exclusiveHolder = [n \in Nodes |-> NoNode]
-        /\ acked = {}
-        /\ failed = {}
-        /\ promotionSafe = TRUE
-        /\ admissionSafe = TRUE
-        /\ ackMembershipSafe = TRUE
-        /\ termMonotonic = TRUE
+        \E initialLeader \in Nodes :
+          LET initialReplicas == Nodes \ {initialPrimary}
+              initialRouting ==
+                  RoutingState(initialPrimary, 1, initialReplicas,
+                               initialInSync, 0, Nodes)
+          IN
+          /\ IF InitialOutOfSync
+                THEN Cardinality(initialInSync) =
+                     Cardinality(initialReplicas) - 1
+                ELSE initialInSync = initialReplicas
+          /\ routing = initialRouting
+          /\ RaftInit(initialRouting, initialLeader)
+          /\ alive = [n \in Nodes |-> TRUE]
+          /\ epoch = [n \in Nodes |-> 0]
+          /\ raftConnected = [n \in Nodes |-> TRUE]
+          /\ activated =
+                [n \in Nodes |-> IF n = initialPrimary THEN 1 ELSE NoTerm]
+          /\ activationPending = [n \in Nodes |-> NoTerm]
+          /\ nextWrite = 1
+          /\ writeStatus = [w \in WriteIds |-> "Unused"]
+          /\ writeDoc = [w \in WriteIds |-> DefaultDoc]
+          /\ writeKind = [w \in WriteIds |-> "Put"]
+          /\ writeTarget = [w \in WriteIds |-> NoNode]
+          /\ writePrimary = [w \in WriteIds |-> NoNode]
+          /\ writeEpoch = [w \in WriteIds |-> 0]
+          /\ writeSeq = [w \in WriteIds |-> 0]
+          /\ writeTerm = [w \in WriteIds |-> NoTerm]
+          /\ writeRequired = [w \in WriteIds |-> {}]
+          /\ writeWait = [w \in WriteIds |-> {}]
+          /\ ops = [n \in Nodes |-> {}]
+          /\ durableOps = [n \in Nodes |-> {}]
+          /\ docValue = [n \in Nodes |-> [d \in Docs |-> NoWrite]]
+          /\ nextSeq = [n \in Nodes |-> 0]
+          /\ committed = [n \in Nodes |-> 0]
+          /\ truncBelow = [n \in Nodes |-> 0]
+          /\ pins = [n \in Nodes |-> {}]
+          /\ copyExists = [n \in Nodes |-> TRUE]
+          /\ copyMode = [n \in Nodes |-> "Active"]
+          /\ installMarker = [n \in Nodes |-> FALSE]
+          /\ messages = {}
+          /\ sharedHolders = [n \in Nodes |-> {}]
+          /\ exclusiveHolder = [n \in Nodes |-> NoNode]
+          /\ acked = {}
+          /\ failed = {}
+          /\ promotionSafe = TRUE
+          /\ admissionSafe = TRUE
+          /\ ackMembershipSafe = TRUE
+          /\ termMonotonic = TRUE
 
 ClientWrite(coordinator, doc, kind) ==
     LET writeId == nextWrite
@@ -398,8 +418,7 @@ ProposeActivate(primaryNode) ==
         command == ActivateCommand(primaryNode, local.term)
     IN
     /\ primaryNode \in Nodes
-    /\ alive[primaryNode]
-    /\ raftConnected[primaryNode]
+    /\ CanReachRaft(primaryNode)
     /\ local.primary = primaryNode
     /\ local.term < MaxTerm
     /\ activated[primaryNode] # local.term
@@ -487,7 +506,9 @@ CommandAccepted(current, command) ==
             /\ command.expectedPrimary = current.primary
             /\ command.expectedTerm = current.term
       [] command.kind = "RemoveNode" -> command.target \in current.members
-      [] command.kind = "AddNode" -> command.target \in Nodes
+      [] command.kind = "AddNode" ->
+            /\ command.target \in Nodes
+            /\ command.target \notin current.members
       [] OTHER -> FALSE
 
 AfterAcceptedCommand(current, command) ==
@@ -539,9 +560,18 @@ CommitRaft(command) ==
     IN
     /\ command \in pendingRaft
     /\ Len(raftLog) < MaxRaftEntries
+    /\ LeaderCanCommit
     /\ raftLog' = Append(raftLog, RaftEntry(command, accepted, after))
     /\ pendingRaft' = pendingRaft \ {command}
     /\ routing' = after
+    /\ applied' =
+          [applied EXCEPT ![raftLeader] = Len(raftLog) + 1]
+    /\ views' = [views EXCEPT ![raftLeader] = after]
+    /\ raftVoters' =
+          IF accepted /\ command.kind = "AddNode"
+          THEN raftVoters \cup {command.target}
+          ELSE raftVoters
+    /\ UNCHANGED raftLeader
     /\ promotionSafe' =
           promotionSafe
           /\ IF promoted THEN AllAckedOn(after.primary) ELSE TRUE
@@ -550,7 +580,7 @@ CommitRaft(command) ==
           /\ IF admitted THEN AllAckedOn(command.target) ELSE TRUE
     /\ termMonotonic' = termMonotonic /\ after.term >= routing.term
     /\ UNCHANGED
-          <<applied, views, alive, epoch, raftConnected, activated,
+          <<alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
@@ -564,34 +594,6 @@ DeliverView(node) ==
     /\ alive[node]
     /\ raftConnected[node]
     /\ DeliverRaftView(node)
-    /\ UNCHANGED
-          <<routing, alive, epoch, raftConnected, activated,
-            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
-            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
-            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyMode, installMarker,
-            messages, sharedHolders, exclusiveHolder, acked, failed,
-            promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic>>
-
-\* src/cluster/state.rs::allocate_unassigned_replicas and
-\* src/node/mod.rs shard allocator.
-Allocate(leader, target) ==
-    LET local == views[leader]
-        command ==
-            RaftCommand("UpdateRouting", leader, target, NoNode, NoTerm,
-                        local.primary, local.replicas \cup {target},
-                        local.unassigned - 1)
-    IN
-    /\ leader \in Nodes
-    /\ target \in Nodes
-    /\ EnableRecovery
-    /\ alive[leader]
-    /\ raftConnected[leader]
-    /\ local.unassigned > 0
-    /\ target \in local.members
-    /\ target # local.primary
-    /\ target \notin local.replicas
-    /\ QueueRaft(command)
     /\ UNCHANGED
           <<routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -661,6 +663,5 @@ ReplicationNext ==
     \/ \E node \in Nodes : CancelActivation(node)
     \/ \E command \in pendingRaft : CommitRaft(command)
     \/ \E node \in Nodes : DeliverView(node)
-    \/ \E leader \in Nodes, target \in Nodes : Allocate(leader, target)
 
 =============================================================================

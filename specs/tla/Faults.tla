@@ -11,15 +11,23 @@ VARIABLES
     crashCount,
     partitionCount,
     diskLost,
-    faultsStopped
+    faultsStopped,
+    lifecyclePhase
 
-FaultVars == <<crashCount, partitionCount, diskLost, faultsStopped>>
+LifecyclePhases ==
+    {"Idle", "RoutingProposed", "RoutingCommitted", "RoutingRejected",
+     "MembershipRemoved", "RemoveProposed", "Removed",
+     "RejoinProposed", "Rejoined", "AllocationProposed"}
+
+FaultVars ==
+    <<crashCount, partitionCount, diskLost, faultsStopped, lifecyclePhase>>
 
 FaultInit ==
     /\ crashCount = 0
     /\ partitionCount = 0
     /\ diskLost = [n \in Nodes |-> FALSE]
     /\ faultsStopped = (FaultMode = "L1")
+    /\ lifecyclePhase = [n \in Nodes |-> "Idle"]
 
 WritesOwnedBy(node) ==
     {w \in WriteIds :
@@ -60,14 +68,16 @@ Crash(node) ==
     /\ nextSeq' =
           [nextSeq EXCEPT ![node] = NextSequenceAfter(survivingOps)]
     /\ CrashRecoveryState(node)
+    /\ raftLeader' = IF raftLeader = node THEN NoNode ELSE raftLeader
     /\ crashCount' = crashCount + 1
     /\ UNCHANGED
-          <<RaftVars, routing, epoch, nextWrite, writeDoc, writeKind,
+          <<raftLog, pendingRaft, applied, views, raftVoters,
+            routing, epoch, nextWrite, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, durableOps, committed, truncBelow,
             copyExists, acked, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, diskLost, partitionCount,
-            faultsStopped>>
+            faultsStopped, lifecyclePhase>>
 
 Restart(node) ==
     /\ ~faultsStopped
@@ -87,7 +97,7 @@ Restart(node) ==
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
-            PeerRecoveryVars>>
+            lifecyclePhase, PeerRecoveryVars>>
 
 \* C2 only: metadata failure detector may suspect a live node whose local
 \* ClusterManager view stops advancing.  Data-plane RPC messages remain usable.
@@ -98,16 +108,18 @@ PartitionMetadata(node) ==
     /\ raftConnected[node]
     /\ partitionCount < MaxPartitions
     /\ raftConnected' = [raftConnected EXCEPT ![node] = FALSE]
+    /\ raftLeader' = IF raftLeader = node THEN NoNode ELSE raftLeader
     /\ partitionCount' = partitionCount + 1
     /\ UNCHANGED
-          <<RaftVars, routing, alive, epoch, activated, activationPending,
+          <<raftLog, pendingRaft, applied, views, raftVoters,
+            routing, alive, epoch, activated, activationPending,
             nextWrite, writeStatus, writeDoc, writeKind, writeTarget,
             writePrimary, writeEpoch, writeSeq, writeTerm, writeRequired,
             writeWait, ops, durableOps, docValue, nextSeq, committed,
             truncBelow, pins, copyExists, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
-            diskLost, faultsStopped, PeerRecoveryVars>>
+            diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
 
 HealMetadata(node) ==
     /\ ~faultsStopped
@@ -123,7 +135,7 @@ HealMetadata(node) ==
             truncBelow, pins, copyExists, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
-            diskLost, faultsStopped, PeerRecoveryVars>>
+            diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
 
 \* transport timeout/drop.  Delay is represented by simply not choosing a
 \* delivery action.
@@ -139,11 +151,46 @@ LoseMsg(message) ==
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
-            diskLost, faultsStopped, PeerRecoveryVars>>
+            diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
 
 FailureDetectorMayRemove(node) ==
     CASE FaultMode = "C2" -> ~alive[node] \/ ~raftConnected[node]
       [] OTHER -> ~alive[node]
+
+CommittedResult(kind, target, accepted) ==
+    \E position \in 1..Len(raftLog) :
+        /\ raftLog[position].command.kind = kind
+        /\ raftLog[position].command.target = target
+        /\ raftLog[position].accepted = accepted
+
+CommittedRoutingRemoval(node) ==
+    \E position \in 1..Len(raftLog) :
+        /\ raftLog[position].command.kind = "UpdateRouting"
+        /\ raftLog[position].command.target = node
+        /\ raftLog[position].accepted
+        /\ node # raftLog[position].state.primary
+        /\ node \notin raftLog[position].state.replicas
+
+CommittedAllocation(node) ==
+    \E position \in 1..Len(raftLog) :
+        /\ raftLog[position].command.kind = "UpdateRouting"
+        /\ raftLog[position].command.target = node
+        /\ raftLog[position].accepted
+        /\ node \in raftLog[position].state.replicas
+
+\* openraft leader election abstraction.  Election details are delegated to
+\* openraft; the model elects one connected live voter only after the previous
+\* leader is absent and only when a live voter majority exists.
+ElectLeader(candidate) ==
+    /\ candidate \in LiveConnectedVoters
+    /\ HasRaftQuorum
+    /\ \/ raftLeader = NoNode
+       \/ raftLeader \notin LiveConnectedVoters
+    /\ raftLeader' = candidate
+    /\ UNCHANGED
+          <<raftLog, pendingRaft, applied, views, raftVoters,
+            ReplicationVars, PeerRecoveryVars, crashCount, partitionCount,
+            diskLost, faultsStopped, lifecyclePhase>>
 
 \* src/node/mod.rs dead-node loop + IndexMetadata::{remove_node,
 \* select_promotion_candidate,promote_replica_to}.  Checkpoint ranking is
@@ -173,8 +220,9 @@ SuspectAndRemove(leader, node, candidate) ==
     /\ node \in Nodes
     /\ candidate \in Nodes
     /\ leader # node
-    /\ alive[leader]
-    /\ raftConnected[leader]
+    /\ leader = raftLeader
+    /\ CanReachRaft(leader)
+    /\ lifecyclePhase[node] = "Idle"
     /\ FailureDetectorMayRemove(node)
     /\ node = local.primary \/ node \in local.replicas
     /\ IF losingPrimary
@@ -182,6 +230,8 @@ SuspectAndRemove(leader, node, candidate) ==
           ELSE candidate = local.primary
     /\ proposedUnassigned <= Cardinality(Nodes)
     /\ QueueRaft(command)
+    /\ lifecyclePhase' =
+          [lifecyclePhase EXCEPT ![node] = "RoutingProposed"]
     /\ UNCHANGED
           <<routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -193,20 +243,71 @@ SuspectAndRemove(leader, node, candidate) ==
             crashCount, partitionCount, diskLost, faultsStopped,
             PeerRecoveryVars>>
 
-\* src/node/mod.rs only submits RemoveNode after the routing UpdateIndex
-\* response succeeded.  The guard uses committed routing, not a stale view.
-RemoveNodeAfterRouting(leader, node) ==
+ObserveRoutingAccepted(node) ==
+    /\ lifecyclePhase[node] = "RoutingProposed"
+    /\ CommittedRoutingRemoval(node)
+    /\ lifecyclePhase' =
+          [lifecyclePhase EXCEPT ![node] = "RoutingCommitted"]
+    /\ UNCHANGED
+          <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
+            partitionCount, diskLost, faultsStopped>>
+
+ObserveRoutingRejected(node) ==
+    /\ lifecyclePhase[node] = "RoutingProposed"
+    /\ CommittedResult("UpdateRouting", node, FALSE)
+    /\ lifecyclePhase' =
+          [lifecyclePhase EXCEPT ![node] = "RoutingRejected"]
+    /\ UNCHANGED
+          <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
+            partitionCount, diskLost, faultsStopped>>
+
+\* src/node/mod.rs::dead-node loop defers RemoveNode after a rejected
+\* UpdateIndex and retries from a fresh view on a later lifecycle tick.
+DeferRejectedRouting(node) ==
+    /\ lifecyclePhase[node] = "RoutingRejected"
+    /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![node] = "Idle"]
+    /\ UNCHANGED
+          <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
+            partitionCount, diskLost, faultsStopped>>
+
+\* src/node/mod.rs calls openraft::change_membership only after the routing
+\* update succeeds.  The abstraction performs the committed voter removal
+\* atomically once both the old and new voter sets have a live majority.
+ChangeRaftMembership(leader, node) ==
+    LET remaining == raftVoters \ {node}
+        liveRemaining ==
+            {voter \in remaining : alive[voter] /\ raftConnected[voter]}
+        remainingQuorum == (Cardinality(remaining) \div 2) + 1
+    IN
+    /\ lifecyclePhase[node] = "RoutingCommitted"
+    /\ leader = raftLeader
+    /\ CanReachRaft(leader)
+    /\ remaining # {}
+    /\ Cardinality(liveRemaining) >= remainingQuorum
+    /\ raftVoters' = remaining
+    /\ lifecyclePhase' =
+          [lifecyclePhase EXCEPT ![node] = "MembershipRemoved"]
+    /\ UNCHANGED
+          <<raftLog, pendingRaft, applied, views, raftLeader,
+            ReplicationVars, PeerRecoveryVars, crashCount, partitionCount,
+            diskLost, faultsStopped>>
+
+\* src/node/mod.rs submits ClusterCommand::RemoveNode after membership removal.
+ProposeRemoveNode(leader, node) ==
     LET command ==
             RaftCommand("RemoveNode", leader, node, NoNode, NoTerm, NoNode,
                         {}, 0)
     IN
     /\ ~faultsStopped
-    /\ alive[leader]
-    /\ raftConnected[leader]
-    /\ node \in routing.members
-    /\ node # routing.primary
-    /\ node \notin routing.replicas
+    /\ lifecyclePhase[node] = "MembershipRemoved"
+    /\ leader = raftLeader
+    /\ CanReachRaft(leader)
+    /\ node \in views[leader].members
+    /\ node # views[leader].primary
+    /\ node \notin views[leader].replicas
     /\ QueueRaft(command)
+    /\ lifecyclePhase' =
+          [lifecyclePhase EXCEPT ![node] = "RemoveProposed"]
     /\ UNCHANGED
           <<routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -218,16 +319,28 @@ RemoveNodeAfterRouting(leader, node) ==
             crashCount, partitionCount, diskLost, faultsStopped,
             PeerRecoveryVars>>
 
-\* src/node/mod.rs follower JoinCluster retry.
+ObserveNodeRemoved(node) ==
+    /\ lifecyclePhase[node] = "RemoveProposed"
+    /\ CommittedResult("RemoveNode", node, TRUE)
+    /\ node \notin routing.members
+    /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![node] = "Removed"]
+    /\ UNCHANGED
+          <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
+            partitionCount, diskLost, faultsStopped>>
+
+\* src/node/mod.rs follower JoinCluster retry.  A removed process must commit
+\* AddNode before the allocator may use it again.
 Rejoin(node) ==
     LET command ==
             RaftCommand("AddNode", node, node, NoNode, NoTerm, NoNode, {}, 0)
     IN
     /\ ~faultsStopped
-    /\ alive[node]
-    /\ raftConnected[node]
+    /\ lifecyclePhase[node] = "Removed"
+    /\ CanReachRaft(node)
     /\ node \notin routing.members
     /\ QueueRaft(command)
+    /\ lifecyclePhase' =
+          [lifecyclePhase EXCEPT ![node] = "RejoinProposed"]
     /\ UNCHANGED
           <<routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -238,6 +351,66 @@ Rejoin(node) ==
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
             PeerRecoveryVars>>
+
+ObserveRejoin(node) ==
+    /\ lifecyclePhase[node] = "RejoinProposed"
+    /\ CommittedResult("AddNode", node, TRUE)
+    /\ node \in routing.members
+    /\ node \in raftVoters
+    /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![node] = "Rejoined"]
+    /\ UNCHANGED
+          <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
+            partitionCount, diskLost, faultsStopped>>
+
+\* src/cluster/state.rs::allocate_unassigned_replicas and the allocator phase
+\* at the end of src/node/mod.rs's leader tick.  The target must be alive and
+\* registered in the current leader's applied view.  A previously removed node
+\* reaches this action only after committed AddNode observation.
+AllocateAfterLifecycle(leader, target) ==
+    LET local == views[leader]
+        command ==
+            RaftCommand("UpdateRouting", leader, target, NoNode, NoTerm,
+                        local.primary, local.replicas \cup {target},
+                        local.unassigned - 1)
+    IN
+    /\ EnableRecovery
+    /\ leader = raftLeader
+    /\ CanReachRaft(leader)
+    /\ alive[target]
+    /\ lifecyclePhase[target] \in {"Idle", "Rejoined"}
+    /\ local.unassigned > 0
+    /\ target \in local.members
+    /\ target # local.primary
+    /\ target \notin local.replicas
+    /\ QueueRaft(command)
+    /\ lifecyclePhase' =
+          [lifecyclePhase EXCEPT ![target] = "AllocationProposed"]
+    /\ UNCHANGED
+          <<routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyMode, installMarker,
+            messages, sharedHolders, exclusiveHolder, acked, failed,
+            promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
+            crashCount, partitionCount, diskLost, faultsStopped,
+            PeerRecoveryVars>>
+
+ObserveAllocationAccepted(target) ==
+    /\ lifecyclePhase[target] = "AllocationProposed"
+    /\ CommittedAllocation(target)
+    /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![target] = "Idle"]
+    /\ UNCHANGED
+          <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
+            partitionCount, diskLost, faultsStopped>>
+
+ObserveAllocationRejected(target) ==
+    /\ lifecyclePhase[target] = "AllocationProposed"
+    /\ CommittedResult("UpdateRouting", target, FALSE)
+    /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![target] = "Rejoined"]
+    /\ UNCHANGED
+          <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
+            partitionCount, diskLost, faultsStopped>>
 
 \* src/engine/tantivy.rs::flush_with_global_checkpoint and
 \* src/wal/mod.rs::{truncate,truncate_below}.  The model retains logical
@@ -266,7 +439,7 @@ Flush(node) ==
             copyExists, copyMode, installMarker, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
-            faultsStopped, PeerRecoveryVars>>
+            faultsStopped, lifecyclePhase, PeerRecoveryVars>>
 
 \* C3 fault: the process identity survives while its shard disk is destroyed.
 DiskLoss(node) ==
@@ -291,7 +464,7 @@ DiskLoss(node) ==
             writeRequired, writeWait, pins, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
-            partitionCount, faultsStopped, PeerRecoveryVars>>
+            partitionCount, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
 
 \* C3 abstraction of an assigned same-name node opening a newly empty local
 \* copy without an allocation identity.  Recovery can subsequently replace it,
@@ -314,25 +487,38 @@ OpenAssignedEmptyCopy(node) ==
             committed, truncBelow, pins, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
-            faultsStopped, PeerRecoveryVars>>
+            faultsStopped, lifecyclePhase, PeerRecoveryVars>>
 
 FaultTypeOK ==
     /\ crashCount \in 0..MaxCrashes
     /\ partitionCount \in 0..MaxPartitions
     /\ diskLost \in [Nodes -> BOOLEAN]
     /\ faultsStopped \in BOOLEAN
+    /\ lifecyclePhase \in [Nodes -> LifecyclePhases]
 
 FaultNext ==
     \/ \E node \in Nodes : Crash(node)
     \/ \E node \in Nodes : Restart(node)
     \/ \E node \in Nodes : PartitionMetadata(node)
     \/ \E node \in Nodes : HealMetadata(node)
+    \/ \E candidate \in Nodes : ElectLeader(candidate)
     \/ \E message \in messages : LoseMsg(message)
     \/ \E leader \in Nodes, node \in Nodes, candidate \in Nodes :
            SuspectAndRemove(leader, node, candidate)
+    \/ \E node \in Nodes : ObserveRoutingAccepted(node)
+    \/ \E node \in Nodes : ObserveRoutingRejected(node)
+    \/ \E node \in Nodes : DeferRejectedRouting(node)
     \/ \E leader \in Nodes, node \in Nodes :
-           RemoveNodeAfterRouting(leader, node)
+           ChangeRaftMembership(leader, node)
+    \/ \E leader \in Nodes, node \in Nodes :
+           ProposeRemoveNode(leader, node)
+    \/ \E node \in Nodes : ObserveNodeRemoved(node)
     \/ \E node \in Nodes : Rejoin(node)
+    \/ \E node \in Nodes : ObserveRejoin(node)
+    \/ \E leader \in Nodes, target \in Nodes :
+           AllocateAfterLifecycle(leader, target)
+    \/ \E target \in Nodes : ObserveAllocationAccepted(target)
+    \/ \E target \in Nodes : ObserveAllocationRejected(target)
     \/ \E node \in Nodes : Flush(node)
     \/ \E node \in Nodes : DiskLoss(node)
     \/ \E node \in Nodes : OpenAssignedEmptyCopy(node)

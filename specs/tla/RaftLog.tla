@@ -2,10 +2,12 @@
 \* Abstract Raft support shared by the shard-replication and recovery model.
 \*
 \* openraft itself is assumed correct.  The model keeps a totally ordered
-\* committed log, but proposals may remain pending, commit in any order, or
-\* commit after the proposer crashes.  Each node applies a prefix of the
-\* committed log and therefore makes protocol decisions from a possibly stale
-\* ClusterManager view.
+\* committed log and an explicit voter/leader configuration.  A command may
+\* remain pending, be appended after later invocations, or commit after its
+\* proposer crashes, but committing requires a live connected leader and a
+\* live majority of the current voters.  The leader applies its committed
+\* command before the synchronous write returns; followers may retain lagging
+\* ClusterManager views.
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -46,29 +48,29 @@ VARIABLES
     raftLog,
     pendingRaft,
     applied,
-    views
+    views,
+    raftLeader,
+    raftVoters
 
-RaftVars == <<raftLog, pendingRaft, applied, views>>
+RaftVars == <<raftLog, pendingRaft, applied, views, raftLeader, raftVoters>>
 
-RaftInit(initialRouting) ==
+RaftInit(initialRouting, initialLeader) ==
     /\ raftLog = <<>>
     /\ pendingRaft = {}
     /\ applied = [n \in Nodes |-> 0]
     /\ views = [n \in Nodes |-> initialRouting]
+    /\ raftLeader = initialLeader
+    /\ raftVoters = Nodes
 
 CanQueueRaft ==
     /\ Len(raftLog) < MaxRaftEntries
     /\ Cardinality(pendingRaft) < MaxPendingRaft
 
-CommittedCommands ==
-    {raftLog[position].command : position \in 1..Len(raftLog)}
-
 QueueRaft(command) ==
     /\ CanQueueRaft
     /\ command \notin pendingRaft
-    /\ command \notin CommittedCommands
     /\ pendingRaft' = pendingRaft \cup {command}
-    /\ UNCHANGED <<raftLog, applied, views>>
+    /\ UNCHANGED <<raftLog, applied, views, raftLeader, raftVoters>>
 
 \* ClusterManager applies committed entries in order, one entry at a time.
 DeliverRaftView(node) ==
@@ -76,7 +78,7 @@ DeliverRaftView(node) ==
     /\ applied[node] < Len(raftLog)
     /\ applied' = [applied EXCEPT ![node] = @ + 1]
     /\ views' = [views EXCEPT ![node] = raftLog[applied[node] + 1].state]
-    /\ UNCHANGED <<raftLog, pendingRaft>>
+    /\ UNCHANGED <<raftLog, pendingRaft, raftLeader, raftVoters>>
 
 RoutingType ==
     [primary    : Nodes,
@@ -109,6 +111,9 @@ RaftTypeOK ==
             newUnassigned   : Nat]
     /\ applied \in [Nodes -> Nat]
     /\ views \in [Nodes -> RoutingType]
+    /\ raftLeader \in Nodes \cup {NoNode}
+    /\ raftVoters \subseteq Nodes
+    /\ raftVoters # {}
     /\ \A n \in Nodes : applied[n] <= Len(raftLog)
 
 \* Safety configurations use this symmetry set.  Liveness configurations do

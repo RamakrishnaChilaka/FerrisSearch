@@ -52,3 +52,7 @@ admission could therefore match a later same-node assignment (the documented
 remove/re-add ABA limitation) if a valid three-node schedule reaches the same
 ordering. That requires a corrected quorum-aware, leader-sequenced C1 model
 before drawing an implementation conclusion.
+
+That corrected run now exists and reproduces the ABA with three voters and the
+merged lifecycle order. See
+[`C1-allocation-aba-no-partial-serve.md`](C1-allocation-aba-no-partial-serve.md).
