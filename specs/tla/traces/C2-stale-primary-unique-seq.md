@@ -9,9 +9,9 @@
 Raw traces:
 
 - [`C2-stale-primary-unfenced-message.log`](C2-stale-primary-unfenced-message.log),
-  SHA-256 `69457024dd1bd44dc2ef34aa5de81c107a9ab0cbfa8559b75108ce877c848822`
+  SHA-256 `6f5a4cca97355dc526b4dcd0f2696d5ca4b5062275f7fc24c4675fd016acfc2e`
 - [`C2-stale-primary-allocation-only-message.log`](C2-stale-primary-allocation-only-message.log),
-  SHA-256 `2ef9a4e700e7dceaeceba69120f09ab4b6a4bc7a2084e02f9da96bdde7968953`
+  SHA-256 `2ce22a39ae7d29911ca90782a6222aa5c8f5dde75a672af815d94b50ccd7c766`
 
 These current traces stop at `C2RejectsStaleMessage`: the lower-term
 replication request is accepted by the replica validation predicate. The

@@ -8,7 +8,7 @@
 
 **Raw trace:** [`Fence-volatile-restart-stale-probe.log`](Fence-volatile-restart-stale-probe.log)
 
-**Raw trace SHA-256:** `f201782a622ce46a966bba8f6169e7243a3797756dff70add231223f470d7304`
+**Raw trace SHA-256:** `4e5f33e90fddbd82b7a506cd0e272ccf94258d856de624b72dd39bab6d51bf1e`
 
 | State range | Model action | Rust requirement represented |
 | --- | --- | --- |

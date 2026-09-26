@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 53 and seed 7976595363299887887 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 7588] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 80 and seed 621898292061911480 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 12122] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_FenceDurability.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C2.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
@@ -7,10 +7,10 @@ Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.ua9LG4/fence-volatile/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.ua9LG4/fence-volatile/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.ua9LG4/fence-volatile/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.ua9LG4/fence-volatile/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.ElK8KP/fence-volatile/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.ElK8KP/fence-volatile/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.ElK8KP/fence-volatile/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.ElK8KP/fence-volatile/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -22,9 +22,9 @@ Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C2
 Semantic processing of module MC_FenceDurability
-Starting... (2026-09-26 17:47:33)
+Starting... (2026-09-26 18:37:26)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-26 17:47:34.
+Finished computing initial states: 1 distinct state generated at 2026-09-26 18:37:27.
 Error: Invariant FenceRejectsStaleProbe is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -91,6 +91,7 @@ State 1: <Initial predicate>
 /\ sessionSnapshot = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ writeTerm = <<0, 0>>
 /\ sessionTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ activePrimaryApplySafe = TRUE
 /\ promotionSafe = TRUE
 /\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
 /\ sessionCursor = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -129,11 +130,11 @@ State 1: <Initial predicate>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Idle")
 /\ writeWait = <<{}, {}>>
 
-State 2: <FencePartition line 98, col 5 to line 99, col 31 of module MC_FenceDurability>
+State 2: <FencePartition line 98, col 5 to line 99, col 32 of module MC_FenceDurability>
 /\ partitionCount = 1
 /\ raftConnected = (n1 :> FALSE @@ n2 :> TRUE @@ n3 :> TRUE)
 
-State 3: <FenceSuspect line 102, col 5 to line 103, col 31 of module MC_FenceDurability>
+State 3: <FenceSuspect line 102, col 5 to line 103, col 32 of module MC_FenceDurability>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
     target |-> n1,
     actor |-> n2,
@@ -202,7 +203,7 @@ State 4: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] )
 
-State 5: <FenceDurabilityNext line 106, col 8 to line 109, col 60 of module MC_FenceDurability>
+State 5: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_FenceDurability>
 /\ pendingRaft = { [ kind |-> "ActivatePrimary",
     target |-> n2,
     actor |-> n2,
@@ -295,12 +296,12 @@ State 7: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
 /\ activated = (n1 :> 1 @@ n2 :> 3 @@ n3 :> 0)
 /\ activationPending = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 
-State 8: <FenceDurabilityNext line 106, col 8 to line 109, col 60 of module MC_FenceDurability>
+State 8: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_FenceDurability>
 /\ writeStatus = <<"Routed", "Unused">>
 /\ nextWrite = 2
 /\ writeTarget = <<n2, "NO_NODE">>
 
-State 9: <FenceDurabilityNext line 106, col 8 to line 109, col 60 of module MC_FenceDurability>
+State 9: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_FenceDurability>
 /\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 0))
 /\ nextSeq = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 0)
 /\ durableOps = (n1 :> {} @@ n2 :> {1} @@ n3 :> {})
@@ -339,27 +340,27 @@ State 10: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_
     toEpoch |-> 0,
     indexUuid |-> "INDEX_UUID" ] }
 
-State 11: <FenceDurabilityNext line 106, col 8 to line 109, col 60 of module MC_FenceDurability>
+State 11: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_FenceDurability>
 /\ messages = {}
 /\ writeWait = <<{}, {}>>
 
-State 12: <FenceDurabilityNext line 106, col 8 to line 109, col 60 of module MC_FenceDurability>
+State 12: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_FenceDurability>
 /\ acked = {1}
 /\ writeStatus = <<"Acked", "Unused">>
 /\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 
-State 13: <FenceCrash line 88, col 5 to line 91, col 31 of module MC_FenceDurability>
+State 13: <FenceCrash line 88, col 5 to line 91, col 32 of module MC_FenceDurability>
 /\ replicaFence = (n1 :> 1 @@ n2 :> 3 @@ n3 :> 0)
 /\ crashCount = 1
 /\ raftConnected = (n1 :> FALSE @@ n2 :> TRUE @@ n3 :> FALSE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> FALSE)
 
-State 14: <FenceRestart line 94, col 5 to line 95, col 31 of module MC_FenceDurability>
+State 14: <FenceRestart line 94, col 5 to line 95, col 32 of module MC_FenceDurability>
 /\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ raftConnected = (n1 :> FALSE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 
-State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 60 of module MC_FenceDurability>
+State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_FenceDurability>
 /\ pendingRaft = {}
 /\ raftVoters = {n1, n2, n3}
 /\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
@@ -423,6 +424,7 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 60 of module MC_
 /\ sessionSnapshot = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ writeTerm = <<3, 1>>
 /\ sessionTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ activePrimaryApplySafe = TRUE
 /\ promotionSafe = TRUE
 /\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
 /\ sessionCursor = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -512,4 +514,4 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 60 of module MC_
 17 states generated, 17 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 15.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 2 and the 95th percentile is 2).
-Finished in 01s at (2026-09-26 17:47:34)
+Finished in 01s at (2026-09-26 18:37:27)

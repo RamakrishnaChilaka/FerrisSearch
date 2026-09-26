@@ -66,6 +66,8 @@ benchmark artifacts.
   check, or a TLAPS proof.
 - Preserve expected counterexample traces and map their steps to source
   functions. Distinguish implementation-faithful failures from model errors.
+- Retain traces that invalidate an over-strong property, but label the property
+  retired and do not cite the failed run as evidence against the implementation.
 - Label model-only fixes, including allocation-ID fencing, as proposed until
   the Rust domain, persistence, transport, and recovery paths implement them.
 - Do not infer timing probability from an untimed TLA+ trace. State only that

@@ -33,7 +33,9 @@ cargo test --test rest_api_integration          # REST API integration tests
 cargo test --test restart_regression            # Real restart/rejoin regression
 cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
-./scripts/tla/check.sh c1-aba-fixed l1           # Selected model checks
+./scripts/tla/check.sh c1-aba-fixed c2-fixed l2  # Selected fixed-design checks
+./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
+./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
 ```
 
 ## TLA+ Model Checks
@@ -43,8 +45,12 @@ cargo test -- test_name                         # Single test by name
 - `scripts/tla/check.sh` verifies the pinned TLA+ tools jar before execution
   and uses isolated Java/TLC temporary directories.
 - Expected counterexamples are living regressions. The runner must fail if
-  `c1-aba`, `c2`, `c2-allocation-ids`, `c3`, or `c4` stops violating its named
-  invariant before the corresponding Rust limitation is fixed.
+  `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, or `c4`
+  stops violating its named invariant before the corresponding Rust limitation
+  is fixed.
+- `c2-fixed`, `fence-durable`, `fixed-crash`, and `fixed-partition` are
+  expected-pass configurations for the model-only allocation-ID plus durable
+  replica-fencing design.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
@@ -52,6 +58,10 @@ cargo test -- test_name                         # Single test by name
   Liveness runs use neither; declare the exact fairness assumptions instead.
 - Keep action comments and `specs/tla/README.md` mapped to the current Rust
   functions. Model-only protocol variants must be labeled unimplemented.
+- Replica-fencing checks use local knowledge: reject below the durable local
+  fence or applied local term. Do not compare every in-flight apply against an
+  unseen globally committed term; the retained retired-property trace explains
+  why that assertion is too strong.
 
 ## Unit Test Conventions
 - Tests live in `#[cfg(test)] mod tests` at the bottom of each source file

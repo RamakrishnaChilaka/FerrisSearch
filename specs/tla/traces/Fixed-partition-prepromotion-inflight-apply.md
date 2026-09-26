@@ -1,4 +1,4 @@
-# Fixed-partition expected-pass trace: pre-promotion in-flight apply
+# Retired fixed-partition property trace: pre-promotion in-flight apply
 
 **Date:** September 26, 2026
 
@@ -11,7 +11,7 @@
 **Raw trace SHA-256:** `0a309415572431695ecf2c7318e3b14143ed5aeaeb6f30ca38e10b203dbeeece`
 
 This was an expected-pass configuration, so the modeling task stopped at this
-trace. No Rust source was changed.
+trace before the property was refined. No Rust source was changed.
 
 ## Trace
 
@@ -29,7 +29,7 @@ trace. No Rust source was changed.
 This is a **model-property error**, not evidence that the proposed fencing
 protocol failed.
 
-`NoStaleReplicaApply` currently rejects every apply whose message term is below
+`NoStaleReplicaApply` rejected every apply whose message term was below
 the globally committed term. That is stronger than the modeled and requested
 replica rule, which rejects below:
 
@@ -43,12 +43,12 @@ has neither observed promotion nor activated or served a new-term write.
 Retaining this indeterminate pre-promotion operation is not, by itself, an
 acknowledged-write loss or conflicting stale-primary success.
 
-The next model revision must distinguish:
+The replacement properties distinguish:
 
 - an operation accepted and sent while its term was still authoritative; from
 - a new operation accepted by an obsolete primary after promotion.
 
-The replica-fence rule itself must remain unchanged. The corrected safety
-property should assert rejection below the replica's local view/fence and
-continue using `UniqueAckedSeq`, `NoAckedLoss`, and `NoAckedRollback` for
-client-visible history.
+`NoApplyBelowObservedFence` now checks the durable local fence at apply time,
+and `ActivePrimaryRejectsOldTerm` checks the activated primary term in the
+current incarnation. The replica-fence rule itself was not weakened. After
+this correction, both unrestricted fixed-design configurations pass.

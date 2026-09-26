@@ -1,15 +1,15 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 127 and seed -1675102765883800453 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 7406] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 123 and seed -7033831247918563623 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 11939] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C2.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.ua9LG4/c2/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.ua9LG4/c2/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.ua9LG4/c2/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.ua9LG4/c2/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.ElK8KP/c2/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.ElK8KP/c2/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.ElK8KP/c2/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.ElK8KP/c2/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -20,9 +20,9 @@ Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C2
-Starting... (2026-09-26 17:47:28)
+Starting... (2026-09-26 18:37:20)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-26 17:47:28.
+Finished computing initial states: 1 distinct state generated at 2026-09-26 18:37:20.
 Error: Invariant C2RejectsStaleMessage is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -89,6 +89,7 @@ State 1: <Initial predicate>
 /\ sessionSnapshot = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ writeTerm = <<0, 0>>
 /\ sessionTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ activePrimaryApplySafe = TRUE
 /\ promotionSafe = TRUE
 /\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
 /\ sessionCursor = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -127,11 +128,11 @@ State 1: <Initial predicate>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Idle")
 /\ writeWait = <<{}, {}>>
 
-State 2: <C2Next line 53, col 8 to line 54, col 34 of module MC_C2>
+State 2: <C2Next line 53, col 8 to line 54, col 35 of module MC_C2>
 /\ partitionCount = 1
 /\ raftConnected = (n1 :> FALSE @@ n2 :> TRUE @@ n3 :> TRUE)
 
-State 3: <C2Next line 55, col 8 to line 56, col 34 of module MC_C2>
+State 3: <C2Next line 55, col 8 to line 56, col 35 of module MC_C2>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
     target |-> n1,
     actor |-> n2,
@@ -199,7 +200,7 @@ State 4: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] )
 
-State 5: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
+State 5: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ pendingRaft = { [ kind |-> "ActivatePrimary",
     target |-> n2,
     actor |-> n2,
@@ -291,12 +292,12 @@ State 7: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
 /\ activated = (n1 :> 1 @@ n2 :> 3 @@ n3 :> 0)
 /\ activationPending = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 
-State 8: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
+State 8: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ writeStatus = <<"Routed", "Unused">>
 /\ nextWrite = 2
 /\ writeTarget = <<n2, "NO_NODE">>
 
-State 9: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
+State 9: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 0))
 /\ nextSeq = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 0)
 /\ durableOps = (n1 :> {} @@ n2 :> {1} @@ n3 :> {})
@@ -334,21 +335,21 @@ State 10: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
     toEpoch |-> 0,
     indexUuid |-> "INDEX_UUID" ] }
 
-State 11: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
+State 11: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ messages = {}
 /\ writeWait = <<{}, {}>>
 
-State 12: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
+State 12: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ acked = {1}
 /\ writeStatus = <<"Acked", "Unused">>
 /\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 
-State 13: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
+State 13: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ writeStatus = <<"Acked", "Routed">>
 /\ nextWrite = 3
 /\ writeTarget = <<n2, n1>>
 
-State 14: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
+State 14: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ pendingRaft = {}
 /\ raftVoters = {n1, n2, n3}
 /\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
@@ -412,6 +413,7 @@ State 14: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
 /\ sessionSnapshot = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ writeTerm = <<3, 1>>
 /\ sessionTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ activePrimaryApplySafe = TRUE
 /\ promotionSafe = TRUE
 /\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
 /\ sessionCursor = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -511,4 +513,4 @@ State 14: <C2Next line 46, col 8 to line 49, col 60 of module MC_C2>
 18 states generated, 16 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 14.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 2 and the 95th percentile is 2).
-Finished in 01s at (2026-09-26 17:47:28)
+Finished in 01s at (2026-09-26 18:37:20)

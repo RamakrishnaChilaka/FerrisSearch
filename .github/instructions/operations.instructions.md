@@ -127,10 +127,12 @@ directory, HTTP port, transport port, Raft ID, and complete seed-host list.
 
 The separate TLA+ CI job runs `scripts/tla/check.sh` with Java 25 and caches
 the checksum-pinned TLA+ tools 1.7.4 jar. Keep the default matrix below five
-minutes. Each invocation needs isolated Java and TLC temporary directories;
-parallel TLC processes otherwise race while extracting standard modules.
-Expected-violation configurations are successful only when they reproduce the
-documented invariant failure.
+minutes; `fixed-crash`, `fixed-partition`, and `fixed-simulation` are
+local-only unless their bounds are reduced and re-recorded. Each invocation
+needs isolated Java and TLC temporary directories; parallel TLC processes
+otherwise race while extracting standard modules. Expected-violation
+configurations are successful only when they reproduce the documented
+invariant failure.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with
