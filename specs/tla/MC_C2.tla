@@ -46,14 +46,14 @@ C2Next ==
     \/ /\ C2StableNext
        /\ UNCHANGED
              <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-               staleApplySafe, PeerRecoveryVars, FaultVars>>
+               ApplySafetyVars, PeerRecoveryVars, FaultVars>>
     \/ /\ C2FenceChangingNext
        /\ UNCHANGED
              <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
     \/ /\ PartitionMetadata(PrimaryNode)
-       /\ UNCHANGED staleApplySafe
+       /\ UNCHANGED ApplySafetyVars
     \/ /\ SuspectAndRemove(MetadataLeader, PrimaryNode, MetadataLeader)
-       /\ UNCHANGED staleApplySafe
+       /\ UNCHANGED ApplySafetyVars
 
 C2RejectsStaleMessage ==
     \A message \in messages :

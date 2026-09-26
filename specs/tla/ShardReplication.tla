@@ -102,6 +102,7 @@ VARIABLES
     admissionSafe,
     ackMembershipSafe,
     staleApplySafe,
+    activePrimaryApplySafe,
     termMonotonic
 
 ReplicationVars ==
@@ -112,7 +113,9 @@ ReplicationVars ==
       copyAllocation, copyUuid, replicaFence, durableReplicaFence,
       copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
       acked, failed, promotionSafe, admissionSafe, ackMembershipSafe,
-      staleApplySafe, termMonotonic>>
+      staleApplySafe, activePrimaryApplySafe, termMonotonic>>
+
+ApplySafetyVars == <<staleApplySafe, activePrimaryApplySafe>>
 
 RoutingWellFormedValue(r) ==
     /\ r.primary \in Nodes
@@ -264,6 +267,7 @@ ReplicationInit ==
           /\ admissionSafe = TRUE
           /\ ackMembershipSafe = TRUE
           /\ staleApplySafe = TRUE
+          /\ activePrimaryApplySafe = TRUE
           /\ termMonotonic = TRUE
 
 \* src/api/index document and bulk handlers resolve the coordinator's local
@@ -415,7 +419,12 @@ ReplicaApply(message) ==
                   THEN message.term
                   ELSE @]
     /\ staleApplySafe' =
-          (staleApplySafe /\ message.term >= routing.term)
+          (staleApplySafe
+           /\ message.term >= durableReplicaFence[replica])
+    /\ activePrimaryApplySafe' =
+          (activePrimaryApplySafe
+           /\ (activated[replica] = NoTerm
+               \/ message.term >= activated[replica]))
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -455,7 +464,7 @@ ReplicaReject(message) ==
             copyUuid, replicaFence, durableReplicaFence, copyMode,
             installMarker, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe,
-            staleApplySafe, termMonotonic>>
+            ApplySafetyVars, termMonotonic>>
 
 \* Completion of replication::{replicate_write,replicate_bulk}'s concurrent
 \* TransportClient RPC and collection of the replica checkpoint.
@@ -554,7 +563,7 @@ DeliverReplicaNack(message) ==
             truncBelow, pins, copyExists, copyAllocation, copyUuid,
             replicaFence, durableReplicaFence, copyMode, installMarker,
             exclusiveHolder, acked, promotionSafe, admissionSafe,
-            ackMembershipSafe, staleApplySafe, termMonotonic>>
+            ackMembershipSafe, ApplySafetyVars, termMonotonic>>
 
 ActivateCommand(primaryNode, expectedPrimaryTerm) ==
     RaftCommand("ActivatePrimary", primaryNode, primaryNode, primaryNode,
@@ -614,7 +623,7 @@ ObserveActivation(primaryNode) ==
             copyExists, copyAllocation, copyUuid, copyMode, installMarker,
             messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
-            ackMembershipSafe, staleApplySafe, termMonotonic>>
+            ackMembershipSafe, ApplySafetyVars, termMonotonic>>
 
 \* TransportService::ensure_primary_activated aborts when a newer term or
 \* different primary makes the requested activation impossible.
@@ -778,7 +787,7 @@ CommitRaft(command) ==
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
-            ackMembershipSafe, staleApplySafe>>
+            ackMembershipSafe, ApplySafetyVars>>
 
 \* ClusterManager applies one more committed Raft entry on this node.
 \* ClusterManager's state-machine-backed local view advances after a committed
@@ -815,7 +824,7 @@ DeliverView(node) ==
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe,
-            staleApplySafe, termMonotonic>>
+            ApplySafetyVars, termMonotonic>>
 
 ReplicationTypeOK ==
     /\ WriteKinds # {}
@@ -871,6 +880,7 @@ ReplicationTypeOK ==
     /\ admissionSafe \in BOOLEAN
     /\ ackMembershipSafe \in BOOLEAN
     /\ staleApplySafe \in BOOLEAN
+    /\ activePrimaryApplySafe \in BOOLEAN
     /\ termMonotonic \in BOOLEAN
 
 ReplicationStableNext ==
@@ -896,7 +906,7 @@ ReplicationNext ==
     \/ /\ ReplicationStableNext
        /\ UNCHANGED
              <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-               staleApplySafe>>
+               ApplySafetyVars>>
     \/ /\ ReplicationFenceChangingNext
        /\ UNCHANGED <<copyAllocation, copyUuid>>
 

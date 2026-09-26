@@ -24,84 +24,84 @@ L1Snapshot ==
     /\ SourceSnapshot(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1BeginInstall ==
     /\ TargetBeginInstall(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1Install ==
     /\ InstallSnapshot(TargetNode)
     /\ UNCHANGED
-          <<staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+          <<ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1FetchOps ==
     /\ FetchOps(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1ApplyOps ==
     /\ ApplyOps(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1FinishCatchUp ==
     /\ FinishCatchUp(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1BeginPrepare ==
     /\ BeginPrepareFinalize(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1AcquireBarrier ==
     /\ AcquireFinalizeBarrier(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1FinishTail ==
     /\ FinishFinalizeTail(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1TargetComplete ==
     /\ TargetComplete(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, FaultVars>>
 
 L1BeginSettlement ==
     /\ BeginSettlement(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1ProposeMark ==
     /\ ProposeMarkInSync(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1ObserveAdmission ==
     /\ ObserveAdmission(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, pendingAllocation, FaultVars>>
+            ApplySafetyVars, pendingAllocation, FaultVars>>
 
 L1TargetAdmitted ==
     /\ TargetObserveAdmitted(TargetNode)
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            staleApplySafe, sessionAllocation, FaultVars>>
+            ApplySafetyVars, sessionAllocation, FaultVars>>
 
 CommitPending ==
     \E command \in pendingRaft : CommitRaft(command)

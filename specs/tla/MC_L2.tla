@@ -13,12 +13,12 @@ L2Init ==
 L2Crash ==
     /\ crashCount = 0
     /\ Crash(TargetNode)
-    /\ UNCHANGED staleApplySafe
+    /\ UNCHANGED ApplySafetyVars
 
 L2Restart ==
     /\ crashCount = 1
     /\ Restart(TargetNode)
-    /\ UNCHANGED staleApplySafe
+    /\ UNCHANGED ApplySafetyVars
 
 L2StopFaults ==
     /\ crashCount = 1

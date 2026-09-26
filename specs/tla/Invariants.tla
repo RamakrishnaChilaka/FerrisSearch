@@ -74,7 +74,9 @@ NoPartialServe ==
             /\ node \notin routing.inSync
             /\ BlocksLiveReplication(node)
 
-NoStaleReplicaApply == staleApplySafe
+NoApplyBelowObservedFence == staleApplySafe
+
+ActivePrimaryRejectsOldTerm == activePrimaryApplySafe
 
 BarrierReleased ==
     \A node \in Nodes :

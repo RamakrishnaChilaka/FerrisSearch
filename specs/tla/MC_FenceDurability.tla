@@ -65,7 +65,7 @@ SendStaleReplicaProbe ==
             activationPending, writeDoc, writeKind, committed, truncBelow,
             pins, copyExists, copyMode, installMarker, exclusiveHolder,
             acked, failed, promotionSafe, admissionSafe, ackMembershipSafe,
-            staleApplySafe, termMonotonic>>
+            ApplySafetyVars, termMonotonic>>
 
 FenceStableNext ==
     \/ FenceClientWrite
@@ -88,25 +88,25 @@ FenceCrash ==
     /\ writeStatus[1] = "Acked"
     /\ replicaFence[ReplicaNode] = routing.term
     /\ Crash(ReplicaNode)
-    /\ UNCHANGED staleApplySafe
+    /\ UNCHANGED ApplySafetyVars
 
 FenceRestart ==
     /\ Restart(ReplicaNode)
-    /\ UNCHANGED staleApplySafe
+    /\ UNCHANGED ApplySafetyVars
 
 FencePartition ==
     /\ PartitionMetadata(PrimaryNode)
-    /\ UNCHANGED staleApplySafe
+    /\ UNCHANGED ApplySafetyVars
 
 FenceSuspect ==
     /\ SuspectAndRemove(MetadataLeader, PrimaryNode, MetadataLeader)
-    /\ UNCHANGED staleApplySafe
+    /\ UNCHANGED ApplySafetyVars
 
 FenceDurabilityNext ==
     \/ /\ FenceStableNext
        /\ UNCHANGED
              <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-               staleApplySafe, PeerRecoveryVars, FaultVars>>
+               ApplySafetyVars, PeerRecoveryVars, FaultVars>>
     \/ /\ FenceChangingNext
        /\ UNCHANGED
              <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>

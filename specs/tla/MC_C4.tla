@@ -28,12 +28,12 @@ C4Next ==
     \/ /\ C4StableNext
        /\ UNCHANGED
              <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-               staleApplySafe, PeerRecoveryVars, FaultVars>>
+               ApplySafetyVars, PeerRecoveryVars, FaultVars>>
     \/ /\ \E message \in messages : ReplicaApply(message)
        /\ UNCHANGED
              <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
     \/ /\ writeStatus[1] = "Acked"
        /\ Crash(PrimaryNode)
-       /\ UNCHANGED staleApplySafe
+       /\ UNCHANGED ApplySafetyVars
 
 =============================================================================

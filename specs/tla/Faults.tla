@@ -578,6 +578,6 @@ FaultCoreNext ==
 
 FaultNext ==
     /\ FaultCoreNext
-    /\ UNCHANGED staleApplySafe
+    /\ UNCHANGED ApplySafetyVars
 
 =============================================================================

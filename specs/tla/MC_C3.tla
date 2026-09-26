@@ -29,18 +29,18 @@ C3Next ==
     \/ /\ C3StableNext
        /\ UNCHANGED
              <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-               staleApplySafe, PeerRecoveryVars, FaultVars>>
+               ApplySafetyVars, PeerRecoveryVars, FaultVars>>
     \/ /\ \E message \in messages : ReplicaApply(message)
        /\ UNCHANGED
              <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
     \/ /\ writeStatus[1] = "Acked"
        /\ Crash(LostNode)
-       /\ UNCHANGED staleApplySafe
+       /\ UNCHANGED ApplySafetyVars
     \/ /\ DiskLoss(LostNode)
-       /\ UNCHANGED staleApplySafe
+       /\ UNCHANGED ApplySafetyVars
     \/ /\ Restart(LostNode)
-       /\ UNCHANGED staleApplySafe
+       /\ UNCHANGED ApplySafetyVars
     \/ /\ OpenAssignedEmptyCopy(LostNode)
-       /\ UNCHANGED staleApplySafe
+       /\ UNCHANGED ApplySafetyVars
 
 =============================================================================

@@ -987,6 +987,6 @@ PeerRecoveryCoreNext ==
 
 PeerRecoveryNext ==
     /\ PeerRecoveryCoreNext
-    /\ UNCHANGED staleApplySafe
+    /\ UNCHANGED ApplySafetyVars
 
 =============================================================================
