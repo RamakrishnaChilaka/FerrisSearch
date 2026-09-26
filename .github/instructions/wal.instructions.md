@@ -39,6 +39,9 @@ pub trait WriteAheadLog: Send + Sync {
     fn next_seq_no(&self) -> u64;
     fn size_bytes(&self) -> Result<u64>;  // auto-flush threshold check
     fn for_each_from(&self, min_seq_no: u64, callback: &mut dyn FnMut(TranslogEntry) -> Result<()>) -> Result<u64>;  // streaming replay
+    fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64>;
+    fn release_retention_pin(&self, pin_id: u64) -> Result<()>;
+    fn min_retention_pin(&self) -> Option<u64>;
 }
 ```
 
@@ -46,7 +49,8 @@ pub trait WriteAheadLog: Send + Sync {
 ### Wire Format
 `[u32 LE: payload_len][bincode(WireEntry { seq_no, op, payload_json })]`
 - Length-prefixed frames for efficient sequential reading
-- Handles partial writes at EOF gracefully (skips/truncates corrupted tail)
+- On open, truncates only an incomplete active-generation tail; replay and
+  retained-generation reads reject incomplete frames elsewhere
 - Seq numbers are monotonically increasing, persisted in `.seqno` sidecar file
 
 ### Files on Disk (per shard)
@@ -63,6 +67,16 @@ pub trait WriteAheadLog: Send + Sync {
   compatibility wrapper.
 - Primary sequence exhaustion and overflowing explicit bulk ranges must fail
   before any bytes are written; never wrap or reuse a saturated allocator value.
+- `MAX_WAL_FRAME_BYTES` is 32 MiB including the four-byte length prefix. Every
+  single, delete, primary-bulk item, and explicit-sequence replica/recovery item
+  is fully encoded and checked before any WAL bytes or sequence state change.
+  The effective `_source` limit is slightly smaller because the encoded frame
+  also contains `_doc_id`, `_source`, operation, sequence, and bincode metadata.
+- `MAX_WAL_DECODE_FRAME_BYTES` is 65 MiB (`GRPC_MAX_MESSAGE_SIZE + 1 MiB`) for
+  bounded compatibility with complete frames written before the 32 MiB write
+  cap existed. Restart scan, replay, and recovery frames skipped below the
+  requested cursor use this decode ceiling and also validate against the actual
+  file length. Frames transferred by recovery remain limited to 32 MiB.
 - `append_with_seq()` persists a caller-supplied seq_no and advances the local allocator past it
 - `write_bulk_with_start_seq()` persists contiguous caller-supplied seq_nos for replica/recovery bulk apply
 - `read_from(seq_no)` scans all generations in order and returns entries with seq_no > the given value (used for replica recovery)
@@ -70,9 +84,36 @@ pub trait WriteAheadLog: Send + Sync {
 - `size_bytes()` returns the summed size of all retained generations so the engine can trigger checkpoint-aware auto-flush
 - `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only generations whose max seq_no is ≤ the checkpoint; it does NOT rewrite mixed generations in place
 - `truncate()` rolls to a new empty generation and deletes all older generations
+- Recovery retention pins protect every operation at or above their exclusive
+  boundary. Both `truncate()` and `truncate_below()` prune only below the
+  lowest active pin; a pin at zero prevents history pruning.
+- `read_bounded_range()` reads an inclusive/exclusive sequence window without
+  opening another append writer and reports whether the bounded response
+  reached the captured head. Recovery reads use the live generation list under
+  the translog state lock, not a potentially lagging on-disk manifest.
+- The lock protects only capture and validation of the exclusive head and
+  generation-list clone. File scanning runs after releasing it. Recovery scans
+  use the 65 MiB decode ceiling for skipped/terminal compatibility frames, the
+  32 MiB transfer ceiling for returned operations, and relative seeks for
+  bounded pre-cursor frames after decoding only their sequence prefix. An
+  incomplete frame is a concurrent append only in the final captured generation
+  when it starts at or beyond that generation's captured `size_bytes`; it ends
+  the scan cleanly only after all pre-head operations are accounted for.
+  Incomplete frames elsewhere and torn-then-appended frames are corruption.
+- `initialize_empty_at()` creates the empty target WAL/high-water state at a
+  file snapshot's exclusive boundary.
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths
 - Async durability: background task fsyncs every `sync_interval_ms` via Tokio's blocking pool — never call `File::sync_data()` inline on an async worker
 - Reopen requires `translog.manifest`; it trusts persisted metadata for old generations, removes stray generation files not listed in the manifest, ignores unrelated non-generation side files, and scans only the active generation file to recover the allocator high-water mark
+- On open, an incomplete trailing frame in the active generation is truncated
+  to the last complete, fully decoded boundary. The generation file and parent
+  directory are fsynced before opening the append writer, and the discarded
+  byte count is logged. Complete malformed frames, corrupt middle frames, and
+  incomplete frames in retained non-active generations fail closed.
+- `HotTranslog::open*()` is a mutating, exclusive startup operation: it may
+  remove unreferenced generations and truncate an incomplete active tail.
+  Never call it against a shard with a live engine/writer. Runtime recovery and
+  diagnostics must read through the live engine's captured generation state.
 - Unknown operation tags in persisted entries are corruption errors: reopen/replay must return `Err`, not panic
 - Persist the manifest before deleting obsolete generation files during `truncate()` / `truncate_below()` so crashes never leave startup without authoritative generation metadata
 - `translog.committed` should be persisted after each intermediate replay batch commit so replay remains idempotent across repeated crash recovery
@@ -84,3 +125,11 @@ pub trait WriteAheadLog: Send + Sync {
 - Carry primary-assigned receipts through the engine and transport layers.
   Reading the allocator/checkpoint again after releasing the write lock cannot
   recover the identity of an earlier operation.
+
+## Known Write-Failure Limitation
+
+A failed `write_all` or `sync_data` does not yet fail-stop the shard. If the
+process continues writing after a partial WAL append, later frames can turn the
+incomplete tail into middle corruption that restart must reject. Do not weaken
+that rejection or claim this failure mode is repaired by startup tail
+truncation; durable fail-stop write handling remains separate work.

@@ -34,7 +34,11 @@ This is the canonical example of the control-plane idiom — read `control-plane
 - Protected index name: `.ferris_security`.
 - Normal user-facing index names still go through `IndexName`, which rejects dot-prefixed names. Internal security index creation must use `security_index_metadata()` and Raft `ClusterCommand::CreateIndex`.
 - Security-enabled leaders auto-create `.ferris_security` only when `auto_create_security_index` is explicitly true and data nodes are known. The metadata is one shard, strict dynamic mapping, explicit `doc_type` / `payload` fields, and an adaptive replica count of `data_nodes - 1`.
-- The leader lifecycle loop must continue reconciling `.ferris_security` after creation: add replicas when data nodes join, trim replicas when data nodes leave, and persist changes with Raft `UpdateIndex`.
+- The leader lifecycle loop must continue reconciling `.ferris_security` after
+  creation: add replicas when data nodes join, trim replicas when data nodes
+  leave, and persist changes with Raft `UpdateIndex`. Initial creation replicas
+  are in sync; later-added security replicas remain out of sync and
+  non-promotable until file recovery is implemented.
 - Ordinary index APIs, global bulk, SQL metadata commands, cat endpoints, and `SHOW TABLES` must not expose `.ferris_security`. Dedicated security APIs should be the only management path.
 
 ## Authorization Surfaces

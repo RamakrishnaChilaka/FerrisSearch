@@ -659,8 +659,10 @@ impl TransportClient {
         }
     }
 
-    /// Request recovery from the primary: send our local checkpoint,
-    /// primary returns translog entries for replay.
+    /// Request a retained WAL suffix from the primary.
+    ///
+    /// The node lifecycle does not use this partial response for replica
+    /// recovery or in-sync admission; complete file recovery is still pending.
     pub async fn request_recovery(
         &self,
         primary_node: &NodeInfo,
@@ -688,6 +690,101 @@ impl TransportClient {
         }
     }
 
+    pub async fn start_peer_recovery(
+        &self,
+        primary_node: &NodeInfo,
+        request: StartPeerRecoveryRequest,
+    ) -> Result<StartPeerRecoveryResponse, anyhow::Error> {
+        let mut client = self
+            .connect(&primary_node.host, primary_node.transport_port)
+            .await?;
+        let response = client
+            .start_peer_recovery(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        Ok(response)
+    }
+
+    pub async fn fetch_recovery_file_chunk(
+        &self,
+        primary_node: &NodeInfo,
+        request: FetchRecoveryFileChunkRequest,
+    ) -> Result<FetchRecoveryFileChunkResponse, anyhow::Error> {
+        let mut client = self
+            .connect(&primary_node.host, primary_node.transport_port)
+            .await?;
+        let response = client
+            .fetch_recovery_file_chunk(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        Ok(response)
+    }
+
+    pub async fn fetch_recovery_ops(
+        &self,
+        primary_node: &NodeInfo,
+        request: FetchRecoveryOpsRequest,
+    ) -> Result<FetchRecoveryOpsResponse, anyhow::Error> {
+        let mut client = self
+            .connect(&primary_node.host, primary_node.transport_port)
+            .await?;
+        let response = client
+            .fetch_recovery_ops(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        Ok(response)
+    }
+
+    pub async fn prepare_finalize_recovery(
+        &self,
+        primary_node: &NodeInfo,
+        request: PrepareFinalizeRecoveryRequest,
+    ) -> Result<PrepareFinalizeRecoveryResponse, anyhow::Error> {
+        let mut client = self
+            .connect(&primary_node.host, primary_node.transport_port)
+            .await?;
+        let response = client
+            .prepare_finalize_recovery(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        Ok(response)
+    }
+
+    pub async fn complete_finalize_recovery(
+        &self,
+        primary_node: &NodeInfo,
+        request: CompleteFinalizeRecoveryRequest,
+    ) -> Result<CompleteFinalizeRecoveryResponse, anyhow::Error> {
+        let mut client = self
+            .connect(&primary_node.host, primary_node.transport_port)
+            .await?;
+        let response = client
+            .complete_finalize_recovery(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.success {
+            return Err(anyhow::anyhow!(
+                "peer recovery finalization was not successful"
+            ));
+        }
+        Ok(response)
+    }
+
     /// Forward a settings update to the master node via gRPC.
     /// The master applies the changes via Raft.
     pub async fn forward_update_settings(
@@ -712,6 +809,62 @@ impl TransportClient {
         let inner = resp.into_inner();
         if !inner.error.is_empty() {
             return Err(anyhow::anyhow!("{}", inner.error));
+        }
+        Ok(())
+    }
+
+    pub async fn forward_mark_replica_in_sync(
+        &self,
+        master: &NodeInfo,
+        request: MarkReplicaInSyncRequest,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
+        let response = client
+            .mark_replica_in_sync(tonic::Request::new(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("MarkReplicaInSync RPC: {e}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.acknowledged {
+            return Err(anyhow::anyhow!("MarkReplicaInSync was not acknowledged"));
+        }
+        Ok(())
+    }
+
+    pub async fn forward_activate_primary(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+        index_uuid: &str,
+        shard_id: u32,
+        primary_node_id: &str,
+        expected_term: u64,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
+        let response = client
+            .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
+                index_name: index_name.to_string(),
+                index_uuid: index_uuid.to_string(),
+                shard_id,
+                primary_node_id: primary_node_id.to_string(),
+                expected_term,
+            }))
+            .await
+            .map_err(|e| anyhow::anyhow!("ActivatePrimary RPC: {e}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.acknowledged {
+            return Err(anyhow::anyhow!("ActivatePrimary was not acknowledged"));
         }
         Ok(())
     }

@@ -81,9 +81,49 @@ impl CompositeEngine {
         })
     }
 
+    pub(crate) fn open_existing_with_mappings(
+        data_dir: impl AsRef<Path>,
+        refresh_interval: Duration,
+        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+    ) -> Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let text = HotEngine::open_existing_with_mappings(
+            &data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache.clone(),
+        )?;
+
+        Ok(Self {
+            text,
+            vector: RwLock::new(None),
+            data_dir,
+            checkpoint: std::sync::atomic::AtomicU64::new(0),
+            global_cp: std::sync::atomic::AtomicU64::new(0),
+            column_cache,
+        })
+    }
+
     /// Get a reference to the underlying HotEngine (for refresh loop).
     pub fn text_engine(&self) -> &HotEngine {
         &self.text
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_wal_append_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
+        self.text.set_wal_append_barrier_for_test(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_peer_recovery_read_started_sender_for_test(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.text
+            .set_peer_recovery_read_started_sender_for_test(sender);
     }
 
     /// Start the background refresh loop for the text engine.
@@ -681,6 +721,37 @@ impl SearchEngine for CompositeEngine {
     fn update_global_checkpoint(&self, checkpoint: u64) {
         self.global_cp
             .fetch_max(checkpoint, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn create_peer_recovery_snapshot(
+        &self,
+        snapshot_dir: &std::path::Path,
+    ) -> Result<super::PeerRecoverySnapshot> {
+        self.text.create_peer_recovery_snapshot(snapshot_dir)
+    }
+
+    fn prepare_peer_recovery_snapshot(
+        &self,
+        snapshot_dir: &std::path::Path,
+    ) -> Result<super::PeerRecoverySnapshotPreparation> {
+        self.text.prepare_peer_recovery_snapshot(snapshot_dir)
+    }
+
+    fn release_peer_recovery_pin(&self, pin_id: u64) -> Result<()> {
+        self.text.release_peer_recovery_pin(pin_id)
+    }
+
+    fn peer_recovery_ops(
+        &self,
+        min_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<super::PeerRecoveryOpsBatch> {
+        self.text.peer_recovery_ops(min_seq_no, max_ops, max_bytes)
+    }
+
+    fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
+        self.text.peer_recovery_commit_files()
     }
 }
 

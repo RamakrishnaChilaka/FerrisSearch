@@ -12,6 +12,7 @@ transport_port: 9300
 # disables the cache. This budget does not cap total process memory.
 # column_cache_size_percent: 10
 # column_cache_populate_threshold: 5
+# max_concurrent_peer_recoveries: 2
 #
 # Default is true. Set to false if you want exact coordinator-side merge
 # instead of approximate shard-level top-K pruning for eligible GROUP BY queries.

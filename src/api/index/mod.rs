@@ -21,15 +21,27 @@ fn is_document_validation_error(error: &anyhow::Error) -> bool {
         .is_some_and(|status| status.code() == tonic::Code::InvalidArgument)
 }
 
+fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &'static str) {
+    if is_document_validation_error(error) {
+        return (StatusCode::BAD_REQUEST, "mapper_parsing_exception");
+    }
+    match error
+        .downcast_ref::<tonic::Status>()
+        .map(tonic::Status::code)
+    {
+        Some(tonic::Code::Aborted) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shard_not_available_exception",
+        ),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "forward_exception"),
+    }
+}
+
 fn document_write_error_response(
     operation: &str,
     error: anyhow::Error,
 ) -> (StatusCode, Json<Value>) {
-    let (status, error_type) = if is_document_validation_error(&error) {
-        (StatusCode::BAD_REQUEST, "mapper_parsing_exception")
-    } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, "forward_exception")
-    };
+    let (status, error_type) = forwarded_write_error_classification(&error);
     crate::api::error_response(status, error_type, format!("{operation} failed: {error}"))
 }
 
@@ -175,7 +187,9 @@ async fn auto_create_index(
         0u32,
         crate::cluster::state::ShardRoutingEntry {
             primary: state.local_node_id.clone(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1211,11 +1225,7 @@ pub async fn delete_document(
         .await
     {
         Ok(res) => (StatusCode::OK, Json(res)),
-        Err(e) => crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "search_exception",
-            format!("{e}"),
-        ),
+        Err(e) => document_write_error_response("Delete", e),
     }
 }
 
@@ -1537,11 +1547,22 @@ pub async fn delete_index(
 
     let cluster_state = state.cluster_manager.get_state();
 
-    if !cluster_state.indices.contains_key(index_name.as_str()) {
+    let Some(index_metadata) = cluster_state.indices.get(index_name.as_str()) else {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
             format!("no such index [{index_name}]"),
+        );
+    };
+    if let Err(error) = state
+        .shard_manager
+        .abort_source_recoveries_for_index(&index_metadata.uuid)
+        .await
+    {
+        return crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "peer_recovery_cleanup_exception",
+            format!("Failed to stop peer recovery before deleting [{index_name}]: {error}"),
         );
     }
 

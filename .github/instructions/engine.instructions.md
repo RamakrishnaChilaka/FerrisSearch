@@ -65,6 +65,10 @@ pub trait SearchEngine: Send + Sync {
 - A non-empty bulk receipt has a contiguous WAL-reserved start; an empty batch
   has no assigned sequence. Explicit-sequence methods are required implementations,
   not defaults that allocate new primary sequences.
+- Every primary, replica, recovery, and delete operation must encode to a WAL
+  frame no larger than `MAX_WAL_FRAME_BYTES` (32 MiB including the frame
+  header). Reject larger operations as validation errors before WAL or engine
+  mutation; validate every item before writing any bulk bytes.
 
 ## CompositeEngine (src/engine/composite.rs)
 ```rust
@@ -83,6 +87,10 @@ pub struct CompositeEngine {
   attribution does not add gap tracking, retry deduplication, or primary fencing.
 
 ### Constructors
+- `HotEngine::open_existing_with_mappings()` /
+  `CompositeEngine::open_existing_with_mappings()` require an existing Tantivy
+  `index/meta.json` and never create a fresh index. Dynamic-mapping reopen uses
+  this path after dropping the old engine.
 - `new(data_dir, refresh_interval)` — default refresh loop (static interval)
 - `new_with_mappings(data_dir, refresh_interval, mappings, durability, column_cache)` — with schema + WAL + shared column cache
 
@@ -142,6 +150,18 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - `rebuild_vectors()` is only called when the index has `KnnVector` fields in its mappings. The shard manager gates this check; the composite engine's `rebuild_vectors()` itself is still a 100K-doc MatchAll scan, so never call it unconditionally.
 - Even the legacy `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used directly; never run Tantivy commit/reload inline on an async interval task
 - Replica/recovery writes use `append_with_seq()` / `write_bulk_with_start_seq()` under the hood so persisted WAL seq_nos match the primary's numbering
+- Peer snapshot creation holds maintenance then translog then writer locks,
+  commits exactly through `B = next_seq_no`, durably persists
+  `translog.committed`, registers the WAL pin before releasing the translog
+  lock, and hard-links the existing committed segment components plus
+  `meta.json`/`.managed.json`. Tantivy's `SegmentMeta::list_files()` can name
+  optional absent components; transfer only files that actually exist.
+- Snapshot hashes run after lock release. Unlocked byte-copy fallback is
+  forbidden when hard links are unavailable.
+- `StartPeerRecovery` snapshot preparation runs in a detached, cancellation-safe
+  task. The short RPC returns/polls preparation status; hashing is outside the
+  maintenance and translog critical sections, so large shards are not bounded
+  by the ordinary 30-second transport request timeout.
 
 ### Shared Column Cache Budget
 - `resolve_column_cache_budget()` is a blocking startup probe. On Linux it reads

@@ -185,7 +185,9 @@ fn make_test_metadata(primary: Option<&str>) -> IndexMetadata {
             0,
             ShardRoutingEntry {
                 primary: primary.to_string(),
+                primary_term: 1,
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -439,6 +441,56 @@ fn finalize_bulk_items_preserves_shard_error_reason() {
     assert_eq!(
         items[0]["index"]["error"]["reason"],
         "Shard bulk index failed: Replication failed: replica node-2 timed out"
+    );
+}
+
+#[test]
+fn retryable_aborted_write_maps_to_service_unavailable() {
+    let error = anyhow::Error::from(tonic::Status::aborted(
+        "reopen shard after dynamic mapping: shard UUID changed; retry the write",
+    ));
+    let (status, Json(body)) = document_write_error_response("Forward", error);
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["type"], "shard_not_available_exception");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("shard UUID changed")
+    );
+}
+
+#[test]
+fn bulk_aborted_failure_remains_attributable_and_retryable() {
+    let routed_docs = vec![RoutedBulkDoc {
+        position: 0,
+        index_name: "idx".into(),
+        doc_id: "doc-1".into(),
+        payload: serde_json::json!({"title": "hello"}),
+        shard_id: 0,
+        node_id: "node-1".into(),
+    }];
+    let failure = bulk::BulkTargetFailure::from_forward_error(anyhow::Error::from(
+        tonic::Status::aborted("stale shard reopen; retry the write"),
+    ));
+    let failed_targets =
+        HashMap::from([(("idx".to_string(), "node-1".to_string(), 0), Err(failure))]);
+
+    let items = finalize_bulk_items(vec![None], routed_docs, &failed_targets);
+
+    assert_eq!(items[0]["index"]["_index"], "idx");
+    assert_eq!(items[0]["index"]["_id"], "doc-1");
+    assert_eq!(items[0]["index"]["status"], 503);
+    assert_eq!(
+        items[0]["index"]["error"]["type"],
+        "shard_not_available_exception"
+    );
+    assert!(
+        items[0]["index"]["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("stale shard reopen")
     );
 }
 

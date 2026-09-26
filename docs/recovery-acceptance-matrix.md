@@ -1,6 +1,6 @@
 # Recovery Protocol Acceptance Matrix
 
-> **Status: Proposed protocol acceptance; limited RP-1 coverage is recorded below.**
+> **Status: Proposed protocol acceptance; limited RP-1, in-sync tracking, primary-term, and bounded file-recovery coverage is recorded below.**
 >
 > **Date:** September 24, 2026.
 >
@@ -148,6 +148,107 @@ acknowledgement policy, or production parity.
 | F09 | Delay sequence s, deliver s+1, lag global-prefix propagation, then crash the primary at each ack boundary. | No success above an unresolved gap; promotion preserves the candidate's own durable acknowledged history even when the known global prefix is lower. | T, P |
 | F10 | Give an old eligible replica a conflicting tail and an older snapshot; crash/supersede promotion during reconciliation, including conflicting peer records where the candidate lacks a position. | No authoritative copy is destructively rolled back before committed exclusion/activation. Missing-candidate conflicts use the declared no-op/exclusion rule; every later eligible promotion preserves acknowledged history. | F, P |
 | F11 | Crash a primary with non-conflicting in-flight records spread across survivors; restart a reporting peer and deliver old-term work; after promotion, lose the new primary's shard storage while retaining metadata quorum. Also exercise genuine conflicts separately. | Durable peer fences reject delayed old-term work; new incarnation requires a fresh report. Normal tails preserve redundancy by append-only resync. Genuine-conflict fallback enforces the selected minimum and reports unavailable after loss of the only eligible copy. | T, F, P |
+
+### PR In-Sync Tracking Evidence Record (September 24, 2026)
+
+This record covers only authoritative replica eligibility, acknowledgement
+targeting, status, and fail-closed promotion on base
+`e0c6509106d64d2c51ed86858cc3dc187457d979`. It is not RP-3 certification.
+
+| ID | Implemented evidence | Current limit |
+|---|---|---|
+| F04 (partial) | `cluster::state::tests::promotion_refuses_out_of_sync_replica_even_with_higher_checkpoint`, `promotion_fallback_skips_out_of_sync_replica_in_routing_order`, and strict cluster-snapshot membership tests in `transport::server::tests`; `update_index_promotes_replica_after_primary_death` preserves an eligible promotion through Raft. | Eligibility is authoritative by node ID, but allocation IDs, primary terms, conditional routing generations, contiguous-prefix proof, and stale-primary/apply fencing are not implemented. |
+| F07 (core) | Process-backed `peer_recovery_disabled_replica_is_not_promoted_and_primary_rejoin_restores_data` in `tests/restart_regression.rs` preserves the September 24 fail-closed schedule with automatic recovery explicitly disabled on prospective replica nodes. It verifies the assigned replica stays out of sync/`INITIALIZING`, primary loss leaves routing unpromoted and health red, GET fails instead of returning a false not-found, and all exact acknowledged values return after the original primary rejoins. | Automatic recovery is now covered separately below. Forced stale-primary recovery tooling, contiguous-prefix checkpoints, the asynchronous durability contract, and complete vector recovery remain unverified. |
+
+### Bounded File Recovery Evidence Record (September 25, 2026)
+
+This record supersedes only the "no automatic file recovery" limit in the
+September 24 entry. It remains a bounded subset, not certification of the full
+proposed protocol or production parity.
+
+| ID | Implemented evidence | Current limit |
+|---|---|---|
+| A02, R01, R02, R08 (partial) | Real-gRPC/real-engine `node::peer_recovery::tests::file_recovery_copies_flushed_state_catches_up_and_admits_target`; process-backed `added_replica_recovers_files_and_survives_primary_loss` and `rejoining_stale_replica_is_recovered_before_primary_failover`. They cover 20 writes, flush, five writes, concurrent acknowledged writes/deletes, file install, suffix replay, admission, exact values, rejoin with stale same-directory data, primary loss, and one post-failover write. | Snapshot-plus-suffix only; no verified common-history operation-only path, resumable transfer, allocation/history identity, or contiguous-prefix proof. |
+| H01, H02, H03 (partial) | `wal::tests::retention_pin_bounds_checkpoint_and_full_truncation`, `zero_retention_pin_prevents_pruning_any_history`, `engine::tantivy::tests::peer_recovery_pin_is_respected_by_every_flush_path`, and `peer_recovery_snapshot_has_exact_boundary_and_retained_suffix`. Pin registration occurs under the translog lock before snapshot release; every current truncation path respects the minimum pin. | Pins are in-memory, time-bounded to the source session, and not byte-budgeted or transferred across source failure. H02 is snapshot fallback for new/stale copies, not negotiated path selection. |
+| M04, M07 (partial) | Primary handlers hold a shared per-shard write guard through replication; `PrepareFinalizeRecovery` takes the exclusive guard and `CompleteFinalizeRecovery` observes committed membership before release. Unknown admission retries under the barrier and uses `ActivatePrimary` to make the stale command impossible. Phase-A real-Raft `conditional_membership_rejects_stale_promotion_and_old_primary_term` fences an old-term admission. Target regressions `completion_timeout_keeps_target_open_until_committed_admission_is_observed`, `restarted_pending_target_observed_as_promoted_is_admitted`, and `definitive_term_bump_rejects_and_marks_pending_target` preserve availability while local ordered state catches up. | No configuration generation or transition ID; settlement is term-based and process-local. Replica apply still lacks full stale-primary term fencing. |
+| S01, S04, S05, S08 (partial) | `peer_recovery_snapshot_has_exact_boundary_and_retained_suffix`, `shard::tests::peer_recovery_marker_blocks_normal_shard_open`, `finalized_peer_recovery_install_opens_exact_snapshot`, `strict_recovery_open_refuses_schema_mismatch_without_wiping`, `recovery_file_names_reject_traversal_and_separators`, and `corrupted_recovery_file_checksum_is_rejected`. | Install replaces only an out-of-sync copy and uses a persistent marker rather than a retained previous generation. Source hard links must be supported; vector state is rebuilt under the existing cap. |
+| O02, O04, O05 (partial) | Per-node `max_concurrent_peer_recoveries` (default 2, zero disables, max 64), bounded 1 MiB chunks, bounded operation batches, 5–60 second backoff, ten-minute session expiry, Tokio blocking-pool file/engine work, and `expired_source_session_releases_pin_and_snapshot`. | No byte reservation, throttling, resumable progress, unified admission governor, or persisted session recovery. |
+| F07 (retained) | `peer_recovery_disabled_replica_is_not_promoted_and_primary_rejoin_restores_data` sets `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES=0` on prospective replica nodes and preserves the fail-closed red-shard/original-primary-return behavior. | Forced stale-primary recovery remains unsupported. |
+
+Source engine replacement coverage includes
+`dynamic_mapping_write_aborts_source_session_before_reopen`: a dynamic mapping
+write aborts the pre-finalize source session, waits for its engine/pin cleanup,
+reopens with the evolved schema, and invalidates the old target session.
+
+The September 26 review regressions add
+`cancelled_start_becomes_pollable_and_reopen_cleans_it`,
+`start_waits_for_reopen_engine_replacement`,
+`idle_reaper_keeps_barrier_during_settlement`,
+`queued_writes_reject_primary_change_inside_barrier`,
+`cancelled_prepare_finalize_clears_preparing_flag`,
+`expired_finalize_without_mark_releases_barrier_and_bumps_term`,
+`lagging_target_view_after_admission_keeps_copy_open`,
+`older_local_term_remains_unknown_for_pending_target`,
+`peer_recovery_marker_created_while_open_waits_is_rechecked`,
+`bounded_range_uses_live_generations_when_manifest_lags_roll`, and
+`dead_node_removal_waits_for_routing_update_success`.
+
+Round-2 evidence adds
+`peer_recovery_scan_does_not_block_concurrent_write`,
+`persistent_setup_failure_is_returned_without_poll_spin`,
+`stale_target_source_session_is_replaced`,
+`cancelled_reopen_completes_while_setup_hash_is_blocked`,
+`setup_lifetime_wait_has_no_lost_wakeup`,
+`peer_recovery_pin_drop_does_not_block_tokio_worker`, and
+`dynamic_mapping_primary_change_before_reopen_rejects_write`.
+
+Round-3 evidence adds
+`dynamic_mapping_reopen_after_delete_does_not_resurrect_old_uuid`,
+`shard::tests::reopen_rechecks_identity_after_waiting_for_open_lock`,
+`setup_panic_does_not_block_engine_release_wait`,
+`expired_finalize_settlement_is_not_blocked_by_hashing_setup`,
+`bounded_range_rejects_torn_terminal_frame_followed_by_append`, and
+`bounded_range_rejects_oversized_frame_payload`.
+
+Round-4 evidence adds
+`delete_during_reopen_open_window_does_not_resurrect_directory`,
+`reopen_refuses_missing_existing_tantivy_index`,
+`dynamic_mapping_same_term_uuid_replacement_rejects_before_open`,
+`bounded_range_treats_partial_post_head_frame_as_complete`, the
+`wal_frame_limit_*` boundary tests,
+`retryable_aborted_write_maps_to_service_unavailable`, and
+`bulk_aborted_failure_remains_attributable_and_retryable`.
+
+Round-5 evidence adds
+`legacy_large_frame_opens_replays_and_skips_in_recovery`,
+`bounded_range_rejects_legacy_large_frame_in_transfer_range`,
+`bounded_range_rejects_partial_post_head_frame_in_non_final_generation`,
+`bounded_range_rejects_partial_post_head_frame_inside_captured_size`,
+`open_truncates_partial_active_tail_before_append`, and
+`open_rejects_complete_corrupt_middle_frame`, while retaining
+`bounded_range_treats_partial_post_head_frame_as_complete`,
+`bounded_range_rejects_torn_terminal_frame_followed_by_append`, and the
+`wal_frame_limit_*` write-boundary tests.
+
+Round-6 evidence adds
+`transport::server::tests::recover_replica_does_not_open_or_mutate_live_wal`.
+It deterministically pauses a live append after a partial frame is visible,
+starts legacy `RecoverReplica`, verifies the RPC enters the live engine read
+path without shrinking the file, then proves the completed append and all
+acknowledged documents survive engine reopen.
+
+The non-blocking WAL write-failure case remains unimplemented: a partial
+`write_all` or failed `sync_data` does not yet fail-stop the shard, so later
+writes could convert a repairable trailing fragment into fail-closed middle
+corruption. This is separate from the closed startup-tail and live-read cases.
+
+The remove-and-re-add ABA case remains a documented liveness limitation:
+without allocation IDs, a finalized pending target cannot distinguish the old
+assignment from a replacement assignment and may remain `INITIALIZING`.
+The generic shard-open fast path also remains keyed by index name and shard ID;
+outside the reviewed coordinator/reopen ordering, a non-coordinator with a
+stale same-name engine does not yet validate the requested UUID. Full
+allocation identity is still required for that boundary.
 
 ## M. Membership And Acknowledgement Sets
 

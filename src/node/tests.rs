@@ -1,132 +1,33 @@
 use super::*;
 use crate::cluster::state::{IndexMetadata, IndexSettings, IndexUuid, ShardRoutingEntry};
-use crate::engine::CompositeEngine;
-use crate::transport::proto::RecoverReplicaOp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn make_engine() -> (tempfile::TempDir, Arc<dyn crate::engine::SearchEngine>) {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
-    (dir, Arc::new(engine))
-}
-
-#[test]
-fn apply_recovery_ops_indexes_documents() {
-    let (_dir, engine) = make_engine();
-    let ops = vec![
-        RecoverReplicaOp {
-            seq_no: 0,
-            op: "index".into(),
-            doc_id: "r1".into(),
-            payload_json: serde_json::to_vec(&serde_json::json!({"x": 1})).unwrap(),
-        },
-        RecoverReplicaOp {
-            seq_no: 1,
-            op: "index".into(),
-            doc_id: "r2".into(),
-            payload_json: serde_json::to_vec(&serde_json::json!({"x": 2})).unwrap(),
-        },
-    ];
-
-    apply_recovery_ops(&engine, &ops);
-
-    engine.refresh().unwrap();
-    assert!(engine.get_document("r1").unwrap().is_some());
-    assert!(engine.get_document("r2").unwrap().is_some());
-    assert!(engine.local_checkpoint() >= 1);
-}
-
-#[test]
-fn apply_recovery_ops_deletes_documents() {
-    let (_dir, engine) = make_engine();
-    engine
-        .add_document("d1", serde_json::json!({"x": 1}))
-        .unwrap();
-    engine.refresh().unwrap();
-    assert!(engine.get_document("d1").unwrap().is_some());
-
-    let ops = vec![RecoverReplicaOp {
-        seq_no: 5,
-        op: "delete".into(),
-        doc_id: "d1".into(),
-        payload_json: vec![],
-    }];
-
-    apply_recovery_ops(&engine, &ops);
-
-    engine.refresh().unwrap();
+#[tokio::test]
+async fn node_rejects_excessive_peer_recovery_concurrency() {
+    let config = crate::config::AppConfig {
+        max_concurrent_peer_recoveries: 65,
+        ..Default::default()
+    };
+    let error = match Node::new(config).await {
+        Ok(_) => panic!("excessive peer recovery concurrency must be rejected"),
+        Err(error) => error,
+    };
     assert!(
-        engine.get_document("d1").unwrap().is_none(),
-        "document should be deleted"
+        error
+            .to_string()
+            .contains("max_concurrent_peer_recoveries must be between 0 and 64")
     );
-    assert!(engine.local_checkpoint() >= 5);
 }
 
 #[test]
-fn apply_recovery_ops_skips_unknown_ops() {
-    let (_dir, engine) = make_engine();
-    let cp_before = engine.local_checkpoint();
-
-    let ops = vec![RecoverReplicaOp {
-        seq_no: 10,
-        op: "unknown_op".into(),
-        doc_id: "x".into(),
-        payload_json: vec![],
-    }];
-
-    apply_recovery_ops(&engine, &ops);
-
-    // Checkpoint should not change for unknown ops
-    assert_eq!(engine.local_checkpoint(), cp_before);
-}
-
-#[test]
-fn apply_recovery_ops_empty_is_noop() {
-    let (_dir, engine) = make_engine();
-    let cp_before = engine.local_checkpoint();
-    apply_recovery_ops(&engine, &[]);
-    assert_eq!(engine.local_checkpoint(), cp_before);
-}
-
-#[test]
-fn apply_recovery_ops_mixed_index_and_delete() {
-    let (_dir, engine) = make_engine();
-
-    let ops = vec![
-        RecoverReplicaOp {
-            seq_no: 0,
-            op: "index".into(),
-            doc_id: "m1".into(),
-            payload_json: serde_json::to_vec(&serde_json::json!({"v": 1})).unwrap(),
-        },
-        RecoverReplicaOp {
-            seq_no: 1,
-            op: "index".into(),
-            doc_id: "m2".into(),
-            payload_json: serde_json::to_vec(&serde_json::json!({"v": 2})).unwrap(),
-        },
-        RecoverReplicaOp {
-            seq_no: 2,
-            op: "delete".into(),
-            doc_id: "m1".into(),
-            payload_json: vec![],
-        },
-    ];
-
-    apply_recovery_ops(&engine, &ops);
-
-    engine.refresh().unwrap();
+fn dead_node_removal_waits_for_routing_update_success() {
+    assert!(dead_node_removal_allowed(false));
     assert!(
-        engine.get_document("m1").unwrap().is_none(),
-        "m1 should be deleted"
+        !dead_node_removal_allowed(true),
+        "node removal must be deferred when promotion/routing persistence fails"
     );
-    assert!(
-        engine.get_document("m2").unwrap().is_some(),
-        "m2 should exist"
-    );
-    assert!(engine.local_checkpoint() >= 2);
 }
 
 #[tokio::test]
@@ -140,7 +41,9 @@ async fn open_local_assigned_shards_opens_unopened_local_shards() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec!["node-2".into()],
+            in_sync_replicas: vec!["node-2".into()],
             unassigned_replicas: 0,
         },
     );
@@ -178,7 +81,9 @@ fn open_local_assigned_shards_skips_missing_expected_uuid_dir_for_recovered_assi
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -215,7 +120,9 @@ async fn open_local_assigned_shards_creates_missing_dir_for_new_assignment() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -253,7 +160,9 @@ async fn recovered_node_only_guards_assignments_from_local_recovered_state() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -290,7 +199,9 @@ async fn recovered_startup_shards_remain_guarded_across_reopen_attempts() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -336,7 +247,9 @@ async fn open_local_assigned_shards_blocking_does_not_starve_runtime() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -432,7 +345,9 @@ fn cleanup_orphaned_data_if_authoritative_keeps_known_uuid_dirs() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -471,7 +386,9 @@ fn cleanup_orphaned_data_if_authoritative_skips_when_local_uuid_dir_missing() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -525,7 +442,9 @@ fn cleanup_skips_when_uuid_dir_was_freshly_created() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -575,7 +494,9 @@ fn cleanup_runs_when_uuid_dir_was_pre_existing() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -623,7 +544,9 @@ fn two_restart_recovery_sequence_preserves_old_data_and_never_creates_fresh_uuid
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );

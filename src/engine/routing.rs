@@ -85,7 +85,9 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "node-A".into(),
+                primary_term: 1,
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -93,7 +95,9 @@ mod tests {
             1,
             ShardRoutingEntry {
                 primary: "node-B".into(),
+                primary_term: 1,
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );

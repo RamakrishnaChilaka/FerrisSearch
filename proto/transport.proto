@@ -19,6 +19,8 @@ message ShardAssignment {
     string node_id = 2;          // primary node
     repeated string replica_node_ids = 3; // replica nodes
     uint32 unassigned_replicas = 4;
+    repeated string in_sync_replica_node_ids = 5; // authoritative replicas
+    uint64 primary_term = 6;
 }
 
 message FieldMappingEntry {
@@ -268,6 +270,77 @@ message RecoverReplicaOp {
     bytes payload_json = 4;  // document body
 }
 
+message RecoveryFileMetadata {
+    string name = 1;
+    uint64 length = 2;
+    string sha256 = 3;
+}
+
+message StartPeerRecoveryRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    string target_node_id = 4;
+}
+
+message StartPeerRecoveryResponse {
+    string session_id = 1;
+    uint64 primary_term = 2;
+    uint64 snapshot_next_seq_no = 3;
+    repeated RecoveryFileMetadata files = 4;
+    string error = 5;
+    bool preparing = 6;
+}
+
+message FetchRecoveryFileChunkRequest {
+    string session_id = 1;
+    string file_name = 2;
+    uint64 offset = 3;
+    uint32 max_len = 4;
+}
+
+message FetchRecoveryFileChunkResponse {
+    bytes data = 1;
+    bool eof = 2;
+    string error = 3;
+}
+
+message FetchRecoveryOpsRequest {
+    string session_id = 1;
+    uint64 from_seq_no = 2;
+    uint32 max_ops = 3;
+}
+
+message FetchRecoveryOpsResponse {
+    repeated RecoverReplicaOp operations = 1;
+    uint64 primary_next_seq_no = 2;
+    bool complete = 3;
+    string error = 4;
+}
+
+message PrepareFinalizeRecoveryRequest {
+    string session_id = 1;
+    uint64 applied_next_seq_no = 2;
+}
+
+message PrepareFinalizeRecoveryResponse {
+    repeated RecoverReplicaOp operations = 1;
+    uint64 barrier_next_seq_no = 2;
+    bool retry_catch_up = 3;
+    bool complete = 4;
+    string error = 5;
+}
+
+message CompleteFinalizeRecoveryRequest {
+    string session_id = 1;
+    uint64 applied_next_seq_no = 2;
+}
+
+message CompleteFinalizeRecoveryResponse {
+    bool success = 1;
+    string error = 2;
+}
+
 // ─── Raft Consensus ─────────────────────────────────────────────────────────
 
 // Generic Raft RPCs — payloads are JSON-encoded openraft messages.
@@ -292,6 +365,33 @@ message UpdateSettingsRequest {
 message UpdateSettingsResponse {
     bool acknowledged = 1;
     string error = 2;         // non-empty on failure
+}
+
+message MarkReplicaInSyncRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    string replica_node_id = 4;
+    string primary_node_id = 5;
+    uint64 primary_term = 6;
+}
+
+message MarkReplicaInSyncResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
+message ActivatePrimaryRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    string primary_node_id = 4;
+    uint64 expected_term = 5;
+}
+
+message ActivatePrimaryResponse {
+    bool acknowledged = 1;
+    string error = 2;
 }
 
 // ─── Index Management (forwarded to leader) ─────────────────────────────────
@@ -498,9 +598,16 @@ service InternalTransport {
 
     // Replica recovery: replica sends its checkpoint, primary replays translog
     rpc RecoverReplica(RecoverReplicaRequest) returns (RecoverReplicaResponse);
+    rpc StartPeerRecovery(StartPeerRecoveryRequest) returns (StartPeerRecoveryResponse);
+    rpc FetchRecoveryFileChunk(FetchRecoveryFileChunkRequest) returns (FetchRecoveryFileChunkResponse);
+    rpc FetchRecoveryOps(FetchRecoveryOpsRequest) returns (FetchRecoveryOpsResponse);
+    rpc PrepareFinalizeRecovery(PrepareFinalizeRecoveryRequest) returns (PrepareFinalizeRecoveryResponse);
+    rpc CompleteFinalizeRecovery(CompleteFinalizeRecoveryRequest) returns (CompleteFinalizeRecoveryResponse);
 
     // Dynamic settings (forwarded to leader)
     rpc UpdateSettings(UpdateSettingsRequest) returns (UpdateSettingsResponse);
+    rpc MarkReplicaInSync(MarkReplicaInSyncRequest) returns (MarkReplicaInSyncResponse);
+    rpc ActivatePrimary(ActivatePrimaryRequest) returns (ActivatePrimaryResponse);
 
     // Index management (forwarded to leader)
     rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);

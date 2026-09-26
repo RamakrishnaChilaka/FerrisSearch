@@ -25,6 +25,8 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `DeleteIndex { index_name: String }` — delete index and all metadata
 - `SetMaster { node_id: String }` — set cluster master
 - `UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replicas, settings)
+- `MarkReplicaInSync { index_name, index_uuid, shard_id, replica, primary, primary_term }` — conditionally admit a recovered assigned replica
+- `ActivatePrimary { index_name, index_uuid, shard_id, primary, expected_term }` — conditionally bump the per-shard primary term
 - `AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
 - `PutApiKey { record: SecurityApiKeyRecord }` — upsert a dynamic API key (stores only the hash) into `ClusterState.api_keys`
 - `DeleteApiKey { key_id: String }` — remove a dynamic API key
@@ -54,12 +56,16 @@ pub struct ClusterStateMachine {
 | `CreateIndex` | `state.add_index()` |
 | `DeleteIndex` | remove from `state.indices` |
 | `SetMaster` | set `state.master_node` |
-| `UpdateIndex` | replace `shard_routing` in `state.indices` |
+| `UpdateIndex` | preserve state-machine-owned terms, intersect in-sync membership, and reject out-of-sync promotion |
+| `MarkReplicaInSync` | add one assigned replica only when UUID, primary, and term match |
+| `ActivatePrimary` | increment the term only when primary and expected term match |
 | `AddMappings` | merge `new_fields` into `state.indices[name].mappings` via `.entry().or_insert()` |
 | `PutApiKey` / `DeleteApiKey` | `insert` / `remove` on `state.api_keys` |
 | `PutRole` / `DeleteRole` | `insert` / `remove` on `state.roles` |
 
-**Every apply arm bumps `state.version += 1`** — including idempotent upserts and deletes
+Successful apply arms bump `state.version += 1`; conditional-command rejection
+returns `ClusterResponse::Error` without partial mutation or a version bump.
+Unconditional apply arms bump on idempotent upserts and deletes
 of absent keys (mirrors `DeleteIndex` / `RemoveNode`). `AddNode`/`CreateIndex` bump version
 inside the `state.*` helper they call.
 

@@ -22,6 +22,8 @@ pub struct ShardManager {
 - `open_shard_with_mappings(index, shard_id, mappings)` — with field type info, reuses the same generated per-index UUID for local/test helpers
 - `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)` — with UUID, SettingsManager + reactive refresh loop + vector rebuild
 - `open_shard_with_settings_blocking(index, shard_id, mappings, settings, index_uuid)` — async-safe Tokio wrapper for shard open/recovery work
+- `open_shard_with_settings_strict*()` — recovery install open that never invokes the schema-mismatch wipe fallback
+- `prepare_peer_recovery_target_blocking()` / `finalize_peer_recovery_target_blocking()` — close and wipe one out-of-sync copy, persist the marker, initialize WAL state, verify the commit files, and publish the opened engine
 - `get_shard(index, shard_id) -> Option<Arc<dyn SearchEngine>>`
 - `get_index_shards(index) -> Vec<(u32, Arc<dyn SearchEngine>)>`
 - `all_shards() -> Vec<(ShardKey, Arc<dyn SearchEngine>)>`
@@ -53,6 +55,36 @@ pub struct ShardManager {
 5. Call `engine.rebuild_vectors()` only when `mappings` contains `KnnVector` fields — skip the expensive 100K-doc MatchAll query for non-vector indices to prevent OOM during multi-shard restart
 6. Handle schema mismatch by wiping orphaned directories and retrying
 
+Peer-recovery install is the exception to step 6: while
+`PEER_RECOVERY_IN_PROGRESS` exists, ordinary open/search/replica-apply paths
+must fail closed. Finalization opens under the per-shard lock with schema reset
+disabled, verifies the exact committed file set, and removes the marker only
+after the engine is ready to publish.
+
+After CompleteFinalize is sent, `PEER_RECOVERY_AWAITING_MEMBERSHIP` preserves
+the caught-up copy across target restart. This marker permits open and live
+replica apply. Reconcile removes it without closing the engine when the node is
+in-sync or promoted; only definitive UUID/assignment/primary-term rejection
+closes the engine and restores `PEER_RECOVERY_IN_PROGRESS`.
+
+`ShardManager::reopen_shard()` and async index-close wrappers invoke the
+registered source-session cleanup hook before replacing engines. Cleanup must
+drop the session's engine `Arc` and WAL pin before Tantivy reopen.
+StartPeerRecovery, reopen, and close also share the UUID/shard lifecycle lock;
+the cleanup-to-removal interval is not open to a new source session.
+Reopen is replacement-only: after acquiring that lifecycle lock and again
+under the per-shard open lock, the registered UUID must still match and the
+exact shard engine/directory must still exist. A detached reopen must never
+register an old UUID, recreate a deleted directory, or create a missing engine.
+Its existing-only engine open also requires `index/meta.json`.
+Async index deletion acquires every lifecycle lock registered for the UUID and
+every per-shard open lock registered for the index, including shards temporarily
+absent from the engine map during reopen, before removing engines or storage.
+
+The in-progress marker must be checked both before and after the per-shard open
+lock. A marker created while open is waiting always wins and keeps the shard
+closed.
+
 ### Async Scheduling Rule
 - `open_shard_with_settings()`, `close_index_shards()`, and `cleanup_orphaned_data()` are synchronous helpers for already-blocking contexts and tests.
 - Any Tokio call site must use the `*_blocking()` wrappers so shard startup/rebuild/delete work does not stall unrelated async tasks.
@@ -66,7 +98,7 @@ pub struct ShardKey {
 }
 ```
 
-## ISR Tracking (In-Sync Replica)
+## Replica Checkpoint Tracking
 ```rust
 pub struct IsrTracker {
     replicas: RwLock<HashMap<ShardKey, HashMap<String, ReplicaCheckpoint>>>,
@@ -83,15 +115,18 @@ pub struct ReplicaCheckpoint {
 - `update_replica_checkpoint(index, shard_id, replica_node_id, checkpoint)`
 - `update_replica_checkpoints(index, shard_id, checkpoints: &[(String, u64)])`
 - `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>`
-  - A replica is "in-sync" if `primary_checkpoint - replica_checkpoint <= max_lag`
+  - Returns a legacy lag-based diagnostic view only; it does not grant
+    authoritative in-sync membership
 - `replica_checkpoints(index, shard_id) -> Vec<(String, u64)>`
 - `remove_shard(index, shard_id)`, `remove_index(index)`
 
-### How ISR is Used
-1. Primary writes to WAL + engine → replicates to all replicas
+### How Checkpoint Observations Are Used
+1. Primary writes to WAL + engine → replicates to the Raft-authoritative
+   `ShardRoutingEntry.in_sync_replicas`
 2. Each replica returns its `local_checkpoint` after applying
 3. Primary calls `update_replica_checkpoints()` with returned values
-4. Leader uses `replica_checkpoints()` during shard failover to pick best replica (highest checkpoint)
+4. Leader may use `replica_checkpoints()` to rank only candidates already in
+   the authoritative in-sync set
 
 The current checkpoint values are highest-observed sequence watermarks, not
 proof that every lower sequence was applied. Do not describe ISR tracking,

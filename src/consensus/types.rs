@@ -47,6 +47,23 @@ pub enum ClusterCommand {
     SetMaster { node_id: String },
     /// Update an existing index's metadata (e.g. shard routing after replica allocation).
     UpdateIndex { metadata: IndexMetadata },
+    /// Conditionally admit a recovered replica into the authoritative in-sync set.
+    MarkReplicaInSync {
+        index_name: String,
+        index_uuid: String,
+        shard_id: u32,
+        replica: String,
+        primary: String,
+        primary_term: u64,
+    },
+    /// Conditionally advance a primary's authority term before it serves writes.
+    ActivatePrimary {
+        index_name: String,
+        index_uuid: String,
+        shard_id: u32,
+        primary: String,
+        expected_term: u64,
+    },
     /// Merge new field mappings into an existing index without replacing the
     /// entire metadata. This avoids TOCTOU races when concurrent documents
     /// discover different new fields at the same time.
@@ -82,6 +99,18 @@ impl std::fmt::Display for ClusterCommand {
             ClusterCommand::UpdateIndex { metadata } => {
                 write!(f, "UpdateIndex({})", metadata.name)
             }
+            ClusterCommand::MarkReplicaInSync {
+                index_name,
+                shard_id,
+                replica,
+                ..
+            } => write!(f, "MarkReplicaInSync({index_name}/{shard_id}, {replica})"),
+            ClusterCommand::ActivatePrimary {
+                index_name,
+                shard_id,
+                primary,
+                ..
+            } => write!(f, "ActivatePrimary({index_name}/{shard_id}, {primary})"),
             ClusterCommand::AddMappings {
                 index_name,
                 new_fields,
@@ -109,10 +138,19 @@ impl std::fmt::Display for ClusterCommand {
 // ─── Responses ──────────────────────────────────────────────────────────────
 
 /// Response returned after a command is applied to the state machine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClusterResponse {
     Ok,
     Error(String),
+}
+
+impl ClusterResponse {
+    pub fn into_result(self) -> Result<(), String> {
+        match self {
+            Self::Ok => Ok(()),
+            Self::Error(error) => Err(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -209,7 +247,9 @@ mod tests {
             0,
             ShardRoutingEntry {
                 primary: "n1".into(),
+                primary_term: 1,
                 replicas: vec!["n2".into()],
+                in_sync_replicas: vec!["n2".into()],
                 unassigned_replicas: 0,
             },
         );
@@ -232,6 +272,7 @@ mod tests {
             assert_eq!(metadata.name, "routed");
             assert_eq!(metadata.number_of_shards, 3);
             assert_eq!(metadata.shard_routing[&0].primary, "n1");
+            assert_eq!(metadata.shard_routing[&0].primary_term, 1);
             assert_eq!(metadata.shard_routing[&0].replicas, vec!["n2"]);
         } else {
             panic!("Expected CreateIndex");
@@ -344,5 +385,32 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: ClusterCommand = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, ClusterCommand::DeleteRole { name } if name == "analyst"));
+    }
+
+    #[test]
+    fn replica_membership_commands_serde_roundtrip() {
+        let commands = [
+            ClusterCommand::MarkReplicaInSync {
+                index_name: "logs".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 2,
+                replica: "node-2".into(),
+                primary: "node-1".into(),
+                primary_term: 7,
+            },
+            ClusterCommand::ActivatePrimary {
+                index_name: "logs".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 2,
+                primary: "node-1".into(),
+                expected_term: 7,
+            },
+        ];
+
+        for command in commands {
+            let json = serde_json::to_string(&command).unwrap();
+            let restored: ClusterCommand = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{restored}"), format!("{command}"));
+        }
     }
 }

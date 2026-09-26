@@ -63,10 +63,8 @@ pub struct Node {
 ### Follower Duties (every 5s tick)
 1. Ping master node for liveness check
 2. Reopen any locally assigned shards that are still not open
-3. Request translog-based replica recovery for replica shards once opened
-4. Replay recovered operations using the seq_no carried by the primary so the replica WAL stays in the shared shard seq space
-5. Retry `JoinCluster` whenever the authoritative cluster state does not contain the local node, even if local Raft state is already initialized from disk
-6. If the master ping is rejected because the target no longer recognizes this node in cluster state, immediately retry `JoinCluster` through the seed hosts so a removed or stale follower can re-register itself. Transient ping failures (timeouts, connection errors, missing local master info) should only log and retry on the next lifecycle tick — they must not trigger a rejoin by themselves. Repeated follower-side join retries should be rate-limited so a permanently rejected or partitioned node does not issue `JoinCluster` on every 5-second lifecycle tick.
+3. Retry `JoinCluster` whenever the authoritative cluster state does not contain the local node, even if local Raft state is already initialized from disk
+4. If the master ping is rejected because the target no longer recognizes this node in cluster state, immediately retry `JoinCluster` through the seed hosts so a removed or stale follower can re-register itself. Transient ping failures (timeouts, connection errors, missing local master info) should only log and retry on the next lifecycle tick — they must not trigger a rejoin by themselves. Repeated follower-side join retries should be rate-limited so a permanently rejected or partitioned node does not issue `JoinCluster` on every 5-second lifecycle tick.
 
 ### Async Scheduling Rule
 - The lifecycle loop itself stays on Tokio because it coordinates Raft/control-plane work, but shard reopen and orphan cleanup perform blocking filesystem/Tantivy recovery work.
@@ -77,9 +75,29 @@ pub struct Node {
 - Do not clear the recovered startup-assignment guard after bootstrap or rejoin. Authoritative cluster state confirms shard ownership, not the continued existence of the local shard data; only assignments that were never part of the recovered local state may create fresh UUID directories later in the lifecycle loop.
 - Later shard assignments may create their UUID directories during the lifecycle loop so new primaries/replicas can come online after startup.
 
-## Recovery Invariant
-- `apply_recovery_ops()` must use the explicit-seq engine write methods for both index and delete operations
-- Recovery replay must not allocate fresh local WAL seq_nos on the recovering replica
+## Peer Recovery Driver
+- The lifecycle loop schedules recovery on every node for each local
+  `local_shards` replica assignment absent from `in_sync_replicas`.
+- `max_concurrent_peer_recoveries` bounds target sessions per node (default 2,
+  `0` disables); failures back off from 5 seconds to 60 seconds.
+- File download, fsync, shard close/open, vector rebuild, and recovery apply run
+  through Tokio's blocking facilities rather than the fixed search/write pools.
+- A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
+  Successful finalization clears the in-memory target gate only after the
+  primary reports settled admission.
+- Completion timeout is not rejection. A caught-up target persists a
+  finalized-awaiting-membership marker, accepts live replication, and is
+  excluded from new recovery scheduling until local ordered state says
+  admitted/promoted or definitively rejected. This state is reconstructed when
+  the target restarts.
+- An abandoned finalize session is made definitive by a source-side
+  `ActivatePrimary` term bump. If no admission command was submitted, release
+  the barrier first and bump asynchronously; after submission, keep the barrier
+  until admission or the newer term is observed.
+- Remove-and-re-add of the same node while a finalized target is pending can
+  remain `Unknown`: routing has node IDs but no allocation IDs, so the target
+  cannot distinguish the old assignment from its replacement. Keep it pending
+  rather than guessing until allocation identity exists.
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every
@@ -87,17 +105,28 @@ pub struct Node {
    returns orphaned primary shard IDs. Mixed primary/replica roles are accounted
    independently per shard, never gated by aggregate index state.
 2. For each orphaned primary:
-   - Query `isr_tracker.replica_checkpoints(index, shard_id)` for all replicas
-   - Find replica with **highest checkpoint** (most up-to-date data)
-   - Call `IndexMetadata::promote_replica_to(shard_id, best_replica_node)`
-   - Increment `unassigned_replicas` for the lost replica slot
+   - Restrict candidates to the Raft-authoritative
+     `ShardRoutingEntry.in_sync_replicas` set.
+   - Prefer the eligible candidate with the highest locally observed ISR
+     checkpoint; if no eligible checkpoint is known, use the first in-sync
+     replica in routing order.
+   - Call `IndexMetadata::promote_replica_to()`; it independently rejects
+     out-of-sync candidates.
+   - Increment `unassigned_replicas` for the promoted replica's old slot.
+   - If no in-sync copy survives, log the index/shard explicitly, do not
+     promote, and leave the missing primary assignment unchanged so health is
+     red and the original primary can return with its data.
 3. Issue `UpdateIndex` through Raft when any replica slot was removed or any
    primary was promoted.
 4. Re-read committed cluster state before processing another dead node so
    sequential removals do not reuse stale routing or double-count slots.
+5. If any conditional routing update is rejected, do not remove that node from
+   cluster state in the same tick; retry from fresh state.
 
-This accounting fix does not change promotion eligibility, acknowledgement
-membership, replica admission, or recovery safety.
+Promotion changes increment the state-machine-owned shard term. A promoted or
+restarted primary still activates once per process before its first write.
+Whole-index `UpdateIndex` races beyond the enforced routing rules remain future
+work.
 
 ## AppState (shared across all API handlers)
 ```rust

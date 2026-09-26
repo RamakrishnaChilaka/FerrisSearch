@@ -2,6 +2,7 @@
 //! Manages node lifecycle including startup, shutdown, and Raft consensus.
 
 mod lifecycle;
+mod peer_recovery;
 mod reconciliation;
 
 #[cfg(test)]
@@ -15,7 +16,7 @@ use crate::shard::ShardManager;
 use crate::transport::client::TransportClient;
 use crate::wal::TranslogDurability;
 
-use lifecycle::{apply_recovery_ops, remote_seed_hosts, try_join_cluster};
+use lifecycle::{remote_seed_hosts, try_join_cluster};
 use reconciliation::{
     build_guarded_startup_shards, cleanup_orphaned_data_if_authoritative_blocking,
     open_local_assigned_shards_blocking, should_retry_cluster_join, snapshot_uuid_dirs,
@@ -168,8 +169,15 @@ fn follower_join_retry_remaining(
     }
 }
 
+fn dead_node_removal_allowed(routing_update_failed: bool) -> bool {
+    !routing_update_failed
+}
+
 impl Node {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
+        if config.max_concurrent_peer_recoveries > 64 {
+            anyhow::bail!("max_concurrent_peer_recoveries must be between 0 and 64");
+        }
         let column_cache_percent = config.column_cache_size_percent;
         let column_cache_budget = tokio::task::spawn_blocking(move || {
             crate::engine::column_cache::resolve_column_cache_budget(column_cache_percent)
@@ -369,6 +377,8 @@ impl Node {
         let raft_node_id = self.config.raft_node_id;
         let manager_clone = self.shard_manager.clone();
         let security_manager = self.security_manager.clone();
+        let peer_recovery_driver =
+            peer_recovery::PeerRecoveryDriver::new(self.config.max_concurrent_peer_recoveries);
         let remote_seeds = remote_seed_hosts(&seed_hosts, local_node.transport_port);
 
         tokio::spawn(async move {
@@ -523,6 +533,13 @@ impl Node {
                     guarded_missing_startup_shards.clone(),
                 )
                 .await;
+                peer_recovery_driver.reconcile(
+                    &state,
+                    &local_id,
+                    manager.clone(),
+                    manager_clone.clone(),
+                    client.clone(),
+                );
 
                 if !orphan_cleanup_done {
                     orphan_cleanup_done = cleanup_orphaned_data_if_authoritative_blocking(
@@ -581,8 +598,9 @@ impl Node {
                             // ── Shard failover: promote replicas for orphaned primaries ──
                             // Before removing the node, handle shard routing updates:
                             // 1. Find all indices where the dead node hosts a primary or replica
-                            // 2. For orphaned primaries: pick best replica (highest checkpoint) and promote
+                            // 2. For orphaned primaries: rank only authoritative in-sync replicas
                             // 3. For lost replicas: increment unassigned count for re-allocation
+                            let mut routing_update_failed = false;
                             for idx_meta in fresh_state.indices.values() {
                                 let mut updated = idx_meta.clone();
                                 let lost_replica_slot = idx_meta
@@ -593,32 +611,36 @@ impl Node {
                                 let mut changed = lost_replica_slot;
 
                                 for shard_id in &orphaned_primaries {
-                                    // Pick the best replica from ISR (highest checkpoint)
+                                    // Prefer the highest observed checkpoint, but only
+                                    // among Raft-authoritative in-sync candidates.
                                     let cps = manager_clone
                                         .isr_tracker
                                         .replica_checkpoints(&idx_meta.name, *shard_id);
 
-                                    let promoted = if let Some((best_node, best_cp)) = cps
-                                        .iter()
-                                        .filter(|(nid, _)| nid != dead)
-                                        .max_by_key(|(_, cp)| *cp)
+                                    let promoted = if let Some(candidate) =
+                                        updated.select_promotion_candidate(*shard_id, &cps)
                                     {
-                                        tracing::info!(
-                                            "Promoting replica '{}' (checkpoint={}) to primary for {}/shard_{}",
-                                            best_node,
-                                            best_cp,
-                                            idx_meta.name,
-                                            shard_id
-                                        );
-                                        updated.promote_replica_to(*shard_id, best_node)
+                                        if let Some((_, checkpoint)) =
+                                            cps.iter().find(|(node_id, _)| node_id == &candidate)
+                                        {
+                                            tracing::info!(
+                                                "Promoting in-sync replica '{}' (checkpoint={}) to primary for {}/shard_{}",
+                                                candidate,
+                                                checkpoint,
+                                                idx_meta.name,
+                                                shard_id
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                "Promoting first in-sync replica '{}' for {}/shard_{} (no checkpoint observation)",
+                                                candidate,
+                                                idx_meta.name,
+                                                shard_id
+                                            );
+                                        }
+                                        updated.promote_replica_to(*shard_id, &candidate)
                                     } else {
-                                        // No ISR data — fall back to first available replica
-                                        tracing::info!(
-                                            "Promoting first available replica for {}/shard_{} (no ISR data)",
-                                            idx_meta.name,
-                                            shard_id
-                                        );
-                                        updated.promote_replica(*shard_id)
+                                        false
                                     };
 
                                     if promoted {
@@ -631,26 +653,36 @@ impl Node {
                                         }
                                     } else {
                                         tracing::error!(
-                                            "No replicas available to promote for {}/shard_{} — shard is unavailable!",
+                                            "No in-sync copy survives for {}/shard_{}; refusing promotion and leaving primary '{}' unchanged",
                                             idx_meta.name,
-                                            shard_id
+                                            shard_id,
+                                            updated.shard_routing[shard_id].primary
                                         );
                                     }
                                 }
 
                                 if changed
-                                    && let Err(e) = raft
-                                        .client_write(ClusterCommand::UpdateIndex {
-                                            metadata: updated,
-                                        })
-                                        .await
+                                    && let Err(e) = crate::consensus::client_write_checked(
+                                        raft,
+                                        ClusterCommand::UpdateIndex { metadata: updated },
+                                    )
+                                    .await
                                 {
+                                    routing_update_failed = true;
                                     tracing::error!(
                                         "Failed to update shard routing for '{}' after node death: {}",
                                         idx_meta.name,
                                         e
                                     );
                                 }
+                            }
+
+                            if !dead_node_removal_allowed(routing_update_failed) {
+                                tracing::warn!(
+                                    "Deferring removal of dead node {} because a shard routing update was rejected; retrying from fresh state on the next lifecycle tick",
+                                    dead
+                                );
+                                continue;
                             }
 
                             // Remove from Raft membership first
@@ -720,9 +752,11 @@ impl Node {
                                         "Creating protected security system index {}",
                                         crate::security::SECURITY_INDEX_NAME
                                     );
-                                    if let Err(e) = raft
-                                        .client_write(ClusterCommand::CreateIndex { metadata })
-                                        .await
+                                    if let Err(e) = crate::consensus::client_write_checked(
+                                        raft,
+                                        ClusterCommand::CreateIndex { metadata },
+                                    )
+                                    .await
                                     {
                                         tracing::error!(
                                             "Failed to create security system index via Raft: {}",
@@ -751,9 +785,11 @@ impl Node {
                                 crate::security::SECURITY_INDEX_NAME,
                                 updated.number_of_replicas
                             );
-                            if let Err(e) = raft
-                                .client_write(ClusterCommand::UpdateIndex { metadata: updated })
-                                .await
+                            if let Err(e) = crate::consensus::client_write_checked(
+                                raft,
+                                ClusterCommand::UpdateIndex { metadata: updated },
+                            )
+                            .await
                             {
                                 tracing::error!(
                                     "Failed to adapt security system index replicas via Raft: {}",
@@ -771,11 +807,11 @@ impl Node {
                                         updated.name,
                                         updated.unassigned_replica_count()
                                     );
-                                    if let Err(e) = raft
-                                        .client_write(ClusterCommand::UpdateIndex {
-                                            metadata: updated,
-                                        })
-                                        .await
+                                    if let Err(e) = crate::consensus::client_write_checked(
+                                        raft,
+                                        ClusterCommand::UpdateIndex { metadata: updated },
+                                    )
+                                    .await
                                     {
                                         tracing::error!(
                                             "Failed to update shard routing via Raft: {}",
@@ -917,65 +953,6 @@ impl Node {
                                         join_pre_existing,
                                     )
                                     .await;
-                            }
-                        }
-
-                        // ── Replica recovery ────────────────────────
-                        // Check if we host any replica shards that need translog-based recovery.
-                        // For each shard where we are a replica, compare our local checkpoint
-                        // against the primary and request missing operations if behind.
-                        for idx_meta in state.indices.values() {
-                            for (shard_id, routing) in &idx_meta.shard_routing {
-                                // Only process shards where we are a replica
-                                if !routing.replicas.contains(&local_id) {
-                                    continue;
-                                }
-                                let primary_node = match state.nodes.get(&routing.primary) {
-                                    Some(n) => n,
-                                    None => continue,
-                                };
-
-                                // Check if we have the shard open and get its checkpoint
-                                let engine =
-                                    match manager_clone.get_shard(&idx_meta.name, *shard_id) {
-                                        Some(e) => e,
-                                        None => continue, // shard not open yet
-                                    };
-
-                                let local_cp = engine.local_checkpoint();
-                                if local_cp == 0 {
-                                    // Never received any data — request full recovery
-                                    match client
-                                        .request_recovery(
-                                            primary_node,
-                                            &idx_meta.name,
-                                            *shard_id,
-                                            0,
-                                        )
-                                        .await
-                                    {
-                                        Ok(result) => {
-                                            if !result.operations.is_empty() {
-                                                apply_recovery_ops(&engine, &result.operations);
-                                                tracing::info!(
-                                                    "Replica recovery for {}/shard_{}: applied {} ops (primary at {})",
-                                                    idx_meta.name,
-                                                    shard_id,
-                                                    result.ops_replayed,
-                                                    result.primary_checkpoint
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Recovery request for {}/shard_{} failed: {}",
-                                                idx_meta.name,
-                                                shard_id,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
                             }
                         }
                     }

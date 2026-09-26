@@ -75,6 +75,48 @@ cargo test -- test_name                         # Single test by name
 - For index UUID / orphan-cleanup fixes, add a regression that an auto-created index opens its local shard with the same UUID stored in cluster state, plus a restart-path regression that missing expected UUID directories cause cleanup to bail out instead of deleting unknown shard data.
 - For recovered-node startup guard changes, add a two-restart regression that proves a missing startup UUID dir never gets recreated on the first restart and therefore can never make the old UUID dir look orphaned on the second restart.
 - For restart/rejoin data-loss fixes that depend on real process startup order, add or extend a process-backed `restart_regression` test that runs real `ferrissearch` binaries through create -> ingest -> flush -> restart -> verify count/UUID-dir invariants.
+- For authoritative in-sync membership changes, cover creation-time admission,
+  later allocation staying out of sync, removal, in-sync-only targeted and
+  fallback promotion, out-of-sync-first replica reduction, legacy serde
+  fail-closed behavior, strict proto roundtrip/rejection, and live replication
+  targeting. Add a real three-process flush -> allocate replica -> primary loss
+  -> red shard -> original-primary rejoin regression that verifies exact
+  acknowledged values.
+- For file-based peer recovery, cover WAL pins on every truncation path,
+  exact snapshot boundary under concurrent writes, marker/strict-open
+  semantics, file name/offset/length/hash validation, ordered bounded operation
+  apply, session expiry, stale term/session rejection, final barrier admission,
+  and live post-admission replication. Process coverage must include added
+  replica recovery with concurrent acknowledged writes, recovery disabled via
+  per-node config, and stale same-directory replica rejoin before failover.
+- Availability regressions must also cover dynamic-mapping reopen with an
+  active source session, completion timeout remaining non-destructive, pending
+  target restart followed by promotion, and definitive term rejection
+  restoring the destructive recovery marker.
+- Review regressions also cover cancelled asynchronous Start, cancelled
+  PrepareFinalize, settlement-safe idle reaping, queued index/bulk/delete after
+  primary change, marker creation during open, live-generation reads after a
+  failed manifest publish, and routing-update rejection before node removal.
+- Round-2 recovery regressions cover lock-free large-generation WAL scans,
+  one-shot setup error polling, stale-target replacement, cancelled reopen
+  during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary
+  changes during dynamic-mapping Raft work.
+- Round-3 recovery regressions cover detached reopen versus delete/recreate at
+  both lifecycle and per-shard-lock boundaries, setup panic completion,
+  unrelated finalize settlement during long hashing, and torn/oversized WAL
+  frames at the captured recovery head.
+- Round-4 recovery regressions cover delete during the reopen open-window,
+  missing existing Tantivy metadata, same-term index UUID replacement,
+  partially visible post-head WAL appends, the 32 MiB frame boundary on every
+  WAL write API, and HTTP 503 mapping with attributable bulk failures.
+- Round-5 WAL regressions cover legacy 40 MiB frame open/replay/skip
+  compatibility, the retained 32 MiB recovery-transfer ceiling, exact
+  final-generation/captured-size handling for in-progress appends, durable
+  active-tail truncation before append, and fail-closed middle corruption.
+- Round-6 recovery coverage pauses a real live WAL append mid-frame and calls
+  legacy `RecoverReplica`; the RPC must wait for and read through the live
+  engine, never truncate/delete files through a second `HotTranslog::open`, and
+  a subsequent engine reopen must replay every acknowledged frame.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.
@@ -94,7 +136,13 @@ cargo test -- test_name                         # Single test by name
 - For new `SearchRequest` / `QueryClause` variants, add a serde JSON roundtrip regression because search DSL requests cross transport boundaries as serialized JSON.
 - For streamed shard SQL transport changes, add a real gRPC integration test that forces multiple Arrow batches from `forward_sql_batch_stream_to_shard()` / `SqlRecordBatchStream`, not just unit tests around IPC decoding.
 - For streamed SQL transport metadata changes, add coverage for `total_hits`, `collected_rows`, and actual `streaming_used`, plus at least one `/_sql/stream` regression where the streamed endpoint must keep `streaming_used=false` because the shard falls back to `sql_record_batch()`.
-- For JoinCluster or cluster-state transport fixes, add one roundtrip regression that proves `raft_node_id`, `unassigned_replicas`, index `mappings`, index `settings`, and index `uuid` survive proto conversion, one regression that unknown field types fail snapshot decoding instead of being coerced, plus concurrent gRPC regressions for duplicate `raft_node_id` rejection and full voter-set preservation across overlapping joins.
+- For JoinCluster or cluster-state transport fixes, add one roundtrip regression
+  that proves `raft_node_id`, `unassigned_replicas`, `in_sync_replicas`, index
+  `mappings`, index `settings`, and index `uuid` survive proto conversion.
+  Reject malformed in-sync membership and unknown field types instead of
+  coercing them, and preserve concurrent gRPC regressions for duplicate
+  `raft_node_id` rejection and full voter-set preservation across overlapping
+  joins.
 - For follower heartbeat/rejoin fixes, add transport coverage that `Ping` rejects unregistered source nodes and a lifecycle-level regression whenever the node loop changes how ping rejection triggers `JoinCluster` recovery.
 - For `_id` fast-path refactors, add a multi-segment sorted-result regression that proves `_id` stays aligned with projected data columns after segment concatenation and reorder.
 - For distributed hit-merge changes, add unit coverage for `merge_sorted_hit_lists()` and a multi-node REST regression where only one shard returns hits but the coordinator still must apply a custom sort.
@@ -117,7 +165,7 @@ cargo test -- test_name                         # Single test by name
 ### Replication Tests (tests/replication_integration.rs)
 - Spin up real gRPC servers with isolated shard managers
 - Test primary-to-replica replication, bulk replication, recovery
-- Test checkpoint tracking, ISR behavior
+- Test checkpoint tracking, authoritative in-sync targeting, and replica apply
 - Uses actual `TransportClient` + `TransportService` over localhost
 - Seed `ClusterManager` with node/index/shard metadata before gRPC write, replication, or search calls; transport now rejects unknown shards instead of implicitly creating them from empty metadata
 
@@ -127,8 +175,12 @@ cargo test -- test_name                         # Single test by name
 - Exercises create -> bulk index -> flush -> restart-all -> verify count and UUID-backed shard directories
 - Exercises bounded mixed-role master loss with 3 shards and 2 replicas, then
   verifies per-shard lost-copy accounting, real promotion, exact acknowledged
-  values/deletes, and a write routed to the promoted shard. This is not safe
-  replica rejoin/admission coverage.
+  values/deletes, and a write routed to the promoted shard.
+- Reproduces the flush-truncated-WAL schedule with a later-added out-of-sync
+  replica, proves it remains `INITIALIZING` and is not promoted, then restarts
+  the original primary and verifies all acknowledged values return.
+- This does not prove file recovery, in-sync admission, terms/fencing, or
+  restarted-replica gap handling.
 - Asserts destructive delete reasons do not appear in logs during the preserved-data workflow
 
 ## Test Helper Patterns

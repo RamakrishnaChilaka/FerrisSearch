@@ -61,6 +61,123 @@ changes. The [restart regression](../tests/restart_regression.rs) restarts the
 cluster and checks data preservation. These do not establish a complete
 partition, stale-primary, divergent-history, and interrupted-recovery contract.
 
+> **Implementation note — September 24, 2026:** the first in-sync tracking
+> package now stores replica eligibility in Raft routing metadata, targets live
+> writes only to that set, refuses promotion when no in-sync copy survives, and
+> removes the follower's unsafe partial WAL-suffix replay. Later-added replicas
+> remain out of sync until file recovery and conditional admission are
+> implemented. See the
+> [PR in-sync tracking evidence record](recovery-acceptance-matrix.md#pr-in-sync-tracking-evidence-record-september-24-2026).
+
+> **Implementation note — September 25, 2026:** a bounded file-based peer
+> recovery subset now gives later-added and rejoining replicas a committed
+> Tantivy file snapshot, a source-side WAL pin at exclusive boundary `B`,
+> bounded suffix transfer, an exclusive final write barrier, and
+> `(primary, primary_term)` conditional in-sync admission. Restarted/promoted
+> primaries activate through a conditional term bump before their first write.
+> Target installation uses `PEER_RECOVERY_IN_PROGRESS`, strict schema open, and
+> SHA-256 validation; hard links are required on the source. Tantivy
+> `SegmentMeta::list_files()` includes optional absent components, so the
+> snapshot manifest contains the existing committed components plus
+> `meta.json` and `.managed.json`.
+>
+> This is not full RP-3/RP-5: checkpoints remain high-water marks rather than
+> contiguous prefixes; there are no history/allocation IDs, replica-side term
+> fencing, operation-only path selection, resumable chunks, compression, or
+> complete vector transfer (the existing rebuild cap remains). Source sessions
+> and pins are process-local; only pre-finalize idle setups/sessions expire
+> after ten minutes, while admitting/settling sessions are resolved by
+> settlement rather than idle reaping. The
+> [September 25 evidence record](recovery-acceptance-matrix.md#bounded-file-recovery-evidence-record-september-25-2026)
+> names the exact executable subset.
+>
+> **Availability correction — September 25, 2026:** primary engine replacement
+> now aborts safe pre-finalize source sessions before Tantivy reopen. Targets
+> that sent completion but cannot yet order the membership result persist a
+> finalized-awaiting-membership state, remain open, and accept live replication.
+> They are closed and marked for a new recovery only after definitive rejection;
+> admission or promotion clears the pending marker without replacing the copy.
+>
+> **Review corrections — September 26, 2026:** StartPeerRecovery now returns a
+> pollable asynchronous preparation state, so snapshot/hash duration is not
+> bounded by the transport timeout and cancelled RPC futures do not leak pins
+> or placeholders. Primary writes revalidate authority inside the shared
+> barrier and use the same routing snapshot for fan-out. Abandoned finalize
+> sessions commit a newer primary term (with barrier ordering determined by
+> whether admission was submitted), making pending targets definitively
+> recoverable. Recovery WAL reads use live generation state rather than a
+> lagging manifest.
+>
+> **Round-2 corrections — September 26, 2026:** recovery reads clone and
+> validate the live generation list under the translog lock, then scan outside
+> it while skipping pre-cursor frames by length. Setup failures are returned on
+> the next poll, stale pre-finalize targets can be replaced, and the setup
+> engine Arc is released before hashing. Reopen continues after caller
+> cancellation, setup lifetime waits use Notify's enable-before-check pattern,
+> and blocking cleanup remains on Tokio's blocking pool. Dynamic-mapping writes
+> revalidate authority again after their Raft mapping round trip.
+>
+> **Round-3 corrections — September 26, 2026:** dynamic-mapping reopen is now
+> replacement-only. It revalidates the registered index UUID and existing
+> shard before source cleanup and again under the per-shard open lock; a
+> delete/recreate race returns a retryable error instead of recreating the old
+> UUID directory. Setup panic completion releases engine waiters, idle setup
+> reaping does not wait through hashing, and bounded WAL scans validate frame
+> length plus the complete frame at the captured head.
+>
+> **Round-4 corrections — September 26, 2026:** index deletion now acquires all
+> lifecycle and open locks already registered for the deleted UUID/index, so a
+> shard temporarily absent from the engine map cannot escape coordination.
+> Reopen requires an existing Tantivy `meta.json` and cannot create a fresh
+> index. Primary write permits bind both UUID and term. New WAL writes and
+> transferred recovery operations share a 32 MiB total-frame limit enforced
+> before mutation; a partial first frame at or beyond the captured head ends
+> the scan cleanly, while a below-head overrun or torn-then-appended frame fails
+> closed. Retryable forwarded `ABORTED` writes map to HTTP 503.
+>
+> **Round-5 corrections — September 26, 2026:** the 32 MiB total-frame ceiling
+> remains the limit for new WAL writes and transferred recovery operations,
+> while restart scan, replay, and recovery skips accept complete legacy frames
+> up to a separate 65 MiB decode ceiling. The concurrent-append exception
+> applies only to the final captured generation at or beyond its captured file
+> size. On restart, an incomplete active-generation tail is truncated to the
+> last fully decoded frame and both file and directory are fsynced before
+> append; complete or middle corruption still fails closed.
+>
+> **Round-6 correction — September 26, 2026:** legacy `RecoverReplica` now
+> reads through the live engine's captured generation state. It never creates
+> a second `HotTranslog` on a live shard, so it cannot run startup tail repair
+> or unreferenced-generation deletion against an active writer. Test-only live
+> WAL inspections use the same non-mutating engine path.
+>
+> **Known liveness limit:** remove-and-re-add of a target node while its
+> finalized copy is awaiting membership can remain `Unknown`. Current routing
+> identifies copies by node ID, so the target cannot prove whether it is still
+> the old assignment or a replacement. It remains caught up but
+> `INITIALIZING`/yellow rather than risking destructive recovery. Allocation IDs
+> are required to resolve this ABA case.
+>
+> **Known same-name reuse limit:** the generic shard-open fast path is still
+> keyed by `(index_name, shard_id)` and does not verify a requested UUID when an
+> engine is already present. The reviewed detached-reopen path is fenced, but a
+> non-coordinator that observes delete/recreate ordering late can still retain
+> a pre-existing same-name engine. UUID/allocation validation on every open
+> path remains future work.
+
+The current maximum document operation size is defined by the encoded WAL
+frame, not the raw HTTP body: one operation must fit within 32 MiB including
+the four-byte frame header, sequence and operation fields, JSON serialization,
+and the internal `_doc_id` / `_source` wrapper. The maximum usable `_source`
+therefore varies slightly with document ID and content. The 65 MiB decode-only
+ceiling exists solely so upgraded nodes can open and replay complete legacy
+frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
+
+**Known write-failure limit:** a failed WAL `write_all` or `sync_data` does not
+yet transition the shard into a fail-stopped state. If the process continues
+writing after a partial append, the torn frame can become middle corruption;
+restart then fails closed rather than skipping acknowledged history. Startup
+tail truncation repairs only a trailing incomplete frame with no later data.
+
 ## 3. Reference Protocols And Intentional Differences
 
 | Reference | Relevant property | FerrisSearch target |

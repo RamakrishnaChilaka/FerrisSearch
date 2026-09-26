@@ -22,6 +22,9 @@ defaults for new fields so older config files continue to load.
   host physical memory capped by visible finite cgroup hard limits. It does not
   bound total process memory.
 - Never log credentials, API keys, private-key contents, or auth headers.
+- `max_concurrent_peer_recoveries` defaults to 2, is capped at 64, and uses
+  `0` as an explicit per-node disable value. The environment override is
+  `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES`.
 
 When adding config, cover default, YAML, environment, invalid, and
 feature-disabled behavior. Update `config/ferrissearch.yml` and README only for
@@ -46,6 +49,9 @@ operator-facing fields.
 - Background maintenance is not automatically low priority just because it was
   spawned. New compaction, hydration, recovery, export, or GC work needs an
   explicit concurrency and byte budget.
+- Peer recovery uses its own semaphore plus bounded 1 MiB file chunks and
+  bounded operation responses. Filesystem/Tantivy install and suffix apply run
+  on Tokio's blocking pool, not the fixed foreground write/search pools.
 
 The current search/write pools isolate CPU threads, but FerrisSearch does not
 yet provide complete admission control, cancellation propagation, tenant

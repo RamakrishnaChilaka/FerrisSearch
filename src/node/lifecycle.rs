@@ -1,4 +1,4 @@
-//! Cluster join, seed host discovery, and replica recovery helpers.
+//! Cluster join and seed host discovery helpers.
 
 use crate::cluster::state::NodeInfo;
 use crate::consensus::types::RaftInstance;
@@ -61,30 +61,4 @@ pub(super) async fn try_join_cluster(
     }
 
     None
-}
-
-/// Apply recovered translog operations from the primary to a replica shard engine.
-pub(super) fn apply_recovery_ops(
-    engine: &Arc<dyn crate::engine::SearchEngine>,
-    operations: &[crate::transport::proto::RecoverReplicaOp],
-) {
-    for op in operations {
-        match op.op.as_str() {
-            "index" => {
-                if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&op.payload_json)
-                    && let Err(e) = engine.add_document_with_seq(&op.doc_id, payload, op.seq_no)
-                {
-                    tracing::error!("Recovery: failed to index doc '{}': {}", op.doc_id, e);
-                }
-            }
-            "delete" => {
-                if let Err(e) = engine.delete_document_with_seq(&op.doc_id, op.seq_no) {
-                    tracing::error!("Recovery: failed to delete doc '{}': {}", op.doc_id, e);
-                }
-            }
-            other => {
-                tracing::warn!("Recovery: unknown op type '{}'", other);
-            }
-        }
-    }
 }

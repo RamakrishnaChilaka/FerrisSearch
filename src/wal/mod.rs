@@ -15,7 +15,7 @@
 //!
 //! This is more compact than JSONL and faster to parse/replay.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -45,6 +45,17 @@ const TRANSLOG_SEQNO_FILE: &str = "translog.seqno";
 const TRANSLOG_FILE_PREFIX: &str = "translog-";
 const TRANSLOG_FILE_SUFFIX: &str = ".bin";
 const TRANSLOG_GENERATION_WIDTH: usize = 20;
+/// Maximum total frame size accepted for new writes and peer-recovery transfer.
+pub const MAX_WAL_FRAME_BYTES: usize = 32 * 1024 * 1024;
+/// Bounded compatibility ceiling for complete frames written before the write cap existed.
+pub const MAX_WAL_DECODE_FRAME_BYTES: usize = 65 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("WAL frame is {frame_bytes} bytes, exceeding maximum {max_bytes} bytes")]
+pub(crate) struct WalFrameTooLargeError {
+    frame_bytes: usize,
+    max_bytes: usize,
+}
 
 /// The type of WAL operation.
 ///
@@ -92,6 +103,37 @@ pub struct TranslogEntry {
     pub op: WalOperation,
     /// The full document payload
     pub payload: serde_json::Value,
+}
+
+#[derive(Clone)]
+pub struct TranslogReadSnapshot {
+    next_seq_no: u64,
+    generations: Vec<GenerationInfo>,
+    #[cfg(test)]
+    scan_barrier: Option<Arc<std::sync::Barrier>>,
+}
+
+impl TranslogReadSnapshot {
+    pub fn next_seq_no(&self) -> u64 {
+        self.next_seq_no
+    }
+
+    pub fn read_bounded_range(
+        &self,
+        min_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TranslogEntry>, bool)> {
+        HotTranslog::read_bounded_range_from_generations(
+            &self.generations,
+            min_seq_no,
+            self.next_seq_no,
+            max_ops,
+            max_bytes,
+            #[cfg(test)]
+            self.scan_barrier.as_ref(),
+        )
+    }
 }
 
 /// Wire format for binary serialization.
@@ -200,18 +242,31 @@ pub trait WriteAheadLog: Send + Sync {
         min_seq_no: u64,
         callback: &mut dyn FnMut(TranslogEntry) -> Result<()>,
     ) -> Result<u64>;
+
+    /// Read a bounded ordered range from the live generation state.
+    fn recovery_read_snapshot(&self) -> Result<TranslogReadSnapshot>;
+
+    #[cfg(test)]
+    fn set_recovery_scan_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>);
+
+    #[cfg(test)]
+    fn set_append_frame_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>);
+
+    /// Pin every operation at or above `min_seq_no` against truncation.
+    fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64>;
+
+    /// Release a previously registered retention pin.
+    fn release_retention_pin(&self, pin_id: u64) -> Result<()>;
+
+    /// Return the lowest currently pinned sequence boundary.
+    fn min_retention_pin(&self) -> Option<u64>;
 }
 
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
 #[cfg(test)]
 fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
     let wire = WireEntry::from_translog(entry)?;
-    let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
-    let len = encoded.len() as u32;
-    let mut frame = Vec::with_capacity(4 + encoded.len());
-    frame.extend_from_slice(&len.to_le_bytes());
-    frame.extend_from_slice(&encoded);
-    Ok(frame)
+    encode_wire_entry(&wire)
 }
 
 /// Encode directly from borrowed values — avoids cloning the payload.
@@ -225,56 +280,127 @@ fn encode_entry_borrowed(
         op: op.as_str().to_string(),
         payload_json: serde_json::to_string(payload)?,
     };
-    let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
-    let len = encoded.len() as u32;
-    let mut frame = Vec::with_capacity(4 + encoded.len());
+    encode_wire_entry(&wire)
+}
+
+fn encode_wire_entry(wire: &WireEntry) -> Result<Vec<u8>> {
+    let encoded = bincode_next::serde::encode_to_vec(wire, BINCODE_CONFIG)?;
+    let frame_bytes = checked_frame_bytes(encoded.len(), MAX_WAL_FRAME_BYTES)?;
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| anyhow::anyhow!("WAL frame payload length exceeds u32"))?;
+    let mut frame = Vec::with_capacity(frame_bytes);
     frame.extend_from_slice(&len.to_le_bytes());
     frame.extend_from_slice(&encoded);
     Ok(frame)
 }
 
-/// Read all length-prefixed entries from a reader, stopping at EOF or a partial frame.
+fn checked_frame_bytes(payload_len: usize, max_bytes: usize) -> Result<usize> {
+    let frame_bytes = 4usize
+        .checked_add(payload_len)
+        .ok_or_else(|| anyhow::anyhow!("WAL frame length overflow"))?;
+    if frame_bytes > max_bytes {
+        return Err(WalFrameTooLargeError {
+            frame_bytes,
+            max_bytes,
+        }
+        .into());
+    }
+    Ok(frame_bytes)
+}
+
+fn decode_wire_entry(payload: &[u8]) -> Result<WireEntry> {
+    let (wire, consumed): (WireEntry, usize) =
+        bincode_next::serde::decode_from_slice(payload, BINCODE_CONFIG)?;
+    if consumed != payload.len() {
+        anyhow::bail!(
+            "translog frame has {} trailing payload bytes",
+            payload.len() - consumed
+        );
+    }
+    Ok(wire)
+}
+
+/// Read all complete length-prefixed entries from a reader.
 #[cfg(test)]
 fn decode_entries<R: Read>(reader: &mut R) -> Result<Vec<TranslogEntry>> {
     let mut entries = Vec::new();
-    decode_entries_streaming(reader, |entry| {
+    decode_entries_streaming(reader, None, |entry| {
         entries.push(entry);
         Ok(())
     })?;
     Ok(entries)
 }
 
-/// Stream through all length-prefixed entries from a reader, calling `callback`
-/// for each decoded entry without accumulating them in memory. Stops at EOF or
-/// a partial frame.
+/// Read one complete entry. Clean EOF is `None`; partial frames are corruption.
+fn read_next_entry<R: Read>(
+    reader: &mut R,
+    remaining_file_bytes: Option<u64>,
+) -> Result<Option<(TranslogEntry, usize)>> {
+    if remaining_file_bytes == Some(0) {
+        return Ok(None);
+    }
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf[..1]) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    reader
+        .read_exact(&mut len_buf[1..])
+        .context("incomplete translog frame length prefix")?;
+    let payload_len = u32::from_le_bytes(len_buf) as usize;
+    let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+    if let Some(remaining) = remaining_file_bytes
+        && frame_bytes as u64 > remaining
+    {
+        anyhow::bail!(
+            "incomplete translog frame: declared {frame_bytes} bytes with only {remaining} bytes remaining"
+        );
+    }
+    let mut payload_buf = vec![0u8; payload_len];
+    reader
+        .read_exact(&mut payload_buf)
+        .with_context(|| format!("incomplete translog frame payload of {payload_len} bytes"))?;
+    let wire = decode_wire_entry(&payload_buf)?;
+    Ok(Some((wire.into_translog()?, frame_bytes)))
+}
+
+fn decode_wire_seq_no(prefix: &[u8]) -> Result<u64> {
+    let ((seq_no,), _): ((u64,), _) =
+        bincode_next::serde::decode_from_slice(prefix, BINCODE_CONFIG)?;
+    Ok(seq_no)
+}
+
+fn decode_wire_entry_with_prefix<R: Read>(
+    reader: &mut R,
+    mut prefix: Vec<u8>,
+    payload_len: usize,
+    expected_seq_no: u64,
+) -> Result<WireEntry> {
+    let prefix_len = prefix.len();
+    prefix.resize(payload_len, 0);
+    reader.read_exact(&mut prefix[prefix_len..])?;
+    let wire = decode_wire_entry(&prefix)?;
+    if wire.seq_no != expected_seq_no {
+        anyhow::bail!("translog frame sequence changed while decoding");
+    }
+    Ok(wire)
+}
+
 fn decode_entries_streaming<R: Read>(
     reader: &mut R,
+    file_len: Option<u64>,
     mut callback: impl FnMut(TranslogEntry) -> Result<()>,
 ) -> Result<()> {
-    let mut len_buf = [0u8; 4];
-    loop {
-        match reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-        let payload_len = u32::from_le_bytes(len_buf) as usize;
-        let mut payload_buf = vec![0u8; payload_len];
-        match reader.read_exact(&mut payload_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Partial entry at end of file — truncated write, skip it
-                tracing::warn!(
-                    "Translog has partial entry at end, ignoring {} bytes",
-                    payload_len
-                );
-                break;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        let (wire, _): (WireEntry, _) =
-            bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
-        callback(wire.into_translog()?)?;
+    let mut consumed = 0u64;
+    while let Some((entry, frame_bytes)) = read_next_entry(
+        reader,
+        file_len.map(|length| length.saturating_sub(consumed)),
+    )? {
+        consumed = consumed
+            .checked_add(frame_bytes as u64)
+            .ok_or_else(|| anyhow::anyhow!("translog decode offset overflow"))?;
+        callback(entry)?;
     }
     Ok(())
 }
@@ -283,6 +409,13 @@ fn decode_entries_streaming<R: Read>(
 struct GenerationScan {
     first_seq_no: Option<u64>,
     last_seq_no: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ActiveGenerationScan {
+    generation: GenerationScan,
+    valid_bytes: u64,
+    trailing_bytes: u64,
 }
 
 impl GenerationScan {
@@ -435,6 +568,8 @@ struct TranslogState {
     active_generation_id: u64,
     active_file: File,
     generations: Vec<GenerationInfo>,
+    next_retention_pin_id: u64,
+    retention_pins: std::collections::BTreeMap<u64, u64>,
 }
 
 impl TranslogState {
@@ -460,9 +595,10 @@ fn scan_max_seq_no<R: Read>(reader: &mut R) -> Result<u64> {
     Ok(scan_generation(reader)?.next_seq_no())
 }
 
+#[cfg(test)]
 fn scan_generation<R: Read>(reader: &mut R) -> Result<GenerationScan> {
     let mut scan = GenerationScan::default();
-    decode_entries_streaming(reader, |entry| {
+    decode_entries_streaming(reader, None, |entry| {
         scan.observe(entry.seq_no);
         Ok(())
     })?;
@@ -507,14 +643,72 @@ fn discover_generation_files(data_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     Ok(generations)
 }
 
-fn scan_generation_from_path(path: &Path) -> Result<GenerationScan> {
-    let file = match OpenOptions::new().read(true).open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(GenerationScan::default()),
-        Err(e) => return Err(e.into()),
-    };
+fn scan_active_generation_from_path(path: &Path) -> Result<ActiveGenerationScan> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
-    scan_generation(&mut reader)
+    let mut generation = GenerationScan::default();
+    let mut valid_bytes = 0u64;
+
+    loop {
+        let frame_start = reader.stream_position()?;
+        if frame_start == file_len {
+            return Ok(ActiveGenerationScan {
+                generation,
+                valid_bytes,
+                trailing_bytes: 0,
+            });
+        }
+        let remaining_bytes = file_len
+            .checked_sub(frame_start)
+            .ok_or_else(|| anyhow::anyhow!("translog scan position exceeds file length"))?;
+        if remaining_bytes < 4 {
+            return Ok(ActiveGenerationScan {
+                generation,
+                valid_bytes,
+                trailing_bytes: remaining_bytes,
+            });
+        }
+
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+        let frame_end = frame_start
+            .checked_add(frame_bytes as u64)
+            .ok_or_else(|| anyhow::anyhow!("translog frame offset overflow"))?;
+        if frame_end > file_len {
+            return Ok(ActiveGenerationScan {
+                generation,
+                valid_bytes,
+                trailing_bytes: file_len - frame_start,
+            });
+        }
+
+        let mut payload = vec![0u8; payload_len];
+        reader.read_exact(&mut payload)?;
+        let entry = decode_wire_entry(&payload)?.into_translog()?;
+        generation.observe(entry.seq_no);
+        valid_bytes = frame_end;
+    }
+}
+
+fn truncate_incomplete_active_tail(
+    path: &Path,
+    data_dir: &Path,
+    valid_bytes: u64,
+    trailing_bytes: u64,
+) -> Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(valid_bytes)?;
+    file.sync_all()?;
+    File::open(data_dir)?.sync_all()?;
+    tracing::warn!(
+        path = ?path,
+        discarded_bytes = trailing_bytes,
+        "Discarded incomplete trailing translog frame during open"
+    );
+    Ok(())
 }
 
 fn load_translog_manifest(data_dir: &Path) -> Result<Option<TranslogManifest>> {
@@ -658,6 +852,10 @@ pub struct HotTranslog {
     seq_no_path: PathBuf,
     /// Controls whether writes are fsynced immediately or on a timer.
     durability: TranslogDurability,
+    #[cfg(test)]
+    recovery_scan_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
+    #[cfg(test)]
+    append_frame_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
 }
 
 async fn sync_file_in_background(state: Arc<Mutex<TranslogState>>) -> std::io::Result<()> {
@@ -689,7 +887,11 @@ impl HotTranslog {
         // Load the persisted high-water mark (survives truncation)
         let persisted_seq = if seq_no_path.exists() {
             let s = fs::read_to_string(&seq_no_path)?;
-            s.trim().parse::<u64>().unwrap_or(0)
+            s.trim().parse::<u64>().map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid translog sequence high-water mark {seq_no_path:?}: {error}"
+                )
+            })?
         } else {
             0
         };
@@ -710,10 +912,18 @@ impl HotTranslog {
                             "manifest active generation {active_generation_id} missing after generation load"
                         )
                     })?;
-            let active_scan = scan_generation_from_path(&active_generation.path)?;
-            active_generation.first_seq_no = active_scan.first_seq_no;
-            active_generation.last_seq_no = active_scan.last_seq_no;
-            active_generation.size_bytes = fs::metadata(&active_generation.path)?.len();
+            let active_scan = scan_active_generation_from_path(&active_generation.path)?;
+            if active_scan.trailing_bytes > 0 {
+                truncate_incomplete_active_tail(
+                    &active_generation.path,
+                    data_dir,
+                    active_scan.valid_bytes,
+                    active_scan.trailing_bytes,
+                )?;
+            }
+            active_generation.first_seq_no = active_scan.generation.first_seq_no;
+            active_generation.last_seq_no = active_scan.generation.last_seq_no;
+            active_generation.size_bytes = active_scan.valid_bytes;
             let active_file = open_generation_writer(&active_generation.path)?;
 
             (
@@ -777,17 +987,184 @@ impl HotTranslog {
                 active_generation_id,
                 active_file,
                 generations,
+                next_retention_pin_id: 1,
+                retention_pins: std::collections::BTreeMap::new(),
             })),
             data_dir: data_dir.to_path_buf(),
             manifest_path,
             seq_no_path,
             durability,
+            #[cfg(test)]
+            recovery_scan_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            append_frame_barrier: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Get the current (next) sequence number without incrementing.
     pub fn current_seq_no(&self) -> u64 {
         recover_lock(&self.state, "state").next_seq_no
+    }
+
+    /// Initialize a freshly prepared shard directory with an empty translog
+    /// whose next sequence number is `next_seq_no`.
+    pub fn initialize_empty_at<P: AsRef<Path>>(
+        data_dir: P,
+        durability: TranslogDurability,
+        next_seq_no: u64,
+    ) -> Result<()> {
+        let translog = Self::open_with_durability(data_dir, durability)?;
+        {
+            let mut state = recover_lock(&translog.state, "state");
+            if state.generations.len() != 1
+                || state.generations[0].first_seq_no.is_some()
+                || state.generations[0].last_seq_no.is_some()
+            {
+                anyhow::bail!("cannot initialize a non-empty translog at a recovery boundary");
+            }
+            state.next_seq_no = next_seq_no;
+        }
+        translog.persist_seq_no_high_watermark(next_seq_no)?;
+        let seq_file = File::open(&translog.seq_no_path)?;
+        seq_file.sync_all()?;
+        Ok(())
+    }
+
+    fn read_bounded_range_from_generations(
+        generations: &[GenerationInfo],
+        min_seq_no: u64,
+        end_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+        #[cfg(test)] scan_barrier: Option<&Arc<std::sync::Barrier>>,
+    ) -> Result<(Vec<TranslogEntry>, bool)> {
+        if max_ops == 0 || max_bytes == 0 {
+            anyhow::bail!("bounded translog read requires non-zero limits");
+        }
+        if min_seq_no >= end_seq_no {
+            return Ok((Vec::new(), true));
+        }
+
+        let mut entries = Vec::new();
+        let mut bytes = 0usize;
+        let mut read_through_head = false;
+        let final_generation_id = generations.last().map(|generation| generation.id);
+        #[cfg(test)]
+        let mut scan_barrier = scan_barrier;
+
+        for generation in generations.iter().filter(|generation| {
+            generation
+                .last_seq_no
+                .is_some_and(|last| last >= min_seq_no)
+                && generation
+                    .first_seq_no
+                    .is_none_or(|first| first < end_seq_no)
+        }) {
+            let is_final_captured_generation = Some(generation.id) == final_generation_id;
+            let file = File::open(&generation.path).with_context(|| {
+                format!(
+                    "live translog generation {:?} is missing or unreadable",
+                    generation.path
+                )
+            })?;
+            let mut reader = BufReader::new(file);
+            #[cfg(test)]
+            if let Some(barrier) = scan_barrier.take() {
+                barrier.wait();
+                barrier.wait();
+            }
+            loop {
+                let frame_start = reader.stream_position()?;
+                let can_be_in_progress_append =
+                    is_final_captured_generation && frame_start >= generation.size_bytes;
+                let mut len_buf = [0u8; 4];
+                let mut len_read = 0usize;
+                while len_read < len_buf.len() {
+                    match reader.read(&mut len_buf[len_read..]) {
+                        Ok(0) => break,
+                        Ok(read) => len_read += read,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                if len_read == 0 {
+                    break;
+                }
+                if len_read < len_buf.len() {
+                    if can_be_in_progress_append {
+                        return Ok((entries, read_through_head));
+                    }
+                    anyhow::bail!(
+                        "incomplete translog frame length prefix at offset {frame_start}"
+                    );
+                }
+                let payload_len = u32::from_le_bytes(len_buf) as usize;
+                let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+                let payload_start = reader.stream_position()?;
+                let frame_end = payload_start
+                    .checked_add(payload_len as u64)
+                    .ok_or_else(|| anyhow::anyhow!("translog frame offset overflow"))?;
+                let file_len = reader.get_ref().metadata()?.len();
+                let prefix_len = payload_len.min(16);
+                let mut prefix = vec![0u8; prefix_len];
+                match reader.read_exact(&mut prefix) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        if can_be_in_progress_append {
+                            return Ok((entries, read_through_head));
+                        }
+                        anyhow::bail!(
+                            "incomplete translog frame sequence prefix at offset {frame_start}"
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                let seq_no = decode_wire_seq_no(&prefix)?;
+                let remaining = payload_len - prefix_len;
+                if frame_end > file_len {
+                    if can_be_in_progress_append && seq_no >= end_seq_no {
+                        return Ok((entries, true));
+                    }
+                    anyhow::bail!(
+                        "translog frame for seq_no {seq_no} extends past generation length"
+                    );
+                }
+                if seq_no >= end_seq_no {
+                    decode_wire_entry_with_prefix(&mut reader, prefix, payload_len, seq_no)?
+                        .into_translog()?;
+                    return Ok((entries, true));
+                }
+                if seq_no < min_seq_no {
+                    reader.seek_relative(remaining as i64)?;
+                    continue;
+                }
+                if frame_bytes > MAX_WAL_FRAME_BYTES {
+                    anyhow::bail!(
+                        "translog operation at seq_no {seq_no} has frame length {frame_bytes}, exceeding recovery transfer maximum {MAX_WAL_FRAME_BYTES}"
+                    );
+                }
+                if entries.len() >= max_ops
+                    || bytes
+                        .checked_add(frame_bytes)
+                        .is_none_or(|total| total > max_bytes)
+                {
+                    if entries.is_empty() {
+                        anyhow::bail!(
+                            "translog operation at seq_no {seq_no} exceeds the recovery byte limit"
+                        );
+                    }
+                    return Ok((entries, false));
+                }
+                let wire = decode_wire_entry_with_prefix(&mut reader, prefix, payload_len, seq_no)?;
+                bytes += frame_bytes;
+                entries.push(wire.into_translog()?);
+                read_through_head = seq_no
+                    .checked_add(1)
+                    .is_some_and(|next_seq_no| next_seq_no >= end_seq_no);
+            }
+        }
+
+        Ok((entries, read_through_head))
     }
 
     /// Start a background task that periodically fsyncs the translog file.
@@ -855,17 +1232,27 @@ impl HotTranslog {
         global_checkpoint: Option<u64>,
     ) -> Vec<GenerationInfo> {
         let active_generation_id = state.active_generation_id;
+        let min_pin = state.retention_pins.values().copied().min();
         let mut kept = Vec::with_capacity(state.generations.len());
         let mut removed = Vec::new();
 
         for generation in state.generations.drain(..) {
             let should_remove = generation.id != active_generation_id
-                && match global_checkpoint {
-                    Some(global_checkpoint) => generation
+                && match (global_checkpoint, min_pin) {
+                    (_, Some(0)) => false,
+                    (Some(global_checkpoint), Some(min_pin)) => generation
+                        .last_seq_no
+                        .map(|last_seq_no| last_seq_no <= global_checkpoint.min(min_pin - 1))
+                        .unwrap_or(true),
+                    (None, Some(min_pin)) => generation
+                        .last_seq_no
+                        .map(|last_seq_no| last_seq_no < min_pin)
+                        .unwrap_or(true),
+                    (Some(global_checkpoint), None) => generation
                         .last_seq_no
                         .map(|last_seq_no| last_seq_no <= global_checkpoint)
                         .unwrap_or(true),
-                    None => true,
+                    (None, None) => true,
                 };
 
             if should_remove {
@@ -916,6 +1303,20 @@ impl WriteAheadLog for HotTranslog {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
         let frame = encode_entry_borrowed(seq_no, op, &payload)?;
+        #[cfg(test)]
+        if let Some(barrier) =
+            recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier").take()
+        {
+            let split = frame.len().min(20);
+            state.active_file.write_all(&frame[..split])?;
+            state.active_file.flush()?;
+            barrier.wait();
+            barrier.wait();
+            state.active_file.write_all(&frame[split..])?;
+        } else {
+            state.active_file.write_all(&frame)?;
+        }
+        #[cfg(not(test))]
         state.active_file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
             state.active_file.sync_data()?;
@@ -1079,8 +1480,9 @@ impl WriteAheadLog for HotTranslog {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
+            let file_len = file.metadata()?.len();
             let mut reader = BufReader::new(file);
-            decode_entries_streaming(&mut reader, |entry| {
+            decode_entries_streaming(&mut reader, Some(file_len), |entry| {
                 entries.push(entry);
                 Ok(())
             })?;
@@ -1105,8 +1507,9 @@ impl WriteAheadLog for HotTranslog {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
+            let file_len = file.metadata()?.len();
             let mut reader = BufReader::new(file);
-            decode_entries_streaming(&mut reader, |entry| {
+            decode_entries_streaming(&mut reader, Some(file_len), |entry| {
                 if entry.seq_no > after_seq_no {
                     entries.push(entry);
                 }
@@ -1202,8 +1605,9 @@ impl WriteAheadLog for HotTranslog {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
+            let file_len = file.metadata()?.len();
             let mut reader = BufReader::new(file);
-            decode_entries_streaming(&mut reader, |entry| {
+            decode_entries_streaming(&mut reader, Some(file_len), |entry| {
                 if entry.seq_no >= min_seq_no {
                     count += 1;
                     callback(entry)?;
@@ -1214,6 +1618,83 @@ impl WriteAheadLog for HotTranslog {
 
         Ok(count)
     }
+
+    fn recovery_read_snapshot(&self) -> Result<TranslogReadSnapshot> {
+        let state = recover_lock(&self.state, "state");
+        let active_matches = state
+            .generations
+            .iter()
+            .filter(|generation| generation.id == state.active_generation_id)
+            .count();
+        if active_matches != 1 {
+            anyhow::bail!(
+                "live translog state has {} entries for active generation {}",
+                active_matches,
+                state.active_generation_id
+            );
+        }
+        for pair in state.generations.windows(2) {
+            if pair[0].id >= pair[1].id {
+                anyhow::bail!(
+                    "live translog generations are not strictly increasing: {} then {}",
+                    pair[0].id,
+                    pair[1].id
+                );
+            }
+        }
+        Ok(TranslogReadSnapshot {
+            next_seq_no: state.next_seq_no,
+            generations: state.generations.clone(),
+            #[cfg(test)]
+            scan_barrier: recover_lock(
+                self.recovery_scan_barrier.as_ref(),
+                "recovery scan barrier",
+            )
+            .clone(),
+        })
+    }
+
+    #[cfg(test)]
+    fn set_recovery_scan_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>) {
+        *recover_lock(self.recovery_scan_barrier.as_ref(), "recovery scan barrier") = barrier;
+    }
+
+    #[cfg(test)]
+    fn set_append_frame_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>) {
+        *recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier") = barrier;
+    }
+
+    fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64> {
+        let mut state = recover_lock(&self.state, "state");
+        if min_seq_no > state.next_seq_no {
+            anyhow::bail!(
+                "cannot pin translog at {} beyond next sequence {}",
+                min_seq_no,
+                state.next_seq_no
+            );
+        }
+        let pin_id = state.next_retention_pin_id;
+        state.next_retention_pin_id = pin_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("translog retention pin space exhausted"))?;
+        state.retention_pins.insert(pin_id, min_seq_no);
+        Ok(pin_id)
+    }
+
+    fn release_retention_pin(&self, pin_id: u64) -> Result<()> {
+        recover_lock(&self.state, "state")
+            .retention_pins
+            .remove(&pin_id);
+        Ok(())
+    }
+
+    fn min_retention_pin(&self) -> Option<u64> {
+        recover_lock(&self.state, "state")
+            .retention_pins
+            .values()
+            .copied()
+            .min()
+    }
 }
 
 #[cfg(test)]
@@ -1222,11 +1703,51 @@ mod tests {
     use serde_json::json;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    const TEST_MAX_WAL_FRAME_BYTES: usize = 32 * 1024 * 1024;
+    static WAL_FRAME_LIMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// Helper: create a translog in a fresh temp directory.
     fn open_translog() -> (tempfile::TempDir, HotTranslog) {
         let dir = tempfile::tempdir().unwrap();
         let tl = HotTranslog::open(dir.path()).unwrap();
         (dir, tl)
+    }
+
+    fn encoded_frame_len(seq_no: u64, op: WalOperation, payload: &serde_json::Value) -> usize {
+        let wire = WireEntry {
+            seq_no,
+            op: op.as_str().to_string(),
+            payload_json: serde_json::to_string(payload).unwrap(),
+        };
+        4 + bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
+            .unwrap()
+            .len()
+    }
+
+    fn payload_for_frame_len(seq_no: u64, op: WalOperation, target: usize) -> serde_json::Value {
+        let mut string_len = target.saturating_sub(128);
+        for _ in 0..8 {
+            let payload = json!({"blob": "x".repeat(string_len)});
+            let actual = encoded_frame_len(seq_no, op, &payload);
+            if actual == target {
+                return payload;
+            }
+            if actual < target {
+                string_len += target - actual;
+            } else {
+                string_len -= actual - target;
+            }
+        }
+        panic!("could not construct a WAL frame with exact length {target}");
+    }
+
+    fn encode_legacy_entry_without_write_limit(entry: &TranslogEntry) -> Vec<u8> {
+        let wire = WireEntry::from_translog(entry).unwrap();
+        let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
+        let mut frame = Vec::with_capacity(4 + encoded.len());
+        frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&encoded);
+        frame
     }
 
     fn generation_file_names(dir: &Path) -> Vec<String> {
@@ -1321,6 +1842,172 @@ mod tests {
             .is_err()
         );
         assert!(wal.read_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wal_frame_limit_is_inclusive_for_single_append() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let allowed = payload_for_frame_len(0, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES);
+        wal.append(WalOperation::Index, allowed).unwrap();
+        assert_eq!(wal.next_seq_no(), 1);
+        assert_eq!(wal.size_bytes().unwrap(), TEST_MAX_WAL_FRAME_BYTES as u64);
+
+        let oversized = payload_for_frame_len(1, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES + 1);
+        let before_size = wal.size_bytes().unwrap();
+        let error = wal.append(WalOperation::Index, oversized).unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("exceeding maximum"),
+            "unexpected WAL frame limit error: {error_chain}"
+        );
+        assert_eq!(wal.next_seq_no(), 1);
+        assert_eq!(wal.size_bytes().unwrap(), before_size);
+    }
+
+    #[test]
+    fn wal_frame_limit_rejects_primary_bulk_item_before_mutation() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let oversized = payload_for_frame_len(1, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES + 1);
+        let ops = vec![
+            (WalOperation::Index, json!({"value": 0})),
+            (WalOperation::Index, oversized),
+        ];
+
+        let (_directory, wal) = open_translog();
+        assert!(wal.write_bulk_with_receipt(&ops).is_err());
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+
+        let (_directory, wal) = open_translog();
+        assert!(wal.append_bulk(&ops).is_err());
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn wal_frame_limit_rejects_explicit_seq_before_mutation() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let oversized = payload_for_frame_len(7, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES + 1);
+        assert!(
+            wal.append_with_seq(7, WalOperation::Index, oversized)
+                .is_err()
+        );
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn wal_frame_limit_rejects_explicit_bulk_item_before_mutation() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let oversized =
+            payload_for_frame_len(11, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES + 1);
+        let ops = vec![
+            (WalOperation::Index, json!({"value": 0})),
+            (WalOperation::Index, oversized),
+        ];
+        assert!(wal.write_bulk_with_start_seq(10, &ops).is_err());
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn wal_frame_limit_rejects_delete_before_mutation() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let oversized =
+            payload_for_frame_len(0, WalOperation::Delete, TEST_MAX_WAL_FRAME_BYTES + 1);
+        assert!(wal.append(WalOperation::Delete, oversized).is_err());
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn legacy_large_frame_opens_replays_and_skips_in_recovery() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = TranslogEntry {
+            seq_no: 0,
+            op: WalOperation::Index,
+            payload: json!({"blob": "x".repeat(40 * 1024 * 1024)}),
+        };
+        let frame = encode_legacy_entry_without_write_limit(&legacy);
+        assert!(frame.len() > MAX_WAL_FRAME_BYTES);
+        assert!(frame.len() < 65 * 1024 * 1024);
+        fs::write(generation_path(dir.path(), 0), &frame).unwrap();
+        let manifest = TranslogManifest {
+            version: TRANSLOG_MANIFEST_VERSION,
+            active_generation_id: 0,
+            next_generation_id: 1,
+            generations: vec![ManifestGenerationInfo {
+                id: 0,
+                first_seq_no: Some(0),
+                last_seq_no: Some(0),
+                size_bytes: frame.len() as u64,
+            }],
+        };
+        persist_translog_manifest(&manifest_path(dir.path()), &manifest).unwrap();
+        drop(frame);
+        drop(legacy);
+
+        let wal = HotTranslog::open(dir.path()).unwrap();
+        assert_eq!(wal.next_seq_no(), 1);
+        let entries = wal.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq_no, 0);
+        assert_eq!(
+            entries[0].payload["blob"].as_str().unwrap().len(),
+            40 * 1024 * 1024
+        );
+        drop(entries);
+
+        let mut replayed = Vec::new();
+        assert_eq!(
+            wal.for_each_from(0, &mut |entry| {
+                replayed.push(entry.seq_no);
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(replayed, [0]);
+
+        let appended = wal
+            .append(WalOperation::Index, json!({"value": "new"}))
+            .unwrap();
+        assert_eq!(appended.seq_no, 1);
+        let snapshot = wal.recovery_read_snapshot().unwrap();
+        let (operations, complete) = snapshot
+            .read_bounded_range(1, 16, MAX_WAL_FRAME_BYTES)
+            .unwrap();
+        assert!(complete);
+        assert_eq!(
+            operations
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+
+        let oversized = payload_for_frame_len(2, WalOperation::Index, MAX_WAL_FRAME_BYTES + 1);
+        let before_size = wal.size_bytes().unwrap();
+        assert!(wal.append(WalOperation::Index, oversized).is_err());
+        assert_eq!(wal.next_seq_no(), 2);
+        assert_eq!(wal.size_bytes().unwrap(), before_size);
     }
 
     #[test]
@@ -1500,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_frame_at_eof_is_skipped() {
+    fn streaming_decode_rejects_partial_frame_at_eof() {
         let entry = TranslogEntry {
             seq_no: 0,
             op: WalOperation::Index,
@@ -1512,11 +2199,11 @@ mod tests {
         frame.extend_from_slice(&[0u8; 10]); // only 10 of 100 bytes
 
         let mut reader = std::io::Cursor::new(&frame);
-        let decoded = decode_entries(&mut reader).unwrap();
-        assert_eq!(
-            decoded.len(),
-            1,
-            "should recover the first valid entry and skip the partial"
+        let error = decode_entries(&mut reader).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete translog frame payload")
         );
     }
 
@@ -1585,7 +2272,405 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    #[test]
+    fn bounded_range_read_reports_completion_and_limits() {
+        let (_dir, tl) = open_translog();
+        for value in 0..5 {
+            tl.append(WalOperation::Index, json!({"value": value}))
+                .unwrap();
+        }
+
+        let snapshot = tl.recovery_read_snapshot().unwrap();
+        let (first, complete) = snapshot.read_bounded_range(1, 2, usize::MAX).unwrap();
+        assert_eq!(
+            first.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(!complete);
+
+        let (second, complete) = snapshot.read_bounded_range(3, 10, usize::MAX).unwrap();
+        assert_eq!(
+            second.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert!(complete);
+
+        let error = snapshot.read_bounded_range(0, 1, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the recovery byte limit")
+        );
+    }
+
+    #[test]
+    fn bounded_range_uses_live_generations_when_manifest_lags_roll() {
+        let (_dir, translog) = open_translog();
+        translog
+            .append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        {
+            let mut state = recover_lock(&translog.state, "test");
+            translog.roll_generation_locked(&mut state).unwrap();
+            // Deliberately do not persist the manifest. This models a failed
+            // manifest publication after the in-memory generation roll.
+        }
+        translog
+            .append(WalOperation::Index, json!({"value": 1}))
+            .unwrap();
+
+        let snapshot = translog.recovery_read_snapshot().unwrap();
+        let (entries, complete) = snapshot.read_bounded_range(0, 16, usize::MAX).unwrap();
+        assert!(complete);
+        assert_eq!(
+            entries.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn bounded_range_rejects_torn_terminal_frame_followed_by_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = generation_path(dir.path(), 0);
+        let first = encode_entry(&TranslogEntry {
+            seq_no: 0,
+            op: WalOperation::Index,
+            payload: json!({"value": 0}),
+        })
+        .unwrap();
+        let torn = encode_entry(&TranslogEntry {
+            seq_no: 1,
+            op: WalOperation::Index,
+            payload: json!({"value": "terminal"}),
+        })
+        .unwrap();
+        let appended = encode_entry(&TranslogEntry {
+            seq_no: 2,
+            op: WalOperation::Index,
+            payload: json!({"value": "x".repeat(256)}),
+        })
+        .unwrap();
+        let torn_payload_len = u32::from_le_bytes(torn[..4].try_into().unwrap()) as usize;
+        assert!(torn_payload_len > 16);
+
+        let mut bytes = first;
+        bytes.extend_from_slice(&(torn_payload_len as u32).to_le_bytes());
+        bytes.extend_from_slice(&torn[4..20]);
+        bytes.extend_from_slice(&appended);
+        fs::write(&path, &bytes).unwrap();
+        let generation = GenerationInfo {
+            id: 0,
+            path,
+            first_seq_no: Some(0),
+            last_seq_no: Some(2),
+            size_bytes: bytes.len() as u64,
+        };
+
+        let error = HotTranslog::read_bounded_range_from_generations(
+            &[generation],
+            0,
+            1,
+            16,
+            usize::MAX,
+            None,
+        )
+        .unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("decode")
+                || error_chain.contains("unknown WAL operation")
+                || error_chain.contains("JSON")
+                || error_chain.contains("utf-8"),
+            "unexpected torn-frame error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn bounded_range_treats_partial_post_head_frame_as_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = generation_path(dir.path(), 0);
+        let first = encode_entry(&TranslogEntry {
+            seq_no: 0,
+            op: WalOperation::Index,
+            payload: json!({"value": 0}),
+        })
+        .unwrap();
+        let second = encode_entry(&TranslogEntry {
+            seq_no: 1,
+            op: WalOperation::Index,
+            payload: json!({"value": 1}),
+        })
+        .unwrap();
+        let post_head = encode_entry(&TranslogEntry {
+            seq_no: 2,
+            op: WalOperation::Index,
+            payload: json!({"value": "x".repeat(8192)}),
+        })
+        .unwrap();
+        let captured_size = first.len() + second.len();
+        let mut bytes = first;
+        bytes.extend_from_slice(&second);
+        bytes.extend_from_slice(&post_head[..4 + 4096]);
+        fs::write(&path, &bytes).unwrap();
+        let generation = GenerationInfo {
+            id: 0,
+            path,
+            first_seq_no: Some(0),
+            last_seq_no: Some(1),
+            size_bytes: captured_size as u64,
+        };
+
+        let (entries, complete) = HotTranslog::read_bounded_range_from_generations(
+            &[generation],
+            0,
+            2,
+            16,
+            usize::MAX,
+            None,
+        )
+        .unwrap();
+        assert!(complete);
+        assert_eq!(
+            entries.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn bounded_range_rejects_partial_post_head_frame_in_non_final_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = generation_path(dir.path(), 0);
+        let final_path = generation_path(dir.path(), 1);
+        let first = encode_entry(&TranslogEntry {
+            seq_no: 0,
+            op: WalOperation::Index,
+            payload: json!({"value": 0}),
+        })
+        .unwrap();
+        let post_head = encode_entry(&TranslogEntry {
+            seq_no: 1,
+            op: WalOperation::Index,
+            payload: json!({"value": "x".repeat(8192)}),
+        })
+        .unwrap();
+        let captured_size = first.len();
+        let mut bytes = first;
+        bytes.extend_from_slice(&post_head[..4 + 4096]);
+        fs::write(&first_path, &bytes).unwrap();
+        fs::write(&final_path, []).unwrap();
+        let generations = vec![
+            GenerationInfo {
+                id: 0,
+                path: first_path,
+                first_seq_no: Some(0),
+                last_seq_no: Some(0),
+                size_bytes: captured_size as u64,
+            },
+            GenerationInfo {
+                id: 1,
+                path: final_path,
+                first_seq_no: None,
+                last_seq_no: None,
+                size_bytes: 0,
+            },
+        ];
+
+        let error = HotTranslog::read_bounded_range_from_generations(
+            &generations,
+            0,
+            1,
+            16,
+            usize::MAX,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("extends past generation length"));
+    }
+
+    #[test]
+    fn bounded_range_rejects_partial_post_head_frame_inside_captured_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = generation_path(dir.path(), 0);
+        let first = encode_entry(&TranslogEntry {
+            seq_no: 0,
+            op: WalOperation::Index,
+            payload: json!({"value": 0}),
+        })
+        .unwrap();
+        let post_head = encode_entry(&TranslogEntry {
+            seq_no: 1,
+            op: WalOperation::Index,
+            payload: json!({"value": "x".repeat(8192)}),
+        })
+        .unwrap();
+        let mut bytes = first;
+        bytes.extend_from_slice(&post_head[..4 + 4096]);
+        fs::write(&path, &bytes).unwrap();
+        let generation = GenerationInfo {
+            id: 0,
+            path,
+            first_seq_no: Some(0),
+            last_seq_no: Some(0),
+            size_bytes: bytes.len() as u64,
+        };
+
+        let error = HotTranslog::read_bounded_range_from_generations(
+            &[generation],
+            0,
+            1,
+            16,
+            usize::MAX,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("extends past generation length"));
+    }
+
+    #[test]
+    fn bounded_range_rejects_frame_above_legacy_decode_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = generation_path(dir.path(), 0);
+        fs::write(&path, (MAX_WAL_DECODE_FRAME_BYTES as u32).to_le_bytes()).unwrap();
+        let generation = GenerationInfo {
+            id: 0,
+            path,
+            first_seq_no: Some(0),
+            last_seq_no: Some(0),
+            size_bytes: 4,
+        };
+
+        let error = HotTranslog::read_bounded_range_from_generations(
+            &[generation],
+            0,
+            1,
+            16,
+            usize::MAX,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("exceeding maximum"));
+    }
+
+    #[test]
+    fn bounded_range_rejects_legacy_large_frame_in_transfer_range() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = generation_path(dir.path(), 0);
+        let payload = payload_for_frame_len(0, WalOperation::Index, MAX_WAL_FRAME_BYTES + 1);
+        let frame = encode_legacy_entry_without_write_limit(&TranslogEntry {
+            seq_no: 0,
+            op: WalOperation::Index,
+            payload,
+        });
+        assert_eq!(frame.len(), MAX_WAL_FRAME_BYTES + 1);
+        fs::write(&path, &frame).unwrap();
+        let generation = GenerationInfo {
+            id: 0,
+            path,
+            first_seq_no: Some(0),
+            last_seq_no: Some(0),
+            size_bytes: frame.len() as u64,
+        };
+
+        let error = HotTranslog::read_bounded_range_from_generations(
+            &[generation],
+            0,
+            1,
+            16,
+            usize::MAX,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding recovery transfer maximum")
+        );
+    }
+
+    #[test]
+    fn initialize_empty_at_sets_recovery_sequence_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        HotTranslog::initialize_empty_at(dir.path(), TranslogDurability::Request, 7).unwrap();
+
+        let translog = HotTranslog::open(dir.path()).unwrap();
+        assert_eq!(translog.next_seq_no(), 7);
+        assert!(translog.read_all().unwrap().is_empty());
+        assert_eq!(
+            translog
+                .append(WalOperation::Index, json!({"value": 7}))
+                .unwrap()
+                .seq_no,
+            7
+        );
+    }
+
     // ── truncate_below ──────────────────────────────────────────────────
+
+    #[test]
+    fn retention_pin_bounds_checkpoint_and_full_truncation() {
+        let (_dir, translog) = open_translog();
+        translog
+            .append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        translog
+            .append(WalOperation::Index, json!({"value": 1}))
+            .unwrap();
+        translog.truncate_below(0).unwrap();
+        translog
+            .append(WalOperation::Index, json!({"value": 2}))
+            .unwrap();
+        translog
+            .append(WalOperation::Index, json!({"value": 3}))
+            .unwrap();
+
+        let pin = translog.register_retention_pin(2).unwrap();
+        assert_eq!(translog.min_retention_pin(), Some(2));
+        translog.truncate_below(u64::MAX).unwrap();
+        assert_eq!(
+            translog
+                .read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+
+        translog.truncate().unwrap();
+        assert_eq!(
+            translog
+                .read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+
+        translog.release_retention_pin(pin).unwrap();
+        assert_eq!(translog.min_retention_pin(), None);
+        translog.truncate().unwrap();
+        assert!(translog.read_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn zero_retention_pin_prevents_pruning_any_history() {
+        let (_dir, translog) = open_translog();
+        translog
+            .append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        let pin = translog.register_retention_pin(0).unwrap();
+
+        translog.truncate().unwrap();
+        assert_eq!(translog.read_all().unwrap()[0].seq_no, 0);
+
+        translog.release_retention_pin(pin).unwrap();
+        translog.truncate().unwrap();
+        assert!(translog.read_all().unwrap().is_empty());
+    }
 
     #[test]
     fn truncate_below_keeps_mixed_generation_until_future_roll() {
@@ -1800,6 +2885,99 @@ mod tests {
         };
         assert!(
             err.to_string()
+                .contains("unknown WAL operation type: bogus")
+        );
+    }
+
+    #[test]
+    fn open_truncates_partial_active_tail_before_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = generation_path(dir.path(), 0);
+        {
+            let wal = HotTranslog::open(dir.path()).unwrap();
+            wal.append(WalOperation::Index, json!({"value": 0}))
+                .unwrap();
+        }
+        let valid_len = fs::metadata(&generation).unwrap().len();
+        {
+            let mut file = OpenOptions::new().append(true).open(&generation).unwrap();
+            file.write_all(&100u32.to_le_bytes()).unwrap();
+            file.write_all(&[0u8; 10]).unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(fs::metadata(&generation).unwrap().len() > valid_len);
+
+        {
+            let wal = HotTranslog::open(dir.path()).unwrap();
+            assert_eq!(fs::metadata(&generation).unwrap().len(), valid_len);
+            assert_eq!(wal.next_seq_no(), 1);
+            assert_eq!(
+                wal.append(WalOperation::Index, json!({"value": 1}))
+                    .unwrap()
+                    .seq_no,
+                1
+            );
+        }
+
+        let reopened = HotTranslog::open(dir.path()).unwrap();
+        let entries = reopened.read_all().unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(entries[0].payload["value"], 0);
+        assert_eq!(entries[1].payload["value"], 1);
+    }
+
+    #[test]
+    fn open_rejects_complete_corrupt_middle_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = encode_entry(&TranslogEntry {
+            seq_no: 0,
+            op: WalOperation::Index,
+            payload: json!({"value": 0}),
+        })
+        .unwrap();
+        let corrupt_wire = WireEntry {
+            seq_no: 1,
+            op: "bogus".to_string(),
+            payload_json: serde_json::to_string(&json!({"value": 1})).unwrap(),
+        };
+        let corrupt_payload =
+            bincode_next::serde::encode_to_vec(&corrupt_wire, BINCODE_CONFIG).unwrap();
+        let mut corrupt = Vec::with_capacity(4 + corrupt_payload.len());
+        corrupt.extend_from_slice(&(corrupt_payload.len() as u32).to_le_bytes());
+        corrupt.extend_from_slice(&corrupt_payload);
+        let last = encode_entry(&TranslogEntry {
+            seq_no: 2,
+            op: WalOperation::Index,
+            payload: json!({"value": 2}),
+        })
+        .unwrap();
+        let mut bytes = first;
+        bytes.extend_from_slice(&corrupt);
+        bytes.extend_from_slice(&last);
+        fs::write(generation_path(dir.path(), 0), &bytes).unwrap();
+        let manifest = TranslogManifest {
+            version: TRANSLOG_MANIFEST_VERSION,
+            active_generation_id: 0,
+            next_generation_id: 1,
+            generations: vec![ManifestGenerationInfo {
+                id: 0,
+                first_seq_no: Some(0),
+                last_seq_no: Some(2),
+                size_bytes: bytes.len() as u64,
+            }],
+        };
+        persist_translog_manifest(&manifest_path(dir.path()), &manifest).unwrap();
+
+        let error = match HotTranslog::open(dir.path()) {
+            Ok(_) => panic!("open accepted a complete corrupt middle frame"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
                 .contains("unknown WAL operation type: bogus")
         );
     }

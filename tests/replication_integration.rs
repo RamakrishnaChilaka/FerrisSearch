@@ -21,7 +21,6 @@ use ferrissearch::transport::proto::{
     ShardSearchRequest,
 };
 use ferrissearch::transport::server::create_transport_service_for_test;
-use ferrissearch::wal::{HotTranslog, WriteAheadLog};
 use futures::TryStreamExt;
 
 use std::collections::HashMap;
@@ -116,6 +115,21 @@ async fn start_grpc_server(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
 ) -> std::net::SocketAddr {
+    start_grpc_server_for_node(cluster_manager, shard_manager, "node-1").await
+}
+
+async fn start_primary_grpc_server(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+) -> std::net::SocketAddr {
+    start_grpc_server_for_node(cluster_manager, shard_manager, "primary-node").await
+}
+
+async fn start_grpc_server_for_node(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    local_node_id: &str,
+) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -126,7 +140,7 @@ async fn start_grpc_server(
         shard_manager,
         transport_client,
         Arc::new(ferrissearch::tasks::TaskManager::new()),
-        "node-1".into(),
+        local_node_id.into(),
     );
 
     tokio::spawn(async move {
@@ -231,7 +245,9 @@ fn setup_single_node_cluster_state(cm: &ClusterManager, index_name: &str) {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -268,7 +284,9 @@ fn setup_multi_shard_single_node_cluster_state(cm: &ClusterManager, index_name: 
             shard_id,
             ShardRoutingEntry {
                 primary: "node-1".into(),
+                primary_term: 1,
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -292,6 +310,22 @@ fn setup_two_node_cluster_state(
     replica_cm: &ClusterManager,
     index_name: &str,
     replica_port: u16,
+) {
+    setup_two_node_cluster_state_with_membership(
+        primary_cm,
+        replica_cm,
+        index_name,
+        replica_port,
+        true,
+    );
+}
+
+fn setup_two_node_cluster_state_with_membership(
+    primary_cm: &ClusterManager,
+    replica_cm: &ClusterManager,
+    index_name: &str,
+    replica_port: u16,
+    replica_in_sync: bool,
 ) {
     let mut cs = primary_cm.get_state();
     cs.add_node(DomainNodeInfo {
@@ -318,7 +352,12 @@ fn setup_two_node_cluster_state(
         0,
         ShardRoutingEntry {
             primary: "primary-node".into(),
+            primary_term: 1,
             replicas: vec!["replica-node".into()],
+            in_sync_replicas: replica_in_sync
+                .then(|| "replica-node".to_string())
+                .into_iter()
+                .collect(),
             unassigned_replicas: 0,
         },
     );
@@ -465,6 +504,84 @@ async fn index_and_get_document_via_grpc_with_tls() {
 }
 
 #[tokio::test]
+async fn primary_write_handlers_reject_non_primary_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new("non-primary-write".into()));
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cluster_manager, "non-primary-index");
+    let mut state = cluster_manager.get_state();
+    state.add_node(DomainNodeInfo {
+        id: "node-2".into(),
+        name: "node-2".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9302,
+        http_port: 9202,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    state
+        .indices
+        .get_mut("non-primary-index")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap()
+        .primary = "node-2".into();
+    cluster_manager.update_state(state);
+
+    let addr = start_grpc_server(cluster_manager, shard_manager.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    let index_response = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "non-primary-index".into(),
+            shard_id: 0,
+            doc_id: "doc-1".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!index_response.success);
+    assert!(index_response.error.contains("not the primary"));
+
+    let bulk_response = client
+        .bulk_index(tonic::Request::new(ShardBulkRequest {
+            index_name: "non-primary-index".into(),
+            shard_id: 0,
+            documents_json: vec![
+                serde_json::to_vec(&serde_json::json!({
+                    "_doc_id": "doc-2",
+                    "_source": {"value": 2}
+                }))
+                .unwrap(),
+            ],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!bulk_response.success);
+    assert!(bulk_response.error.contains("not the primary"));
+
+    let delete_response = client
+        .delete_doc(tonic::Request::new(ShardDeleteRequest {
+            index_name: "non-primary-index".into(),
+            shard_id: 0,
+            doc_id: "doc-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!delete_response.success);
+    assert!(delete_response.error.contains("not the primary"));
+
+    assert!(
+        shard_manager.get_shard("non-primary-index", 0).is_none(),
+        "rejected writes must not open or mutate a local shard"
+    );
+}
+
+#[tokio::test]
 async fn bulk_index_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
@@ -590,8 +707,12 @@ async fn replicate_doc_index_via_grpc() {
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["color"], "blue");
 
-    let tl = HotTranslog::open(sm.shard_data_dir("replica-idx", 0).unwrap()).unwrap();
-    let entries = tl.read_all().unwrap();
+    let entries = sm
+        .get_shard("replica-idx", 0)
+        .unwrap()
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].seq_no, 0);
 }
@@ -701,8 +822,12 @@ async fn replicate_bulk_via_grpc() {
         assert!(resp.found, "bulk-rep-{i} not found");
     }
 
-    let tl = HotTranslog::open(sm.shard_data_dir("bulk-rep-idx", 0).unwrap()).unwrap();
-    let entries = tl.read_all().unwrap();
+    let entries = sm
+        .get_shard("bulk-rep-idx", 0)
+        .unwrap()
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].seq_no, 0);
     assert_eq!(entries[1].seq_no, 1);
@@ -772,7 +897,7 @@ async fn primary_write_replicates_to_replica_node() {
         replica_addr.port(),
     );
 
-    let primary_addr = start_grpc_server(primary_cm, primary_sm).await;
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
 
     // Write a document to the primary
@@ -809,10 +934,127 @@ async fn primary_write_replicates_to_replica_node() {
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["message"], "hello from primary");
 
-    let tl = HotTranslog::open(replica_sm.shard_data_dir("replicated-idx", 0).unwrap()).unwrap();
-    let entries = tl.read_all().unwrap();
+    let entries = replica_sm
+        .get_shard("replicated-idx", 0)
+        .unwrap()
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].seq_no, 0);
+}
+
+#[tokio::test]
+async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("out-of-sync".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("out-of-sync".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    setup_two_node_cluster_state_with_membership(
+        &primary_cm,
+        &replica_cm,
+        "out-of-sync-idx",
+        replica_addr.port(),
+        false,
+    );
+
+    let primary_addr = start_primary_grpc_server(primary_cm.clone(), primary_sm).await;
+    let mut client = connect_client(primary_addr).await;
+
+    let first = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "out-of-sync-idx".into(),
+            shard_id: 0,
+            doc_id: "not-replicated".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        first.success,
+        "out-of-sync replica blocked write: {}",
+        first.error
+    );
+    assert!(
+        replica_sm.get_shard("out-of-sync-idx", 0).is_none(),
+        "an out-of-sync replica must not receive or open for live replication"
+    );
+
+    let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unreachable_port = unused_listener.local_addr().unwrap().port();
+    drop(unused_listener);
+    let mut state = primary_cm.get_state();
+    state.nodes.get_mut("replica-node").unwrap().transport_port = unreachable_port;
+    primary_cm.update_state(state);
+
+    let second = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "out-of-sync-idx".into(),
+            shard_id: 0,
+            doc_id: "still-acknowledged".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 2})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        second.success,
+        "unreachable out-of-sync replica blocked write: {}",
+        second.error
+    );
+    assert!(replica_sm.get_shard("out-of-sync-idx", 0).is_none());
+}
+
+#[tokio::test]
+async fn unreachable_in_sync_replica_still_fails_live_write() {
+    let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unreachable_port = unused_listener.local_addr().unwrap().port();
+    drop(unused_listener);
+
+    let replica_cm = Arc::new(ClusterManager::new("required-replica".into()));
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("required-replica".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &replica_cm,
+        "required-replica-idx",
+        unreachable_port,
+    );
+
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
+    let mut client = connect_client(primary_addr).await;
+    let response = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "required-replica-idx".into(),
+            shard_id: 0,
+            doc_id: "must-fail".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!response.success);
+    assert!(
+        response.error.contains("Replication failed"),
+        "{}",
+        response.error
+    );
 }
 
 #[tokio::test]
@@ -839,7 +1081,7 @@ async fn primary_delete_replicates_to_replica_node() {
         replica_addr.port(),
     );
 
-    let primary_addr = start_grpc_server(primary_cm, primary_sm).await;
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
 
     // Index a document
@@ -905,7 +1147,7 @@ async fn primary_bulk_replicates_to_replica_node() {
         replica_addr.port(),
     );
 
-    let primary_addr = start_grpc_server(primary_cm, primary_sm).await;
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
 
     // Bulk index 5 documents on the primary
@@ -948,8 +1190,12 @@ async fn primary_bulk_replicates_to_replica_node() {
         assert!(resp.found, "repl-bulk-{i} not replicated to replica");
     }
 
-    let tl = HotTranslog::open(replica_sm.shard_data_dir("bulk-repl-idx", 0).unwrap()).unwrap();
-    let entries = tl.read_all().unwrap();
+    let entries = replica_sm
+        .get_shard("bulk-repl-idx", 0)
+        .unwrap()
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
     assert_eq!(entries.len(), 5);
     assert_eq!(entries[0].seq_no, 0);
     assert_eq!(entries[4].seq_no, 4);
@@ -1035,7 +1281,9 @@ async fn search_shard_reopens_persisted_shard_after_restart() {
             0,
             ShardRoutingEntry {
                 primary: "node-1".into(),
+                primary_term: 1,
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -1163,7 +1411,9 @@ async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
             0,
             ShardRoutingEntry {
                 primary: "node-1".into(),
+                primary_term: 1,
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -1250,7 +1500,9 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1346,7 +1598,9 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
             0,
             ShardRoutingEntry {
                 primary: "node-1".into(),
+                primary_term: 1,
                 replicas: vec![],
+                in_sync_replicas: vec![],
                 unassigned_replicas: 0,
             },
         );
@@ -1448,7 +1702,9 @@ async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -1574,7 +1830,9 @@ async fn forward_sql_batch_stream_to_shard_returns_multiple_arrow_batches() {
         0,
         ShardRoutingEntry {
             primary: "node-1".into(),
+            primary_term: 1,
             replicas: vec![],
+            in_sync_replicas: vec![],
             unassigned_replicas: 0,
         },
     );
@@ -2395,7 +2653,7 @@ async fn primary_write_advances_global_checkpoint() {
 
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "gc-idx", replica_addr.port());
 
-    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
 
     // Write 3 documents — replication succeeds, global checkpoint should advance
@@ -2438,7 +2696,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("receipt-cluster".into()));
     let primary_sm = Arc::new(ShardManager::new(
@@ -2460,7 +2718,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         );
         manager.update_state(state);
     }
-    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
     let seed = client
         .index_doc(tonic::Request::new(ShardDocRequest {
@@ -2560,10 +2818,13 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         receipts.keys().copied().collect::<Vec<_>>(),
         (0..41).collect::<Vec<_>>()
     );
-    for directory in [primary_dir.path(), replica_dir.path()] {
-        let wal =
-            HotTranslog::open(directory.join(format!("{index}-uuid")).join("shard_0")).unwrap();
-        let entries = wal.read_all().unwrap();
+    for shard_manager in [&primary_sm, &replica_sm] {
+        let entries = shard_manager
+            .get_shard(index, 0)
+            .unwrap()
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations;
         assert_eq!(entries.len(), receipts.len());
         let actual: std::collections::BTreeMap<_, _> = entries
             .into_iter()
@@ -2622,14 +2883,15 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
-    let wal = HotTranslog::open(
-        directory
-            .path()
-            .join(format!("{index}-uuid"))
-            .join("shard_0"),
-    )
-    .unwrap();
-    assert!(wal.read_all().unwrap().is_empty());
+    assert!(
+        shards
+            .get_shard(index, 0)
+            .unwrap()
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
     assert_eq!(shards.get_shard(index, 0).unwrap().doc_count(), 0);
 }
 
@@ -2743,7 +3005,7 @@ async fn bulk_replication_advances_global_checkpoint() {
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "bgc-idx", replica_addr.port());
 
-    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
 
     // Bulk index 5 docs
@@ -2796,7 +3058,7 @@ async fn delete_replication_advances_global_checkpoint() {
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "dgc-idx", replica_addr.port());
 
-    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
 
     // Index a doc first
@@ -2856,7 +3118,7 @@ async fn isr_tracker_updated_after_replication() {
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "isr-idx", replica_addr.port());
 
-    let primary_addr = start_grpc_server(primary_cm, primary_sm.clone()).await;
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
 
     // Index docs to trigger replication → ISR update

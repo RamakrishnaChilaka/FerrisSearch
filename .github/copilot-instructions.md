@@ -89,6 +89,17 @@ architecture decision.
 - **Primary writes own sequence numbers.** Carry the WAL-assigned sequence or
   batch range with the operation result; never infer it from a later shared
   checkpoint. Replica apply and recovery preserve these values.
+- **Replica authority is Raft metadata.** Live writes, required acknowledgements,
+  and automatic promotion use only `ShardRoutingEntry.in_sync_replicas`; an
+  assigned but out-of-sync copy is never promotable. If no in-sync copy
+  survives, keep the shard unavailable rather than promoting stale data.
+- **Peer recovery admission is barriered and conditional.** A target installs a
+  committed Tantivy file snapshot, replays the pinned WAL suffix, reaches the
+  primary's exclusive write-barrier head, and enters the in-sync set only
+  through a `(primary, primary_term)` Raft compare-and-set. Never release an
+  unresolved admission barrier by guessing whether membership committed.
+  Idle/session reaping cannot release a settling barrier; only settlement may
+  release it after observing admission/impossibility or fencing the old term.
 - **Synchronous replication failures are request failures.** Do not turn
   partial replication into success-shaped responses.
 - **Remote publication is not multi-writer safe yet.** Do not claim otherwise
