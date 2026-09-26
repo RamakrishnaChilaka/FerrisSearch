@@ -165,6 +165,24 @@ struct PeerRecoveryInstallMarker {
     allocation_id: AllocationId,
 }
 
+impl PeerRecoveryInstallMarker {
+    fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            anyhow::bail!(
+                "unsupported peer recovery install marker version {}",
+                self.version
+            );
+        }
+        if self.index_uuid.is_empty() {
+            anyhow::bail!("peer recovery install marker has an empty index UUID");
+        }
+        if self.allocation_id == 0 {
+            anyhow::bail!("peer recovery install marker has a zero allocation ID");
+        }
+        Ok(())
+    }
+}
+
 /// Key uniquely identifying a shard: (index_name, shard_id)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ShardKey {
@@ -1371,6 +1389,41 @@ impl ShardManager {
             .contains_key(&ShardKey::new(index, shard_id))
     }
 
+    pub fn failed_peer_recovery_install_matches(
+        &self,
+        index: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<bool> {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self
+            .peer_recovery_targets
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&key)
+        {
+            return Ok(false);
+        }
+        let marker_path = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"))
+            .join(PEER_RECOVERY_IN_PROGRESS_MARKER);
+        if !marker_path.exists() {
+            return Ok(false);
+        }
+        let marker: PeerRecoveryInstallMarker =
+            serde_json::from_slice(&std::fs::read(&marker_path)?)
+                .map_err(|error| anyhow::anyhow!("decode peer recovery marker: {error}"))?;
+        marker.validate()?;
+        Ok(marker.index_uuid == index_uuid && marker.allocation_id == allocation_id)
+    }
+
     pub fn rejects_live_replication(&self, index: &str, shard_id: u32) -> bool {
         matches!(
             self.peer_recovery_targets
@@ -1579,10 +1632,8 @@ impl ShardManager {
             let marker: PeerRecoveryInstallMarker =
                 serde_json::from_slice(&std::fs::read(&marker_path)?)
                     .map_err(|error| anyhow::anyhow!("decode peer recovery marker: {error}"))?;
-            if marker.version != 1
-                || marker.index_uuid != index_uuid
-                || marker.allocation_id != allocation_id
-            {
+            marker.validate()?;
+            if marker.index_uuid != index_uuid || marker.allocation_id != allocation_id {
                 anyhow::bail!("peer recovery install marker does not match the target allocation");
             }
 

@@ -261,20 +261,48 @@ pub(super) fn open_local_assigned_shards(
             }
             let authoritative_here =
                 routing.primary == local_node_id || routing.is_replica_in_sync(local_node_id);
-            if !authoritative_here {
-                continue;
-            }
             let Some(allocation_id) =
                 state.shard_allocation_id(index_name, *shard_id, local_node_id)
             else {
-                shard_manager.quarantine_shard_copy(index_name, *shard_id);
-                tracing::error!(
-                    "Refusing to open authoritative shard {}/{} because its allocation ID is missing; pre-1.0 copies must be recreated or reindexed",
-                    index_name,
-                    shard_id
-                );
+                if authoritative_here {
+                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
+                    tracing::error!(
+                        "Refusing to open authoritative shard {}/{} because its allocation ID is missing; pre-1.0 copies must be recreated or reindexed",
+                        index_name,
+                        shard_id
+                    );
+                }
                 continue;
             };
+            if !authoritative_here {
+                if state.primary_initialized(index_name, *shard_id) {
+                    match shard_manager.failed_peer_recovery_install_matches(
+                        index_name,
+                        *shard_id,
+                        metadata.uuid.as_str(),
+                        allocation_id,
+                    ) {
+                        Ok(true) => failures.push(ShardCopyFailure {
+                            index_name: index_name.clone(),
+                            index_uuid: metadata.uuid.to_string(),
+                            shard_id: *shard_id,
+                            node_id: local_node_id.to_string(),
+                            allocation_id,
+                            reason: "peer recovery install marker remains after target failure"
+                                .to_string(),
+                        }),
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            "Unable to classify peer recovery install marker for {}/{} allocation {}: {}",
+                            index_name,
+                            shard_id,
+                            allocation_id,
+                            error
+                        ),
+                    }
+                }
+                continue;
+            }
             if shard_manager.get_shard(index_name, *shard_id).is_some() {
                 if let Err(error) = shard_manager.validate_open_copy_identity(
                     index_name,

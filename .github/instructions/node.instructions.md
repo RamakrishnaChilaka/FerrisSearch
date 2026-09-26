@@ -91,6 +91,10 @@ pub struct Node {
 - File download, fsync, shard close/open, vector rebuild, and recovery apply run
   through Tokio's blocking facilities rather than the fixed search/write pools.
 - A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
+  An inactive marker whose embedded allocation ID matches the current
+  out-of-sync assignment is reported through `FailShardCopy`; an active target,
+  a fresh target with no marker, or a stale marker from another allocation is
+  not reported.
   Successful finalization clears the in-memory target gate only after the
   primary reports settled admission.
 - Completion timeout is not rejection. A caught-up target persists a

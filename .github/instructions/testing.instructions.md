@@ -121,7 +121,8 @@ cargo test -- test_name                         # Single test by name
   the C1 same-node admission ABA and C2 stale-primary apply. Cover log-position
   ID assignment, exact-ID recovery start/session/install/pending/admission,
   G1 pre-activation empty creation, malformed/missing identity rejection,
-  allocation-bound `FailShardCopy`, UUID/allocation/term/missing-field replica
+  allocation-bound `FailShardCopy`, active-versus-failed-versus-stale install
+  marker classification, UUID/allocation/term/missing-field replica
   rejection, bulk pre-mutation validation, durable fence restart, separate
   source/target state handles, and a real-process in-sync replica disk-loss
   recovery with exact acknowledged documents.
