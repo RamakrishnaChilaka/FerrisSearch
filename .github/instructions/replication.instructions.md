@@ -39,14 +39,22 @@ pub async fn replicate_bulk(
 5. gRPC sends only to replicas in the Raft-authoritative
    `ShardRoutingEntry.in_sync_replicas` set, concurrently via `tokio::spawn` +
    `join_all` (fan-out)
-6. Each replica: applies the write using the primary-provided seq_no, persists that exact seq_no in its WAL, updates its local checkpoint, returns checkpoint
-7. Primary updates ISR tracker with returned checkpoints
-8. Primary computes global checkpoint (min of all replica checkpoints)
-9. Write acknowledged to client **only after every in-sync replica confirms**
+6. Each request carries index UUID, sender primary term, and the target's exact
+   allocation ID. The replica validates UUID, allocation, recovery gate, and
+   `term >= max(applied_view_term, durable_fence)` before mutation.
+7. A higher accepted term is atomically persisted in the local copy identity
+   before the WAL/engine operation. Bulk validates the common envelope first
+   and advances the fence once.
+8. Each replica applies the write using the primary-provided seq_no, persists that exact seq_no in its WAL, updates its local checkpoint, and returns the checkpoint
+9. Primary updates ISR tracker with returned checkpoints
+10. Primary computes global checkpoint (min of all replica checkpoints)
+11. Write acknowledged to client **only after every in-sync replica confirms**
 
 ## File-Based Peer Recovery
 - Every node drives recovery for assigned local replicas absent from
   `in_sync_replicas`; metadata-leader role does not disable the driver.
+- `StartPeerRecovery` carries the target-observed allocation ID. The source
+  rejects snapshot setup until its own current assignment has the exact same ID.
 - The primary commits under the translog lock, captures boundary `B`, registers
   a WAL retention pin before releasing that lock, and hard-links the existing
   committed Tantivy files into a per-session directory.
@@ -60,7 +68,7 @@ pub async fn replicate_bulk(
   in-progress marker after definitive rejection.
 - Catch-up applies explicit primary sequence numbers. A final exclusive shard
   write barrier establishes `H`; the target applies through `H`, then the
-  primary submits `MarkReplicaInSync(primary, term)` and observes local
+  primary submits `MarkReplicaInSync(allocation_id, primary, term)` and observes local
   membership before releasing writes.
 - Admission uncertainty remains write-blocking until membership is observed or
   `ActivatePrimary` commits a term bump that makes the stale admission
@@ -97,9 +105,9 @@ pub async fn replicate_bulk(
 - Each replicated operation must fit the same 32 MiB encoded WAL-frame limit as
   a primary operation. Oversized explicit-sequence single or bulk writes fail
   validation before replica WAL mutation.
-- Pending-target reconciliation cannot safely resolve remove-and-re-add ABA
-  with node IDs alone. This is a known liveness limitation pending allocation
-  IDs; never wipe the caught-up copy based on guessed assignment identity.
+- Pending-target reconciliation admits only the same allocation when in sync or
+  after promotion. Missing or different allocation identity is definitive
+  rejection; otherwise the result remains unknown.
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates but cannot grant membership.
@@ -109,8 +117,9 @@ pub async fn replicate_bulk(
   releasing the primary write lock. Concurrent writes can advance both before
   replication begins.
 - Current local/global checkpoints are monotonic high-water marks. They are not
-  a gap-free applied-prefix protocol and do not add idempotent retry handling,
-  primary-epoch fencing, or a new failover ordering model.
+  a gap-free applied-prefix protocol and do not add idempotent retry handling
+  or a complete new failover ordering model beyond the implemented
+  allocation/replica-term fences.
 
 ## Proposed Recovery Work
 

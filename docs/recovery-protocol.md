@@ -150,6 +150,19 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > or unreferenced-generation deletion against an active writer. Test-only live
 > WAL inspections use the same non-mutating engine path.
 >
+> **Allocation identity and replica fencing — September 26, 2026:** Raft now
+> assigns every shard copy an allocation ID derived from the assigning log
+> position. Recovery start, source sessions, install state, pending membership,
+> admission, activation, replication, and copy-failure reports retain that
+> identity. Local copies atomically persist index UUID, allocation ID, and a
+> monotonic replica term fence; replica RPCs validate those fields and the
+> recovery gate before WAL mutation. CreateIndex replicas start out of sync,
+> first activation marks the shard initialized, and only an initial
+> pre-activation allocation may be created empty. An unopenable initialized
+> copy reports `FailShardCopy`; the exact allocation is removed, an in-sync
+> survivor is promoted when available, and otherwise the cleared primary
+> allocation leaves the shard red.
+>
 > **Known liveness limit:** remove-and-re-add of a target node while its
 > finalized copy is awaiting membership can remain `Unknown`. Current routing
 > identifies copies by node ID, so the target cannot prove whether it is still
@@ -760,11 +773,13 @@ unsealed trailing attempt beyond the durability frontier can be discarded under
 the restart rule in Section 5.
 New fields are not silently defaulted into a valid epoch, allocation, or history.
 
-Existing old-format data can be opened for a deliberate conversion/export path,
-but must not be labelled protocol-safe by assuming a term of zero or a complete
-prefix from a maximum sequence. The proposed first release requires offline
-conversion/reindexing or a fresh test cluster; no rolling mixed-protocol support
-is implied. Final format/conversion details belong to FS-005 before implementation.
+Existing old-format data can be opened only by a future deliberate
+conversion/export path and must not be labelled protocol-safe by assuming a
+term of zero or a complete prefix from a maximum sequence. The current pre-1.0
+implementation requires reindexing or a fresh cluster when routing snapshots or
+local copies lack allocation identity; no rolling mixed-protocol support or
+legacy adoption path is provided. Broader format/conversion details remain part
+of FS-005.
 
 Ordinary process restart and same-version recovery remain required. File
 deletion and old-generation cleanup must wait until atomic-install and retention

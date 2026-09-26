@@ -39,6 +39,7 @@ FetchRecoveryFileChunk(FetchRecoveryFileChunkRequest) → FetchRecoveryFileChunk
 FetchRecoveryOps(FetchRecoveryOpsRequest) → FetchRecoveryOpsResponse
 PrepareFinalizeRecovery(PrepareFinalizeRecoveryRequest) → PrepareFinalizeRecoveryResponse
 CompleteFinalizeRecovery(CompleteFinalizeRecoveryRequest) → CompleteFinalizeRecoveryResponse
+FailShardCopy(FailShardCopyRequest) → FailShardCopyResponse
 
 // Forwarded to leader
 UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
@@ -83,6 +84,9 @@ acknowledgement/promotion set in JoinCluster snapshots. Conversion must preserve
 it losslessly and reject duplicate IDs, the primary ID, or any ID absent from
 `replica_node_ids` with `INVALID_ARGUMENT`. An absent field from pre-1.0 peers
 decodes as empty and therefore non-promotable.
+`ShardAssignment` also carries primary/replica allocation IDs, the initial
+CreateIndex allocation ID, and `primary_initialized`. Missing allocation
+metadata is rejected on join snapshots; pre-1.0 snapshots are not adopted.
 
 ### Runtime And Code Generation
 
@@ -136,11 +140,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   `success: false` if replication fails** — write is only acknowledged after all
   in-sync replicas confirm (synchronous replication contract). Assigned
   out-of-sync replicas receive no live writes and cannot fail the request.
-- **replicate_doc / replicate_bulk**: Apply to local replica engine using the
-  seq_no supplied by the primary, persist that same seq_no in the replica WAL,
-  return the current local high-water mark. Bulk apply rejects empty-range
-  overflow, non-contiguous/out-of-order sequences, and non-index operations
-  before mutation.
+- **replicate_doc / replicate_bulk**: Require index UUID, sender primary term,
+  and target allocation ID. Revalidate the current local assignment inside the
+  write worker; then validate durable identity, recovery gate, and term fence
+  before WAL/engine mutation. A higher term is fsynced before mutation. Bulk
+  validates the shared envelope and every item before the first mutation and
+  advances the fence once.
 - **recover_replica**: Read the live engine's captured generation snapshot and
   return operations above the requested checkpoint. Never construct a second
   `HotTranslog` on the live shard directory: open performs startup repair and
@@ -151,7 +156,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   on a copy installed from files), when a concurrent flush removes a needed
   generation, or when a legacy frame above the 32 MiB transfer limit falls in
   the requested range.
-- **peer recovery RPCs**: source sessions are UUID/target/primary-term bound,
+- **peer recovery RPCs**: source sessions are
+  UUID/target/allocation/primary-term bound,
   file chunks are at most 1 MiB, operation batches are bounded by count and
   bytes, and stale authority aborts the session. Prepare holds the exclusive
   shard write barrier; Complete keeps it until conditional membership is
@@ -178,6 +184,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc` and
   `replicate_bulk` must call the explicit-seq engine methods. Do not route
   replicated writes through local seq allocation APIs.
+- **Replica apply is allocation- and term-fenced**: missing identity fields,
+  UUID/allocation mismatches, installing targets, and terms below
+  `max(applied_view_term, durable_fence)` reject before mutation and propagate
+  through the synchronous replication failure path.
 - **Installing targets reject live replica apply.** A finalized target awaiting
   membership accepts live apply and remains open; its durable pending marker is
   reconciled to admitted/promoted or definitively rejected state after restart.

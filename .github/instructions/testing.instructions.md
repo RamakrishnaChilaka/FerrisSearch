@@ -45,10 +45,10 @@ cargo test -- test_name                         # Single test by name
   selected `.cfg`; never describe them as proofs for arbitrary cluster sizes.
 - `scripts/tla/check.sh` verifies the pinned TLA+ tools jar before execution
   and uses isolated Java/TLC temporary directories.
-- Expected counterexamples are living regressions. The runner must fail if
+- Historical counterexamples are living model regressions. The runner must fail if
   `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, or `c4`
-  stops violating its named invariant before the corresponding Rust limitation
-  is fixed.
+  stops violating its named invariant; those configurations intentionally retain
+  the old protocol after the Rust implementation moves to the fixed variant.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
   `g2-primary-red`, `g2-liveness`, `fixed-crash`, and `fixed-partition` are
   expected-pass configurations for the allocation-ID, durable-fencing,
@@ -117,6 +117,14 @@ cargo test -- test_name                         # Single test by name
   targeting. Add a real three-process flush -> allocate replica -> primary loss
   -> red shard -> original-primary rejoin regression that verifies exact
   acknowledged values.
+- For allocation identity and replica fencing, retain fail-first evidence for
+  the C1 same-node admission ABA and C2 stale-primary apply. Cover log-position
+  ID assignment, exact-ID recovery start/session/install/pending/admission,
+  G1 pre-activation empty creation, malformed/missing identity rejection,
+  allocation-bound `FailShardCopy`, UUID/allocation/term/missing-field replica
+  rejection, bulk pre-mutation validation, durable fence restart, separate
+  source/target state handles, and a real-process in-sync replica disk-loss
+  recovery with exact acknowledged documents.
 - For file-based peer recovery, cover WAL pins on every truncation path,
   exact snapshot boundary under concurrent writes, marker/strict-open
   semantics, file name/offset/length/hash validation, ordered bounded operation

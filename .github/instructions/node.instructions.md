@@ -57,8 +57,12 @@ pub struct Node {
    - Nodes not seen for 15s → dead
    - Remove from Raft membership before cluster state; if membership removal fails or would empty the voter set, leave the node registered
    - Shard failover for orphaned primaries (see shard failover section)
-3. Reopen any locally assigned shards that are still not open
-4. Allocate unassigned replicas to available data nodes
+3. Reopen only authoritative local copies whose durable UUID/allocation
+   identity matches; initial CreateIndex copies may be created empty only before
+   the shard's first activation
+4. Report unopenable authoritative copies with allocation-bound
+   `FailShardCopy`
+5. Allocate unassigned replicas only for shards with a live allocated primary
 
 ### Follower Duties (every 5s tick)
 1. Ping master node for liveness check
@@ -70,10 +74,14 @@ pub struct Node {
 - The lifecycle loop itself stays on Tokio because it coordinates Raft/control-plane work, but shard reopen and orphan cleanup perform blocking filesystem/Tantivy recovery work.
 - On Tokio call sites, use `open_local_assigned_shards_blocking()` and `cleanup_orphaned_data_if_authoritative_blocking()` so the actual shard-manager work runs on Tokio's blocking pool.
 - Do NOT move Raft heartbeats or master pings onto rayon; keep control-plane futures on Tokio and offload only the blocking shard work.
-- Recovered-node startup assignments must fail closed when the authoritative shard UUID path is missing: do not create a fresh shard directory during restart reconciliation, and do not run orphan cleanup while locally assigned UUID paths are missing.
+- Recovered-node startup assignments must fail closed when durable
+  UUID/allocation identity is missing, malformed, or mismatched. The sole
+  exception is an uninitialized allocation created by CreateIndex, before any
+  write can be acknowledged.
 - The guarded startup-assignment set must come from the node's pre-join recovered state, not the later authoritative join snapshot. Otherwise fresh assignments learned during rejoin can be permanently misclassified as guarded startup shards and stay stuck in `INITIALIZING`.
 - Do not clear the recovered startup-assignment guard after bootstrap or rejoin. Authoritative cluster state confirms shard ownership, not the continued existence of the local shard data; only assignments that were never part of the recovered local state may create fresh UUID directories later in the lifecycle loop.
-- Later shard assignments may create their UUID directories during the lifecycle loop so new primaries/replicas can come online after startup.
+- Later out-of-sync replica assignments do not create empty engines; verified
+  peer recovery installs their identity and data.
 
 ## Peer Recovery Driver
 - The lifecycle loop schedules recovery on every node for each local
@@ -94,10 +102,9 @@ pub struct Node {
   `ActivatePrimary` term bump. If no admission command was submitted, release
   the barrier first and bump asynchronously; after submission, keep the barrier
   until admission or the newer term is observed.
-- Remove-and-re-add of the same node while a finalized target is pending can
-  remain `Unknown`: routing has node IDs but no allocation IDs, so the target
-  cannot distinguish the old assignment from its replacement. Keep it pending
-  rather than guessing until allocation identity exists.
+- Recovery start, source session, install, pending marker, admission, and target
+  observation retain one exact allocation ID. Same-node remove/re-add is a
+  definitive mismatch rather than an ABA-ambiguous `Unknown`.
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every

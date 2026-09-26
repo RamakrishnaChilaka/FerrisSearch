@@ -12,6 +12,7 @@ pub struct ShardManager {
     shards: RwLock<HashMap<ShardKey, Arc<dyn SearchEngine>>>,
     settings_managers: RwLock<HashMap<String, Arc<SettingsManager>>>,  // per-index
     index_uuids: RwLock<HashMap<String, String>>,  // index_name → UUID for on-disk dirs
+    copy_identities: RwLock<HashMap<ShardKey, ShardCopyIdentity>>,
     pub isr_tracker: IsrTracker,
     durability: TranslogDurability,
 }
@@ -22,6 +23,8 @@ pub struct ShardManager {
 - `open_shard_with_mappings(index, shard_id, mappings)` — with field type info, reuses the same generated per-index UUID for local/test helpers
 - `open_shard_with_settings(index, shard_id, mappings, settings, index_uuid)` — with UUID, SettingsManager + reactive refresh loop + vector rebuild
 - `open_shard_with_settings_blocking(index, shard_id, mappings, settings, index_uuid)` — async-safe Tokio wrapper for shard open/recovery work
+- `open_assigned_shard_with_settings*()` — authoritative open that requires the
+  expected allocation ID and term and permits empty creation only under G1
 - `open_shard_with_settings_strict*()` — recovery install open that never invokes the schema-mismatch wipe fallback
 - `prepare_peer_recovery_target_blocking()` / `finalize_peer_recovery_target_blocking()` — close and wipe one out-of-sync copy, persist the marker, initialize WAL state, verify the commit files, and publish the opened engine
 - `get_shard(index, shard_id) -> Option<Arc<dyn SearchEngine>>`
@@ -37,6 +40,20 @@ pub struct ShardManager {
 - `shard_data_dir(index, shard_id) -> Option<PathBuf>` — on-disk path using UUID
 - `cleanup_orphaned_data(known_uuids)` — delete dirs not matching any authoritative known UUID
 - `cleanup_orphaned_data_blocking(known_uuids)` — async-safe Tokio wrapper for orphan cleanup
+- `raise_copy_fence_blocking(...)` — atomically persist a monotonic replica fence
+- `apply_replica_operation(...)` — serialize identity/gate/fence validation with replica mutation
+- `quarantine_shard_copy_blocking(...)` — stop serving an invalid copy without deleting evidence
+
+### Durable Copy Identity
+- Every served assigned copy has `<data_dir>/<uuid>/shard_<id>/SHARD_COPY_IDENTITY.json`.
+- The versioned JSON contains index UUID, allocation ID, and durable replica
+  fence. Updates use temp write, file fsync, rename, and directory fsync.
+- Assigned opens load and validate the file before publishing an engine.
+  Missing, malformed, or mismatched identity fails closed.
+- Only an uninitialized CreateIndex allocation may create a fresh empty copy.
+  Out-of-sync replicas receive identity through verified recovery install.
+- Pre-1.0 copies without this file are not adopted; clusters must be recreated
+  or reindexed.
 
 ### UUID-Based Data Directories
 - On-disk path: `<data_dir>/<uuid>/shard_<id>` (NOT `<data_dir>/<index_name>/shard_<id>`)
@@ -64,7 +81,8 @@ after the engine is ready to publish.
 After CompleteFinalize is sent, `PEER_RECOVERY_AWAITING_MEMBERSHIP` preserves
 the caught-up copy across target restart. This marker permits open and live
 replica apply. Reconcile removes it without closing the engine when the node is
-in-sync or promoted; only definitive UUID/assignment/primary-term rejection
+in-sync or promoted with the same allocation ID; missing/different allocation
+identity is definitive rejection
 closes the engine and restores `PEER_RECOVERY_IN_PROGRESS`.
 
 `ShardManager::reopen_shard()` and async index-close wrappers invoke the

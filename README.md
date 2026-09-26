@@ -266,7 +266,11 @@ coordinator-side merge semantics are required.
 - Monotonic sequence high-watermark tracking
 - Bounded file-based peer recovery for later-added/rejoining replicas:
   committed Tantivy files, pinned WAL suffix, final write barrier, and
-  conditional in-sync admission
+  allocation-bound conditional in-sync admission
+- Raft-owned shard-copy allocation IDs, durable local copy identity, and
+  replica primary-term fencing before WAL mutation
+- Fail-closed copy startup plus allocation-bound failure reporting,
+  reallocation, and peer recovery after replica disk loss
 - UUID-backed shard data directories and process-backed restart regression
 - Separate rayon pools for search and write engine work
 - Blocking wrappers for filesystem/recovery work on async call paths
@@ -294,6 +298,10 @@ capacity; it is not a total-process memory limit.
 (default `2`, maximum `64`). Set it to `0`, or set
 `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES=0`, to keep assigned replicas
 `INITIALIZING` without automatic recovery.
+
+This pre-1.0 protocol does not adopt legacy shard directories or routing
+snapshots that lack allocation identity. Clusters created before this change
+must be recreated or reindexed; there is no rolling compatibility path.
 
 For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
 the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable

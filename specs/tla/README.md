@@ -123,7 +123,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | `ClientWrite` | Coordinator routing in `src/api/index/`. |
 | `PrimaryAccept`, `PrimaryReject`, `PrimaryAck`, `PrimaryFail` | `TransportService::{index_doc,bulk_index,delete_doc}`, including `ensure_primary_activated`, `peer_recovery_write_guard`, `validated_primary_write_state`, and all-in-sync acknowledgement. |
 | `ReplicaApply`, `DeliverReplicaAck` | `TransportService::{replicate_doc,replicate_bulk}` and `replication::{replicate_write,replicate_bulk}`. |
-| `ReplicaReject`, `DeliverReplicaNack` | Proposed pre-WAL identity/fence rejection in the same replica handlers and propagation as a synchronous replication failure. |
+| `ReplicaReject`, `DeliverReplicaNack` | Pre-WAL identity/fence rejection in the same replica handlers and propagation as a synchronous replication failure. |
 | `ProposeActivate`, `ObserveActivation`, `CancelActivation` | `TransportService::ensure_primary_activated`. |
 | `CommitRaft` | `ClusterStateMachine::apply_command`, including allocation-matched `ActivatePrimary` and `FailShardCopy`; rejected conditional commands retain a log position without changing routing. |
 | `DeliverView` | Per-node `ClusterManager` observation of an applied Raft prefix. |
@@ -135,7 +135,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | `ReportShardCopyFailure` | `open_local_assigned_shards`, `TransportService::fail_shard_copy`, and `TransportClient::forward_fail_shard_copy`. |
 | `StartRecovery`, `SourceSetupFailure`, `PollSetupFailure` | `run_peer_recovery`, `start_peer_recovery_inner`, `launch_source_setup`, and `source_start_status`. |
 | `SourceSnapshot` | `HotEngine::prepare_peer_recovery_snapshot`, including commit, durable checkpoint, hard-linked files, and `register_retention_pin`. |
-| `TargetBeginInstall`, `InstallSnapshot` | `ShardManager::{begin_peer_recovery_target,prepare_peer_recovery_target_blocking,finalize_peer_recovery_target_blocking}`. |
+| `TargetBeginInstall`, `InstallSnapshot` | `ShardManager::{begin_peer_recovery_target_blocking,prepare_peer_recovery_target_blocking,finalize_peer_recovery_target_blocking}`. |
 | `FetchOps`, `ApplyOps`, `FinishCatchUp` | `fetch_recovery_ops_inner` and `apply_recovery_operations`. |
 | `BeginPrepareFinalize`, `CancelPrepareFinalize`, `AcquireFinalizeBarrier`, `FinishFinalizeTail` | `prepare_finalize_recovery_inner` and `FinalizePreparingGuard`. |
 | `TargetComplete` | `mark_peer_recovery_awaiting_membership_blocking`. |
@@ -149,10 +149,10 @@ liveness configurations use neither symmetry nor a state constraint.
 
 ## Allocation-ID variant
 
-`AllocationIds = FALSE` models merged Rust behavior. Replica authority is keyed
-by node name, index UUID, primary, and primary term.
+`AllocationIds = FALSE` models the historical pre-fix Rust behavior. Replica
+authority was keyed by node name, index UUID, primary, and primary term.
 
-`AllocationIds = TRUE` models a proposed fix:
+`AllocationIds = TRUE` models the implemented allocation-identity protocol:
 
 1. every routed copy has a durable assignment ID;
 2. removal clears that assignment;
@@ -166,15 +166,16 @@ by node name, index UUID, primary, and primary term.
 8. target observation admits the same ID when in sync, admits promotion, and
    rejects a missing or different ID.
 
-The Rust fix must implement this complete handshake. Adding only an allocation
+The Rust implementation uses this complete handshake. Adding only an allocation
 field to `MarkReplicaInSync` is insufficient: the retained
 [`stale-start trace`](traces/C1-allocation-id-stale-start-no-partial-serve.md)
 shows why target and source must agree before snapshot setup.
 
 ## Replica-fencing variant
 
-`ReplicaFencing = FALSE` models the merged replica handlers, which accept
-primary-originated operations without checking the sender's primary term.
+`ReplicaFencing = FALSE` models the historical pre-fix replica handlers, which
+accepted primary-originated operations without checking the sender's primary
+term.
 
 `ReplicaFencing = TRUE` requires every `ReplicateDoc` and `ReplicateBulk`
 operation to carry:
@@ -228,9 +229,9 @@ G2 models `FailShardCopy(node, allocation_id)` as a conditional Raft command:
 - the allocator requires a live allocated primary, assigns a fresh ID, and
   peer recovery installs and admits the replacement.
 
-### Required Rust implementation contract
+### Implemented Rust contract
 
-The Rust change must implement the model variant as one protocol:
+The Rust implementation follows the model variant as one protocol:
 
 1. Routing metadata assigns every primary and replica copy an allocation ID.
    Removing a copy clears its ID; every later assignment, including reuse of

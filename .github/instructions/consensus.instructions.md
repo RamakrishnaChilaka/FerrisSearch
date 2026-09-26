@@ -25,8 +25,9 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `DeleteIndex { index_name: String }` — delete index and all metadata
 - `SetMaster { node_id: String }` — set cluster master
 - `UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replicas, settings)
-- `MarkReplicaInSync { index_name, index_uuid, shard_id, replica, primary, primary_term }` — conditionally admit a recovered assigned replica
-- `ActivatePrimary { index_name, index_uuid, shard_id, primary, expected_term }` — conditionally bump the per-shard primary term
+- `MarkReplicaInSync { index_name, index_uuid, shard_id, replica, allocation_id, primary, primary_term }` — conditionally admit the exact recovered assignment
+- `ActivatePrimary { index_name, index_uuid, shard_id, primary, allocation_id, expected_term }` — conditionally bump the term and monotonically mark the shard initialized
+- `FailShardCopy { index_name, index_uuid, shard_id, node, allocation_id }` — conditionally remove an unopenable copy, promote an in-sync survivor, or leave a red primary
 - `AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
 - `PutApiKey { record: SecurityApiKeyRecord }` — upsert a dynamic API key (stores only the hash) into `ClusterState.api_keys`
 - `DeleteApiKey { key_id: String }` — remove a dynamic API key
@@ -53,12 +54,13 @@ pub struct ClusterStateMachine {
 |---------|--------|
 | `AddNode` | `state.add_node()` |
 | `RemoveNode` | `state.remove_node()` |
-| `CreateIndex` | `state.add_index()` |
+| `CreateIndex` | assign initial copy IDs from the committed log index; replicas start out of sync |
 | `DeleteIndex` | remove from `state.indices` |
 | `SetMaster` | set `state.master_node` |
-| `UpdateIndex` | preserve state-machine-owned terms, intersect in-sync membership, and reject out-of-sync promotion |
-| `MarkReplicaInSync` | add one assigned replica only when UUID, primary, and term match |
-| `ActivatePrimary` | increment the term only when primary and expected term match |
+| `UpdateIndex` | preserve existing copy IDs, assign the current log index to new copies, clear removed IDs, intersect in-sync membership, and reject out-of-sync promotion |
+| `MarkReplicaInSync` | add one assigned replica only when UUID, allocation ID, primary, and term match |
+| `ActivatePrimary` | increment the term and set `primary_initialized` only when UUID, allocation ID, primary, and expected term match |
+| `FailShardCopy` | after initialization, remove only the exact failed allocation; promote an in-sync replica with a term bump or clear the primary allocation and leave the shard red |
 | `AddMappings` | merge `new_fields` into `state.indices[name].mappings` via `.entry().or_insert()` |
 | `PutApiKey` / `DeleteApiKey` | `insert` / `remove` on `state.api_keys` |
 | `PutRole` / `DeleteRole` | `insert` / `remove` on `state.roles` |

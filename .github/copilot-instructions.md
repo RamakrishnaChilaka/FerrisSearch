@@ -93,10 +93,20 @@ architecture decision.
   and automatic promotion use only `ShardRoutingEntry.in_sync_replicas`; an
   assigned but out-of-sync copy is never promotable. If no in-sync copy
   survives, keep the shard unavailable rather than promoting stale data.
+- **Shard-copy authority includes an allocation ID.** Every primary and replica
+  assignment has a Raft-owned ID derived from the assigning log position.
+  Removal clears it, same-node reassignment gets a fresh ID, and recovery,
+  admission, open, replication, activation, and failure reporting compare the
+  exact current ID.
+- **Local copy identity and replica fences are durable.** Each served
+  `local_shards` copy atomically persists index UUID, allocation ID, and the
+  highest accepted primary term. Missing, malformed, or mismatched identity
+  fails closed; replica RPCs reject below the maximum of applied-view term and
+  durable fence before WAL or engine mutation.
 - **Peer recovery admission is barriered and conditional.** A target installs a
   committed Tantivy file snapshot, replays the pinned WAL suffix, reaches the
   primary's exclusive write-barrier head, and enters the in-sync set only
-  through a `(primary, primary_term)` Raft compare-and-set. Never release an
+  through an `(allocation_id, primary, primary_term)` Raft compare-and-set. Never release an
   unresolved admission barrier by guessing whether membership committed.
   Idle/session reaping cannot release a settling barrier; only settlement may
   release it after observing admission/impossibility or fencing the old term.
