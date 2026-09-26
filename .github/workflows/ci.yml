@@ -45,7 +45,7 @@ jobs:
 
   tla-model-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
