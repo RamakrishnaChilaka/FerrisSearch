@@ -3109,9 +3109,14 @@ impl TransportService {
                 )
                 .await
                 .map_err(|e| {
-                    Status::internal(format!(
+                    let message = format!(
                         "reopen shard after dynamic mapping for [{index_name}][{shard_id}]: {e}"
-                    ))
+                    );
+                    if e.is::<crate::shard::ShardReopenAborted>() {
+                        Status::aborted(format!("{message}; retry the write"))
+                    } else {
+                        Status::internal(message)
+                    }
                 })?;
         }
 

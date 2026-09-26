@@ -81,8 +81,10 @@ pub trait WriteAheadLog: Send + Sync {
   reached the captured head. Recovery reads use the live generation list under
   the translog state lock, not a potentially lagging on-disk manifest.
 - The lock protects only capture and validation of the exclusive head and
-  generation-list clone. File scanning runs after releasing it, and skipped
-  frames are advanced by length after decoding only their sequence prefix.
+  generation-list clone. File scanning runs after releasing it. Recovery scans
+  reject payload lengths beyond the remaining file or the 64 MiB frame cap,
+  fully decode the frame that reaches the captured head, and use relative seeks
+  to skip bounded pre-cursor frames after decoding only their sequence prefix.
 - `initialize_empty_at()` creates the empty target WAL/high-water state at a
   file snapshot's exclusive boundary.
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths

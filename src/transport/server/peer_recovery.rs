@@ -89,7 +89,8 @@ impl SetupLifetime {
             let monitor_finished = self.monitor_finished.load(Ordering::Acquire);
             let blocking_started = self.blocking_started.load(Ordering::Acquire);
             let engine_released = self.engine_released.load(Ordering::Acquire);
-            if engine_released || (monitor_finished && !blocking_started) {
+            let blocking_finished = self.blocking_finished.load(Ordering::Acquire);
+            if engine_released || blocking_finished || (monitor_finished && !blocking_started) {
                 return;
             }
             notified.await;
@@ -218,7 +219,7 @@ impl PeerRecoveryTransportState {
                 .collect::<Vec<_>>()
         };
         for session_id in setup_ids {
-            self.cancel_setup(&session_id, true).await;
+            self.cancel_setup(&session_id, false).await;
         }
 
         let sessions = {
@@ -1961,6 +1962,24 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_panic_does_not_block_engine_release_wait() {
+        let lifetime = Arc::new(SetupLifetime::default());
+        lifetime.mark_blocking_started();
+        let blocking_lifetime = lifetime.clone();
+        let panic_result = tokio::task::spawn_blocking(move || {
+            let _guard = SetupBlockingGuard(blocking_lifetime);
+            panic!("injected peer recovery setup panic");
+        })
+        .await;
+        assert!(panic_result.is_err());
+        lifetime.finish_monitor();
+
+        tokio::time::timeout(Duration::from_secs(2), lifetime.wait_engine_released())
+            .await
+            .expect("blocking setup completion must release engine waiters");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn start_waits_for_reopen_engine_replacement() {
         let dir = tempfile::tempdir().unwrap();
@@ -1991,7 +2010,10 @@ mod tests {
                 )
                 .await
         });
-        reopen_entered_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reopen_entered_rx)
+            .await
+            .expect("reopen did not finish source-session cleanup")
+            .unwrap();
 
         let (start_waiting_tx, start_waiting_rx) = oneshot::channel();
         *service
@@ -2100,6 +2122,113 @@ mod tests {
             tokio::task::yield_now().await;
         }
         hash_release_tx.send(()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn expired_finalize_settlement_is_not_blocked_by_hashing_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, shard_manager, _cluster) = review_service(dir.path());
+        let engine = shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        engine
+            .add_document("base", serde_json::json!({"value": 0}))
+            .unwrap();
+
+        let (hash_started_tx, hash_started_rx) = std::sync::mpsc::channel();
+        let (hash_release_tx, hash_release_rx) = std::sync::mpsc::channel();
+        *service
+            .peer_recovery_state
+            .setup_hash_started_sender
+            .lock()
+            .await = Some(hash_started_tx);
+        *service.peer_recovery_state.setup_hash_release.lock().await = Some(hash_release_rx);
+        let setup = service
+            .start_peer_recovery_inner(review_start_request())
+            .await
+            .unwrap();
+        assert!(setup.preparing);
+        tokio::task::spawn_blocking(move || {
+            hash_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("snapshot setup did not reach hashing")
+        })
+        .await
+        .unwrap();
+        service
+            .peer_recovery_state
+            .registry
+            .lock()
+            .await
+            .setups
+            .get_mut(&setup.session_id)
+            .unwrap()
+            .last_activity =
+            Instant::now() - RECOVERY_SESSION_IDLE_TIMEOUT - Duration::from_secs(1);
+
+        let settlement_key = ("settlement-uuid".to_string(), 0);
+        let settlement_barrier = service
+            .peer_recovery_state
+            .barrier(settlement_key.clone())
+            .await;
+        let settlement_guard = settlement_barrier.clone().write_owned().await;
+        let settlement = Arc::new(Mutex::new(SourceSession {
+            index_name: "deleted-index".into(),
+            index_uuid: settlement_key.0.clone(),
+            shard_id: settlement_key.1,
+            target_node_id: "replica".into(),
+            primary_node_id: "primary".into(),
+            primary_term: 1,
+            snapshot_next_seq_no: 0,
+            snapshot_dir: dir.path().join("settlement-session"),
+            files: HashMap::new(),
+            retention_pin: None,
+            last_activity: Instant::now(),
+            barrier_next_seq_no: Some(0),
+            barrier_guard: Some(settlement_guard),
+            finalize_deadline: Some(Instant::now() - Duration::from_secs(1)),
+            finalize_preparing: Arc::new(AtomicBool::new(false)),
+            mark_submitted: true,
+            settlement_running: false,
+        }));
+        {
+            let mut registry = service.peer_recovery_state.registry.lock().await;
+            registry
+                .active_shards
+                .insert(settlement_key, "settlement".into());
+            registry.sessions.insert("settlement".into(), settlement);
+        }
+
+        let reaper_service = service.clone();
+        let reaper =
+            tokio::spawn(async move { reaper_service.reap_peer_recovery_sessions().await });
+        let settled = tokio::time::timeout(
+            Duration::from_secs(2),
+            settlement_barrier.clone().write_owned(),
+        )
+        .await;
+        hash_release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reaper)
+            .await
+            .expect("reaper did not finish after hashing was released")
+            .unwrap();
+        let guard = settled.expect("hashing one setup must not delay another session's settlement");
+        drop(guard);
+        assert!(
+            !service
+                .peer_recovery_state
+                .registry
+                .lock()
+                .await
+                .sessions
+                .contains_key("settlement")
+        );
     }
 
     #[tokio::test]
@@ -2390,6 +2519,181 @@ mod tests {
                 .mappings
                 .contains_key("new_field")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_mapping_reopen_after_delete_does_not_resurrect_old_uuid() {
+        let (raft, state_handle) =
+            consensus::create_raft_instance_mem(1, "mapping-delete-fence".into())
+                .await
+                .unwrap();
+        consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+            .await
+            .unwrap();
+        wait_for_test_leader(&raft).await;
+        let metadata = IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("uuid-old"),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary".into(),
+                    primary_term: 1,
+                    replicas: Vec::new(),
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: DynamicMapping::True,
+            settings: IndexSettings::default(),
+        };
+        assert_eq!(
+            raft.client_write(ClusterCommand::CreateIndex { metadata })
+                .await
+                .unwrap()
+                .data,
+            ClusterResponse::Ok
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-old",
+            )
+            .unwrap();
+        let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
+        let peer_recovery_state = PeerRecoveryTransportState::new();
+        shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
+        let service = TransportService {
+            cluster_manager,
+            shard_manager: shard_manager.clone(),
+            transport_client: TransportClient::new(),
+            storage_manager: Arc::new(
+                crate::storage::StorageManager::new_in_path(dir.path()).unwrap(),
+            ),
+            remote_store_reader_cache: Arc::new(
+                crate::engine::remote_store::RemoteSplitReaderCache::default(),
+            ),
+            raft: Some(raft.clone()),
+            local_node_id: "primary".into(),
+            worker_pools: WorkerPools::new(2, 2),
+            task_manager: Arc::new(TaskManager::new()),
+            primary_activation_state: super::super::new_primary_activation_state(),
+            peer_recovery_state,
+            join_lock: super::super::new_join_lock(),
+        };
+
+        let lifecycle_guard = shard_manager
+            .source_recovery_lifecycle_lock("uuid-old", 0)
+            .lock_owned()
+            .await;
+        let (reopen_waiting_tx, reopen_waiting_rx) = oneshot::channel();
+        shard_manager.set_reopen_before_lifecycle_signal(reopen_waiting_tx);
+        let writer = service.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .index_doc(tonic::Request::new(ShardDocRequest {
+                    index_name: "idx".into(),
+                    shard_id: 0,
+                    doc_id: "stale".into(),
+                    payload_json: serde_json::to_vec(&serde_json::json!({"new_field": 1})).unwrap(),
+                }))
+                .await
+        });
+        reopen_waiting_rx.await.unwrap();
+
+        let active_term =
+            state_handle.read().unwrap().indices["idx"].shard_routing[&0].primary_term;
+        assert_eq!(
+            raft.client_write(ClusterCommand::DeleteIndex {
+                index_name: "idx".into(),
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+        shard_manager
+            .close_index_shards_with_reason(
+                "idx",
+                crate::shard::SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX,
+            )
+            .unwrap();
+        let old_dir = dir.path().join("uuid-old");
+        assert!(!old_dir.exists());
+        assert!(shard_manager.get_shard("idx", 0).is_none());
+
+        let recreated_metadata = IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("uuid-new"),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary".into(),
+                    primary_term: active_term,
+                    replicas: Vec::new(),
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: DynamicMapping::True,
+            settings: IndexSettings::default(),
+        };
+        assert_eq!(
+            raft.client_write(ClusterCommand::CreateIndex {
+                metadata: recreated_metadata,
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+        drop(lifecycle_guard);
+
+        let error = write
+            .await
+            .unwrap()
+            .expect_err("stale dynamic-mapping reopen must fail the write");
+        assert_eq!(error.code(), tonic::Code::Aborted);
+        assert!(
+            !old_dir.exists(),
+            "the deleted UUID directory was resurrected"
+        );
+        assert!(
+            shard_manager.get_shard("idx", 0).is_none(),
+            "the deleted index left a zombie shard engine"
+        );
+
+        let recreated = shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-new",
+            )
+            .unwrap();
+        recreated
+            .add_document("new-index-doc", serde_json::json!({"value": 1}))
+            .unwrap();
+        recreated.flush().unwrap();
+        assert_eq!(
+            shard_manager.shard_data_dir("idx", 0),
+            Some(dir.path().join("uuid-new/shard_0"))
+        );
+        assert!(dir.path().join("uuid-new/shard_0").exists());
+        assert!(!old_dir.exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

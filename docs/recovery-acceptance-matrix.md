@@ -202,9 +202,21 @@ Round-2 evidence adds
 `peer_recovery_pin_drop_does_not_block_tokio_worker`, and
 `dynamic_mapping_primary_change_before_reopen_rejects_write`.
 
+Round-3 evidence adds
+`dynamic_mapping_reopen_after_delete_does_not_resurrect_old_uuid`,
+`shard::tests::reopen_rechecks_identity_after_waiting_for_open_lock`,
+`setup_panic_does_not_block_engine_release_wait`,
+`expired_finalize_settlement_is_not_blocked_by_hashing_setup`,
+`bounded_range_rejects_torn_terminal_frame_followed_by_append`, and
+`bounded_range_rejects_oversized_frame_payload`.
+
 The remove-and-re-add ABA case remains a documented liveness limitation:
 without allocation IDs, a finalized pending target cannot distinguish the old
 assignment from a replacement assignment and may remain `INITIALIZING`.
+The generic shard-open fast path also remains keyed by index name and shard ID;
+outside the reviewed coordinator/reopen ordering, a non-coordinator with a
+stale same-name engine does not yet validate the requested UUID. Full
+allocation identity is still required for that boundary.
 
 ## M. Membership And Acknowledgement Sets
 

@@ -72,6 +72,10 @@ registered source-session cleanup hook before replacing engines. Cleanup must
 drop the session's engine `Arc` and WAL pin before Tantivy reopen.
 StartPeerRecovery, reopen, and close also share the UUID/shard lifecycle lock;
 the cleanup-to-removal interval is not open to a new source session.
+Reopen is replacement-only: after acquiring that lifecycle lock and again
+under the per-shard open lock, the registered UUID must still match and the
+exact shard engine/directory must still exist. A detached reopen must never
+register an old UUID, recreate a deleted directory, or create a missing engine.
 
 The in-progress marker must be checked both before and after the per-shard open
 lock. A marker created while open is waiting always wins and keeps the shard

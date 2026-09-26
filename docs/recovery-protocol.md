@@ -117,12 +117,27 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > and blocking cleanup remains on Tokio's blocking pool. Dynamic-mapping writes
 > revalidate authority again after their Raft mapping round trip.
 >
+> **Round-3 corrections — September 26, 2026:** dynamic-mapping reopen is now
+> replacement-only. It revalidates the registered index UUID and existing
+> shard before source cleanup and again under the per-shard open lock; a
+> delete/recreate race returns a retryable error instead of recreating the old
+> UUID directory. Setup panic completion releases engine waiters, idle setup
+> reaping does not wait through hashing, and bounded WAL scans validate frame
+> length plus the complete frame at the captured head.
+>
 > **Known liveness limit:** remove-and-re-add of a target node while its
 > finalized copy is awaiting membership can remain `Unknown`. Current routing
 > identifies copies by node ID, so the target cannot prove whether it is still
 > the old assignment or a replacement. It remains caught up but
 > `INITIALIZING`/yellow rather than risking destructive recovery. Allocation IDs
 > are required to resolve this ABA case.
+>
+> **Known same-name reuse limit:** the generic shard-open fast path is still
+> keyed by `(index_name, shard_id)` and does not verify a requested UUID when an
+> engine is already present. The reviewed detached-reopen path is fenced, but a
+> non-coordinator that observes delete/recreate ordering late can still retain
+> a pre-existing same-name engine. UUID/allocation validation on every open
+> path remains future work.
 
 ## 3. Reference Protocols And Intentional Differences
 

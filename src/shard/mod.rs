@@ -23,6 +23,15 @@ type SourceRecoveryIdentity = (String, u32);
 type SourceRecoveryLock = Arc<tokio::sync::Mutex<()>>;
 type SourceRecoveryLockMap = HashMap<SourceRecoveryIdentity, SourceRecoveryLock>;
 
+#[derive(Debug, thiserror::Error)]
+#[error("shard reopen aborted for [{index}][{shard_id}] with UUID [{expected_uuid}]: {reason}")]
+pub(crate) struct ShardReopenAborted {
+    index: String,
+    shard_id: u32,
+    expected_uuid: String,
+    reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerRecoveryAwaitingMembership {
     pub index_uuid: String,
@@ -221,6 +230,8 @@ pub struct ShardManager {
     reopen_after_cleanup_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
     reopen_after_cleanup_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    #[cfg(test)]
+    reopen_before_lifecycle_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     peer_recovery_targets: RwLock<HashMap<ShardKey, PeerRecoveryTargetState>>,
     source_recovery_cleanup: RwLock<Option<Arc<dyn SourceRecoverySessionCleanup>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
@@ -269,6 +280,8 @@ impl ShardManager {
             reopen_after_cleanup_sender: Mutex::new(None),
             #[cfg(test)]
             reopen_after_cleanup_release: Mutex::new(None),
+            #[cfg(test)]
+            reopen_before_lifecycle_sender: Mutex::new(None),
             peer_recovery_targets: RwLock::new(HashMap::new()),
             source_recovery_cleanup: RwLock::new(None),
             isr_tracker: IsrTracker::new(1000),
@@ -347,6 +360,17 @@ impl ShardManager {
             .unwrap_or_else(|error| error.into_inner()) = Some(release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_reopen_before_lifecycle_signal(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        *self
+            .reopen_before_lifecycle_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
+    }
+
     pub(crate) async fn abort_source_recoveries_for_index(
         &self,
         index_uuid: &str,
@@ -360,6 +384,48 @@ impl ShardManager {
             Some(cleanup) => cleanup.abort_index(index_uuid).await,
             None => Ok(0),
         }
+    }
+
+    fn ensure_reopen_target(&self, index: &str, shard_id: u32, expected_uuid: &str) -> Result<()> {
+        let registered_uuid = self.index_uuid(index);
+        if registered_uuid.as_deref() != Some(expected_uuid) {
+            return Err(ShardReopenAborted {
+                index: index.to_string(),
+                shard_id,
+                expected_uuid: expected_uuid.to_string(),
+                reason: format!("registered UUID is {registered_uuid:?}"),
+            }
+            .into());
+        }
+        let key = ShardKey::new(index, shard_id);
+        if !self
+            .shards
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&key)
+        {
+            return Err(ShardReopenAborted {
+                index: index.to_string(),
+                shard_id,
+                expected_uuid: expected_uuid.to_string(),
+                reason: "the shard engine is no longer open".to_string(),
+            }
+            .into());
+        }
+        let shard_dir = self
+            .data_dir
+            .join(expected_uuid)
+            .join(format!("shard_{shard_id}"));
+        if !shard_dir.is_dir() {
+            return Err(ShardReopenAborted {
+                index: index.to_string(),
+                shard_id,
+                expected_uuid: expected_uuid.to_string(),
+                reason: format!("the shard directory {shard_dir:?} no longer exists"),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Open or create the engine for a specific shard.
@@ -1010,9 +1076,19 @@ impl ShardManager {
     ) -> Result<Arc<dyn SearchEngine>> {
         let shard_manager = self.clone();
         tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(sender) = shard_manager
+                .reopen_before_lifecycle_sender
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
             let source_recovery_lock =
                 shard_manager.source_recovery_lifecycle_lock(&index_uuid, shard_id);
             let _source_recovery_guard = source_recovery_lock.lock_owned().await;
+            shard_manager.ensure_reopen_target(&index, shard_id, &index_uuid)?;
             shard_manager
                 .abort_source_recovery_for_shard(&index_uuid, shard_id)
                 .await?;
@@ -1046,21 +1122,39 @@ impl ShardManager {
             let blocking_manager = shard_manager.clone();
             tokio::task::spawn_blocking(move || {
                 let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
-                {
+                blocking_manager.ensure_reopen_target(&index, shard_id, &index_uuid)?;
+                let old_engine = {
                     let shards = blocking_manager
                         .shards
                         .read()
                         .unwrap_or_else(|e| e.into_inner());
-                    if let Some(engine) = shards.get(&key) {
-                        let _ = engine.flush();
-                    }
-                }
-                blocking_manager
+                    shards
+                        .get(&key)
+                        .cloned()
+                        .ok_or_else(|| ShardReopenAborted {
+                            index: index.clone(),
+                            shard_id,
+                            expected_uuid: index_uuid.clone(),
+                            reason: "the shard engine disappeared before replacement".to_string(),
+                        })?
+                };
+                let _ = old_engine.flush();
+                drop(old_engine);
+                let removed = blocking_manager
                     .shards
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&key);
-                blocking_manager.register_index_uuid(&index, &index_uuid);
+                if removed.is_none() {
+                    return Err(ShardReopenAborted {
+                        index: index.clone(),
+                        shard_id,
+                        expected_uuid: index_uuid.clone(),
+                        reason: "the shard engine disappeared before replacement".to_string(),
+                    }
+                    .into());
+                }
+                drop(removed);
                 let settings_mgr = blocking_manager.ensure_settings_manager(&index, &settings);
                 let refresh_interval = settings_mgr.refresh_interval();
                 let refresh_rx = settings_mgr.watch_refresh_interval();
@@ -1069,7 +1163,6 @@ impl ShardManager {
                     .data_dir
                     .join(&index_uuid)
                     .join(format!("shard_{shard_id}"));
-                std::fs::create_dir_all(&shard_dir)?;
                 let engine = blocking_manager.open_composite_engine(
                     &index,
                     shard_id,
@@ -1442,6 +1535,50 @@ mod tests {
         let e2 = mgr.open_shard("idx", 0).unwrap();
         // Both should point to the same engine (Arc)
         assert!(std::sync::Arc::ptr_eq(&e1, &e2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopen_rechecks_identity_after_waiting_for_open_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-old",
+            )
+            .unwrap();
+
+        let (reopen_entered_tx, reopen_entered_rx) = tokio::sync::oneshot::channel();
+        let (reopen_release_tx, reopen_release_rx) = tokio::sync::oneshot::channel();
+        manager.set_reopen_after_cleanup_gate(reopen_entered_tx, reopen_release_rx);
+        let reopen_manager = manager.clone();
+        let reopen = tokio::spawn(async move {
+            reopen_manager
+                .reopen_shard(
+                    "idx".into(),
+                    0,
+                    HashMap::new(),
+                    IndexSettings::default(),
+                    "uuid-old".into(),
+                )
+                .await
+        });
+        reopen_entered_rx.await.unwrap();
+
+        manager
+            .close_index_shards_with_reason("idx", SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX)
+            .unwrap();
+        reopen_release_tx.send(()).unwrap();
+        let error = match reopen.await.unwrap() {
+            Ok(_) => panic!("reopen recreated a shard that was deleted while it waited"),
+            Err(error) => error,
+        };
+        assert!(error.is::<ShardReopenAborted>());
+        assert!(manager.get_shard("idx", 0).is_none());
+        assert!(!dir.path().join("uuid-old").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]

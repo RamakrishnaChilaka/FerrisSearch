@@ -189,6 +189,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   barrier-owning, or settlement-running sessions.
 - Reopen/replacement waits only until setup releases the old engine Arc.
   Hashing and cancellation cleanup continue on Tokio's blocking pool.
+- Idle setup reaping also waits only for engine release; it must not let a
+  long hash delay settlement or pin reaping for unrelated sessions. Blocking
+  setup completion, including panic, is terminal for engine-release waiters.
+- A dynamic-mapping reopen that loses its registered UUID or live engine is a
+  retryable `ABORTED` write failure. It must not fall through to mutation or
+  recreate the deleted shard.
 - **Successful write responses MUST carry valid receipts**: zero is a valid
   sequence, not a missing-value sentinel. Clients must reject successful
   single/delete responses without `seq_no`. A single index response must match

@@ -101,6 +101,10 @@ cargo test -- test_name                         # Single test by name
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary
   changes during dynamic-mapping Raft work.
+- Round-3 recovery regressions cover detached reopen versus delete/recreate at
+  both lifecycle and per-shard-lock boundaries, setup panic completion,
+  unrelated finalize settlement during long hashing, and torn/oversized WAL
+  frames at the captured recovery head.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.
