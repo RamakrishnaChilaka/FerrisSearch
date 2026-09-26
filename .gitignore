@@ -7,3 +7,4 @@ test_workload_data/
 logs/
 .rustfs-dev/
 __pycache__/
+specs/tla/states/

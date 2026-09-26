@@ -1,6 +1,6 @@
 ---
 description: "Use for README, architecture and roadmap documents, benchmark reports, agent instructions, and public compatibility or maturity claims."
-applyTo: "README.md,docs/**,.github/**/*.md,AGENTS.md,CLAUDE.md"
+applyTo: "README.md,docs/**,specs/tla/**,.github/**/*.md,AGENTS.md,CLAUDE.md"
 ---
 
 # Documentation And Evidence Instructions
@@ -56,6 +56,20 @@ as exploratory. Prefer ranges/distributions over a single best run.
 Do not hard-code total test counts in long-lived documentation. They drift as
 normal tests are added. Name suites and record observed results in releases or
 benchmark artifacts.
+
+## Formal-Model Evidence
+
+- Describe TLC results as bounded model checking, with exact node/write/fault
+  bounds, state counts, depth, tool version, and run date.
+- A TLC pass covers every reachable behavior only within those constants. It
+  is not an unbounded proof, an implementation test, an Apalache inductive
+  check, or a TLAPS proof.
+- Preserve expected counterexample traces and map their steps to source
+  functions. Distinguish implementation-faithful failures from model errors.
+- Label model-only fixes, including allocation-ID fencing, as proposed until
+  the Rust domain, persistence, transport, and recovery paths implement them.
+- Do not infer timing probability from an untimed TLA+ trace. State only that
+  the ordering is reachable under the documented timing assumptions.
 
 ## README Standard
 

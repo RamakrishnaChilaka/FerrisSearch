@@ -5,7 +5,7 @@
 > **Date:** September 24, 2026.
 >
 > Contract: [Shard replication and recovery](recovery-protocol.md).
-> Source baseline: `e805f70ff5dba0be9077b9bc32fcd488e837e6d1`.
+> Source baseline: `8f17172` (merged PR #143).
 
 Every row is an acceptance requirement. Existing tests may supply setup or
 partial coverage, but no row is considered passed until evidence from the final
@@ -242,13 +242,31 @@ The non-blocking WAL write-failure case remains unimplemented: a partial
 writes could convert a repairable trailing fragment into fail-closed middle
 corruption. This is separate from the closed startup-tail and live-read cases.
 
-The remove-and-re-add ABA case remains a documented liveness limitation:
+The remove-and-re-add ABA case is a safety as well as liveness limitation:
 without allocation IDs, a finalized pending target cannot distinguish the old
-assignment from a replacement assignment and may remain `INITIALIZING`.
+assignment from a replacement assignment. Bounded model checking found a
+schedule where the target rejects the old pending state and writes its install
+marker, then the old source settlement admits the newly assigned same-name
+copy.
 The generic shard-open fast path also remains keyed by index name and shard ID;
 outside the reviewed coordinator/reopen ordering, a non-coordinator with a
 stale same-name engine does not yet validate the requested UUID. Full
 allocation identity is still required for that boundary.
+
+### Bounded TLA+ Evidence Record (September 26, 2026)
+
+This evidence is exhaustive only within the finite bounds recorded in
+[`../specs/tla/README.md`](../specs/tla/README.md). It is not an implementation
+test, an unbounded proof, an Apalache inductive check, or a TLAPS proof.
+
+| Acceptance area | Bounded result | Interpretation |
+| --- | --- | --- |
+| M04, M07, pending-target safety | Three-voter crash/rejoin model with one recovery finds `NoPartialServe`: after ordered removal, committed `AddNode`, and same-name reallocation, an old `MarkReplicaInSync` can admit the new assignment after the target has restored its destructive marker. | Confirms the allocation ABA as an implementation gap under the modeled bounds. Retained trace: [`C1-allocation-aba-no-partial-serve.md`](../specs/tla/traces/C1-allocation-aba-no-partial-serve.md). |
+| Proposed allocation identity | The variant with a target-supplied allocation ID, exact source start validation, session/pending binding, and state-machine comparison passes the same bounded crash/rejoin configuration. | Model evidence for the proposed protocol only. FerrisSearch does not yet implement allocation IDs. The handshake must be complete; binding only the admission command is insufficient. |
+| F02 | Both node-name and allocation-ID variants produce `UniqueAckedSeq` after metadata partition, promotion, and delayed old-primary replication. | Allocation identity does not replace primary-term fencing on `ReplicateDoc`/bulk apply. Retained trace: [`C2-stale-primary-unique-seq.md`](../specs/tla/traces/C2-stale-primary-unique-seq.md). |
+| I05 | Same-name restart with an empty disk violates `NoAckedLoss` without durable local allocation identity. The allocation-ID variant fails the empty copy closed and passes the bounded check. | Confirms the node-name identity gap within this fault model; it does not prove filesystem or process behavior beyond the abstraction. |
+| D05 | Asynchronous durability acknowledges an operation that the committed primary can lose on crash. | Documents the weaker mode; request-durability results must not be inferred from this configuration. |
+| M04 liveness | Under fault-free weak fairness, the exclusive barrier releases, the assigned target becomes in sync, and persistent pending state resolves. | Liveness result applies only to the two-node, zero-write bound and the stated delivery/fairness assumptions. |
 
 ## M. Membership And Acknowledgement Sets
 

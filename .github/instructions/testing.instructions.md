@@ -1,6 +1,6 @@
 ---
-description: "Use for integration, restart, SQL logic, transport, object-store, and subsystem regression tests."
-applyTo: "tests/**,src/**/tests.rs"
+description: "Use for integration, restart, SQL logic, transport, object-store, TLA+, and subsystem regression tests."
+applyTo: "tests/**,src/**/tests.rs,specs/tla/**,scripts/tla/**"
 ---
 
 # Testing Patterns
@@ -14,6 +14,7 @@ applyTo: "tests/**,src/**/tests.rs"
 - Process-backed restart regression (`cargo test --test restart_regression`)
 - SQL correctness through sqllogictest (`cargo test --test sql_correctness`)
 - S3-compatible remote-store integration (`cargo test --test remote_store_s3_integration`), skipped unless `FERRIS_RUSTFS_ENDPOINT` is set
+- Bounded shard replication/recovery model checking (`./scripts/tla/check.sh`)
 
 Do not hard-code suite or assertion counts in instructions or README. They
 become stale after ordinary test additions; report the command and observed
@@ -31,7 +32,26 @@ cargo test --test replication_integration --features transport-tls  # Replicatio
 cargo test --test rest_api_integration          # REST API integration tests
 cargo test --test restart_regression            # Real restart/rejoin regression
 cargo test -- test_name                         # Single test by name
+./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
+./scripts/tla/check.sh c1-aba-fixed l1           # Selected model checks
 ```
+
+## TLA+ Model Checks
+
+- TLC passes are exhaustive only for the exact finite constants in the
+  selected `.cfg`; never describe them as proofs for arbitrary cluster sizes.
+- `scripts/tla/check.sh` verifies the pinned TLA+ tools jar before execution
+  and uses isolated Java/TLC temporary directories.
+- Expected counterexamples are living regressions. The runner must fail if
+  `c1-aba`, `c2`, `c2-allocation-ids`, `c3`, or `c4` stops violating its named
+  invariant before the corresponding Rust limitation is fixed.
+- An expected-pass failure stops the modeling task. Preserve the raw trace,
+  decide whether the model or implementation is wrong, and do not weaken an
+  invariant or transition merely to obtain green output.
+- Safety runs may use a documented state constraint and valid node symmetry.
+  Liveness runs use neither; declare the exact fairness assumptions instead.
+- Keep action comments and `specs/tla/README.md` mapped to the current Rust
+  functions. Model-only protocol variants must be labeled unimplemented.
 
 ## Unit Test Conventions
 - Tests live in `#[cfg(test)] mod tests` at the bottom of each source file

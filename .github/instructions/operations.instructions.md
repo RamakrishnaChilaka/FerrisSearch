@@ -1,6 +1,6 @@
 ---
-description: "Use for configuration, server TLS, metrics, worker pools, background tasks, CI, development clusters, and operational resource controls."
-applyTo: "src/config/**,src/metrics/**,src/tasks.rs,src/worker.rs,config/**,Dockerfile,.github/workflows/**,scripts/ci-local.sh,dev_cluster*.sh"
+description: "Use for configuration, server TLS, metrics, worker pools, background tasks, CI, TLA+ runners, development clusters, and operational resource controls."
+applyTo: "src/config/**,src/metrics/**,src/tasks.rs,src/worker.rs,config/**,Dockerfile,.github/workflows/**,scripts/ci-local.sh,scripts/tla/**,dev_cluster*.sh"
 ---
 
 # Operations, Configuration, And Resource Instructions
@@ -124,6 +124,13 @@ cargo test
 S3-compatible tests remain explicitly gated and must report skip vs pass
 accurately. Development cluster scripts must give every node a unique data
 directory, HTTP port, transport port, Raft ID, and complete seed-host list.
+
+The separate TLA+ CI job runs `scripts/tla/check.sh` with Java 25 and caches
+the checksum-pinned TLA+ tools 1.7.4 jar. Keep the default matrix below five
+minutes. Each invocation needs isolated Java and TLC temporary directories;
+parallel TLC processes otherwise race while extracting standard modules.
+Expected-violation configurations are successful only when they reproduce the
+documented invariant failure.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with
