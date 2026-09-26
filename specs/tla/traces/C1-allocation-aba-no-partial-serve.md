@@ -1,9 +1,13 @@
 # C1 allocation ABA counterexample: `NoPartialServe`
 
-**Date:** September 26, 2026  
-**Configuration:** `MC_C1_ABA.cfg`  
-**TLC result:** expected implementation-faithful violation of `NoPartialServe`  
-**Raw trace:** [`C1-allocation-aba-no-partial-serve.log`](C1-allocation-aba-no-partial-serve.log)  
+**Date:** September 26, 2026
+
+**Configuration:** `MC_C1_ABA.cfg`
+
+**TLC result:** expected implementation-faithful violation of `NoPartialServe`
+
+**Raw trace:** [`C1-allocation-aba-no-partial-serve.log`](C1-allocation-aba-no-partial-serve.log)
+
 **Raw trace SHA-256:** `6cede2ed92cd5ebf1db0b3aaa77ff84dc24cd1028f5415cb6f625825b582ee72`
 
 This trace uses three Raft voters. Every committed command has a live leader

@@ -1,9 +1,13 @@
 # Allocation-ID variant counterexample: stale target start
 
-**Date:** September 26, 2026  
-**Configuration:** `MC_C1_ABA_fixed.cfg`  
-**TLC result:** unexpected violation of `NoPartialServe`  
-**Raw trace:** [`C1-allocation-id-stale-start-no-partial-serve.log`](C1-allocation-id-stale-start-no-partial-serve.log)  
+**Date:** September 26, 2026
+
+**Configuration:** `MC_C1_ABA_fixed.cfg`
+
+**TLC result:** unexpected violation of `NoPartialServe`
+
+**Raw trace:** [`C1-allocation-id-stale-start-no-partial-serve.log`](C1-allocation-id-stale-start-no-partial-serve.log)
+
 **Raw trace SHA-256:** `d08062d6d6b9994247b175ab9970b4d31aedf0dabbe8957be0b8a9dc0aa51d92`
 
 This was an expected-pass configuration, so work stopped at this trace. The

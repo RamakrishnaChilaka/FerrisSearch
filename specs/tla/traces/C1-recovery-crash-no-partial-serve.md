@@ -1,9 +1,13 @@
 # C1 recovery/crash counterexample: `NoPartialServe`
 
-**Date:** September 26, 2026  
-**Configuration:** `MC_C1_recovery_crash.cfg`  
-**TLC result:** unexpected violation of `NoPartialServe`  
-**Raw trace:** [`C1-recovery-crash-no-partial-serve.log`](C1-recovery-crash-no-partial-serve.log)  
+**Date:** September 26, 2026
+
+**Configuration:** `MC_C1_recovery_crash.cfg`
+
+**TLC result:** unexpected violation of `NoPartialServe`
+
+**Raw trace:** [`C1-recovery-crash-no-partial-serve.log`](C1-recovery-crash-no-partial-serve.log)
+
 **Raw trace SHA-256:** `ffb36304c9e63cbf61302eb904e4c4c8b78b31592017919d70d151143e4ca32a`
 
 This was an expected-pass configuration, so modeling work stopped at this

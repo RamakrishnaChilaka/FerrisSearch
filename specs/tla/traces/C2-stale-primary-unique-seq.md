@@ -1,7 +1,9 @@
 # C2 stale-primary counterexample: `UniqueAckedSeq`
 
-**Date:** September 26, 2026  
-**Configurations:** `MC_C2_fast.cfg`, `MC_C2_allocation_ids.cfg`  
+**Date:** September 26, 2026
+
+**Configurations:** `MC_C2_fast.cfg`, `MC_C2_allocation_ids.cfg`
+
 **TLC result:** expected violation of `UniqueAckedSeq` in both variants
 
 Raw traces:

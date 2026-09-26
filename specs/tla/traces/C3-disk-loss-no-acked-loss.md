@@ -1,9 +1,13 @@
 # C3 disk-loss counterexample: `NoAckedLoss`
 
-**Date:** September 26, 2026  
-**Configuration:** `MC_C3.cfg`  
-**TLC result:** expected violation of `NoAckedLoss`  
-**Raw trace:** [`C3-disk-loss-no-acked-loss.log`](C3-disk-loss-no-acked-loss.log)  
+**Date:** September 26, 2026
+
+**Configuration:** `MC_C3.cfg`
+
+**TLC result:** expected violation of `NoAckedLoss`
+
+**Raw trace:** [`C3-disk-loss-no-acked-loss.log`](C3-disk-loss-no-acked-loss.log)
+
 **Raw trace SHA-256:** `49240e554eb2f295efead488a360381f91b410e854cd52afe85469f0900f0118`
 
 | State range | Model action | Rust behavior represented |
