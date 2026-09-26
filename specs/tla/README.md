@@ -205,13 +205,13 @@ retry. The durable variant rejects the same probe.
 ## Empty-store and copy-failure rules
 
 G1 models CreateIndex routing with `initialized = FALSE`, allocation ID 1 for
-each initial assignment, no in-sync replicas, and no local copies. An assigned
-node may create an empty local copy only while its applied view still names
-that initial allocation and is uninitialized. `ActivatePrimary` carries the
-primary allocation ID; an exact-match commit monotonically sets
-`initialized = TRUE`. No write can be acknowledged before that transition.
-Later out-of-sync assignments are populated by peer recovery rather than an
-empty engine.
+each initial assignment, no in-sync replicas, and no local copies. The model
+over-approximates Rust by allowing any initial assignment to create an empty
+local copy while its applied view remains uninitialized. Rust uses the stricter
+rule that only the initial primary allocation may do so; initial replicas are
+always populated by peer recovery. `ActivatePrimary` carries the primary
+allocation ID; an exact-match commit monotonically sets `initialized = TRUE`.
+No write can be acknowledged before that transition.
 
 G2 models `FailShardCopy(node, allocation_id)` as a conditional Raft command:
 
@@ -264,9 +264,10 @@ The Rust implementation follows the model variant as one protocol:
    unknown.
 10. Any rejection is returned through the existing synchronous replication
     failure path; it must not be converted into a successful item or request.
-11. CreateIndex routing starts with `initialized = false`. Initial assigned
-    copies may be created empty only for that initial allocation before first
-    activation; all initial replicas remain out of sync until recovery.
+11. CreateIndex routing starts with `initialized = false`. Rust may create an
+    empty copy only for the initial primary allocation before first activation;
+    all initial replicas remain out of sync until recovery. The model's broader
+    initial-copy action is a safety over-approximation of this Rust rule.
 12. `ActivatePrimary` carries and conditionally checks the primary allocation
     ID. Its first successful application sets `initialized = true`
     monotonically. A missing or mismatched primary copy cannot activate.

@@ -266,7 +266,7 @@ test, an unbounded proof, an Apalache inductive check, or a TLAPS proof.
 | F02 | Node-name-only and allocation-ID-only variants allow a lower-term replication request after metadata partition and promotion. The combined allocation-ID plus replica-fencing variant rejects it and passes the same bounded C2 schedule. | Allocation identity does not replace primary-term fencing on `ReplicateDoc`/bulk apply. Retained trace: [`C2-stale-primary-unique-seq.md`](../specs/tla/traces/C2-stale-primary-unique-seq.md). |
 | F03 | A replica learns term 3 from a valid replication request while its Raft view remains at term 1, crashes, restarts, and receives a term-1 retry. A volatile fence permits the request; a durable fence rejects it. | The local replica fence must be persisted before acknowledging a higher-term apply and restored before serving replication. Retained trace: [`Fence-volatile-restart-stale-probe.md`](../specs/tla/traces/Fence-volatile-restart-stale-probe.md). |
 | I05 | Same-name restart with an empty disk violates `NoAckedLoss` without durable local allocation identity. The allocation-ID variant fails the empty copy closed and passes the bounded check. | Confirms the node-name identity gap within this fault model; it does not prove filesystem or process behavior beyond the abstraction. |
-| G1 initial empty store | Starting from CreateIndex with `initialized = false`, one pre-activation primary crash/disk loss/restart, allocation-matched first activation, and the first write passes 14 distinct states to depth 13 under weak fairness. | Initial allocation ID 1 may be recreated empty before first activation because no write can yet be acknowledged. Initialization is monotonic and later empty authoritative recreation is forbidden. |
+| G1 initial empty store | Starting from CreateIndex with `initialized = false`, one pre-activation primary crash/disk loss/restart, allocation-matched first activation, and the first write passes 14 distinct states to depth 13 under weak fairness. | Rust uses the stricter primary-only form: the initial primary allocation may be recreated empty before first activation because no write can yet be acknowledged. Initial replicas recover from the primary. Initialization is monotonic and later empty authoritative recreation is forbidden. |
 | G2 replica copy failure | The three-voter replica-loss model passes 33,877 distinct states to depth 46 after an acknowledged write, disk loss, exact-allocation failure report, fresh allocation, and possible peer recovery. | A disk-lost in-sync replica cannot reopen empty under its old allocation. Exact failure removes it from `replicas`/`inSync`, increments `unassigned`, and permits fresh recovery allocation. |
 | G2 primary copy failure | The three-voter primary-loss model passes 17,863 distinct states to depth 46; the surviving in-sync copy is the only eligible promoted authority and retains all acknowledged writes. The no-survivor variant passes 20 distinct states to depth 13 with the primary allocation cleared. | Exact primary failure promotes with a term bump, or leaves the shard red when no authoritative copy survives. |
 | G2 stale failure report | The fair replica-loss model commits a delayed `FailShardCopy` for allocation 1 after allocation 3 exists; `StaleFailShardCopyRejected` requires the command to be rejected. | Failure reports require exact allocation identity and cannot remove a replacement assignment. |
@@ -319,10 +319,10 @@ they are not claims that the complete proposed recovery protocol is finished:
 9. CreateIndex routing records `initialized = false`; the first successful
    allocation-matched `ActivatePrimary` sets it true monotonically. Initial
    replicas remain out of sync until recovery.
-10. Empty local creation is permitted only for an initial CreateIndex
+10. Rust permits empty local creation only for the initial CreateIndex primary
     allocation before first activation. Missing or mismatched authoritative
-    copies after initialization fail closed; fresh out-of-sync replicas are
-    populated only through recovery.
+    copies after initialization fail closed; initial and later out-of-sync
+    replicas are populated only through recovery.
 11. An unopenable authoritative copy reports index name, UUID, shard ID, node,
     and its observed allocation ID through a leader-forwarded
     `FailShardCopy`.

@@ -58,8 +58,8 @@ pub struct Node {
    - Remove from Raft membership before cluster state; if membership removal fails or would empty the voter set, leave the node registered
    - Shard failover for orphaned primaries (see shard failover section)
 3. Reopen only authoritative local copies whose durable UUID/allocation
-   identity matches; initial CreateIndex copies may be created empty only before
-   the shard's first activation
+   identity matches; only an initial CreateIndex primary may be created empty
+   before the shard's first activation
 4. Report unopenable authoritative copies with allocation-bound
    `FailShardCopy`
 5. Allocate unassigned replicas only for shards with a live allocated primary

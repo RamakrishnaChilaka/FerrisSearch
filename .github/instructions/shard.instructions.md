@@ -50,8 +50,9 @@ pub struct ShardManager {
   fence. Updates use temp write, file fsync, rename, and directory fsync.
 - Assigned opens load and validate the file before publishing an engine.
   Missing, malformed, or mismatched identity fails closed.
-- Only an uninitialized CreateIndex allocation may create a fresh empty copy.
-  Out-of-sync replicas receive identity through verified recovery install.
+- Only an uninitialized CreateIndex primary allocation may create a fresh empty
+  copy. Initial and later out-of-sync replicas receive identity through
+  verified recovery install.
 - Pre-1.0 copies without this file are not adopted; clusters must be recreated
   or reindexed.
 

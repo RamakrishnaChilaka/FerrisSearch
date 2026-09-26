@@ -157,25 +157,16 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > identity. Local copies atomically persist index UUID, allocation ID, and a
 > monotonic replica term fence; replica RPCs validate those fields and the
 > recovery gate before WAL mutation. CreateIndex replicas start out of sync,
-> first activation marks the shard initialized, and only an initial
-> pre-activation allocation may be created empty. An unopenable initialized
+> first activation marks the shard initialized, and only the initial primary
+> allocation may be created empty before activation. An unopenable initialized
 > copy reports `FailShardCopy`; the exact allocation is removed, an in-sync
 > survivor is promoted when available, and otherwise the cleared primary
 > allocation leaves the shard red.
 >
-> **Known liveness limit:** remove-and-re-add of a target node while its
-> finalized copy is awaiting membership can remain `Unknown`. Current routing
-> identifies copies by node ID, so the target cannot prove whether it is still
-> the old assignment or a replacement. It remains caught up but
-> `INITIALIZING`/yellow rather than risking destructive recovery. Allocation IDs
-> are required to resolve this ABA case.
->
-> **Known same-name reuse limit:** the generic shard-open fast path is still
-> keyed by `(index_name, shard_id)` and does not verify a requested UUID when an
-> engine is already present. The reviewed detached-reopen path is fenced, but a
-> non-coordinator that observes delete/recreate ordering late can still retain
-> a pre-existing same-name engine. UUID/allocation validation on every open
-> path remains future work.
+> Allocation IDs now resolve remove-and-re-add ABA for recovery start,
+> admission, pending-target observation, and copy-failure reports. Assigned
+> read/write/replication opens validate UUID and allocation identity even when
+> an engine is already present.
 
 The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including

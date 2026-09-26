@@ -440,6 +440,32 @@ fn setup_replica_target_state(cm: &ClusterManager, index_name: &str, primary_ter
     cm.update_state(state);
 }
 
+fn install_recovered_replica_fixture(
+    cluster_manager: &ClusterManager,
+    shard_manager: &ShardManager,
+    index_name: &str,
+) {
+    let state = cluster_manager.get_state();
+    let metadata = &state.indices[index_name];
+    assert!(
+        metadata.shard_routing[&0].is_replica_in_sync("replica-node"),
+        "fixture must represent an already-recovered replica"
+    );
+    assert_eq!(
+        state.shard_allocation_id(index_name, 0, "replica-node"),
+        Some(1)
+    );
+    shard_manager
+        .open_shard_with_settings(
+            index_name,
+            0,
+            &metadata.mappings,
+            &metadata.settings,
+            metadata.uuid.as_str(),
+        )
+        .unwrap();
+}
+
 // ─── Single-node integration tests ─────────────────────────────────────────
 
 #[tokio::test]
@@ -1419,6 +1445,7 @@ async fn primary_write_replicates_to_replica_node() {
         "replicated-idx",
         replica_addr.port(),
     );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "replicated-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -1603,6 +1630,7 @@ async fn primary_delete_replicates_to_replica_node() {
         "del-repl-idx",
         replica_addr.port(),
     );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "del-repl-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -1669,6 +1697,7 @@ async fn primary_bulk_replicates_to_replica_node() {
         "bulk-repl-idx",
         replica_addr.port(),
     );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "bulk-repl-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -3195,6 +3224,7 @@ async fn primary_write_advances_global_checkpoint() {
     ));
 
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "gc-idx", replica_addr.port());
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "gc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -3261,6 +3291,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         );
         manager.update_state(state);
     }
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, index);
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
     let seed = client
@@ -3544,7 +3575,7 @@ async fn bulk_replication_advances_global_checkpoint() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("bulk-gc".into()));
@@ -3553,6 +3584,7 @@ async fn bulk_replication_advances_global_checkpoint() {
         Duration::from_secs(60),
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "bgc-idx", replica_addr.port());
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "bgc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -3597,7 +3629,7 @@ async fn delete_replication_advances_global_checkpoint() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("del-gc".into()));
@@ -3606,6 +3638,7 @@ async fn delete_replication_advances_global_checkpoint() {
         Duration::from_secs(60),
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "dgc-idx", replica_addr.port());
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "dgc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -3657,7 +3690,7 @@ async fn isr_tracker_updated_after_replication() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("isr-it".into()));
@@ -3666,6 +3699,7 @@ async fn isr_tracker_updated_after_replication() {
         Duration::from_secs(60),
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "isr-idx", replica_addr.port());
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "isr-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;

@@ -264,7 +264,7 @@ coordinator-side merge semantics are required.
 - Primary write receipts propagated to REST `_seq_no` responses, including bulk
   ranges, with replica WAL sequence preservation
 - Monotonic sequence high-watermark tracking
-- Bounded file-based peer recovery for later-added/rejoining replicas:
+- Bounded file-based peer recovery for initial, later-added, and rejoining replicas:
   committed Tantivy files, pinned WAL suffix, final write barrier, and
   allocation-bound conditional in-sync admission
 - Raft-owned shard-copy allocation IDs, durable local copy identity, and

@@ -115,8 +115,8 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
   UUID/allocation-bound conditional Raft commands. Rejected commands perform no
   partial mutation and do not bump `ClusterState.version`.
 - `primary_initialized` starts false and becomes true only through an exact
-  allocation-bound `ActivatePrimary`. Only an initial CreateIndex allocation
-  may be created empty before that transition.
+  allocation-bound `ActivatePrimary`. Only the initial primary allocation may
+  be created empty before that transition; initial replicas recover from it.
 - Node removal deletes that node from both replica collections while preserving
   per-shard lost-slot accounting. Replica-count decreases remove unassigned
   slots first, then assigned out-of-sync copies before in-sync copies.

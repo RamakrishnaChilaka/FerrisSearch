@@ -1143,10 +1143,9 @@ impl ClusterState {
         else {
             return false;
         };
-        !allocations.primary_initialized
-            && allocations
-                .allocation_for(routing, node_id)
-                .is_some_and(|allocation_id| allocation_id == allocations.initial_allocation_id)
+        routing.primary == node_id
+            && !allocations.primary_initialized
+            && allocations.primary == Some(allocations.initial_allocation_id)
     }
 }
 
@@ -2979,6 +2978,29 @@ mod tests {
         assert_eq!(restored.primary_allocation_id("idx", 0), Some(1));
         assert_eq!(restored.shard_allocation_id("idx", 0, "node-2"), Some(1));
         assert!(restored.primary_initialized("idx", 0));
+    }
+
+    #[test]
+    fn only_initial_primary_may_create_an_empty_copy() {
+        let mut state = ClusterState::new("initial-empty".into());
+        state.add_index(IndexMetadata::build_shard_routing(
+            "idx",
+            1,
+            1,
+            &["node-1".into(), "node-2".into()],
+        ));
+
+        assert!(state.may_create_initial_empty_copy("idx", 0, "node-1"));
+        assert!(!state.may_create_initial_empty_copy("idx", 0, "node-2"));
+
+        state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_initialized = true;
+        assert!(!state.may_create_initial_empty_copy("idx", 0, "node-1"));
     }
 
     #[test]

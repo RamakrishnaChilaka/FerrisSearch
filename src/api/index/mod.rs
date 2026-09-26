@@ -307,11 +307,7 @@ async fn auto_create_index(
 
     let committed_state = state.cluster_manager.get_state();
     if let Some(routing) = created_metadata.shard_routing.get(&0)
-        && (routing.primary == state.local_node_id
-            || routing
-                .replicas
-                .iter()
-                .any(|node_id| node_id == &state.local_node_id))
+        && routing.primary == state.local_node_id
         && let Some(allocation_id) =
             committed_state.shard_allocation_id(index_name, 0, &state.local_node_id)
         && let Err(e) = state
@@ -509,10 +505,10 @@ pub async fn create_index(
         );
     };
 
-    // Open local shard engines for shards assigned to this node (primary or replica)
+    // Only the initial primary may create an empty local copy. Initial replicas
+    // remain out of sync and are populated by peer recovery.
     for (shard_id, routing) in &committed_metadata.shard_routing {
-        if (routing.primary == state.local_node_id
-            || routing.replicas.contains(&state.local_node_id))
+        if routing.primary == state.local_node_id
             && let Some(allocation_id) = committed_state.shard_allocation_id(
                 index_name.as_str(),
                 *shard_id,
