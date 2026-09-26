@@ -17,19 +17,23 @@ NoNode == "NO_NODE"
 NoTerm == 0
 
 RoutingState(primaryNode, primaryTerm, replicaNodes, inSyncNodes,
-             unassignedCount, memberNodes) ==
+             unassignedCount, memberNodes, allocationMap) ==
     [primary   |-> primaryNode,
      term      |-> primaryTerm,
      replicas  |-> replicaNodes,
      inSync    |-> inSyncNodes,
      unassigned|-> unassignedCount,
-     members   |-> memberNodes]
+     members   |-> memberNodes,
+     allocations |-> allocationMap]
+
+EmptyAllocations == [node \in Nodes |-> 0]
 
 \* Every command uses one record shape so TLC can enumerate pending commands
 \* without record-field normalization surprises.
 RaftCommand(commandKind, actorNode, targetNode, expectedPrimaryNode,
             expectedPrimaryTerm, proposedPrimaryNode, proposedReplicaNodes,
-            proposedUnassignedCount) ==
+            proposedUnassignedCount, expectedAllocationId,
+            proposedAllocations) ==
     [kind             |-> commandKind,
      actor            |-> actorNode,
      target           |-> targetNode,
@@ -37,7 +41,9 @@ RaftCommand(commandKind, actorNode, targetNode, expectedPrimaryNode,
      expectedTerm     |-> expectedPrimaryTerm,
      newPrimary       |-> proposedPrimaryNode,
      newReplicas      |-> proposedReplicaNodes,
-     newUnassigned    |-> proposedUnassignedCount]
+     newUnassigned    |-> proposedUnassignedCount,
+     expectedAllocation |-> expectedAllocationId,
+     newAllocations   |-> proposedAllocations]
 
 RaftEntry(command, wasAccepted, resultingState) ==
     [command  |-> command,
@@ -86,7 +92,8 @@ RoutingType ==
      replicas   : SUBSET Nodes,
      inSync     : SUBSET Nodes,
      unassigned : Nat,
-     members    : SUBSET Nodes]
+     members    : SUBSET Nodes,
+     allocations: [Nodes -> Nat]]
 
 RaftTypeOK ==
     /\ raftLog \in Seq(
@@ -97,7 +104,9 @@ RaftTypeOK ==
                         expectedTerm    : Nat,
                         newPrimary      : Nodes \cup {NoNode},
                         newReplicas     : SUBSET Nodes,
-                        newUnassigned   : Nat],
+                        newUnassigned   : Nat,
+                        expectedAllocation : Nat,
+                        newAllocations  : [Nodes -> Nat]],
             accepted : BOOLEAN,
             state    : RoutingType])
     /\ pendingRaft \subseteq
@@ -108,7 +117,9 @@ RaftTypeOK ==
             expectedTerm    : Nat,
             newPrimary      : Nodes \cup {NoNode},
             newReplicas     : SUBSET Nodes,
-            newUnassigned   : Nat]
+            newUnassigned   : Nat,
+            expectedAllocation : Nat,
+            newAllocations  : [Nodes -> Nat]]
     /\ applied \in [Nodes -> Nat]
     /\ views \in [Nodes -> RoutingType]
     /\ raftLeader \in Nodes \cup {NoNode}

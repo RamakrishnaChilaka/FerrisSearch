@@ -15,9 +15,11 @@ CONSTANTS
     MaxTerm,
     MaxMessages,
     MaxViewLag,
+    MaxAllocationId,
     FaultMode,
     InitialOutOfSync,
-    EnableRecovery
+    EnableRecovery,
+    AllocationIds
 
 WriteIds == 1..MaxWrites
 NoWrite == 0
@@ -102,6 +104,10 @@ RoutingWellFormedValue(r) ==
     /\ r.inSync \subseteq r.replicas
     /\ r.unassigned \in 0..Cardinality(Nodes)
     /\ r.members \subseteq Nodes
+    /\ r.allocations \in [Nodes -> 0..MaxAllocationId]
+    /\ \A node \in Nodes :
+           (node = r.primary \/ node \in r.replicas)
+           <=> r.allocations[node] > 0
 
 LatestWriteForDoc(writeSet, doc) ==
     LET candidates == {w \in writeSet : writeDoc[w] = doc}
@@ -162,9 +168,10 @@ ReplicationInit ==
       \E initialInSync \in SUBSET (Nodes \ {initialPrimary}) :
         \E initialLeader \in Nodes :
           LET initialReplicas == Nodes \ {initialPrimary}
+              initialAllocations == [node \in Nodes |-> 1]
               initialRouting ==
                   RoutingState(initialPrimary, 1, initialReplicas,
-                               initialInSync, 0, Nodes)
+                               initialInSync, 0, Nodes, initialAllocations)
           IN
           /\ IF InitialOutOfSync
                 THEN Cardinality(initialInSync) =
@@ -410,7 +417,8 @@ PrimaryFail(writeId) ==
 
 ActivateCommand(primaryNode, expectedPrimaryTerm) ==
     RaftCommand("ActivatePrimary", primaryNode, primaryNode, primaryNode,
-                expectedPrimaryTerm, primaryNode, {}, 0)
+                expectedPrimaryTerm, primaryNode, {}, 0, 0,
+                EmptyAllocations)
 
 \* src/transport/server/mod.rs::ensure_primary_activated
 ProposeActivate(primaryNode) ==
@@ -481,7 +489,8 @@ UpdateRoutingAccepted(current, command) ==
             ELSE current.term
         proposed ==
             RoutingState(command.newPrimary, nextTerm, command.newReplicas,
-                         nextInSync, command.newUnassigned, current.members)
+                         nextInSync, command.newUnassigned, current.members,
+                         command.newAllocations)
     IN
     /\ command.newPrimary \in Nodes
     /\ command.newReplicas \subseteq Nodes
@@ -505,6 +514,11 @@ CommandAccepted(current, command) ==
             /\ command.target \notin current.inSync
             /\ command.expectedPrimary = current.primary
             /\ command.expectedTerm = current.term
+            /\ IF AllocationIds
+                  THEN /\ command.expectedAllocation > 0
+                       /\ command.expectedAllocation =
+                          current.allocations[command.target]
+                  ELSE TRUE
       [] command.kind = "RemoveNode" -> command.target \in current.members
       [] command.kind = "AddNode" ->
             /\ command.target \in Nodes
@@ -514,7 +528,8 @@ CommandAccepted(current, command) ==
 AfterAcceptedCommand(current, command) ==
     CASE command.kind = "ActivatePrimary" ->
             RoutingState(current.primary, current.term + 1, current.replicas,
-                         current.inSync, current.unassigned, current.members)
+                         current.inSync, current.unassigned, current.members,
+                         current.allocations)
       [] command.kind = "UpdateRouting" ->
             LET nextTerm ==
                     IF command.newPrimary # current.primary
@@ -525,19 +540,23 @@ AfterAcceptedCommand(current, command) ==
                     \ {command.newPrimary}
             IN RoutingState(command.newPrimary, nextTerm,
                             command.newReplicas, nextInSync,
-                            command.newUnassigned, current.members)
+                            command.newUnassigned, current.members,
+                            command.newAllocations)
       [] command.kind = "MarkReplicaInSync" ->
             RoutingState(current.primary, current.term, current.replicas,
                          current.inSync \cup {command.target},
-                         current.unassigned, current.members)
+                         current.unassigned, current.members,
+                         current.allocations)
       [] command.kind = "RemoveNode" ->
             RoutingState(current.primary, current.term, current.replicas,
                          current.inSync, current.unassigned,
-                         current.members \ {command.target})
+                         current.members \ {command.target},
+                         current.allocations)
       [] command.kind = "AddNode" ->
             RoutingState(current.primary, current.term, current.replicas,
                          current.inSync, current.unassigned,
-                         current.members \cup {command.target})
+                         current.members \cup {command.target},
+                         current.allocations)
       [] OTHER -> current
 
 AfterCommand(current, command) ==

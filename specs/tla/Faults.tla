@@ -211,9 +211,16 @@ SuspectAndRemove(leader, node, candidate) ==
             local.unassigned
             + IF lostReplica THEN 1 ELSE 0
             + IF losingPrimary THEN 1 ELSE 0
+        proposedAllocations ==
+            [assigned \in Nodes |->
+                IF assigned = chosenPrimary
+                   \/ assigned \in proposedReplicas
+                THEN local.allocations[assigned]
+                ELSE 0]
         command ==
             RaftCommand("UpdateRouting", leader, node, NoNode, NoTerm,
-                        chosenPrimary, proposedReplicas, proposedUnassigned)
+                        chosenPrimary, proposedReplicas, proposedUnassigned,
+                        0, proposedAllocations)
     IN
     /\ ~faultsStopped
     /\ leader \in Nodes
@@ -296,7 +303,7 @@ ChangeRaftMembership(leader, node) ==
 ProposeRemoveNode(leader, node) ==
     LET command ==
             RaftCommand("RemoveNode", leader, node, NoNode, NoTerm, NoNode,
-                        {}, 0)
+                        {}, 0, 0, EmptyAllocations)
     IN
     /\ ~faultsStopped
     /\ lifecyclePhase[node] = "MembershipRemoved"
@@ -332,7 +339,8 @@ ObserveNodeRemoved(node) ==
 \* AddNode before the allocator may use it again.
 Rejoin(node) ==
     LET command ==
-            RaftCommand("AddNode", node, node, NoNode, NoTerm, NoNode, {}, 0)
+            RaftCommand("AddNode", node, node, NoNode, NoTerm, NoNode, {}, 0,
+                        0, EmptyAllocations)
     IN
     /\ ~faultsStopped
     /\ lifecyclePhase[node] = "Removed"
@@ -368,10 +376,14 @@ ObserveRejoin(node) ==
 \* reaches this action only after committed AddNode observation.
 AllocateAfterLifecycle(leader, target) ==
     LET local == views[leader]
+        allocationId ==
+            IF AllocationIds THEN Len(raftLog) + 2 ELSE 1
+        proposedAllocations ==
+            [local.allocations EXCEPT ![target] = allocationId]
         command ==
             RaftCommand("UpdateRouting", leader, target, NoNode, NoTerm,
                         local.primary, local.replicas \cup {target},
-                        local.unassigned - 1)
+                        local.unassigned - 1, 0, proposedAllocations)
     IN
     /\ EnableRecovery
     /\ leader = raftLeader
@@ -382,6 +394,7 @@ AllocateAfterLifecycle(leader, target) ==
     /\ target \in local.members
     /\ target # local.primary
     /\ target \notin local.replicas
+    /\ allocationId <= MaxAllocationId
     /\ QueueRaft(command)
     /\ lifecyclePhase' =
           [lifecyclePhase EXCEPT ![target] = "AllocationProposed"]

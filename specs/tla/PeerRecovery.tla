@@ -23,6 +23,7 @@ VARIABLES
     sessionSource,
     sessionSourceEpoch,
     sessionTerm,
+    sessionAllocation,
     sessionBoundary,
     sessionCursor,
     sessionHead,
@@ -34,14 +35,16 @@ VARIABLES
     sessionBumpSubmitted,
     pendingPrimary,
     pendingTerm,
+    pendingAllocation,
     authoritativeWipeSafe
 
 PeerRecoveryVars ==
     <<recoveryAttempts, sessionPhase, sessionSource, sessionSourceEpoch,
-      sessionTerm, sessionBoundary, sessionCursor, sessionHead,
+      sessionTerm, sessionAllocation, sessionBoundary, sessionCursor, sessionHead,
       sessionSnapshot, sessionFetched, sessionFinalizePreparing,
       sessionMarkSubmitted, sessionSettlementRunning, sessionBumpSubmitted,
-      pendingPrimary, pendingTerm, authoritativeWipeSafe>>
+      pendingPrimary, pendingTerm, pendingAllocation,
+      authoritativeWipeSafe>>
 
 PeerRecoveryInit ==
     /\ recoveryAttempts = 0
@@ -49,6 +52,7 @@ PeerRecoveryInit ==
     /\ sessionSource = [n \in Nodes |-> NoNode]
     /\ sessionSourceEpoch = [n \in Nodes |-> 0]
     /\ sessionTerm = [n \in Nodes |-> NoTerm]
+    /\ sessionAllocation = [n \in Nodes |-> 0]
     /\ sessionBoundary = [n \in Nodes |-> 0]
     /\ sessionCursor = [n \in Nodes |-> 0]
     /\ sessionHead = [n \in Nodes |-> 0]
@@ -60,6 +64,7 @@ PeerRecoveryInit ==
     /\ sessionBumpSubmitted = [n \in Nodes |-> FALSE]
     /\ pendingPrimary = [n \in Nodes |-> NoNode]
     /\ pendingTerm = [n \in Nodes |-> NoTerm]
+    /\ pendingAllocation = [n \in Nodes |-> 0]
     /\ authoritativeWipeSafe = TRUE
 
 ActiveRecoveryTargets ==
@@ -90,6 +95,9 @@ CrashRecoveryState(node) ==
     /\ sessionTerm' =
           [target \in Nodes |->
               IF target \in cleared THEN NoTerm ELSE sessionTerm[target]]
+    /\ sessionAllocation' =
+          [target \in Nodes |->
+              IF target \in cleared THEN 0 ELSE sessionAllocation[target]]
     /\ sessionBoundary' =
           [target \in Nodes |->
               IF target \in cleared THEN 0 ELSE sessionBoundary[target]]
@@ -142,7 +150,7 @@ CrashRecoveryState(node) ==
               THEN TRUE
               ELSE installMarker[target]]
     /\ UNCHANGED
-          <<recoveryAttempts, pendingPrimary, pendingTerm,
+          <<recoveryAttempts, pendingPrimary, pendingTerm, pendingAllocation,
             authoritativeWipeSafe>>
 
 PreFinalizePhases ==
@@ -160,6 +168,9 @@ SourceAuthorityValid(target) ==
     /\ local.term = sessionTerm[target]
     /\ target \in local.replicas
     /\ target \notin local.inSync
+    /\ IF AllocationIds
+          THEN local.allocations[target] = sessionAllocation[target]
+          ELSE TRUE
 
 TargetNeedsRecovery(target, source) ==
     LET targetView == views[target]
@@ -196,8 +207,15 @@ SourceObservation(target) ==
 
 TargetObservation(target) ==
     LET local == views[target]
+        allocationMatches ==
+            \/ ~AllocationIds
+            \/ /\ pendingAllocation[target] > 0
+               /\ local.allocations[target] = pendingAllocation[target]
     IN
-    CASE target = local.primary \/ target \in local.inSync -> "Admitted"
+    CASE /\ (target = local.primary \/ target \in local.inSync)
+         /\ allocationMatches -> "Admitted"
+      [] /\ AllocationIds
+         /\ ~allocationMatches -> "Rejected"
       [] /\ target \in local.replicas
          /\ local.primary = pendingPrimary[target]
          /\ local.term <= pendingTerm[target] -> "Unknown"
@@ -208,6 +226,8 @@ ClearSession(target) ==
     /\ sessionSource' = [sessionSource EXCEPT ![target] = NoNode]
     /\ sessionSourceEpoch' = [sessionSourceEpoch EXCEPT ![target] = 0]
     /\ sessionTerm' = [sessionTerm EXCEPT ![target] = NoTerm]
+    /\ sessionAllocation' =
+          [sessionAllocation EXCEPT ![target] = 0]
     /\ sessionBoundary' = [sessionBoundary EXCEPT ![target] = 0]
     /\ sessionCursor' = [sessionCursor EXCEPT ![target] = 0]
     /\ sessionHead' = [sessionHead EXCEPT ![target] = 0]
@@ -247,13 +267,16 @@ StartRecovery(target, source) ==
           [sessionSourceEpoch EXCEPT ![target] = epoch[source]]
     /\ sessionTerm' =
           [sessionTerm EXCEPT ![target] = views[source].term]
+    /\ sessionAllocation' =
+          [sessionAllocation EXCEPT
+              ![target] = views[source].allocations[target]]
     /\ recoveryAttempts' = recoveryAttempts + 1
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, sessionBoundary, sessionCursor,
             sessionHead, sessionSnapshot, sessionFetched,
             sessionFinalizePreparing, sessionMarkSubmitted,
             sessionSettlementRunning, sessionBumpSubmitted, pendingPrimary,
-            pendingTerm, authoritativeWipeSafe>>
+            pendingTerm, pendingAllocation, authoritativeWipeSafe>>
 
 \* src/engine/tantivy.rs::prepare_peer_recovery_snapshot.  B is captured
 \* under the translog lock, the writer is committed, and a retention pin is
@@ -542,6 +565,8 @@ TargetComplete(target) ==
           [pendingPrimary EXCEPT ![target] = sessionSource[target]]
     /\ pendingTerm' =
           [pendingTerm EXCEPT ![target] = sessionTerm[target]]
+    /\ pendingAllocation' =
+          [pendingAllocation EXCEPT ![target] = sessionAllocation[target]]
     /\ sessionPhase' =
           [sessionPhase EXCEPT ![target] = "AwaitingComplete"]
     /\ UNCHANGED
@@ -578,7 +603,8 @@ BeginSettlement(target) ==
 MarkInSyncCommand(target) ==
     LET source == sessionSource[target]
     IN RaftCommand("MarkReplicaInSync", source, target, source,
-                   sessionTerm[target], source, {}, 0)
+                   sessionTerm[target], source, {}, 0,
+                   sessionAllocation[target], EmptyAllocations)
 
 \* settle_peer_recovery submits MarkReplicaInSync(primary, term) repeatedly
 \* until the local source view observes admission or impossibility.
@@ -610,7 +636,8 @@ ProposeMarkInSync(target) ==
 SettlementBumpCommand(target) ==
     LET source == sessionSource[target]
     IN RaftCommand("ActivatePrimary", source, source, source,
-                   sessionTerm[target], source, {}, 0)
+                   sessionTerm[target], source, {}, 0, 0,
+                   EmptyAllocations)
 
 \* After the settlement deadline, ActivatePrimary is used as a conditional
 \* term bump so a delayed MarkReplicaInSync becomes impossible.
@@ -671,6 +698,8 @@ TargetObserveAdmitted(target) ==
     /\ copyMode' = [copyMode EXCEPT ![target] = "Active"]
     /\ pendingPrimary' = [pendingPrimary EXCEPT ![target] = NoNode]
     /\ pendingTerm' = [pendingTerm EXCEPT ![target] = NoTerm]
+    /\ pendingAllocation' =
+          [pendingAllocation EXCEPT ![target] = 0]
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -695,6 +724,8 @@ TargetObserveRejected(target) ==
     /\ installMarker' = [installMarker EXCEPT ![target] = TRUE]
     /\ pendingPrimary' = [pendingPrimary EXCEPT ![target] = NoNode]
     /\ pendingTerm' = [pendingTerm EXCEPT ![target] = NoTerm]
+    /\ pendingAllocation' =
+          [pendingAllocation EXCEPT ![target] = 0]
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -788,6 +819,7 @@ PeerRecoveryTypeOK ==
     /\ sessionSource \in [Nodes -> Nodes \cup {NoNode}]
     /\ sessionSourceEpoch \in [Nodes -> Nat]
     /\ sessionTerm \in [Nodes -> 0..MaxTerm]
+    /\ sessionAllocation \in [Nodes -> 0..MaxAllocationId]
     /\ sessionBoundary \in [Nodes -> 0..MaxWrites]
     /\ sessionCursor \in [Nodes -> 0..MaxWrites]
     /\ sessionHead \in [Nodes -> 0..MaxWrites]
@@ -799,32 +831,77 @@ PeerRecoveryTypeOK ==
     /\ sessionBumpSubmitted \in [Nodes -> BOOLEAN]
     /\ pendingPrimary \in [Nodes -> Nodes \cup {NoNode}]
     /\ pendingTerm \in [Nodes -> 0..MaxTerm]
+    /\ pendingAllocation \in [Nodes -> 0..MaxAllocationId]
     /\ authoritativeWipeSafe \in BOOLEAN
     /\ Cardinality(ActiveRecoveryTargets) <= 1
 
 PeerRecoveryNext ==
     \/ \E target \in Nodes, source \in Nodes : StartRecovery(target, source)
-    \/ \E target \in Nodes : SourceSnapshot(target)
-    \/ \E target \in Nodes : SourceSetupFailure(target)
-    \/ \E target \in Nodes : PollSetupFailure(target)
-    \/ \E target \in Nodes : TargetBeginInstall(target)
-    \/ \E target \in Nodes : InstallSnapshot(target)
-    \/ \E target \in Nodes : FetchOps(target)
-    \/ \E target \in Nodes : ApplyOps(target)
-    \/ \E target \in Nodes : FinishCatchUp(target)
-    \/ \E target \in Nodes : BeginPrepareFinalize(target)
-    \/ \E target \in Nodes : CancelPrepareFinalize(target)
-    \/ \E target \in Nodes : AcquireFinalizeBarrier(target)
-    \/ \E target \in Nodes : FinishFinalizeTail(target)
-    \/ \E target \in Nodes : TargetComplete(target)
-    \/ \E target \in Nodes : BeginSettlement(target)
-    \/ \E target \in Nodes : ProposeMarkInSync(target)
-    \/ \E target \in Nodes : SettlementDeadline(target)
-    \/ \E target \in Nodes : ObserveAdmission(target)
-    \/ \E target \in Nodes : TargetObserveAdmitted(target)
-    \/ \E target \in Nodes : TargetObserveRejected(target)
-    \/ \E target \in Nodes : AbortSession(target)
-    \/ \E target \in Nodes : ExpireSession(target)
-    \/ \E target \in Nodes : ExpireFinalizeWithoutMark(target)
+    \/ \E target \in Nodes :
+           /\ SourceSnapshot(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ SourceSetupFailure(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ PollSetupFailure(target)
+           /\ UNCHANGED pendingAllocation
+    \/ \E target \in Nodes :
+           /\ TargetBeginInstall(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ InstallSnapshot(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ FetchOps(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ ApplyOps(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ FinishCatchUp(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ BeginPrepareFinalize(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ CancelPrepareFinalize(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ AcquireFinalizeBarrier(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ FinishFinalizeTail(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ TargetComplete(target)
+           /\ UNCHANGED sessionAllocation
+    \/ \E target \in Nodes :
+           /\ BeginSettlement(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ ProposeMarkInSync(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ SettlementDeadline(target)
+           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+    \/ \E target \in Nodes :
+           /\ ObserveAdmission(target)
+           /\ UNCHANGED pendingAllocation
+    \/ \E target \in Nodes :
+           /\ TargetObserveAdmitted(target)
+           /\ UNCHANGED sessionAllocation
+    \/ \E target \in Nodes :
+           /\ TargetObserveRejected(target)
+           /\ UNCHANGED sessionAllocation
+    \/ \E target \in Nodes :
+           /\ AbortSession(target)
+           /\ UNCHANGED pendingAllocation
+    \/ \E target \in Nodes :
+           /\ ExpireSession(target)
+           /\ UNCHANGED pendingAllocation
+    \/ \E target \in Nodes :
+           /\ ExpireFinalizeWithoutMark(target)
+           /\ UNCHANGED pendingAllocation
 
 =============================================================================
