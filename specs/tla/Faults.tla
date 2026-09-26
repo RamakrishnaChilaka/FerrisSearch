@@ -54,21 +54,20 @@ Crash(node) ==
               IF n = node
               THEN {}
               ELSE sharedHolders[n] \ lostWrites]
-    /\ exclusiveHolder' =
-          [exclusiveHolder EXCEPT ![node] = NoNode]
     /\ ops' = [ops EXCEPT ![node] = survivingOps]
     /\ docValue' =
           [docValue EXCEPT ![node] = RebuiltDocValue(survivingOps)]
     /\ nextSeq' =
           [nextSeq EXCEPT ![node] = NextSequenceAfter(survivingOps)]
+    /\ CrashRecoveryState(node)
     /\ crashCount' = crashCount + 1
     /\ UNCHANGED
           <<RaftVars, routing, epoch, nextWrite, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
-            writeRequired, writeWait, durableOps, committed, truncBelow, pins,
-            copyExists, copyMode, installMarker, acked, promotionSafe,
-            admissionSafe, ackMembershipSafe, termMonotonic, diskLost,
-            partitionCount, faultsStopped>>
+            writeRequired, writeWait, durableOps, committed, truncBelow,
+            copyExists, acked, promotionSafe, admissionSafe,
+            ackMembershipSafe, termMonotonic, diskLost, partitionCount,
+            faultsStopped>>
 
 Restart(node) ==
     /\ ~faultsStopped
@@ -87,7 +86,8 @@ Restart(node) ==
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
-            crashCount, partitionCount, diskLost, faultsStopped>>
+            crashCount, partitionCount, diskLost, faultsStopped,
+            PeerRecoveryVars>>
 
 \* C2 only: metadata failure detector may suspect a live node whose local
 \* ClusterManager view stops advancing.  Data-plane RPC messages remain usable.
@@ -107,7 +107,7 @@ PartitionMetadata(node) ==
             truncBelow, pins, copyExists, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
-            diskLost, faultsStopped>>
+            diskLost, faultsStopped, PeerRecoveryVars>>
 
 HealMetadata(node) ==
     /\ ~faultsStopped
@@ -123,7 +123,7 @@ HealMetadata(node) ==
             truncBelow, pins, copyExists, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
-            diskLost, faultsStopped>>
+            diskLost, faultsStopped, PeerRecoveryVars>>
 
 \* transport timeout/drop.  Delay is represented by simply not choosing a
 \* delivery action.
@@ -139,7 +139,7 @@ LoseMsg(message) ==
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
-            diskLost, faultsStopped>>
+            diskLost, faultsStopped, PeerRecoveryVars>>
 
 FailureDetectorMayRemove(node) ==
     CASE FaultMode = "C2" -> ~alive[node] \/ ~raftConnected[node]
@@ -190,7 +190,8 @@ SuspectAndRemove(leader, node, candidate) ==
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
-            crashCount, partitionCount, diskLost, faultsStopped>>
+            crashCount, partitionCount, diskLost, faultsStopped,
+            PeerRecoveryVars>>
 
 \* src/node/mod.rs only submits RemoveNode after the routing UpdateIndex
 \* response succeeded.  The guard uses committed routing, not a stale view.
@@ -214,7 +215,8 @@ RemoveNodeAfterRouting(leader, node) ==
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
-            crashCount, partitionCount, diskLost, faultsStopped>>
+            crashCount, partitionCount, diskLost, faultsStopped,
+            PeerRecoveryVars>>
 
 \* src/node/mod.rs follower JoinCluster retry.
 Rejoin(node) ==
@@ -234,7 +236,8 @@ Rejoin(node) ==
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
-            crashCount, partitionCount, diskLost, faultsStopped>>
+            crashCount, partitionCount, diskLost, faultsStopped,
+            PeerRecoveryVars>>
 
 \* src/engine/tantivy.rs::flush_with_global_checkpoint and
 \* src/wal/mod.rs::{truncate,truncate_below}.  The model retains logical
@@ -263,7 +266,7 @@ Flush(node) ==
             copyExists, copyMode, installMarker, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
-            faultsStopped>>
+            faultsStopped, PeerRecoveryVars>>
 
 \* C3 fault: the process identity survives while its shard disk is destroyed.
 DiskLoss(node) ==
@@ -288,7 +291,7 @@ DiskLoss(node) ==
             writeRequired, writeWait, pins, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
-            partitionCount, faultsStopped>>
+            partitionCount, faultsStopped, PeerRecoveryVars>>
 
 \* C3 abstraction of an assigned same-name node opening a newly empty local
 \* copy without an allocation identity.  Recovery can subsequently replace it,
@@ -311,7 +314,7 @@ OpenAssignedEmptyCopy(node) ==
             committed, truncBelow, pins, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
-            faultsStopped>>
+            faultsStopped, PeerRecoveryVars>>
 
 FaultTypeOK ==
     /\ crashCount \in 0..MaxCrashes

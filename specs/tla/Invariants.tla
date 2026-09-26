@@ -1,7 +1,7 @@
 ----------------------------- MODULE Invariants -----------------------------
 EXTENDS Faults
 
-vars == <<RaftVars, ReplicationVars, FaultVars>>
+vars == <<RaftVars, ReplicationVars, PeerRecoveryVars, FaultVars>>
 
 Init ==
     /\ ReplicationInit
@@ -10,7 +10,7 @@ Init ==
 
 Next ==
     \/ /\ ReplicationNext
-       /\ UNCHANGED FaultVars
+       /\ UNCHANGED <<PeerRecoveryVars, FaultVars>>
     \/ /\ PeerRecoveryNext
        /\ UNCHANGED FaultVars
     \/ FaultNext
@@ -65,7 +65,7 @@ NoAckedRollback ==
               /\ writeSeq[currentWrite] >= LatestAckedSeq(doc)
 
 \* Set by PeerRecovery.InstallSnapshot before any destructive install.
-NoAuthoritativeWipe == TRUE
+NoAuthoritativeWipe == authoritativeWipeSafe
 
 NoPartialServe ==
     \A node \in Nodes :
