@@ -107,6 +107,22 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > whether admission was submitted), making pending targets definitively
 > recoverable. Recovery WAL reads use live generation state rather than a
 > lagging manifest.
+>
+> **Round-2 corrections — September 26, 2026:** recovery reads clone and
+> validate the live generation list under the translog lock, then scan outside
+> it while skipping pre-cursor frames by length. Setup failures are returned on
+> the next poll, stale pre-finalize targets can be replaced, and the setup
+> engine Arc is released before hashing. Reopen continues after caller
+> cancellation, setup lifetime waits use Notify's enable-before-check pattern,
+> and blocking cleanup remains on Tokio's blocking pool. Dynamic-mapping writes
+> revalidate authority again after their Raft mapping round trip.
+>
+> **Known liveness limit:** remove-and-re-add of a target node while its
+> finalized copy is awaiting membership can remain `Unknown`. Current routing
+> identifies copies by node ID, so the target cannot prove whether it is still
+> the old assignment or a replacement. It remains caught up but
+> `INITIALIZING`/yellow rather than risking destructive recovery. Allocation IDs
+> are required to resolve this ABA case.
 
 ## 3. Reference Protocols And Intentional Differences
 

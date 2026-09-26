@@ -1,11 +1,10 @@
 use anyhow::{Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
-use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -1640,35 +1639,6 @@ impl HotEngine {
         Ok(names)
     }
 
-    fn hash_peer_recovery_file(path: &Path) -> Result<super::PeerRecoveryFileMetadata> {
-        let mut file = std::fs::File::open(path)?;
-        let length = file.metadata()?.len();
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; 1024 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        let sha256 = hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("peer recovery file name is not UTF-8"))?
-            .to_string();
-        Ok(super::PeerRecoveryFileMetadata {
-            name,
-            length,
-            sha256,
-        })
-    }
-
     /// Starts the per-index background refresh loop.
     /// Called by the Node after wrapping the engine in an Arc.
     pub fn start_refresh_loop(engine: Arc<Self>) {
@@ -1707,6 +1677,15 @@ impl HotEngine {
             .refresh_before_writer_sender
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(sender);
+    }
+
+    #[cfg(test)]
+    fn set_peer_recovery_scan_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
+        self.with_translog("set recovery scan barrier", |translog| {
+            translog.set_recovery_scan_barrier(Some(barrier));
+            Ok(())
+        })
+        .expect("set recovery scan barrier");
     }
 
     /// Shared search execution helper — returns _id + _source from each hit.
@@ -5937,6 +5916,45 @@ impl super::SearchEngine for HotEngine {
         &self,
         snapshot_dir: &Path,
     ) -> Result<super::PeerRecoverySnapshot> {
+        let prepared = self.prepare_peer_recovery_snapshot(snapshot_dir)?;
+
+        #[cfg(test)]
+        if let Some(sender) = self
+            .peer_recovery_snapshot_ready_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = sender.send(prepared.snapshot_next_seq_no);
+        }
+        #[cfg(test)]
+        if let Some(receiver) = self
+            .peer_recovery_snapshot_release_receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = receiver.recv();
+        }
+
+        let prepared = match prepared.hash_files(snapshot_dir) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(snapshot_dir);
+                return Err(error);
+            }
+        };
+        Ok(super::PeerRecoverySnapshot {
+            snapshot_next_seq_no: prepared.snapshot_next_seq_no,
+            retention_pin_id: prepared.retention_pin.into_pin_id(),
+            files: prepared.files,
+        })
+    }
+
+    fn prepare_peer_recovery_snapshot(
+        &self,
+        snapshot_dir: &Path,
+    ) -> Result<super::PeerRecoverySnapshotPreparation> {
         if snapshot_dir.exists() {
             anyhow::bail!("peer recovery snapshot directory already exists: {snapshot_dir:?}");
         }
@@ -5987,43 +6005,13 @@ impl super::SearchEngine for HotEngine {
                 }
             })?;
         drop(_maintenance);
-
-        #[cfg(test)]
-        if let Some(sender) = self
-            .peer_recovery_snapshot_ready_sender
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            let _ = sender.send(snapshot_next_seq_no);
-        }
-        #[cfg(test)]
-        if let Some(receiver) = self
-            .peer_recovery_snapshot_release_receiver
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            let _ = receiver.recv();
-        }
-
-        let files = file_names
-            .into_iter()
-            .map(|name| Self::hash_peer_recovery_file(&snapshot_dir.join(name)))
-            .collect::<Result<Vec<_>>>();
-        let files = match files {
-            Ok(files) => files,
-            Err(error) => {
-                let _ = self.release_peer_recovery_pin(retention_pin_id);
-                let _ = std::fs::remove_dir_all(snapshot_dir);
-                return Err(error);
-            }
-        };
-
-        Ok(super::PeerRecoverySnapshot {
+        Ok(super::PeerRecoverySnapshotPreparation {
             snapshot_next_seq_no,
-            retention_pin_id,
-            files,
+            retention_pin: super::PeerRecoveryRetentionPin::new(
+                self.translog.clone(),
+                retention_pin_id,
+            ),
+            file_names,
         })
     }
 
@@ -6039,17 +6027,11 @@ impl super::SearchEngine for HotEngine {
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
-        let (primary_next_seq_no, operations, complete) =
-            self.with_translog("peer recovery operation read", |translog| {
-                let primary_next_seq_no = translog.next_seq_no();
-                let (operations, complete) = translog.read_bounded_range(
-                    min_seq_no,
-                    primary_next_seq_no,
-                    max_ops,
-                    max_bytes,
-                )?;
-                Ok((primary_next_seq_no, operations, complete))
-            })?;
+        let snapshot = self.with_translog("peer recovery operation snapshot", |translog| {
+            translog.recovery_read_snapshot()
+        })?;
+        let primary_next_seq_no = snapshot.next_seq_no();
+        let (operations, complete) = snapshot.read_bounded_range(min_seq_no, max_ops, max_bytes)?;
         Ok(super::PeerRecoveryOpsBatch {
             operations,
             primary_next_seq_no,
@@ -10512,6 +10494,83 @@ mod tests {
                 .operations
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn peer_recovery_scan_does_not_block_concurrent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap());
+        let padding = "x".repeat(32 * 1024);
+        for index in 0..32 {
+            engine
+                .add_document(
+                    &format!("prefix-{index}"),
+                    json!({"value": index, "padding": padding}),
+                )
+                .unwrap();
+        }
+        let suffix = engine
+            .add_document_with_receipt("suffix", json!({"value": 32}))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        engine.set_peer_recovery_scan_barrier_for_test(barrier.clone());
+
+        let scan_engine = engine.clone();
+        let scan = std::thread::spawn(move || {
+            scan_engine.peer_recovery_ops(suffix.seq_no, 16, 4 * 1024 * 1024)
+        });
+        barrier.wait();
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let writer_engine = engine.clone();
+        let writer = std::thread::spawn(move || {
+            let result =
+                writer_engine.add_document_with_receipt("concurrent", json!({"value": 33}));
+            completed_tx.send(()).unwrap();
+            result
+        });
+        completed_rx
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .expect("WAL scan outside the lock must not block writes");
+        barrier.wait();
+
+        let scanned = scan.join().unwrap().unwrap();
+        assert_eq!(scanned.operations[0].seq_no, suffix.seq_no);
+        assert_eq!(writer.join().unwrap().unwrap().seq_no, suffix.seq_no + 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_recovery_pin_drop_does_not_block_tokio_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.add_document("base", json!({"value": 0})).unwrap();
+        let snapshot_dir = dir.path().join("peer-recovery/session");
+        let preparation = engine
+            .prepare_peer_recovery_snapshot(&snapshot_dir)
+            .unwrap();
+
+        let translog = engine.translog.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (runtime_progress_tx, runtime_progress_rx) = mpsc::channel();
+        let (holder_result_tx, holder_result_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = translog.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let observed = runtime_progress_rx.recv_timeout(TEST_SYNC_TIMEOUT).is_ok();
+            holder_result_tx.send(observed).unwrap();
+        });
+        held_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+
+        drop(preparation);
+        runtime_progress_tx
+            .send(())
+            .expect("pin drop must return control to the Tokio worker");
+        assert!(
+            holder_result_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap(),
+            "blocking pin cleanup ran inline on the Tokio worker"
+        );
+        holder.join().unwrap();
+        let _ = std::fs::remove_dir_all(snapshot_dir);
     }
 
     #[test]

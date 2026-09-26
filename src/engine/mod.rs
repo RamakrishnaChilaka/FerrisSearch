@@ -7,6 +7,10 @@ pub mod vector;
 
 use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 pub use self::composite::CompositeEngine;
 pub use self::tantivy::HotEngine;
@@ -57,6 +61,107 @@ pub struct PeerRecoverySnapshot {
     pub snapshot_next_seq_no: u64,
     pub retention_pin_id: u64,
     pub files: Vec<PeerRecoveryFileMetadata>,
+}
+
+pub struct PeerRecoveryRetentionPin {
+    translog: Arc<Mutex<dyn crate::wal::WriteAheadLog>>,
+    pin_id: Option<u64>,
+}
+
+impl PeerRecoveryRetentionPin {
+    pub(crate) fn new(translog: Arc<Mutex<dyn crate::wal::WriteAheadLog>>, pin_id: u64) -> Self {
+        Self {
+            translog,
+            pin_id: Some(pin_id),
+        }
+    }
+
+    pub fn release(mut self) -> Result<()> {
+        if let Some(pin_id) = self.pin_id.take() {
+            self.translog
+                .lock()
+                .map_err(|_| anyhow::anyhow!("peer recovery pin lock poisoned"))?
+                .release_retention_pin(pin_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn into_pin_id(mut self) -> u64 {
+        self.pin_id
+            .take()
+            .expect("peer recovery pin has already been released")
+    }
+}
+
+impl Drop for PeerRecoveryRetentionPin {
+    fn drop(&mut self) {
+        let Some(pin_id) = self.pin_id.take() else {
+            return;
+        };
+        let translog = self.translog.clone();
+        let release = move || {
+            if let Ok(translog) = translog.lock() {
+                let _ = translog.release_retention_pin(pin_id);
+            }
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::spawn_blocking(release);
+        } else {
+            release();
+        }
+    }
+}
+
+pub struct PeerRecoverySnapshotPreparation {
+    pub snapshot_next_seq_no: u64,
+    pub retention_pin: PeerRecoveryRetentionPin,
+    pub file_names: Vec<String>,
+}
+
+pub struct PreparedPeerRecoverySnapshot {
+    pub snapshot_next_seq_no: u64,
+    pub retention_pin: PeerRecoveryRetentionPin,
+    pub files: Vec<PeerRecoveryFileMetadata>,
+}
+
+impl PeerRecoverySnapshotPreparation {
+    pub fn hash_files(self, snapshot_dir: &Path) -> Result<PreparedPeerRecoverySnapshot> {
+        let Self {
+            snapshot_next_seq_no,
+            retention_pin,
+            file_names,
+        } = self;
+        let mut files = Vec::with_capacity(file_names.len());
+        for name in file_names {
+            let path = snapshot_dir.join(&name);
+            let mut file = std::fs::File::open(&path)?;
+            let length = file.metadata()?.len();
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0u8; 1024 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            let sha256 = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            files.push(PeerRecoveryFileMetadata {
+                name,
+                length,
+                sha256,
+            });
+        }
+        Ok(PreparedPeerRecoverySnapshot {
+            snapshot_next_seq_no,
+            retention_pin,
+            files,
+        })
+    }
 }
 
 pub struct PeerRecoveryOpsBatch {
@@ -314,6 +419,13 @@ pub trait SearchEngine: Send + Sync {
         _snapshot_dir: &std::path::Path,
     ) -> Result<PeerRecoverySnapshot> {
         anyhow::bail!("peer recovery snapshots are not supported by this engine")
+    }
+
+    fn prepare_peer_recovery_snapshot(
+        &self,
+        _snapshot_dir: &std::path::Path,
+    ) -> Result<PeerRecoverySnapshotPreparation> {
+        anyhow::bail!("peer recovery snapshot preparation is not supported by this engine")
     }
 
     fn release_peer_recovery_pin(&self, _pin_id: u64) -> Result<()> {

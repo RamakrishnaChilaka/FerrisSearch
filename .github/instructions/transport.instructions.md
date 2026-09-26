@@ -152,6 +152,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - `StartPeerRecovery` is an asynchronous start/status RPC. `preparing=true`
   means the client should poll the same request/session reservation; snapshot
   commit/link/hash work is not performed in the RPC future.
+- Snapshot preparation failures are retained and returned once on the next
+  poll, so the target enters normal recovery backoff instead of relaunching
+  setup in a tight loop.
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **get_remote_store_leaf_status**: Report whether the local node is root/leaf-capable plus per-split artifact/reader warmth and current `StorageManager` load counters
 - **search_remote_store_splits**: Validate the remote_store index/UUID, batch split execution through the shared leaf helper, and return per-split hits, totals, partial aggs, and per-split errors
@@ -184,6 +187,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - Cancelled PrepareFinalize futures must clear the preparing state through a
   drop guard. Reapers never idle-expire `finalize_preparing`,
   barrier-owning, or settlement-running sessions.
+- Reopen/replacement waits only until setup releases the old engine Arc.
+  Hashing and cancellation cleanup continue on Tokio's blocking pool.
 - **Successful write responses MUST carry valid receipts**: zero is a valid
   sequence, not a missing-value sentinel. Clients must reject successful
   single/delete responses without `seq_no`. A single index response must match

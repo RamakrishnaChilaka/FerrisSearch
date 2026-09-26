@@ -498,7 +498,7 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
-        let write_state =
+        let _pre_mapping_write_state =
             match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
             {
                 Ok(state) => state,
@@ -526,6 +526,19 @@ impl InternalTransport for TransportService {
         let dynamic_override = self
             .ensure_dynamic_mappings(&req.index_name, req.shard_id, &payload)
             .await?;
+        let write_state =
+            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    return Ok(Response::new(ShardDocResponse {
+                        success: false,
+                        doc_id,
+                        error,
+                        seq_no: None,
+                    }));
+                }
+            };
         let engine = self
             .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
             .await?;
@@ -640,7 +653,7 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
-        let write_state =
+        let _pre_mapping_write_state =
             match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
             {
                 Ok(state) => state,
@@ -673,6 +686,19 @@ impl InternalTransport for TransportService {
         let dynamic_override = self
             .ensure_dynamic_mappings_batch(&req.index_name, req.shard_id, &docs)
             .await?;
+        let write_state =
+            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    return Ok(Response::new(ShardBulkResponse {
+                        success: false,
+                        doc_ids: Vec::new(),
+                        error,
+                        start_seq_no: None,
+                    }));
+                }
+            };
         let engine = self
             .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
             .await?;
@@ -3047,6 +3073,28 @@ impl TransportService {
                 return Err(Status::internal(format!(
                     "No master node available to commit dynamic mappings for index '{index_name}'"
                 )));
+            }
+        }
+
+        #[cfg(test)]
+        {
+            if let Some(sender) = self
+                .peer_recovery_state
+                .dynamic_mapping_committed_sender
+                .lock()
+                .await
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            if let Some(release) = self
+                .peer_recovery_state
+                .dynamic_mapping_release
+                .lock()
+                .await
+                .take()
+            {
+                let _ = release.await;
             }
         }
 

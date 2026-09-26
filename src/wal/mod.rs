@@ -94,6 +94,37 @@ pub struct TranslogEntry {
     pub payload: serde_json::Value,
 }
 
+#[derive(Clone)]
+pub struct TranslogReadSnapshot {
+    next_seq_no: u64,
+    generations: Vec<GenerationInfo>,
+    #[cfg(test)]
+    scan_barrier: Option<Arc<std::sync::Barrier>>,
+}
+
+impl TranslogReadSnapshot {
+    pub fn next_seq_no(&self) -> u64 {
+        self.next_seq_no
+    }
+
+    pub fn read_bounded_range(
+        &self,
+        min_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TranslogEntry>, bool)> {
+        HotTranslog::read_bounded_range_from_generations(
+            &self.generations,
+            min_seq_no,
+            self.next_seq_no,
+            max_ops,
+            max_bytes,
+            #[cfg(test)]
+            self.scan_barrier.as_ref(),
+        )
+    }
+}
+
 /// Wire format for binary serialization.
 /// `serde_json::Value` uses `deserialize_any()` which bincode doesn't support,
 /// so we serialize the JSON payload to a string first.
@@ -202,13 +233,10 @@ pub trait WriteAheadLog: Send + Sync {
     ) -> Result<u64>;
 
     /// Read a bounded ordered range from the live generation state.
-    fn read_bounded_range(
-        &self,
-        min_seq_no: u64,
-        end_seq_no: u64,
-        max_ops: usize,
-        max_bytes: usize,
-    ) -> Result<(Vec<TranslogEntry>, bool)>;
+    fn recovery_read_snapshot(&self) -> Result<TranslogReadSnapshot>;
+
+    #[cfg(test)]
+    fn set_recovery_scan_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>);
 
     /// Pin every operation at or above `min_seq_no` against truncation.
     fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64>;
@@ -288,6 +316,12 @@ fn read_next_entry<R: Read>(reader: &mut R) -> Result<Option<(TranslogEntry, usi
     let (wire, _): (WireEntry, _) =
         bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
     Ok(Some((wire.into_translog()?, 4 + payload_len)))
+}
+
+fn decode_wire_seq_no(prefix: &[u8]) -> Result<u64> {
+    let ((seq_no,), _): ((u64,), _) =
+        bincode_next::serde::decode_from_slice(prefix, BINCODE_CONFIG)?;
+    Ok(seq_no)
 }
 
 fn decode_entries_streaming<R: Read>(
@@ -681,6 +715,8 @@ pub struct HotTranslog {
     seq_no_path: PathBuf,
     /// Controls whether writes are fsynced immediately or on a timer.
     durability: TranslogDurability,
+    #[cfg(test)]
+    recovery_scan_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
 }
 
 async fn sync_file_in_background(state: Arc<Mutex<TranslogState>>) -> std::io::Result<()> {
@@ -811,6 +847,8 @@ impl HotTranslog {
             manifest_path,
             seq_no_path,
             durability,
+            #[cfg(test)]
+            recovery_scan_barrier: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -849,6 +887,7 @@ impl HotTranslog {
         end_seq_no: u64,
         max_ops: usize,
         max_bytes: usize,
+        #[cfg(test)] scan_barrier: Option<&Arc<std::sync::Barrier>>,
     ) -> Result<(Vec<TranslogEntry>, bool)> {
         if max_ops == 0 || max_bytes == 0 {
             anyhow::bail!("bounded translog read requires non-zero limits");
@@ -859,6 +898,8 @@ impl HotTranslog {
 
         let mut entries = Vec::new();
         let mut bytes = 0usize;
+        #[cfg(test)]
+        let mut scan_barrier = scan_barrier;
 
         for generation in generations.iter().filter(|generation| {
             generation
@@ -874,14 +915,51 @@ impl HotTranslog {
                     generation.path
                 )
             })?;
+            let file_len = file.metadata()?.len();
             let mut reader = BufReader::new(file);
-            while let Some((entry, frame_bytes)) = read_next_entry(&mut reader)? {
-                if entry.seq_no < min_seq_no {
-                    continue;
+            #[cfg(test)]
+            if let Some(barrier) = scan_barrier.take() {
+                barrier.wait();
+                barrier.wait();
+            }
+            loop {
+                let mut len_buf = [0u8; 4];
+                match reader.read_exact(&mut len_buf) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                if entry.seq_no >= end_seq_no {
+                let payload_len = u32::from_le_bytes(len_buf) as usize;
+                let prefix_len = payload_len.min(16);
+                let mut prefix = vec![0u8; prefix_len];
+                match reader.read_exact(&mut prefix) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                let seq_no = decode_wire_seq_no(&prefix)?;
+                let remaining = payload_len - prefix_len;
+                if seq_no >= end_seq_no {
                     return Ok((entries, true));
                 }
+                if seq_no < min_seq_no {
+                    let current = reader.stream_position()?;
+                    let target = current
+                        .checked_add(remaining as u64)
+                        .ok_or_else(|| anyhow::anyhow!("translog frame offset overflow"))?;
+                    if target > file_len {
+                        anyhow::bail!(
+                            "translog frame for seq_no {seq_no} exceeds generation length"
+                        );
+                    }
+                    reader.seek(SeekFrom::Start(target))?;
+                    continue;
+                }
+                let frame_bytes = 4 + payload_len;
                 if entries.len() >= max_ops
                     || bytes
                         .checked_add(frame_bytes)
@@ -889,14 +967,21 @@ impl HotTranslog {
                 {
                     if entries.is_empty() {
                         anyhow::bail!(
-                            "translog operation at seq_no {} exceeds the recovery byte limit",
-                            entry.seq_no
+                            "translog operation at seq_no {seq_no} exceeds the recovery byte limit"
                         );
                     }
                     return Ok((entries, false));
                 }
+                let mut payload_buf = prefix;
+                payload_buf.resize(payload_len, 0);
+                reader.read_exact(&mut payload_buf[prefix_len..])?;
+                let (wire, _): (WireEntry, _) =
+                    bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
+                if wire.seq_no != seq_no {
+                    anyhow::bail!("translog frame sequence changed while decoding");
+                }
                 bytes += frame_bytes;
-                entries.push(entry);
+                entries.push(wire.into_translog()?);
             }
         }
 
@@ -1338,13 +1423,7 @@ impl WriteAheadLog for HotTranslog {
         Ok(count)
     }
 
-    fn read_bounded_range(
-        &self,
-        min_seq_no: u64,
-        end_seq_no: u64,
-        max_ops: usize,
-        max_bytes: usize,
-    ) -> Result<(Vec<TranslogEntry>, bool)> {
+    fn recovery_read_snapshot(&self) -> Result<TranslogReadSnapshot> {
         let state = recover_lock(&self.state, "state");
         let active_matches = state
             .generations
@@ -1367,13 +1446,21 @@ impl WriteAheadLog for HotTranslog {
                 );
             }
         }
-        Self::read_bounded_range_from_generations(
-            &state.generations,
-            min_seq_no,
-            end_seq_no,
-            max_ops,
-            max_bytes,
-        )
+        Ok(TranslogReadSnapshot {
+            next_seq_no: state.next_seq_no,
+            generations: state.generations.clone(),
+            #[cfg(test)]
+            scan_barrier: recover_lock(
+                self.recovery_scan_barrier.as_ref(),
+                "recovery scan barrier",
+            )
+            .clone(),
+        })
+    }
+
+    #[cfg(test)]
+    fn set_recovery_scan_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>) {
+        *recover_lock(self.recovery_scan_barrier.as_ref(), "recovery scan barrier") = barrier;
     }
 
     fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64> {
@@ -1786,21 +1873,22 @@ mod tests {
                 .unwrap();
         }
 
-        let (first, complete) = tl.read_bounded_range(1, 5, 2, usize::MAX).unwrap();
+        let snapshot = tl.recovery_read_snapshot().unwrap();
+        let (first, complete) = snapshot.read_bounded_range(1, 2, usize::MAX).unwrap();
         assert_eq!(
             first.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
             [1, 2]
         );
         assert!(!complete);
 
-        let (second, complete) = tl.read_bounded_range(3, 5, 10, usize::MAX).unwrap();
+        let (second, complete) = snapshot.read_bounded_range(3, 10, usize::MAX).unwrap();
         assert_eq!(
             second.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
             [3, 4]
         );
         assert!(complete);
 
-        let error = tl.read_bounded_range(0, 5, 1, 1).unwrap_err();
+        let error = snapshot.read_bounded_range(0, 1, 1).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1824,7 +1912,8 @@ mod tests {
             .append(WalOperation::Index, json!({"value": 1}))
             .unwrap();
 
-        let (entries, complete) = translog.read_bounded_range(0, 2, 16, usize::MAX).unwrap();
+        let snapshot = translog.recovery_read_snapshot().unwrap();
+        let (entries, complete) = snapshot.read_bounded_range(0, 16, usize::MAX).unwrap();
         assert!(complete);
         assert_eq!(
             entries.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),

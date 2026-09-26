@@ -690,6 +690,13 @@ impl SearchEngine for CompositeEngine {
         self.text.create_peer_recovery_snapshot(snapshot_dir)
     }
 
+    fn prepare_peer_recovery_snapshot(
+        &self,
+        snapshot_dir: &std::path::Path,
+    ) -> Result<super::PeerRecoverySnapshotPreparation> {
+        self.text.prepare_peer_recovery_snapshot(snapshot_dir)
+    }
+
     fn release_peer_recovery_pin(&self, pin_id: u64) -> Result<()> {
         self.text.release_peer_recovery_pin(pin_id)
     }

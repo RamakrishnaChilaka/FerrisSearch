@@ -1,6 +1,9 @@
 use super::TransportService;
 use crate::consensus::types::ClusterCommand;
-use crate::engine::{PeerRecoveryFileMetadata, PeerRecoveryOpsBatch, SearchEngine};
+use crate::engine::{
+    PeerRecoveryFileMetadata, PeerRecoveryOpsBatch, PeerRecoveryRetentionPin,
+    PreparedPeerRecoverySnapshot, SearchEngine,
+};
 use crate::shard::SourceRecoverySessionCleanup;
 use crate::transport::proto::{
     CompleteFinalizeRecoveryRequest, CompleteFinalizeRecoveryResponse,
@@ -40,16 +43,22 @@ struct SourceSetup {
     target_node_id: String,
     primary_term: u64,
     last_activity: Instant,
-    abort_handle: tokio::task::AbortHandle,
-    lifetime: Arc<SetupLifetime>,
+    abort_handle: Option<tokio::task::AbortHandle>,
+    lifetime: Option<Arc<SetupLifetime>>,
+    failure: Option<String>,
 }
 
 #[derive(Default)]
 struct SetupLifetime {
     monitor_finished: AtomicBool,
     blocking_started: AtomicBool,
+    engine_released: AtomicBool,
     blocking_finished: AtomicBool,
     notify: Notify,
+    #[cfg(test)]
+    wait_enabled_sender: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    wait_check_release: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl SetupLifetime {
@@ -67,15 +76,47 @@ impl SetupLifetime {
         self.notify.notify_waiters();
     }
 
+    fn finish_engine_release(&self) {
+        self.engine_released.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_engine_released(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let monitor_finished = self.monitor_finished.load(Ordering::Acquire);
+            let blocking_started = self.blocking_started.load(Ordering::Acquire);
+            let engine_released = self.engine_released.load(Ordering::Acquire);
+            if engine_released || (monitor_finished && !blocking_started) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     async fn wait_finished(&self) {
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            #[cfg(test)]
+            {
+                if let Some(sender) = self.wait_enabled_sender.lock().await.take() {
+                    let _ = sender.send(());
+                }
+                if let Some(release) = self.wait_check_release.lock().await.take() {
+                    let _ = release.await;
+                }
+            }
             let monitor_finished = self.monitor_finished.load(Ordering::Acquire);
             let blocking_started = self.blocking_started.load(Ordering::Acquire);
             let blocking_finished = self.blocking_finished.load(Ordering::Acquire);
             if monitor_finished && (!blocking_started || blocking_finished) {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -115,6 +156,18 @@ pub(crate) struct PeerRecoveryTransportState {
     write_guard_waiting_sender: Mutex<Option<oneshot::Sender<()>>>,
     #[cfg(test)]
     start_lifecycle_waiting_sender: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    forced_setup_failure: Mutex<Option<String>>,
+    #[cfg(test)]
+    setup_attempts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    setup_hash_started_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    setup_hash_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    #[cfg(test)]
+    pub(super) dynamic_mapping_committed_sender: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    pub(super) dynamic_mapping_release: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl PeerRecoveryTransportState {
@@ -128,6 +181,18 @@ impl PeerRecoveryTransportState {
             write_guard_waiting_sender: Mutex::new(None),
             #[cfg(test)]
             start_lifecycle_waiting_sender: Mutex::new(None),
+            #[cfg(test)]
+            forced_setup_failure: Mutex::new(None),
+            #[cfg(test)]
+            setup_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            setup_hash_started_sender: Mutex::new(None),
+            #[cfg(test)]
+            setup_hash_release: Mutex::new(None),
+            #[cfg(test)]
+            dynamic_mapping_committed_sender: Mutex::new(None),
+            #[cfg(test)]
+            dynamic_mapping_release: Mutex::new(None),
         })
     }
 
@@ -153,7 +218,7 @@ impl PeerRecoveryTransportState {
                 .collect::<Vec<_>>()
         };
         for session_id in setup_ids {
-            self.cancel_setup(&session_id).await;
+            self.cancel_setup(&session_id, true).await;
         }
 
         let sessions = {
@@ -203,7 +268,7 @@ impl PeerRecoveryTransportState {
         session
     }
 
-    async fn cancel_setup(&self, session_id: &str) -> bool {
+    async fn cancel_setup(&self, session_id: &str, wait_for_blocking: bool) -> bool {
         let setup = {
             let mut registry = self.registry.lock().await;
             let setup = registry.setups.remove(session_id);
@@ -217,8 +282,16 @@ impl PeerRecoveryTransportState {
         let Some(setup) = setup else {
             return false;
         };
-        setup.abort_handle.abort();
-        setup.lifetime.wait_finished().await;
+        if let Some(abort_handle) = setup.abort_handle {
+            abort_handle.abort();
+        }
+        if let Some(lifetime) = setup.lifetime {
+            if wait_for_blocking {
+                lifetime.wait_finished().await;
+            } else {
+                lifetime.wait_engine_released().await;
+            }
+        }
         true
     }
 
@@ -230,7 +303,7 @@ impl PeerRecoveryTransportState {
                 return Ok(false);
             };
             let session_id = active_session;
-            if self.cancel_setup(&session_id).await {
+            if self.cancel_setup(&session_id, false).await {
                 return Ok(true);
             }
             let session = {
@@ -323,8 +396,7 @@ struct SourceSession {
     snapshot_next_seq_no: u64,
     snapshot_dir: PathBuf,
     files: HashMap<String, PeerRecoveryFileMetadata>,
-    engine: Arc<dyn SearchEngine>,
-    retention_pin_id: Option<u64>,
+    retention_pin: Option<PeerRecoveryRetentionPin>,
     last_activity: Instant,
     barrier_next_seq_no: Option<u64>,
     barrier_guard: Option<OwnedRwLockWriteGuard<()>>,
@@ -358,29 +430,20 @@ impl From<&SourceSession> for SourceSessionAuthority {
 }
 
 struct SessionCleanup {
-    engine: Arc<dyn SearchEngine>,
-    retention_pin_id: Option<u64>,
+    retention_pin: Option<PeerRecoveryRetentionPin>,
     snapshot_dir: PathBuf,
 }
 
 struct PreparedSourceSnapshot {
-    engine: Option<Arc<dyn SearchEngine>>,
-    snapshot: Option<crate::engine::PeerRecoverySnapshot>,
+    snapshot: Option<PreparedPeerRecoverySnapshot>,
     snapshot_dir: PathBuf,
     retained: bool,
 }
 
 impl PreparedSourceSnapshot {
-    fn into_parts(
-        mut self,
-    ) -> (
-        Arc<dyn SearchEngine>,
-        crate::engine::PeerRecoverySnapshot,
-        PathBuf,
-    ) {
+    fn into_parts(mut self) -> (PreparedPeerRecoverySnapshot, PathBuf) {
         self.retained = true;
         (
-            self.engine.take().expect("prepared snapshot has engine"),
             self.snapshot
                 .take()
                 .expect("prepared snapshot has snapshot metadata"),
@@ -391,23 +454,34 @@ impl PreparedSourceSnapshot {
 
 impl Drop for PreparedSourceSnapshot {
     fn drop(&mut self) {
-        if let (Some(engine), Some(snapshot)) = (self.engine.take(), self.snapshot.take())
-            && let Err(error) = engine.release_peer_recovery_pin(snapshot.retention_pin_id)
-        {
-            tracing::warn!(
-                error = %error,
-                "Failed to release cancelled peer recovery setup pin"
-            );
+        if self.retained {
+            return;
         }
-        if !self.retained
-            && self.snapshot_dir.exists()
-            && let Err(error) = std::fs::remove_dir_all(&self.snapshot_dir)
-        {
-            tracing::warn!(
-                path = ?self.snapshot_dir,
-                error = %error,
-                "Failed to remove cancelled peer recovery setup directory"
-            );
+        let snapshot = self.snapshot.take();
+        let snapshot_dir = self.snapshot_dir.clone();
+        let cleanup = move || {
+            if let Some(snapshot) = snapshot
+                && let Err(error) = snapshot.retention_pin.release()
+            {
+                tracing::warn!(
+                    error = %error,
+                    "Failed to release cancelled peer recovery setup pin"
+                );
+            }
+            if snapshot_dir.exists()
+                && let Err(error) = std::fs::remove_dir_all(&snapshot_dir)
+            {
+                tracing::warn!(
+                    path = ?snapshot_dir,
+                    error = %error,
+                    "Failed to remove cancelled peer recovery setup directory"
+                );
+            }
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::spawn_blocking(cleanup);
+        } else {
+            cleanup();
         }
     }
 }
@@ -417,14 +491,13 @@ async fn cleanup_session(session: Arc<Mutex<SourceSession>>) {
         let mut session = session.lock().await;
         session.barrier_guard.take();
         SessionCleanup {
-            engine: session.engine.clone(),
-            retention_pin_id: session.retention_pin_id.take(),
+            retention_pin: session.retention_pin.take(),
             snapshot_dir: session.snapshot_dir.clone(),
         }
     };
     let result = tokio::task::spawn_blocking(move || {
-        if let Some(pin_id) = cleanup.retention_pin_id {
-            cleanup.engine.release_peer_recovery_pin(pin_id)?;
+        if let Some(retention_pin) = cleanup.retention_pin {
+            retention_pin.release()?;
         }
         if cleanup.snapshot_dir.exists() {
             std::fs::remove_dir_all(&cleanup.snapshot_dir)?;
@@ -440,6 +513,28 @@ async fn cleanup_session(session: Arc<Mutex<SourceSession>>) {
         Err(error) => {
             tracing::warn!("Peer recovery source cleanup task failed: {error}");
         }
+    }
+}
+
+async fn record_setup_failure(
+    state: &PeerRecoveryTransportState,
+    session_id: &str,
+    key: &ShardIdentity,
+    error: String,
+) {
+    let mut registry = state.registry.lock().await;
+    if registry
+        .active_shards
+        .get(key)
+        .is_some_and(|active| active == session_id)
+        && let Some(setup) = registry.setups.get_mut(session_id)
+    {
+        setup.failure = Some(error);
+        setup.abort_handle = None;
+        setup.lifetime = None;
+        setup.last_activity = Instant::now();
+    } else {
+        registry.setups.remove(session_id);
     }
 }
 
@@ -509,6 +604,25 @@ enum MembershipObservation {
 }
 
 impl TransportService {
+    fn target_still_needs_recovery(&self, key: &ShardIdentity, target_node_id: &str) -> bool {
+        let state = self.cluster_manager.get_state();
+        let Some(metadata) = state
+            .indices
+            .values()
+            .find(|metadata| metadata.uuid.as_str() == key.0)
+        else {
+            return false;
+        };
+        let Some(routing) = metadata.shard_routing.get(&key.1) else {
+            return false;
+        };
+        routing.replicas.iter().any(|node| node == target_node_id)
+            && !routing
+                .in_sync_replicas
+                .iter()
+                .any(|node| node == target_node_id)
+    }
+
     async fn reap_peer_recovery_sessions(&self) {
         self.peer_recovery_state.reap_expired_sessions().await;
         let sessions = {
@@ -605,23 +719,55 @@ impl TransportService {
             return Ok(None);
         };
 
-        if let Some(session) = self
-            .peer_recovery_state
-            .registry
-            .lock()
-            .await
-            .sessions
-            .get(&active_id)
-            .cloned()
-        {
+        let existing_session = {
+            let registry = self.peer_recovery_state.registry.lock().await;
+            registry.sessions.get(&active_id).cloned()
+        };
+        if let Some(session) = existing_session {
             let mut session = session.lock().await;
             if session.target_node_id != target_node_id {
-                return Err(Status::already_exists(
-                    "a peer recovery source session already exists for a different target",
-                ));
+                let old_target = session.target_node_id.clone();
+                let replaceable = !session.finalize_preparing.load(Ordering::Acquire)
+                    && session.barrier_guard.is_none()
+                    && !session.settlement_running;
+                drop(session);
+                if self.target_still_needs_recovery(key, &old_target) {
+                    return Err(Status::already_exists(
+                        "a peer recovery source session already exists for a different active target",
+                    ));
+                }
+                if !replaceable {
+                    return Err(Status::failed_precondition(
+                        "stale peer recovery target is already admitting or settling",
+                    ));
+                }
+                if let Some(removed) = self.peer_recovery_state.remove_session(&active_id).await {
+                    cleanup_session(removed).await;
+                }
+                return Ok(None);
             }
             session.last_activity = Instant::now();
             return Ok(Some(source_session_start_response(&active_id, &session)));
+        }
+
+        let setup_target = {
+            let mut registry = self.peer_recovery_state.registry.lock().await;
+            let Some(setup) = registry.setups.get_mut(&active_id) else {
+                registry.active_shards.remove(key);
+                return Ok(None);
+            };
+            setup.target_node_id.clone()
+        };
+        if setup_target != target_node_id {
+            if self.target_still_needs_recovery(key, &setup_target) {
+                return Err(Status::already_exists(
+                    "a peer recovery snapshot is being prepared for a different active target",
+                ));
+            }
+            self.peer_recovery_state
+                .cancel_setup(&active_id, false)
+                .await;
+            return Ok(None);
         }
 
         let mut registry = self.peer_recovery_state.registry.lock().await;
@@ -629,10 +775,18 @@ impl TransportService {
             registry.active_shards.remove(key);
             return Ok(None);
         };
-        if setup.target_node_id != target_node_id {
-            return Err(Status::already_exists(
-                "a peer recovery snapshot is being prepared for a different target",
-            ));
+        if let Some(error) = setup.failure.take() {
+            registry.setups.remove(&active_id);
+            if registry
+                .active_shards
+                .get(key)
+                .is_some_and(|active| active == &active_id)
+            {
+                registry.active_shards.remove(key);
+            }
+            return Err(Status::internal(format!(
+                "peer recovery snapshot setup failed: {error}"
+            )));
         }
         setup.last_activity = Instant::now();
         Ok(Some(StartPeerRecoveryResponse {
@@ -668,15 +822,46 @@ impl TransportService {
                 return;
             }
             task_lifetime.mark_blocking_started();
+            #[cfg(test)]
+            state.setup_attempts.fetch_add(1, Ordering::AcqRel);
+            #[cfg(test)]
+            let forced_failure = state.forced_setup_failure.lock().await.clone();
+            #[cfg(test)]
+            let hash_started = state.setup_hash_started_sender.lock().await.take();
+            #[cfg(test)]
+            let hash_release = state.setup_hash_release.lock().await.take();
+            #[cfg(not(test))]
+            let forced_failure: Option<String> = None;
             let blocking_lifetime = task_lifetime.clone();
-            let snapshot_engine = engine.clone();
+            let snapshot_engine = engine;
             let snapshot_dir_for_task = snapshot_dir.clone();
             let prepared = tokio::task::spawn_blocking(move || {
-                let _blocking_guard = SetupBlockingGuard(blocking_lifetime);
-                let snapshot =
-                    snapshot_engine.create_peer_recovery_snapshot(&snapshot_dir_for_task)?;
+                let _blocking_guard = SetupBlockingGuard(blocking_lifetime.clone());
+                if let Some(error) = forced_failure {
+                    anyhow::bail!("{error}");
+                }
+                let preparation =
+                    snapshot_engine.prepare_peer_recovery_snapshot(&snapshot_dir_for_task);
+                drop(snapshot_engine);
+                blocking_lifetime.finish_engine_release();
+                let preparation = preparation?;
+                #[cfg(test)]
+                {
+                    if let Some(sender) = hash_started {
+                        let _ = sender.send(());
+                    }
+                    if let Some(release) = hash_release {
+                        let _ = release.recv();
+                    }
+                }
+                let snapshot = match preparation.hash_files(&snapshot_dir_for_task) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ = std::fs::remove_dir_all(&snapshot_dir_for_task);
+                        return Err(error);
+                    }
+                };
                 Ok::<PreparedSourceSnapshot, anyhow::Error>(PreparedSourceSnapshot {
-                    engine: Some(snapshot_engine),
                     snapshot: Some(snapshot),
                     snapshot_dir: snapshot_dir_for_task,
                     retained: false,
@@ -692,15 +877,8 @@ impl TransportService {
                         error = %error,
                         "Peer recovery snapshot preparation failed"
                     );
-                    let mut registry = state.registry.lock().await;
-                    registry.setups.remove(&task_session_id);
-                    if registry
-                        .active_shards
-                        .get(&task_key)
-                        .is_some_and(|active| active == &task_session_id)
-                    {
-                        registry.active_shards.remove(&task_key);
-                    }
+                    record_setup_failure(&state, &task_session_id, &task_key, error.to_string())
+                        .await;
                     return;
                 }
                 Err(error) => {
@@ -709,15 +887,8 @@ impl TransportService {
                         error = %error,
                         "Peer recovery snapshot preparation task failed"
                     );
-                    let mut registry = state.registry.lock().await;
-                    registry.setups.remove(&task_session_id);
-                    if registry
-                        .active_shards
-                        .get(&task_key)
-                        .is_some_and(|active| active == &task_session_id)
-                    {
-                        registry.active_shards.remove(&task_key);
-                    }
+                    record_setup_failure(&state, &task_session_id, &task_key, error.to_string())
+                        .await;
                     return;
                 }
             };
@@ -734,7 +905,7 @@ impl TransportService {
                 return;
             }
 
-            let (engine, snapshot, snapshot_dir) = prepared.into_parts();
+            let (snapshot, snapshot_dir) = prepared.into_parts();
             let files = snapshot
                 .files
                 .iter()
@@ -751,8 +922,7 @@ impl TransportService {
                 snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
                 snapshot_dir,
                 files,
-                engine,
-                retention_pin_id: Some(snapshot.retention_pin_id),
+                retention_pin: Some(snapshot.retention_pin),
                 last_activity: Instant::now(),
                 barrier_next_seq_no: None,
                 barrier_guard: None,
@@ -792,8 +962,9 @@ impl TransportService {
                     target_node_id: setup_target_node_id,
                     primary_term,
                     last_activity: Instant::now(),
-                    abort_handle,
-                    lifetime,
+                    abort_handle: Some(abort_handle),
+                    lifetime: Some(lifetime),
+                    failure: None,
                 },
             );
         }
@@ -1151,7 +1322,7 @@ impl TransportService {
             ));
         }
         let session = self.source_session(&request.session_id).await?;
-        let engine = {
+        let (index_name, shard_id) = {
             let mut session = session.lock().await;
             if !self.source_authority_valid(&session) {
                 drop(session);
@@ -1166,8 +1337,14 @@ impl TransportService {
                 ));
             }
             session.last_activity = Instant::now();
-            session.engine.clone()
+            (session.index_name.clone(), session.shard_id)
         };
+        let engine = self
+            .shard_manager
+            .get_shard(&index_name, shard_id)
+            .ok_or_else(|| {
+                Status::unavailable("peer recovery source engine is not currently open")
+            })?;
 
         let from_seq_no = request.from_seq_no;
         let batch = tokio::task::spawn_blocking(move || {
@@ -1191,7 +1368,7 @@ impl TransportService {
         request: PrepareFinalizeRecoveryRequest,
     ) -> Result<PrepareFinalizeRecoveryResponse, Status> {
         let session = self.source_session(&request.session_id).await?;
-        let (key, engine, _preparing_guard) = {
+        let (key, index_name, _preparing_guard) = {
             let mut session = session.lock().await;
             if !self.source_authority_valid(&session) {
                 drop(session);
@@ -1218,10 +1395,16 @@ impl TransportService {
             session.last_activity = Instant::now();
             (
                 (session.index_uuid.clone(), session.shard_id),
-                session.engine.clone(),
+                session.index_name.clone(),
                 preparing,
             )
         };
+        let engine = self
+            .shard_manager
+            .get_shard(&index_name, key.1)
+            .ok_or_else(|| {
+                Status::unavailable("peer recovery source engine is not currently open")
+            })?;
 
         let barrier = self.peer_recovery_state.barrier(key).await;
         let guard =
@@ -1422,7 +1605,7 @@ mod tests {
     use super::*;
     use crate::cluster::manager::ClusterManager;
     use crate::cluster::state::{
-        ClusterState, IndexMetadata, IndexSettings, IndexUuid, NodeInfo, NodeRole,
+        ClusterState, DynamicMapping, IndexMetadata, IndexSettings, IndexUuid, NodeInfo, NodeRole,
         ShardRoutingEntry,
     };
     use crate::engine::CompositeEngine;
@@ -1534,6 +1717,17 @@ mod tests {
         }
     }
 
+    fn prepared_test_snapshot(
+        engine: &Arc<dyn SearchEngine>,
+        snapshot_dir: &std::path::Path,
+    ) -> PreparedPeerRecoverySnapshot {
+        engine
+            .prepare_peer_recovery_snapshot(snapshot_dir)
+            .unwrap()
+            .hash_files(snapshot_dir)
+            .unwrap()
+    }
+
     async fn wait_for_ready_source_session(service: &TransportService) -> String {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -1623,6 +1817,151 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn persistent_setup_failure_is_returned_without_poll_spin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, shard_manager, _cluster) = review_service(dir.path());
+        shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        *service
+            .peer_recovery_state
+            .forced_setup_failure
+            .lock()
+            .await = Some("hard links unavailable".into());
+
+        let first = service
+            .start_peer_recovery_inner(review_start_request())
+            .await
+            .unwrap();
+        assert!(first.preparing);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            match service
+                .start_peer_recovery_inner(review_start_request())
+                .await
+            {
+                Ok(response) => {
+                    assert!(response.preparing);
+                }
+                Err(error) => break error,
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "setup failure was not returned to the poller"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("hard links unavailable"));
+        assert_eq!(
+            service
+                .peer_recovery_state
+                .setup_attempts
+                .load(Ordering::Acquire),
+            1,
+            "polling one failed setup must not relaunch snapshot work"
+        );
+        assert!(
+            service
+                .peer_recovery_state
+                .registry
+                .lock()
+                .await
+                .active_shards
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_target_source_session_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, shard_manager, cluster) = review_service(dir.path());
+        shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        let first = service
+            .start_peer_recovery_inner(review_start_request())
+            .await
+            .unwrap();
+        assert!(first.preparing);
+        let old_session = wait_for_ready_source_session(&service).await;
+
+        let mut replaced = review_state("primary", 1);
+        replaced.nodes.insert(
+            "replacement".into(),
+            NodeInfo {
+                id: "replacement".into(),
+                name: "replacement".into(),
+                host: "127.0.0.1".into(),
+                transport_port: 1,
+                http_port: 0,
+                roles: vec![NodeRole::Data],
+                raft_node_id: 0,
+            },
+        );
+        replaced
+            .indices
+            .get_mut("idx")
+            .unwrap()
+            .shard_routing
+            .get_mut(&0)
+            .unwrap()
+            .replicas = vec!["replacement".into()];
+        cluster.update_state(replaced);
+
+        let mut replacement_request = review_start_request();
+        replacement_request.target_node_id = "replacement".into();
+        let replacement = service
+            .start_peer_recovery_inner(replacement_request.clone())
+            .await
+            .unwrap();
+        assert!(replacement.preparing);
+        let replacement_session = wait_for_ready_source_session(&service).await;
+        assert_ne!(old_session, replacement_session);
+        assert!(
+            service.source_session(&old_session).await.is_err(),
+            "the stale target session must be invalidated"
+        );
+        let ready = service
+            .start_peer_recovery_inner(replacement_request)
+            .await
+            .unwrap();
+        assert_eq!(ready.session_id, replacement_session);
+        assert!(!ready.preparing);
+    }
+
+    #[tokio::test]
+    async fn setup_lifetime_wait_has_no_lost_wakeup() {
+        let lifetime = Arc::new(SetupLifetime::default());
+        let (enabled_tx, enabled_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *lifetime.wait_enabled_sender.lock().await = Some(enabled_tx);
+        *lifetime.wait_check_release.lock().await = Some(release_rx);
+
+        let waiter_lifetime = lifetime.clone();
+        let waiter = tokio::spawn(async move { waiter_lifetime.wait_finished().await });
+        enabled_rx.await.unwrap();
+        lifetime.finish_monitor();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("enabled Notify waiter must observe the final wakeup")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn start_waits_for_reopen_engine_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let (service, shard_manager, _cluster) = review_service(dir.path());
@@ -1686,6 +2025,83 @@ mod tests {
         assert!(shard_manager.get_shard("idx", 0).is_some());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_reopen_completes_while_setup_hash_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, shard_manager, _cluster) = review_service(dir.path());
+        shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        let (hash_started_tx, hash_started_rx) = std::sync::mpsc::channel();
+        let (hash_release_tx, hash_release_rx) = std::sync::mpsc::channel();
+        *service
+            .peer_recovery_state
+            .setup_hash_started_sender
+            .lock()
+            .await = Some(hash_started_tx);
+        *service.peer_recovery_state.setup_hash_release.lock().await = Some(hash_release_rx);
+        let start = service
+            .start_peer_recovery_inner(review_start_request())
+            .await
+            .unwrap();
+        assert!(start.preparing);
+        tokio::task::spawn_blocking(move || {
+            hash_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("snapshot setup did not reach hashing")
+        })
+        .await
+        .unwrap();
+
+        let (reopen_entered_tx, reopen_entered_rx) = oneshot::channel();
+        let (reopen_release_tx, reopen_release_rx) = oneshot::channel();
+        shard_manager.set_reopen_after_cleanup_gate(reopen_entered_tx, reopen_release_rx);
+        let reopen_manager = shard_manager.clone();
+        let reopen = tokio::spawn(async move {
+            reopen_manager
+                .reopen_shard(
+                    "idx".into(),
+                    0,
+                    HashMap::from([(
+                        "new_field".to_string(),
+                        crate::cluster::state::FieldMapping {
+                            field_type: crate::cluster::state::FieldType::Integer,
+                            dimension: None,
+                        },
+                    )]),
+                    IndexSettings::default(),
+                    "uuid-1".into(),
+                )
+                .await
+        });
+        reopen_entered_rx.await.unwrap();
+        reopen.abort();
+        let _ = reopen.await;
+        reopen_release_tx.send(()).unwrap();
+
+        let meta_path = dir.path().join("uuid-1/shard_0/index/meta.json");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let evolved =
+                std::fs::read_to_string(&meta_path).is_ok_and(|meta| meta.contains("new_field"));
+            if evolved && shard_manager.get_shard("idx", 0).is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled reopen did not complete independently"
+            );
+            tokio::task::yield_now().await;
+        }
+        hash_release_tx.send(()).unwrap();
+    }
+
     #[tokio::test]
     async fn idle_reaper_keeps_barrier_during_settlement() {
         let dir = tempfile::tempdir().unwrap();
@@ -1695,7 +2111,7 @@ mod tests {
             .add_document("base", serde_json::json!({"value": 0}))
             .unwrap();
         let snapshot_dir = dir.path().join("peer-recovery/session");
-        let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+        let snapshot = prepared_test_snapshot(&engine, &snapshot_dir);
         let state = PeerRecoveryTransportState::new();
         let key = ("uuid-1".to_string(), 0);
         let barrier = state.barrier(key.clone()).await;
@@ -1718,8 +2134,7 @@ mod tests {
                 snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
                 snapshot_dir,
                 files: HashMap::new(),
-                engine,
-                retention_pin_id: Some(snapshot.retention_pin_id),
+                retention_pin: Some(snapshot.retention_pin),
                 last_activity: Instant::now()
                     - RECOVERY_SESSION_IDLE_TIMEOUT
                     - Duration::from_secs(1),
@@ -1855,6 +2270,129 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_mapping_primary_change_before_reopen_rejects_write() {
+        let (raft, state_handle) = consensus::create_raft_instance_mem(1, "mapping-fence".into())
+            .await
+            .unwrap();
+        consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+            .await
+            .unwrap();
+        wait_for_test_leader(&raft).await;
+        let metadata = IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("uuid-1"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary".into(),
+                    primary_term: 1,
+                    replicas: vec!["replica".into()],
+                    in_sync_replicas: vec!["replica".into()],
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: DynamicMapping::True,
+            settings: IndexSettings::default(),
+        };
+        assert_eq!(
+            raft.client_write(ClusterCommand::CreateIndex { metadata })
+                .await
+                .unwrap()
+                .data,
+            ClusterResponse::Ok
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
+        let peer_recovery_state = PeerRecoveryTransportState::new();
+        shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
+        let service = TransportService {
+            cluster_manager,
+            shard_manager: shard_manager.clone(),
+            transport_client: TransportClient::new(),
+            storage_manager: Arc::new(
+                crate::storage::StorageManager::new_in_path(dir.path()).unwrap(),
+            ),
+            remote_store_reader_cache: Arc::new(
+                crate::engine::remote_store::RemoteSplitReaderCache::default(),
+            ),
+            raft: Some(raft.clone()),
+            local_node_id: "primary".into(),
+            worker_pools: WorkerPools::new(2, 2),
+            task_manager: Arc::new(TaskManager::new()),
+            primary_activation_state: super::super::new_primary_activation_state(),
+            peer_recovery_state,
+            join_lock: super::super::new_join_lock(),
+        };
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *service
+            .peer_recovery_state
+            .dynamic_mapping_committed_sender
+            .lock()
+            .await = Some(committed_tx);
+        *service
+            .peer_recovery_state
+            .dynamic_mapping_release
+            .lock()
+            .await = Some(release_rx);
+
+        let writer = service.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .index_doc(tonic::Request::new(ShardDocRequest {
+                    index_name: "idx".into(),
+                    shard_id: 0,
+                    doc_id: "stale".into(),
+                    payload_json: serde_json::to_vec(&serde_json::json!({"new_field": 1})).unwrap(),
+                }))
+                .await
+        });
+        committed_rx.await.unwrap();
+
+        let mut promoted = state_handle.read().unwrap().indices["idx"].clone();
+        assert!(promoted.promote_replica_to(0, "replica"));
+        assert_eq!(
+            raft.client_write(ClusterCommand::UpdateIndex { metadata: promoted })
+                .await
+                .unwrap()
+                .data,
+            ClusterResponse::Ok
+        );
+        release_tx.send(()).unwrap();
+
+        let response = write.await.unwrap().unwrap().into_inner();
+        assert!(!response.success);
+        assert!(
+            response.error.contains("no longer the primary")
+                || response.error.contains("primary term changed")
+        );
+        assert!(
+            shard_manager
+                .get_shard("idx", 0)
+                .is_none_or(|engine| { engine.get_document("stale").unwrap().is_none() })
+        );
+        assert!(
+            state_handle.read().unwrap().indices["idx"]
+                .mappings
+                .contains_key("new_field")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled_prepare_finalize_clears_preparing_flag() {
         let dir = tempfile::tempdir().unwrap();
         let (service, shard_manager, _cluster) = review_service(dir.path());
@@ -1871,7 +2409,7 @@ mod tests {
             .add_document("base", serde_json::json!({"value": 0}))
             .unwrap();
         let snapshot_dir = dir.path().join("uuid-1/shard_0/peer-recovery/session");
-        let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+        let snapshot = prepared_test_snapshot(&engine, &snapshot_dir);
         let session = Arc::new(Mutex::new(SourceSession {
             index_name: "idx".into(),
             index_uuid: "uuid-1".into(),
@@ -1886,8 +2424,7 @@ mod tests {
                 .into_iter()
                 .map(|file| (file.name.clone(), file))
                 .collect(),
-            engine,
-            retention_pin_id: Some(snapshot.retention_pin_id),
+            retention_pin: Some(snapshot.retention_pin),
             last_activity: Instant::now(),
             barrier_next_seq_no: None,
             barrier_guard: None,
@@ -1995,7 +2532,7 @@ mod tests {
             )
             .unwrap();
         let snapshot_dir = dir.path().join("uuid-1/shard_0/peer-recovery/session");
-        let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+        let snapshot = prepared_test_snapshot(&engine, &snapshot_dir);
         let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
         let peer_recovery_state = PeerRecoveryTransportState::new();
         shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
@@ -2032,8 +2569,7 @@ mod tests {
             snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
             snapshot_dir,
             files: HashMap::new(),
-            engine,
-            retention_pin_id: Some(snapshot.retention_pin_id),
+            retention_pin: Some(snapshot.retention_pin),
             last_activity: Instant::now(),
             barrier_next_seq_no: Some(snapshot.snapshot_next_seq_no),
             barrier_guard: Some(guard),
@@ -2083,7 +2619,7 @@ mod tests {
             .add_document("base", serde_json::json!({"value": 0}))
             .unwrap();
         let snapshot_dir = dir.path().join("peer-recovery/session");
-        let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+        let snapshot = prepared_test_snapshot(&engine, &snapshot_dir);
         engine
             .add_document("suffix", serde_json::json!({"value": 1}))
             .unwrap();
@@ -2112,8 +2648,7 @@ mod tests {
                     .into_iter()
                     .map(|file| (file.name.clone(), file))
                     .collect(),
-                engine: engine.clone(),
-                retention_pin_id: Some(snapshot.retention_pin_id),
+                retention_pin: Some(snapshot.retention_pin),
                 last_activity: Instant::now()
                     - RECOVERY_SESSION_IDLE_TIMEOUT
                     - Duration::from_secs(1),
@@ -2159,7 +2694,7 @@ mod tests {
             .add_document("base", serde_json::json!({"value": 0}))
             .unwrap();
         let snapshot_dir = dir.path().join("uuid-1/shard_0/peer-recovery/session");
-        let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+        let snapshot = prepared_test_snapshot(&engine, &snapshot_dir);
         let first_file = snapshot.files[0].clone();
 
         let mut cluster_state = ClusterState::new("test".into());
@@ -2210,8 +2745,7 @@ mod tests {
                     .into_iter()
                     .map(|file| (file.name.clone(), file))
                     .collect(),
-                engine,
-                retention_pin_id: Some(snapshot.retention_pin_id),
+                retention_pin: Some(snapshot.retention_pin),
                 last_activity: Instant::now(),
                 barrier_next_seq_no: None,
                 barrier_guard: None,

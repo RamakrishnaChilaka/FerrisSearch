@@ -193,6 +193,19 @@ The September 26 review regressions add
 `bounded_range_uses_live_generations_when_manifest_lags_roll`, and
 `dead_node_removal_waits_for_routing_update_success`.
 
+Round-2 evidence adds
+`peer_recovery_scan_does_not_block_concurrent_write`,
+`persistent_setup_failure_is_returned_without_poll_spin`,
+`stale_target_source_session_is_replaced`,
+`cancelled_reopen_completes_while_setup_hash_is_blocked`,
+`setup_lifetime_wait_has_no_lost_wakeup`,
+`peer_recovery_pin_drop_does_not_block_tokio_worker`, and
+`dynamic_mapping_primary_change_before_reopen_rejects_write`.
+
+The remove-and-re-add ABA case remains a documented liveness limitation:
+without allocation IDs, a finalized pending target cannot distinguish the old
+assignment from a replacement assignment and may remain `INITIALIZING`.
+
 ## M. Membership And Acknowledgement Sets
 
 | ID | Boundary or scenario | Required result | Layer |

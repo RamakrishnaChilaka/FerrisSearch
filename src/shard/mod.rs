@@ -1008,107 +1008,100 @@ impl ShardManager {
         settings: IndexSettings,
         index_uuid: String,
     ) -> Result<Arc<dyn SearchEngine>> {
-        let source_recovery_lock = self.source_recovery_lifecycle_lock(&index_uuid, shard_id);
-        let _source_recovery_guard = source_recovery_lock.lock_owned().await;
-        self.abort_source_recovery_for_shard(&index_uuid, shard_id)
-            .await?;
-        #[cfg(test)]
-        {
-            if let Some(sender) = self
-                .reopen_after_cleanup_sender
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-            {
-                let _ = sender.send(());
-            }
-            let release = self
-                .reopen_after_cleanup_release
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            if let Some(release) = release {
-                let _ = release.await;
-            }
-        }
-        let key = ShardKey::new(&index, shard_id);
-
-        // Serialize with other open/reopen attempts for the same shard.
-        let per_shard_lock = {
-            let mut locks = self.open_locks.lock().unwrap_or_else(|e| e.into_inner());
-            locks.entry(key.clone()).or_default().clone()
-        };
-
         let shard_manager = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
-
-            // Commit the old engine before dropping to persist pending docs.
+        tokio::spawn(async move {
+            let source_recovery_lock =
+                shard_manager.source_recovery_lifecycle_lock(&index_uuid, shard_id);
+            let _source_recovery_guard = source_recovery_lock.lock_owned().await;
+            shard_manager
+                .abort_source_recovery_for_shard(&index_uuid, shard_id)
+                .await?;
+            #[cfg(test)]
             {
-                let shards = shard_manager
-                    .shards
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner());
-                if let Some(engine) = shards.get(&key) {
-                    let _ = engine.flush();
+                if let Some(sender) = shard_manager
+                    .reopen_after_cleanup_sender
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    let _ = sender.send(());
+                }
+                let release = shard_manager
+                    .reopen_after_cleanup_release
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some(release) = release {
+                    let _ = release.await;
                 }
             }
-
-            // Remove old engine (drop releases the Tantivy write lock).
-            {
-                let mut shards = shard_manager
+            let key = ShardKey::new(&index, shard_id);
+            let per_shard_lock = {
+                let mut locks = shard_manager
+                    .open_locks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                locks.entry(key.clone()).or_default().clone()
+            };
+            let blocking_manager = shard_manager.clone();
+            tokio::task::spawn_blocking(move || {
+                let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+                {
+                    let shards = blocking_manager
+                        .shards
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(engine) = shards.get(&key) {
+                        let _ = engine.flush();
+                    }
+                }
+                blocking_manager
                     .shards
                     .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                shards.remove(&key);
-            }
-
-            // Reopen inline — do NOT call open_shard_with_settings() because it
-            // tries to acquire the same per_shard_lock (deadlock).
-            shard_manager.register_index_uuid(&index, &index_uuid);
-
-            let settings_mgr = shard_manager.ensure_settings_manager(&index, &settings);
-            let refresh_interval = settings_mgr.refresh_interval();
-            let refresh_rx = settings_mgr.watch_refresh_interval();
-            let flush_threshold_rx = settings_mgr.watch_flush_threshold();
-
-            let shard_dir = shard_manager
-                .data_dir
-                .join(&index_uuid)
-                .join(format!("shard_{shard_id}"));
-            std::fs::create_dir_all(&shard_dir)?;
-
-            let engine = shard_manager.open_composite_engine(
-                &index,
-                shard_id,
-                &shard_dir,
-                refresh_interval,
-                &mappings,
-                true,
-            )?;
-            CompositeEngine::start_refresh_loop_reactive(
-                engine.clone(),
-                refresh_rx,
-                flush_threshold_rx,
-            );
-
-            tracing::info!(
-                "Reopened shard engine for {}/{} at {:?}",
-                index,
-                shard_id,
-                shard_dir
-            );
-
-            let dyn_engine: Arc<dyn SearchEngine> = engine;
-            let mut shards = shard_manager
-                .shards
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            shards.insert(key, dyn_engine.clone());
-            Ok(dyn_engine)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+                blocking_manager.register_index_uuid(&index, &index_uuid);
+                let settings_mgr = blocking_manager.ensure_settings_manager(&index, &settings);
+                let refresh_interval = settings_mgr.refresh_interval();
+                let refresh_rx = settings_mgr.watch_refresh_interval();
+                let flush_threshold_rx = settings_mgr.watch_flush_threshold();
+                let shard_dir = blocking_manager
+                    .data_dir
+                    .join(&index_uuid)
+                    .join(format!("shard_{shard_id}"));
+                std::fs::create_dir_all(&shard_dir)?;
+                let engine = blocking_manager.open_composite_engine(
+                    &index,
+                    shard_id,
+                    &shard_dir,
+                    refresh_interval,
+                    &mappings,
+                    true,
+                )?;
+                CompositeEngine::start_refresh_loop_reactive(
+                    engine.clone(),
+                    refresh_rx,
+                    flush_threshold_rx,
+                );
+                tracing::info!(
+                    "Reopened shard engine for {}/{} at {:?}",
+                    index,
+                    shard_id,
+                    shard_dir
+                );
+                let dyn_engine: Arc<dyn SearchEngine> = engine;
+                blocking_manager
+                    .shards
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, dyn_engine.clone());
+                Ok(dyn_engine)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("blocking shard reopen task failed: {e}"))?
         })
         .await
-        .map_err(|e| anyhow::anyhow!("blocking shard reopen task failed: {e}"))?
+        .map_err(|e| anyhow::anyhow!("shard reopen task failed: {e}"))?
     }
 
     /// Get an already-open shard engine.

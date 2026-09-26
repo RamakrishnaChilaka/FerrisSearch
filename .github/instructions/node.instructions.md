@@ -94,6 +94,10 @@ pub struct Node {
   `ActivatePrimary` term bump. If no admission command was submitted, release
   the barrier first and bump asynchronously; after submission, keep the barrier
   until admission or the newer term is observed.
+- Remove-and-re-add of the same node while a finalized target is pending can
+  remain `Unknown`: routing has node IDs but no allocation IDs, so the target
+  cannot distinguish the old assignment from its replacement. Keep it pending
+  rather than guessing until allocation identity exists.
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every

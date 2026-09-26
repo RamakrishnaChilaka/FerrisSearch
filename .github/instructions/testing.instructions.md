@@ -97,6 +97,10 @@ cargo test -- test_name                         # Single test by name
   PrepareFinalize, settlement-safe idle reaping, queued index/bulk/delete after
   primary change, marker creation during open, live-generation reads after a
   failed manifest publish, and routing-update rejection before node removal.
+- Round-2 recovery regressions cover lock-free large-generation WAL scans,
+  one-shot setup error polling, stale-target replacement, cancelled reopen
+  during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary
+  changes during dynamic-mapping Raft work.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.

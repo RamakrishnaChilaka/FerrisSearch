@@ -93,6 +93,9 @@ pub async fn replicate_bulk(
   session on the shared-write path is a logic error and must fail the operation.
 - Start/reopen/delete share a per-shard lifecycle lock, so no new source session
   can capture the old engine between cleanup and engine replacement.
+- Pending-target reconciliation cannot safely resolve remove-and-re-add ABA
+  with node IDs alone. This is a known liveness limitation pending allocation
+  IDs; never wipe the caught-up copy based on guessed assignment identity.
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates but cannot grant membership.
