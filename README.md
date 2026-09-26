@@ -370,6 +370,9 @@ production ready**. The most important limits are:
 
 - A primary can mutate before replica acknowledgement fails; write retry and
   acknowledgement semantics need a formal contract.
+- A WAL `write_all` or `sync_data` failure does not yet fail-stop the shard.
+  Continuing writes after a partial frame can create middle corruption that a
+  later restart correctly rejects; automatic handling is future work.
 - `_seq_no` now reports the primary WAL assignment, but `_version` and
   `_primary_term` compatibility fields remain placeholders. Gap-aware
   checkpoints, primary epochs, idempotent retries, `if_seq_no` /

@@ -110,6 +110,10 @@ pub trait WriteAheadLog: Send + Sync {
   directory are fsynced before opening the append writer, and the discarded
   byte count is logged. Complete malformed frames, corrupt middle frames, and
   incomplete frames in retained non-active generations fail closed.
+- `HotTranslog::open*()` is a mutating, exclusive startup operation: it may
+  remove unreferenced generations and truncate an incomplete active tail.
+  Never call it against a shard with a live engine/writer. Runtime recovery and
+  diagnostics must read through the live engine's captured generation state.
 - Unknown operation tags in persisted entries are corruption errors: reopen/replay must return `Err`, not panic
 - Persist the manifest before deleting obsolete generation files during `truncate()` / `truncate_below()` so crashes never leave startup without authoritative generation metadata
 - `translog.committed` should be persisted after each intermediate replay batch commit so replay remains idempotent across repeated crash recovery
@@ -121,3 +125,11 @@ pub trait WriteAheadLog: Send + Sync {
 - Carry primary-assigned receipts through the engine and transport layers.
   Reading the allocator/checkpoint again after releasing the write lock cannot
   recover the identity of an earlier operation.
+
+## Known Write-Failure Limitation
+
+A failed `write_all` or `sync_data` does not yet fail-stop the shard. If the
+process continues writing after a partial WAL append, later frames can turn the
+incomplete tail into middle corruption that restart must reject. Do not weaken
+that rejection or claim this failure mode is repaired by startup tail
+truncation; durable fail-stop write handling remains separate work.

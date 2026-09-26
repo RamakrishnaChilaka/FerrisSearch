@@ -144,6 +144,12 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > last fully decoded frame and both file and directory are fsynced before
 > append; complete or middle corruption still fails closed.
 >
+> **Round-6 correction — September 26, 2026:** legacy `RecoverReplica` now
+> reads through the live engine's captured generation state. It never creates
+> a second `HotTranslog` on a live shard, so it cannot run startup tail repair
+> or unreferenced-generation deletion against an active writer. Test-only live
+> WAL inspections use the same non-mutating engine path.
+>
 > **Known liveness limit:** remove-and-re-add of a target node while its
 > finalized copy is awaiting membership can remain `Unknown`. Current routing
 > identifies copies by node ID, so the target cannot prove whether it is still
@@ -165,6 +171,12 @@ and the internal `_doc_id` / `_source` wrapper. The maximum usable `_source`
 therefore varies slightly with document ID and content. The 65 MiB decode-only
 ceiling exists solely so upgraded nodes can open and replay complete legacy
 frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
+
+**Known write-failure limit:** a failed WAL `write_all` or `sync_data` does not
+yet transition the shard into a fail-stopped state. If the process continues
+writing after a partial append, the torn frame can become middle corruption;
+restart then fails closed rather than skipping acknowledged history. Startup
+tail truncation repairs only a trailing incomplete frame with no later data.
 
 ## 3. Reference Protocols And Intentional Differences
 

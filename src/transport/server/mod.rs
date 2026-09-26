@@ -7,7 +7,6 @@ use crate::transport::proto::internal_transport_server::{
     InternalTransport, InternalTransportServer,
 };
 use crate::transport::proto::*;
-use crate::wal::WriteAheadLog;
 use futures::{FutureExt, Stream, stream};
 use openraft::type_config::async_runtime::WatchReceiver;
 use std::collections::{HashMap, HashSet};
@@ -1644,48 +1643,29 @@ impl InternalTransport for TransportService {
             req.index_name, req.shard_id, req.local_checkpoint
         );
 
-        // Read translog entries above the replica's checkpoint
-        // The engine's underlying HotEngine has the translog — we need to read ops from it.
-        // Since we can't access the translog directly through the SearchEngine trait,
-        // we replay by reading all entries and filtering.
-        // For now, use the WAL's read_from capability through the shard directory.
-        let shard_dir = match self
-            .shard_manager
-            .shard_data_dir(&req.index_name, req.shard_id)
-        {
-            Some(dir) => dir,
-            None => {
-                return Ok(Response::new(RecoverReplicaResponse {
-                    success: false,
-                    error: format!(
-                        "No UUID mapping for index '{}' — cannot locate shard directory",
-                        req.index_name
-                    ),
-                    ops_replayed: 0,
-                    primary_checkpoint: engine.local_checkpoint(),
-                    operations: vec![],
-                }));
-            }
-        };
-
-        let entries: Vec<crate::wal::TranslogEntry> = {
-            let shard_dir = shard_dir.clone();
-            let checkpoint = req.local_checkpoint;
+        let entries = if let Some(from_seq_no) = req.local_checkpoint.checked_add(1) {
+            let recovery_engine = engine.clone();
             match self
                 .worker_pools
-                .spawn_search(
-                    move || -> crate::common::Result<Vec<crate::wal::TranslogEntry>> {
-                        let tl = crate::wal::HotTranslog::open(&shard_dir)?;
-                        tl.read_from(checkpoint)
-                    },
-                )
+                .spawn_search(move || {
+                    recovery_engine.peer_recovery_ops(from_seq_no, usize::MAX, usize::MAX)
+                })
                 .await
             {
-                Ok(Ok(entries)) => entries,
+                Ok(Ok(batch)) if batch.complete => batch.operations,
+                Ok(Ok(_)) => {
+                    return Ok(Response::new(RecoverReplicaResponse {
+                        success: false,
+                        error: "Live recovery read did not reach the captured WAL head".to_string(),
+                        ops_replayed: 0,
+                        primary_checkpoint: engine.local_checkpoint(),
+                        operations: vec![],
+                    }));
+                }
                 Ok(Err(e)) => {
                     return Ok(Response::new(RecoverReplicaResponse {
                         success: false,
-                        error: format!("Failed to read translog: {e}"),
+                        error: format!("Failed to read live recovery operations: {e}"),
                         ops_replayed: 0,
                         primary_checkpoint: engine.local_checkpoint(),
                         operations: vec![],
@@ -1694,13 +1674,15 @@ impl InternalTransport for TransportService {
                 Err(e) => {
                     return Ok(Response::new(RecoverReplicaResponse {
                         success: false,
-                        error: format!("Translog read task failed: {e}"),
+                        error: format!("Live recovery read task failed: {e}"),
                         ops_replayed: 0,
                         primary_checkpoint: engine.local_checkpoint(),
                         operations: vec![],
                     }));
                 }
             }
+        } else {
+            Vec::new()
         };
 
         let ops_count = entries.len() as u64;

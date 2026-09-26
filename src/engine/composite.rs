@@ -112,6 +112,20 @@ impl CompositeEngine {
         &self.text
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_wal_append_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
+        self.text.set_wal_append_barrier_for_test(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_peer_recovery_read_started_sender_for_test(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.text
+            .set_peer_recovery_read_started_sender_for_test(sender);
+    }
+
     /// Start the background refresh loop for the text engine.
     /// Holds only a Weak reference so dropping the shard from the manager lets
     /// the old engine shut down cleanly before a reopen.

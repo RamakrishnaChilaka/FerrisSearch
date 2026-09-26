@@ -21,7 +21,6 @@ use ferrissearch::transport::proto::{
     ShardSearchRequest,
 };
 use ferrissearch::transport::server::create_transport_service_for_test;
-use ferrissearch::wal::{HotTranslog, WriteAheadLog};
 use futures::TryStreamExt;
 
 use std::collections::HashMap;
@@ -708,8 +707,12 @@ async fn replicate_doc_index_via_grpc() {
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["color"], "blue");
 
-    let tl = HotTranslog::open(sm.shard_data_dir("replica-idx", 0).unwrap()).unwrap();
-    let entries = tl.read_all().unwrap();
+    let entries = sm
+        .get_shard("replica-idx", 0)
+        .unwrap()
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].seq_no, 0);
 }
@@ -819,8 +822,12 @@ async fn replicate_bulk_via_grpc() {
         assert!(resp.found, "bulk-rep-{i} not found");
     }
 
-    let tl = HotTranslog::open(sm.shard_data_dir("bulk-rep-idx", 0).unwrap()).unwrap();
-    let entries = tl.read_all().unwrap();
+    let entries = sm
+        .get_shard("bulk-rep-idx", 0)
+        .unwrap()
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].seq_no, 0);
     assert_eq!(entries[1].seq_no, 1);
@@ -927,8 +934,12 @@ async fn primary_write_replicates_to_replica_node() {
     let source: serde_json::Value = serde_json::from_slice(&resp.source_json).unwrap();
     assert_eq!(source["message"], "hello from primary");
 
-    let tl = HotTranslog::open(replica_sm.shard_data_dir("replicated-idx", 0).unwrap()).unwrap();
-    let entries = tl.read_all().unwrap();
+    let entries = replica_sm
+        .get_shard("replicated-idx", 0)
+        .unwrap()
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].seq_no, 0);
 }
@@ -1179,8 +1190,12 @@ async fn primary_bulk_replicates_to_replica_node() {
         assert!(resp.found, "repl-bulk-{i} not replicated to replica");
     }
 
-    let tl = HotTranslog::open(replica_sm.shard_data_dir("bulk-repl-idx", 0).unwrap()).unwrap();
-    let entries = tl.read_all().unwrap();
+    let entries = replica_sm
+        .get_shard("bulk-repl-idx", 0)
+        .unwrap()
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
     assert_eq!(entries.len(), 5);
     assert_eq!(entries[0].seq_no, 0);
     assert_eq!(entries[4].seq_no, 4);
@@ -2681,7 +2696,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
+    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("receipt-cluster".into()));
     let primary_sm = Arc::new(ShardManager::new(
@@ -2803,10 +2818,13 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         receipts.keys().copied().collect::<Vec<_>>(),
         (0..41).collect::<Vec<_>>()
     );
-    for directory in [primary_dir.path(), replica_dir.path()] {
-        let wal =
-            HotTranslog::open(directory.join(format!("{index}-uuid")).join("shard_0")).unwrap();
-        let entries = wal.read_all().unwrap();
+    for shard_manager in [&primary_sm, &replica_sm] {
+        let entries = shard_manager
+            .get_shard(index, 0)
+            .unwrap()
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations;
         assert_eq!(entries.len(), receipts.len());
         let actual: std::collections::BTreeMap<_, _> = entries
             .into_iter()
@@ -2865,14 +2883,15 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
-    let wal = HotTranslog::open(
-        directory
-            .path()
-            .join(format!("{index}-uuid"))
-            .join("shard_0"),
-    )
-    .unwrap();
-    assert!(wal.read_all().unwrap().is_empty());
+    assert!(
+        shards
+            .get_shard(index, 0)
+            .unwrap()
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
     assert_eq!(shards.get_shard(index, 0).unwrap().doc_count(), 0);
 }
 

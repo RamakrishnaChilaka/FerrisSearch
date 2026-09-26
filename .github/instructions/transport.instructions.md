@@ -141,9 +141,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   return the current local high-water mark. Bulk apply rejects empty-range
   overflow, non-contiguous/out-of-order sequences, and non-index operations
   before mutation.
-- **recover_replica**: Read WAL entries via `read_from()`, return operations.
-  The RPC remains available for transport tests but the node lifecycle does not
-  use this partial suffix as recovery or admission.
+- **recover_replica**: Read the live engine's captured generation snapshot and
+  return operations above the requested checkpoint. Never construct a second
+  `HotTranslog` on the live shard directory: open performs startup repair and
+  unreferenced-generation cleanup. The RPC remains available for transport
+  tests but the node lifecycle does not use this partial suffix as recovery or
+  admission.
 - **peer recovery RPCs**: source sessions are UUID/target/primary-term bound,
   file chunks are at most 1 MiB, operation batches are bounded by count and
   bytes, and stale authority aborts the session. Prepare holds the exclusive

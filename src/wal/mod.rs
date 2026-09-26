@@ -249,6 +249,9 @@ pub trait WriteAheadLog: Send + Sync {
     #[cfg(test)]
     fn set_recovery_scan_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>);
 
+    #[cfg(test)]
+    fn set_append_frame_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>);
+
     /// Pin every operation at or above `min_seq_no` against truncation.
     fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64>;
 
@@ -851,6 +854,8 @@ pub struct HotTranslog {
     durability: TranslogDurability,
     #[cfg(test)]
     recovery_scan_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
+    #[cfg(test)]
+    append_frame_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
 }
 
 async fn sync_file_in_background(state: Arc<Mutex<TranslogState>>) -> std::io::Result<()> {
@@ -991,6 +996,8 @@ impl HotTranslog {
             durability,
             #[cfg(test)]
             recovery_scan_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            append_frame_barrier: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1296,6 +1303,20 @@ impl WriteAheadLog for HotTranslog {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
         let frame = encode_entry_borrowed(seq_no, op, &payload)?;
+        #[cfg(test)]
+        if let Some(barrier) =
+            recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier").take()
+        {
+            let split = frame.len().min(20);
+            state.active_file.write_all(&frame[..split])?;
+            state.active_file.flush()?;
+            barrier.wait();
+            barrier.wait();
+            state.active_file.write_all(&frame[split..])?;
+        } else {
+            state.active_file.write_all(&frame)?;
+        }
+        #[cfg(not(test))]
         state.active_file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
             state.active_file.sync_data()?;
@@ -1636,6 +1657,11 @@ impl WriteAheadLog for HotTranslog {
     #[cfg(test)]
     fn set_recovery_scan_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>) {
         *recover_lock(self.recovery_scan_barrier.as_ref(), "recovery scan barrier") = barrier;
+    }
+
+    #[cfg(test)]
+    fn set_append_frame_barrier(&self, barrier: Option<Arc<std::sync::Barrier>>) {
+        *recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier") = barrier;
     }
 
     fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64> {

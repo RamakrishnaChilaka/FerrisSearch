@@ -115,6 +115,8 @@ pub struct HotEngine {
     peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
     #[cfg(test)]
     peer_recovery_snapshot_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    #[cfg(test)]
+    peer_recovery_read_started_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     field_registry: RwLock<FieldRegistry>,
     /// The per-index refresh interval (e.g. 5s default, matches OpenSearch's index.refresh_interval)
     pub refresh_interval: Duration,
@@ -555,6 +557,8 @@ impl HotEngine {
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
+            #[cfg(test)]
+            peer_recovery_read_started_sender: Mutex::new(None),
             field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
@@ -1725,6 +1729,26 @@ impl HotEngine {
             Ok(())
         })
         .expect("set recovery scan barrier");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_wal_append_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
+        self.with_translog("set append frame barrier", |translog| {
+            translog.set_append_frame_barrier(Some(barrier));
+            Ok(())
+        })
+        .expect("set append frame barrier");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_peer_recovery_read_started_sender_for_test(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        *self
+            .peer_recovery_read_started_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
     }
 
     /// Shared search execution helper — returns _id + _source from each hit.
@@ -6066,6 +6090,15 @@ impl super::SearchEngine for HotEngine {
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
+        #[cfg(test)]
+        if let Some(sender) = self
+            .peer_recovery_read_started_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+        }
         let snapshot = self.with_translog("peer recovery operation snapshot", |translog| {
             translog.recovery_read_snapshot()
         })?;
@@ -6908,6 +6941,7 @@ mod tests {
             refresh_before_writer_sender: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
+            peer_recovery_read_started_sender: Mutex::new(None),
             field_registry: RwLock::new(FieldRegistry {
                 id_field,
                 source_field,

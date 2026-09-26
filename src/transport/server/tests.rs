@@ -18,6 +18,148 @@ fn test_remote_store_reader_cache() -> Arc<crate::engine::remote_store::RemoteSp
     Arc::new(crate::engine::remote_store::RemoteSplitReaderCache::default())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recover_replica_does_not_open_or_mutate_live_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let index_name = "recover-live";
+    let index_uuid = "recover-live-uuid";
+    let shard_dir = dir.path().join(index_uuid).join("shard_0");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    let engine = Arc::new(CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap());
+    engine.add_document("before", json!({"value": 0})).unwrap();
+
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager.register_index_uuid(index_name, index_uuid);
+    shard_manager.insert_shard_for_test(index_name, 0, engine.clone());
+
+    let mut cluster_state = DomainClusterState::new("recover-live-cluster".into());
+    cluster_state.add_node(DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9300,
+        http_port: 9200,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    cluster_state.add_index(DomainIndexMetadata {
+        name: index_name.into(),
+        uuid: crate::cluster::state::IndexUuid::new(index_uuid),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 1,
+                replicas: Vec::new(),
+                in_sync_replicas: Vec::new(),
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+    let cluster_manager = Arc::new(ClusterManager::new(cluster_state.cluster_name.clone()));
+    cluster_manager.update_state(cluster_state);
+    let peer_recovery_state = peer_recovery::new_peer_recovery_transport_state();
+    shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
+    let service = TransportService {
+        cluster_manager,
+        shard_manager: shard_manager.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state,
+        join_lock: new_join_lock(),
+    };
+
+    let generation_path = shard_dir.join("translog-00000000000000000000.bin");
+    let valid_length = std::fs::metadata(&generation_path).unwrap().len();
+    let append_barrier = Arc::new(std::sync::Barrier::new(2));
+    engine.set_wal_append_barrier_for_test(append_barrier.clone());
+    let writer_engine = engine.clone();
+    let writer = std::thread::spawn(move || {
+        writer_engine.add_document_with_receipt("during", json!({"value": 1}))
+    });
+    append_barrier.wait();
+    let partial_length = std::fs::metadata(&generation_path).unwrap().len();
+    assert!(partial_length > valid_length);
+
+    let (read_started_tx, read_started_rx) = tokio::sync::oneshot::channel();
+    engine.set_peer_recovery_read_started_sender_for_test(read_started_tx);
+    let recover_service = service.clone();
+    let mut recover = tokio::spawn(async move {
+        recover_service
+            .recover_replica(Request::new(RecoverReplicaRequest {
+                index_name: index_name.into(),
+                shard_id: 0,
+                local_checkpoint: 0,
+            }))
+            .await
+    });
+    let early_result = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            read_started = read_started_rx => {
+                read_started.expect("live recovery read signal was dropped");
+                None
+            }
+            result = &mut recover => Some(result)
+        }
+    })
+    .await
+    .expect("RecoverReplica reached neither live read nor an early response");
+    let observed_length = std::fs::metadata(&generation_path).unwrap().len();
+
+    append_barrier.wait();
+    let receipt = tokio::task::spawn_blocking(move || writer.join().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let completed_early = early_result.is_some();
+    let response = match early_result {
+        Some(result) => result.unwrap().unwrap().into_inner(),
+        None => recover.await.unwrap().unwrap().into_inner(),
+    };
+    let final_length = std::fs::metadata(&generation_path).unwrap().len();
+
+    assert_eq!(
+        observed_length, partial_length,
+        "RecoverReplica truncated the live append from {partial_length} to {observed_length} bytes"
+    );
+    assert!(
+        !completed_early,
+        "RecoverReplica completed without entering the live engine recovery path"
+    );
+    assert!(final_length > partial_length);
+    assert!(
+        response.success,
+        "RecoverReplica failed: {}",
+        response.error
+    );
+    assert_eq!(
+        response
+            .operations
+            .iter()
+            .map(|operation| operation.seq_no)
+            .collect::<Vec<_>>(),
+        [receipt.seq_no]
+    );
+
+    drop(service);
+    drop(shard_manager);
+    drop(engine);
+    let reopened = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+    assert!(reopened.get_document("before").unwrap().is_some());
+    assert!(reopened.get_document("during").unwrap().is_some());
+}
+
 fn make_full_cluster_state() -> DomainClusterState {
     let mut cs = DomainClusterState::new("roundtrip-cluster".into());
     cs.version = 42;

@@ -113,6 +113,10 @@ cargo test -- test_name                         # Single test by name
   compatibility, the retained 32 MiB recovery-transfer ceiling, exact
   final-generation/captured-size handling for in-progress appends, durable
   active-tail truncation before append, and fail-closed middle corruption.
+- Round-6 recovery coverage pauses a real live WAL append mid-frame and calls
+  legacy `RecoverReplica`; the RPC must wait for and read through the live
+  engine, never truncate/delete files through a second `HotTranslog::open`, and
+  a subsequent engine reopen must replay every acknowledged frame.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.

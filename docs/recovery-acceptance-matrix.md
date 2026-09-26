@@ -230,6 +230,18 @@ Round-5 evidence adds
 `bounded_range_rejects_torn_terminal_frame_followed_by_append`, and the
 `wal_frame_limit_*` write-boundary tests.
 
+Round-6 evidence adds
+`transport::server::tests::recover_replica_does_not_open_or_mutate_live_wal`.
+It deterministically pauses a live append after a partial frame is visible,
+starts legacy `RecoverReplica`, verifies the RPC enters the live engine read
+path without shrinking the file, then proves the completed append and all
+acknowledged documents survive engine reopen.
+
+The non-blocking WAL write-failure case remains unimplemented: a partial
+`write_all` or failed `sync_data` does not yet fail-stop the shard, so later
+writes could convert a repairable trailing fragment into fail-closed middle
+corruption. This is separate from the closed startup-tail and live-read cases.
+
 The remove-and-re-add ABA case remains a documented liveness limitation:
 without allocation IDs, a finalized pending target cannot distinguish the old
 assignment from a replacement assignment and may remain `INITIALIZING`.
