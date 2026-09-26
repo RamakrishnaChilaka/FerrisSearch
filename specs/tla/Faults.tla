@@ -75,7 +75,7 @@ Crash(node) ==
             routing, epoch, nextWrite, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, durableOps, committed, truncBelow,
-            copyExists, acked, promotionSafe, admissionSafe,
+            copyExists, copyAllocation, acked, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, diskLost, partitionCount,
             faultsStopped, lifecyclePhase>>
 
@@ -93,7 +93,8 @@ Restart(node) ==
           <<RaftVars, routing, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation,
+            copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -116,7 +117,8 @@ PartitionMetadata(node) ==
             nextWrite, writeStatus, writeDoc, writeKind, writeTarget,
             writePrimary, writeEpoch, writeSeq, writeTerm, writeRequired,
             writeWait, ops, durableOps, docValue, nextSeq, committed,
-            truncBelow, pins, copyExists, copyMode, installMarker, messages,
+            truncBelow, pins, copyExists, copyAllocation, copyMode,
+            installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
             diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -132,7 +134,8 @@ HealMetadata(node) ==
             nextWrite, writeStatus, writeDoc, writeKind, writeTarget,
             writePrimary, writeEpoch, writeSeq, writeTerm, writeRequired,
             writeWait, ops, durableOps, docValue, nextSeq, committed,
-            truncBelow, pins, copyExists, copyMode, installMarker, messages,
+            truncBelow, pins, copyExists, copyAllocation, copyMode,
+            installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
             diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -148,7 +151,8 @@ LoseMsg(message) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation,
+            copyMode, installMarker,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
             diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -244,7 +248,8 @@ SuspectAndRemove(leader, node, candidate) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation,
+            copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -320,7 +325,8 @@ ProposeRemoveNode(leader, node) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation,
+            copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -354,7 +360,8 @@ Rejoin(node) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation,
+            copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -403,7 +410,8 @@ AllocateAfterLifecycle(leader, target) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation,
+            copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -449,7 +457,8 @@ Flush(node) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, docValue, nextSeq, pins,
-            copyExists, copyMode, installMarker, messages, sharedHolders,
+            copyExists, copyAllocation, copyMode, installMarker, messages,
+            sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
             faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -470,6 +479,7 @@ DiskLoss(node) ==
     /\ nextSeq' = [nextSeq EXCEPT ![node] = 0]
     /\ committed' = [committed EXCEPT ![node] = 0]
     /\ truncBelow' = [truncBelow EXCEPT ![node] = 0]
+    /\ copyAllocation' = [copyAllocation EXCEPT ![node] = 0]
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -489,6 +499,10 @@ OpenAssignedEmptyCopy(node) ==
     /\ alive[node]
     /\ ~copyExists[node]
     /\ node = routing.primary \/ node \in routing.replicas
+    /\ IF AllocationIds
+          THEN /\ copyAllocation[node] > 0
+               /\ copyAllocation[node] = routing.allocations[node]
+          ELSE TRUE
     /\ copyExists' = [copyExists EXCEPT ![node] = TRUE]
     /\ copyMode' = [copyMode EXCEPT ![node] = "Active"]
     /\ installMarker' = [installMarker EXCEPT ![node] = FALSE]
@@ -497,7 +511,7 @@ OpenAssignedEmptyCopy(node) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, messages, sharedHolders,
+            committed, truncBelow, pins, copyAllocation, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
             faultsStopped, lifecyclePhase, PeerRecoveryVars>>

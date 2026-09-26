@@ -40,7 +40,7 @@ C2ReplicationNext ==
 
 C2Next ==
     \/ /\ C2ReplicationNext
-       /\ UNCHANGED <<PeerRecoveryVars, FaultVars>>
+       /\ UNCHANGED <<copyAllocation, PeerRecoveryVars, FaultVars>>
     \/ PartitionMetadata(PrimaryNode)
     \/ SuspectAndRemove(MetadataLeader, PrimaryNode, MetadataLeader)
 

@@ -76,6 +76,7 @@ VARIABLES
     truncBelow,
     pins,
     copyExists,
+    copyAllocation,
     copyMode,
     installMarker,
     messages,
@@ -93,7 +94,7 @@ ReplicationVars ==
       nextWrite, writeStatus, writeDoc, writeKind, writeTarget, writePrimary,
       writeEpoch, writeSeq, writeTerm, writeRequired, writeWait, ops,
       durableOps, docValue, nextSeq, committed, truncBelow, pins, copyExists,
-      copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
+      copyAllocation, copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
       acked, failed, promotionSafe, admissionSafe, ackMembershipSafe,
       termMonotonic>>
 
@@ -143,6 +144,11 @@ WriteMessages(writeId) ==
 
 BlocksLiveReplication(node) ==
     copyMode[node] \in {"Recovering", "InstallMarker"}
+
+CopyAssignmentValid(node) ==
+    \/ ~AllocationIds
+    \/ /\ copyAllocation[node] > 0
+       /\ copyAllocation[node] = views[node].allocations[node]
 
 LiveConnectedVoters ==
     {node \in raftVoters : alive[node] /\ raftConnected[node]}
@@ -204,6 +210,8 @@ ReplicationInit ==
           /\ truncBelow = [n \in Nodes |-> 0]
           /\ pins = [n \in Nodes |-> {}]
           /\ copyExists = [n \in Nodes |-> TRUE]
+          /\ copyAllocation =
+                [n \in Nodes |-> initialRouting.allocations[n]]
           /\ copyMode = [n \in Nodes |-> "Active"]
           /\ installMarker = [n \in Nodes |-> FALSE]
           /\ messages = {}
@@ -248,6 +256,7 @@ CanPrimaryAccept(writeId) ==
     /\ primaryNode \in Nodes
     /\ alive[primaryNode]
     /\ copyExists[primaryNode]
+    /\ CopyAssignmentValid(primaryNode)
     /\ views[primaryNode].primary = primaryNode
     /\ activated[primaryNode] = views[primaryNode].term
     /\ exclusiveHolder[primaryNode] = NoNode
@@ -322,6 +331,7 @@ ReplicaApply(message) ==
     /\ message.kind = "Replicate"
     /\ alive[replica]
     /\ copyExists[replica]
+    /\ CopyAssignmentValid(replica)
     /\ epoch[replica] = message.toEpoch
     /\ epoch[message.from] = message.fromEpoch
     /\ ~BlocksLiveReplication(replica)
@@ -649,6 +659,7 @@ ReplicationTypeOK ==
     /\ truncBelow \in [Nodes -> 0..MaxWrites]
     /\ pins \in [Nodes -> SUBSET (0..MaxWrites)]
     /\ copyExists \in [Nodes -> BOOLEAN]
+    /\ copyAllocation \in [Nodes -> 0..MaxAllocationId]
     /\ copyMode \in [Nodes -> CopyModes]
     /\ installMarker \in [Nodes -> BOOLEAN]
     /\ messages \subseteq
@@ -669,18 +680,19 @@ ReplicationTypeOK ==
     /\ termMonotonic \in BOOLEAN
 
 ReplicationNext ==
-    \/ \E coordinator \in Nodes, doc \in Docs, kind \in WriteKinds :
-           ClientWrite(coordinator, doc, kind)
-    \/ \E writeId \in WriteIds : PrimaryAccept(writeId)
-    \/ \E writeId \in WriteIds : PrimaryReject(writeId)
-    \/ \E message \in messages : ReplicaApply(message)
-    \/ \E message \in messages : DeliverReplicaAck(message)
-    \/ \E writeId \in WriteIds : PrimaryAck(writeId)
-    \/ \E writeId \in WriteIds : PrimaryFail(writeId)
-    \/ \E node \in Nodes : ProposeActivate(node)
-    \/ \E node \in Nodes : ObserveActivation(node)
-    \/ \E node \in Nodes : CancelActivation(node)
-    \/ \E command \in pendingRaft : CommitRaft(command)
-    \/ \E node \in Nodes : DeliverView(node)
+    /\ UNCHANGED copyAllocation
+    /\ \/ \E coordinator \in Nodes, doc \in Docs, kind \in WriteKinds :
+              ClientWrite(coordinator, doc, kind)
+       \/ \E writeId \in WriteIds : PrimaryAccept(writeId)
+       \/ \E writeId \in WriteIds : PrimaryReject(writeId)
+       \/ \E message \in messages : ReplicaApply(message)
+       \/ \E message \in messages : DeliverReplicaAck(message)
+       \/ \E writeId \in WriteIds : PrimaryAck(writeId)
+       \/ \E writeId \in WriteIds : PrimaryFail(writeId)
+       \/ \E node \in Nodes : ProposeActivate(node)
+       \/ \E node \in Nodes : ObserveActivation(node)
+       \/ \E node \in Nodes : CancelActivation(node)
+       \/ \E command \in pendingRaft : CommitRaft(command)
+       \/ \E node \in Nodes : DeliverView(node)
 
 =============================================================================

@@ -74,6 +74,21 @@ NoPartialServe ==
             /\ node \notin routing.inSync
             /\ BlocksLiveReplication(node)
 
+BarrierReleased ==
+    \A node \in Nodes :
+        (exclusiveHolder[node] # NoNode)
+        ~> (exclusiveHolder[node] = NoNode)
+
+RecoveryConverges ==
+    \A node \in Nodes :
+        (node \in routing.replicas)
+        ~> (node \in routing.inSync \/ node = routing.primary)
+
+PendingResolves ==
+    \A node \in Nodes :
+        (copyMode[node] = "Pending")
+        ~> (copyMode[node] # "Pending")
+
 SafetyConstraint ==
     /\ Len(raftLog) <= MaxRaftEntries
     /\ Cardinality(pendingRaft) <= MaxPendingRaft

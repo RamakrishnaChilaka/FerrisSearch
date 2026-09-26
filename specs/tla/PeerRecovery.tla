@@ -394,6 +394,8 @@ InstallSnapshot(target) ==
     /\ truncBelow' =
           [truncBelow EXCEPT ![target] = sessionBoundary[target]]
     /\ copyExists' = [copyExists EXCEPT ![target] = TRUE]
+    /\ copyAllocation' =
+          [copyAllocation EXCEPT ![target] = sessionAllocation[target]]
     /\ installMarker' = [installMarker EXCEPT ![target] = FALSE]
     /\ sessionPhase' =
           [sessionPhase EXCEPT ![target] = "CatchingUp"]
@@ -855,69 +857,69 @@ PeerRecoveryNext ==
     \/ \E target \in Nodes, source \in Nodes : StartRecovery(target, source)
     \/ \E target \in Nodes :
            /\ SourceSnapshot(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ SourceSetupFailure(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ PollSetupFailure(target)
-           /\ UNCHANGED pendingAllocation
+           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ TargetBeginInstall(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ InstallSnapshot(target)
            /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ FetchOps(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ApplyOps(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ FinishCatchUp(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ BeginPrepareFinalize(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ CancelPrepareFinalize(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ AcquireFinalizeBarrier(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ FinishFinalizeTail(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ TargetComplete(target)
-           /\ UNCHANGED sessionAllocation
+           /\ UNCHANGED <<copyAllocation, sessionAllocation>>
     \/ \E target \in Nodes :
            /\ BeginSettlement(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ProposeMarkInSync(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ SettlementDeadline(target)
-           /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ObserveAdmission(target)
-           /\ UNCHANGED pendingAllocation
+           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ TargetObserveAdmitted(target)
-           /\ UNCHANGED sessionAllocation
+           /\ UNCHANGED <<copyAllocation, sessionAllocation>>
     \/ \E target \in Nodes :
            /\ TargetObserveRejected(target)
-           /\ UNCHANGED sessionAllocation
+           /\ UNCHANGED <<copyAllocation, sessionAllocation>>
     \/ \E target \in Nodes :
            /\ AbortSession(target)
-           /\ UNCHANGED pendingAllocation
+           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ExpireSession(target)
-           /\ UNCHANGED pendingAllocation
+           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ExpireFinalizeWithoutMark(target)
-           /\ UNCHANGED pendingAllocation
+           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
 
 =============================================================================

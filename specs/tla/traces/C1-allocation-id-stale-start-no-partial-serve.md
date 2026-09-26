@@ -41,5 +41,5 @@ observation cannot mistake the old ID 1 for a newer conflicting assignment.
 A subsequent missing or changed ID remains a definitive rejection.
 
 The model now implements that target-to-source handshake. Under the same
-three-node crash/rejoin bounds, `MC_C1_ABA_fixed.cfg` explores 713,208 distinct
+three-node crash/rejoin bounds, `MC_C1_ABA_fixed.cfg` explores 713,276 distinct
 states to depth 45 without a safety violation.
