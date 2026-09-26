@@ -105,6 +105,10 @@ cargo test -- test_name                         # Single test by name
   both lifecycle and per-shard-lock boundaries, setup panic completion,
   unrelated finalize settlement during long hashing, and torn/oversized WAL
   frames at the captured recovery head.
+- Round-4 recovery regressions cover delete during the reopen open-window,
+  missing existing Tantivy metadata, same-term index UUID replacement,
+  partially visible post-head WAL appends, the 32 MiB frame boundary on every
+  WAL write API, and HTTP 503 mapping with attributable bulk failures.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.

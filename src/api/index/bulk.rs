@@ -35,6 +35,15 @@ impl BulkTargetFailure {
             reason,
         }
     }
+
+    pub(super) fn from_forward_error(error: anyhow::Error) -> Self {
+        let (status, error_type) = forwarded_write_error_classification(&error);
+        Self {
+            status,
+            error_type,
+            reason: error.to_string(),
+        }
+    }
 }
 
 type BulkTargetResults = HashMap<BulkTargetKey, Result<u64, BulkTargetFailure>>;
@@ -173,16 +182,7 @@ async fn forward_bulk_batches(
                 outcomes.insert(key, Ok(start_seq_no));
             }
             Ok(Err(e)) => {
-                let failure = if is_document_validation_error(&e) {
-                    BulkTargetFailure {
-                        status: StatusCode::BAD_REQUEST,
-                        error_type: "mapper_parsing_exception",
-                        reason: e.to_string(),
-                    }
-                } else {
-                    BulkTargetFailure::internal(e.to_string())
-                };
-                outcomes.insert(key, Err(failure));
+                outcomes.insert(key, Err(BulkTargetFailure::from_forward_error(e)));
             }
             Err(join_err) => {
                 outcomes.insert(

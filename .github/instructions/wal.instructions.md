@@ -66,6 +66,11 @@ pub trait WriteAheadLog: Send + Sync {
   compatibility wrapper.
 - Primary sequence exhaustion and overflowing explicit bulk ranges must fail
   before any bytes are written; never wrap or reuse a saturated allocator value.
+- `MAX_WAL_FRAME_BYTES` is 32 MiB including the four-byte length prefix. Every
+  single, delete, primary-bulk item, and explicit-sequence replica/recovery item
+  is fully encoded and checked before any WAL bytes or sequence state change.
+  The effective `_source` limit is slightly smaller because the encoded frame
+  also contains `_doc_id`, `_source`, operation, sequence, and bincode metadata.
 - `append_with_seq()` persists a caller-supplied seq_no and advances the local allocator past it
 - `write_bulk_with_start_seq()` persists contiguous caller-supplied seq_nos for replica/recovery bulk apply
 - `read_from(seq_no)` scans all generations in order and returns entries with seq_no > the given value (used for replica recovery)
@@ -82,9 +87,13 @@ pub trait WriteAheadLog: Send + Sync {
   the translog state lock, not a potentially lagging on-disk manifest.
 - The lock protects only capture and validation of the exclusive head and
   generation-list clone. File scanning runs after releasing it. Recovery scans
-  reject payload lengths beyond the remaining file or the 64 MiB frame cap,
-  fully decode the frame that reaches the captured head, and use relative seeks
-  to skip bounded pre-cursor frames after decoding only their sequence prefix.
+  use the same 32 MiB total-frame cap, fully decode a complete frame that reaches
+  the captured head, and use relative seeks to skip bounded pre-cursor frames
+  after decoding only their sequence prefix. A partial frame whose decoded
+  sequence is at or beyond the captured head is a concurrent append and ends
+  the scan cleanly; a frame below the head that extends past EOF is corruption,
+  while an incomplete sequence prefix is treated as EOF and cannot report
+  completion until every pre-head operation was read.
 - `initialize_empty_at()` creates the empty target WAL/high-water state at a
   file snapshot's exclusive boundary.
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths

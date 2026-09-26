@@ -45,7 +45,14 @@ const TRANSLOG_SEQNO_FILE: &str = "translog.seqno";
 const TRANSLOG_FILE_PREFIX: &str = "translog-";
 const TRANSLOG_FILE_SUFFIX: &str = ".bin";
 const TRANSLOG_GENERATION_WIDTH: usize = 20;
-const MAX_TRANSLOG_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_WAL_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("WAL frame is {frame_bytes} bytes, exceeding maximum {max_bytes} bytes")]
+pub(crate) struct WalFrameTooLargeError {
+    frame_bytes: usize,
+    max_bytes: usize,
+}
 
 /// The type of WAL operation.
 ///
@@ -253,12 +260,7 @@ pub trait WriteAheadLog: Send + Sync {
 #[cfg(test)]
 fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
     let wire = WireEntry::from_translog(entry)?;
-    let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
-    let len = encoded.len() as u32;
-    let mut frame = Vec::with_capacity(4 + encoded.len());
-    frame.extend_from_slice(&len.to_le_bytes());
-    frame.extend_from_slice(&encoded);
-    Ok(frame)
+    encode_wire_entry(&wire)
 }
 
 /// Encode directly from borrowed values — avoids cloning the payload.
@@ -272,9 +274,24 @@ fn encode_entry_borrowed(
         op: op.as_str().to_string(),
         payload_json: serde_json::to_string(payload)?,
     };
-    let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)?;
-    let len = encoded.len() as u32;
-    let mut frame = Vec::with_capacity(4 + encoded.len());
+    encode_wire_entry(&wire)
+}
+
+fn encode_wire_entry(wire: &WireEntry) -> Result<Vec<u8>> {
+    let encoded = bincode_next::serde::encode_to_vec(wire, BINCODE_CONFIG)?;
+    let frame_bytes = 4usize
+        .checked_add(encoded.len())
+        .ok_or_else(|| anyhow::anyhow!("WAL frame length overflow"))?;
+    if frame_bytes > MAX_WAL_FRAME_BYTES {
+        return Err(WalFrameTooLargeError {
+            frame_bytes,
+            max_bytes: MAX_WAL_FRAME_BYTES,
+        }
+        .into());
+    }
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| anyhow::anyhow!("WAL frame payload length exceeds u32"))?;
+    let mut frame = Vec::with_capacity(frame_bytes);
     frame.extend_from_slice(&len.to_le_bytes());
     frame.extend_from_slice(&encoded);
     Ok(frame)
@@ -302,6 +319,16 @@ fn read_next_entry<R: Read>(reader: &mut R) -> Result<Option<(TranslogEntry, usi
         Err(e) => return Err(e.into()),
     }
     let payload_len = u32::from_le_bytes(len_buf) as usize;
+    let frame_bytes = 4usize
+        .checked_add(payload_len)
+        .ok_or_else(|| anyhow::anyhow!("WAL frame length overflow"))?;
+    if frame_bytes > MAX_WAL_FRAME_BYTES {
+        return Err(WalFrameTooLargeError {
+            frame_bytes,
+            max_bytes: MAX_WAL_FRAME_BYTES,
+        }
+        .into());
+    }
     let mut payload_buf = vec![0u8; payload_len];
     match reader.read_exact(&mut payload_buf) {
         Ok(()) => {}
@@ -316,7 +343,7 @@ fn read_next_entry<R: Read>(reader: &mut R) -> Result<Option<(TranslogEntry, usi
     }
     let (wire, _): (WireEntry, _) =
         bincode_next::serde::decode_from_slice(&payload_buf, BINCODE_CONFIG)?;
-    Ok(Some((wire.into_translog()?, 4 + payload_len)))
+    Ok(Some((wire.into_translog()?, frame_bytes)))
 }
 
 fn decode_wire_seq_no(prefix: &[u8]) -> Result<u64> {
@@ -922,6 +949,7 @@ impl HotTranslog {
 
         let mut entries = Vec::new();
         let mut bytes = 0usize;
+        let mut read_through_head = false;
         #[cfg(test)]
         let mut scan_barrier = scan_barrier;
 
@@ -947,17 +975,28 @@ impl HotTranslog {
             }
             loop {
                 let mut len_buf = [0u8; 4];
-                match reader.read_exact(&mut len_buf) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        break;
+                let mut len_read = 0usize;
+                while len_read < len_buf.len() {
+                    match reader.read(&mut len_buf[len_read..]) {
+                        Ok(0) => break,
+                        Ok(read) => len_read += read,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error.into()),
                     }
-                    Err(error) => return Err(error.into()),
+                }
+                if len_read == 0 {
+                    break;
+                }
+                if len_read < len_buf.len() {
+                    return Ok((entries, read_through_head));
                 }
                 let payload_len = u32::from_le_bytes(len_buf) as usize;
-                if payload_len > MAX_TRANSLOG_FRAME_PAYLOAD_BYTES {
+                let frame_bytes = 4usize
+                    .checked_add(payload_len)
+                    .ok_or_else(|| anyhow::anyhow!("translog frame length overflow"))?;
+                if frame_bytes > MAX_WAL_FRAME_BYTES {
                     anyhow::bail!(
-                        "translog frame payload length {payload_len} exceeds maximum {MAX_TRANSLOG_FRAME_PAYLOAD_BYTES}"
+                        "translog frame length {frame_bytes} exceeds maximum {MAX_WAL_FRAME_BYTES}"
                     );
                 }
                 let payload_start = reader.stream_position()?;
@@ -965,16 +1004,25 @@ impl HotTranslog {
                     .checked_add(payload_len as u64)
                     .ok_or_else(|| anyhow::anyhow!("translog frame offset overflow"))?;
                 let file_len = reader.get_ref().metadata()?.len();
-                if frame_end > file_len {
-                    anyhow::bail!(
-                        "translog frame payload length {payload_len} exceeds generation length"
-                    );
-                }
                 let prefix_len = payload_len.min(16);
                 let mut prefix = vec![0u8; prefix_len];
-                reader.read_exact(&mut prefix)?;
+                match reader.read_exact(&mut prefix) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return Ok((entries, read_through_head));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 let seq_no = decode_wire_seq_no(&prefix)?;
                 let remaining = payload_len - prefix_len;
+                if frame_end > file_len {
+                    if seq_no >= end_seq_no {
+                        return Ok((entries, true));
+                    }
+                    anyhow::bail!(
+                        "translog frame for seq_no {seq_no} extends past generation length"
+                    );
+                }
                 if seq_no >= end_seq_no {
                     decode_wire_entry_with_prefix(&mut reader, prefix, payload_len, seq_no)?
                         .into_translog()?;
@@ -984,7 +1032,6 @@ impl HotTranslog {
                     reader.seek_relative(remaining as i64)?;
                     continue;
                 }
-                let frame_bytes = 4 + payload_len;
                 if entries.len() >= max_ops
                     || bytes
                         .checked_add(frame_bytes)
@@ -1000,10 +1047,13 @@ impl HotTranslog {
                 let wire = decode_wire_entry_with_prefix(&mut reader, prefix, payload_len, seq_no)?;
                 bytes += frame_bytes;
                 entries.push(wire.into_translog()?);
+                read_through_head = seq_no
+                    .checked_add(1)
+                    .is_some_and(|next_seq_no| next_seq_no >= end_seq_no);
             }
         }
 
-        Ok((entries, true))
+        Ok((entries, read_through_head))
     }
 
     /// Start a background task that periodically fsyncs the translog file.
@@ -1520,11 +1570,42 @@ mod tests {
     use serde_json::json;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    const TEST_MAX_WAL_FRAME_BYTES: usize = 32 * 1024 * 1024;
+    static WAL_FRAME_LIMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// Helper: create a translog in a fresh temp directory.
     fn open_translog() -> (tempfile::TempDir, HotTranslog) {
         let dir = tempfile::tempdir().unwrap();
         let tl = HotTranslog::open(dir.path()).unwrap();
         (dir, tl)
+    }
+
+    fn encoded_frame_len(seq_no: u64, op: WalOperation, payload: &serde_json::Value) -> usize {
+        let wire = WireEntry {
+            seq_no,
+            op: op.as_str().to_string(),
+            payload_json: serde_json::to_string(payload).unwrap(),
+        };
+        4 + bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
+            .unwrap()
+            .len()
+    }
+
+    fn payload_for_frame_len(seq_no: u64, op: WalOperation, target: usize) -> serde_json::Value {
+        let mut string_len = target.saturating_sub(128);
+        for _ in 0..8 {
+            let payload = json!({"blob": "x".repeat(string_len)});
+            let actual = encoded_frame_len(seq_no, op, &payload);
+            if actual == target {
+                return payload;
+            }
+            if actual < target {
+                string_len += target - actual;
+            } else {
+                string_len -= actual - target;
+            }
+        }
+        panic!("could not construct a WAL frame with exact length {target}");
     }
 
     fn generation_file_names(dir: &Path) -> Vec<String> {
@@ -1619,6 +1700,96 @@ mod tests {
             .is_err()
         );
         assert!(wal.read_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wal_frame_limit_is_inclusive_for_single_append() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let allowed = payload_for_frame_len(0, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES);
+        wal.append(WalOperation::Index, allowed).unwrap();
+        assert_eq!(wal.next_seq_no(), 1);
+        assert_eq!(wal.size_bytes().unwrap(), TEST_MAX_WAL_FRAME_BYTES as u64);
+
+        let oversized = payload_for_frame_len(1, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES + 1);
+        let before_size = wal.size_bytes().unwrap();
+        let error = wal.append(WalOperation::Index, oversized).unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("exceeding maximum"),
+            "unexpected WAL frame limit error: {error_chain}"
+        );
+        assert_eq!(wal.next_seq_no(), 1);
+        assert_eq!(wal.size_bytes().unwrap(), before_size);
+    }
+
+    #[test]
+    fn wal_frame_limit_rejects_primary_bulk_item_before_mutation() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let oversized = payload_for_frame_len(1, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES + 1);
+        let ops = vec![
+            (WalOperation::Index, json!({"value": 0})),
+            (WalOperation::Index, oversized),
+        ];
+
+        let (_directory, wal) = open_translog();
+        assert!(wal.write_bulk_with_receipt(&ops).is_err());
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+
+        let (_directory, wal) = open_translog();
+        assert!(wal.append_bulk(&ops).is_err());
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn wal_frame_limit_rejects_explicit_seq_before_mutation() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let oversized = payload_for_frame_len(7, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES + 1);
+        assert!(
+            wal.append_with_seq(7, WalOperation::Index, oversized)
+                .is_err()
+        );
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn wal_frame_limit_rejects_explicit_bulk_item_before_mutation() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let oversized =
+            payload_for_frame_len(11, WalOperation::Index, TEST_MAX_WAL_FRAME_BYTES + 1);
+        let ops = vec![
+            (WalOperation::Index, json!({"value": 0})),
+            (WalOperation::Index, oversized),
+        ];
+        assert!(wal.write_bulk_with_start_seq(10, &ops).is_err());
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn wal_frame_limit_rejects_delete_before_mutation() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let oversized =
+            payload_for_frame_len(0, WalOperation::Delete, TEST_MAX_WAL_FRAME_BYTES + 1);
+        assert!(wal.append(WalOperation::Delete, oversized).is_err());
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
     }
 
     #[test]
@@ -1997,14 +2168,60 @@ mod tests {
     }
 
     #[test]
+    fn bounded_range_treats_partial_post_head_frame_as_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = generation_path(dir.path(), 0);
+        let first = encode_entry(&TranslogEntry {
+            seq_no: 0,
+            op: WalOperation::Index,
+            payload: json!({"value": 0}),
+        })
+        .unwrap();
+        let second = encode_entry(&TranslogEntry {
+            seq_no: 1,
+            op: WalOperation::Index,
+            payload: json!({"value": 1}),
+        })
+        .unwrap();
+        let post_head = encode_entry(&TranslogEntry {
+            seq_no: 2,
+            op: WalOperation::Index,
+            payload: json!({"value": "x".repeat(8192)}),
+        })
+        .unwrap();
+        let mut bytes = first;
+        bytes.extend_from_slice(&second);
+        bytes.extend_from_slice(&post_head[..4 + 4096]);
+        fs::write(&path, &bytes).unwrap();
+        let generation = GenerationInfo {
+            id: 0,
+            path,
+            first_seq_no: Some(0),
+            last_seq_no: Some(1),
+            size_bytes: bytes.len() as u64,
+        };
+
+        let (entries, complete) = HotTranslog::read_bounded_range_from_generations(
+            &[generation],
+            0,
+            2,
+            16,
+            usize::MAX,
+            None,
+        )
+        .unwrap();
+        assert!(complete);
+        assert_eq!(
+            entries.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
     fn bounded_range_rejects_oversized_frame_payload() {
         let dir = tempfile::tempdir().unwrap();
         let path = generation_path(dir.path(), 0);
-        fs::write(
-            &path,
-            ((MAX_TRANSLOG_FRAME_PAYLOAD_BYTES + 1) as u32).to_le_bytes(),
-        )
-        .unwrap();
+        fs::write(&path, (MAX_WAL_FRAME_BYTES as u32).to_le_bytes()).unwrap();
         let generation = GenerationInfo {
             id: 0,
             path,

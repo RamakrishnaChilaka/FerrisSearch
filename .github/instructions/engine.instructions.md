@@ -65,6 +65,10 @@ pub trait SearchEngine: Send + Sync {
 - A non-empty bulk receipt has a contiguous WAL-reserved start; an empty batch
   has no assigned sequence. Explicit-sequence methods are required implementations,
   not defaults that allocate new primary sequences.
+- Every primary, replica, recovery, and delete operation must encode to a WAL
+  frame no larger than `MAX_WAL_FRAME_BYTES` (32 MiB including the frame
+  header). Reject larger operations as validation errors before WAL or engine
+  mutation; validate every item before writing any bulk bytes.
 
 ## CompositeEngine (src/engine/composite.rs)
 ```rust
@@ -83,6 +87,10 @@ pub struct CompositeEngine {
   attribution does not add gap tracking, retry deduplication, or primary fencing.
 
 ### Constructors
+- `HotEngine::open_existing_with_mappings()` /
+  `CompositeEngine::open_existing_with_mappings()` require an existing Tantivy
+  `index/meta.json` and never create a fresh index. Dynamic-mapping reopen uses
+  this path after dropping the old engine.
 - `new(data_dir, refresh_interval)` — default refresh loop (static interval)
 - `new_with_mappings(data_dir, refresh_interval, mappings, durability, column_cache)` — with schema + WAL + shared column cache
 

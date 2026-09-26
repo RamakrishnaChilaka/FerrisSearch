@@ -23,7 +23,7 @@ use tonic::Status;
 
 pub(crate) const MAX_RECOVERY_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_RECOVERY_OPS: usize = 1024;
-pub(super) const MAX_RECOVERY_OP_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_RECOVERY_OP_BYTES: usize = crate::wal::MAX_WAL_FRAME_BYTES;
 const MAX_SOURCE_RECOVERY_SESSIONS: usize = 8;
 const RECOVERY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const RECOVERY_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(2);
@@ -2694,6 +2694,142 @@ mod tests {
         );
         assert!(dir.path().join("uuid-new/shard_0").exists());
         assert!(!old_dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_mapping_same_term_uuid_replacement_rejects_before_open() {
+        let (raft, state_handle) =
+            consensus::create_raft_instance_mem(1, "mapping-uuid-fence".into())
+                .await
+                .unwrap();
+        consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+            .await
+            .unwrap();
+        wait_for_test_leader(&raft).await;
+        let metadata = IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("uuid-old"),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary".into(),
+                    primary_term: 1,
+                    replicas: Vec::new(),
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: DynamicMapping::True,
+            settings: IndexSettings::default(),
+        };
+        assert_eq!(
+            raft.client_write(ClusterCommand::CreateIndex { metadata })
+                .await
+                .unwrap()
+                .data,
+            ClusterResponse::Ok
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
+        let peer_recovery_state = PeerRecoveryTransportState::new();
+        shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
+        let service = TransportService {
+            cluster_manager,
+            shard_manager: shard_manager.clone(),
+            transport_client: TransportClient::new(),
+            storage_manager: Arc::new(
+                crate::storage::StorageManager::new_in_path(dir.path()).unwrap(),
+            ),
+            remote_store_reader_cache: Arc::new(
+                crate::engine::remote_store::RemoteSplitReaderCache::default(),
+            ),
+            raft: Some(raft.clone()),
+            local_node_id: "primary".into(),
+            worker_pools: WorkerPools::new(2, 2),
+            task_manager: Arc::new(TaskManager::new()),
+            primary_activation_state: super::super::new_primary_activation_state(),
+            peer_recovery_state,
+            join_lock: super::super::new_join_lock(),
+        };
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *service
+            .peer_recovery_state
+            .dynamic_mapping_committed_sender
+            .lock()
+            .await = Some(committed_tx);
+        *service
+            .peer_recovery_state
+            .dynamic_mapping_release
+            .lock()
+            .await = Some(release_rx);
+
+        let writer = service.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .index_doc(tonic::Request::new(ShardDocRequest {
+                    index_name: "idx".into(),
+                    shard_id: 0,
+                    doc_id: "stale".into(),
+                    payload_json: serde_json::to_vec(&serde_json::json!({"new_field": 1})).unwrap(),
+                }))
+                .await
+        });
+        committed_rx.await.unwrap();
+
+        let active_term =
+            state_handle.read().unwrap().indices["idx"].shard_routing[&0].primary_term;
+        assert_eq!(
+            raft.client_write(ClusterCommand::DeleteIndex {
+                index_name: "idx".into(),
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+        let replacement = IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("uuid-new"),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary".into(),
+                    primary_term: active_term,
+                    replicas: Vec::new(),
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: DynamicMapping::True,
+            settings: IndexSettings::default(),
+        };
+        assert_eq!(
+            raft.client_write(ClusterCommand::CreateIndex {
+                metadata: replacement,
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+        release_tx.send(()).unwrap();
+
+        let response = write.await.unwrap().unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.seq_no.is_none());
+        assert!(response.error.contains("UUID"));
+        assert!(shard_manager.get_shard("idx", 0).is_none());
+        assert!(!dir.path().join("uuid-old").exists());
+        assert!(!dir.path().join("uuid-new").exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

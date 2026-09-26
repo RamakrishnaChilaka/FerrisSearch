@@ -125,6 +125,16 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > reaping does not wait through hashing, and bounded WAL scans validate frame
 > length plus the complete frame at the captured head.
 >
+> **Round-4 corrections — September 26, 2026:** index deletion now acquires all
+> lifecycle and open locks already registered for the deleted UUID/index, so a
+> shard temporarily absent from the engine map cannot escape coordination.
+> Reopen requires an existing Tantivy `meta.json` and cannot create a fresh
+> index. Primary write permits bind both UUID and term. WAL writes and recovery
+> scans share a 32 MiB total-frame limit enforced before mutation; a partial
+> first frame at or beyond the captured head ends the scan cleanly, while a
+> below-head overrun or torn-then-appended frame fails closed. Retryable
+> forwarded `ABORTED` writes map to HTTP 503.
+>
 > **Known liveness limit:** remove-and-re-add of a target node while its
 > finalized copy is awaiting membership can remain `Unknown`. Current routing
 > identifies copies by node ID, so the target cannot prove whether it is still
@@ -138,6 +148,12 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > non-coordinator that observes delete/recreate ordering late can still retain
 > a pre-existing same-name engine. UUID/allocation validation on every open
 > path remains future work.
+
+The current maximum document operation size is defined by the encoded WAL
+frame, not the raw HTTP body: one operation must fit within 32 MiB including
+the four-byte frame header, sequence and operation fields, JSON serialization,
+and the internal `_doc_id` / `_source` wrapper. The maximum usable `_source`
+therefore varies slightly with document ID and content.
 
 ## 3. Reference Protocols And Intentional Differences
 

@@ -178,9 +178,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.
-- Revalidate `(primary, primary_term)` after acquiring the guard and use the
-  same routing snapshot for replica fan-out. Queued old-primary writes fail
-  before mutation.
+- Revalidate `(index_uuid, primary, primary_term)` after acquiring the guard
+  and after dynamic-mapping Raft work, then use the same routing snapshot for
+  replica fan-out. Queued old-primary or same-term replaced-index writes fail
+  before open or mutation.
 - Before dynamic-mapping reopen, abort the shard's safe pre-finalize source
   session and wait for cleanup. Never remove the shard-map engine while a
   source-session `Arc` still owns its Tantivy writer/directory lock.
@@ -195,6 +196,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - A dynamic-mapping reopen that loses its registered UUID or live engine is a
   retryable `ABORTED` write failure. It must not fall through to mutation or
   recreate the deleted shard.
+- Primary and explicit-sequence replica handlers classify the shared 32 MiB
+  encoded WAL-frame ceiling as `INVALID_ARGUMENT`; recovery operation batches
+  use that same byte ceiling.
 - **Successful write responses MUST carry valid receipts**: zero is a valid
   sequence, not a missing-value sentinel. Clients must reject successful
   single/delete responses without `seq_no`. A single index response must match

@@ -81,6 +81,32 @@ impl CompositeEngine {
         })
     }
 
+    pub(crate) fn open_existing_with_mappings(
+        data_dir: impl AsRef<Path>,
+        refresh_interval: Duration,
+        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+    ) -> Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let text = HotEngine::open_existing_with_mappings(
+            &data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache.clone(),
+        )?;
+
+        Ok(Self {
+            text,
+            vector: RwLock::new(None),
+            data_dir,
+            checkpoint: std::sync::atomic::AtomicU64::new(0),
+            global_cp: std::sync::atomic::AtomicU64::new(0),
+            column_cache,
+        })
+    }
+
     /// Get a reference to the underlying HotEngine (for refresh loop).
     pub fn text_engine(&self) -> &HotEngine {
         &self.text

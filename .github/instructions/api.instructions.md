@@ -185,6 +185,13 @@ primary WAL-assigned `_seq_no`; sequence zero is valid. Bulk finalization must
 apply each target receipt by request-order offset, not by document-ID lookup,
 because duplicate IDs can appear in one batch. Missing or inconsistent target
 receipts are item failures, never `_seq_no: 0` fallbacks.
+Each encoded WAL operation is limited to 32 MiB, including its four-byte frame
+header and the internal `_doc_id` / `_source` wrapper. The usable JSON document
+body is therefore slightly smaller and depends on its ID and serialized shape.
+Oversized single/delete writes return a validation error before mutation;
+oversized bulk documents remain attributable item failures.
+Retryable gRPC `ABORTED` write failures map to HTTP 503
+`shard_not_available_exception` with the underlying cause preserved.
 
 This does not implement full OpenSearch write concurrency semantics.
 `_version` / `_primary_term` values that appear in compatibility response shapes

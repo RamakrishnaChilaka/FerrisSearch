@@ -19,6 +19,10 @@ pub use self::tantivy::HotEngine;
 #[error("{0}")]
 pub(crate) struct DocumentValidationError(pub String);
 
+pub(crate) fn is_write_validation_error(error: &anyhow::Error) -> bool {
+    error.is::<DocumentValidationError>() || error.is::<crate::wal::WalFrameTooLargeError>()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexWriteReceipt {
     pub doc_id: String,

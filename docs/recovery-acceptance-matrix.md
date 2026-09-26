@@ -210,6 +210,15 @@ Round-3 evidence adds
 `bounded_range_rejects_torn_terminal_frame_followed_by_append`, and
 `bounded_range_rejects_oversized_frame_payload`.
 
+Round-4 evidence adds
+`delete_during_reopen_open_window_does_not_resurrect_directory`,
+`reopen_refuses_missing_existing_tantivy_index`,
+`dynamic_mapping_same_term_uuid_replacement_rejects_before_open`,
+`bounded_range_treats_partial_post_head_frame_as_complete`, the
+`wal_frame_limit_*` boundary tests,
+`retryable_aborted_write_maps_to_service_unavailable`, and
+`bulk_aborted_failure_remains_attributable_and_retryable`.
+
 The remove-and-re-add ABA case remains a documented liveness limitation:
 without allocation IDs, a finalized pending target cannot distinguish the old
 assignment from a replacement assignment and may remain `INITIALIZING`.

@@ -406,12 +406,51 @@ impl HotEngine {
         durability: TranslogDurability,
         column_cache: Arc<super::column_cache::ColumnCache>,
     ) -> Result<Self> {
+        Self::new_with_mappings_mode(
+            data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache,
+            false,
+        )
+    }
+
+    pub(crate) fn open_existing_with_mappings<P: AsRef<Path>>(
+        data_dir: P,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+    ) -> Result<Self> {
+        Self::new_with_mappings_mode(
+            data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache,
+            true,
+        )
+    }
+
+    fn new_with_mappings_mode<P: AsRef<Path>>(
+        data_dir: P,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+        existing_only: bool,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         let index_path = data_dir.join("index");
-        std::fs::create_dir_all(&index_path)?;
-
         let meta_json_path = index_path.join("meta.json");
-        let index_exists = meta_json_path.exists();
+        if existing_only && !meta_json_path.is_file() {
+            anyhow::bail!("existing Tantivy index metadata is missing at {meta_json_path:?}");
+        }
+        if !existing_only {
+            std::fs::create_dir_all(&index_path)?;
+        }
+        let index_exists = meta_json_path.is_file();
 
         // If an existing index is on disk, evolve its schema to include any
         // new mapped fields before opening.  This preserves the existing field

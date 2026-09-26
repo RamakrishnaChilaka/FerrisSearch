@@ -84,6 +84,12 @@ struct DynamicShardOpenOverride {
     index_uuid: String,
 }
 
+#[derive(Clone)]
+struct ActivatedPrimary {
+    index_uuid: String,
+    primary_term: u64,
+}
+
 pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
@@ -470,7 +476,7 @@ impl InternalTransport for TransportService {
     ) -> Result<Response<ShardDocResponse>, Status> {
         let req = request.into_inner();
 
-        let activated_term = match self
+        let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
             .await
         {
@@ -498,19 +504,21 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
-        let _pre_mapping_write_state =
-            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
-            {
-                Ok(state) => state,
-                Err(error) => {
-                    return Ok(Response::new(ShardDocResponse {
-                        success: false,
-                        doc_id: req.doc_id,
-                        error,
-                        seq_no: None,
-                    }));
-                }
-            };
+        let _pre_mapping_write_state = match self.validated_primary_write_state(
+            &req.index_name,
+            req.shard_id,
+            &activated_primary,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(Response::new(ShardDocResponse {
+                    success: false,
+                    doc_id: req.doc_id,
+                    error,
+                    seq_no: None,
+                }));
+            }
+        };
 
         let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
             .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
@@ -526,19 +534,21 @@ impl InternalTransport for TransportService {
         let dynamic_override = self
             .ensure_dynamic_mappings(&req.index_name, req.shard_id, &payload)
             .await?;
-        let write_state =
-            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
-            {
-                Ok(state) => state,
-                Err(error) => {
-                    return Ok(Response::new(ShardDocResponse {
-                        success: false,
-                        doc_id,
-                        error,
-                        seq_no: None,
-                    }));
-                }
-            };
+        let write_state = match self.validated_primary_write_state(
+            &req.index_name,
+            req.shard_id,
+            &activated_primary,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(Response::new(ShardDocResponse {
+                    success: false,
+                    doc_id,
+                    error,
+                    seq_no: None,
+                }));
+            }
+        };
         let engine = self
             .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
             .await?;
@@ -607,7 +617,7 @@ impl InternalTransport for TransportService {
                     seq_no: Some(seq_no),
                 }))
             }
-            Err(e) if e.is::<crate::engine::DocumentValidationError>() => {
+            Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) => Ok(Response::new(ShardDocResponse {
@@ -625,7 +635,7 @@ impl InternalTransport for TransportService {
     ) -> Result<Response<ShardBulkResponse>, Status> {
         let req = request.into_inner();
 
-        let activated_term = match self
+        let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
             .await
         {
@@ -653,19 +663,21 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
-        let _pre_mapping_write_state =
-            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
-            {
-                Ok(state) => state,
-                Err(error) => {
-                    return Ok(Response::new(ShardBulkResponse {
-                        success: false,
-                        doc_ids: Vec::new(),
-                        error,
-                        start_seq_no: None,
-                    }));
-                }
-            };
+        let _pre_mapping_write_state = match self.validated_primary_write_state(
+            &req.index_name,
+            req.shard_id,
+            &activated_primary,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(Response::new(ShardBulkResponse {
+                    success: false,
+                    doc_ids: Vec::new(),
+                    error,
+                    start_seq_no: None,
+                }));
+            }
+        };
 
         let mut docs: Vec<(String, serde_json::Value)> =
             Vec::with_capacity(req.documents_json.len());
@@ -686,19 +698,21 @@ impl InternalTransport for TransportService {
         let dynamic_override = self
             .ensure_dynamic_mappings_batch(&req.index_name, req.shard_id, &docs)
             .await?;
-        let write_state =
-            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
-            {
-                Ok(state) => state,
-                Err(error) => {
-                    return Ok(Response::new(ShardBulkResponse {
-                        success: false,
-                        doc_ids: Vec::new(),
-                        error,
-                        start_seq_no: None,
-                    }));
-                }
-            };
+        let write_state = match self.validated_primary_write_state(
+            &req.index_name,
+            req.shard_id,
+            &activated_primary,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(Response::new(ShardBulkResponse {
+                    success: false,
+                    doc_ids: Vec::new(),
+                    error,
+                    start_seq_no: None,
+                }));
+            }
+        };
         let engine = self
             .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
             .await?;
@@ -779,7 +793,7 @@ impl InternalTransport for TransportService {
                     start_seq_no: Some(start_seq_no),
                 }))
             }
-            Err(e) if e.is::<crate::engine::DocumentValidationError>() => {
+            Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) => Ok(Response::new(ShardBulkResponse {
@@ -796,7 +810,7 @@ impl InternalTransport for TransportService {
         request: Request<ShardDeleteRequest>,
     ) -> Result<Response<ShardDeleteResponse>, Status> {
         let req = request.into_inner();
-        let activated_term = match self
+        let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
             .await
         {
@@ -824,19 +838,21 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
-        let write_state =
-            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
-            {
-                Ok(state) => state,
-                Err(error) => {
-                    return Ok(Response::new(ShardDeleteResponse {
-                        success: false,
-                        deleted: 0,
-                        error,
-                        seq_no: None,
-                    }));
-                }
-            };
+        let write_state = match self.validated_primary_write_state(
+            &req.index_name,
+            req.shard_id,
+            &activated_primary,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                return Ok(Response::new(ShardDeleteResponse {
+                    success: false,
+                    deleted: 0,
+                    error,
+                    seq_no: None,
+                }));
+            }
+        };
         let engine = self
             .get_or_open_shard(&req.index_name, req.shard_id)
             .await?;
@@ -900,6 +916,9 @@ impl InternalTransport for TransportService {
                     error: String::new(),
                     seq_no: Some(seq_no),
                 }))
+            }
+            Err(e) if crate::engine::is_write_validation_error(&e) => {
+                Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) => Ok(Response::new(ShardDeleteResponse {
                 success: false,
@@ -1519,6 +1538,9 @@ impl InternalTransport for TransportService {
                 error: String::new(),
                 local_checkpoint: engine.local_checkpoint(),
             })),
+            Err(e) if crate::engine::is_write_validation_error(&e) => {
+                Err(Status::invalid_argument(e.to_string()))
+            }
             Err(e) => Ok(Response::new(ReplicateDocResponse {
                 success: false,
                 error: e.to_string(),
@@ -1597,6 +1619,9 @@ impl InternalTransport for TransportService {
                 error: String::new(),
                 local_checkpoint: engine.local_checkpoint(),
             })),
+            Err(e) if crate::engine::is_write_validation_error(&e) => {
+                Err(Status::invalid_argument(e.to_string()))
+            }
             Err(e) => Ok(Response::new(ReplicateBulkResponse {
                 success: false,
                 error: e.to_string(),
@@ -2599,10 +2624,13 @@ impl TransportService {
         &self,
         index_name: &str,
         shard_id: u32,
-    ) -> Result<u64, String> {
+    ) -> Result<ActivatedPrimary, String> {
         let (index_uuid, current_term) = self.primary_routing(index_name, shard_id)?;
         if self.raft.is_none() {
-            return Ok(current_term);
+            return Ok(ActivatedPrimary {
+                index_uuid,
+                primary_term: current_term,
+            });
         }
 
         let key = (index_uuid.clone(), shard_id);
@@ -2614,7 +2642,10 @@ impl TransportService {
             .get(&key)
             .is_some_and(|term| *term == current_term)
         {
-            return Ok(current_term);
+            return Ok(ActivatedPrimary {
+                index_uuid,
+                primary_term: current_term,
+            });
         }
 
         let _activation_guard = self.primary_activation_state.activation_lock.lock().await;
@@ -2628,7 +2659,10 @@ impl TransportService {
             .get(&key)
             .is_some_and(|term| *term == expected_term)
         {
-            return Ok(expected_term);
+            return Ok(ActivatedPrimary {
+                index_uuid,
+                primary_term: expected_term,
+            });
         }
 
         let raft = self
@@ -2715,20 +2749,29 @@ impl TransportService {
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .insert(key, activated_term);
-        Ok(activated_term)
+        Ok(ActivatedPrimary {
+            index_uuid,
+            primary_term: activated_term,
+        })
     }
 
     fn validated_primary_write_state(
         &self,
         index_name: &str,
         shard_id: u32,
-        activated_term: u64,
+        activated_primary: &ActivatedPrimary,
     ) -> Result<crate::cluster::state::ClusterState, String> {
         let state = self.cluster_manager.get_state();
         let metadata = state
             .indices
             .get(index_name)
             .ok_or_else(|| format!("index [{index_name}] is not present in local cluster state"))?;
+        if metadata.uuid.as_str() != activated_primary.index_uuid {
+            return Err(format!(
+                "index UUID changed for [{index_name}] from activated UUID [{}] to [{}]; retry the write",
+                activated_primary.index_uuid, metadata.uuid
+            ));
+        }
         let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
             format!("shard [{index_name}][{shard_id}] is not present in local cluster state")
         })?;
@@ -2738,10 +2781,10 @@ impl TransportService {
                 self.local_node_id
             ));
         }
-        if routing.primary_term != activated_term {
+        if routing.primary_term != activated_primary.primary_term {
             return Err(format!(
-                "primary term changed for shard [{index_name}][{shard_id}] from activated term {activated_term} to {}; retry the write",
-                routing.primary_term
+                "primary term changed for shard [{index_name}][{shard_id}] from activated term {} to {}; retry the write",
+                activated_primary.primary_term, routing.primary_term
             ));
         }
         Ok(state)

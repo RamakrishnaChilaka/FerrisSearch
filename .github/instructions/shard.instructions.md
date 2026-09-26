@@ -76,6 +76,10 @@ Reopen is replacement-only: after acquiring that lifecycle lock and again
 under the per-shard open lock, the registered UUID must still match and the
 exact shard engine/directory must still exist. A detached reopen must never
 register an old UUID, recreate a deleted directory, or create a missing engine.
+Its existing-only engine open also requires `index/meta.json`.
+Async index deletion acquires every lifecycle lock registered for the UUID and
+every per-shard open lock registered for the index, including shards temporarily
+absent from the engine map during reopen, before removing engines or storage.
 
 The in-progress marker must be checked both before and after the per-shard open
 lock. A marker created while open is waiting always wins and keeps the shard

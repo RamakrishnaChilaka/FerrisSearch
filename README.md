@@ -295,6 +295,12 @@ capacity; it is not a total-process memory limit.
 `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES=0`, to keep assigned replicas
 `INITIALIZING` without automatic recovery.
 
+For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
+the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable
+JSON document body is therefore slightly smaller and varies with the document
+ID and serialized shape. Oversized single or bulk items are rejected before
+WAL mutation.
+
 Force merge keeps its asynchronous `202 Accepted` task lifecycle. A valid
 `max_num_segments` is at least 1; each shard drains already-scheduled automatic
 Tantivy merges, performs the requested merge under shard-local maintenance
