@@ -19,6 +19,9 @@ pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_del
 pub const SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP: &str = "orphan_cleanup_unknown_uuid";
 pub const PEER_RECOVERY_IN_PROGRESS_MARKER: &str = "PEER_RECOVERY_IN_PROGRESS";
 pub const PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER: &str = "PEER_RECOVERY_AWAITING_MEMBERSHIP";
+type SourceRecoveryIdentity = (String, u32);
+type SourceRecoveryLock = Arc<tokio::sync::Mutex<()>>;
+type SourceRecoveryLockMap = HashMap<SourceRecoveryIdentity, SourceRecoveryLock>;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerRecoveryAwaitingMembership {
@@ -209,6 +212,15 @@ pub struct ShardManager {
     /// Serializes concurrent open attempts for the same shard key so only
     /// one thread performs the expensive CompositeEngine creation at a time.
     open_locks: Mutex<HashMap<ShardKey, Arc<Mutex<()>>>>,
+    source_recovery_locks: Mutex<SourceRecoveryLockMap>,
+    #[cfg(test)]
+    open_before_lock_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    open_before_lock_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    #[cfg(test)]
+    reopen_after_cleanup_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    reopen_after_cleanup_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     peer_recovery_targets: RwLock<HashMap<ShardKey, PeerRecoveryTargetState>>,
     source_recovery_cleanup: RwLock<Option<Arc<dyn SourceRecoverySessionCleanup>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
@@ -248,6 +260,15 @@ impl ShardManager {
             settings_managers: RwLock::new(HashMap::new()),
             index_uuids: RwLock::new(HashMap::new()),
             open_locks: Mutex::new(HashMap::new()),
+            source_recovery_locks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            open_before_lock_sender: Mutex::new(None),
+            #[cfg(test)]
+            open_before_lock_release: Mutex::new(None),
+            #[cfg(test)]
+            reopen_after_cleanup_sender: Mutex::new(None),
+            #[cfg(test)]
+            reopen_after_cleanup_release: Mutex::new(None),
             peer_recovery_targets: RwLock::new(HashMap::new()),
             source_recovery_cleanup: RwLock::new(None),
             isr_tracker: IsrTracker::new(1000),
@@ -295,6 +316,35 @@ impl ShardManager {
             Some(cleanup) => cleanup.abort_shard(index_uuid, shard_id).await,
             None => Ok(false),
         }
+    }
+
+    pub(crate) fn source_recovery_lifecycle_lock(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.source_recovery_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry((index_uuid.to_string(), shard_id))
+            .or_default()
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reopen_after_cleanup_gate(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self
+            .reopen_after_cleanup_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
+        *self
+            .reopen_after_cleanup_release
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(release);
     }
 
     pub(crate) async fn abort_source_recoveries_for_index(
@@ -465,19 +515,6 @@ impl ShardManager {
         if shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists() {
             anyhow::bail!("shard {index}/{shard_id} has an incomplete peer recovery installation");
         }
-        let awaiting_membership_path = shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER);
-        let awaiting_membership = if awaiting_membership_path.exists() {
-            let pending: PeerRecoveryAwaitingMembership =
-                serde_json::from_slice(&std::fs::read(&awaiting_membership_path)?)?;
-            if pending.index_uuid != index_uuid {
-                anyhow::bail!(
-                    "peer recovery awaiting-membership marker UUID does not match shard metadata"
-                );
-            }
-            Some(pending)
-        } else {
-            None
-        };
 
         // Fast path: shard already open.
         {
@@ -490,6 +527,25 @@ impl ShardManager {
         // Serialize concurrent open attempts for the same shard key.
         // This prevents two threads from both creating a CompositeEngine
         // on the same directory (which causes a Tantivy LockBusy error).
+        #[cfg(test)]
+        {
+            if let Some(sender) = self
+                .open_before_lock_sender
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            if let Some(release) = self
+                .open_before_lock_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = release.recv();
+            }
+        }
         let per_shard_lock = {
             let mut locks = self.open_locks.lock().unwrap_or_else(|e| e.into_inner());
             locks.entry(key.clone()).or_default().clone()
@@ -504,6 +560,23 @@ impl ShardManager {
                 return Ok(engine.clone());
             }
         }
+
+        if shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists() {
+            anyhow::bail!("shard {index}/{shard_id} has an incomplete peer recovery installation");
+        }
+        let awaiting_membership_path = shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER);
+        let awaiting_membership = if awaiting_membership_path.exists() {
+            let pending: PeerRecoveryAwaitingMembership =
+                serde_json::from_slice(&std::fs::read(&awaiting_membership_path)?)?;
+            if pending.index_uuid != index_uuid {
+                anyhow::bail!(
+                    "peer recovery awaiting-membership marker UUID does not match shard metadata"
+                );
+            }
+            Some(pending)
+        } else {
+            None
+        };
 
         self.register_index_uuid(index, index_uuid);
 
@@ -935,8 +1008,29 @@ impl ShardManager {
         settings: IndexSettings,
         index_uuid: String,
     ) -> Result<Arc<dyn SearchEngine>> {
+        let source_recovery_lock = self.source_recovery_lifecycle_lock(&index_uuid, shard_id);
+        let _source_recovery_guard = source_recovery_lock.lock_owned().await;
         self.abort_source_recovery_for_shard(&index_uuid, shard_id)
             .await?;
+        #[cfg(test)]
+        {
+            if let Some(sender) = self
+                .reopen_after_cleanup_sender
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            let release = self
+                .reopen_after_cleanup_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
         let key = ShardKey::new(&index, shard_id);
 
         // Serialize with other open/reopen attempts for the same shard.
@@ -1136,7 +1230,25 @@ impl ShardManager {
         index: String,
         reason: &'static str,
     ) -> Result<()> {
+        let mut source_recovery_guards = Vec::new();
         if let Some(index_uuid) = self.index_uuid(&index) {
+            let mut shard_ids = self
+                .shards
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .keys()
+                .filter(|key| key.index == index)
+                .map(|key| key.shard_id)
+                .collect::<Vec<_>>();
+            shard_ids.sort_unstable();
+            shard_ids.dedup();
+            for shard_id in shard_ids {
+                source_recovery_guards.push(
+                    self.source_recovery_lifecycle_lock(&index_uuid, shard_id)
+                        .lock_owned()
+                        .await,
+                );
+            }
             self.abort_source_recoveries_for_index(&index_uuid).await?;
         }
         let shard_manager = self.clone();
@@ -1806,6 +1918,43 @@ mod tests {
                 .to_string()
                 .contains("incomplete peer recovery installation")
         );
+    }
+
+    #[test]
+    fn peer_recovery_marker_created_while_open_waits_is_rechecked() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *manager.open_before_lock_sender.lock().unwrap() = Some(entered_tx);
+        *manager.open_before_lock_release.lock().unwrap() = Some(release_rx);
+
+        let open_manager = manager.clone();
+        let open = std::thread::spawn(move || {
+            open_manager.open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let shard_dir = dir.path().join("uuid-1/shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::File::create(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER)).unwrap();
+        release_tx.send(()).unwrap();
+
+        let error = match open.join().unwrap() {
+            Ok(_) => panic!("open must reject a marker created while waiting"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete peer recovery installation")
+        );
+        assert!(manager.get_shard("idx", 0).is_none());
     }
 
     #[tokio::test]

@@ -169,6 +169,10 @@ fn follower_join_retry_remaining(
     }
 }
 
+fn dead_node_removal_allowed(routing_update_failed: bool) -> bool {
+    !routing_update_failed
+}
+
 impl Node {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
         if config.max_concurrent_peer_recoveries > 64 {
@@ -596,6 +600,7 @@ impl Node {
                             // 1. Find all indices where the dead node hosts a primary or replica
                             // 2. For orphaned primaries: rank only authoritative in-sync replicas
                             // 3. For lost replicas: increment unassigned count for re-allocation
+                            let mut routing_update_failed = false;
                             for idx_meta in fresh_state.indices.values() {
                                 let mut updated = idx_meta.clone();
                                 let lost_replica_slot = idx_meta
@@ -663,12 +668,21 @@ impl Node {
                                     )
                                     .await
                                 {
+                                    routing_update_failed = true;
                                     tracing::error!(
                                         "Failed to update shard routing for '{}' after node death: {}",
                                         idx_meta.name,
                                         e
                                     );
                                 }
+                            }
+
+                            if !dead_node_removal_allowed(routing_update_failed) {
+                                tracing::warn!(
+                                    "Deferring removal of dead node {} because a shard routing update was rejected; retrying from fresh state on the next lifecycle tick",
+                                    dead
+                                );
+                                continue;
                             }
 
                             // Remove from Raft membership first

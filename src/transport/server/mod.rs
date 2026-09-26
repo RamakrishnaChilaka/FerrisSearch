@@ -470,17 +470,20 @@ impl InternalTransport for TransportService {
     ) -> Result<Response<ShardDocResponse>, Status> {
         let req = request.into_inner();
 
-        if let Err(error) = self
+        let activated_term = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
             .await
         {
-            return Ok(Response::new(ShardDocResponse {
-                success: false,
-                doc_id: req.doc_id,
-                error,
-                seq_no: None,
-            }));
-        }
+            Ok(term) => term,
+            Err(error) => {
+                return Ok(Response::new(ShardDocResponse {
+                    success: false,
+                    doc_id: req.doc_id,
+                    error,
+                    seq_no: None,
+                }));
+            }
+        };
         let _write_guard = match self
             .peer_recovery_write_guard(&req.index_name, req.shard_id)
             .await
@@ -495,6 +498,19 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
+        let write_state =
+            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    return Ok(Response::new(ShardDocResponse {
+                        success: false,
+                        doc_id: req.doc_id,
+                        error,
+                        seq_no: None,
+                    }));
+                }
+            };
 
         let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
             .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
@@ -535,10 +551,9 @@ impl InternalTransport for TransportService {
                 let seq_no = receipt.seq_no;
 
                 // Replicate to replica shards with seq_no
-                let cs = self.cluster_manager.get_state();
                 match crate::replication::replicate_write(
                     &self.transport_client,
-                    &cs,
+                    &write_state,
                     &req.index_name,
                     req.shard_id,
                     &id,
@@ -597,17 +612,20 @@ impl InternalTransport for TransportService {
     ) -> Result<Response<ShardBulkResponse>, Status> {
         let req = request.into_inner();
 
-        if let Err(error) = self
+        let activated_term = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
             .await
         {
-            return Ok(Response::new(ShardBulkResponse {
-                success: false,
-                doc_ids: Vec::new(),
-                error,
-                start_seq_no: None,
-            }));
-        }
+            Ok(term) => term,
+            Err(error) => {
+                return Ok(Response::new(ShardBulkResponse {
+                    success: false,
+                    doc_ids: Vec::new(),
+                    error,
+                    start_seq_no: None,
+                }));
+            }
+        };
         let _write_guard = match self
             .peer_recovery_write_guard(&req.index_name, req.shard_id)
             .await
@@ -622,6 +640,19 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
+        let write_state =
+            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    return Ok(Response::new(ShardBulkResponse {
+                        success: false,
+                        doc_ids: Vec::new(),
+                        error,
+                        start_seq_no: None,
+                    }));
+                }
+            };
 
         let mut docs: Vec<(String, serde_json::Value)> =
             Vec::with_capacity(req.documents_json.len());
@@ -680,10 +711,9 @@ impl InternalTransport for TransportService {
                     Status::internal("non-empty bulk receipt has no last sequence")
                 })?;
                 // Replicate to replica shards
-                let cs = self.cluster_manager.get_state();
                 match crate::replication::replicate_bulk(
                     &self.transport_client,
-                    &cs,
+                    &write_state,
                     &req.index_name,
                     req.shard_id,
                     &docs,
@@ -740,17 +770,20 @@ impl InternalTransport for TransportService {
         request: Request<ShardDeleteRequest>,
     ) -> Result<Response<ShardDeleteResponse>, Status> {
         let req = request.into_inner();
-        if let Err(error) = self
+        let activated_term = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
             .await
         {
-            return Ok(Response::new(ShardDeleteResponse {
-                success: false,
-                deleted: 0,
-                error,
-                seq_no: None,
-            }));
-        }
+            Ok(term) => term,
+            Err(error) => {
+                return Ok(Response::new(ShardDeleteResponse {
+                    success: false,
+                    deleted: 0,
+                    error,
+                    seq_no: None,
+                }));
+            }
+        };
         let _write_guard = match self
             .peer_recovery_write_guard(&req.index_name, req.shard_id)
             .await
@@ -765,6 +798,19 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
+        let write_state =
+            match self.validated_primary_write_state(&req.index_name, req.shard_id, activated_term)
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    return Ok(Response::new(ShardDeleteResponse {
+                        success: false,
+                        deleted: 0,
+                        error,
+                        seq_no: None,
+                    }));
+                }
+            };
         let engine = self
             .get_or_open_shard(&req.index_name, req.shard_id)
             .await?;
@@ -787,10 +833,9 @@ impl InternalTransport for TransportService {
                 let deleted = receipt.deleted;
                 let seq_no = receipt.seq_no;
                 // Replicate delete to replica shards
-                let cs = self.cluster_manager.get_state();
                 match crate::replication::replicate_write(
                     &self.transport_client,
-                    &cs,
+                    &write_state,
                     &req.index_name,
                     req.shard_id,
                     &req.doc_id,
@@ -2528,10 +2573,10 @@ impl TransportService {
         &self,
         index_name: &str,
         shard_id: u32,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let (index_uuid, current_term) = self.primary_routing(index_name, shard_id)?;
         if self.raft.is_none() {
-            return Ok(());
+            return Ok(current_term);
         }
 
         let key = (index_uuid.clone(), shard_id);
@@ -2543,7 +2588,7 @@ impl TransportService {
             .get(&key)
             .is_some_and(|term| *term == current_term)
         {
-            return Ok(());
+            return Ok(current_term);
         }
 
         let _activation_guard = self.primary_activation_state.activation_lock.lock().await;
@@ -2557,7 +2602,7 @@ impl TransportService {
             .get(&key)
             .is_some_and(|term| *term == expected_term)
         {
-            return Ok(());
+            return Ok(expected_term);
         }
 
         let raft = self
@@ -2644,7 +2689,36 @@ impl TransportService {
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .insert(key, activated_term);
-        Ok(())
+        Ok(activated_term)
+    }
+
+    fn validated_primary_write_state(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        activated_term: u64,
+    ) -> Result<crate::cluster::state::ClusterState, String> {
+        let state = self.cluster_manager.get_state();
+        let metadata = state
+            .indices
+            .get(index_name)
+            .ok_or_else(|| format!("index [{index_name}] is not present in local cluster state"))?;
+        let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
+            format!("shard [{index_name}][{shard_id}] is not present in local cluster state")
+        })?;
+        if routing.primary != self.local_node_id {
+            return Err(format!(
+                "node [{}] is no longer the primary for shard [{index_name}][{shard_id}]; retry after refreshing shard routing",
+                self.local_node_id
+            ));
+        }
+        if routing.primary_term != activated_term {
+            return Err(format!(
+                "primary term changed for shard [{index_name}][{shard_id}] from activated term {activated_term} to {}; retry the write",
+                routing.primary_term
+            ));
+        }
+        Ok(state)
     }
 
     #[allow(clippy::result_large_err)]
@@ -3029,6 +3103,7 @@ pub fn create_transport_service_for_test(
         peer_recovery_state,
         join_lock: new_join_lock(),
     };
+    peer_recovery::start_peer_recovery_reaper(service.clone());
     InternalTransportServer::new(service)
         .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
@@ -3089,6 +3164,7 @@ pub fn create_transport_service_with_raft_and_storage(
         peer_recovery_state,
         join_lock: new_join_lock(),
     };
+    peer_recovery::start_peer_recovery_reaper(service.clone());
     InternalTransportServer::new(service)
         .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)

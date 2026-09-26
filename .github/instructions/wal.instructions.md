@@ -77,8 +77,9 @@ pub trait WriteAheadLog: Send + Sync {
   boundary. Both `truncate()` and `truncate_below()` prune only below the
   lowest active pin; a pin at zero prevents history pruning.
 - `read_bounded_range()` reads an inclusive/exclusive sequence window without
-  opening an append writer and reports whether the bounded response reached
-  the captured head.
+  opening another append writer and reports whether the bounded response
+  reached the captured head. Recovery reads use the live generation list under
+  the translog state lock, not a potentially lagging on-disk manifest.
 - `initialize_empty_at()` creates the empty target WAL/high-water state at a
   file snapshot's exclusive boundary.
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths

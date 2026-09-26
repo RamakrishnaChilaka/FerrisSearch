@@ -85,7 +85,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > contiguous prefixes; there are no history/allocation IDs, replica-side term
 > fencing, operation-only path selection, resumable chunks, compression, or
 > complete vector transfer (the existing rebuild cap remains). Source sessions
-> and pins are process-local and expire after ten minutes. The
+> and pins are process-local; only pre-finalize idle setups/sessions expire
+> after ten minutes, while admitting/settling sessions are resolved by
+> settlement rather than idle reaping. The
 > [September 25 evidence record](recovery-acceptance-matrix.md#bounded-file-recovery-evidence-record-september-25-2026)
 > names the exact executable subset.
 >
@@ -95,6 +97,16 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > finalized-awaiting-membership state, remain open, and accept live replication.
 > They are closed and marked for a new recovery only after definitive rejection;
 > admission or promotion clears the pending marker without replacing the copy.
+>
+> **Review corrections — September 26, 2026:** StartPeerRecovery now returns a
+> pollable asynchronous preparation state, so snapshot/hash duration is not
+> bounded by the transport timeout and cancelled RPC futures do not leak pins
+> or placeholders. Primary writes revalidate authority inside the shared
+> barrier and use the same routing snapshot for fan-out. Abandoned finalize
+> sessions commit a newer primary term (with barrier ordering determined by
+> whether admission was submitted), making pending targets definitively
+> recoverable. Recovery WAL reads use live generation state rather than a
+> lagging manifest.
 
 ## 3. Reference Protocols And Intentional Differences
 

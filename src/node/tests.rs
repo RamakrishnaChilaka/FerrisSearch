@@ -21,6 +21,15 @@ async fn node_rejects_excessive_peer_recovery_concurrency() {
     );
 }
 
+#[test]
+fn dead_node_removal_waits_for_routing_update_success() {
+    assert!(dead_node_removal_allowed(false));
+    assert!(
+        !dead_node_removal_allowed(true),
+        "node removal must be deferred when promotion/routing persistence fails"
+    );
+}
+
 #[tokio::test]
 async fn open_local_assigned_shards_opens_unopened_local_shards() {
     let dir = tempfile::tempdir().unwrap();

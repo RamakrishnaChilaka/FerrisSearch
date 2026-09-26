@@ -5986,6 +5986,7 @@ impl super::SearchEngine for HotEngine {
                     }
                 }
             })?;
+        drop(_maintenance);
 
         #[cfg(test)]
         if let Some(sender) = self
@@ -6038,20 +6039,17 @@ impl super::SearchEngine for HotEngine {
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
-        let primary_next_seq_no = self.with_translog("peer recovery head read", |translog| {
-            Ok(translog.next_seq_no())
-        })?;
-        let data_dir = self
-            .committed_seq_no_path
-            .parent()
-            .expect("committed checkpoint path has a parent");
-        let (operations, complete) = HotTranslog::read_bounded_range(
-            data_dir,
-            min_seq_no,
-            primary_next_seq_no,
-            max_ops,
-            max_bytes,
-        )?;
+        let (primary_next_seq_no, operations, complete) =
+            self.with_translog("peer recovery operation read", |translog| {
+                let primary_next_seq_no = translog.next_seq_no();
+                let (operations, complete) = translog.read_bounded_range(
+                    min_seq_no,
+                    primary_next_seq_no,
+                    max_ops,
+                    max_bytes,
+                )?;
+                Ok((primary_next_seq_no, operations, complete))
+            })?;
         Ok(super::PeerRecoveryOpsBatch {
             operations,
             primary_next_seq_no,
@@ -10419,6 +10417,10 @@ mod tests {
             ready_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap(),
             2,
             "snapshot boundary must be captured before the concurrent write"
+        );
+        assert!(
+            engine.maintenance_lock.try_lock().is_ok(),
+            "snapshot hashing must not hold the maintenance lock"
         );
         let (attempted_tx, attempted_rx) = mpsc::channel();
         let (completed_tx, completed_rx) = mpsc::channel();

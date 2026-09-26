@@ -150,6 +150,10 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   optional absent components; transfer only files that actually exist.
 - Snapshot hashes run after lock release. Unlocked byte-copy fallback is
   forbidden when hard links are unavailable.
+- `StartPeerRecovery` snapshot preparation runs in a detached, cancellation-safe
+  task. The short RPC returns/polls preparation status; hashing is outside the
+  maintenance and translog critical sections, so large shards are not bounded
+  by the ordinary 30-second transport request timeout.
 
 ### Shared Column Cache Budget
 - `resolve_column_cache_budget()` is a blocking startup probe. On Linux it reads

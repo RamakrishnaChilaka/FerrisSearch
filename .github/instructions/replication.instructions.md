@@ -84,10 +84,15 @@ pub async fn replicate_bulk(
 - Primary write handlers hold the shard's shared write-barrier guard from
   before engine mutation through synchronous replication. Finalization holds
   the exclusive guard.
+- After acquiring the shared guard, handlers revalidate local primary and the
+  activated term, then mutate and replicate using that exact cluster-state
+  snapshot. Never re-read a newer acknowledgement set after mutation.
 - Dynamic-mapping reopen and async index close abort safe pre-finalize source
   sessions and await pin/snapshot/engine-Arc cleanup before replacing or
   deleting the primary engine. Encountering an admitting/settling source
   session on the shared-write path is a logic error and must fail the operation.
+- Start/reopen/delete share a per-shard lifecycle lock, so no new source session
+  can capture the old engine between cleanup and engine replacement.
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates but cannot grant membership.

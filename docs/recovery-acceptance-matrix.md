@@ -180,6 +180,19 @@ Source engine replacement coverage includes
 write aborts the pre-finalize source session, waits for its engine/pin cleanup,
 reopens with the evolved schema, and invalidates the old target session.
 
+The September 26 review regressions add
+`cancelled_start_becomes_pollable_and_reopen_cleans_it`,
+`start_waits_for_reopen_engine_replacement`,
+`idle_reaper_keeps_barrier_during_settlement`,
+`queued_writes_reject_primary_change_inside_barrier`,
+`cancelled_prepare_finalize_clears_preparing_flag`,
+`expired_finalize_without_mark_releases_barrier_and_bumps_term`,
+`lagging_target_view_after_admission_keeps_copy_open`,
+`older_local_term_remains_unknown_for_pending_target`,
+`peer_recovery_marker_created_while_open_waits_is_rechecked`,
+`bounded_range_uses_live_generations_when_manifest_lags_roll`, and
+`dead_node_removal_waits_for_routing_update_success`.
+
 ## M. Membership And Acknowledgement Sets
 
 | ID | Boundary or scenario | Required result | Layer |

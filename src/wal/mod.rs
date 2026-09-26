@@ -15,7 +15,7 @@
 //!
 //! This is more compact than JSONL and faster to parse/replay.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -200,6 +200,15 @@ pub trait WriteAheadLog: Send + Sync {
         min_seq_no: u64,
         callback: &mut dyn FnMut(TranslogEntry) -> Result<()>,
     ) -> Result<u64>;
+
+    /// Read a bounded ordered range from the live generation state.
+    fn read_bounded_range(
+        &self,
+        min_seq_no: u64,
+        end_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TranslogEntry>, bool)>;
 
     /// Pin every operation at or above `min_seq_no` against truncation.
     fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64>;
@@ -834,10 +843,8 @@ impl HotTranslog {
         Ok(())
     }
 
-    /// Read a bounded ordered range from the persisted translog without
-    /// opening an append writer. `end_seq_no` is exclusive.
-    pub fn read_bounded_range<P: AsRef<Path>>(
-        data_dir: P,
+    fn read_bounded_range_from_generations(
+        generations: &[GenerationInfo],
         min_seq_no: u64,
         end_seq_no: u64,
         max_ops: usize,
@@ -850,27 +857,10 @@ impl HotTranslog {
             return Ok((Vec::new(), true));
         }
 
-        let data_dir = data_dir.as_ref();
-        let manifest = load_translog_manifest(data_dir)?
-            .ok_or_else(|| anyhow::anyhow!("translog manifest is missing"))?;
-        let mut generations = generations_from_manifest(data_dir, &manifest)?;
-        let active_generation = generations
-            .iter_mut()
-            .find(|generation| generation.id == manifest.active_generation_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "translog manifest active generation {} is missing",
-                    manifest.active_generation_id
-                )
-            })?;
-        let active_scan = scan_generation_from_path(&active_generation.path)?;
-        active_generation.first_seq_no = active_scan.first_seq_no;
-        active_generation.last_seq_no = active_scan.last_seq_no;
-        active_generation.size_bytes = fs::metadata(&active_generation.path)?.len();
         let mut entries = Vec::new();
         let mut bytes = 0usize;
 
-        for generation in generations.into_iter().filter(|generation| {
+        for generation in generations.iter().filter(|generation| {
             generation
                 .last_seq_no
                 .is_some_and(|last| last >= min_seq_no)
@@ -878,7 +868,12 @@ impl HotTranslog {
                     .first_seq_no
                     .is_none_or(|first| first < end_seq_no)
         }) {
-            let file = File::open(&generation.path)?;
+            let file = File::open(&generation.path).with_context(|| {
+                format!(
+                    "live translog generation {:?} is missing or unreadable",
+                    generation.path
+                )
+            })?;
             let mut reader = BufReader::new(file);
             while let Some((entry, frame_bytes)) = read_next_entry(&mut reader)? {
                 if entry.seq_no < min_seq_no {
@@ -1343,6 +1338,44 @@ impl WriteAheadLog for HotTranslog {
         Ok(count)
     }
 
+    fn read_bounded_range(
+        &self,
+        min_seq_no: u64,
+        end_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TranslogEntry>, bool)> {
+        let state = recover_lock(&self.state, "state");
+        let active_matches = state
+            .generations
+            .iter()
+            .filter(|generation| generation.id == state.active_generation_id)
+            .count();
+        if active_matches != 1 {
+            anyhow::bail!(
+                "live translog state has {} entries for active generation {}",
+                active_matches,
+                state.active_generation_id
+            );
+        }
+        for pair in state.generations.windows(2) {
+            if pair[0].id >= pair[1].id {
+                anyhow::bail!(
+                    "live translog generations are not strictly increasing: {} then {}",
+                    pair[0].id,
+                    pair[1].id
+                );
+            }
+        }
+        Self::read_bounded_range_from_generations(
+            &state.generations,
+            min_seq_no,
+            end_seq_no,
+            max_ops,
+            max_bytes,
+        )
+    }
+
     fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64> {
         let mut state = recover_lock(&self.state, "state");
         if min_seq_no > state.next_seq_no {
@@ -1747,33 +1780,55 @@ mod tests {
 
     #[test]
     fn bounded_range_read_reports_completion_and_limits() {
-        let (dir, tl) = open_translog();
+        let (_dir, tl) = open_translog();
         for value in 0..5 {
             tl.append(WalOperation::Index, json!({"value": value}))
                 .unwrap();
         }
 
-        let (first, complete) =
-            HotTranslog::read_bounded_range(dir.path(), 1, 5, 2, usize::MAX).unwrap();
+        let (first, complete) = tl.read_bounded_range(1, 5, 2, usize::MAX).unwrap();
         assert_eq!(
             first.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
             [1, 2]
         );
         assert!(!complete);
 
-        let (second, complete) =
-            HotTranslog::read_bounded_range(dir.path(), 3, 5, 10, usize::MAX).unwrap();
+        let (second, complete) = tl.read_bounded_range(3, 5, 10, usize::MAX).unwrap();
         assert_eq!(
             second.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
             [3, 4]
         );
         assert!(complete);
 
-        let error = HotTranslog::read_bounded_range(dir.path(), 0, 5, 1, 1).unwrap_err();
+        let error = tl.read_bounded_range(0, 5, 1, 1).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("exceeds the recovery byte limit")
+        );
+    }
+
+    #[test]
+    fn bounded_range_uses_live_generations_when_manifest_lags_roll() {
+        let (_dir, translog) = open_translog();
+        translog
+            .append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        {
+            let mut state = recover_lock(&translog.state, "test");
+            translog.roll_generation_locked(&mut state).unwrap();
+            // Deliberately do not persist the manifest. This models a failed
+            // manifest publication after the in-memory generation roll.
+        }
+        translog
+            .append(WalOperation::Index, json!({"value": 1}))
+            .unwrap();
+
+        let (entries, complete) = translog.read_bounded_range(0, 2, 16, usize::MAX).unwrap();
+        assert!(complete);
+        assert_eq!(
+            entries.iter().map(|entry| entry.seq_no).collect::<Vec<_>>(),
+            [0, 1]
         );
     }
 

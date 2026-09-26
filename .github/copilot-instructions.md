@@ -98,6 +98,8 @@ architecture decision.
   primary's exclusive write-barrier head, and enters the in-sync set only
   through a `(primary, primary_term)` Raft compare-and-set. Never release an
   unresolved admission barrier by guessing whether membership committed.
+  Idle/session reaping cannot release a settling barrier; only settlement may
+  release it after observing admission/impossibility or fencing the old term.
 - **Synchronous replication failures are request failures.** Do not turn
   partial replication into success-shaped responses.
 - **Remote publication is not multi-writer safe yet.** Do not claim otherwise

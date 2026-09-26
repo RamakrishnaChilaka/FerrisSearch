@@ -90,6 +90,10 @@ pub struct Node {
   excluded from new recovery scheduling until local ordered state says
   admitted/promoted or definitively rejected. This state is reconstructed when
   the target restarts.
+- An abandoned finalize session is made definitive by a source-side
+  `ActivatePrimary` term bump. If no admission command was submitted, release
+  the barrier first and bump asynchronously; after submission, keep the barrier
+  until admission or the newer term is observed.
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every
@@ -112,6 +116,8 @@ pub struct Node {
    primary was promoted.
 4. Re-read committed cluster state before processing another dead node so
    sequential removals do not reuse stale routing or double-count slots.
+5. If any conditional routing update is rejected, do not remove that node from
+   cluster state in the same tick; retry from fresh state.
 
 Promotion changes increment the state-machine-owned shard term. A promoted or
 restarted primary still activates once per process before its first write.

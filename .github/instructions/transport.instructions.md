@@ -149,6 +149,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   bytes, and stale authority aborts the session. Prepare holds the exclusive
   shard write barrier; Complete keeps it until conditional membership is
   observed or a term bump settles the outcome.
+- `StartPeerRecovery` is an asynchronous start/status RPC. `preparing=true`
+  means the client should poll the same request/session reservation; snapshot
+  commit/link/hash work is not performed in the RPC future.
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **get_remote_store_leaf_status**: Report whether the local node is root/leaf-capable plus per-split artifact/reader warmth and current `StorageManager` load counters
 - **search_remote_store_splits**: Validate the remote_store index/UUID, batch split execution through the shared leaf helper, and return per-split hits, totals, partial aggs, and per-split errors
@@ -172,9 +175,15 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.
+- Revalidate `(primary, primary_term)` after acquiring the guard and use the
+  same routing snapshot for replica fan-out. Queued old-primary writes fail
+  before mutation.
 - Before dynamic-mapping reopen, abort the shard's safe pre-finalize source
   session and wait for cleanup. Never remove the shard-map engine while a
   source-session `Arc` still owns its Tantivy writer/directory lock.
+- Cancelled PrepareFinalize futures must clear the preparing state through a
+  drop guard. Reapers never idle-expire `finalize_preparing`,
+  barrier-owning, or settlement-running sessions.
 - **Successful write responses MUST carry valid receipts**: zero is a valid
   sequence, not a missing-value sentinel. Clients must reject successful
   single/delete responses without `seq_no`. A single index response must match
