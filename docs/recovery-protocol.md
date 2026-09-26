@@ -129,11 +129,20 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > lifecycle and open locks already registered for the deleted UUID/index, so a
 > shard temporarily absent from the engine map cannot escape coordination.
 > Reopen requires an existing Tantivy `meta.json` and cannot create a fresh
-> index. Primary write permits bind both UUID and term. WAL writes and recovery
-> scans share a 32 MiB total-frame limit enforced before mutation; a partial
-> first frame at or beyond the captured head ends the scan cleanly, while a
-> below-head overrun or torn-then-appended frame fails closed. Retryable
-> forwarded `ABORTED` writes map to HTTP 503.
+> index. Primary write permits bind both UUID and term. New WAL writes and
+> transferred recovery operations share a 32 MiB total-frame limit enforced
+> before mutation; a partial first frame at or beyond the captured head ends
+> the scan cleanly, while a below-head overrun or torn-then-appended frame fails
+> closed. Retryable forwarded `ABORTED` writes map to HTTP 503.
+>
+> **Round-5 corrections — September 26, 2026:** the 32 MiB total-frame ceiling
+> remains the limit for new WAL writes and transferred recovery operations,
+> while restart scan, replay, and recovery skips accept complete legacy frames
+> up to a separate 65 MiB decode ceiling. The concurrent-append exception
+> applies only to the final captured generation at or beyond its captured file
+> size. On restart, an incomplete active-generation tail is truncated to the
+> last fully decoded frame and both file and directory are fsynced before
+> append; complete or middle corruption still fails closed.
 >
 > **Known liveness limit:** remove-and-re-add of a target node while its
 > finalized copy is awaiting membership can remain `Unknown`. Current routing
@@ -153,7 +162,9 @@ The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including
 the four-byte frame header, sequence and operation fields, JSON serialization,
 and the internal `_doc_id` / `_source` wrapper. The maximum usable `_source`
-therefore varies slightly with document ID and content.
+therefore varies slightly with document ID and content. The 65 MiB decode-only
+ceiling exists solely so upgraded nodes can open and replay complete legacy
+frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
 
 ## 3. Reference Protocols And Intentional Differences
 

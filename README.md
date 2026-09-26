@@ -299,7 +299,10 @@ For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
 the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable
 JSON document body is therefore slightly smaller and varies with the document
 ID and serialized shape. Oversized single or bulk items are rejected before
-WAL mutation.
+WAL mutation. Restart and replay retain bounded upgrade compatibility for
+complete legacy frames up to 65 MiB; peer recovery may skip those frames when
+they are already represented by the file snapshot, but transferred operations
+remain limited to 32 MiB.
 
 Force merge keeps its asynchronous `202 Accepted` task lifecycle. A valid
 `max_num_segments` is at least 1; each shard drains already-scheduled automatic

@@ -109,6 +109,10 @@ cargo test -- test_name                         # Single test by name
   missing existing Tantivy metadata, same-term index UUID replacement,
   partially visible post-head WAL appends, the 32 MiB frame boundary on every
   WAL write API, and HTTP 503 mapping with attributable bulk failures.
+- Round-5 WAL regressions cover legacy 40 MiB frame open/replay/skip
+  compatibility, the retained 32 MiB recovery-transfer ceiling, exact
+  final-generation/captured-size handling for in-progress appends, durable
+  active-tail truncation before append, and fail-closed middle corruption.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.

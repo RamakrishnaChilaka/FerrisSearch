@@ -219,6 +219,17 @@ Round-4 evidence adds
 `retryable_aborted_write_maps_to_service_unavailable`, and
 `bulk_aborted_failure_remains_attributable_and_retryable`.
 
+Round-5 evidence adds
+`legacy_large_frame_opens_replays_and_skips_in_recovery`,
+`bounded_range_rejects_legacy_large_frame_in_transfer_range`,
+`bounded_range_rejects_partial_post_head_frame_in_non_final_generation`,
+`bounded_range_rejects_partial_post_head_frame_inside_captured_size`,
+`open_truncates_partial_active_tail_before_append`, and
+`open_rejects_complete_corrupt_middle_frame`, while retaining
+`bounded_range_treats_partial_post_head_frame_as_complete`,
+`bounded_range_rejects_torn_terminal_frame_followed_by_append`, and the
+`wal_frame_limit_*` write-boundary tests.
+
 The remove-and-re-add ABA case remains a documented liveness limitation:
 without allocation IDs, a finalized pending target cannot distinguish the old
 assignment from a replacement assignment and may remain `INITIALIZING`.
