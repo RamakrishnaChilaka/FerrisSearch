@@ -180,6 +180,9 @@ fn shard_display_state(
     if !cs.nodes.contains_key(node_id) {
         return "UNASSIGNED";
     }
+    if cs.shard_allocation_id(index, shard_id, node_id).is_none() {
+        return "UNASSIGNED";
+    }
     if !in_sync {
         return "INITIALIZING";
     }
@@ -370,7 +373,21 @@ pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>
         }
 
         let meta = &cs.indices[idx_name];
-        let health = index_health(meta, &data_node_ids);
+        let health = if meta.shard_routing.iter().any(|(shard_id, routing)| {
+            cs.shard_allocation_id(idx_name, *shard_id, &routing.primary)
+                .is_none()
+        }) {
+            "red"
+        } else if meta.shard_routing.iter().any(|(shard_id, routing)| {
+            routing.replicas.iter().any(|replica| {
+                cs.shard_allocation_id(idx_name, *shard_id, replica)
+                    .is_none()
+            })
+        }) {
+            "yellow"
+        } else {
+            index_health(meta, &data_node_ids)
+        };
 
         let total_docs: u64 = match &doc_counts {
             Some(m) => (0..meta.number_of_shards)
@@ -724,6 +741,32 @@ mod tests {
         assert_eq!(
             shard_display_state(
                 "missing-node",
+                "idx",
+                0,
+                true,
+                &cluster_state,
+                &Some(ShardCopyDocCounts::new()),
+                &app_state,
+            ),
+            "UNASSIGNED"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_display_state_reports_missing_allocation_as_unassigned() {
+        let (_dir, app_state) = make_app_state("node-1").await;
+        let mut cluster_state = make_cluster_state();
+        cluster_state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary = None;
+
+        assert_eq!(
+            shard_display_state(
+                "node-1",
                 "idx",
                 0,
                 true,

@@ -4,6 +4,8 @@ use std::time::Instant;
 
 /// Represents a unique node in the cluster
 pub type NodeId = String;
+/// Monotonic identity of one routed shard-copy assignment.
+pub type AllocationId = u64;
 
 /// The role a node plays in the OpenSearch cluster
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +112,100 @@ impl ShardRoutingEntry {
 
     pub fn is_replica_in_sync(&self, node_id: &str) -> bool {
         self.in_sync_replicas.iter().any(|node| node == node_id)
+    }
+}
+
+/// Allocation identities and first-activation state owned by Raft routing.
+///
+/// The routing entry keeps the existing node-oriented compatibility shape,
+/// while this state binds each assigned copy to the committed log position
+/// that created that assignment. A missing allocation is never authoritative.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShardAllocationIds {
+    #[serde(default)]
+    pub primary: Option<AllocationId>,
+    #[serde(default)]
+    pub replicas: HashMap<NodeId, AllocationId>,
+    /// The allocation ID used for copies assigned by CreateIndex.
+    #[serde(default)]
+    pub initial_allocation_id: AllocationId,
+    /// Set by the first successful allocation-bound ActivatePrimary command.
+    #[serde(default)]
+    pub primary_initialized: bool,
+}
+
+impl ShardAllocationIds {
+    fn for_initial_routing(
+        routing: &ShardRoutingEntry,
+        allocation_id: AllocationId,
+    ) -> Result<Self, String> {
+        if allocation_id == 0 {
+            return Err("allocation ID must be greater than zero".to_string());
+        }
+        Ok(Self {
+            primary: Some(allocation_id),
+            replicas: routing
+                .replicas
+                .iter()
+                .cloned()
+                .map(|node_id| (node_id, allocation_id))
+                .collect(),
+            initial_allocation_id: allocation_id,
+            primary_initialized: false,
+        })
+    }
+
+    pub fn allocation_for(
+        &self,
+        routing: &ShardRoutingEntry,
+        node_id: &str,
+    ) -> Option<AllocationId> {
+        if routing.primary == node_id {
+            self.primary
+        } else if routing.replicas.iter().any(|replica| replica == node_id) {
+            self.replicas.get(node_id).copied()
+        } else {
+            None
+        }
+    }
+
+    pub fn validate_for_routing(&self, routing: &ShardRoutingEntry) -> Result<(), String> {
+        if self.initial_allocation_id == 0 {
+            return Err("initial allocation ID must be greater than zero".to_string());
+        }
+        if self.primary == Some(0) {
+            return Err("primary allocation ID must be greater than zero".to_string());
+        }
+        if self.replicas.len() != routing.replicas.len() {
+            return Err(format!(
+                "allocation metadata has {} replicas but routing has {}",
+                self.replicas.len(),
+                routing.replicas.len()
+            ));
+        }
+        for replica in &routing.replicas {
+            match self.replicas.get(replica) {
+                Some(allocation_id) if *allocation_id > 0 => {}
+                Some(_) => {
+                    return Err(format!(
+                        "replica '{replica}' has an invalid zero allocation ID"
+                    ));
+                }
+                None => {
+                    return Err(format!("replica '{replica}' has no allocation ID"));
+                }
+            }
+        }
+        if let Some(extra) = self
+            .replicas
+            .keys()
+            .find(|replica| !routing.replicas.contains(replica))
+        {
+            return Err(format!(
+                "allocation metadata contains unassigned replica '{extra}'"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -672,7 +768,7 @@ impl IndexMetadata {
                 ShardRoutingEntry {
                     primary: primary_node,
                     primary_term: 1,
-                    in_sync_replicas: replicas.clone(),
+                    in_sync_replicas: Vec::new(),
                     replicas,
                     unassigned_replicas: unassigned,
                 },
@@ -706,8 +802,20 @@ impl IndexMetadata {
     /// Try to assign unassigned replicas to available data nodes.
     /// Returns true if any assignments were made (caller should persist via Raft).
     pub fn allocate_unassigned_replicas(&mut self, data_nodes: &[String]) -> bool {
+        let eligible_shards = self.shard_routing.keys().copied().collect();
+        self.allocate_unassigned_replicas_for_shards(data_nodes, &eligible_shards)
+    }
+
+    pub fn allocate_unassigned_replicas_for_shards(
+        &mut self,
+        data_nodes: &[String],
+        eligible_shards: &std::collections::HashSet<u32>,
+    ) -> bool {
         let mut changed = false;
-        for routing in self.shard_routing.values_mut() {
+        for (shard_id, routing) in &mut self.shard_routing {
+            if !eligible_shards.contains(shard_id) {
+                continue;
+            }
             while routing.unassigned_replicas > 0 {
                 // Find a data node not already used by this shard (primary or existing replicas)
                 let used: std::collections::HashSet<&str> =
@@ -902,6 +1010,12 @@ pub struct ClusterState {
     pub master_node: Option<NodeId>,
     pub nodes: HashMap<NodeId, NodeInfo>,
     pub indices: HashMap<String, IndexMetadata>,
+    /// Per-index, per-shard allocation identities and first-activation state.
+    ///
+    /// Older pre-1.0 snapshots deserialize with this map empty and therefore
+    /// fail closed at every authoritative data path.
+    #[serde(default)]
+    pub shard_allocations: HashMap<String, HashMap<u32, ShardAllocationIds>>,
     /// Dynamically-managed API keys, keyed by key id. Snapshotted via serde;
     /// `#[serde(default)]` keeps older snapshots without this field readable.
     #[serde(default)]
@@ -921,6 +1035,7 @@ impl ClusterState {
             master_node: None,
             nodes: HashMap::new(),
             indices: HashMap::new(),
+            shard_allocations: HashMap::new(),
             api_keys: HashMap::new(),
             roles: HashMap::new(),
             last_seen: HashMap::new(),
@@ -956,10 +1071,82 @@ impl ClusterState {
         }
     }
 
-    /// Add an index to the cluster state
+    /// Add an index to local/test state using the normalized initial allocation
+    /// identity. Production Raft application uses the committed log position.
     pub fn add_index(&mut self, metadata: IndexMetadata) {
+        self.add_index_with_allocation_id(metadata, 1)
+            .expect("local/test index metadata must accept allocation ID 1");
+    }
+
+    pub(crate) fn add_index_with_allocation_id(
+        &mut self,
+        metadata: IndexMetadata,
+        allocation_id: AllocationId,
+    ) -> Result<(), String> {
+        let mut allocations = HashMap::new();
+        for (shard_id, routing) in &metadata.shard_routing {
+            allocations.insert(
+                *shard_id,
+                ShardAllocationIds::for_initial_routing(routing, allocation_id)?,
+            );
+        }
+        let index_name = metadata.name.clone();
         self.indices.insert(metadata.name.clone(), metadata);
+        self.shard_allocations.insert(index_name, allocations);
         self.version += 1;
+        Ok(())
+    }
+
+    pub fn shard_allocation_ids(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Option<&ShardAllocationIds> {
+        self.shard_allocations
+            .get(index_name)
+            .and_then(|shards| shards.get(&shard_id))
+    }
+
+    pub fn shard_allocation_id(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        node_id: &str,
+    ) -> Option<AllocationId> {
+        let routing = self.indices.get(index_name)?.shard_routing.get(&shard_id)?;
+        self.shard_allocation_ids(index_name, shard_id)?
+            .allocation_for(routing, node_id)
+    }
+
+    pub fn primary_allocation_id(&self, index_name: &str, shard_id: u32) -> Option<AllocationId> {
+        self.shard_allocation_ids(index_name, shard_id)?.primary
+    }
+
+    pub fn primary_initialized(&self, index_name: &str, shard_id: u32) -> bool {
+        self.shard_allocation_ids(index_name, shard_id)
+            .is_some_and(|allocation| allocation.primary_initialized)
+    }
+
+    pub fn may_create_initial_empty_copy(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        node_id: &str,
+    ) -> bool {
+        let Some(allocations) = self.shard_allocation_ids(index_name, shard_id) else {
+            return false;
+        };
+        let Some(routing) = self
+            .indices
+            .get(index_name)
+            .and_then(|metadata| metadata.shard_routing.get(&shard_id))
+        else {
+            return false;
+        };
+        !allocations.primary_initialized
+            && allocations
+                .allocation_for(routing, node_id)
+                .is_some_and(|allocation_id| allocation_id == allocations.initial_allocation_id)
     }
 }
 
@@ -1314,6 +1501,9 @@ mod tests {
             2,
             &["node-A".into(), "node-B".into(), "node-C".into()],
         );
+        for routing in meta.shard_routing.values_mut() {
+            routing.in_sync_replicas = routing.replicas.clone();
+        }
 
         let mut orphaned = meta.remove_node(&"node-A".into());
         orphaned.sort();
@@ -1627,7 +1817,7 @@ mod tests {
         let routing = &meta.shard_routing[&0];
         assert_eq!(routing.primary, "node-1");
         assert_eq!(routing.replicas, vec!["node-2".to_string()]);
-        assert_eq!(routing.in_sync_replicas, vec!["node-2".to_string()]);
+        assert!(routing.in_sync_replicas.is_empty());
         assert_eq!(routing.unassigned_replicas, 0);
         assert_eq!(meta.unassigned_replica_count(), 0);
     }
@@ -1655,7 +1845,7 @@ mod tests {
         );
         let routing = &meta.shard_routing[&0];
         assert_eq!(routing.replicas.len(), 2);
-        assert_eq!(routing.in_sync_replicas, routing.replicas);
+        assert!(routing.in_sync_replicas.is_empty());
         assert_eq!(routing.unassigned_replicas, 0);
     }
 
@@ -1666,7 +1856,7 @@ mod tests {
         let routing = &meta.shard_routing[&0];
         assert_eq!(routing.primary_term, 1);
         assert_eq!(routing.replicas, ["node-2"]);
-        assert_eq!(routing.in_sync_replicas, ["node-2"]);
+        assert!(routing.in_sync_replicas.is_empty());
         assert_eq!(routing.unassigned_replicas, 3);
         routing.validate_in_sync_replicas().unwrap();
     }
@@ -1836,6 +2026,20 @@ mod tests {
         // Only node available is the same as primary
         let changed = meta.allocate_unassigned_replicas(&["node-1".into()]);
         assert!(!changed, "should not assign replica to primary node");
+    }
+
+    #[test]
+    fn allocate_skips_shards_without_a_surviving_primary_allocation() {
+        let mut meta = IndexMetadata::build_shard_routing("test", 2, 1, &["node-1".into()]);
+        let eligible = std::collections::HashSet::from([1]);
+        assert!(meta.allocate_unassigned_replicas_for_shards(
+            &["node-1".into(), "node-2".into()],
+            &eligible,
+        ));
+        assert!(meta.shard_routing[&0].replicas.is_empty());
+        assert_eq!(meta.shard_routing[&0].unassigned_replicas, 1);
+        assert_eq!(meta.shard_routing[&1].replicas, ["node-2"]);
+        assert_eq!(meta.shard_routing[&1].unassigned_replicas, 0);
     }
 
     // ── promote_replica_to tests ────────────────────────────────────────
@@ -2750,5 +2954,40 @@ mod tests {
         assert_eq!(state.version, 7);
         assert!(state.api_keys.is_empty());
         assert!(state.roles.is_empty());
+    }
+
+    #[test]
+    fn cluster_state_roundtrips_allocation_identity() {
+        let mut state = ClusterState::new("allocations".into());
+        state.add_index(IndexMetadata::build_shard_routing(
+            "idx",
+            1,
+            1,
+            &["node-1".into(), "node-2".into()],
+        ));
+        state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_initialized = true;
+
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let restored: ClusterState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.shard_allocations, state.shard_allocations);
+        assert_eq!(restored.primary_allocation_id("idx", 0), Some(1));
+        assert_eq!(restored.shard_allocation_id("idx", 0, "node-2"), Some(1));
+        assert!(restored.primary_initialized("idx", 0));
+    }
+
+    #[test]
+    fn cluster_state_missing_allocation_identity_defaults_fail_closed() {
+        let json = r#"{"cluster_name":"old","version":7,"master_node":null,
+                       "nodes":{},"indices":{}}"#;
+        let state: ClusterState = serde_json::from_str(json).unwrap();
+        assert!(state.shard_allocations.is_empty());
+        assert_eq!(state.primary_allocation_id("idx", 0), None);
+        assert!(!state.may_create_initial_empty_copy("idx", 0, "node-1"));
     }
 }

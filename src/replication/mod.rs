@@ -6,6 +6,7 @@
 
 use crate::cluster::state::ClusterState;
 use crate::transport::TransportClient;
+use crate::transport::proto::{ReplicateBulkRequest, ReplicateDocRequest};
 use tracing::error;
 
 /// Replicate a single document write to all in-sync replica nodes for a shard.
@@ -27,6 +28,11 @@ pub async fn replicate_write(
         Some(m) => m,
         None => return Ok(vec![]), // no index metadata, nothing to replicate
     };
+    let Some(routing) = metadata.shard_routing.get(&shard_id) else {
+        return Ok(vec![]);
+    };
+    let index_uuid = metadata.uuid.to_string();
+    let primary_term = routing.primary_term;
 
     let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
     if replica_node_ids.is_empty() {
@@ -58,10 +64,46 @@ pub async fn replicate_write(
         let pl = payload.clone();
         let operation = op.to_string();
         let rid = replica_node_id.to_string();
+        let Some(target_allocation_id) =
+            cluster_state.shard_allocation_id(index_name, shard_id, replica_node_id)
+        else {
+            futures.push(tokio::spawn(async move {
+                (
+                    rid.clone(),
+                    Err::<u64, String>(format!(
+                        "Replica node {rid} has no allocation ID in cluster state"
+                    )),
+                )
+            }));
+            continue;
+        };
+        let uuid = index_uuid.clone();
 
         futures.push(tokio::spawn(async move {
+            let payload_json = match serde_json::to_vec(&pl) {
+                Ok(payload_json) => payload_json,
+                Err(error) => {
+                    return (
+                        rid.clone(),
+                        Err(format!("{rid}: serialize replica payload: {error}")),
+                    );
+                }
+            };
             match client
-                .replicate_to_shard(&node_info, &idx, shard_id, &did, &pl, &operation, seq_no)
+                .replicate_to_shard(
+                    &node_info,
+                    ReplicateDocRequest {
+                        index_name: idx,
+                        shard_id,
+                        doc_id: did,
+                        payload_json,
+                        op: operation,
+                        seq_no,
+                        index_uuid: uuid,
+                        primary_term: Some(primary_term),
+                        target_allocation_id: Some(target_allocation_id),
+                    },
+                )
                 .await
             {
                 Ok(checkpoint) => (rid, Ok(checkpoint)),
@@ -113,6 +155,11 @@ pub async fn replicate_bulk(
         Some(m) => m,
         None => return Ok(vec![]),
     };
+    let Some(routing) = metadata.shard_routing.get(&shard_id) else {
+        return Ok(vec![]);
+    };
+    let index_uuid = metadata.uuid.to_string();
+    let primary_term = routing.primary_term;
 
     let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
     if replica_node_ids.is_empty() {
@@ -143,10 +190,60 @@ pub async fn replicate_bulk(
         let idx = index_name.to_string();
         let rid = replica_node_id.to_string();
         let docs_clone = docs_owned.clone();
+        let Some(target_allocation_id) =
+            cluster_state.shard_allocation_id(index_name, shard_id, replica_node_id)
+        else {
+            futures.push(tokio::spawn(async move {
+                (
+                    rid.clone(),
+                    Err::<u64, String>(format!(
+                        "Replica node {rid} has no allocation ID in cluster state"
+                    )),
+                )
+            }));
+            continue;
+        };
+        let uuid = index_uuid.clone();
 
         futures.push(tokio::spawn(async move {
+            let ops = match docs_clone
+                .iter()
+                .enumerate()
+                .map(|(offset, (doc_id, payload))| {
+                    let seq_no = start_seq_no
+                        .checked_add(offset as u64)
+                        .ok_or_else(|| "bulk replication sequence range overflows".to_string())?;
+                    let payload_json = serde_json::to_vec(payload)
+                        .map_err(|error| format!("serialize replica payload: {error}"))?;
+                    Ok(ReplicateDocRequest {
+                        index_name: idx.clone(),
+                        shard_id,
+                        doc_id: doc_id.clone(),
+                        payload_json,
+                        op: "index".to_string(),
+                        seq_no,
+                        index_uuid: uuid.clone(),
+                        primary_term: Some(primary_term),
+                        target_allocation_id: Some(target_allocation_id),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()
+            {
+                Ok(ops) => ops,
+                Err(error) => return (rid.clone(), Err(format!("{rid}: {error}"))),
+            };
             match client
-                .replicate_bulk_to_shard(&node_info, &idx, shard_id, &docs_clone, start_seq_no)
+                .replicate_bulk_to_shard(
+                    &node_info,
+                    ReplicateBulkRequest {
+                        index_name: idx,
+                        shard_id,
+                        ops,
+                        index_uuid: uuid,
+                        primary_term: Some(primary_term),
+                        target_allocation_id: Some(target_allocation_id),
+                    },
+                )
                 .await
             {
                 Ok(checkpoint) => (rid, Ok(checkpoint)),

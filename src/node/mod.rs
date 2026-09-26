@@ -18,8 +18,9 @@ use crate::wal::TranslogDurability;
 
 use lifecycle::{remote_seed_hosts, try_join_cluster};
 use reconciliation::{
-    build_guarded_startup_shards, cleanup_orphaned_data_if_authoritative_blocking,
-    open_local_assigned_shards_blocking, should_retry_cluster_join, snapshot_uuid_dirs,
+    ShardCopyFailure, build_guarded_startup_shards,
+    cleanup_orphaned_data_if_authoritative_blocking, open_local_assigned_shards_blocking,
+    should_retry_cluster_join, snapshot_uuid_dirs,
 };
 
 #[cfg(test)]
@@ -171,6 +172,76 @@ fn follower_join_retry_remaining(
 
 fn dead_node_removal_allowed(routing_update_failed: bool) -> bool {
     !routing_update_failed
+}
+
+async fn report_failed_shard_copies(
+    failures: Vec<ShardCopyFailure>,
+    cluster_manager: &ClusterManager,
+    transport_client: &TransportClient,
+    raft: &RaftInstance,
+) {
+    for failure in failures {
+        tracing::error!(
+            index = failure.index_name,
+            shard_id = failure.shard_id,
+            node = failure.node_id,
+            allocation_id = failure.allocation_id,
+            reason = failure.reason,
+            "Local authoritative shard copy failed closed"
+        );
+        let command = ClusterCommand::FailShardCopy {
+            index_name: failure.index_name.clone(),
+            index_uuid: failure.index_uuid.clone(),
+            shard_id: failure.shard_id,
+            node: failure.node_id.clone(),
+            allocation_id: failure.allocation_id,
+        };
+        let result = if raft.is_leader() {
+            crate::consensus::client_write_checked(raft, command)
+                .await
+                .map_err(anyhow::Error::msg)
+        } else {
+            let state = cluster_manager.get_state();
+            let Some(master_id) = state.master_node.as_ref() else {
+                tracing::warn!(
+                    index = failure.index_name,
+                    shard_id = failure.shard_id,
+                    "Cannot report failed shard copy because no Raft leader is known"
+                );
+                continue;
+            };
+            let Some(master) = state.nodes.get(master_id) else {
+                tracing::warn!(
+                    index = failure.index_name,
+                    shard_id = failure.shard_id,
+                    master = master_id,
+                    "Cannot report failed shard copy because the Raft leader is absent"
+                );
+                continue;
+            };
+            transport_client
+                .forward_fail_shard_copy(
+                    master,
+                    crate::transport::proto::FailShardCopyRequest {
+                        index_name: failure.index_name.clone(),
+                        index_uuid: failure.index_uuid.clone(),
+                        shard_id: failure.shard_id,
+                        node_id: failure.node_id.clone(),
+                        allocation_id: Some(failure.allocation_id),
+                    },
+                )
+                .await
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                allocation_id = failure.allocation_id,
+                error = %error,
+                "Failed shard-copy report was not applied"
+            );
+        }
+    }
 }
 
 impl Node {
@@ -487,7 +558,7 @@ impl Node {
             }
 
             let has_authoritative_startup_state = startup_state.is_some();
-            let state = startup_state.clone().unwrap_or_else(|| manager.get_state());
+            let mut state = startup_state.clone().unwrap_or_else(|| manager.get_state());
             let guarded_missing_startup_shards =
                 build_guarded_startup_shards(recovered_guard_state.as_ref(), &local_id);
             // Keep the recovered-startup guard in place even after we obtain
@@ -500,13 +571,15 @@ impl Node {
             // freshly-created (empty) shard dirs as evidence that the
             // authoritative data is present.
             let pre_existing_uuid_dirs = snapshot_uuid_dirs(manager_clone.data_dir());
-            open_local_assigned_shards_blocking(
+            let failures = open_local_assigned_shards_blocking(
                 state.clone(),
                 local_id.clone(),
                 manager_clone.clone(),
                 guarded_missing_startup_shards.clone(),
             )
             .await;
+            report_failed_shard_copies(failures, manager.as_ref(), &client, raft.as_ref()).await;
+            state = manager.get_state();
 
             let mut orphan_cleanup_done = cleanup_orphaned_data_if_authoritative_blocking(
                 Some(state.clone()),
@@ -525,14 +598,17 @@ impl Node {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
-                let state = manager.get_state();
-                open_local_assigned_shards_blocking(
+                let mut state = manager.get_state();
+                let failures = open_local_assigned_shards_blocking(
                     state.clone(),
                     local_id.clone(),
                     manager_clone.clone(),
                     guarded_missing_startup_shards.clone(),
                 )
                 .await;
+                report_failed_shard_copies(failures, manager.as_ref(), &client, raft.as_ref())
+                    .await;
+                state = manager.get_state();
                 peer_recovery_driver.reconcile(
                     &state,
                     &local_id,
@@ -801,7 +877,28 @@ impl Node {
                         for idx_meta in alloc_state.indices.values() {
                             if idx_meta.unassigned_replica_count() > 0 {
                                 let mut updated = idx_meta.clone();
-                                if updated.allocate_unassigned_replicas(&data_nodes) {
+                                let eligible_shards = idx_meta
+                                    .shard_routing
+                                    .keys()
+                                    .copied()
+                                    .filter(|shard_id| {
+                                        idx_meta.shard_routing.get(shard_id).is_some_and(
+                                            |routing| {
+                                                alloc_state.nodes.contains_key(&routing.primary)
+                                                    && alloc_state
+                                                        .primary_allocation_id(
+                                                            &idx_meta.name,
+                                                            *shard_id,
+                                                        )
+                                                        .is_some()
+                                            },
+                                        )
+                                    })
+                                    .collect();
+                                if updated.allocate_unassigned_replicas_for_shards(
+                                    &data_nodes,
+                                    &eligible_shards,
+                                ) {
                                     tracing::info!(
                                         "Allocating unassigned replicas for index '{}' ({} remaining)",
                                         updated.name,

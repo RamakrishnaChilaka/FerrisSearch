@@ -201,6 +201,25 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
                     .shard_routing
                     .iter()
                     .map(|(sid, routing)| ShardAssignment {
+                        primary_allocation_id: s
+                            .shard_allocation_ids(&idx.name, *sid)
+                            .and_then(|allocations| allocations.primary),
+                        replica_allocations: routing
+                            .replicas
+                            .iter()
+                            .map(|node_id| ReplicaAllocation {
+                                node_id: node_id.clone(),
+                                allocation_id: s.shard_allocation_ids(&idx.name, *sid).and_then(
+                                    |allocations| allocations.replicas.get(node_id).copied(),
+                                ),
+                            })
+                            .collect(),
+                        initial_allocation_id: s
+                            .shard_allocation_ids(&idx.name, *sid)
+                            .map(|allocations| allocations.initial_allocation_id),
+                        primary_initialized: s
+                            .shard_allocation_ids(&idx.name, *sid)
+                            .is_some_and(|allocations| allocations.primary_initialized),
                         shard_id: *sid,
                         node_id: routing.primary.clone(),
                         primary_term: routing.primary_term,
@@ -248,6 +267,7 @@ pub fn proto_to_cluster_state(
     }
     for idx in &p.indices {
         let mut shard_routing = std::collections::HashMap::new();
+        let mut shard_allocations = std::collections::HashMap::new();
         for sa in &idx.shards {
             let routing = crate::cluster::state::ShardRoutingEntry {
                 primary: sa.node_id.clone(),
@@ -262,7 +282,52 @@ pub fn proto_to_cluster_state(
                     idx.name, sa.shard_id, reason
                 ))
             })?;
+            let initial_allocation_id = sa.initial_allocation_id.ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "index '{}' shard {} is missing allocation identity metadata",
+                    idx.name, sa.shard_id
+                ))
+            })?;
+            let mut replica_allocations = std::collections::HashMap::new();
+            for replica in &sa.replica_allocations {
+                if !routing.replicas.contains(&replica.node_id) {
+                    return Err(Status::invalid_argument(format!(
+                        "allocation metadata for index '{}' shard {} names unassigned replica '{}'",
+                        idx.name, sa.shard_id, replica.node_id
+                    )));
+                }
+                let allocation_id = replica.allocation_id.ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "replica '{}' for index '{}' shard {} is missing an allocation ID",
+                        replica.node_id, idx.name, sa.shard_id
+                    ))
+                })?;
+                if replica_allocations
+                    .insert(replica.node_id.clone(), allocation_id)
+                    .is_some()
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "duplicate replica allocation '{}' for index '{}' shard {}",
+                        replica.node_id, idx.name, sa.shard_id
+                    )));
+                }
+            }
+            let allocations = crate::cluster::state::ShardAllocationIds {
+                primary: sa.primary_allocation_id,
+                replicas: replica_allocations,
+                initial_allocation_id,
+                primary_initialized: sa.primary_initialized,
+            };
+            allocations
+                .validate_for_routing(&routing)
+                .map_err(|reason| {
+                    Status::invalid_argument(format!(
+                        "invalid allocation identity for index '{}' shard {}: {}",
+                        idx.name, sa.shard_id, reason
+                    ))
+                })?;
             shard_routing.insert(sa.shard_id, routing);
+            shard_allocations.insert(sa.shard_id, allocations);
         }
         let mut mappings = std::collections::HashMap::new();
         for mapping in &idx.mappings {
@@ -306,6 +371,9 @@ pub fn proto_to_cluster_state(
                 })?,
             },
         );
+        state
+            .shard_allocations
+            .insert(idx.name.clone(), shard_allocations);
     }
     for record_json in &p.api_keys_json {
         let record: crate::cluster::state::SecurityApiKeyRecord = serde_json::from_str(record_json)

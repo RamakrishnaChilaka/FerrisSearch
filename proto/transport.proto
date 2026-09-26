@@ -21,6 +21,15 @@ message ShardAssignment {
     uint32 unassigned_replicas = 4;
     repeated string in_sync_replica_node_ids = 5; // authoritative replicas
     uint64 primary_term = 6;
+    optional uint64 primary_allocation_id = 7;
+    repeated ReplicaAllocation replica_allocations = 8;
+    optional uint64 initial_allocation_id = 9;
+    bool primary_initialized = 10;
+}
+
+message ReplicaAllocation {
+    string node_id = 1;
+    optional uint64 allocation_id = 2;
 }
 
 message FieldMappingEntry {
@@ -226,6 +235,9 @@ message ReplicateDocRequest {
     bytes payload_json = 4;   // document body as JSON bytes
     string op = 5;            // "index" or "delete"
     uint64 seq_no = 6;        // monotonic sequence number from primary WAL
+    string index_uuid = 7;
+    optional uint64 primary_term = 8;
+    optional uint64 target_allocation_id = 9;
 }
 
 message ReplicateDocResponse {
@@ -238,6 +250,9 @@ message ReplicateBulkRequest {
     string index_name = 1;
     uint32 shard_id = 2;
     repeated ReplicateDocRequest ops = 3;
+    string index_uuid = 4;
+    optional uint64 primary_term = 5;
+    optional uint64 target_allocation_id = 6;
 }
 
 message ReplicateBulkResponse {
@@ -281,6 +296,7 @@ message StartPeerRecoveryRequest {
     string index_uuid = 2;
     uint32 shard_id = 3;
     string target_node_id = 4;
+    optional uint64 target_allocation_id = 5;
 }
 
 message StartPeerRecoveryResponse {
@@ -290,6 +306,7 @@ message StartPeerRecoveryResponse {
     repeated RecoveryFileMetadata files = 4;
     string error = 5;
     bool preparing = 6;
+    optional uint64 target_allocation_id = 7;
 }
 
 message FetchRecoveryFileChunkRequest {
@@ -374,6 +391,7 @@ message MarkReplicaInSyncRequest {
     string replica_node_id = 4;
     string primary_node_id = 5;
     uint64 primary_term = 6;
+    optional uint64 allocation_id = 7;
 }
 
 message MarkReplicaInSyncResponse {
@@ -387,9 +405,23 @@ message ActivatePrimaryRequest {
     uint32 shard_id = 3;
     string primary_node_id = 4;
     uint64 expected_term = 5;
+    optional uint64 allocation_id = 6;
 }
 
 message ActivatePrimaryResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
+message FailShardCopyRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    string node_id = 4;
+    optional uint64 allocation_id = 5;
+}
+
+message FailShardCopyResponse {
     bool acknowledged = 1;
     string error = 2;
 }
@@ -608,6 +640,7 @@ service InternalTransport {
     rpc UpdateSettings(UpdateSettingsRequest) returns (UpdateSettingsResponse);
     rpc MarkReplicaInSync(MarkReplicaInSyncRequest) returns (MarkReplicaInSyncResponse);
     rpc ActivatePrimary(ActivatePrimaryRequest) returns (ActivatePrimaryResponse);
+    rpc FailShardCopy(FailShardCopyRequest) returns (FailShardCopyResponse);
 
     // Index management (forwarded to leader)
     rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);

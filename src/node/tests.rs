@@ -97,6 +97,13 @@ fn open_local_assigned_shards_skips_missing_expected_uuid_dir_for_recovered_assi
         dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
 
     let guarded = collect_guarded_startup_shards(&state, "node-1");
     open_local_assigned_shards(
@@ -215,6 +222,13 @@ async fn recovered_startup_shards_remain_guarded_across_reopen_attempts() {
         dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
 
     // Directory does NOT exist on disk — guard should block every reopen attempt.
     let guarded = build_guarded_startup_shards(Some(&state), "node-1");
@@ -560,6 +574,13 @@ fn two_restart_recovery_sequence_preserves_old_data_and_never_creates_fresh_uuid
         dynamic: Default::default(),
         settings: IndexSettings::default(),
     });
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
 
     // First restart: startup guard must keep the missing authoritative
     // UUID dir fail-closed and prevent orphan cleanup from touching old data.

@@ -240,6 +240,18 @@ fn make_full_cluster_state() -> DomainClusterState {
             remote_store: None,
         },
     });
+    {
+        let allocations = cs.shard_allocations.get_mut("products").unwrap();
+        let shard0 = allocations.get_mut(&0).unwrap();
+        shard0.primary = Some(101);
+        shard0.replicas.insert("node-2".into(), 102);
+        shard0.initial_allocation_id = 100;
+        shard0.primary_initialized = true;
+        let shard1 = allocations.get_mut(&1).unwrap();
+        shard1.primary = Some(201);
+        shard1.replicas.insert("node-1".into(), 202);
+        shard1.initial_allocation_id = 200;
+    }
     cs.version = 42; // reset again after add_index
 
     cs
@@ -295,6 +307,12 @@ fn roundtrip_preserves_shard_routing() {
     assert_eq!(shard0.primary_term, 7);
     assert_eq!(shard0.replicas, vec!["node-2".to_string()]);
     assert_eq!(shard0.in_sync_replicas, vec!["node-2".to_string()]);
+    assert_eq!(restored.primary_allocation_id("products", 0), Some(101));
+    assert_eq!(
+        restored.shard_allocation_id("products", 0, "node-2"),
+        Some(102)
+    );
+    assert!(restored.primary_initialized("products", 0));
 
     let shard1 = idx.shard_routing.get(&1).unwrap();
     assert_eq!(shard1.primary, "node-2");
@@ -302,6 +320,11 @@ fn roundtrip_preserves_shard_routing() {
     assert_eq!(shard1.replicas, vec!["node-1".to_string()]);
     assert_eq!(shard1.in_sync_replicas, vec!["node-1".to_string()]);
     assert_eq!(shard1.unassigned_replicas, 1);
+    assert_eq!(restored.primary_allocation_id("products", 1), Some(201));
+    assert_eq!(
+        restored.shard_allocation_id("products", 1, "node-1"),
+        Some(202)
+    );
 }
 
 fn shard_assignment_mut(
@@ -342,6 +365,28 @@ fn cluster_state_snapshot_without_primary_term_preserves_legacy_zero() {
         restored.indices["products"].shard_routing[&0].primary_term,
         0
     );
+}
+
+#[test]
+fn cluster_state_snapshot_without_allocation_identity_is_rejected() {
+    let original = make_full_cluster_state();
+    let mut proto = cluster_state_to_proto(&original);
+    shard_assignment_mut(&mut proto, 0).initial_allocation_id = None;
+
+    let error = proto_to_cluster_state(&proto).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("missing allocation identity"));
+}
+
+#[test]
+fn cluster_state_snapshot_rejects_missing_replica_allocation_id() {
+    let original = make_full_cluster_state();
+    let mut proto = cluster_state_to_proto(&original);
+    shard_assignment_mut(&mut proto, 0).replica_allocations[0].allocation_id = None;
+
+    let error = proto_to_cluster_state(&proto).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("missing an allocation ID"));
 }
 
 #[test]
@@ -590,9 +635,17 @@ async fn get_or_open_search_shard_reopens_persisted_shard_via_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let test_uuid = "test-uuid-reopen";
     {
-        let shard_dir = dir.path().join(test_uuid).join("shard_0");
-        std::fs::create_dir_all(&shard_dir).unwrap();
-        let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.register_index_uuid("restart-idx", test_uuid);
+        let engine = manager
+            .open_shard_with_settings(
+                "restart-idx",
+                0,
+                &HashMap::new(),
+                &crate::cluster::state::IndexSettings::default(),
+                test_uuid,
+            )
+            .unwrap();
         engine
             .add_document("d1", json!({"title": "rust restart unit"}))
             .unwrap();
@@ -653,9 +706,17 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let test_uuid = "test-uuid-getdoc";
     {
-        let shard_dir = dir.path().join(test_uuid).join("shard_0");
-        std::fs::create_dir_all(&shard_dir).unwrap();
-        let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.register_index_uuid("restart-idx", test_uuid);
+        let engine = manager
+            .open_shard_with_settings(
+                "restart-idx",
+                0,
+                &HashMap::new(),
+                &crate::cluster::state::IndexSettings::default(),
+                test_uuid,
+            )
+            .unwrap();
         engine
             .add_document("d1", json!({"title": "rust restart unit"}))
             .unwrap();
@@ -1071,9 +1132,17 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
     let dir = tempfile::tempdir().unwrap();
     let test_uuid = "test-uuid-flush";
     {
-        let shard_dir = dir.path().join(test_uuid).join("shard_0");
-        std::fs::create_dir_all(&shard_dir).unwrap();
-        let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.register_index_uuid("maint-idx", test_uuid);
+        let engine = manager
+            .open_shard_with_settings(
+                "maint-idx",
+                0,
+                &HashMap::new(),
+                &crate::cluster::state::IndexSettings::default(),
+                test_uuid,
+            )
+            .unwrap();
         engine
             .add_document("d1", json!({"title": "flush reopen"}))
             .unwrap();
@@ -1168,6 +1237,8 @@ async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
         dir.path().join("shards"),
         Duration::from_secs(60),
     ));
+    shard_manager.register_index_uuid("maintenance-idx", "maintenance-uuid");
+    shard_manager.register_index_uuid("write-idx", "write-uuid");
     shard_manager.insert_shard_for_test("maintenance-idx", 0, maintenance_engine);
     shard_manager.insert_shard_for_test("write-idx", 0, write_engine.clone());
 
@@ -1236,6 +1307,9 @@ async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
             doc_id: "replica-doc".into(),
             payload_json: serde_json::to_vec(&json!({"value": "written"})).unwrap(),
             seq_no: 7,
+            index_uuid: "write-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         })),
     )
     .await;

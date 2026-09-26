@@ -974,6 +974,26 @@ fn routing_snapshot(
         .collect()
 }
 
+fn allocation_id_for_node(
+    cluster_state: &Value,
+    index_name: &str,
+    shard_id: u32,
+    node_id: &str,
+) -> Result<Option<u64>> {
+    let routing = routing_snapshot(cluster_state, index_name)?;
+    let Some(shard) = routing.get(&shard_id) else {
+        return Ok(None);
+    };
+    let allocations = &cluster_state["shard_allocations"][index_name][shard_id.to_string()];
+    if shard.primary == node_id {
+        return Ok(allocations["primary"].as_u64());
+    }
+    if shard.replicas.iter().any(|replica| replica == node_id) {
+        return Ok(allocations["replicas"][node_id].as_u64());
+    }
+    Ok(None)
+}
+
 fn expected_document(doc_id: usize) -> Value {
     json!({
         "title": format!("restart regression doc {doc_id}"),
@@ -1346,6 +1366,77 @@ async fn rejoining_stale_replica_is_recovered_before_primary_failover() -> Resul
         .put_document("doc-25", expected_document(25))
         .await?;
     harness.wait_for_exact_documents(26).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_sync_replica_disk_loss_is_failed_reallocated_and_recovered() -> Result<()> {
+    let mut harness = RestartClusterHarness::start().await?;
+    let index_uuid = harness.create_index_with_shards(1, 2).await?;
+    harness
+        .wait_for_index_shards(INDEX_NAME, 3, 0, READY_TIMEOUT)
+        .await?;
+    harness.bulk_index_document_range(0, 20).await?;
+    harness.refresh_index().await?;
+    harness.flush_index_copies(3).await?;
+
+    let before_loss = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    let routing = routing_snapshot(&before_loss, INDEX_NAME)?;
+    let master = before_loss["master_node"]
+        .as_str()
+        .context("cluster state is missing master_node")?;
+    let lost_replica = routing[&0]
+        .replicas
+        .iter()
+        .find(|replica| replica.as_str() != master)
+        .cloned()
+        .context("no non-master replica is available for disk-loss test")?;
+    let old_allocation = allocation_id_for_node(&before_loss, INDEX_NAME, 0, &lost_replica)?
+        .context("lost replica is missing its original allocation ID")?;
+
+    let stopped = harness.stop_node(&lost_replica)?;
+    let lost_config = stopped.config.clone();
+    let shard_dir = lost_config.data_dir.join(&index_uuid).join("shard_0");
+    assert!(shard_dir.exists(), "replica shard directory should exist");
+    fs::remove_dir_all(&shard_dir)?;
+    harness.restart_node(stopped).await?;
+
+    let deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
+    let new_allocation = loop {
+        let state = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+        if let Some(allocation_id) = allocation_id_for_node(&state, INDEX_NAME, 0, &lost_replica)?
+            && allocation_id != old_allocation
+        {
+            break allocation_id;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "failed replica allocation was not replaced after disk loss\n{}",
+                harness.logs_summary()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert_ne!(new_allocation, old_allocation);
+
+    harness
+        .put_document("doc-20", expected_document(20))
+        .await?;
+    harness.wait_for_in_sync_replicas(2).await?;
+    harness.wait_for_green().await?;
+    harness
+        .put_document("doc-21", expected_document(21))
+        .await?;
+    harness.refresh_index().await?;
+    harness.wait_for_exact_documents(22).await?;
+
+    for doc_id in 0..22 {
+        assert_eq!(
+            get_local_document(&lost_config, &format!("doc-{doc_id}")).await?,
+            Some(expected_document(doc_id)),
+            "recovered replica is missing acknowledged doc-{doc_id}"
+        );
+    }
     Ok(())
 }
 

@@ -51,7 +51,7 @@ fn new_join_lock() -> Arc<Mutex<()>> {
 
 #[derive(Default)]
 struct PrimaryActivationState {
-    activated_terms: RwLock<HashMap<(String, u32), u64>>,
+    activated_terms: RwLock<HashMap<(String, u32, u64), u64>>,
     activation_lock: Mutex<()>,
 }
 
@@ -86,7 +86,19 @@ struct DynamicShardOpenOverride {
 #[derive(Clone)]
 struct ActivatedPrimary {
     index_uuid: String,
+    allocation_id: u64,
     primary_term: u64,
+}
+
+#[derive(Clone)]
+struct AssignedLocalShard {
+    index_uuid: String,
+    mappings: std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+    settings: crate::cluster::state::IndexSettings,
+    allocation_id: u64,
+    primary_term: u64,
+    allow_empty_creation: bool,
+    authoritative: bool,
 }
 
 pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
@@ -151,23 +163,43 @@ pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
 async fn get_or_open_read_shard(
     cluster_manager: &ClusterManager,
     shard_manager: &Arc<ShardManager>,
+    local_node_id: &str,
     index_name: &str,
     shard_id: u32,
 ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
-    if let Some(engine) = shard_manager.get_shard(index_name, shard_id) {
-        return Ok(engine);
-    }
-
     let cs = cluster_manager.get_state();
     let Some(metadata) = cs.indices.get(index_name) else {
         return Err(Status::not_found(format!(
             "Shard [{index_name}][{shard_id}] not found on this node"
         )));
     };
-    if !metadata.shard_routing.contains_key(&shard_id) {
+    let Some(routing) = metadata.shard_routing.get(&shard_id) else {
         return Err(Status::not_found(format!(
             "Shard [{index_name}][{shard_id}] not found on this node"
         )));
+    };
+    if routing.primary != local_node_id && !routing.is_replica_in_sync(local_node_id) {
+        return Err(Status::failed_precondition(format!(
+            "node [{local_node_id}] is not an authoritative copy for shard [{index_name}][{shard_id}]"
+        )));
+    }
+    let allocation_id = cs
+        .shard_allocation_id(index_name, shard_id, local_node_id)
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "Shard [{index_name}][{shard_id}] has no local allocation identity"
+            ))
+        })?;
+    if let Some(engine) = shard_manager.get_shard(index_name, shard_id) {
+        shard_manager
+            .validate_open_copy_identity(
+                index_name,
+                shard_id,
+                metadata.uuid.as_str(),
+                allocation_id,
+            )
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        return Ok(engine);
     }
 
     let shard_dir = shard_manager
@@ -181,12 +213,17 @@ async fn get_or_open_read_shard(
     }
 
     Arc::clone(shard_manager)
-        .open_shard_with_settings_blocking(
+        .open_assigned_shard_with_settings_blocking(
             index_name.to_string(),
             shard_id,
             metadata.mappings.clone(),
             metadata.settings.clone(),
             metadata.uuid.clone(),
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: routing.primary_term,
+                allow_empty_creation: false,
+            },
         )
         .await
         .map_err(|e| Status::internal(format!("Failed to open shard: {e}")))
@@ -220,6 +257,7 @@ pub(crate) async fn run_maintenance_on_assigned_shards_async(
         let engine = match get_or_open_read_shard(
             cluster_manager.as_ref(),
             &shard_manager,
+            &local_node_id,
             &index_name,
             *shard_id,
         )
@@ -1482,6 +1520,36 @@ impl InternalTransport for TransportService {
         request: Request<ReplicateDocRequest>,
     ) -> Result<Response<ReplicateDocResponse>, Status> {
         let req = request.into_inner();
+        if req.index_uuid.is_empty() {
+            return Err(Status::invalid_argument(
+                "replication requires an index UUID",
+            ));
+        }
+        let primary_term = req
+            .primary_term
+            .filter(|term| *term > 0)
+            .ok_or_else(|| Status::invalid_argument("replication requires a primary term"))?;
+        let allocation_id = req
+            .target_allocation_id
+            .filter(|allocation_id| *allocation_id > 0)
+            .ok_or_else(|| {
+                Status::invalid_argument("replication requires a target allocation ID")
+            })?;
+        let assigned = match self.replica_apply_routing(
+            &req.index_name,
+            req.shard_id,
+            &req.index_uuid,
+            allocation_id,
+        ) {
+            Ok(assigned) => assigned,
+            Err(error) => {
+                return Ok(Response::new(ReplicateDocResponse {
+                    success: false,
+                    error,
+                    local_checkpoint: 0,
+                }));
+            }
+        };
         if self
             .shard_manager
             .rejects_live_replication(&req.index_name, req.shard_id)
@@ -1492,50 +1560,104 @@ impl InternalTransport for TransportService {
                 local_checkpoint: 0,
             }));
         }
-        let engine = self
-            .get_or_open_shard(&req.index_name, req.shard_id)
-            .await?;
+        let assigned_uuid = assigned.index_uuid.clone();
+        let assigned_authoritative = assigned.authoritative;
+        if let Err(error) = self
+            .shard_manager
+            .open_assigned_shard_with_settings_blocking(
+                req.index_name.clone(),
+                req.shard_id,
+                assigned.mappings,
+                assigned.settings,
+                assigned_uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id,
+                    primary_term: assigned.primary_term,
+                    allow_empty_creation: assigned.allow_empty_creation,
+                },
+            )
+            .await
+        {
+            if assigned_authoritative {
+                self.report_local_copy_failure(
+                    &req.index_name,
+                    &assigned_uuid,
+                    req.shard_id,
+                    allocation_id,
+                    &error.to_string(),
+                )
+                .await;
+            }
+            return Ok(Response::new(ReplicateDocResponse {
+                success: false,
+                error: format!("failed to open replica copy: {error}"),
+                local_checkpoint: 0,
+            }));
+        }
 
         info!(
             "gRPC: replicate {} doc '{}' (seq_no={}) to {}/shard_{}",
             req.op, req.doc_id, req.seq_no, req.index_name, req.shard_id
         );
 
-        let result = match req.op.as_str() {
-            "index" => {
-                let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
-                    .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
-                let engine = engine.clone();
-                let doc_id = req.doc_id.clone();
-                let seq_no = req.seq_no;
-                self.worker_pools
-                    .spawn_write(move || {
-                        engine
-                            .add_document_with_seq(&doc_id, payload, seq_no)
-                            .map(|_| ())
-                    })
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
+        enum ReplicaOperation {
+            Index(serde_json::Value),
+            Delete,
+        }
+        let operation = match req.op.as_str() {
+            "index" => ReplicaOperation::Index(
+                serde_json::from_slice(&req.payload_json)
+                    .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?,
+            ),
+            "delete" => ReplicaOperation::Delete,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown replication op: {other}"
+                )));
             }
-            "delete" => {
-                let engine = engine.clone();
-                let doc_id = req.doc_id.clone();
-                let seq_no = req.seq_no;
-                self.worker_pools
-                    .spawn_write(move || {
-                        engine.delete_document_with_seq(&doc_id, seq_no).map(|_| ())
-                    })
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-            }
-            other => Err(anyhow::anyhow!("Unknown replication op: {other}")),
         };
+        let service = self.clone();
+        let index_name = req.index_name.clone();
+        let index_uuid = req.index_uuid.clone();
+        let shard_id = req.shard_id;
+        let doc_id = req.doc_id.clone();
+        let seq_no = req.seq_no;
+        let result = self
+            .worker_pools
+            .spawn_write(move || {
+                let current = service
+                    .replica_apply_routing(&index_name, shard_id, &index_uuid, allocation_id)
+                    .map_err(anyhow::Error::msg)?;
+                service.shard_manager.apply_replica_operation(
+                    &index_name,
+                    shard_id,
+                    crate::shard::ReplicaApplyContext {
+                        index_uuid: &index_uuid,
+                        allocation_id,
+                        applied_view_term: current.primary_term,
+                        message_term: primary_term,
+                    },
+                    |engine| {
+                        match operation {
+                            ReplicaOperation::Index(payload) => {
+                                engine.add_document_with_seq(&doc_id, payload, seq_no)?;
+                            }
+                            ReplicaOperation::Delete => {
+                                engine.delete_document_with_seq(&doc_id, seq_no)?;
+                            }
+                        }
+                        Ok(engine.local_checkpoint())
+                    },
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
-            Ok(()) => Ok(Response::new(ReplicateDocResponse {
+            Ok(local_checkpoint) => Ok(Response::new(ReplicateDocResponse {
                 success: true,
                 error: String::new(),
-                local_checkpoint: engine.local_checkpoint(),
+                local_checkpoint,
             })),
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
@@ -1543,7 +1665,10 @@ impl InternalTransport for TransportService {
             Err(e) => Ok(Response::new(ReplicateDocResponse {
                 success: false,
                 error: e.to_string(),
-                local_checkpoint: engine.local_checkpoint(),
+                local_checkpoint: self
+                    .shard_manager
+                    .get_shard(&req.index_name, req.shard_id)
+                    .map_or(0, |engine| engine.local_checkpoint()),
             })),
         }
     }
@@ -1553,6 +1678,36 @@ impl InternalTransport for TransportService {
         request: Request<ReplicateBulkRequest>,
     ) -> Result<Response<ReplicateBulkResponse>, Status> {
         let req = request.into_inner();
+        if req.index_uuid.is_empty() {
+            return Err(Status::invalid_argument(
+                "bulk replication requires an index UUID",
+            ));
+        }
+        let primary_term = req
+            .primary_term
+            .filter(|term| *term > 0)
+            .ok_or_else(|| Status::invalid_argument("bulk replication requires a primary term"))?;
+        let allocation_id = req
+            .target_allocation_id
+            .filter(|allocation_id| *allocation_id > 0)
+            .ok_or_else(|| {
+                Status::invalid_argument("bulk replication requires a target allocation ID")
+            })?;
+        let assigned = match self.replica_apply_routing(
+            &req.index_name,
+            req.shard_id,
+            &req.index_uuid,
+            allocation_id,
+        ) {
+            Ok(assigned) => assigned,
+            Err(error) => {
+                return Ok(Response::new(ReplicateBulkResponse {
+                    success: false,
+                    error,
+                    local_checkpoint: 0,
+                }));
+            }
+        };
         if self
             .shard_manager
             .rejects_live_replication(&req.index_name, req.shard_id)
@@ -1563,9 +1718,40 @@ impl InternalTransport for TransportService {
                 local_checkpoint: 0,
             }));
         }
-        let engine = self
-            .get_or_open_shard(&req.index_name, req.shard_id)
-            .await?;
+        let assigned_uuid = assigned.index_uuid.clone();
+        let assigned_authoritative = assigned.authoritative;
+        if let Err(error) = self
+            .shard_manager
+            .open_assigned_shard_with_settings_blocking(
+                req.index_name.clone(),
+                req.shard_id,
+                assigned.mappings,
+                assigned.settings,
+                assigned_uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id,
+                    primary_term: assigned.primary_term,
+                    allow_empty_creation: assigned.allow_empty_creation,
+                },
+            )
+            .await
+        {
+            if assigned_authoritative {
+                self.report_local_copy_failure(
+                    &req.index_name,
+                    &assigned_uuid,
+                    req.shard_id,
+                    allocation_id,
+                    &error.to_string(),
+                )
+                .await;
+            }
+            return Ok(Response::new(ReplicateBulkResponse {
+                success: false,
+                error: format!("failed to open replica copy: {error}"),
+                local_checkpoint: 0,
+            }));
+        }
 
         info!(
             "gRPC: replicate bulk {} ops to {}/shard_{}",
@@ -1574,16 +1760,19 @@ impl InternalTransport for TransportService {
             req.shard_id
         );
 
-        let Some(first) = req.ops.first() else {
-            return Ok(Response::new(ReplicateBulkResponse {
-                success: true,
-                error: String::new(),
-                local_checkpoint: engine.local_checkpoint(),
-            }));
-        };
-        let start_seq_no = first.seq_no;
+        let start_seq_no = req.ops.first().map_or(0, |first| first.seq_no);
         let mut docs = Vec::with_capacity(req.ops.len());
         for (offset, op) in req.ops.iter().enumerate() {
+            if op.index_name != req.index_name
+                || op.shard_id != req.shard_id
+                || op.index_uuid != req.index_uuid
+                || op.primary_term != Some(primary_term)
+                || op.target_allocation_id != Some(allocation_id)
+            {
+                return Err(Status::invalid_argument(
+                    "bulk replication operation identity does not match the envelope",
+                ));
+            }
             let expected_seq = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
                 Status::invalid_argument("bulk replication sequence range overflows")
             })?;
@@ -1604,19 +1793,43 @@ impl InternalTransport for TransportService {
             docs.push((op.doc_id.clone(), payload));
         }
 
-        let write_result = {
-            let engine = engine.clone();
-            self.worker_pools
-                .spawn_write(move || engine.bulk_add_documents_with_start_seq(docs, start_seq_no))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-        };
+        let service = self.clone();
+        let index_name = req.index_name.clone();
+        let index_uuid = req.index_uuid.clone();
+        let shard_id = req.shard_id;
+        let write_result = self
+            .worker_pools
+            .spawn_write(move || {
+                let current = service
+                    .replica_apply_routing(&index_name, shard_id, &index_uuid, allocation_id)
+                    .map_err(anyhow::Error::msg)?;
+                service.shard_manager.apply_replica_operation(
+                    &index_name,
+                    shard_id,
+                    crate::shard::ReplicaApplyContext {
+                        index_uuid: &index_uuid,
+                        allocation_id,
+                        applied_view_term: current.primary_term,
+                        message_term: primary_term,
+                    },
+                    |engine| {
+                        if !docs.is_empty() {
+                            engine
+                                .bulk_add_documents_with_start_seq(docs, start_seq_no)
+                                .map_err(anyhow::Error::msg)?;
+                        }
+                        Ok(engine.local_checkpoint())
+                    },
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         match write_result {
-            Ok(_) => Ok(Response::new(ReplicateBulkResponse {
+            Ok(local_checkpoint) => Ok(Response::new(ReplicateBulkResponse {
                 success: true,
                 error: String::new(),
-                local_checkpoint: engine.local_checkpoint(),
+                local_checkpoint,
             })),
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
@@ -1624,7 +1837,10 @@ impl InternalTransport for TransportService {
             Err(e) => Ok(Response::new(ReplicateBulkResponse {
                 success: false,
                 error: e.to_string(),
-                local_checkpoint: engine.local_checkpoint(),
+                local_checkpoint: self
+                    .shard_manager
+                    .get_shard(&req.index_name, req.shard_id)
+                    .map_or(0, |engine| engine.local_checkpoint()),
             })),
         }
     }
@@ -1879,12 +2095,21 @@ impl InternalTransport for TransportService {
                 "This node is not the Raft leader — caller should forward",
             ));
         }
+        let allocation_id = req.allocation_id.ok_or_else(|| {
+            Status::invalid_argument("MarkReplicaInSync requires an allocation ID")
+        })?;
+        if allocation_id == 0 {
+            return Err(Status::invalid_argument(
+                "MarkReplicaInSync allocation ID must be greater than zero",
+            ));
+        }
 
         let command = crate::consensus::types::ClusterCommand::MarkReplicaInSync {
             index_name: req.index_name,
             index_uuid: req.index_uuid,
             shard_id: req.shard_id,
             replica: req.replica_node_id,
+            allocation_id,
             primary: req.primary_node_id,
             primary_term: req.primary_term,
         };
@@ -1922,12 +2147,21 @@ impl InternalTransport for TransportService {
                 "This node is not the Raft leader — caller should forward",
             ));
         }
+        let allocation_id = req
+            .allocation_id
+            .ok_or_else(|| Status::invalid_argument("ActivatePrimary requires an allocation ID"))?;
+        if allocation_id == 0 {
+            return Err(Status::invalid_argument(
+                "ActivatePrimary allocation ID must be greater than zero",
+            ));
+        }
 
         let command = crate::consensus::types::ClusterCommand::ActivatePrimary {
             index_name: req.index_name,
             index_uuid: req.index_uuid,
             shard_id: req.shard_id,
             primary: req.primary_node_id,
+            allocation_id,
             expected_term: req.expected_term,
         };
         let response = raft
@@ -1943,6 +2177,60 @@ impl InternalTransport for TransportService {
             }
             crate::consensus::types::ClusterResponse::Error(error) => {
                 Ok(Response::new(ActivatePrimaryResponse {
+                    acknowledged: false,
+                    error,
+                }))
+            }
+        }
+    }
+
+    async fn fail_shard_copy(
+        &self,
+        request: Request<FailShardCopyRequest>,
+    ) -> Result<Response<FailShardCopyResponse>, Status> {
+        let req = request.into_inner();
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+        if req.index_name.is_empty() || req.index_uuid.is_empty() || req.node_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "FailShardCopy requires index, UUID, and node identity",
+            ));
+        }
+        let allocation_id = req
+            .allocation_id
+            .ok_or_else(|| Status::invalid_argument("FailShardCopy requires an allocation ID"))?;
+        if allocation_id == 0 {
+            return Err(Status::invalid_argument(
+                "FailShardCopy allocation ID must be greater than zero",
+            ));
+        }
+
+        let response = raft
+            .client_write(crate::consensus::types::ClusterCommand::FailShardCopy {
+                index_name: req.index_name,
+                index_uuid: req.index_uuid,
+                shard_id: req.shard_id,
+                node: req.node_id,
+                allocation_id,
+            })
+            .await
+            .map_err(|error| Status::internal(format!("Raft FailShardCopy failed: {error}")))?;
+        match response.data {
+            crate::consensus::types::ClusterResponse::Ok => {
+                Ok(Response::new(FailShardCopyResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                }))
+            }
+            crate::consensus::types::ClusterResponse::Error(error) => {
+                Ok(Response::new(FailShardCopyResponse {
                     acknowledged: false,
                     error,
                 }))
@@ -2584,7 +2872,199 @@ impl InternalTransport for TransportService {
 }
 
 impl TransportService {
-    fn primary_routing(&self, index_name: &str, shard_id: u32) -> Result<(String, u64), String> {
+    fn replica_apply_routing(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        allocation_id: u64,
+    ) -> Result<AssignedLocalShard, String> {
+        let cluster_state = self.cluster_manager.get_state();
+        let metadata = cluster_state
+            .indices
+            .get(index_name)
+            .ok_or_else(|| format!("replication index [{index_name}] is not present"))?;
+        if metadata.uuid.as_str() != index_uuid {
+            return Err(format!(
+                "replication index UUID mismatch for [{index_name}]: expected {}, got {index_uuid}",
+                metadata.uuid
+            ));
+        }
+        let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
+            format!("replication shard [{index_name}][{shard_id}] is not present")
+        })?;
+        let current_allocation = cluster_state
+            .shard_allocation_id(index_name, shard_id, &self.local_node_id)
+            .ok_or_else(|| {
+                format!(
+                    "node [{}] has no current allocation for shard [{index_name}][{shard_id}]",
+                    self.local_node_id
+                )
+            })?;
+        if current_allocation != allocation_id {
+            return Err(format!(
+                "replication allocation mismatch for shard [{index_name}][{shard_id}]: expected {current_allocation}, got {allocation_id}"
+            ));
+        }
+        let ordinary_authoritative = routing.primary == self.local_node_id
+            || routing.is_replica_in_sync(&self.local_node_id);
+        if !ordinary_authoritative
+            && !self
+                .shard_manager
+                .accepts_live_replication_while_pending(index_name, shard_id)
+        {
+            return Err(format!(
+                "node [{}] is not an authoritative or finalized pending copy for shard [{index_name}][{shard_id}]",
+                self.local_node_id
+            ));
+        }
+        Ok(AssignedLocalShard {
+            index_uuid: metadata.uuid.to_string(),
+            mappings: metadata.mappings.clone(),
+            settings: metadata.settings.clone(),
+            allocation_id,
+            primary_term: routing.primary_term,
+            allow_empty_creation: ordinary_authoritative
+                && cluster_state.may_create_initial_empty_copy(
+                    index_name,
+                    shard_id,
+                    &self.local_node_id,
+                ),
+            authoritative: ordinary_authoritative,
+        })
+    }
+
+    fn assigned_local_shard(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Result<AssignedLocalShard, String> {
+        let cluster_state = self.cluster_manager.get_state();
+        let metadata = cluster_state
+            .indices
+            .get(index_name)
+            .ok_or_else(|| format!("index [{index_name}] is not present in local cluster state"))?;
+        let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
+            format!("shard [{index_name}][{shard_id}] is not present in local cluster state")
+        })?;
+        let authoritative = routing.primary == self.local_node_id
+            || routing.is_replica_in_sync(&self.local_node_id);
+        if !authoritative {
+            return Err(format!(
+                "node [{}] is not an authoritative copy for shard [{index_name}][{shard_id}]",
+                self.local_node_id
+            ));
+        }
+        let allocation_id = cluster_state
+            .shard_allocation_id(index_name, shard_id, &self.local_node_id)
+            .ok_or_else(|| {
+                format!(
+                    "node [{}] has no allocation ID for shard [{index_name}][{shard_id}]",
+                    self.local_node_id
+                )
+            })?;
+        Ok(AssignedLocalShard {
+            index_uuid: metadata.uuid.to_string(),
+            mappings: metadata.mappings.clone(),
+            settings: metadata.settings.clone(),
+            allocation_id,
+            primary_term: routing.primary_term,
+            allow_empty_creation: cluster_state.may_create_initial_empty_copy(
+                index_name,
+                shard_id,
+                &self.local_node_id,
+            ),
+            authoritative: true,
+        })
+    }
+
+    async fn report_local_copy_failure(
+        &self,
+        index_name: &str,
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: u64,
+        reason: &str,
+    ) {
+        if let Err(error) = self
+            .shard_manager
+            .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
+            .await
+        {
+            tracing::warn!(
+                index = index_name,
+                shard_id,
+                error = %error,
+                "Failed to quarantine invalid local shard copy"
+            );
+        }
+        let Some(raft) = self.raft.as_ref() else {
+            return;
+        };
+        let result = if raft.is_leader() {
+            crate::consensus::client_write_checked(
+                raft,
+                crate::consensus::types::ClusterCommand::FailShardCopy {
+                    index_name: index_name.to_string(),
+                    index_uuid: index_uuid.to_string(),
+                    shard_id,
+                    node: self.local_node_id.clone(),
+                    allocation_id,
+                },
+            )
+            .await
+            .map_err(anyhow::Error::msg)
+        } else {
+            let state = self.cluster_manager.get_state();
+            let Some(master_id) = state.master_node.as_ref() else {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    reason,
+                    "Cannot report local shard failure because no Raft leader is known"
+                );
+                return;
+            };
+            let Some(master) = state.nodes.get(master_id) else {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    reason,
+                    master = master_id,
+                    "Cannot report local shard failure because the Raft leader is absent"
+                );
+                return;
+            };
+            self.transport_client
+                .forward_fail_shard_copy(
+                    master,
+                    FailShardCopyRequest {
+                        index_name: index_name.to_string(),
+                        index_uuid: index_uuid.to_string(),
+                        shard_id,
+                        node_id: self.local_node_id.clone(),
+                        allocation_id: Some(allocation_id),
+                    },
+                )
+                .await
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                index = index_name,
+                shard_id,
+                allocation_id,
+                reason,
+                error = %error,
+                "Local shard-copy failure report was not applied"
+            );
+        }
+    }
+
+    fn primary_routing(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Result<AssignedLocalShard, String> {
         let cluster_state = self.cluster_manager.get_state();
         let metadata = cluster_state
             .indices
@@ -2599,7 +3079,27 @@ impl TransportService {
                 self.local_node_id, routing.primary_term
             ));
         }
-        Ok((metadata.uuid.to_string(), routing.primary_term))
+        let allocation_id = cluster_state
+            .shard_allocation_id(index_name, shard_id, &self.local_node_id)
+            .ok_or_else(|| {
+                format!(
+                    "node [{}] has no allocation ID for shard [{index_name}][{shard_id}]",
+                    self.local_node_id
+                )
+            })?;
+        Ok(AssignedLocalShard {
+            index_uuid: metadata.uuid.to_string(),
+            mappings: metadata.mappings.clone(),
+            settings: metadata.settings.clone(),
+            allocation_id,
+            primary_term: routing.primary_term,
+            allow_empty_creation: cluster_state.may_create_initial_empty_copy(
+                index_name,
+                shard_id,
+                &self.local_node_id,
+            ),
+            authoritative: true,
+        })
     }
 
     async fn ensure_primary_activated(
@@ -2607,32 +3107,131 @@ impl TransportService {
         index_name: &str,
         shard_id: u32,
     ) -> Result<ActivatedPrimary, String> {
-        let (index_uuid, current_term) = self.primary_routing(index_name, shard_id)?;
+        let current = self.primary_routing(index_name, shard_id)?;
+        if let Err(error) = self
+            .shard_manager
+            .open_assigned_shard_with_settings_blocking(
+                index_name.to_string(),
+                shard_id,
+                current.mappings.clone(),
+                current.settings.clone(),
+                current.index_uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id: current.allocation_id,
+                    primary_term: current.primary_term,
+                    allow_empty_creation: current.allow_empty_creation,
+                },
+            )
+            .await
+        {
+            self.report_local_copy_failure(
+                index_name,
+                &current.index_uuid,
+                shard_id,
+                current.allocation_id,
+                &error.to_string(),
+            )
+            .await;
+            return Err(format!("failed to open primary shard copy: {error}"));
+        }
+        if let Err(error) = self
+            .shard_manager
+            .raise_copy_fence_blocking(
+                index_name.to_string(),
+                shard_id,
+                current.index_uuid.clone(),
+                current.allocation_id,
+                current.primary_term,
+            )
+            .await
+        {
+            self.report_local_copy_failure(
+                index_name,
+                &current.index_uuid,
+                shard_id,
+                current.allocation_id,
+                &error.to_string(),
+            )
+            .await;
+            return Err(format!("failed to persist primary fence: {error}"));
+        }
         if self.raft.is_none() {
             return Ok(ActivatedPrimary {
-                index_uuid,
-                primary_term: current_term,
+                index_uuid: current.index_uuid,
+                allocation_id: current.allocation_id,
+                primary_term: current.primary_term,
             });
         }
 
-        let key = (index_uuid.clone(), shard_id);
+        let key = (current.index_uuid.clone(), shard_id, current.allocation_id);
         if self
             .primary_activation_state
             .activated_terms
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .get(&key)
-            .is_some_and(|term| *term == current_term)
+            .is_some_and(|term| *term == current.primary_term)
         {
             return Ok(ActivatedPrimary {
-                index_uuid,
-                primary_term: current_term,
+                index_uuid: current.index_uuid,
+                allocation_id: current.allocation_id,
+                primary_term: current.primary_term,
             });
         }
 
         let _activation_guard = self.primary_activation_state.activation_lock.lock().await;
-        let (index_uuid, expected_term) = self.primary_routing(index_name, shard_id)?;
-        let key = (index_uuid.clone(), shard_id);
+        let current = self.primary_routing(index_name, shard_id)?;
+        if let Err(error) = self
+            .shard_manager
+            .open_assigned_shard_with_settings_blocking(
+                index_name.to_string(),
+                shard_id,
+                current.mappings.clone(),
+                current.settings.clone(),
+                current.index_uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id: current.allocation_id,
+                    primary_term: current.primary_term,
+                    allow_empty_creation: current.allow_empty_creation,
+                },
+            )
+            .await
+        {
+            self.report_local_copy_failure(
+                index_name,
+                &current.index_uuid,
+                shard_id,
+                current.allocation_id,
+                &error.to_string(),
+            )
+            .await;
+            return Err(format!("failed to open primary shard copy: {error}"));
+        }
+        if let Err(error) = self
+            .shard_manager
+            .raise_copy_fence_blocking(
+                index_name.to_string(),
+                shard_id,
+                current.index_uuid.clone(),
+                current.allocation_id,
+                current.primary_term,
+            )
+            .await
+        {
+            self.report_local_copy_failure(
+                index_name,
+                &current.index_uuid,
+                shard_id,
+                current.allocation_id,
+                &error.to_string(),
+            )
+            .await;
+            return Err(format!("failed to persist primary fence: {error}"));
+        }
+        let expected_term = current.primary_term;
+        let index_uuid = current.index_uuid.clone();
+        let allocation_id = current.allocation_id;
+        let key = (index_uuid.clone(), shard_id, allocation_id);
         if self
             .primary_activation_state
             .activated_terms
@@ -2643,6 +3242,7 @@ impl TransportService {
         {
             return Ok(ActivatedPrimary {
                 index_uuid,
+                allocation_id,
                 primary_term: expected_term,
             });
         }
@@ -2658,6 +3258,7 @@ impl TransportService {
                     index_uuid: index_uuid.clone(),
                     shard_id,
                     primary: self.local_node_id.clone(),
+                    allocation_id,
                     expected_term,
                 })
                 .await
@@ -2678,11 +3279,14 @@ impl TransportService {
             self.transport_client
                 .forward_activate_primary(
                     master,
-                    index_name,
-                    &index_uuid,
-                    shard_id,
-                    &self.local_node_id,
-                    expected_term,
+                    ActivatePrimaryRequest {
+                        index_name: index_name.to_string(),
+                        index_uuid: index_uuid.clone(),
+                        shard_id,
+                        primary_node_id: self.local_node_id.clone(),
+                        expected_term,
+                        allocation_id: Some(allocation_id),
+                    },
                 )
                 .await
                 .map_err(|error| format!("primary activation forward failed: {error}"))?;
@@ -2712,6 +3316,17 @@ impl TransportService {
                             self.local_node_id
                         ));
                     }
+                    if cluster_state.shard_allocation_id(
+                        index_name,
+                        shard_id,
+                        &self.local_node_id,
+                    ) != Some(allocation_id)
+                    {
+                        return Err(format!(
+                            "node [{}] lost allocation {} for shard [{index_name}][{shard_id}] during activation",
+                            self.local_node_id, allocation_id
+                        ));
+                    }
                     if routing.primary_term > expected_term {
                         return Ok(routing.primary_term);
                     }
@@ -2726,6 +3341,29 @@ impl TransportService {
             )
         })??;
 
+        if let Err(error) = self
+            .shard_manager
+            .raise_copy_fence_blocking(
+                index_name.to_string(),
+                shard_id,
+                index_uuid.clone(),
+                allocation_id,
+                activated_term,
+            )
+            .await
+        {
+            self.report_local_copy_failure(
+                index_name,
+                &index_uuid,
+                shard_id,
+                allocation_id,
+                &error.to_string(),
+            )
+            .await;
+            return Err(format!(
+                "failed to persist activated primary fence: {error}"
+            ));
+        }
         self.primary_activation_state
             .activated_terms
             .write()
@@ -2733,6 +3371,7 @@ impl TransportService {
             .insert(key, activated_term);
         Ok(ActivatedPrimary {
             index_uuid,
+            allocation_id,
             primary_term: activated_term,
         })
     }
@@ -2769,21 +3408,27 @@ impl TransportService {
                 activated_primary.primary_term, routing.primary_term
             ));
         }
+        if state.shard_allocation_id(index_name, shard_id, &self.local_node_id)
+            != Some(activated_primary.allocation_id)
+        {
+            return Err(format!(
+                "primary allocation changed for shard [{index_name}][{shard_id}] from {}",
+                activated_primary.allocation_id
+            ));
+        }
+        self.shard_manager
+            .validate_open_copy_identity(
+                index_name,
+                shard_id,
+                &activated_primary.index_uuid,
+                activated_primary.allocation_id,
+            )
+            .map_err(|error| {
+                format!(
+                    "local primary identity is invalid for shard [{index_name}][{shard_id}]: {error}"
+                )
+            })?;
         Ok(state)
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn ensure_authoritative_shard_uuid(
-        &self,
-        _index_name: &str,
-        shard_id: u32,
-        metadata: &crate::cluster::state::IndexMetadata,
-    ) -> Result<std::path::PathBuf, Status> {
-        Ok(self
-            .shard_manager
-            .data_dir()
-            .join(&metadata.uuid)
-            .join(format!("shard_{shard_id}")))
     }
 
     #[allow(clippy::result_large_err)]
@@ -2803,26 +3448,8 @@ impl TransportService {
         shard_id: u32,
         open_override: Option<DynamicShardOpenOverride>,
     ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
-        if let Some(e) = self.shard_manager.get_shard(index_name, shard_id) {
-            return Ok(e);
-        }
-
-        if let Some(open_override) = open_override {
-            return self
-                .shard_manager
-                .open_shard_with_settings_blocking(
-                    index_name.to_string(),
-                    shard_id,
-                    open_override.mappings,
-                    open_override.settings,
-                    open_override.index_uuid,
-                )
-                .await
-                .map_err(|e| Status::internal(format!("Failed to open shard: {e}")));
-        }
-
-        let cs = self.cluster_manager.get_state();
-        let Some(metadata) = cs.indices.get(index_name) else {
+        let state = self.cluster_manager.get_state();
+        let Some(metadata) = state.indices.get(index_name) else {
             return Err(Status::not_found(format!(
                 "Shard [{index_name}][{shard_id}] not found on this node"
             )));
@@ -2832,17 +3459,95 @@ impl TransportService {
                 "Shard [{index_name}][{shard_id}] not found on this node"
             )));
         }
-        let _ = self.ensure_authoritative_shard_uuid(index_name, shard_id, metadata)?;
-        self.shard_manager
-            .open_shard_with_settings_blocking(
+        let assigned = self
+            .assigned_local_shard(index_name, shard_id)
+            .map_err(Status::failed_precondition)?;
+        if let Some(engine) = self.shard_manager.get_shard(index_name, shard_id) {
+            if let Err(error) = self.shard_manager.validate_open_copy_identity(
+                index_name,
+                shard_id,
+                &assigned.index_uuid,
+                assigned.allocation_id,
+            ) {
+                self.report_local_copy_failure(
+                    index_name,
+                    &assigned.index_uuid,
+                    shard_id,
+                    assigned.allocation_id,
+                    &error.to_string(),
+                )
+                .await;
+                return Err(Status::failed_precondition(error.to_string()));
+            }
+            return Ok(engine);
+        }
+
+        if let Some(open_override) = open_override {
+            if open_override.index_uuid != assigned.index_uuid {
+                return Err(Status::aborted(format!(
+                    "index UUID changed for [{index_name}] before shard open"
+                )));
+            }
+            let result = self
+                .shard_manager
+                .open_assigned_shard_with_settings_blocking(
+                    index_name.to_string(),
+                    shard_id,
+                    open_override.mappings,
+                    open_override.settings,
+                    open_override.index_uuid,
+                    crate::shard::AssignedShardOpen {
+                        allocation_id: assigned.allocation_id,
+                        primary_term: assigned.primary_term,
+                        allow_empty_creation: assigned.allow_empty_creation,
+                    },
+                )
+                .await;
+            return match result {
+                Ok(engine) => Ok(engine),
+                Err(error) => {
+                    self.report_local_copy_failure(
+                        index_name,
+                        &assigned.index_uuid,
+                        shard_id,
+                        assigned.allocation_id,
+                        &error.to_string(),
+                    )
+                    .await;
+                    Err(Status::internal(format!("Failed to open shard: {error}")))
+                }
+            };
+        }
+
+        let result = self
+            .shard_manager
+            .open_assigned_shard_with_settings_blocking(
                 index_name.to_string(),
                 shard_id,
-                metadata.mappings.clone(),
-                metadata.settings.clone(),
-                metadata.uuid.clone(),
+                assigned.mappings,
+                assigned.settings,
+                assigned.index_uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id: assigned.allocation_id,
+                    primary_term: assigned.primary_term,
+                    allow_empty_creation: assigned.allow_empty_creation,
+                },
             )
-            .await
-            .map_err(|e| Status::internal(format!("Failed to open shard: {e}")))
+            .await;
+        match result {
+            Ok(engine) => Ok(engine),
+            Err(error) => {
+                self.report_local_copy_failure(
+                    index_name,
+                    &assigned.index_uuid,
+                    shard_id,
+                    assigned.allocation_id,
+                    &error.to_string(),
+                )
+                .await;
+                Err(Status::internal(format!("Failed to open shard: {error}")))
+            }
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -2854,6 +3559,7 @@ impl TransportService {
         get_or_open_read_shard(
             self.cluster_manager.as_ref(),
             &self.shard_manager,
+            &self.local_node_id,
             index_name,
             shard_id,
         )
@@ -3124,6 +3830,51 @@ impl TransportService {
         }
 
         if self.shard_manager.get_shard(index_name, shard_id).is_some() {
+            let current_state = self.cluster_manager.get_state();
+            let Some(current_metadata) = current_state.indices.get(index_name) else {
+                return Ok(());
+            };
+            let Some(current_routing) = current_metadata.shard_routing.get(&shard_id) else {
+                return Ok(());
+            };
+            let Some(previous_routing) = metadata.shard_routing.get(&shard_id) else {
+                return Ok(());
+            };
+            if current_metadata.uuid != metadata.uuid {
+                self.shard_manager
+                    .close_index_shards_blocking_with_reason(
+                        index_name.to_string(),
+                        crate::shard::SHARD_DATA_REMOVE_REASON_STALE_UUID_REPLACEMENT,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "close stale UUID shard after dynamic mapping for [{index_name}][{shard_id}]: {error}"
+                        ))
+                    })?;
+                return Ok(());
+            }
+            if current_routing.primary != self.local_node_id
+                || current_routing.primary != previous_routing.primary
+                || current_routing.primary_term != previous_routing.primary_term
+            {
+                return Ok(());
+            }
+            let Some(allocation_id) =
+                current_state.shard_allocation_id(index_name, shard_id, &self.local_node_id)
+            else {
+                return Ok(());
+            };
+            if self
+                .shard_manager
+                .copy_identity(index_name, shard_id)
+                .is_none_or(|identity| {
+                    identity.index_uuid != current_metadata.uuid.as_str()
+                        || identity.allocation_id != allocation_id
+                })
+            {
+                return Ok(());
+            }
             self.shard_manager
                 .reopen_shard(
                     index_name.to_string(),
@@ -3131,6 +3882,7 @@ impl TransportService {
                     merged_mappings.clone(),
                     metadata.settings.clone(),
                     metadata.uuid.to_string(),
+                    allocation_id,
                 )
                 .await
                 .map_err(|e| {
