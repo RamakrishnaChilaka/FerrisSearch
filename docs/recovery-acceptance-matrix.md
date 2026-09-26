@@ -262,11 +262,40 @@ test, an unbounded proof, an Apalache inductive check, or a TLAPS proof.
 | Acceptance area | Bounded result | Interpretation |
 | --- | --- | --- |
 | M04, M07, pending-target safety | Three-voter crash/rejoin model with one recovery finds `NoPartialServe`: after ordered removal, committed `AddNode`, and same-name reallocation, an old `MarkReplicaInSync` can admit the new assignment after the target has restored its destructive marker. | Confirms the allocation ABA as an implementation gap under the modeled bounds. Retained trace: [`C1-allocation-aba-no-partial-serve.md`](../specs/tla/traces/C1-allocation-aba-no-partial-serve.md). |
-| Proposed allocation identity | The variant with a target-supplied allocation ID, exact source start validation, session/pending binding, and state-machine comparison passes the same bounded crash/rejoin configuration. | Model evidence for the proposed protocol only. FerrisSearch does not yet implement allocation IDs. The handshake must be complete; binding only the admission command is insufficient. |
-| F02 | Both node-name and allocation-ID variants produce `UniqueAckedSeq` after metadata partition, promotion, and delayed old-primary replication. | Allocation identity does not replace primary-term fencing on `ReplicateDoc`/bulk apply. Retained trace: [`C2-stale-primary-unique-seq.md`](../specs/tla/traces/C2-stale-primary-unique-seq.md). |
+| Proposed allocation identity | The variant with a target-supplied allocation ID, exact source start validation, session/pending binding, state-machine comparison, and durable local copy identity passes the bounded crash/rejoin configuration. | Model evidence for the proposed protocol only. FerrisSearch does not yet implement allocation IDs. The handshake must be complete; binding only the admission command is insufficient. |
+| F02 | Node-name-only and allocation-ID-only variants allow a lower-term replication request after metadata partition and promotion. The combined allocation-ID plus replica-fencing variant rejects it and passes the same bounded C2 schedule. | Allocation identity does not replace primary-term fencing on `ReplicateDoc`/bulk apply. Retained trace: [`C2-stale-primary-unique-seq.md`](../specs/tla/traces/C2-stale-primary-unique-seq.md). |
+| F03 | A replica learns term 3 from a valid replication request while its Raft view remains at term 1, crashes, restarts, and receives a term-1 retry. A volatile fence permits the request; a durable fence rejects it. | The local replica fence must be persisted before acknowledging a higher-term apply and restored before serving replication. Retained trace: [`Fence-volatile-restart-stale-probe.md`](../specs/tla/traces/Fence-volatile-restart-stale-probe.md). |
 | I05 | Same-name restart with an empty disk violates `NoAckedLoss` without durable local allocation identity. The allocation-ID variant fails the empty copy closed and passes the bounded check. | Confirms the node-name identity gap within this fault model; it does not prove filesystem or process behavior beyond the abstraction. |
 | D05 | Asynchronous durability acknowledges an operation that the committed primary can lose on crash. | Documents the weaker mode; request-durability results must not be inferred from this configuration. |
-| M04 liveness | Under fault-free weak fairness, the exclusive barrier releases, the assigned target becomes in sync, and persistent pending state resolves. | Liveness result applies only to the two-node, zero-write bound and the stated delivery/fairness assumptions. |
+| Fixed design, crash | An earlier unrestricted run reached 11,284,617 distinct states to depth 41 without a violation. | Superseded after correcting the diagnostic stale-apply history update; it must be rerun before being cited as current evidence. |
+| Fixed design, partition | The corrected unrestricted run stops on `NoStaleReplicaApply` after 1,511 distinct states. The accepted operation was sent before promotion and reached a copy whose view/fence remained at the old term. | This is a model-property error, not a demonstrated protocol failure. The specified fence correctly compares against local view/fence, not unseen global state. Retained trace: [`Fixed-partition-prepromotion-inflight-apply.md`](../specs/tla/traces/Fixed-partition-prepromotion-inflight-apply.md). |
+| Fixed-design simulation | The earlier seed-`20260926`, depth-80 simulation checked 1,575,912 states without a violation. | Superseded by the property correction and must be rerun. Simulation is sampling, not exhaustive model checking. |
+| M04 liveness | Under fault-free weak fairness, and separately with one weakly fair target crash/restart followed by permanent fault cessation, the barrier releases, the assigned target becomes in sync, and persistent pending state resolves. | Liveness results apply only to the two-node, zero-write bounds and the stated scheduling assumptions. |
+
+### Modeled Requirements For The Rust Fencing Work
+
+These requirements are model-derived design inputs, not claims about current
+Rust behavior:
+
+1. `ReplicateDoc` and every operation in `ReplicateBulk` carry index UUID,
+   sender primary term, and target allocation ID.
+2. Before WAL or engine mutation, the target validates UUID and allocation ID,
+   then rejects a term below `max(local cluster-view term, durable local
+   replica fence)`.
+3. Accepting a higher term durably advances the local fence before success is
+   returned. A crash must restore that fence before accepting replication.
+4. A node whose applied view makes it primary persists a fence at least equal
+   to the promoted term before activation and before its first write.
+5. A recovery start carries the target-observed allocation ID. The source
+   rejects the request until that ID exactly matches its current assignment.
+6. The source session, snapshot metadata, installed copy metadata, persistent
+   awaiting-membership marker, forwarding RPC, and `MarkReplicaInSync` command
+   all retain that same allocation ID.
+7. Admission compares the exact allocation ID in addition to index UUID,
+   primary node, and primary term.
+8. Target observation admits the same allocation when in sync, or the same
+   copy after promotion; a missing or different allocation is definitive
+   rejection. Other lagging observations remain unknown.
 
 ## M. Membership And Acknowledgement Sets
 

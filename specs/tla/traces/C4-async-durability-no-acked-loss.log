@@ -1,15 +1,15 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 102 and seed -355703021222271574 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 99345] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 15 and seed 487874634614289158 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 7829] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C4.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.s3za2x/c4/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.s3za2x/c4/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.s3za2x/c4/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.s3za2x/c4/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.ua9LG4/c4/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.ua9LG4/c4/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.ua9LG4/c4/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.ua9LG4/c4/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -20,9 +20,9 @@ Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C4
-Starting... (2026-09-26 15:55:14)
+Starting... (2026-09-26 17:47:41)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-26 15:55:15.
+Finished computing initial states: 1 distinct state generated at 2026-09-26 17:47:41.
 Error: Invariant NoAckedLoss is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -36,6 +36,7 @@ State 1: <Initial predicate>
 /\ nextSeq = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ writeKind = <<"Put">>
 /\ writeEpoch = <<0>>
+/\ staleApplySafe = TRUE
 /\ raftLeader = n2
 /\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ applied = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -53,12 +54,14 @@ State 1: <Initial predicate>
   members |-> {n1, n2, n3},
   term |-> 1 ]
 /\ faultsStopped = FALSE
+/\ replicaFence = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
 /\ writePrimary = <<"NO_NODE">>
 /\ writeSeq = <<0>>
 /\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pins = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ copyUuid = (n1 :> "INDEX_UUID" @@ n2 :> "INDEX_UUID" @@ n3 :> "INDEX_UUID")
 /\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
 /\ copyExists = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ crashCount = 0
@@ -81,6 +84,7 @@ State 1: <Initial predicate>
 /\ writeTarget = <<"NO_NODE">>
 /\ committed = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ failed = {}
+/\ durableReplicaFence = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ ops = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ sessionSnapshot = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ writeTerm = <<0>>
@@ -123,12 +127,12 @@ State 1: <Initial predicate>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Idle")
 /\ writeWait = <<{}>>
 
-State 2: <C4Next line 27, col 8 to line 28, col 67 of module MC_C4>
+State 2: <C4Next line 28, col 8 to line 31, col 60 of module MC_C4>
 /\ writeStatus = <<"Routed">>
 /\ nextWrite = 2
 /\ writeTarget = <<n1>>
 
-State 3: <C4Next line 27, col 8 to line 28, col 67 of module MC_C4>
+State 3: <C4Next line 28, col 8 to line 31, col 60 of module MC_C4>
 /\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 0) @@ n3 :> (d1 :> 0))
 /\ nextSeq = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 0)
 /\ writePrimary = <<n1>>
@@ -140,77 +144,88 @@ State 3: <C4Next line 27, col 8 to line 28, col 67 of module MC_C4>
 /\ messages = { [ from |-> n1,
     to |-> n2,
     kind |-> "Replicate",
+    term |-> 1,
+    targetAllocation |-> 1,
     write |-> 1,
     seq |-> 0,
     fromEpoch |-> 0,
-    toEpoch |-> 0 ],
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
   [ from |-> n1,
     to |-> n3,
     kind |-> "Replicate",
+    term |-> 1,
+    targetAllocation |-> 1,
     write |-> 1,
     seq |-> 0,
     fromEpoch |-> 0,
-    toEpoch |-> 0 ] }
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
 /\ writeWait = <<{n2, n3}>>
 
-State 4: <C4Next line 27, col 8 to line 28, col 67 of module MC_C4>
+State 4: <C4Next line 32, col 8 to line 34, col 70 of module MC_C4>
 /\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 0))
 /\ nextSeq = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0)
 /\ ops = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {})
 /\ messages = { [ from |-> n1,
     to |-> n3,
     kind |-> "Replicate",
+    term |-> 1,
+    targetAllocation |-> 1,
     write |-> 1,
     seq |-> 0,
     fromEpoch |-> 0,
-    toEpoch |-> 0 ],
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
   [ from |-> n2,
     to |-> n1,
     kind |-> "ReplicaAck",
+    term |-> 1,
+    targetAllocation |-> 1,
     write |-> 1,
     seq |-> 0,
     fromEpoch |-> 0,
-    toEpoch |-> 0 ] }
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
 
-State 5: <C4Next line 27, col 8 to line 28, col 67 of module MC_C4>
+State 5: <C4Next line 28, col 8 to line 31, col 60 of module MC_C4>
+/\ messages = { [ from |-> n1,
+    to |-> n3,
+    kind |-> "Replicate",
+    term |-> 1,
+    targetAllocation |-> 1,
+    write |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{n3}>>
+
+State 6: <C4Next line 32, col 8 to line 34, col 70 of module MC_C4>
 /\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
 /\ nextSeq = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
 /\ ops = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {1})
-/\ messages = { [ from |-> n2,
-    to |-> n1,
-    kind |-> "ReplicaAck",
-    write |-> 1,
-    seq |-> 0,
-    fromEpoch |-> 0,
-    toEpoch |-> 0 ],
-  [ from |-> n3,
-    to |-> n1,
-    kind |-> "ReplicaAck",
-    write |-> 1,
-    seq |-> 0,
-    fromEpoch |-> 0,
-    toEpoch |-> 0 ] }
-
-State 6: <C4Next line 27, col 8 to line 28, col 67 of module MC_C4>
 /\ messages = { [ from |-> n3,
     to |-> n1,
     kind |-> "ReplicaAck",
+    term |-> 1,
+    targetAllocation |-> 1,
     write |-> 1,
     seq |-> 0,
     fromEpoch |-> 0,
-    toEpoch |-> 0 ] }
-/\ writeWait = <<{n3}>>
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
 
-State 7: <C4Next line 27, col 8 to line 28, col 67 of module MC_C4>
+State 7: <C4Next line 28, col 8 to line 31, col 60 of module MC_C4>
 /\ messages = {}
 /\ writeWait = <<{}>>
 
-State 8: <C4Next line 27, col 8 to line 28, col 67 of module MC_C4>
+State 8: <C4Next line 28, col 8 to line 31, col 60 of module MC_C4>
 /\ acked = {1}
 /\ writeStatus = <<"Acked">>
 /\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 
-State 9: <C4Next line 29, col 8 to line 30, col 28 of module MC_C4>
+State 9: <C4Next line 35, col 8 to line 37, col 34 of module MC_C4>
 /\ pendingRaft = {}
 /\ raftVoters = {n1, n2, n3}
 /\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
@@ -221,6 +236,7 @@ State 9: <C4Next line 29, col 8 to line 30, col 28 of module MC_C4>
 /\ nextSeq = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1)
 /\ writeKind = <<"Put">>
 /\ writeEpoch = <<0>>
+/\ staleApplySafe = TRUE
 /\ raftLeader = n2
 /\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ applied = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -238,12 +254,14 @@ State 9: <C4Next line 29, col 8 to line 30, col 28 of module MC_C4>
   members |-> {n1, n2, n3},
   term |-> 1 ]
 /\ faultsStopped = FALSE
+/\ replicaFence = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
 /\ writePrimary = <<n1>>
 /\ writeSeq = <<0>>
 /\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pins = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ copyUuid = (n1 :> "INDEX_UUID" @@ n2 :> "INDEX_UUID" @@ n3 :> "INDEX_UUID")
 /\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
 /\ copyExists = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ crashCount = 1
@@ -266,6 +284,7 @@ State 9: <C4Next line 29, col 8 to line 30, col 28 of module MC_C4>
 /\ writeTarget = <<n1>>
 /\ committed = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ failed = {}
+/\ durableReplicaFence = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ ops = (n1 :> {} @@ n2 :> {1} @@ n3 :> {1})
 /\ sessionSnapshot = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 /\ writeTerm = <<1>>
@@ -311,4 +330,4 @@ State 9: <C4Next line 29, col 8 to line 30, col 28 of module MC_C4>
 32 states generated, 21 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 9.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 3 and the 95th percentile is 3).
-Finished in 01s at (2026-09-26 15:55:15)
+Finished in 01s at (2026-09-26 17:47:41)

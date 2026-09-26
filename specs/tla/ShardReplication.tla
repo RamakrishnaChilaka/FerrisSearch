@@ -19,16 +19,23 @@ CONSTANTS
     FaultMode,
     InitialOutOfSync,
     EnableRecovery,
-    AllocationIds
+    AllocationIds,
+    ReplicaFencing,
+    DurableReplicaFence,
+    AllowedWriteKinds,
+    EnableRecoveryFailures
 
 WriteIds == 1..MaxWrites
 NoWrite == 0
 DefaultDoc == CHOOSE d \in Docs : TRUE
 
 WriteStatuses == {"Unused", "Routed", "Replicating", "Acked", "Failed"}
-WriteKinds == {"Put", "Delete"}
+AllWriteKinds == {"Put", "Delete"}
+WriteKinds == AllowedWriteKinds
 CopyModes == {"Active", "Recovering", "Pending", "InstallMarker"}
-MessageKinds == {"Replicate", "ReplicaAck"}
+MessageKinds == {"Replicate", "ReplicaAck", "ReplicaNack"}
+IndexUuid == "INDEX_UUID"
+NoIndexUuid == "NO_INDEX_UUID"
 
 Event(eventName, actorNode, targetNode, writeId, sequenceNumber,
       primaryTerm, eventDetail) ==
@@ -41,14 +48,18 @@ Event(eventName, actorNode, targetNode, writeId, sequenceNumber,
      detail |-> eventDetail]
 
 Message(messageKind, writeId, sourceNode, targetNode, sequenceNumber,
-        sourceEpoch, targetEpoch) ==
+        sourceEpoch, targetEpoch, primaryTerm, messageIndexUuid,
+        targetAllocationId) ==
     [kind      |-> messageKind,
      write     |-> writeId,
      from      |-> sourceNode,
      to        |-> targetNode,
      seq       |-> sequenceNumber,
      fromEpoch |-> sourceEpoch,
-     toEpoch   |-> targetEpoch]
+     toEpoch   |-> targetEpoch,
+     term      |-> primaryTerm,
+     indexUuid |-> messageIndexUuid,
+     targetAllocation |-> targetAllocationId]
 
 VARIABLES
     routing,
@@ -77,6 +88,9 @@ VARIABLES
     pins,
     copyExists,
     copyAllocation,
+    copyUuid,
+    replicaFence,
+    durableReplicaFence,
     copyMode,
     installMarker,
     messages,
@@ -87,6 +101,7 @@ VARIABLES
     promotionSafe,
     admissionSafe,
     ackMembershipSafe,
+    staleApplySafe,
     termMonotonic
 
 ReplicationVars ==
@@ -94,9 +109,10 @@ ReplicationVars ==
       nextWrite, writeStatus, writeDoc, writeKind, writeTarget, writePrimary,
       writeEpoch, writeSeq, writeTerm, writeRequired, writeWait, ops,
       durableOps, docValue, nextSeq, committed, truncBelow, pins, copyExists,
-      copyAllocation, copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
+      copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+      copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
       acked, failed, promotionSafe, admissionSafe, ackMembershipSafe,
-      termMonotonic>>
+      staleApplySafe, termMonotonic>>
 
 RoutingWellFormedValue(r) ==
     /\ r.primary \in Nodes
@@ -149,6 +165,25 @@ CopyAssignmentValid(node) ==
     \/ ~AllocationIds
     \/ /\ copyAllocation[node] > 0
        /\ copyAllocation[node] = views[node].allocations[node]
+
+ReplicaMessageValid(message) ==
+    LET replica == message.to
+        observedTerm ==
+            IF views[replica].term > replicaFence[replica]
+            THEN views[replica].term
+            ELSE replicaFence[replica]
+    IN
+    /\ message.indexUuid = copyUuid[replica]
+    /\ message.indexUuid = IndexUuid
+    /\ IF AllocationIds
+          THEN /\ message.targetAllocation > 0
+               /\ message.targetAllocation = copyAllocation[replica]
+               /\ message.targetAllocation =
+                  views[replica].allocations[replica]
+          ELSE TRUE
+    /\ IF ReplicaFencing
+          THEN message.term >= observedTerm
+          ELSE TRUE
 
 LiveConnectedVoters ==
     {node \in raftVoters : alive[node] /\ raftConnected[node]}
@@ -212,6 +247,12 @@ ReplicationInit ==
           /\ copyExists = [n \in Nodes |-> TRUE]
           /\ copyAllocation =
                 [n \in Nodes |-> initialRouting.allocations[n]]
+          /\ copyUuid = [n \in Nodes |-> IndexUuid]
+          /\ replicaFence =
+                [n \in Nodes |-> IF ReplicaFencing THEN 1 ELSE 0]
+          /\ durableReplicaFence =
+                [n \in Nodes |->
+                    IF ReplicaFencing /\ DurableReplicaFence THEN 1 ELSE 0]
           /\ copyMode = [n \in Nodes |-> "Active"]
           /\ installMarker = [n \in Nodes |-> FALSE]
           /\ messages = {}
@@ -222,6 +263,7 @@ ReplicationInit ==
           /\ promotionSafe = TRUE
           /\ admissionSafe = TRUE
           /\ ackMembershipSafe = TRUE
+          /\ staleApplySafe = TRUE
           /\ termMonotonic = TRUE
 
 \* src/api/index document and bulk handlers resolve the coordinator's local
@@ -258,7 +300,11 @@ CanPrimaryAccept(writeId) ==
     /\ primaryNode \in Nodes
     /\ alive[primaryNode]
     /\ copyExists[primaryNode]
+    /\ copyUuid[primaryNode] = IndexUuid
     /\ CopyAssignmentValid(primaryNode)
+    /\ IF ReplicaFencing
+          THEN replicaFence[primaryNode] >= views[primaryNode].term
+          ELSE TRUE
     /\ views[primaryNode].primary = primaryNode
     /\ activated[primaryNode] = views[primaryNode].term
     /\ exclusiveHolder[primaryNode] = NoNode
@@ -273,7 +319,9 @@ PrimaryAccept(writeId) ==
         requiredReplicas == views[primaryNode].inSync
         requests ==
             {Message("Replicate", writeId, primaryNode, replica,
-                     sequenceNumber, epoch[primaryNode], epoch[replica]) :
+                     sequenceNumber, epoch[primaryNode], epoch[replica],
+                     views[primaryNode].term, IndexUuid,
+                     views[primaryNode].allocations[replica]) :
                 replica \in requiredReplicas}
     IN
     /\ CanPrimaryAccept(writeId)
@@ -321,15 +369,17 @@ PrimaryReject(writeId) ==
             sharedHolders, exclusiveHolder, acked, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic>>
 
-\* src/transport/server/mod.rs::{replicate_doc,replicate_bulk}
-\* Deliberately no primary-term check.  Only the pre-finalize recovery gate
-\* blocks live apply; Pending copies accept live writes.
+\* src/transport/server/mod.rs::{replicate_doc,replicate_bulk}.  With
+\* ReplicaFencing = FALSE this preserves the merged no-term-check behavior.
+\* The proposed variant validates UUID, target allocation, and primary term
+\* before the WAL/engine mutation. Pending copies still accept valid live writes.
 ReplicaApply(message) ==
     LET replica == message.to
         writeId == message.write
         response ==
             Message("ReplicaAck", writeId, replica, message.from, message.seq,
-                    epoch[replica], message.fromEpoch)
+                    epoch[replica], message.fromEpoch, message.term,
+                    message.indexUuid, message.targetAllocation)
     IN
     /\ message \in messages
     /\ message.kind = "Replicate"
@@ -339,6 +389,7 @@ ReplicaApply(message) ==
     /\ epoch[replica] = message.toEpoch
     /\ epoch[message.from] = message.fromEpoch
     /\ ~BlocksLiveReplication(replica)
+    /\ ReplicaMessageValid(message)
     /\ messages' = (messages \ {message}) \cup {response}
     /\ ops' = [ops EXCEPT ![replica] = @ \cup {writeId}]
     /\ durableOps' =
@@ -351,14 +402,60 @@ ReplicaApply(message) ==
           [nextSeq EXCEPT
               ![replica] =
                   IF @ < message.seq + 1 THEN message.seq + 1 ELSE @]
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![replica] =
+                  IF ReplicaFencing /\ @ < message.term
+                  THEN message.term
+                  ELSE @]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![replica] =
+                  IF ReplicaFencing /\ DurableReplicaFence /\ @ < message.term
+                  THEN message.term
+                  ELSE @]
+    /\ staleApplySafe' =
+          (staleApplySafe /\ message.term >= routing.term)
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, committed, truncBelow, pins, copyExists,
-            copyMode, installMarker, sharedHolders, exclusiveHolder, acked,
+            copyAllocation, copyUuid, copyMode, installMarker,
+            sharedHolders, exclusiveHolder, acked,
             failed, promotionSafe, admissionSafe, ackMembershipSafe,
             termMonotonic>>
+
+\* Proposed transport/server replica fencing for
+\* TransportService::{replicate_doc,replicate_bulk}: reject UUID, allocation,
+\* recovery-gate, or stale-primary-term mismatches before WAL/engine mutation.
+ReplicaReject(message) ==
+    LET replica == message.to
+        response ==
+            Message("ReplicaNack", message.write, replica, message.from,
+                    message.seq, epoch[replica], message.fromEpoch,
+                    message.term, message.indexUuid,
+                    message.targetAllocation)
+    IN
+    /\ message \in messages
+    /\ message.kind = "Replicate"
+    /\ alive[replica]
+    /\ copyExists[replica]
+    /\ epoch[replica] = message.toEpoch
+    /\ epoch[message.from] = message.fromEpoch
+    /\ \/ BlocksLiveReplication(replica)
+       \/ ~ReplicaMessageValid(message)
+    /\ messages' = (messages \ {message}) \cup {response}
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation,
+            copyUuid, replicaFence, durableReplicaFence, copyMode,
+            installMarker, sharedHolders, exclusiveHolder, acked, failed,
+            promotionSafe, admissionSafe, ackMembershipSafe,
+            staleApplySafe, termMonotonic>>
 
 \* Completion of replication::{replicate_write,replicate_bulk}'s concurrent
 \* TransportClient RPC and collection of the replica checkpoint.
@@ -433,6 +530,32 @@ PrimaryFail(writeId) ==
             exclusiveHolder, acked, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic>>
 
+\* replication::{replicate_write,replicate_bulk} reports a rejected replica
+\* response as a request failure; partial replication is never success-shaped.
+DeliverReplicaNack(message) ==
+    LET writeId == message.write
+        primaryNode == message.to
+    IN
+    /\ message \in messages
+    /\ message.kind = "ReplicaNack"
+    /\ writeStatus[writeId] = "Replicating"
+    /\ alive[primaryNode]
+    /\ epoch[primaryNode] = message.toEpoch
+    /\ messages' = messages \ WriteMessages(writeId)
+    /\ writeStatus' = [writeStatus EXCEPT ![writeId] = "Failed"]
+    /\ failed' = failed \cup {writeId}
+    /\ sharedHolders' =
+          [sharedHolders EXCEPT ![primaryNode] = @ \ {writeId}]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeDoc, writeKind, writeTarget,
+            writePrimary, writeEpoch, writeSeq, writeTerm, writeRequired,
+            writeWait, ops, durableOps, docValue, nextSeq, committed,
+            truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
+            exclusiveHolder, acked, promotionSafe, admissionSafe,
+            ackMembershipSafe, staleApplySafe, termMonotonic>>
+
 ActivateCommand(primaryNode, expectedPrimaryTerm) ==
     RaftCommand("ActivatePrimary", primaryNode, primaryNode, primaryNode,
                 expectedPrimaryTerm, primaryNode, {}, 0, 0,
@@ -473,14 +596,25 @@ ObserveActivation(primaryNode) ==
     /\ activated' = [activated EXCEPT ![primaryNode] = local.term]
     /\ activationPending' =
           [activationPending EXCEPT ![primaryNode] = NoTerm]
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![primaryNode] =
+                  IF ReplicaFencing /\ @ < local.term THEN local.term ELSE @]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![primaryNode] =
+                  IF ReplicaFencing /\ DurableReplicaFence /\ @ < local.term
+                  THEN local.term
+                  ELSE @]
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, nextWrite,
             writeStatus, writeDoc, writeKind, writeTarget, writePrimary,
             writeEpoch, writeSeq, writeTerm, writeRequired, writeWait, ops,
             durableOps, docValue, nextSeq, committed, truncBelow, pins,
-            copyExists, copyMode, installMarker, messages, sharedHolders,
+            copyExists, copyAllocation, copyUuid, copyMode, installMarker,
+            messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
-            ackMembershipSafe, termMonotonic>>
+            ackMembershipSafe, staleApplySafe, termMonotonic>>
 
 \* TransportService::ensure_primary_activated aborts when a newer term or
 \* different primary makes the requested activation impossible.
@@ -613,6 +747,23 @@ CommitRaft(command) ==
           THEN raftVoters \cup {command.target}
           ELSE raftVoters
     /\ UNCHANGED raftLeader
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![raftLeader] =
+                  IF ReplicaFencing
+                     /\ after.primary = raftLeader
+                     /\ @ < after.term
+                  THEN after.term
+                  ELSE @]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![raftLeader] =
+                  IF ReplicaFencing
+                     /\ DurableReplicaFence
+                     /\ after.primary = raftLeader
+                     /\ @ < after.term
+                  THEN after.term
+                  ELSE @]
     /\ promotionSafe' =
           promotionSafe
           /\ IF promoted THEN AllAckedOn(after.primary) ELSE TRUE
@@ -627,16 +778,35 @@ CommitRaft(command) ==
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
-            ackMembershipSafe>>
+            ackMembershipSafe, staleApplySafe>>
 
 \* ClusterManager applies one more committed Raft entry on this node.
 \* ClusterManager's state-machine-backed local view advances after a committed
 \* openraft log entry is applied on this node.
 DeliverView(node) ==
+    LET nextView == raftLog[applied[node] + 1].state
+    IN
     /\ node \in Nodes
     /\ alive[node]
     /\ raftConnected[node]
     /\ DeliverRaftView(node)
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![node] =
+                  IF ReplicaFencing
+                     /\ nextView.primary = node
+                     /\ @ < nextView.term
+                  THEN nextView.term
+                  ELSE @]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![node] =
+                  IF ReplicaFencing
+                     /\ DurableReplicaFence
+                     /\ nextView.primary = node
+                     /\ @ < nextView.term
+                  THEN nextView.term
+                  ELSE @]
     /\ UNCHANGED
           <<routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -644,9 +814,12 @@ DeliverView(node) ==
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
             committed, truncBelow, pins, copyExists, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
-            promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic>>
+            promotionSafe, admissionSafe, ackMembershipSafe,
+            staleApplySafe, termMonotonic>>
 
 ReplicationTypeOK ==
+    /\ WriteKinds # {}
+    /\ WriteKinds \subseteq AllWriteKinds
     /\ routing \in RoutingType
     /\ RoutingWellFormedValue(routing)
     /\ alive \in [Nodes -> BOOLEAN]
@@ -674,6 +847,9 @@ ReplicationTypeOK ==
     /\ pins \in [Nodes -> SUBSET (0..MaxWrites)]
     /\ copyExists \in [Nodes -> BOOLEAN]
     /\ copyAllocation \in [Nodes -> 0..MaxAllocationId]
+    /\ copyUuid \in [Nodes -> {IndexUuid, NoIndexUuid}]
+    /\ replicaFence \in [Nodes -> 0..MaxTerm]
+    /\ durableReplicaFence \in [Nodes -> 0..MaxTerm]
     /\ copyMode \in [Nodes -> CopyModes]
     /\ installMarker \in [Nodes -> BOOLEAN]
     /\ messages \subseteq
@@ -683,7 +859,10 @@ ReplicationTypeOK ==
            to        : Nodes,
            seq       : 0..MaxWrites,
            fromEpoch : Nat,
-           toEpoch   : Nat]
+           toEpoch   : Nat,
+           term      : 0..MaxTerm,
+           indexUuid : {IndexUuid, NoIndexUuid},
+           targetAllocation : 0..MaxAllocationId]
     /\ sharedHolders \in [Nodes -> SUBSET WriteIds]
     /\ exclusiveHolder \in [Nodes -> Nodes \cup {NoNode}]
     /\ acked \subseteq WriteIds
@@ -691,22 +870,34 @@ ReplicationTypeOK ==
     /\ promotionSafe \in BOOLEAN
     /\ admissionSafe \in BOOLEAN
     /\ ackMembershipSafe \in BOOLEAN
+    /\ staleApplySafe \in BOOLEAN
     /\ termMonotonic \in BOOLEAN
 
+ReplicationStableNext ==
+    \/ \E coordinator \in Nodes, doc \in Docs, kind \in WriteKinds :
+           ClientWrite(coordinator, doc, kind)
+    \/ \E writeId \in WriteIds : PrimaryAccept(writeId)
+    \/ \E writeId \in WriteIds : PrimaryReject(writeId)
+    \/ \E message \in messages : ReplicaReject(message)
+    \/ \E message \in messages : DeliverReplicaAck(message)
+    \/ \E message \in messages : DeliverReplicaNack(message)
+    \/ \E writeId \in WriteIds : PrimaryAck(writeId)
+    \/ \E writeId \in WriteIds : PrimaryFail(writeId)
+    \/ \E node \in Nodes : ProposeActivate(node)
+    \/ \E node \in Nodes : CancelActivation(node)
+
+ReplicationFenceChangingNext ==
+    \/ \E message \in messages : ReplicaApply(message)
+    \/ \E node \in Nodes : ObserveActivation(node)
+    \/ \E command \in pendingRaft : CommitRaft(command)
+    \/ \E node \in Nodes : DeliverView(node)
+
 ReplicationNext ==
-    /\ UNCHANGED copyAllocation
-    /\ \/ \E coordinator \in Nodes, doc \in Docs, kind \in WriteKinds :
-              ClientWrite(coordinator, doc, kind)
-       \/ \E writeId \in WriteIds : PrimaryAccept(writeId)
-       \/ \E writeId \in WriteIds : PrimaryReject(writeId)
-       \/ \E message \in messages : ReplicaApply(message)
-       \/ \E message \in messages : DeliverReplicaAck(message)
-       \/ \E writeId \in WriteIds : PrimaryAck(writeId)
-       \/ \E writeId \in WriteIds : PrimaryFail(writeId)
-       \/ \E node \in Nodes : ProposeActivate(node)
-       \/ \E node \in Nodes : ObserveActivation(node)
-       \/ \E node \in Nodes : CancelActivation(node)
-       \/ \E command \in pendingRaft : CommitRaft(command)
-       \/ \E node \in Nodes : DeliverView(node)
+    \/ /\ ReplicationStableNext
+       /\ UNCHANGED
+             <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+               staleApplySafe>>
+    \/ /\ ReplicationFenceChangingNext
+       /\ UNCHANGED <<copyAllocation, copyUuid>>
 
 =============================================================================

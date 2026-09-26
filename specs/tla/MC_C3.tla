@@ -14,23 +14,33 @@ C3Init ==
     /\ LostNode \in routing.inSync
     /\ raftLeader = MetadataLeader
 
-C3ReplicationNext ==
+C3StableNext ==
     \/ /\ nextWrite = 1
        /\ ClientWrite(PrimaryNode, DefaultDoc, "Put")
     \/ \E writeId \in WriteIds : PrimaryAccept(writeId)
     \/ \E writeId \in WriteIds : PrimaryReject(writeId)
-    \/ \E message \in messages : ReplicaApply(message)
+    \/ \E message \in messages : ReplicaReject(message)
     \/ \E message \in messages : DeliverReplicaAck(message)
+    \/ \E message \in messages : DeliverReplicaNack(message)
     \/ \E writeId \in WriteIds : PrimaryAck(writeId)
     \/ \E writeId \in WriteIds : PrimaryFail(writeId)
 
 C3Next ==
-    \/ /\ C3ReplicationNext
-       /\ UNCHANGED <<copyAllocation, PeerRecoveryVars, FaultVars>>
+    \/ /\ C3StableNext
+       /\ UNCHANGED
+             <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+               staleApplySafe, PeerRecoveryVars, FaultVars>>
+    \/ /\ \E message \in messages : ReplicaApply(message)
+       /\ UNCHANGED
+             <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
     \/ /\ writeStatus[1] = "Acked"
        /\ Crash(LostNode)
-    \/ DiskLoss(LostNode)
-    \/ Restart(LostNode)
-    \/ OpenAssignedEmptyCopy(LostNode)
+       /\ UNCHANGED staleApplySafe
+    \/ /\ DiskLoss(LostNode)
+       /\ UNCHANGED staleApplySafe
+    \/ /\ Restart(LostNode)
+       /\ UNCHANGED staleApplySafe
+    \/ /\ OpenAssignedEmptyCopy(LostNode)
+       /\ UNCHANGED staleApplySafe
 
 =============================================================================

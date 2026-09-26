@@ -331,6 +331,7 @@ SourceSnapshot(target) ==
 \* launch_source_setup records a setup failure and source_start_status returns
 \* it exactly once on the next poll.
 SourceSetupFailure(target) ==
+    /\ EnableRecoveryFailures
     /\ sessionPhase[target] = "Starting"
     /\ sessionPhase' = [sessionPhase EXCEPT ![target] = "SetupFailed"]
     /\ UNCHANGED
@@ -397,6 +398,16 @@ InstallSnapshot(target) ==
     /\ copyExists' = [copyExists EXCEPT ![target] = TRUE]
     /\ copyAllocation' =
           [copyAllocation EXCEPT ![target] = sessionAllocation[target]]
+    /\ copyUuid' = [copyUuid EXCEPT ![target] = IndexUuid]
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![target] = IF ReplicaFencing THEN sessionTerm[target] ELSE 0]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![target] =
+                  IF ReplicaFencing /\ DurableReplicaFence
+                  THEN sessionTerm[target]
+                  ELSE 0]
     /\ installMarker' = [installMarker EXCEPT ![target] = FALSE]
     /\ sessionPhase' =
           [sessionPhase EXCEPT ![target] = "CatchingUp"]
@@ -516,6 +527,7 @@ BeginPrepareFinalize(target) ==
 \* Dropping FinalizePreparingGuard after a cancelled or failed
 \* prepare_finalize_recovery_inner clears finalize_preparing.
 CancelPrepareFinalize(target) ==
+    /\ EnableRecoveryFailures
     /\ sessionPhase[target] = "Preparing"
     /\ sessionFinalizePreparing[target]
     /\ sessionPhase' = [sessionPhase EXCEPT ![target] = "Ready"]
@@ -772,6 +784,7 @@ AbortSession(target) ==
     LET source == sessionSource[target]
         boundary == sessionBoundary[target]
     IN
+    /\ EnableRecoveryFailures
     /\ sessionPhase[target] \in PreFinalizePhases
     /\ sessionPhase[target] # "SetupFailed"
     /\ IF boundary \in pins[source]
@@ -811,6 +824,7 @@ ExpireFinalizeWithoutMark(target) ==
         boundary == sessionBoundary[target]
         command == SettlementBumpCommand(target)
     IN
+    /\ EnableRecoveryFailures
     /\ sessionPhase[target] \in {"Finalizing", "AwaitingComplete"}
     /\ ~sessionMarkSubmitted[target]
     /\ exclusiveHolder[source] = target
@@ -860,73 +874,119 @@ PeerRecoveryTypeOK ==
     /\ authoritativeWipeSafe \in BOOLEAN
     /\ Cardinality(ActiveRecoveryTargets) <= 1
 
-PeerRecoveryNext ==
+PeerRecoveryCoreNext ==
     \/ \E target \in Nodes, source \in Nodes : StartRecovery(target, source)
     \/ \E target \in Nodes :
            /\ SourceSnapshot(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ SourceSetupFailure(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ PollSetupFailure(target)
-           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ TargetBeginInstall(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ InstallSnapshot(target)
            /\ UNCHANGED <<sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ FetchOps(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ApplyOps(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ FinishCatchUp(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ BeginPrepareFinalize(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ CancelPrepareFinalize(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ AcquireFinalizeBarrier(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ FinishFinalizeTail(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ TargetComplete(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation>>
     \/ \E target \in Nodes :
            /\ BeginSettlement(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ProposeMarkInSync(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ SettlementDeadline(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ObserveAdmission(target)
-           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ TargetObserveAdmitted(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation>>
     \/ \E target \in Nodes :
            /\ TargetObserveRejected(target)
-           /\ UNCHANGED <<copyAllocation, sessionAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, sessionAllocation>>
     \/ \E target \in Nodes :
            /\ AbortSession(target)
-           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ExpireSession(target)
-           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, pendingAllocation>>
     \/ \E target \in Nodes :
            /\ ExpireFinalizeWithoutMark(target)
-           /\ UNCHANGED <<copyAllocation, pendingAllocation>>
+           /\ UNCHANGED
+                 <<copyAllocation, copyUuid, replicaFence,
+                   durableReplicaFence, pendingAllocation>>
+
+PeerRecoveryNext ==
+    /\ PeerRecoveryCoreNext
+    /\ UNCHANGED staleApplySafe
 
 =============================================================================

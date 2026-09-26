@@ -67,6 +67,10 @@ Crash(node) ==
           [docValue EXCEPT ![node] = RebuiltDocValue(survivingOps)]
     /\ nextSeq' =
           [nextSeq EXCEPT ![node] = NextSequenceAfter(survivingOps)]
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![node] =
+                  IF ReplicaFencing THEN durableReplicaFence[node] ELSE 0]
     /\ CrashRecoveryState(node)
     /\ raftLeader' = IF raftLeader = node THEN NoNode ELSE raftLeader
     /\ crashCount' = crashCount + 1
@@ -75,7 +79,8 @@ Crash(node) ==
             routing, epoch, nextWrite, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, durableOps, committed, truncBelow,
-            copyExists, copyAllocation, acked, promotionSafe, admissionSafe,
+            copyExists, copyAllocation, copyUuid, durableReplicaFence,
+            acked, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, diskLost, partitionCount,
             faultsStopped, lifecyclePhase>>
 
@@ -96,7 +101,8 @@ Restart(node) ==
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
             committed, truncBelow, pins, copyExists, copyAllocation,
-            copyMode, installMarker,
+            copyUuid, replicaFence, durableReplicaFence, copyMode,
+            installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -121,8 +127,8 @@ PartitionMetadata(node) ==
             nextWrite, writeStatus, writeDoc, writeKind, writeTarget,
             writePrimary, writeEpoch, writeSeq, writeTerm, writeRequired,
             writeWait, ops, durableOps, docValue, nextSeq, committed,
-            truncBelow, pins, copyExists, copyAllocation, copyMode,
-            installMarker, messages,
+            truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
             diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -139,8 +145,8 @@ HealMetadata(node) ==
             nextWrite, writeStatus, writeDoc, writeKind, writeTarget,
             writePrimary, writeEpoch, writeSeq, writeTerm, writeRequired,
             writeWait, ops, durableOps, docValue, nextSeq, committed,
-            truncBelow, pins, copyExists, copyAllocation, copyMode,
-            installMarker, messages,
+            truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
             diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -157,8 +163,8 @@ LoseMsg(message) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyAllocation,
-            copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
             diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -254,8 +260,8 @@ SuspectAndRemove(leader, node, candidate) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyAllocation,
-            copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -333,8 +339,8 @@ ProposeRemoveNode(leader, node) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyAllocation,
-            copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -369,8 +375,8 @@ Rejoin(node) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyAllocation,
-            copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -420,8 +426,8 @@ AllocateAfterLifecycle(leader, target) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
-            committed, truncBelow, pins, copyExists, copyAllocation,
-            copyMode, installMarker,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
@@ -469,8 +475,8 @@ Flush(node) ==
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
             writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
             writeRequired, writeWait, ops, docValue, nextSeq, pins,
-            copyExists, copyAllocation, copyMode, installMarker, messages,
-            sharedHolders,
+            copyExists, copyAllocation, copyUuid, replicaFence,
+            durableReplicaFence, copyMode, installMarker, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
             faultsStopped, lifecyclePhase, PeerRecoveryVars>>
@@ -492,6 +498,10 @@ DiskLoss(node) ==
     /\ committed' = [committed EXCEPT ![node] = 0]
     /\ truncBelow' = [truncBelow EXCEPT ![node] = 0]
     /\ copyAllocation' = [copyAllocation EXCEPT ![node] = 0]
+    /\ copyUuid' = [copyUuid EXCEPT ![node] = NoIndexUuid]
+    /\ replicaFence' = [replicaFence EXCEPT ![node] = 0]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT ![node] = 0]
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -516,6 +526,10 @@ OpenAssignedEmptyCopy(node) ==
                /\ copyAllocation[node] = routing.allocations[node]
           ELSE TRUE
     /\ copyExists' = [copyExists EXCEPT ![node] = TRUE]
+    /\ copyUuid' = [copyUuid EXCEPT ![node] = IndexUuid]
+    /\ replicaFence' = [replicaFence EXCEPT ![node] = 0]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT ![node] = 0]
     /\ copyMode' = [copyMode EXCEPT ![node] = "Active"]
     /\ installMarker' = [installMarker EXCEPT ![node] = FALSE]
     /\ UNCHANGED
@@ -535,7 +549,7 @@ FaultTypeOK ==
     /\ faultsStopped \in BOOLEAN
     /\ lifecyclePhase \in [Nodes -> LifecyclePhases]
 
-FaultNext ==
+FaultCoreNext ==
     \/ \E node \in Nodes : Crash(node)
     \/ \E node \in Nodes : Restart(node)
     \/ \E node \in Nodes : PartitionMetadata(node)
@@ -561,5 +575,9 @@ FaultNext ==
     \/ \E node \in Nodes : Flush(node)
     \/ \E node \in Nodes : DiskLoss(node)
     \/ \E node \in Nodes : OpenAssignedEmptyCopy(node)
+
+FaultNext ==
+    /\ FaultCoreNext
+    /\ UNCHANGED staleApplySafe
 
 =============================================================================

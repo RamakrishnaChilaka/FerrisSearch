@@ -74,6 +74,8 @@ NoPartialServe ==
             /\ node \notin routing.inSync
             /\ BlocksLiveReplication(node)
 
+NoStaleReplicaApply == staleApplySafe
+
 BarrierReleased ==
     \A node \in Nodes :
         (exclusiveHolder[node] # NoNode)

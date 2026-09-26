@@ -13,20 +13,27 @@ C4Init ==
     /\ routing.primary = PrimaryNode
     /\ raftLeader = MetadataLeader
 
-C4ReplicationNext ==
+C4StableNext ==
     \/ /\ nextWrite = 1
        /\ ClientWrite(PrimaryNode, DefaultDoc, "Put")
     \/ \E writeId \in WriteIds : PrimaryAccept(writeId)
     \/ \E writeId \in WriteIds : PrimaryReject(writeId)
-    \/ \E message \in messages : ReplicaApply(message)
+    \/ \E message \in messages : ReplicaReject(message)
     \/ \E message \in messages : DeliverReplicaAck(message)
+    \/ \E message \in messages : DeliverReplicaNack(message)
     \/ \E writeId \in WriteIds : PrimaryAck(writeId)
     \/ \E writeId \in WriteIds : PrimaryFail(writeId)
 
 C4Next ==
-    \/ /\ C4ReplicationNext
-       /\ UNCHANGED <<copyAllocation, PeerRecoveryVars, FaultVars>>
+    \/ /\ C4StableNext
+       /\ UNCHANGED
+             <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+               staleApplySafe, PeerRecoveryVars, FaultVars>>
+    \/ /\ \E message \in messages : ReplicaApply(message)
+       /\ UNCHANGED
+             <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
     \/ /\ writeStatus[1] = "Acked"
        /\ Crash(PrimaryNode)
+       /\ UNCHANGED staleApplySafe
 
 =============================================================================

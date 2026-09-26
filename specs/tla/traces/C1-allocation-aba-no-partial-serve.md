@@ -8,7 +8,7 @@
 
 **Raw trace:** [`C1-allocation-aba-no-partial-serve.log`](C1-allocation-aba-no-partial-serve.log)
 
-**Raw trace SHA-256:** `6cede2ed92cd5ebf1db0b3aaa77ff84dc24cd1028f5415cb6f625825b582ee72`
+**Raw trace SHA-256:** `a3974be4537cabd45b7acfa1646454667ec662ea3f737738d2943a6c94aff4bc`
 
 This trace uses three Raft voters. Every committed command has a live leader
 and a live voter majority. Dead-node processing follows the merged

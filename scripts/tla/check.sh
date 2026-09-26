@@ -9,6 +9,10 @@ TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tl
 DEFAULT_JAR="${XDG_CACHE_HOME:-$HOME/.cache}/ferrissearch-tla/v${TLA_VERSION}/tla2tools.jar"
 WORKERS="${TLA_WORKERS:-4}"
 TIMEOUT_SECONDS="${TLA_TIMEOUT_SECONDS:-300}"
+LONG_TIMEOUT_SECONDS="${TLA_LONG_TIMEOUT_SECONDS:-1800}"
+SIMULATION_TRACES="${TLA_SIMULATION_TRACES:-10000}"
+SIMULATION_DEPTH="${TLA_SIMULATION_DEPTH:-80}"
+SIMULATION_SEED="${TLA_SIMULATION_SEED:-20260926}"
 
 RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ferrissearch-tla.XXXXXX")
 cleanup() {
@@ -65,10 +69,21 @@ default_configs=(
     c1-aba-fixed
     c2
     c2-allocation-ids
+    c2-fixed
+    fence-volatile
+    fence-durable
     c3
     c3-allocation-ids
     c4
     l1
+    l2
+)
+
+all_configs=(
+    "${default_configs[@]}"
+    fixed-crash
+    fixed-partition
+    fixed-simulation
 )
 
 list_configs() {
@@ -77,12 +92,19 @@ c1-fast                 pass: crash-only replication smoke check
 c1-recovery             pass: snapshot, suffix, finalize, and admission
 c1-aba                  expected NoPartialServe violation: assignment ABA
 c1-aba-fixed            pass: allocation-ID handshake variant
-c2                      expected UniqueAckedSeq violation: stale primary
-c2-allocation-ids       expected UniqueAckedSeq violation with allocation IDs
+c2                      expected stale replication rejection violation
+c2-allocation-ids       expected stale rejection violation with allocation IDs
+c2-fixed                pass: allocation IDs plus replica-term fencing
+fence-volatile          expected stale-probe violation after replica restart
+fence-durable           pass: durable replica fence survives restart
 c3                      expected NoAckedLoss violation: same-name empty disk
 c3-allocation-ids       pass: empty disk fails closed on missing local identity
 c4                      expected NoAckedLoss violation: asynchronous durability
 l1                      pass: fair fault-free recovery liveness
+l2                      pass: fair recovery after one crash and restart
+fixed-crash             pass: exhaustive full fixed design with one crash
+fixed-partition         pass: exhaustive full fixed design with one partition
+fixed-simulation        pass: seeded depth-80 simulation of larger fixed bounds
 EOF
 }
 
@@ -91,8 +113,10 @@ if [[ "${1:-}" == "--list" ]]; then
     exit 0
 fi
 
-if [[ $# -eq 0 || "${1:-}" == "fast" || "${1:-}" == "all" ]]; then
+if [[ $# -eq 0 || "${1:-}" == "fast" ]]; then
     configs=("${default_configs[@]}")
+elif [[ "${1:-}" == "all" ]]; then
+    configs=("${all_configs[@]}")
 else
     configs=("$@")
 fi
@@ -102,6 +126,8 @@ run_config() {
     local module
     local cfg
     local expected
+    local mode="check"
+    local timeout_seconds=$TIMEOUT_SECONDS
 
     case "$name" in
         c1-fast|MC_C1_fast)
@@ -127,12 +153,27 @@ run_config() {
         c2|MC_C2_fast)
             module="MC_C2.tla"
             cfg="MC_C2_fast.cfg"
-            expected="UniqueAckedSeq"
+            expected="C2RejectsStaleMessage"
             ;;
         c2-allocation-ids|MC_C2_allocation_ids)
             module="MC_C2.tla"
             cfg="MC_C2_allocation_ids.cfg"
-            expected="UniqueAckedSeq"
+            expected="C2RejectsStaleMessage"
+            ;;
+        c2-fixed|MC_C2_fixed)
+            module="MC_C2.tla"
+            cfg="MC_C2_fixed.cfg"
+            expected="pass"
+            ;;
+        fence-volatile|MC_Fence_volatile)
+            module="MC_FenceDurability.tla"
+            cfg="MC_Fence_volatile.cfg"
+            expected="FenceRejectsStaleProbe"
+            ;;
+        fence-durable|MC_Fence_durable)
+            module="MC_FenceDurability.tla"
+            cfg="MC_Fence_durable.cfg"
+            expected="pass"
             ;;
         c3|MC_C3)
             module="MC_C3.tla"
@@ -154,6 +195,30 @@ run_config() {
             cfg="MC_L1.cfg"
             expected="pass"
             ;;
+        l2|MC_L2)
+            module="MC_L2.tla"
+            cfg="MC_L2.cfg"
+            expected="pass"
+            ;;
+        fixed-crash|MC_Fixed_Crash)
+            module="Invariants.tla"
+            cfg="MC_Fixed_Crash.cfg"
+            expected="pass"
+            timeout_seconds=$LONG_TIMEOUT_SECONDS
+            ;;
+        fixed-partition|MC_Fixed_Partition)
+            module="Invariants.tla"
+            cfg="MC_Fixed_Partition.cfg"
+            expected="pass"
+            timeout_seconds=$LONG_TIMEOUT_SECONDS
+            ;;
+        fixed-simulation|MC_Fixed_Simulation)
+            module="Invariants.tla"
+            cfg="MC_Fixed_Simulation.cfg"
+            expected="pass"
+            mode="simulate"
+            timeout_seconds=$LONG_TIMEOUT_SECONDS
+            ;;
         *)
             echo "Unknown TLA+ configuration: $name" >&2
             list_configs >&2
@@ -171,31 +236,48 @@ run_config() {
     set +e
     (
         cd "$SPEC_DIR"
-        timeout "${TIMEOUT_SECONDS}s" \
-            java \
-            -Djava.io.tmpdir="$java_tmp" \
-            -XX:+UseParallelGC \
-            -cp "$JAR" \
-            tlc2.TLC \
-            -deadlock \
-            -difftrace \
-            -workers "$WORKERS" \
-            -metadir "$states" \
-            -config "$cfg" \
-            "$module"
+        if [[ "$mode" == "simulate" ]]; then
+            timeout "${timeout_seconds}s" \
+                java \
+                -Djava.io.tmpdir="$java_tmp" \
+                -XX:+UseParallelGC \
+                -cp "$JAR" \
+                tlc2.TLC \
+                -deadlock \
+                -simulate "num=${SIMULATION_TRACES}" \
+                -depth "$SIMULATION_DEPTH" \
+                -seed "$SIMULATION_SEED" \
+                -metadir "$states" \
+                -config "$cfg" \
+                "$module"
+        else
+            timeout "${timeout_seconds}s" \
+                java \
+                -Djava.io.tmpdir="$java_tmp" \
+                -XX:+UseParallelGC \
+                -cp "$JAR" \
+                tlc2.TLC \
+                -deadlock \
+                -difftrace \
+                -workers "$WORKERS" \
+                -metadir "$states" \
+                -config "$cfg" \
+                "$module"
+        fi
     ) >"$log" 2>&1
     local status=$?
     set -e
     cat "$log"
 
     if [[ $status -eq 124 ]]; then
-        echo "TLA+ configuration '$name' exceeded ${TIMEOUT_SECONDS}s" >&2
+        echo "TLA+ configuration '$name' exceeded ${timeout_seconds}s" >&2
         return 1
     fi
 
     if [[ "$expected" == "pass" ]]; then
         if [[ $status -ne 0 ]] ||
-            ! grep -Fq "Model checking completed. No error has been found." "$log"; then
+            grep -Fq "Error:" "$log" ||
+            ! grep -Fq "Finished in " "$log"; then
             echo "TLA+ configuration '$name' was expected to pass" >&2
             return 1
         fi

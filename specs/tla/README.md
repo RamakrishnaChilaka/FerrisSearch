@@ -7,6 +7,14 @@ This directory contains a bounded TLA+ model of one FerrisSearch
 within each configuration's stated finite bounds. A passing configuration is
 not a proof for arbitrary cluster sizes, write counts, failures, or time.
 
+**Current stop condition:** the corrected unrestricted partition run exposes
+that `NoStaleReplicaApply` is over-strong: it classifies an operation accepted
+and sent before promotion as stale merely because it arrives after the global
+term changes. See
+[`Fixed-partition-prepromotion-inflight-apply.md`](traces/Fixed-partition-prepromotion-inflight-apply.md).
+The fixed design has not failed its specified local-view/fence rule; the
+history property must be refined before the long runs can be claimed.
+
 ## Run the model
 
 Java 25 is used in CI. The runner downloads TLA+ tools 1.7.4 and verifies:
@@ -50,7 +58,7 @@ liveness configuration uses neither symmetry nor a state constraint.
 | Module | Responsibility |
 | --- | --- |
 | `RaftLog.tla` | Ordered conditional command log, explicit voters and leader, quorum-aware commits, leader-applied writes, lagging follower views. |
-| `ShardReplication.tla` | Primary activation, validated writes, sequence allocation, synchronous in-sync replication, promotion semantics, and optional allocation identities. |
+| `ShardReplication.tla` | Primary activation, validated writes, sequence allocation, synchronous in-sync replication, wire identity, optional allocation identities, and optional durable primary-term fencing. |
 | `PeerRecovery.tla` | Asynchronous source setup, snapshot boundary and pin, atomic verified install, suffix catch-up, exclusive finalize barrier, settlement, persistent pending observation, abort, and expiry. |
 | `Faults.tla` | Crash/restart, elections, metadata partitions, message loss, ordered dead-node lifecycle, rejoin/allocation, disk loss, flush/truncation, and asynchronous durability loss. |
 | `Invariants.tla` | Safety and liveness properties. |
@@ -58,6 +66,8 @@ liveness configuration uses neither symmetry nor a state constraint.
 | `MC_C3.tla` | Canonical same-node disk-loss scenario. |
 | `MC_C4.tla` | Canonical asynchronous-durability crash scenario. |
 | `MC_L1.tla` | Fault-free recovery progress actions and weak-fairness assumptions. |
+| `MC_L2.tla` | One target crash/restart followed by fault-free weakly fair recovery. |
+| `MC_FenceDurability.tla` | Targeted proof that a learned replica fence must survive restart. |
 
 ## Core abstractions
 
@@ -77,6 +87,9 @@ liveness configuration uses neither symmetry nor a state constraint.
   reaching the leader and be appended after later requests.
 - A data-plane RPC may remain delayed or be lost. It is not duplicated unless
   the modeled caller retries.
+- Replication messages carry sender primary term, index UUID, and target
+  allocation ID. With `ReplicaFencing = FALSE`, the term is informational and
+  models the merged implementation's missing term check.
 - Request durability places each successful WAL append in `durableOps`.
   C4 leaves appends volatile until `Flush`.
 - Snapshot files, hard links, chunk hashes, directory fsyncs, and strict
@@ -100,6 +113,7 @@ liveness configuration uses neither symmetry nor a state constraint.
 | `ClientWrite` | Coordinator routing in `src/api/index/`. |
 | `PrimaryAccept`, `PrimaryReject`, `PrimaryAck`, `PrimaryFail` | `TransportService::{index_doc,bulk_index,delete_doc}`, including `ensure_primary_activated`, `peer_recovery_write_guard`, `validated_primary_write_state`, and all-in-sync acknowledgement. |
 | `ReplicaApply`, `DeliverReplicaAck` | `TransportService::{replicate_doc,replicate_bulk}` and `replication::{replicate_write,replicate_bulk}`. |
+| `ReplicaReject`, `DeliverReplicaNack` | Proposed pre-WAL identity/fence rejection in the same replica handlers and propagation as a synchronous replication failure. |
 | `ProposeActivate`, `ObserveActivation`, `CancelActivation` | `TransportService::ensure_primary_activated`. |
 | `CommitRaft` | `ClusterStateMachine::apply_command`; rejected conditional commands retain a log position without changing routing. |
 | `DeliverView` | Per-node `ClusterManager` observation of an applied Raft prefix. |
@@ -146,6 +160,36 @@ field to `MarkReplicaInSync` is insufficient: the retained
 [`stale-start trace`](traces/C1-allocation-id-stale-start-no-partial-serve.md)
 shows why target and source must agree before snapshot setup.
 
+## Replica-fencing variant
+
+`ReplicaFencing = FALSE` models the merged replica handlers, which accept
+primary-originated operations without checking the sender's primary term.
+
+`ReplicaFencing = TRUE` requires every `ReplicateDoc` and `ReplicateBulk`
+operation to carry:
+
+- the index UUID;
+- the sender's activated primary term; and
+- the target allocation ID when allocation identities are enabled.
+
+Before WAL or engine mutation, the replica rejects the operation when:
+
+- the index UUID differs from the local copy UUID;
+- the target allocation ID differs from the current local assignment; or
+- the message term is below `max(local cluster-view term, local replica fence)`.
+
+An accepted operation raises the local fence to its term. A node whose view
+shows that it became primary also raises the fence before activation and its
+first write. `DurableReplicaFence = TRUE` persists those advances atomically
+before acknowledging the triggering operation or activation. Restart restores
+the durable fence before replica RPCs are accepted.
+
+The retained
+[`volatile-fence trace`](traces/Fence-volatile-restart-stale-probe.md)
+shows why durability is required: a replica can learn term 3 from replication,
+restart while its Raft view still says term 1, and otherwise accept a term-1
+retry. The durable variant rejects the same probe.
+
 ## Properties
 
 Safety invariants:
@@ -158,6 +202,16 @@ Safety invariants:
 - `NoAckedRollback`
 - `NoAuthoritativeWipe`
 - `NoPartialServe`
+- `NoStaleReplicaApply`
+
+The targeted fence-durability model also checks
+`FenceRejectsStaleProbe`, and the C2 model checks
+`C2RejectsStaleMessage`.
+
+`NoStaleReplicaApply` is currently a diagnostic history assertion against the
+globally committed term. It is too strong for a pre-promotion operation that
+was already in flight and reaches a copy whose local view and durable fence
+have not advanced. Its latest failure is retained rather than hidden.
 
 Liveness properties under the explicit fault-free fairness assumptions in
 `MC_L1.tla`:
@@ -175,15 +229,37 @@ performance benchmarks.
 | Runner name | Nodes/docs/writes | Fault and protocol bounds | Allocation IDs | Expected/result | Generated / distinct | Depth | Time |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: |
 | `c1-fast` | 2 / 1 / 1 | 1 crash; no recovery; term 3; log 5; view lag 2 | Off | Pass | 3,340 / 999 | 15 | 1s |
-| `c1-recovery` | 2 / 1 / 1 | 1 recovery; no crash; term 3; log 3; view lag 2 | Off | Pass | 25,149 / 6,734 | 29 | 2s |
-| `c1-aba` | 3 / 1 / 0 | 1 recovery and crash; term 2; log 5; view lag 5 | Off | Expected `NoPartialServe` violation | 546,975 / 166,448 | 28 | 11s |
-| `c1-aba-fixed` | 3 / 1 / 0 | 1 recovery and crash; term 2; log 6; view lag 5 | On | Pass | 2,619,823 / 713,276 | 45 | 43s |
-| `c2` | 3 / 1 / 2 | 1 metadata partition; term 3; log 2; canonical primary/leader | Off | Expected `UniqueAckedSeq` violation | 46 / 33 | 19 | 1s |
-| `c2-allocation-ids` | Same as C2 | Same as C2 | On | Expected `UniqueAckedSeq` violation | 37 / 33 | 19 | 1s |
+| `c1-recovery` | 2 / 1 / 1 | 1 recovery; no crash; term 3; log 3; view lag 2 | Off | Pass | 23,125 / 6,334 | 29 | 2s |
+| `c1-aba` | 3 / 1 / 0 | 1 recovery and crash; term 2; log 5; view lag 5 | Off | Expected `NoPartialServe` violation | 496,070 / 152,915 | 28 | 11s |
+| `c1-aba-fixed` | 3 / 1 / 0 | 1 recovery and crash; term 2; log 6; view lag 5 | Allocation IDs + durable fencing | Pass | 2,619,829 / 713,284 | 45 | 44s |
+| `c2` | 3 / 1 / 2 | 1 metadata partition; term 3; log 2; canonical primary/leader | Off | Expected `C2RejectsStaleMessage` violation | 18 / 16 | 14 | 1s |
+| `c2-allocation-ids` | Same as C2 | Same as C2 | Allocation IDs only | Expected `C2RejectsStaleMessage` violation | 16 / 16 | 14 | 1s |
+| `c2-fixed` | Same as C2 | Same as C2 | Allocation IDs + durable fencing | Pass | 28 / 20 | 16 | 1s |
+| `fence-volatile` | 3 / 1 / 2 | 1 partition and replica crash/restart; term 3 | Allocation IDs + volatile fencing | Expected `FenceRejectsStaleProbe` violation | 17 / 17 | 15 | 1s |
+| `fence-durable` | Same as volatile-fence check | Same schedule | Allocation IDs + durable fencing | Pass | 21 / 19 | 16 | 1s |
 | `c3` | 3 / 1 / 1 | 1 crash and disk loss; no metadata update | Off | Expected `NoAckedLoss` violation | 36 / 25 | 12 | 1s |
 | `c3-allocation-ids` | Same as C3 | Missing local assignment identity fails closed | On | Pass | 28 / 24 | 11 | 1s |
 | `c4` | 3 / 1 / 1 | 1 primary crash; async WAL durability | Off | Expected `NoAckedLoss` violation | 32 / 21 | 9 | 1s |
-| `l1` | 2 / 1 / 0 | 1 recovery; no faults; weak fairness; no constraint/symmetry | On | Safety and all liveness properties pass | 20 / 17 | 15 | 1s |
+| `l1` | 2 / 1 / 0 | 1 recovery; no faults; weak fairness; no constraint/symmetry | Both fixes | Safety and all liveness properties pass | 20 / 17 | 15 | 2s |
+| `l2` | 2 / 1 / 0 | Up to 2 recovery attempts; exactly 1 transient target crash/restart; weak fairness; no constraint/symmetry | Both fixes | Safety and all liveness properties pass | 167 / 98 | 21 | 2s |
+| `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Both fixes | Earlier pass superseded by property correction; rerun required | 77,133,185 / 11,284,617 | 41 | 12m47s |
+| `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Both fixes | **Stopped:** diagnostic `NoStaleReplicaApply` false positive | 4,690 / 1,511 before stop | 8 | 1s |
+
+The two long fixed-design configurations use the complete `Next` relation, not
+a scenario wrapper. They constrain writes to `Put` and disable optional
+recovery setup/cancellation/expiry injection, while retaining every write,
+replication, message-loss/delay, recovery-progress, Raft, view-delivery,
+crash/restart, or live-suspicion interleaving within the numeric bounds. The
+recorded pass counts predate correction of the diagnostic stale-apply update
+and are not current evidence; both exhaustive runs must be repeated after that
+property is refined.
+
+The larger `fixed-simulation` profile uses 3 nodes, 2 documents, 4 writes,
+2 crashes, 1 partition, 2 recoveries, term 4, 3 in-flight messages, view lag 4,
+and 8 Raft entries. With seed `20260926`, depth 80, and 10,000 requested traces,
+TLC checked 1,575,912 states in 1m42s without finding a violation before the
+diagnostic property correction. That result is superseded and must be rerun.
+Simulation is sampling, not exhaustive model checking.
 
 The C2 configurations deliberately use canonical role constants rather than
 symmetry reduction. Their next-state relation is restricted to the
@@ -194,6 +270,8 @@ well below the CI budget.
 
 - [C1 same-node allocation ABA](traces/C1-allocation-aba-no-partial-serve.md)
 - [C2 stale-primary duplicate sequence](traces/C2-stale-primary-unique-seq.md)
+- [Why the replica fence must survive restart](traces/Fence-volatile-restart-stale-probe.md)
+- [Why global-term stale-apply classification is too strong](traces/Fixed-partition-prepromotion-inflight-apply.md)
 - [C3 same-node empty-disk reuse](traces/C3-disk-loss-no-acked-loss.md)
 - [C4 asynchronous-durability loss](traces/C4-async-durability-no-acked-loss.md)
 - [Why allocation-ID start must be a two-sided handshake](traces/C1-allocation-id-stale-start-no-partial-serve.md)

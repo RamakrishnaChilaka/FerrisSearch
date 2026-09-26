@@ -23,81 +23,98 @@ L1Start ==
 L1Snapshot ==
     /\ SourceSnapshot(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1BeginInstall ==
     /\ TargetBeginInstall(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1Install ==
     /\ InstallSnapshot(TargetNode)
-    /\ UNCHANGED <<sessionAllocation, pendingAllocation, FaultVars>>
+    /\ UNCHANGED
+          <<staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1FetchOps ==
     /\ FetchOps(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1ApplyOps ==
     /\ ApplyOps(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1FinishCatchUp ==
     /\ FinishCatchUp(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1BeginPrepare ==
     /\ BeginPrepareFinalize(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1AcquireBarrier ==
     /\ AcquireFinalizeBarrier(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1FinishTail ==
     /\ FinishFinalizeTail(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1TargetComplete ==
     /\ TargetComplete(TargetNode)
-    /\ UNCHANGED <<copyAllocation, sessionAllocation, FaultVars>>
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, FaultVars>>
 
 L1BeginSettlement ==
     /\ BeginSettlement(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1ProposeMark ==
     /\ ProposeMarkInSync(TargetNode)
     /\ UNCHANGED
-          <<copyAllocation, sessionAllocation, pendingAllocation, FaultVars>>
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, pendingAllocation, FaultVars>>
 
 L1ObserveAdmission ==
     /\ ObserveAdmission(TargetNode)
-    /\ UNCHANGED <<copyAllocation, pendingAllocation, FaultVars>>
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, pendingAllocation, FaultVars>>
 
 L1TargetAdmitted ==
     /\ TargetObserveAdmitted(TargetNode)
-    /\ UNCHANGED <<copyAllocation, sessionAllocation, FaultVars>>
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            staleApplySafe, sessionAllocation, FaultVars>>
 
 CommitPending ==
     \E command \in pendingRaft : CommitRaft(command)
 
 L1Commit ==
     /\ CommitPending
-    /\ UNCHANGED <<copyAllocation, PeerRecoveryVars, FaultVars>>
+    /\ UNCHANGED <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
 
 L1DeliverTargetView ==
     /\ DeliverView(TargetNode)
-    /\ UNCHANGED <<copyAllocation, PeerRecoveryVars, FaultVars>>
+    /\ UNCHANGED <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
 
-L1Next ==
+L1CoreNext ==
     \/ L1Start
     \/ L1Snapshot
     \/ L1BeginInstall
@@ -115,6 +132,8 @@ L1Next ==
     \/ L1ObserveAdmission
     \/ L1DeliverTargetView
     \/ L1TargetAdmitted
+
+L1Next == L1CoreNext
 
 LivenessSpec ==
     /\ L1Init
