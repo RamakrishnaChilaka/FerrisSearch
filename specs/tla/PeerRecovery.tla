@@ -341,6 +341,7 @@ SourceSetupFailure(target) ==
             sessionSettlementRunning, sessionBumpSubmitted, pendingPrimary,
             pendingTerm, authoritativeWipeSafe>>
 
+\* source_start_status returns the stored launch_source_setup failure once.
 PollSetupFailure(target) ==
     /\ sessionPhase[target] = "SetupFailed"
     /\ ClearSession(target)
@@ -475,6 +476,8 @@ ApplyOps(target) ==
             sessionSettlementRunning, sessionBumpSubmitted, pendingPrimary,
             pendingTerm, authoritativeWipeSafe>>
 
+\* run_peer_recovery observes FetchRecoveryOps.complete at the current source
+\* head after apply_recovery_operations has advanced its cursor.
 FinishCatchUp(target) ==
     LET source == sessionSource[target]
         upper == nextSeq[source]
@@ -510,6 +513,8 @@ BeginPrepareFinalize(target) ==
             sessionBumpSubmitted, pendingPrimary, pendingTerm,
             authoritativeWipeSafe>>
 
+\* Dropping FinalizePreparingGuard after a cancelled or failed
+\* prepare_finalize_recovery_inner clears finalize_preparing.
 CancelPrepareFinalize(target) ==
     /\ sessionPhase[target] = "Preparing"
     /\ sessionFinalizePreparing[target]
@@ -555,6 +560,8 @@ AcquireFinalizeBarrier(target) ==
             sessionBumpSubmitted, pendingPrimary, pendingTerm,
             authoritativeWipeSafe>>
 
+\* prepare_finalize_recovery_inner returns a complete tail through the captured
+\* barrier head; apply_recovery_operations advances the target to that head.
 FinishFinalizeTail(target) ==
     LET upper == sessionHead[target]
     IN

@@ -4,7 +4,7 @@
 **Configuration:** `MC_C1_ABA.cfg`  
 **TLC result:** expected implementation-faithful violation of `NoPartialServe`  
 **Raw trace:** [`C1-allocation-aba-no-partial-serve.log`](C1-allocation-aba-no-partial-serve.log)  
-**Raw trace SHA-256:** `ed58240e780aa51a7717458e4894b03b48453ea1fd1a833b73c37d99223c0ac7`
+**Raw trace SHA-256:** `6cede2ed92cd5ebf1db0b3aaa77ff84dc24cd1028f5415cb6f625825b582ee72`
 
 This trace uses three Raft voters. Every committed command has a live leader
 and a live voter majority. Dead-node processing follows the merged

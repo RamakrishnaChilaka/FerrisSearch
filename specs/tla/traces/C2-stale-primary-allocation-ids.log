@@ -1,15 +1,15 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 7 and seed 1838122742893535219 with 6 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 97264] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 76 and seed 4488674444372554366 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 99170] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C2.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/Naturals.tla
-Parsing file /tmp/Sequences.tla
-Parsing file /tmp/FiniteSets.tla
-Parsing file /tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.s3za2x/c2-allocation-ids/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.s3za2x/c2-allocation-ids/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.s3za2x/c2-allocation-ids/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.s3za2x/c2-allocation-ids/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -20,9 +20,9 @@ Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C2
-Starting... (2026-09-26 15:43:27)
+Starting... (2026-09-26 15:55:09)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-26 15:43:27.
+Finished computing initial states: 1 distinct state generated at 2026-09-26 15:55:09.
 Error: Invariant UniqueAckedSeq is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -30,6 +30,7 @@ State 1: <Initial predicate>
 /\ raftVoters = {n1, n2, n3}
 /\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0) @@ n3 :> (d1 :> 0))
 /\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ copyAllocation = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
 /\ sessionHead = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ admissionSafe = TRUE
 /\ nextSeq = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -122,11 +123,11 @@ State 1: <Initial predicate>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Idle")
 /\ writeWait = <<{}, {}>>
 
-State 2: <PartitionMetadata line 105, col 5 to line 122, col 71 of module Faults>
+State 2: <PartitionMetadata line 106, col 5 to line 124, col 71 of module Faults>
 /\ partitionCount = 1
 /\ raftConnected = (n1 :> FALSE @@ n2 :> TRUE @@ n3 :> TRUE)
 
-State 3: <SuspectAndRemove line 225, col 5 to line 251, col 30 of module Faults>
+State 3: <SuspectAndRemove line 229, col 5 to line 256, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
     target |-> n1,
     actor |-> n2,
@@ -139,7 +140,7 @@ State 3: <SuspectAndRemove line 225, col 5 to line 251, col 30 of module Faults>
     expectedAllocation |-> 0 ] }
 /\ lifecyclePhase = (n1 :> "RoutingProposed" @@ n2 :> "Idle" @@ n3 :> "Idle")
 
-State 4: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 4: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ pendingRaft = {}
 /\ applied = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 0)
 /\ routing = [ primary |-> n2,
@@ -194,7 +195,7 @@ State 4: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] )
 
-State 5: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 5: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ pendingRaft = { [ kind |-> "ActivatePrimary",
     target |-> n2,
     actor |-> n2,
@@ -207,7 +208,7 @@ State 5: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
     expectedAllocation |-> 0 ] }
 /\ activationPending = (n1 :> 0 @@ n2 :> 2 @@ n3 :> 0)
 
-State 6: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 6: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ pendingRaft = {}
 /\ applied = (n1 :> 0 @@ n2 :> 2 @@ n3 :> 0)
 /\ routing = [ primary |-> n2,
@@ -282,16 +283,16 @@ State 6: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] )
 
-State 7: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 7: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ activated = (n1 :> 1 @@ n2 :> 3 @@ n3 :> 0)
 /\ activationPending = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 
-State 8: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 8: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ writeStatus = <<"Routed", "Unused">>
 /\ nextWrite = 2
 /\ writeTarget = <<n2, "NO_NODE">>
 
-State 9: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 9: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 0))
 /\ nextSeq = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 0)
 /\ durableOps = (n1 :> {} @@ n2 :> {1} @@ n3 :> {})
@@ -310,7 +311,7 @@ State 9: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
     toEpoch |-> 0 ] }
 /\ writeWait = <<{n3}, {}>>
 
-State 10: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 10: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
 /\ nextSeq = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1)
 /\ durableOps = (n1 :> {} @@ n2 :> {1} @@ n3 :> {1})
@@ -323,21 +324,21 @@ State 10: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
     fromEpoch |-> 0,
     toEpoch |-> 0 ] }
 
-State 11: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 11: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ messages = {}
 /\ writeWait = <<{}, {}>>
 
-State 12: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 12: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ acked = {1}
 /\ writeStatus = <<"Acked", "Unused">>
 /\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
 
-State 13: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 13: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ writeStatus = <<"Acked", "Routed">>
 /\ nextWrite = 3
 /\ writeTarget = <<n2, n1>>
 
-State 14: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 14: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
 /\ nextSeq = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
 /\ durableOps = (n1 :> {2} @@ n2 :> {1} @@ n3 :> {1})
@@ -363,7 +364,7 @@ State 14: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
     toEpoch |-> 0 ] }
 /\ writeWait = <<{}, {n2, n3}>>
 
-State 15: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 15: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 2) @@ n3 :> (d1 :> 1))
 /\ durableOps = (n1 :> {2} @@ n2 :> {1, 2} @@ n3 :> {1})
 /\ ops = (n1 :> {2} @@ n2 :> {1, 2} @@ n3 :> {1})
@@ -382,7 +383,7 @@ State 15: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
     fromEpoch |-> 0,
     toEpoch |-> 0 ] }
 
-State 16: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 16: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 2) @@ n3 :> (d1 :> 2))
 /\ durableOps = (n1 :> {2} @@ n2 :> {1, 2} @@ n3 :> {1, 2})
 /\ ops = (n1 :> {2} @@ n2 :> {1, 2} @@ n3 :> {1, 2})
@@ -401,7 +402,7 @@ State 16: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
     fromEpoch |-> 0,
     toEpoch |-> 0 ] }
 
-State 17: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 17: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ messages = { [ from |-> n3,
     to |-> n1,
     kind |-> "ReplicaAck",
@@ -411,15 +412,16 @@ State 17: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
     toEpoch |-> 0 ] }
 /\ writeWait = <<{}, {n3}>>
 
-State 18: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 18: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ messages = {}
 /\ writeWait = <<{}, {}>>
 
-State 19: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
+State 19: <C2Next line 42, col 8 to line 43, col 67 of module MC_C2>
 /\ pendingRaft = {}
 /\ raftVoters = {n1, n2, n3}
 /\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 2) @@ n3 :> (d1 :> 2))
 /\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ copyAllocation = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
 /\ sessionHead = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ admissionSafe = TRUE
 /\ nextSeq = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
@@ -554,4 +556,4 @@ State 19: <C2Next line 42, col 8 to line 43, col 51 of module MC_C2>
 37 states generated, 33 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 19.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 3 and the 95th percentile is 3).
-Finished in 01s at (2026-09-26 15:43:27)
+Finished in 01s at (2026-09-26 15:55:09)

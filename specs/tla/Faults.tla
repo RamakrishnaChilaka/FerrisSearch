@@ -79,6 +79,8 @@ Crash(node) ==
             ackMembershipSafe, termMonotonic, diskLost, partitionCount,
             faultsStopped, lifecyclePhase>>
 
+\* src/node startup plus HotTranslog::open/replay starts a new process
+\* incarnation while durable shard and pending-recovery markers survive.
 Restart(node) ==
     /\ ~faultsStopped
     /\ node \in Nodes
@@ -102,6 +104,8 @@ Restart(node) ==
 
 \* C2 only: metadata failure detector may suspect a live node whose local
 \* ClusterManager view stops advancing.  Data-plane RPC messages remain usable.
+\* Lost/delayed Ping and Raft connectivity as observed by the leader's
+\* src/node/mod.rs failure detector; data-plane RPC connectivity is separate.
 PartitionMetadata(node) ==
     /\ ~faultsStopped
     /\ FaultMode = "C2"
@@ -123,6 +127,7 @@ PartitionMetadata(node) ==
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
             diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
 
+\* Successful Ping/JoinCluster/Raft connectivity restores metadata delivery.
 HealMetadata(node) ==
     /\ ~faultsStopped
     /\ FaultMode = "C2"
@@ -142,6 +147,7 @@ HealMetadata(node) ==
 
 \* transport timeout/drop.  Delay is represented by simply not choosing a
 \* delivery action.
+\* A TransportClient request or response times out or is dropped.
 LoseMsg(message) ==
     /\ ~faultsStopped
     /\ message \in messages
@@ -255,6 +261,7 @@ SuspectAndRemove(leader, node, candidate) ==
             crashCount, partitionCount, diskLost, faultsStopped,
             PeerRecoveryVars>>
 
+\* client_write_checked(UpdateIndex) returned success to the dead-node loop.
 ObserveRoutingAccepted(node) ==
     /\ lifecyclePhase[node] = "RoutingProposed"
     /\ CommittedRoutingRemoval(node)
@@ -264,6 +271,7 @@ ObserveRoutingAccepted(node) ==
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
             partitionCount, diskLost, faultsStopped>>
 
+\* client_write_checked(UpdateIndex) returned the state-machine rejection.
 ObserveRoutingRejected(node) ==
     /\ lifecyclePhase[node] = "RoutingProposed"
     /\ CommittedResult("UpdateRouting", node, FALSE)
@@ -332,6 +340,7 @@ ProposeRemoveNode(leader, node) ==
             crashCount, partitionCount, diskLost, faultsStopped,
             PeerRecoveryVars>>
 
+\* The leader observes successful ClusterCommand::RemoveNode application.
 ObserveNodeRemoved(node) ==
     /\ lifecyclePhase[node] = "RemoveProposed"
     /\ CommittedResult("RemoveNode", node, TRUE)
@@ -367,6 +376,7 @@ Rejoin(node) ==
             crashCount, partitionCount, diskLost, faultsStopped,
             PeerRecoveryVars>>
 
+\* JoinCluster observes committed ClusterCommand::AddNode registration.
 ObserveRejoin(node) ==
     /\ lifecyclePhase[node] = "RejoinProposed"
     /\ CommittedResult("AddNode", node, TRUE)
@@ -417,6 +427,7 @@ AllocateAfterLifecycle(leader, target) ==
             crashCount, partitionCount, diskLost, faultsStopped,
             PeerRecoveryVars>>
 
+\* The leader allocator observes successful UpdateIndex assignment.
 ObserveAllocationAccepted(target) ==
     /\ lifecyclePhase[target] = "AllocationProposed"
     /\ CommittedAllocation(target)
@@ -425,6 +436,7 @@ ObserveAllocationAccepted(target) ==
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
             partitionCount, diskLost, faultsStopped>>
 
+\* The leader allocator observes a rejected stale UpdateIndex proposal.
 ObserveAllocationRejected(target) ==
     /\ lifecyclePhase[target] = "AllocationProposed"
     /\ CommittedResult("UpdateRouting", target, FALSE)

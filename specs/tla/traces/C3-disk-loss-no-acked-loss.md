@@ -4,7 +4,7 @@
 **Configuration:** `MC_C3.cfg`  
 **TLC result:** expected violation of `NoAckedLoss`  
 **Raw trace:** [`C3-disk-loss-no-acked-loss.log`](C3-disk-loss-no-acked-loss.log)  
-**Raw trace SHA-256:** `147c42ad2e39ecd96e792d19d086fdd72de86baabcca474783af41b30c5e610f`
+**Raw trace SHA-256:** `49240e554eb2f295efead488a360381f91b410e854cd52afe85469f0900f0118`
 
 | State range | Model action | Rust behavior represented |
 | --- | --- | --- |

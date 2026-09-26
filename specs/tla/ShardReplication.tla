@@ -224,6 +224,8 @@ ReplicationInit ==
           /\ ackMembershipSafe = TRUE
           /\ termMonotonic = TRUE
 
+\* src/api/index document and bulk handlers resolve the coordinator's local
+\* routing view and forward to that view's primary.
 ClientWrite(coordinator, doc, kind) ==
     LET writeId == nextWrite
         target == views[coordinator].primary
@@ -302,6 +304,8 @@ PrimaryAccept(writeId) ==
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic>>
 
+\* Failure return from TransportService::{index_doc,bulk_index,delete_doc}
+\* when activation or the in-guard routing/UUID/term revalidation fails.
 PrimaryReject(writeId) ==
     /\ writeId \in WriteIds
     /\ writeStatus[writeId] = "Routed"
@@ -356,6 +360,8 @@ ReplicaApply(message) ==
             failed, promotionSafe, admissionSafe, ackMembershipSafe,
             termMonotonic>>
 
+\* Completion of replication::{replicate_write,replicate_bulk}'s concurrent
+\* TransportClient RPC and collection of the replica checkpoint.
 DeliverReplicaAck(message) ==
     LET writeId == message.write
         primaryNode == message.to
@@ -405,6 +411,8 @@ PrimaryAck(writeId) ==
             exclusiveHolder, failed, promotionSafe, admissionSafe,
             termMonotonic>>
 
+\* TransportService::{index_doc,bulk_index,delete_doc} returns a request
+\* failure when any required synchronous replica did not acknowledge.
 PrimaryFail(writeId) ==
     LET primaryNode == writePrimary[writeId]
     IN
@@ -453,6 +461,8 @@ ProposeActivate(primaryNode) ==
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic>>
 
+\* TransportService::ensure_primary_activated observes its local
+\* ClusterManager view after the conditional ActivatePrimary command.
 ObserveActivation(primaryNode) ==
     LET expected == activationPending[primaryNode]
         local == views[primaryNode]
@@ -472,6 +482,8 @@ ObserveActivation(primaryNode) ==
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic>>
 
+\* TransportService::ensure_primary_activated aborts when a newer term or
+\* different primary makes the requested activation impossible.
 CancelActivation(primaryNode) ==
     LET expected == activationPending[primaryNode]
         local == views[primaryNode]
@@ -618,6 +630,8 @@ CommitRaft(command) ==
             ackMembershipSafe>>
 
 \* ClusterManager applies one more committed Raft entry on this node.
+\* ClusterManager's state-machine-backed local view advances after a committed
+\* openraft log entry is applied on this node.
 DeliverView(node) ==
     /\ node \in Nodes
     /\ alive[node]

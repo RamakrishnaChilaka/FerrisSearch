@@ -7,9 +7,9 @@
 Raw traces:
 
 - [`C2-stale-primary-unique-seq.log`](C2-stale-primary-unique-seq.log),
-  SHA-256 `65380361d5b61b6392e52c84fe463b307066d35d6c8e8e8c7dfdefc9a641185a`
+  SHA-256 `fba4992a0bc5be765a907c48a78e354709f0a8021d0414ae8c34d20a70fec936`
 - [`C2-stale-primary-allocation-ids.log`](C2-stale-primary-allocation-ids.log),
-  SHA-256 `21c23be74bef4132ce496f4046100aff0e49804ca00c47f6c7a0146736c9c11f`
+  SHA-256 `f0c3a9a78ed704f9e765f008b074589d339c8f3c7d7ba487e927dbe43f4d3c95`
 
 The two traces have the same protocol behavior. Allocation IDs protect replica
 assignment and recovery admission; they do not fence primary-term data-plane

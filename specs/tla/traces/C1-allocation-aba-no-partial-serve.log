@@ -1,14 +1,14 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 55 and seed 2989810526546325862 with 4 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 96378] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 116 and seed 159422480607799500 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 98971] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/Naturals.tla
-Parsing file /tmp/Sequences.tla
-Parsing file /tmp/FiniteSets.tla
-Parsing file /tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.s3za2x/c1-aba/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.s3za2x/c1-aba/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.s3za2x/c1-aba/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.s3za2x/c1-aba/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -18,14 +18,14 @@ Semantic processing of module ShardReplication
 Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
-Starting... (2026-09-26 15:31:19)
+Starting... (2026-09-26 15:54:11)
 Computing initial states...
 Computed 2 initial states...
 Computed 4 initial states...
 Computed 8 initial states...
 Computed 16 initial states...
-Finished computing initial states: 18 states generated, with 3 of them distinct at 2026-09-26 15:31:20.
-Progress(16) at 2026-09-26 15:31:23: 12,228 states generated (12,228 s/min), 4,448 distinct states found (4,448 ds/min), 1,050 states left on queue.
+Finished computing initial states: 18 states generated, with 3 of them distinct at 2026-09-26 15:54:11.
+Progress(22) at 2026-09-26 15:54:14: 96,406 states generated (96,406 s/min), 34,170 distinct states found (34,170 ds/min), 9,767 states left on queue.
 Error: Invariant NoPartialServe is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -33,12 +33,13 @@ State 1: <Initial predicate>
 /\ raftVoters = {n1, n2, n3}
 /\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0) @@ n3 :> (d1 :> 0))
 /\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ copyAllocation = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
 /\ sessionHead = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ admissionSafe = TRUE
 /\ nextSeq = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ writeKind = << >>
 /\ writeEpoch = << >>
-/\ raftLeader = n1
+/\ raftLeader = n2
 /\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ applied = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
@@ -169,10 +170,10 @@ State 10: <Crash line 46, col 5 to line 80, col 43 of module Faults>
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> FALSE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> FALSE)
 
-State 11: <SuspectAndRemove line 225, col 5 to line 251, col 30 of module Faults>
+State 11: <SuspectAndRemove line 229, col 5 to line 256, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
     target |-> n3,
-    actor |-> n1,
+    actor |-> n2,
     newReplicas |-> {n2},
     newPrimary |-> n1,
     newUnassigned |-> 1,
@@ -184,7 +185,7 @@ State 11: <SuspectAndRemove line 225, col 5 to line 251, col 30 of module Faults
 
 State 12: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ pendingRaft = {}
-/\ applied = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 0)
 /\ routing = [ primary |-> n1,
   inSync |-> {n2},
   replicas |-> {n2},
@@ -204,7 +205,7 @@ State 12: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "UpdateRouting",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
@@ -215,17 +216,17 @@ State 12: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ views = ( n1 :>
       [ primary |-> n1,
         inSync |-> {n2},
-        replicas |-> {n2},
-        unassigned |-> 1,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
+        replicas |-> {n2, n3},
+        unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n2 :>
       [ primary |-> n1,
         inSync |-> {n2},
-        replicas |-> {n2, n3},
-        unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        replicas |-> {n2},
+        unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -241,27 +242,27 @@ State 13: <Next line 14, col 8 to line 15, col 29 of module Invariants>
 /\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
 /\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Settling")
 
-State 14: <Restart line 83, col 5 to line 100, col 46 of module Faults>
+State 14: <Restart line 83, col 5 to line 101, col 46 of module Faults>
 /\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 
 State 15: <Next line 12, col 8 to line 13, col 51 of module Invariants>
-/\ applied = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 1)
+/\ applied = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1)
 /\ views = ( n1 :>
-      [ primary |-> n1,
-        inSync |-> {n2},
-        replicas |-> {n2},
-        unassigned |-> 1,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
-        members |-> {n1, n2, n3},
-        term |-> 1 ] @@
-  n2 :>
       [ primary |-> n1,
         inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        members |-> {n1, n2, n3},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {n2},
+        replicas |-> {n2},
+        unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -273,24 +274,24 @@ State 15: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
-State 16: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+State 16: <ObserveRoutingAccepted line 259, col 5 to line 265, col 53 of module Faults>
+/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RoutingCommitted")
+
+State 17: <ChangeRaftMembership line 294, col 5 to line 305, col 37 of module Faults>
+/\ raftVoters = {n1, n2}
+/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "MembershipRemoved")
+
+State 18: <Next line 14, col 8 to line 15, col 29 of module Invariants>
 /\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
 /\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
 /\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "InstallMarker")
 
-State 17: <ObserveRoutingAccepted line 254, col 5 to line 260, col 53 of module Faults>
-/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RoutingCommitted")
-
-State 18: <ChangeRaftMembership line 289, col 5 to line 300, col 37 of module Faults>
-/\ raftVoters = {n1, n2}
-/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "MembershipRemoved")
-
-State 19: <ProposeRemoveNode line 308, col 5 to line 327, col 30 of module Faults>
+State 19: <ProposeRemoveNode line 313, col 5 to line 333, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "RemoveNode",
     target |-> n3,
-    actor |-> n1,
+    actor |-> n2,
     newReplicas |-> {},
     newPrimary |-> "NO_NODE",
     newUnassigned |-> 0,
@@ -302,7 +303,7 @@ State 19: <ProposeRemoveNode line 308, col 5 to line 327, col 30 of module Fault
 
 State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ pendingRaft = {}
-/\ applied = (n1 :> 2 @@ n2 :> 0 @@ n3 :> 1)
+/\ applied = (n1 :> 0 @@ n2 :> 2 @@ n3 :> 1)
 /\ routing = [ primary |-> n1,
   inSync |-> {n2},
   replicas |-> {n2},
@@ -322,7 +323,7 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "UpdateRouting",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
@@ -342,7 +343,7 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "RemoveNode",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
@@ -353,18 +354,18 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ views = ( n1 :>
       [ primary |-> n1,
         inSync |-> {n2},
-        replicas |-> {n2},
-        unassigned |-> 1,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
-        members |-> {n1, n2},
-        term |-> 1 ] @@
-  n2 :>
-      [ primary |-> n1,
-        inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {n2},
+        replicas |-> {n2},
+        unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
+        members |-> {n1, n2},
         term |-> 1 ] @@
   n3 :>
       [ primary |-> n1,
@@ -375,10 +376,10 @@ State 20: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
-State 21: <ObserveNodeRemoved line 330, col 5 to line 336, col 53 of module Faults>
+State 21: <ObserveNodeRemoved line 336, col 5 to line 342, col 53 of module Faults>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Removed")
 
-State 22: <Rejoin line 345, col 5 to line 361, col 30 of module Faults>
+State 22: <Rejoin line 351, col 5 to line 368, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "AddNode",
     target |-> n3,
     actor |-> n3,
@@ -394,7 +395,7 @@ State 22: <Rejoin line 345, col 5 to line 361, col 30 of module Faults>
 State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ pendingRaft = {}
 /\ raftVoters = {n1, n2, n3}
-/\ applied = (n1 :> 3 @@ n2 :> 0 @@ n3 :> 1)
+/\ applied = (n1 :> 0 @@ n2 :> 3 @@ n3 :> 1)
 /\ routing = [ primary |-> n1,
   inSync |-> {n2},
   replicas |-> {n2},
@@ -414,7 +415,7 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "UpdateRouting",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
@@ -434,7 +435,7 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "RemoveNode",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
@@ -465,17 +466,17 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ views = ( n1 :>
       [ primary |-> n1,
         inSync |-> {n2},
-        replicas |-> {n2},
-        unassigned |-> 1,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
+        replicas |-> {n2, n3},
+        unassigned |-> 0,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n2 :>
       [ primary |-> n1,
         inSync |-> {n2},
-        replicas |-> {n2, n3},
-        unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        replicas |-> {n2},
+        unassigned |-> 1,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0),
         members |-> {n1, n2, n3},
         term |-> 1 ] @@
   n3 :>
@@ -487,13 +488,13 @@ State 23: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
-State 24: <ObserveRejoin line 364, col 5 to line 371, col 53 of module Faults>
+State 24: <ObserveRejoin line 371, col 5 to line 378, col 53 of module Faults>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Rejoined")
 
-State 25: <AllocateAfterLifecycle line 388, col 5 to line 410, col 30 of module Faults>
+State 25: <AllocateAfterLifecycle line 395, col 5 to line 418, col 30 of module Faults>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
     target |-> n3,
-    actor |-> n1,
+    actor |-> n2,
     newReplicas |-> {n2, n3},
     newPrimary |-> n1,
     newUnassigned |-> 0,
@@ -505,7 +506,7 @@ State 25: <AllocateAfterLifecycle line 388, col 5 to line 410, col 30 of module 
 
 State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ pendingRaft = {}
-/\ applied = (n1 :> 4 @@ n2 :> 0 @@ n3 :> 1)
+/\ applied = (n1 :> 0 @@ n2 :> 4 @@ n3 :> 1)
 /\ routing = [ primary |-> n1,
   inSync |-> {n2},
   replicas |-> {n2, n3},
@@ -525,7 +526,7 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "UpdateRouting",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
@@ -545,7 +546,7 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "RemoveNode",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
@@ -585,7 +586,7 @@ State 26: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "UpdateRouting",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {n2, n3},
            newPrimary |-> n1,
            newUnassigned |-> 0,
@@ -636,14 +637,15 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ raftVoters = {n1, n2, n3}
 /\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0) @@ n3 :> (d1 :> 0))
 /\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ copyAllocation = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
 /\ sessionHead = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ admissionSafe = TRUE
 /\ nextSeq = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ writeKind = << >>
 /\ writeEpoch = << >>
-/\ raftLeader = n1
+/\ raftLeader = n2
 /\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
-/\ applied = (n1 :> 5 @@ n2 :> 0 @@ n3 :> 1)
+/\ applied = (n1 :> 0 @@ n2 :> 5 @@ n3 :> 1)
 /\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
 /\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ authoritativeWipeSafe = TRUE
@@ -707,7 +709,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "UpdateRouting",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {n2},
            newPrimary |-> n1,
            newUnassigned |-> 1,
@@ -727,7 +729,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "RemoveNode",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {},
            newPrimary |-> "NO_NODE",
            newUnassigned |-> 0,
@@ -767,7 +769,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
      command |->
          [ kind |-> "UpdateRouting",
            target |-> n3,
-           actor |-> n1,
+           actor |-> n2,
            newReplicas |-> {n2, n3},
            newPrimary |-> n1,
            newUnassigned |-> 0,
@@ -800,7 +802,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ ackMembershipSafe = TRUE
 /\ views = ( n1 :>
       [ primary |-> n1,
-        inSync |-> {n2, n3},
+        inSync |-> {n2},
         replicas |-> {n2, n3},
         unassigned |-> 0,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
@@ -808,7 +810,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         term |-> 1 ] @@
   n2 :>
       [ primary |-> n1,
-        inSync |-> {n2},
+        inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
@@ -827,7 +829,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "AllocationProposed")
 /\ writeWait = << >>
 
-462191 states generated, 143638 distinct states found, 27272 states left on queue.
+546975 states generated, 166448 distinct states found, 27850 states left on queue.
 The depth of the complete state graph search is 28.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 8 and the 95th percentile is 3).
-Finished in 25s at (2026-09-26 15:31:43)
+Finished in 11s at (2026-09-26 15:54:21)

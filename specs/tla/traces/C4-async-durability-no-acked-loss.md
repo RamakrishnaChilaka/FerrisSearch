@@ -4,7 +4,7 @@
 **Configuration:** `MC_C4.cfg`  
 **TLC result:** expected violation of `NoAckedLoss`  
 **Raw trace:** [`C4-async-durability-no-acked-loss.log`](C4-async-durability-no-acked-loss.log)  
-**Raw trace SHA-256:** `76898ffc253611f60da5faa43798bd6e5c7bfc514d7d0ec543a4bfbbdfee6fbd`
+**Raw trace SHA-256:** `a2e9da867069fcd37f0ae1336c99a50faa384cbd9426fcfac97e9f1c9bef0077`
 
 | State range | Model action | Rust behavior represented |
 | --- | --- | --- |
