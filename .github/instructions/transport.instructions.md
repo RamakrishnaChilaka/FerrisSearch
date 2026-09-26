@@ -146,7 +146,11 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   `HotTranslog` on the live shard directory: open performs startup repair and
   unreferenced-generation cleanup. The RPC remains available for transport
   tests but the node lifecycle does not use this partial suffix as recovery or
-  admission.
+  admission. It returns `success=false` rather than an empty success when the
+  retained WAL cannot reach the captured head (for example after a flush, or
+  on a copy installed from files), when a concurrent flush removes a needed
+  generation, or when a legacy frame above the 32 MiB transfer limit falls in
+  the requested range.
 - **peer recovery RPCs**: source sessions are UUID/target/primary-term bound,
   file chunks are at most 1 MiB, operation batches are bounded by count and
   bytes, and stale authority aborts the session. Prepare holds the exclusive
