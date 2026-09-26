@@ -30,7 +30,7 @@ Run the complete fast matrix:
 Run selected configurations:
 
 ```bash
-./scripts/tla/check.sh c1-aba c1-aba-fixed c2 l1
+./scripts/tla/check.sh c1-aba-fixed c2-fixed g1-empty-store g2-liveness
 ```
 
 Use an existing verified jar or retain raw logs:
@@ -49,7 +49,7 @@ expected counterexample no longer violates its named invariant.
 Deadlock checking is disabled because the finite write/fault/recovery bounds
 create intentional terminal states. Safety configurations use a state
 constraint and, where no node role is distinguished, node symmetry. The
-liveness configuration uses neither symmetry nor a state constraint.
+liveness configurations use neither symmetry nor a state constraint.
 
 ## Modules
 
@@ -66,6 +66,9 @@ liveness configuration uses neither symmetry nor a state constraint.
 | `MC_L1.tla` | Fault-free recovery progress actions and weak-fairness assumptions. |
 | `MC_L2.tla` | One target crash/restart followed by fault-free weakly fair recovery. |
 | `MC_FenceDurability.tla` | Targeted proof that a learned replica fence must survive restart. |
+| `MC_G1_EmptyStore.tla` | CreateIndex, permitted initial empty-copy creation, pre-activation disk loss, first activation, and first acknowledged write. |
+| `MC_G2_CopyFailure.tla` | Replica/primary copy-failure reporting, exact-allocation removal, promotion or red state, fresh allocation, and recovery safety. |
+| `MC_G2_Liveness.tla` | Fair replica disk-loss reporting, stale-report rejection, resumed writes, and replacement recovery. |
 | `MC_Fixed_Crash.cfg`, `MC_Fixed_Partition.cfg` | Unrestricted three-voter fixed-design safety checks with two writes, recovery, message loss/delay, and crash or partition faults. |
 | `MC_Fixed_Simulation.cfg` | Larger seeded simulation profile for deeper randomized executions. |
 
@@ -77,9 +80,13 @@ liveness configuration uses neither symmetry nor a state constraint.
   identity and exact sequence numbers.
 - At most one client write is active at once. That write still interleaves with
   Raft, replication, recovery, crashes, view delivery, and message loss.
-- The initial primary term is normalized to 1 after its initial activation.
-  Promotion and later activation preserve the implemented relative term
-  ordering.
+- `InitialInitialized = TRUE` starts at normalized term 1 after initial
+  activation, as the original configurations did. `FALSE` starts at the
+  committed CreateIndex routing record with no open copies or in-sync
+  replicas; the first activation is modeled explicitly.
+- Routing carries a monotonic `initialized` bit. A cleared primary allocation
+  represents a red shard: no primary copy is authoritative and client writes
+  fail closed.
 - Raft requires a live connected leader and a live majority of current voters.
   The leader applies a committed command before its synchronous write returns.
   Other nodes nondeterministically apply a committed-log prefix.
@@ -105,23 +112,27 @@ liveness configuration uses neither symmetry nor a state constraint.
 - Wall-clock durations are abstracted as nondeterministic timeout actions.
   Trace documentation explains when a counterexample also fits implemented
   timing bounds.
+- `FailShardCopy` omits index name, UUID, and shard ID from its abstract record
+  because the model contains exactly one fixed-UUID shard. Allocation identity,
+  conditional commit, promotion, unassignment, and view lag remain explicit.
 
 ## Action-to-code mapping
 
-| Model action | Merged Rust implementation |
+| Model action | Rust boundary represented |
 | --- | --- |
 | `ClientWrite` | Coordinator routing in `src/api/index/`. |
 | `PrimaryAccept`, `PrimaryReject`, `PrimaryAck`, `PrimaryFail` | `TransportService::{index_doc,bulk_index,delete_doc}`, including `ensure_primary_activated`, `peer_recovery_write_guard`, `validated_primary_write_state`, and all-in-sync acknowledgement. |
 | `ReplicaApply`, `DeliverReplicaAck` | `TransportService::{replicate_doc,replicate_bulk}` and `replication::{replicate_write,replicate_bulk}`. |
 | `ReplicaReject`, `DeliverReplicaNack` | Proposed pre-WAL identity/fence rejection in the same replica handlers and propagation as a synchronous replication failure. |
 | `ProposeActivate`, `ObserveActivation`, `CancelActivation` | `TransportService::ensure_primary_activated`. |
-| `CommitRaft` | `ClusterStateMachine::apply_command`; rejected conditional commands retain a log position without changing routing. |
+| `CommitRaft` | `ClusterStateMachine::apply_command`, including allocation-matched `ActivatePrimary` and `FailShardCopy`; rejected conditional commands retain a log position without changing routing. |
 | `DeliverView` | Per-node `ClusterManager` observation of an applied Raft prefix. |
 | `ElectLeader` | openraft leader election, abstracted to a live connected voter with quorum. |
 | `SuspectAndRemove`, `ObserveRoutingAccepted`, `ObserveRoutingRejected` | Leader dead-node loop in `src/node/mod.rs`, `IndexMetadata::{remove_node,select_promotion_candidate,promote_replica_to}`, and checked `UpdateIndex`. |
 | `ChangeRaftMembership`, `ProposeRemoveNode`, `ObserveNodeRemoved` | `Raft::change_membership`, followed by `ClusterCommand::RemoveNode`; removal is deferred after rejected routing updates. |
 | `Rejoin`, `ObserveRejoin` | Follower `JoinCluster` retry and committed `ClusterCommand::AddNode`. |
 | `AllocateAfterLifecycle`, `ObserveAllocationAccepted`, `ObserveAllocationRejected` | `IndexMetadata::allocate_unassigned_replicas` and the allocator phase of the leader lifecycle loop. |
+| `ReportShardCopyFailure` | `open_local_assigned_shards`, `TransportService::fail_shard_copy`, and `TransportClient::forward_fail_shard_copy`. |
 | `StartRecovery`, `SourceSetupFailure`, `PollSetupFailure` | `run_peer_recovery`, `start_peer_recovery_inner`, `launch_source_setup`, and `source_start_status`. |
 | `SourceSnapshot` | `HotEngine::prepare_peer_recovery_snapshot`, including commit, durable checkpoint, hard-linked files, and `register_retention_pin`. |
 | `TargetBeginInstall`, `InstallSnapshot` | `ShardManager::{begin_peer_recovery_target,prepare_peer_recovery_target_blocking,finalize_peer_recovery_target_blocking}`. |
@@ -134,7 +145,7 @@ liveness configuration uses neither symmetry nor a state constraint.
 | `Flush` | `HotEngine::flush_with_global_checkpoint` and `HotTranslog::{truncate,truncate_below}`. |
 | `Crash`, `Restart` | Process loss/restart and WAL reopen/replay; volatile activation, barriers, and source sessions are discarded while durable pending markers survive. |
 | `PartitionMetadata`, `LoseMsg` | Metadata-link isolation and delayed/lost transport requests. |
-| `DiskLoss`, `OpenAssignedEmptyCopy` | Same-node restart with a missing shard directory; the allocation-ID variant rejects a missing durable local identity. |
+| `DiskLoss`, `OpenAssignedEmptyCopy` | Same-node missing shard directory and `open_local_assigned_shards` / `ShardManager::open_assigned_shard_with_settings`; only a pre-activation CreateIndex allocation may be created empty in the fixed design. |
 
 ## Allocation-ID variant
 
@@ -190,9 +201,36 @@ shows why durability is required: a replica can learn term 3 from replication,
 restart while its Raft view still says term 1, and otherwise accept a term-1
 retry. The durable variant rejects the same probe.
 
+## Empty-store and copy-failure rules
+
+G1 models CreateIndex routing with `initialized = FALSE`, allocation ID 1 for
+each initial assignment, no in-sync replicas, and no local copies. An assigned
+node may create an empty local copy only while its applied view still names
+that initial allocation and is uninitialized. `ActivatePrimary` carries the
+primary allocation ID; an exact-match commit monotonically sets
+`initialized = TRUE`. No write can be acknowledged before that transition.
+Later out-of-sync assignments are populated by peer recovery rather than an
+empty engine.
+
+G2 models `FailShardCopy(node, allocation_id)` as a conditional Raft command:
+
+- an authoritative primary or in-sync replica with missing/malformed/mismatched
+  identity reports its target-observed allocation ID;
+- a failed recovery install may also report, while an ordinary newly assigned
+  out-of-sync recovery target does not;
+- an exact replica match removes it from `replicas` and `inSync`, clears its
+  allocation, and increments `unassigned`;
+- an exact primary match promotes an in-sync replica and increments the term,
+  or clears the primary allocation and leaves the shard red when no in-sync
+  copy survives;
+- a stale allocation ID commits as a rejected command with unchanged routing;
+  and
+- the allocator requires a live allocated primary, assigns a fresh ID, and
+  peer recovery installs and admits the replacement.
+
 ### Required Rust implementation contract
 
-The future Rust change must implement the model variant as one protocol:
+The Rust change must implement the model variant as one protocol:
 
 1. Routing metadata assigns every primary and replica copy an allocation ID.
    Removing a copy clears its ID; every later assignment, including reuse of
@@ -225,6 +263,25 @@ The future Rust change must implement the model variant as one protocol:
    unknown.
 10. Any rejection is returned through the existing synchronous replication
     failure path; it must not be converted into a successful item or request.
+11. CreateIndex routing starts with `initialized = false`. Initial assigned
+    copies may be created empty only for that initial allocation before first
+    activation; all initial replicas remain out of sync until recovery.
+12. `ActivatePrimary` carries and conditionally checks the primary allocation
+    ID. Its first successful application sets `initialized = true`
+    monotonically. A missing or mismatched primary copy cannot activate.
+13. After initialization, a missing, malformed, or mismatched authoritative
+    copy never creates an empty engine and never serves. A fresh out-of-sync
+    replica is populated only by verified peer-recovery install.
+14. An unopenable authoritative copy reports index name, index UUID, shard ID,
+    node ID, and observed allocation ID through a leader-forwarded
+    `FailShardCopy` command.
+15. `FailShardCopy` changes routing only on an exact allocation match. Replica
+    failure removes it from `replicas` and `inSync`; primary failure promotes
+    an in-sync copy with a term bump, or leaves the shard red when none exists.
+    Every removed allocation increments `unassigned`.
+16. Allocation after copy failure uses a fresh ID and requires a surviving
+    allocated primary. The replacement remains out of sync until recovery
+    installs matching durable identity and admission commits.
 
 The model updates fence and accepted operation atomically. Rust may persist the
 fence immediately before the WAL mutation; a crash in between is conservative
@@ -236,6 +293,10 @@ without its fence.
 Safety invariants:
 
 - `RoutingWellFormed`
+- `InitializationMonotonic`
+- `InitializationBeforeAcknowledgement`
+- `StaleFailShardCopyRejected`
+- `RedShardRejectsWrites`
 - `NoAckedLoss`
 - `PromotionComplete`
 - `AdmissionComplete`
@@ -259,6 +320,10 @@ Liveness properties:
 - `BarrierReleased`
 - `RecoveryConverges`
 - `PendingResolves`
+- `PreActivationDiskLossHarmless`
+- `WritesResumeAfterReplicaDiskLoss`
+- `ReplacementEventuallyInSync`
+- `StaleFailureEventuallyRejected`
 
 `MC_L1.tla` assumes no faults and weak fairness for each recovery phase, Raft
 commit, target view delivery, source admission observation, and target pending
@@ -266,6 +331,14 @@ observation. `MC_L2.tla` additionally makes one target crash, its restart, and
 permanent cessation of faults weakly fair. The transient crash completes
 before failure detection removes the assignment. Neither liveness
 configuration uses symmetry reduction or a state constraint.
+
+`MC_G1_EmptyStore.tla` weakly fairly schedules initial copy creation, one
+pre-activation crash/disk loss/restart, allocation-matched first activation,
+and the first write. `MC_G2_Liveness.tla` weakly fairly schedules one in-sync
+replica crash/disk loss/restart, permanent fault cessation, exact failure
+report, fresh allocation, a delayed stale report and its rejection, a resumed
+write, every recovery phase, Raft commits, and target view delivery. Neither
+uses symmetry reduction or a state constraint.
 
 ## Configurations and results
 
@@ -275,22 +348,27 @@ performance benchmarks.
 
 | Runner name | Nodes/docs/writes | Fault and protocol bounds | Allocation IDs | Expected/result | Generated / distinct | Depth | Time |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: |
-| `c1-fast` | 2 / 1 / 1 | 1 crash; no recovery; term 3; log 5; view lag 2 | Off | Pass | 3,340 / 999 | 15 | 2s |
-| `c1-recovery` | 2 / 1 / 1 | 1 recovery; no crash; term 3; log 3; view lag 2 | Off | Pass | 25,149 / 6,734 | 29 | 3s |
-| `c1-aba` | 3 / 1 / 0 | 1 recovery and crash; term 2; log 5; view lag 5 | Off | Expected `NoPartialServe` violation | 496,458 / 153,029 | 28 | 12s |
-| `c1-aba-fixed` | 3 / 1 / 0 | 1 recovery and crash; term 2; log 6; view lag 5 | Allocation IDs + durable fencing | Pass | 2,619,829 / 713,284 | 45 | 47s |
-| `c2` | 3 / 1 / 2 | 1 metadata partition; term 3; log 2; canonical primary/leader | Off | Expected `C2RejectsStaleMessage` violation | 18 / 16 | 14 | 1s |
+| `c1-fast` | 2 / 1 / 1 | 1 crash; no recovery; term 3; log 5; view lag 2 | Off | Pass | 3,406 / 999 | 15 | 2s |
+| `c1-recovery` | 2 / 1 / 1 | 1 recovery; no crash; term 3; log 3; view lag 2 | Off | Pass | 25,477 / 6,734 | 29 | 2s |
+| `c1-aba` | 3 / 1 / 0 | 1 recovery and crash; term 2; log 5; view lag 5 | Off | Expected `NoPartialServe` violation | 598,150 / 177,762 | 28 | 15s |
+| `c1-aba-fixed` | 3 / 1 / 0 | 1 recovery and crash; term 2; log 6; view lag 5 | Allocation IDs + durable fencing | Pass | 2,663,187 / 721,246 | 45 | 53s |
+| `c2` | 3 / 1 / 2 | 1 metadata partition; term 3; log 2; canonical primary/leader | Off | Expected `C2RejectsStaleMessage` violation | 19 / 16 | 14 | 1s |
 | `c2-allocation-ids` | Same as C2 | Same as C2 | Allocation IDs only | Expected `C2RejectsStaleMessage` violation | 16 / 16 | 14 | 1s |
 | `c2-fixed` | Same as C2 | Same as C2 | Allocation IDs + durable fencing | Pass | 28 / 20 | 16 | 1s |
-| `fence-volatile` | 3 / 1 / 2 | 1 partition and replica crash/restart; term 3 | Allocation IDs + volatile fencing | Expected `FenceRejectsStaleProbe` violation | 17 / 17 | 15 | 1s |
+| `fence-volatile` | 3 / 1 / 2 | 1 partition and replica crash/restart; term 3 | Allocation IDs + volatile fencing | Expected `FenceRejectsStaleProbe` violation | 17 / 17 | 15 | 2s |
 | `fence-durable` | Same as volatile-fence check | Same schedule | Allocation IDs + durable fencing | Pass | 21 / 19 | 16 | 1s |
 | `c3` | 3 / 1 / 1 | 1 crash and disk loss; no metadata update | Off | Expected `NoAckedLoss` violation | 36 / 25 | 12 | 1s |
 | `c3-allocation-ids` | Same as C3 | Missing local assignment identity fails closed | On | Pass | 28 / 24 | 11 | 1s |
 | `c4` | 3 / 1 / 1 | 1 primary crash; async WAL durability | Off | Expected `NoAckedLoss` violation | 32 / 21 | 9 | 1s |
+| `g1-empty-store` | 2 / 1 / 1 | CreateIndex; pre-activation crash/disk loss/restart; first activation | Both fixes + G1 | Safety and liveness pass | 14 / 14 | 13 | 1s |
+| `g2-replica` | 3 / 1 / 1 | In-sync replica disk loss; exact failure report; fresh allocation/recovery | Both fixes + G2 | Pass | 108,744 / 33,877 | 46 | 4s |
+| `g2-primary` | 3 / 1 / 1 | Primary disk loss; in-sync promotion; fresh allocation/recovery | Both fixes + G2 | Pass | 49,506 / 17,863 | 46 | 3s |
+| `g2-primary-red` | 2 / 1 / 1 | Primary disk loss with no in-sync survivor | Both fixes + G2 | Red-state safety passes | 22 / 20 | 13 | 1s |
+| `g2-liveness` | 2 / 1 / 1 | Replica disk loss; faults stop; stale report; write and recovery fairness | Both fixes + G2 | Safety and all liveness properties pass | 433 / 184 | 32 | 3s |
 | `l1` | 2 / 1 / 0 | 1 recovery; no faults; weak fairness; no constraint/symmetry | Both fixes | Safety and all liveness properties pass | 20 / 17 | 15 | 1s |
 | `l2` | 2 / 1 / 0 | Up to 2 recovery attempts; exactly 1 transient target crash/restart; weak fairness; no constraint/symmetry | Both fixes | Safety and all liveness properties pass | 167 / 98 | 21 | 2s |
-| `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Both fixes | Pass | 78,085,145 / 11,366,697 | 41 | 12m18s |
-| `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Both fixes | Pass | 97,142,840 / 12,887,671 | 42 | 14m47s |
+| `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Both fixes + G1/G2 rules | Pass | 78,164,957 / 11,366,697 | 41 | 14m28s |
+| `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Both fixes + G1/G2 rules | Pass | 97,142,840 / 12,887,671 | 42 | 17m11s |
 
 The two long fixed-design configurations use the complete `Next` relation, not
 a scenario wrapper. They constrain writes to `Put` and disable optional
@@ -301,7 +379,7 @@ crash/restart, or live-suspicion interleaving within the numeric bounds.
 The larger `fixed-simulation` profile uses 3 nodes, 2 documents, 4 writes,
 2 crashes, 1 partition, 2 recoveries, term 4, 3 in-flight messages, view lag 4,
 and 8 Raft entries. With seed `20260926`, depth 80, and 10,000 requested traces,
-TLC checked 1,574,980 states in 1m44s without finding a violation. Simulation
+TLC checked 1,721,246 states in 2m13s without finding a violation. Simulation
 is sampling, not exhaustive model checking.
 
 The C2 configurations deliberately use canonical role constants rather than

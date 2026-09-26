@@ -1,15 +1,15 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 123 and seed -7033831247918563623 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 11939] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 98 and seed 4057236316214000521 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 37267] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C2.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.ElK8KP/c2/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.ElK8KP/c2/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.ElK8KP/c2/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.ElK8KP/c2/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.YOjWCK/c2/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.YOjWCK/c2/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.YOjWCK/c2/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.YOjWCK/c2/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -20,9 +20,9 @@ Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C2
-Starting... (2026-09-26 18:37:20)
+Starting... (2026-09-26 19:37:14)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-26 18:37:20.
+Finished computing initial states: 1 distinct state generated at 2026-09-26 19:37:15.
 Error: Invariant C2RejectsStaleMessage is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -48,10 +48,11 @@ State 1: <Initial predicate>
 /\ truncBelow = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ routing = [ primary |-> n1,
   term |-> 1,
+  initialized |-> TRUE,
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
   inSync |-> {n2, n3},
   replicas |-> {n2, n3},
   unassigned |-> 0,
-  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
   members |-> {n1, n2, n3} ]
 /\ faultsStopped = FALSE
 /\ replicaFence = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -102,26 +103,29 @@ State 1: <Initial predicate>
 /\ views = ( n1 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] @@
   n2 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] @@
   n3 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] )
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ diskLost = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
@@ -134,6 +138,7 @@ State 2: <C2Next line 53, col 8 to line 54, col 35 of module MC_C2>
 
 State 3: <C2Next line 55, col 8 to line 56, col 35 of module MC_C2>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
+    expectedAllocation |-> 0,
     target |-> n1,
     actor |-> n2,
     newReplicas |-> {n3},
@@ -141,8 +146,7 @@ State 3: <C2Next line 55, col 8 to line 56, col 35 of module MC_C2>
     newUnassigned |-> 1,
     newAllocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
     expectedPrimary |-> "NO_NODE",
-    expectedTerm |-> 0,
-    expectedAllocation |-> 0 ] }
+    expectedTerm |-> 0 ] }
 /\ lifecyclePhase = (n1 :> "RoutingProposed" @@ n2 :> "Idle" @@ n3 :> "Idle")
 
 State 4: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
@@ -150,13 +154,15 @@ State 4: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
 /\ applied = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 0)
 /\ routing = [ primary |-> n2,
   term |-> 2,
+  initialized |-> TRUE,
+  allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
   inSync |-> {n3},
   replicas |-> {n3},
   unassigned |-> 1,
-  allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
   members |-> {n1, n2, n3} ]
 /\ raftLog = << [ command |->
          [ kind |-> "UpdateRouting",
+           expectedAllocation |-> 0,
            target |-> n1,
            actor |-> n2,
            newReplicas |-> {n3},
@@ -164,44 +170,48 @@ State 4: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
            newUnassigned |-> 1,
            newAllocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 0 ],
      state |->
          [ primary |-> n2,
            term |-> 2,
+           initialized |-> TRUE,
+           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            inSync |-> {n3},
            replicas |-> {n3},
            unassigned |-> 1,
-           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            members |-> {n1, n2, n3} ],
      accepted |-> TRUE ] >>
 /\ views = ( n1 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] @@
   n2 :>
       [ primary |-> n2,
         term |-> 2,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n3},
         replicas |-> {n3},
         unassigned |-> 1,
-        allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] @@
   n3 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] )
 
 State 5: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ pendingRaft = { [ kind |-> "ActivatePrimary",
+    expectedAllocation |-> 1,
     target |-> n2,
     actor |-> n2,
     newReplicas |-> {},
@@ -209,8 +219,7 @@ State 5: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
     newUnassigned |-> 0,
     newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
     expectedPrimary |-> n2,
-    expectedTerm |-> 2,
-    expectedAllocation |-> 0 ] }
+    expectedTerm |-> 2 ] }
 /\ activationPending = (n1 :> 0 @@ n2 :> 2 @@ n3 :> 0)
 
 State 6: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
@@ -218,13 +227,15 @@ State 6: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
 /\ applied = (n1 :> 0 @@ n2 :> 2 @@ n3 :> 0)
 /\ routing = [ primary |-> n2,
   term |-> 3,
+  initialized |-> TRUE,
+  allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
   inSync |-> {n3},
   replicas |-> {n3},
   unassigned |-> 1,
-  allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
   members |-> {n1, n2, n3} ]
 /\ raftLog = << [ command |->
          [ kind |-> "UpdateRouting",
+           expectedAllocation |-> 0,
            target |-> n1,
            actor |-> n2,
            newReplicas |-> {n3},
@@ -232,19 +243,20 @@ State 6: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
            newUnassigned |-> 1,
            newAllocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 0 ],
      state |->
          [ primary |-> n2,
            term |-> 2,
+           initialized |-> TRUE,
+           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            inSync |-> {n3},
            replicas |-> {n3},
            unassigned |-> 1,
-           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            members |-> {n1, n2, n3} ],
      accepted |-> TRUE ],
    [ command |->
          [ kind |-> "ActivatePrimary",
+           expectedAllocation |-> 1,
            target |-> n2,
            actor |-> n2,
            newReplicas |-> {},
@@ -252,40 +264,43 @@ State 6: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
            newUnassigned |-> 0,
            newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> n2,
-           expectedTerm |-> 2,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 2 ],
      state |->
          [ primary |-> n2,
            term |-> 3,
+           initialized |-> TRUE,
+           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            inSync |-> {n3},
            replicas |-> {n3},
            unassigned |-> 1,
-           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            members |-> {n1, n2, n3} ],
      accepted |-> TRUE ] >>
 /\ views = ( n1 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] @@
   n2 :>
       [ primary |-> n2,
         term |-> 3,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n3},
         replicas |-> {n3},
         unassigned |-> 1,
-        allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] @@
   n3 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] )
 
 State 7: <C2Next line 50, col 8 to line 52, col 70 of module MC_C2>
@@ -372,10 +387,11 @@ State 14: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ truncBelow = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ routing = [ primary |-> n2,
   term |-> 3,
+  initialized |-> TRUE,
+  allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
   inSync |-> {n3},
   replicas |-> {n3},
   unassigned |-> 1,
-  allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
   members |-> {n1, n2, n3} ]
 /\ faultsStopped = FALSE
 /\ replicaFence = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
@@ -421,6 +437,7 @@ State 14: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ sharedHolders = (n1 :> {2} @@ n2 :> {} @@ n3 :> {})
 /\ raftLog = << [ command |->
          [ kind |-> "UpdateRouting",
+           expectedAllocation |-> 0,
            target |-> n1,
            actor |-> n2,
            newReplicas |-> {n3},
@@ -428,19 +445,20 @@ State 14: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
            newUnassigned |-> 1,
            newAllocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 0 ],
      state |->
          [ primary |-> n2,
            term |-> 2,
+           initialized |-> TRUE,
+           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            inSync |-> {n3},
            replicas |-> {n3},
            unassigned |-> 1,
-           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            members |-> {n1, n2, n3} ],
      accepted |-> TRUE ],
    [ command |->
          [ kind |-> "ActivatePrimary",
+           expectedAllocation |-> 1,
            target |-> n2,
            actor |-> n2,
            newReplicas |-> {},
@@ -448,15 +466,15 @@ State 14: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
            newUnassigned |-> 0,
            newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> n2,
-           expectedTerm |-> 2,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 2 ],
      state |->
          [ primary |-> n2,
            term |-> 3,
+           initialized |-> TRUE,
+           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            inSync |-> {n3},
            replicas |-> {n3},
            unassigned |-> 1,
-           allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            members |-> {n1, n2, n3} ],
      accepted |-> TRUE ] >>
 /\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "Active")
@@ -484,33 +502,36 @@ State 14: <C2Next line 46, col 8 to line 49, col 61 of module MC_C2>
 /\ views = ( n1 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] @@
   n2 :>
       [ primary |-> n2,
         term |-> 3,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n3},
         replicas |-> {n3},
         unassigned |-> 1,
-        allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] @@
   n3 :>
       [ primary |-> n1,
         term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
         unassigned |-> 0,
-        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         members |-> {n1, n2, n3} ] )
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ diskLost = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
 /\ lifecyclePhase = (n1 :> "RoutingProposed" @@ n2 :> "Idle" @@ n3 :> "Idle")
 /\ writeWait = <<{}, {n2, n3}>>
 
-18 states generated, 16 distinct states found, 0 states left on queue.
+19 states generated, 16 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 14.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 2 and the 95th percentile is 2).
-Finished in 01s at (2026-09-26 18:37:20)
+Finished in 01s at (2026-09-26 19:37:15)

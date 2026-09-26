@@ -34,6 +34,7 @@ cargo test --test restart_regression            # Real restart/rejoin regression
 cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
 ./scripts/tla/check.sh c1-aba-fixed c2-fixed l2  # Selected fixed-design checks
+./scripts/tla/check.sh g1-empty-store g2-replica g2-primary g2-liveness
 ./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
 ./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
 ```
@@ -48,9 +49,10 @@ cargo test -- test_name                         # Single test by name
   `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, or `c4`
   stops violating its named invariant before the corresponding Rust limitation
   is fixed.
-- `c2-fixed`, `fence-durable`, `fixed-crash`, and `fixed-partition` are
-  expected-pass configurations for the model-only allocation-ID plus durable
-  replica-fencing design.
+- `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
+  `g2-primary-red`, `g2-liveness`, `fixed-crash`, and `fixed-partition` are
+  expected-pass configurations for the allocation-ID, durable-fencing,
+  empty-store, and copy-failure design.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
@@ -62,6 +64,9 @@ cargo test -- test_name                         # Single test by name
   fence or applied local term. Do not compare every in-flight apply against an
   unseen globally committed term; the retained retired-property trace explains
   why that assertion is too strong.
+- G1/G2 checks must cover CreateIndex before first activation, disk loss of
+  primary and in-sync replica copies, exact-allocation `FailShardCopy`,
+  no-survivor red state, stale-report rejection, and fair replacement recovery.
 
 ## Unit Test Conventions
 - Tests live in `#[cfg(test)] mod tests` at the bottom of each source file

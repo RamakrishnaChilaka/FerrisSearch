@@ -68,6 +68,9 @@ benchmark artifacts.
   functions. Distinguish implementation-faithful failures from model errors.
 - Retain traces that invalidate an over-strong property, but label the property
   retired and do not cite the failed run as evidence against the implementation.
+- For empty-store/copy-failure evidence, state whether the run begins before or
+  after first activation, whether a surviving in-sync copy exists, and the
+  fairness assumed for failure reporting, allocation, and recovery.
 - Label model-only fixes, including allocation-ID fencing, as proposed until
   the Rust domain, persistence, transport, and recovery paths implement them.
 - Do not infer timing probability from an untimed TLA+ trace. State only that

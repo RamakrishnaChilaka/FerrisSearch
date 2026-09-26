@@ -132,7 +132,8 @@ local-only unless their bounds are reduced and re-recorded. Each invocation
 needs isolated Java and TLC temporary directories; parallel TLC processes
 otherwise race while extracting standard modules. Expected-violation
 configurations are successful only when they reproduce the documented
-invariant failure.
+invariant failure. Keep the bounded G1 empty-store and G2 copy-failure/liveness
+checks in the fast matrix.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with

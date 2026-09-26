@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 80 and seed 621898292061911480 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 12122] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 45 and seed -2396982098921908365 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 37478] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_FenceDurability.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C2.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
@@ -7,10 +7,10 @@ Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.ElK8KP/fence-volatile/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.ElK8KP/fence-volatile/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.ElK8KP/fence-volatile/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.ElK8KP/fence-volatile/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.YOjWCK/fence-volatile/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.YOjWCK/fence-volatile/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.YOjWCK/fence-volatile/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.YOjWCK/fence-volatile/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -22,9 +22,9 @@ Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C2
 Semantic processing of module MC_FenceDurability
-Starting... (2026-09-26 18:37:26)
+Starting... (2026-09-26 19:37:21)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-26 18:37:27.
+Finished computing initial states: 1 distinct state generated at 2026-09-26 19:37:21.
 Error: Invariant FenceRejectsStaleProbe is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -52,6 +52,7 @@ State 1: <Initial predicate>
   primary |-> n1,
   term |-> 1,
   allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+  initialized |-> TRUE,
   replicas |-> {n2, n3},
   unassigned |-> 0,
   members |-> {n1, n2, n3} ]
@@ -106,6 +107,7 @@ State 1: <Initial predicate>
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] @@
@@ -114,6 +116,7 @@ State 1: <Initial predicate>
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] @@
@@ -122,6 +125,7 @@ State 1: <Initial predicate>
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] )
@@ -136,6 +140,7 @@ State 2: <FencePartition line 98, col 5 to line 99, col 32 of module MC_FenceDur
 
 State 3: <FenceSuspect line 102, col 5 to line 103, col 32 of module MC_FenceDurability>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
+    expectedAllocation |-> 0,
     target |-> n1,
     actor |-> n2,
     newReplicas |-> {n3},
@@ -143,8 +148,7 @@ State 3: <FenceSuspect line 102, col 5 to line 103, col 32 of module MC_FenceDur
     newUnassigned |-> 1,
     newAllocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
     expectedPrimary |-> "NO_NODE",
-    expectedTerm |-> 0,
-    expectedAllocation |-> 0 ] }
+    expectedTerm |-> 0 ] }
 /\ lifecyclePhase = (n1 :> "RoutingProposed" @@ n2 :> "Idle" @@ n3 :> "Idle")
 
 State 4: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_FenceDurability>
@@ -154,12 +158,14 @@ State 4: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
   primary |-> n2,
   term |-> 2,
   allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+  initialized |-> TRUE,
   replicas |-> {n3},
   unassigned |-> 1,
   members |-> {n1, n2, n3} ]
 /\ replicaFence = (n1 :> 1 @@ n2 :> 2 @@ n3 :> 1)
 /\ raftLog = << [ command |->
          [ kind |-> "UpdateRouting",
+           expectedAllocation |-> 0,
            target |-> n1,
            actor |-> n2,
            newReplicas |-> {n3},
@@ -167,13 +173,13 @@ State 4: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
            newUnassigned |-> 1,
            newAllocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 0 ],
      state |->
          [ inSync |-> {n3},
            primary |-> n2,
            term |-> 2,
            allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+           initialized |-> TRUE,
            replicas |-> {n3},
            unassigned |-> 1,
            members |-> {n1, n2, n3} ],
@@ -183,6 +189,7 @@ State 4: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] @@
@@ -191,6 +198,7 @@ State 4: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
         primary |-> n2,
         term |-> 2,
         allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n3},
         unassigned |-> 1,
         members |-> {n1, n2, n3} ] @@
@@ -199,12 +207,14 @@ State 4: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] )
 
 State 5: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_FenceDurability>
 /\ pendingRaft = { [ kind |-> "ActivatePrimary",
+    expectedAllocation |-> 1,
     target |-> n2,
     actor |-> n2,
     newReplicas |-> {},
@@ -212,8 +222,7 @@ State 5: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_F
     newUnassigned |-> 0,
     newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
     expectedPrimary |-> n2,
-    expectedTerm |-> 2,
-    expectedAllocation |-> 0 ] }
+    expectedTerm |-> 2 ] }
 /\ activationPending = (n1 :> 0 @@ n2 :> 2 @@ n3 :> 0)
 
 State 6: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_FenceDurability>
@@ -223,12 +232,14 @@ State 6: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
   primary |-> n2,
   term |-> 3,
   allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+  initialized |-> TRUE,
   replicas |-> {n3},
   unassigned |-> 1,
   members |-> {n1, n2, n3} ]
 /\ replicaFence = (n1 :> 1 @@ n2 :> 3 @@ n3 :> 1)
 /\ raftLog = << [ command |->
          [ kind |-> "UpdateRouting",
+           expectedAllocation |-> 0,
            target |-> n1,
            actor |-> n2,
            newReplicas |-> {n3},
@@ -236,19 +247,20 @@ State 6: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
            newUnassigned |-> 1,
            newAllocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 0 ],
      state |->
          [ inSync |-> {n3},
            primary |-> n2,
            term |-> 2,
            allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+           initialized |-> TRUE,
            replicas |-> {n3},
            unassigned |-> 1,
            members |-> {n1, n2, n3} ],
      accepted |-> TRUE ],
    [ command |->
          [ kind |-> "ActivatePrimary",
+           expectedAllocation |-> 1,
            target |-> n2,
            actor |-> n2,
            newReplicas |-> {},
@@ -256,13 +268,13 @@ State 6: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
            newUnassigned |-> 0,
            newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> n2,
-           expectedTerm |-> 2,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 2 ],
      state |->
          [ inSync |-> {n3},
            primary |-> n2,
            term |-> 3,
            allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+           initialized |-> TRUE,
            replicas |-> {n3},
            unassigned |-> 1,
            members |-> {n1, n2, n3} ],
@@ -272,6 +284,7 @@ State 6: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] @@
@@ -280,6 +293,7 @@ State 6: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
         primary |-> n2,
         term |-> 3,
         allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n3},
         unassigned |-> 1,
         members |-> {n1, n2, n3} ] @@
@@ -288,6 +302,7 @@ State 6: <FenceDurabilityNext line 110, col 8 to line 112, col 70 of module MC_F
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] )
@@ -385,6 +400,7 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
   primary |-> n2,
   term |-> 3,
   allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+  initialized |-> TRUE,
   replicas |-> {n3},
   unassigned |-> 1,
   members |-> {n1, n2, n3} ]
@@ -432,6 +448,7 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
 /\ sharedHolders = (n1 :> {2} @@ n2 :> {} @@ n3 :> {})
 /\ raftLog = << [ command |->
          [ kind |-> "UpdateRouting",
+           expectedAllocation |-> 0,
            target |-> n1,
            actor |-> n2,
            newReplicas |-> {n3},
@@ -439,19 +456,20 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
            newUnassigned |-> 1,
            newAllocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
            expectedPrimary |-> "NO_NODE",
-           expectedTerm |-> 0,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 0 ],
      state |->
          [ inSync |-> {n3},
            primary |-> n2,
            term |-> 2,
            allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+           initialized |-> TRUE,
            replicas |-> {n3},
            unassigned |-> 1,
            members |-> {n1, n2, n3} ],
      accepted |-> TRUE ],
    [ command |->
          [ kind |-> "ActivatePrimary",
+           expectedAllocation |-> 1,
            target |-> n2,
            actor |-> n2,
            newReplicas |-> {},
@@ -459,13 +477,13 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
            newUnassigned |-> 0,
            newAllocations |-> (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0),
            expectedPrimary |-> n2,
-           expectedTerm |-> 2,
-           expectedAllocation |-> 0 ],
+           expectedTerm |-> 2 ],
      state |->
          [ inSync |-> {n3},
            primary |-> n2,
            term |-> 3,
            allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+           initialized |-> TRUE,
            replicas |-> {n3},
            unassigned |-> 1,
            members |-> {n1, n2, n3} ],
@@ -487,6 +505,7 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] @@
@@ -495,6 +514,7 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
         primary |-> n2,
         term |-> 3,
         allocations |-> (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n3},
         unassigned |-> 1,
         members |-> {n1, n2, n3} ] @@
@@ -503,6 +523,7 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
         primary |-> n1,
         term |-> 1,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        initialized |-> TRUE,
         replicas |-> {n2, n3},
         unassigned |-> 0,
         members |-> {n1, n2, n3} ] )
@@ -514,4 +535,4 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
 17 states generated, 17 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 15.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 2 and the 95th percentile is 2).
-Finished in 01s at (2026-09-26 18:37:27)
+Finished in 01s at (2026-09-26 19:37:21)

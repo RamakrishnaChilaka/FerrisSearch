@@ -262,15 +262,20 @@ test, an unbounded proof, an Apalache inductive check, or a TLAPS proof.
 | Acceptance area | Bounded result | Interpretation |
 | --- | --- | --- |
 | M04, M07, pending-target safety | Three-voter crash/rejoin model with one recovery finds `NoPartialServe`: after ordered removal, committed `AddNode`, and same-name reallocation, an old `MarkReplicaInSync` can admit the new assignment after the target has restored its destructive marker. | Confirms the allocation ABA as an implementation gap under the modeled bounds. Retained trace: [`C1-allocation-aba-no-partial-serve.md`](../specs/tla/traces/C1-allocation-aba-no-partial-serve.md). |
-| Proposed allocation identity | The variant with a target-supplied allocation ID, exact source start validation, session/pending binding, state-machine comparison, and durable local copy identity passes the bounded crash/rejoin configuration. | Model evidence for the proposed protocol only. FerrisSearch does not yet implement allocation IDs. The handshake must be complete; binding only the admission command is insufficient. |
+| Proposed allocation identity | The variant with a target-supplied allocation ID, exact source start validation, session/pending binding, state-machine comparison, and durable local copy identity passes the bounded crash/rejoin configuration. | Model evidence for the protocol only. The Rust implementation must match the complete handshake before merge; binding only the admission command is insufficient. |
 | F02 | Node-name-only and allocation-ID-only variants allow a lower-term replication request after metadata partition and promotion. The combined allocation-ID plus replica-fencing variant rejects it and passes the same bounded C2 schedule. | Allocation identity does not replace primary-term fencing on `ReplicateDoc`/bulk apply. Retained trace: [`C2-stale-primary-unique-seq.md`](../specs/tla/traces/C2-stale-primary-unique-seq.md). |
 | F03 | A replica learns term 3 from a valid replication request while its Raft view remains at term 1, crashes, restarts, and receives a term-1 retry. A volatile fence permits the request; a durable fence rejects it. | The local replica fence must be persisted before acknowledging a higher-term apply and restored before serving replication. Retained trace: [`Fence-volatile-restart-stale-probe.md`](../specs/tla/traces/Fence-volatile-restart-stale-probe.md). |
 | I05 | Same-name restart with an empty disk violates `NoAckedLoss` without durable local allocation identity. The allocation-ID variant fails the empty copy closed and passes the bounded check. | Confirms the node-name identity gap within this fault model; it does not prove filesystem or process behavior beyond the abstraction. |
+| G1 initial empty store | Starting from CreateIndex with `initialized = false`, one pre-activation primary crash/disk loss/restart, allocation-matched first activation, and the first write passes 14 distinct states to depth 13 under weak fairness. | Initial allocation ID 1 may be recreated empty before first activation because no write can yet be acknowledged. Initialization is monotonic and later empty authoritative recreation is forbidden. |
+| G2 replica copy failure | The three-voter replica-loss model passes 33,877 distinct states to depth 46 after an acknowledged write, disk loss, exact-allocation failure report, fresh allocation, and possible peer recovery. | A disk-lost in-sync replica cannot reopen empty under its old allocation. Exact failure removes it from `replicas`/`inSync`, increments `unassigned`, and permits fresh recovery allocation. |
+| G2 primary copy failure | The three-voter primary-loss model passes 17,863 distinct states to depth 46; the surviving in-sync copy is the only eligible promoted authority and retains all acknowledged writes. The no-survivor variant passes 20 distinct states to depth 13 with the primary allocation cleared. | Exact primary failure promotes with a term bump, or leaves the shard red when no authoritative copy survives. |
+| G2 stale failure report | The fair replica-loss model commits a delayed `FailShardCopy` for allocation 1 after allocation 3 exists; `StaleFailShardCopyRejected` requires the command to be rejected. | Failure reports require exact allocation identity and cannot remove a replacement assignment. |
+| G2 recovery liveness | With one weakly fair replica crash/disk loss/restart and permanent fault cessation, 184 distinct states to depth 32 satisfy resumed writes, stale-report rejection, and eventual admission of the fresh replacement. | Liveness depends on weak fairness for reporting, Raft commit/view delivery, allocation, the resumed write, and every recovery phase. No symmetry or state constraint is used. |
 | D05 | Asynchronous durability acknowledges an operation that the committed primary can lose on crash. | Documents the weaker mode; request-durability results must not be inferred from this configuration. |
-| Fixed design, crash | The unrestricted three-voter model with both fixes, two writes, one crash, one recovery, and message loss/delay passes 11,366,697 distinct states to depth 41. | Bounded safety evidence only; optional recovery setup/cancellation/expiry injection is disabled for this state-space run. |
-| Fixed design, partition | The unrestricted three-voter model with both fixes, two writes, one live-node partition, one recovery, and message loss/delay passes 12,887,671 distinct states to depth 42. | Covers erroneous live-node suspicion under the bounded partition model. |
+| Fixed design, crash | The unrestricted three-voter model with allocation identity, durable fencing, and the G1/G2 rules, two writes, one crash, one recovery, and message loss/delay passes 11,366,697 distinct states to depth 41. | Bounded safety evidence only; optional recovery setup/cancellation/expiry injection is disabled for this state-space run. |
+| Fixed design, partition | The unrestricted three-voter model with the same rules, two writes, one live-node partition, one recovery, and message loss/delay passes 12,887,671 distinct states to depth 42. | Covers erroneous live-node suspicion under the bounded partition model. |
 | Retired global-term property | `NoStaleReplicaApply` stopped the fixed partition run after 1,511 distinct states because it classified a pre-promotion in-flight operation against unseen global state. | This was a model-property error. It was replaced by `NoApplyBelowObservedFence` and `ActivePrimaryRejectsOldTerm`; the trace remains at [`Fixed-partition-prepromotion-inflight-apply.md`](../specs/tla/traces/Fixed-partition-prepromotion-inflight-apply.md). |
-| Fixed-design simulation | Seed `20260926`, depth 80, 10,000 requested traces, 1,574,980 states checked with larger write/crash/recovery/log bounds and no violation. | Random simulation supplements but does not replace exhaustive checks. |
+| Fixed-design simulation | Seed `20260926`, depth 80, 10,000 requested traces, 1,721,246 states checked with larger write/crash/recovery/log bounds and no violation. | Random simulation supplements but does not replace exhaustive checks. |
 | M04 liveness | Under fault-free weak fairness, and separately with one weakly fair target crash/restart followed by permanent fault cessation, the barrier releases, the assigned target becomes in sync, and persistent pending state resolves. | Liveness results apply only to the two-node, zero-write bounds and the stated scheduling assumptions. |
 
 ### Modeled Requirements For The Rust Fencing Work
@@ -297,6 +302,23 @@ Rust behavior:
 8. Target observation admits the same allocation when in sync, or the same
    copy after promotion; a missing or different allocation is definitive
    rejection. Other lagging observations remain unknown.
+9. CreateIndex routing records `initialized = false`; the first successful
+   allocation-matched `ActivatePrimary` sets it true monotonically. Initial
+   replicas remain out of sync until recovery.
+10. Empty local creation is permitted only for an initial CreateIndex
+    allocation before first activation. Missing or mismatched authoritative
+    copies after initialization fail closed; fresh out-of-sync replicas are
+    populated only through recovery.
+11. An unopenable authoritative copy reports index name, UUID, shard ID, node,
+    and its observed allocation ID through a leader-forwarded
+    `FailShardCopy`.
+12. `FailShardCopy` is applied only on an exact allocation match. Replica
+    failure removes it from replica/in-sync membership and increments
+    unassigned; primary failure promotes an in-sync copy with a term bump or
+    leaves the shard red with a cleared primary allocation.
+13. The allocator requires a surviving allocated primary, assigns a fresh
+    allocation ID, and leaves the replacement out of sync until peer recovery
+    installs matching durable identity and admission commits.
 
 ## M. Membership And Acknowledgement Sets
 
