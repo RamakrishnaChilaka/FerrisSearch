@@ -62,7 +62,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | `RaftLog.tla` | Ordered conditional command log, explicit voters and leader, quorum-aware commits, leader-applied writes, lagging follower views. |
 | `ShardReplication.tla` | Primary activation, validated writes, sequence allocation, synchronous in-sync replication, wire identity, optional allocation identities, and optional durable primary-term fencing. |
 | `PeerRecovery.tla` | Asynchronous source setup, snapshot boundary and pin, atomic verified install, suffix catch-up, exclusive finalize barrier, settlement, persistent pending observation, abort, and expiry. |
-| `Faults.tla` | Crash/restart, elections, metadata partitions, message loss, ordered dead-node lifecycle, rejoin/allocation, disk loss, flush/truncation, and asynchronous durability loss. |
+| `Faults.tla` | Crash/restart, elections, metadata partitions, message loss, ordered dead-node lifecycle, rejoin/allocation, disk loss, persistent storage-fault retry/reset/repair, flush/truncation, and asynchronous durability loss. |
 | `Invariants.tla` | Safety and liveness properties. |
 | `MC_C2.tla` | Canonical three-voter stale-primary scenario with equivalent role permutations removed. |
 | `MC_C3.tla` | Canonical same-node disk-loss scenario. |
@@ -77,6 +77,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_PendingRestart.tla` | Durable pending-marker restoration and historical restarted-target wipe regression. |
 | `MC_StorageFailure.tla` | Corruption and persistent open/fence/marker-I/O escalation, promote-only copy failure, and post-failure write liveness. |
 | `MC_ApplyStorageFailure.tla` | Persistent WAL/fsync/engine apply failure on an open copy, bounded escalation, post-removal/promotion write liveness, and the historical no-escalation lasso. |
+| `MC_S1_Combined.tla` | Persistent open/apply failure combined with crash/restart, leader change, delayed conditional reports, repair, fresh allocation, peer recovery, transport timeout, and resumed writes. |
 | `MC_TwoShardIsolation.tla` | Minimal index-level check that one red shard does not block failover and allocation on a sibling shard. |
 | `MC_FenceDurability.tla` | Bounded check that a learned replica fence must survive restart. |
 | `MC_G1_EmptyStore.tla` | CreateIndex, permitted initial empty-copy creation, pre-activation disk loss, first activation, and first acknowledged write. |
@@ -131,11 +132,15 @@ liveness configurations use neither symmetry nor a state constraint.
   Trace documentation explains when a counterexample also fits implemented
   timing bounds.
 - Persistent local-storage retry counts and elapsed time are abstracted as a
-  separate escalation action. Open/fence/marker failures use
-  `StorageRetrying`/`StorageFailed` and make the copy unavailable. Apply
-  failures use `ApplyFailing`/`ApplyRetrying`/`ApplyFailed`; the copy remains
-  open and readable, but every modeled WAL/fsync/engine mutation fails. Weak
-  fairness on escalation represents exhaustion of the finite retry budget.
+  separate escalation action. Definitive corruption uses `StorageCorrupt`.
+  Persistent open/fence/marker failures use
+  `StorageFailing`/`StorageRetrying`/`StorageFailed` and make the copy
+  unavailable. Apply failures use
+  `ApplyFailing`/`ApplyRetrying`/`ApplyFailed`; the copy remains open and
+  readable, but every modeled WAL/fsync/engine mutation fails. Crash preserves
+  the underlying fault while resetting retrying/escalated process state to
+  `StorageFailing` or `ApplyFailing`. Weak fairness on escalation represents
+  exhaustion of the finite retry budget after redetection.
 - `FailShardCopy` omits index name, UUID, and shard ID from its abstract record
   because the model contains exactly one fixed-UUID shard. Allocation identity,
   conditional commit, leader-selected promotion candidate, unassignment, and
@@ -159,8 +164,10 @@ liveness configurations use neither symmetry nor a state constraint.
 | `Rejoin`, `ObserveRejoin` | Follower `JoinCluster` retry and committed `ClusterCommand::AddNode`. |
 | `AllocateAfterLifecycle`, `ObserveAllocationAccepted`, `ObserveAllocationRejected` | `IndexMetadata::allocate_unassigned_replicas` and the allocator phase of the leader lifecycle loop. |
 | `ReportShardCopyFailure` | `open_local_assigned_shards`, `TransportService::fail_shard_copy`, `TransportClient::forward_fail_shard_copy`, and leader-side live/highest-checkpoint promotion-candidate selection. |
-| `CorruptShardStorage`, `BeginPersistentStorageFailure`, `EscalatePersistentStorageFailure` | Definitive storage decoding/validation failure and bounded persistent local I/O escalation while opening a copy or reading/persisting fence/marker state. |
+| `CorruptShardStorage`, `BeginPersistentStorageFailure`, `RedetectPersistentStorageFailure`, `EscalatePersistentStorageFailure` | Definitive storage decoding/validation failure and bounded persistent local I/O escalation while opening a copy or reading/persisting fence/marker state, including retry-budget reset and redetection after restart. |
 | `BeginPersistentApplyFailure`, `PrimaryApplyFailure`, `ReplicaApplyFailure`, `EscalatePersistentApplyFailure` | `ShardManager::{ensure_local_apply_allowed,record_local_apply_result,apply_replica_operation}` around primary and replica WAL/fsync/engine mutation; failed operations do not acknowledge or mutate the modeled logical history. |
+| `RepairPersistentStorageFault` | Operator/storage repair after an accepted exact-allocation failure; repair remains possible if fresh allocation races ahead of the repair action. |
+| `S1TimedOutReplicationFails` | `TransportClient` request timeout plus `replication::replicate_write` error propagation for a required replica that is down, has restarted past the request epoch, or whose request/response was dropped. |
 | `LifecycleProposeActivation` | Proactive local-primary activation from the node lifecycle after startup or promotion. |
 | `StartRecovery`, `SourceSetupFailure`, `PollSetupFailure` | `run_peer_recovery`, `start_peer_recovery_inner`, `launch_source_setup`, and `source_start_status`. |
 | `SourceSnapshot` | `HotEngine::prepare_peer_recovery_snapshot`, including commit, durable checkpoint, hard-linked files, and `register_retention_pin`. |
@@ -271,7 +278,7 @@ G2 models `FailShardCopy(node, allocation_id)` as a conditional Raft command:
 
 `FaultMode = "S1"` adds three live-copy failure classes:
 
-- corruption or decode/validation failure enters `StorageFailed`
+- corruption or decode/validation failure enters `StorageCorrupt`
   immediately; and
 - persistent local I/O while opening a copy or reading/persisting its durable
   fence or recovery marker enters `StorageRetrying`, where serving remains
@@ -282,19 +289,53 @@ G2 models `FailShardCopy(node, allocation_id)` as a conditional Raft command:
   the first failed mutation enters `ApplyRetrying`. A separate escalation
   action reaches `ApplyFailed`.
 
-The underlying persistent fault is assumed to survive restart. Only
-`StorageFailed` and `ApplyFailed` are reportable. Replica reports remove the
-exact allocation, after which writes no longer wait for that copy. Primary
-reports are promote-only: the leader chooses a live in-sync replica with the
-highest observed checkpoint and carries it in the command; the state machine
-validates current in-sync membership. Without a candidate the modeled command
-is rejected and routing remains unchanged.
+The underlying persistent fault survives restart, while the process-local
+retry count/window resets. Restart changes `StorageRetrying` or
+`StorageFailed` to `StorageFailing`, and changes `ApplyRetrying` or
+`ApplyFailed` to `ApplyFailing`; a later open or mutation redetects the same
+fault and starts a fresh retry budget. `StorageCorrupt`, `StorageFailed`, and
+`ApplyFailed` are reportable. Replica reports remove the exact allocation,
+after which writes no longer wait for that copy. Primary reports are
+promote-only: the leader chooses a live in-sync replica with the highest
+observed checkpoint and carries it in the command; the state machine validates
+current in-sync membership. Without a candidate the modeled command is
+rejected and routing remains unchanged.
+
+The combined S1 checks permit one persistent storage fault per execution. An
+already queued failure command may commit after the failed process or Raft
+leader crashes; allocation identity still decides whether it applies.
+After an accepted removal, storage repair remains enabled even if the
+allocator races ahead with a fresh assignment, and peer recovery is the only
+action that installs that fresh identity.
 
 `MC_ApplyStorageReplicaNoEscalation.cfg` omits only apply-level escalation. It
 retains the historical lasso in which the open replica NACKs every mutation
 but remains in sync forever, so writes need not resume. The fixed replica and
 primary configurations weakly fairly schedule the failed write, escalation,
 report, Raft commit, activation when needed, and a later successful write.
+
+`MC_S1_CombinedReplica.cfg` and `MC_S1_CombinedPrimary.cfg` combine storage
+failure with one crash/restart, leader election, delayed conditional reports,
+repair, fresh allocation, and peer recovery. The primary variant includes
+promote-only reports that remain pending while either the failed primary or
+the current Raft leader crashes.
+
+`MC_S1_CombinedLiveness.cfg` forces the harder apply-I/O sequence: an initial
+failed request, target crash and retry-budget reset, a request sent while the
+target is unreachable, restart, redetection, exact removal, repair, fresh
+allocation, peer recovery, and a final acknowledged write. Liveness assumes
+that the transport request to an unreachable target eventually fails.
+`TransportClient` configures a 30-second endpoint timeout and a 5-second
+connect timeout in `src/transport/client.rs` (around lines 122 and 163-164),
+and `replication::replicate_write` converts every RPC error or timeout into a
+request error in `src/replication/mod.rs` (around lines 98-127). Healthy
+targets are assumed to respond before that timeout. The model puts weak
+fairness only on the guarded timeout action, never on unguarded
+`PrimaryFail`.
+
+The paired `s1-combined-liveness-no-timeout` configuration intentionally omits
+that action and retains a temporal counterexample as evidence for the modeling
+assumption, not as evidence of a Rust defect.
 
 Rust additionally records an exact-allocation, Raft-replicated
 `primary_unavailable` health flag when no live promotion candidate exists.
@@ -387,7 +428,8 @@ The combined Rust implementation must follow the model variant as one protocol:
     leaves the copy open but fails every affected mutation; success clears the
     corresponding retry state. Exhausting the bounded count/time budget makes
     the exact copy reportable with index name, UUID, shard ID, node ID, and
-    allocation ID.
+    allocation ID. The underlying fault survives restart, while process-local
+    counters reset and must be redetected before escalation recurs.
 16. `FailShardCopy` changes routing only on an exact allocation match. Replica
     failure removes it from `replicas` and `inSync` and increments
     `unassigned`. For primary failure, the leader chooses a live in-sync
@@ -405,6 +447,10 @@ The combined Rust implementation must follow the model variant as one protocol:
     promotion whenever the node's applied view names it as primary and the
     current incarnation has not activated that term. Pending-target progress
     must not depend on a later client write or recovery request.
+19. Synchronous replication to a required target has a bounded transport
+    request. A down target, a target that restarted past the request epoch, or
+    a dropped request/response eventually produces a request failure; healthy
+    targets are assumed to respond before that timeout.
 
 The model updates fence and accepted operation atomically. Rust may persist the
 fence immediately before the WAL mutation; a crash in between is conservative
@@ -459,6 +505,9 @@ Liveness properties:
 - `ApplyFailedPrimaryReplaced`
 - `WritesResumeAfterApplyFailure`
 - `ApplyPrimaryReportEventuallyRejected`
+- `S1UnavailableWriteCompletes`
+- `S1WritesResume`
+- `S1ReplacementEventuallyInSync`
 
 `RecoveryConverges` is attempt-level: an assigned recovery candidate
 eventually becomes in sync, becomes primary, or reaches definitive rejection
@@ -512,6 +561,45 @@ configuration omits only the escalation/report path and retains a temporal
 counterexample. These liveness configurations use neither symmetry nor a state
 constraint.
 
+The combined S1 liveness configuration also uses neither symmetry nor a state
+constraint. Weak fairness covers only the forced scenario actions and the
+guarded transport-timeout action. Action coverage reached 1,512
+post-recovery client writes and 1,512 target admissions, so resumed writes and
+replacement admission are not vacuous.
+
+Liveness bounds must leave room for conditional commands that commit as
+rejected, including delayed duplicate failure reports. An earlier
+`MaxRaftEntries = 3` run reached settlement after consuming the bound with a
+failure report, a rejected duplicate, and allocation; the final bound is 5,
+covering those entries plus admission and a possible activation command. A
+stutter caused solely by exhausting a finite model bound is not evidence about
+Rust's unbounded Raft log. An intermediate run also showed that unrestricted
+duplicate submissions can consume any finite bound, so the liveness scenario
+explicitly permits the accepted report plus one rejected duplicate; the safety
+relations retain unrestricted duplicate submissions.
+
+## Fault-class coverage
+
+`FaultMode` and each scenario relation determine which fault actions are
+actually enabled. A configuration using the top-level `Next` does not
+implicitly enable every fault class.
+
+| Configuration family | Crash / restart | Metadata partition | Message loss or delay | Disk loss | Storage open/fence/marker | Storage apply | Async durability |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| C1 and `fixed-crash` | Yes | No | Loss and delay | No | No | No | No |
+| C2 and `fixed-partition` | No in fixed run | Yes | Loss and delay | No | No | No | No |
+| C3, G1, G2 | Yes | No | Scenario delay only | Yes | No | No | No |
+| C4 | Yes | No | Scenario delay only | No | No | No | Yes |
+| Focused S1 storage checks | No | No | Scenario delay only | No | Yes | Yes in apply variants | No |
+| Combined S1 safety | One crash/restart; leader may change | No | Delay and crash-dropped requests | No | Yes | Yes | No |
+| Combined S1 liveness | Forced target crash/restart | No | Delay plus guarded timeout/drop failure | No | No | Yes | No |
+| L1/L2 recovery checks | L2 only | No | Scenario delay only | No | No | No | No |
+
+No bounded configuration combines metadata partition with storage failure,
+disk loss with storage failure, or asynchronous durability with storage
+failure. The combined S1 checks do not enable `DiskLoss` or
+`PartitionMetadata`.
+
 ## Configurations and results
 
 Results below were produced on September 27, 2026 with Java 25 and the pinned
@@ -545,26 +633,33 @@ performance benchmarks.
 | `l2-primary-idle` | 2 / 1 / 0 | Pending target; idle source restart/election; lifecycle activation to term 2 | Lifecycle trigger enabled | Safety and liveness pass | 94 / 49 | 22 | 2s |
 | `l2-promotion` | 3 / 1 / 0 | Pending target; distinct in-sync replica promoted to term 2 | Corrected observation | Safety and liveness pass | 43 / 29 | 19 | 2s |
 | `l2` | 2 / 1 / 0 | Up to 2 recovery attempts; exactly 1 transient target crash/restart; marker restoration; weak fairness | Both fixes | Safety and liveness pass | 200 / 112 | 21 | 2s |
-| `storage-replica` | 3 / 1 / 2 | Corruption or persistent open/fence/marker-I/O; term 3; messages 2; log 2; view lag 2 | Promote-only storage rules | Replica removed; second write succeeds | 35 / 29 | 17 | 2s |
+| `storage-replica` | 3 / 1 / 2 | Corruption or persistent open/fence/marker-I/O; term 3; messages 2; log 2; view lag 2 | Promote-only storage rules | Replica removed; second write succeeds | 35 / 29 | 17 | 1s |
 | `storage-primary` | 3 / 1 / 2 | Primary open/fence/marker-I/O; term 3; messages 2; log 2; view lag 2 | Leader-selected candidate | Candidate promoted; second write succeeds | 41 / 35 | 20 | 1s |
 | `storage-primary-no-replica` | 2 / 1 / 1 | No-candidate primary; term 2; no messages; log 1; view lag 1 | Promote-only storage rules | Failure report rejected; routing retained | 13 / 11 | 8 | 1s |
-| `storage-apply-replica` | 3 / 1 / 3 | Open replica apply I/O; term 3; messages 2; log 1; view lag 2; fair escalation | Apply-I/O rules | Exact replica removed; third write succeeds | 53 / 47 | 23 | 2s |
+| `storage-apply-replica` | 3 / 1 / 3 | Open replica apply I/O; term 3; messages 2; log 1; view lag 2; fair escalation | Apply-I/O rules | Exact replica removed; third write succeeds | 53 / 47 | 23 | 1s |
 | `storage-apply-primary` | 3 / 1 / 3 | Open primary apply I/O; term 3; messages 2; log 2; view lag 2; fair escalation | Leader-selected candidate | Candidate promoted; third write succeeds | 30 / 26 | 22 | 1s |
 | `storage-apply-primary-no-replica` | 2 / 1 / 2 | No-candidate primary apply I/O; term 2; no messages; log 1; view lag 1 | Promote-only storage rules | Failure report rejected; authority retained | 10 / 10 | 10 | 1s |
 | `storage-apply-no-escalation` | 3 / 1 / 3 | Replica apply I/O; two failed requests; term 3; messages 2; log 1; view lag 2; escalation/report omitted | Historical apply behavior | Expected temporal violation | 65 / 53 | 19-state lasso | 2s |
+| `s1-combined-replica` | 3 / 1 / 3 | Open or apply fault; 1 crash; 1 recovery; term 3; messages 2; log 4 | Retry reset + repair | Safety pass | 394,276 / 105,401 | 55 | 9s |
+| `s1-combined-primary` | 3 / 1 / 3 | Failed primary; promote-only report; primary/leader crash; 1 recovery; log 4 | Retry reset + carried candidate | Safety pass | 643,048 / 162,852 | 53 | 11s |
+| `s1-combined-liveness` | 3 / 1 / 5 | Apply fault; timeout; 1 crash; 1 recovery; term 3; messages 2; log 5 | Guarded timeout fairness | Safety and liveness pass | 138,367 / 43,844 | 66 | 33s |
+| `s1-combined-liveness-no-timeout` | Same as combined liveness | Guarded timeout action omitted | Modeling-assumption regression | Expected temporal violation | 49 / 41 | 21-state lasso | 2s |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
 | `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 87,012,150 / 12,495,758 | 42 | 42m55s |
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
-The complete default eight-worker fast matrix ran from 11:13:44 to
-11:16:58 UTC (3m14s), and every expected pass or expected counterexample
+The complete default eight-worker fast matrix ran from 11:54:55 to
+11:58:59 UTC (4m04s), and every expected pass or expected counterexample
 matched. The two large exhaustive runs also used eight workers.
 
-The two long fixed-design configurations use the complete `Next` relation, not
-a scenario wrapper. They constrain writes to `Put` and disable optional
-recovery setup/cancellation/expiry injection, while retaining every write,
-replication, message-loss/delay, recovery-progress, Raft, view-delivery,
-crash/restart, or live-suspicion interleaving within the numeric bounds.
+The two long fixed-design configurations use the top-level `Next` relation,
+not a scenario wrapper, but `FaultMode` still limits enabled fault classes.
+`fixed-crash` uses C1 and therefore disables S1 storage injection, metadata
+partition, disk loss, and asynchronous durability. `fixed-partition` uses C2
+and therefore enables metadata partition but disables S1 storage injection,
+disk loss, and asynchronous durability. They constrain writes to `Put` and
+disable optional recovery setup/cancellation/expiry injection while retaining
+the other enabled interleavings within their numeric bounds.
 
 The larger `fixed-simulation` profile uses 3 nodes, 2 documents, 4 writes,
 2 crashes, 1 partition, 2 recoveries, term 4, 3 in-flight messages, view lag 4,
@@ -596,6 +691,7 @@ well below the CI budget.
 - [B3 restarted pending target wipe](traces/B3-pending-restart-wipe.md)
 - [R2 idle primary without lifecycle activation](traces/R2-idle-primary-no-activation.md)
 - [R3 open replica apply I/O without escalation](traces/R3-apply-io-no-escalation.md)
+- [S1 liveness without transport timeout](traces/S1-combined-liveness-no-timeout.md)
 
 ## Not covered
 

@@ -80,6 +80,14 @@ benchmark artifacts.
   from transient recovery. Apply-I/O evidence must state that the copy remains
   open/readable while mutations fail and preserve the no-escalation liveness
   trace.
+- Combined-fault evidence must include a fault-class table. State explicitly
+  which modes enable crash, metadata partition, message loss/delay, disk loss,
+  storage open/apply failure, and asynchronous durability, and name
+  combinations that are never checked together.
+- Storage/crash liveness evidence must document process-local retry-budget
+  reset, persistent-fault redetection, repair eligibility, the guarded
+  transport-timeout assumption, and any numeric bound raised after a retained
+  bound-exhaustion trace.
 - Activation liveness claims must name the proactive lifecycle trigger and
   preserve the no-trigger stutter trace as bounded counterevidence.
 - Record the monotonic applied-Raft-view assumption. Loss of `raft.db` followed

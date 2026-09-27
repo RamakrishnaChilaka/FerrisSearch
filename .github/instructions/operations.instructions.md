@@ -145,7 +145,9 @@ liveness checks, and minimal two-shard isolation check in the fast matrix.
 Keep corruption,
 open/fence/marker/apply persistent-I/O escalation, promote-only primary
 reporting, the apply-I/O no-escalation temporal regression, and the
-no-lifecycle-activation temporal regression in that fast set.
+no-lifecycle-activation temporal regression in that fast set. Also keep the
+combined S1 crash/restart/recovery safety and liveness checks plus the
+no-timeout modeling-assumption regression in the fast matrix.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with

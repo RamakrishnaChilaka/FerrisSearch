@@ -51,18 +51,25 @@ cargo test -- test_name                         # Single test by name
 - Historical counterexamples are living model regressions. The runner must fail if
   `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, `c4`, or
   `pending-restart-legacy` stops violating its named invariant, or if
-  `l2-primary-no-trigger` or `storage-apply-no-escalation` stops producing its
-  temporal liveness violation; those configurations intentionally retain
-  historical protocol behavior.
+  `l2-primary-no-trigger`, `storage-apply-no-escalation`, or
+  `s1-combined-liveness-no-timeout` stops producing its temporal liveness
+  violation. The S1 no-timeout case is a modeling-assumption regression, not a
+  historical Rust defect.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
   `g2-primary-no-replica`, `g2-liveness`, `pending-restart-fixed`, `l1-bump`,
   `l2-primary-idle`, `l2-promotion`, `storage-replica`, `storage-primary`,
   `storage-primary-no-replica`, `storage-apply-replica`,
-  `storage-apply-primary`, `storage-apply-primary-no-replica`, `two-shard`,
-  `fixed-crash`, and `fixed-partition` are expected-pass configurations.
+  `storage-apply-primary`, `storage-apply-primary-no-replica`,
+  `s1-combined-replica`, `s1-combined-primary`, `s1-combined-liveness`,
+  `two-shard`, `fixed-crash`, and `fixed-partition` are expected-pass
+  configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
+- Numeric liveness-bound exhaustion is the exception: increase only the
+  exhausted Raft/message/term/allocation/recovery bound, preserve the trace,
+  and record the old and new values. Safety failures and non-bound liveness
+  failures still stop immediately.
 - Safety runs may use a documented state constraint and valid node symmetry.
   Liveness runs use neither; declare the exact fairness assumptions instead.
 - Keep action comments and `specs/tla/README.md` mapped to the current Rust
@@ -84,6 +91,12 @@ cargo test -- test_name                         # Single test by name
   live highest-checkpoint candidate; the state machine validates current
   in-sync membership. A primary report without a candidate must be rejected
   without clearing its allocation.
+- Combined S1 checks must cover retry-budget reset across restart, reports
+  pending across failed-primary or leader crash, repair that remains possible
+  if allocation races ahead, fresh-allocation recovery, and a final
+  acknowledged write. Timeout fairness is permitted only when a required
+  target is down, has restarted past the request epoch, or its transport
+  message was dropped.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt
