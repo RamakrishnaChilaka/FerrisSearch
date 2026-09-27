@@ -726,18 +726,26 @@ well below the CI budget.
   are abstracted as one nondeterministic escalation step; their concrete
   numeric policy is not verified here.
 - Apply-I/O failure is modeled as a failed logical mutation with no
-  acknowledged operation effect. Rust keeps an Apply-failed copy open; an
-  operation that reached the WAL but failed engine apply is not restored to the
-  live reader. A later successful commit can advance past that entry, while a
-  retained peer-recovery suffix can still transfer it to another copy. Partial
-  or torn WAL-frame persistence and those cross-copy effects remain outside the
-  model.
+  acknowledged operation effect. Rust keeps an Apply-failed copy open, but an
+  operation that reached the WAL and then failed engine apply has an unknown
+  outcome: it begins absent from the live reader, a later commit can advance
+  past it, a later writer-invalidating commit failure can replay it on this
+  copy, and retained peer-recovery history can apply it on another copy.
+  Resulting cross-copy divergence and partial or torn WAL-frame persistence
+  remain outside the model.
 - The Rust implementation assumes `translog.committed` never advances beyond
   operations made durable by a successful Tantivy commit. Any commit failure
-  invalidates the writer; before accepting the next write, writer reconstruction
-  replays and commits the retained WAL suffix from the persisted checkpoint.
-  The model represents those operations as durable atomically and does not
-  model Tantivy worker/channel reconstruction.
+  invalidates the writer; before the next write or blocking
+  maintenance/snapshot commit, writer reconstruction replays and commits the
+  retained WAL suffix from the persisted checkpoint. Replay validates
+  `_doc_id`/`_source`, applies deletes as deletes, and holds the translog lock
+  for the whole suffix. The model represents those operations as durable
+  atomically and does not model Tantivy worker/channel reconstruction or replay
+  latency.
+- At source baseline `8f17172`, startup replay could resurrect an acknowledged
+  delete and a transient Tantivy commit failure could lose later acknowledged
+  writes. Both are Rust defects fixed by the current implementation; neither is
+  represented as a separate TLA+ transition.
 - The allocator may assign a replacement back to the same faulty node. Retry is
   bounded per attempt by recovery backoff and the storage escalation window;
   excluding a node after a configured number of failed allocations is deferred.

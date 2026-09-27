@@ -160,6 +160,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   on a copy installed from files), when a concurrent flush removes a needed
   generation, or when a legacy frame above the 32 MiB transfer limit falls in
   the requested range.
+- Modern peer-recovery catch-up and legacy `RecoverReplica` share the strict WAL
+  document decoder. Missing `_doc_id`, or missing `_source` on an index
+  operation, fails closed; delete operations carry no synthetic source and
+  must never be converted back into indexed documents.
 - **peer recovery RPCs**: source sessions are
   UUID/target/allocation/primary-term bound,
   file chunks are at most 1 MiB, operation batches are bounded by count and
@@ -172,6 +176,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - Snapshot preparation failures are retained and returned once on the next
   poll, so the target enters normal recovery backoff instead of relaunching
   setup in a tight loop.
+- Snapshot preparation on a repaired idle primary rebuilds a failed writer and
+  replays its retained WAL suffix before committing the source snapshot; it
+  does not require an unrelated client write to heal the source.
 - `StartPeerRecovery` may poll a safe pre-finalize session, but it must reject
   reattachment to the same session once finalization, admission, or settlement
   has begun.

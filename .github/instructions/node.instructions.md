@@ -107,6 +107,9 @@ pub struct Node {
   `0` disables); failures back off from 5 seconds to 60 seconds.
 - File download, fsync, shard close/open, vector rebuild, and recovery apply run
   through Tokio's blocking facilities rather than the fixed search/write pools.
+- Source snapshot preparation can rebuild a failed Tantivy writer and replay
+  the retained WAL suffix while the shard is idle. A transient source commit
+  failure must not leave replica recovery dependent on a later client write.
 - A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
   An inactive marker whose embedded allocation ID matches the current
   out-of-sync assignment is reported through `FailShardCopy`; an active target,

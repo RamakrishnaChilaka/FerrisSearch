@@ -224,6 +224,11 @@ cargo test -- test_name                         # Single test by name
   writer is removed, the persisted checkpoint does not advance, five later
   acknowledged writes survive the next commit and restart, and a failed
   replica retains every acknowledged write after promotion.
+- Round-7 storage regressions cover delete-preserving startup and failed-writer
+  replay, malformed WAL document envelopes, idempotent replay with deletes,
+  replica delete survival through promotion, idle refresh/snapshot healing,
+  full transport recovery after a transient source snapshot failure, and
+  operation-correct legacy `RecoverReplica` encoding.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

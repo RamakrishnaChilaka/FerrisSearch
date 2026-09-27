@@ -108,10 +108,19 @@ pub trait WriteAheadLog: Send + Sync {
   boundary equals the current WAL head before deleting history; a failed commit
   must leave both the checkpoint and WAL intact.
 - Any failed Tantivy commit invalidates its writer. Before a later write appends
-  a new operation, writer reconstruction replays
-  `[translog.committed, next_seq_no)` with the same idempotent replay logic used
-  at startup. Persistent rebuild/replay I/O is reported through the Apply
-  retry budget.
+  a new operation, or before blocking maintenance/snapshot commit continues,
+  writer reconstruction replays `[translog.committed, next_seq_no)` with the
+  same idempotent replay logic used at startup. Best-effort try-flush may defer
+  instead. Persistent rebuild/replay I/O is reported through the Apply retry
+  budget.
+- WAL document interpretation is shared by startup/runtime replay, peer
+  recovery, and legacy `RecoverReplica`. Every operation requires `_doc_id`;
+  index operations additionally require `_source`. Missing fields are typed
+  corruption. Replay deletes the ID for every operation and adds a document
+  back only for `Index`.
+- Writer reconstruction holds the translog lock for the entire suffix so no new
+  append can race recovery. This blocks writes to that shard and may scan a
+  large suffix when refresh is disabled.
 - Async durability: background task fsyncs every `sync_interval_ms` via Tokio's blocking pool — never call `File::sync_data()` inline on an async worker
 - Reopen requires `translog.manifest`; it trusts persisted metadata for old generations, removes stray generation files not listed in the manifest, ignores unrelated non-generation side files, and scans only the active generation file to recover the allocator high-water mark
 - On open, an incomplete trailing frame in the active generation is truncated

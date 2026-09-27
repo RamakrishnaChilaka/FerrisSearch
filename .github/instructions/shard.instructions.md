@@ -66,9 +66,11 @@ pub struct ShardManager {
   rebuild I/O consumes the same Apply budget. Successful Apply clears that key.
   Apply escalation does not quarantine or reopen the copy; reads remain
   available. A writer-invalidating commit failure rebuilds and replays the
-  retained WAL suffix before the next write. A separate engine-apply failure
-  after WAL append is not applied to the live reader; a later commit can advance
-  past it, while peer recovery can still transfer the retained WAL entry.
+  retained WAL suffix before the next write or blocking maintenance/snapshot
+  commit. A separate engine-apply failure after WAL append has an unknown
+  outcome: it starts absent from the live reader, a later commit can advance
+  past it, a later writer-invalidating commit failure can replay it locally,
+  and peer recovery can apply the retained entry on another copy.
   Definitive and open-level failures may quarantine, but only after the report
   throttle admits the attempt.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty

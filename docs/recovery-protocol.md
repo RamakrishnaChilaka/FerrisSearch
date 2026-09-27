@@ -150,6 +150,21 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > or unreferenced-generation deletion against an active writer. Test-only live
 > WAL inspections use the same non-mutating engine path.
 >
+> **Round-7 corrections — September 27, 2026:** WAL replay now validates the
+> internal `_doc_id` and operation payload, deletes that ID for every
+> operation, and adds a document back only for an index operation. Startup,
+> failed-writer reconstruction, peer-recovery catch-up, and legacy
+> `RecoverReplica` therefore preserve deletes and fail closed on malformed
+> operation envelopes. Blocking maintenance and snapshot preparation acquire
+> the writer through the same rebuild-and-replay path as document writes, so
+> an idle repaired primary can recover and serve peer recovery without an
+> unrelated client mutation. Replay holds the shard translog lock for the
+> entire retained suffix, blocking writes to that shard; this can be a long
+> critical section when refresh is disabled.
+>
+> Both the startup delete-resurrection defect and the transient-commit
+> acknowledged-write loss existed at the `8f17172` main baseline.
+>
 > **Allocation identity and replica fencing — September 26, 2026:** Raft now
 > assigns every shard copy an allocation ID derived from the assigning log
 > position. Recovery start, source sessions, install state, pending membership,
@@ -219,12 +234,16 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > quarantined only after report throttling; repaired storage then requires a
 > fresh `ActivatePrimary`, which clears the flag while advancing the term.
 > Apply-level escalation keeps the existing engine open for reads and does not
-> replay a WAL-appended but engine-failed operation at runtime. A force-merge
+> itself quarantine, reopen, or replay a WAL-appended but engine-failed
+> operation. Such an operation has an unknown outcome: it is initially absent
+> from the live reader, a later successful commit can advance past it, and a
+> later writer-invalidating commit failure can cause suffix replay to apply it
+> on this copy while another copy still lacks it. A force-merge
 > writer-replacement failure leaves a typed unavailable-writer state. The next
-> write tries once to rebuild the writer with the normal heap budget and
-> automatic merge policy, then replays the retained WAL suffix before adding a
-> new WAL entry. Transient failure can heal there, while persistent rebuild or
-> replay I/O consumes the Apply retry budget.
+> write or blocking maintenance/snapshot operation rebuilds the writer with the
+> normal heap budget and automatic merge policy, then replays the retained WAL
+> suffix before continuing. Transient failure can heal there, while persistent
+> rebuild or replay I/O consumes the Apply retry budget.
 > Status-only `MarkPrimaryAvailable` reporting runs in the background so leader
 > discovery or forwarding cannot delay an already-successful write response.
 > This status introduces an intentional health-semantics difference from
@@ -259,13 +278,14 @@ frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
 
 **Known write-failure limit:** synchronous WAL/fsync/engine failures now fail
 the request and enter bounded escalation, but a WAL entry whose later engine
-apply fails remains absent from the live reader. A later successful commit can
-advance the committed checkpoint past that entry, so restart can skip it;
-while retained, peer-recovery suffix transfer can still apply it on another
-copy. If a partial append is followed by later writes, the torn frame can become
-middle corruption; restart then fails closed rather than skipping acknowledged
-history. Startup tail truncation repairs only a trailing incomplete frame with
-no later data.
+apply fails has an unknown outcome. It starts absent from the live reader. A
+later successful commit can advance the committed checkpoint past it, while a
+later failed commit can invalidate the writer and cause suffix replay to apply
+it on this copy. Retained peer-recovery history can also apply it on another
+copy, so copies can diverge. If a partial append is followed by later writes,
+the torn frame can become middle corruption; restart then fails closed rather
+than skipping acknowledged history. Startup tail truncation repairs only a
+trailing incomplete frame with no later data.
 
 ## 3. Reference Protocols And Intentional Differences
 

@@ -414,15 +414,24 @@ production ready**. The most important limits are:
 - A primary can mutate before replica acknowledgement fails; write retry and
   acknowledgement semantics need a formal contract.
 - Synchronous WAL/fsync/engine failures fail the request and enter bounded
-  escalation, but an operation that reached the WAL and then failed engine
-  apply is not automatically restored to the live reader. A later successful
-  commit can advance past that entry, while a retained peer-recovery WAL suffix
-  can still transmit it to another copy. A partial frame followed by later
-  writes can still create middle corruption that restart correctly rejects.
+  escalation. An operation that reached the WAL and then failed engine apply
+  has an unknown outcome: it starts absent from the live reader, a later
+  successful commit can advance past it, a later writer-invalidating commit
+  failure can replay it on this copy, and retained peer-recovery history can
+  apply it on another copy. Copies can therefore diverge after this failure.
+  A partial frame followed by later writes can still create middle corruption
+  that restart correctly rejects.
 - A failed Tantivy commit invalidates the writer without advancing
-  `translog.committed` or truncating the WAL. Before accepting the next write,
-  FerrisSearch rebuilds the writer and replays the retained suffix; persistent
-  rebuild or replay I/O enters the Apply escalation budget.
+  `translog.committed` or truncating the WAL. The next write, blocking
+  maintenance operation, or peer-recovery snapshot rebuilds the writer and
+  replays the retained suffix. Replay deletes each document ID first and adds
+  content back only for index operations; malformed operation payloads fail
+  closed. Persistent rebuild or replay I/O enters the Apply escalation budget.
+  Replay holds the shard translog lock for the entire suffix, blocking writes
+  to that shard; the suffix can be large when refresh is disabled.
+- At the `8f17172` main baseline, startup replay resurrected acknowledged
+  deletes and one transient Tantivy commit failure could lose later
+  acknowledged writes. Both defects are fixed on this branch.
 - `_seq_no` now reports the primary WAL assignment, but `_version` and
   `_primary_term` compatibility fields remain placeholders. Gap-aware
   checkpoints, primary epochs, idempotent retries, `if_seq_no` /

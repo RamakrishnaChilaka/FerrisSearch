@@ -138,8 +138,13 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   replay helper. They stream entries via `for_each_from()` starting at the
   persisted committed checkpoint.
 - Replay must stay idempotent across repeated restart or write-path recovery:
-  delete-before-add on `_id`, commit in bounded batches, and persist
-  `translog.committed` only after each successful intermediate commit.
+  validate `_doc_id` for every operation and `_source` for index operations,
+  delete `_id` for every operation, add content back only for index operations,
+  commit in bounded batches, and persist `translog.committed` only after each
+  successful intermediate commit. Missing fields are typed WAL corruption.
+- Replay holds the translog lock for the entire retained suffix so no new WAL
+  entry can be appended before reconstruction is complete. This blocks writes
+  to that shard and can be a long critical section when refresh is disabled.
 - `translog_size_bytes()` exposes the current WAL size for the auto-flush loop
 - The Tantivy `IndexWriter` heap budget is intentionally capped at 64 MiB per shard. Multi-shard restart/open paths must not reserve the old 512 MiB-per-shard budget or nodes with many local shards can OOM before recovery completes.
 - Force merge is serialized only within one `HotEngine`. It temporarily installs
@@ -157,11 +162,13 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - Every production Tantivy commit boundary—refresh, flush, checkpoint-aware
   flush, recovery snapshot, replay batches, and pre-force-merge commit—must
   fail the `WriterState` on error. No later write may reuse that writer.
-- Before the next write appends a new WAL entry, a failed writer is rebuilt and
-  the retained suffix `[translog.committed, WAL next_seq)` is replayed and
-  committed with the normal automatic merge policy. Persistent rebuild or
-  replay I/O remains an Apply failure. The original background task logs its
-  commit error; the next write or restart performs recovery.
+- Before the next write appends a new WAL entry, or before blocking refresh,
+  flush, force-merge preparation, or peer-snapshot commit proceeds, a failed
+  writer is rebuilt and the retained suffix
+  `[translog.committed, WAL next_seq)` is replayed and committed with the
+  normal automatic merge policy. Persistent rebuild or replay I/O remains an
+  Apply failure. Best-effort `try_flush_with_global_checkpoint()` may return
+  `Ok(false)` instead of rebuilding.
 - `force_merge(0)` is invalid. Successful force merge must verify the final
   searchable segment count is at most the requested positive bound while
   preserving document values, deletes, and the committed WAL watermark.
