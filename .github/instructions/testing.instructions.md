@@ -38,6 +38,8 @@ cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh l1-bump l2-primary-idle l2-promotion
 ./scripts/tla/check.sh pending-restart-legacy pending-restart-fixed two-shard
 ./scripts/tla/check.sh storage-replica storage-primary storage-primary-no-replica
+./scripts/tla/check.sh storage-apply-replica storage-apply-primary storage-apply-primary-no-replica
+./scripts/tla/check.sh s1-combined-replica s1-combined-primary s1-combined-liveness
 ./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
 ./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
 ```
@@ -72,6 +74,14 @@ cargo test -- test_name                         # Single test by name
   failures still stop immediately.
 - Safety runs may use a documented state constraint and valid node symmetry.
   Liveness runs use neither; declare the exact fairness assumptions instead.
+- When you add a model variable, add it to every action's `UNCHANGED` tuple,
+  including scenario-wrapper actions such as `G2StopFaults`. Round 3 missed
+  `storageFaultInjected` in those wrappers and `g2-liveness` failed. Rerun the
+  full fast matrix after adding a variable.
+- `FaultMode` enables one fault class per configuration. Before you describe a
+  fault combination as checked, confirm it in the fault-class coverage table in
+  `specs/tla/README.md`. The `fixed-crash` and `fixed-partition` runs use C1
+  and C2, so they include neither storage (S1) nor disk-loss faults.
 - Keep action comments and `specs/tla/README.md` mapped to the current Rust
   functions. Label each protocol variant as current, historical, or proposed;
   never imply that a model-only transition is implemented.
