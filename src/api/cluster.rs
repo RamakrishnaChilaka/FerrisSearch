@@ -17,7 +17,7 @@ pub struct ClusterHealth {
 /// Compute cluster health status based on shard allocation.
 /// - "green": all primaries exist and all desired replicas are assigned and in sync
 /// - "yellow": all primaries exist, but some replicas are unassigned or out of sync
-/// - "red": no data nodes, or a primary shard is assigned to a missing node
+/// - "red": no data nodes, a primary shard is missing, or primary storage is unavailable
 fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
     let data_node_ids: std::collections::HashSet<&String> = cs
         .nodes
@@ -47,6 +47,7 @@ fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
                 || cs
                     .shard_allocation_id(&index_meta.name, *shard_id, &routing.primary)
                     .is_none()
+                || cs.primary_unavailable(&index_meta.name, *shard_id)
             {
                 primary_missing = true;
             }
@@ -286,5 +287,18 @@ mod tests {
             .unwrap()
             .unassigned_replicas = 1;
         assert_eq!(compute_health_status(&state), ("red", 1));
+    }
+
+    #[test]
+    fn health_is_red_when_primary_storage_is_unavailable() {
+        let mut state = health_state(in_sync_routing());
+        state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_unavailable = true;
+        assert_eq!(compute_health_status(&state), ("red", 0));
     }
 }

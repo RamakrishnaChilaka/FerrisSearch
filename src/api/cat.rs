@@ -376,6 +376,7 @@ pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>
         let health = if meta.shard_routing.iter().any(|(shard_id, routing)| {
             cs.shard_allocation_id(idx_name, *shard_id, &routing.primary)
                 .is_none()
+                || cs.primary_unavailable(idx_name, *shard_id)
         }) {
             "red"
         } else if meta.shard_routing.iter().any(|(shard_id, routing)| {

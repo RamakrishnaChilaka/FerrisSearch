@@ -510,7 +510,8 @@ async fn run_peer_recovery(
             candidate.metadata.uuid.to_string(),
             candidate.allocation_id,
         )
-        .await?;
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
     let index_dir = shard_dir.join("index");
     let mut transferred_bytes = 0u64;
     for file in &start.files {
@@ -530,7 +531,8 @@ async fn run_peer_recovery(
     let index_dir_for_sync = index_dir.clone();
     tokio::task::spawn_blocking(move || std::fs::File::open(index_dir_for_sync)?.sync_all())
         .await
-        .map_err(|error| anyhow::anyhow!("index directory sync task failed: {error}"))??;
+        .map_err(|error| anyhow::anyhow!("index directory sync task failed: {error}"))?
+        .map_err(ShardManager::local_storage_failure)?;
 
     let engine = shard_manager
         .finalize_peer_recovery_target_blocking(PeerRecoveryTargetInstall {
@@ -545,7 +547,8 @@ async fn run_peer_recovery(
             snapshot_next_seq_no: start.snapshot_next_seq_no,
             expected_files: start.files.iter().map(|file| file.name.clone()).collect(),
         })
-        .await?;
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
     set_checkpoint_from_next(&engine, start.snapshot_next_seq_no);
 
     let mut next_seq_no = start.snapshot_next_seq_no;
@@ -633,7 +636,8 @@ async fn run_peer_recovery(
     let engine_for_refresh = engine.clone();
     tokio::task::spawn_blocking(move || engine_for_refresh.refresh())
         .await
-        .map_err(|error| anyhow::anyhow!("peer recovery refresh task failed: {error}"))??;
+        .map_err(|error| anyhow::anyhow!("peer recovery refresh task failed: {error}"))?
+        .map_err(ShardManager::local_storage_failure)?;
 
     let pending = PeerRecoveryAwaitingMembership {
         index_uuid: candidate.metadata.uuid.to_string(),
@@ -647,7 +651,8 @@ async fn run_peer_recovery(
             candidate.shard_id,
             pending.clone(),
         )
-        .await?;
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
     let observation = complete_with_observed_settlement(CompletionSettlementContext {
         candidate,
         local_node_id,
@@ -765,7 +770,8 @@ async fn download_recovery_file(
         .create_new(true)
         .write(true)
         .open(&destination)
-        .await?;
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
     let mut hasher = Sha256::new();
     let mut offset = 0u64;
     while offset < metadata.length {
@@ -787,13 +793,17 @@ async fn download_recovery_file(
             anyhow::bail!("peer recovery file chunk exceeds the declared length");
         }
         hasher.update(&response.data);
-        file.write_all(&response.data).await?;
+        file.write_all(&response.data)
+            .await
+            .map_err(ShardManager::local_storage_failure)?;
         offset += response.data.len() as u64;
         if response.eof != (offset == metadata.length) {
             anyhow::bail!("peer recovery file EOF flag does not match the declared length");
         }
     }
-    file.sync_all().await?;
+    file.sync_all()
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
     let actual_hash: String = hasher
         .finalize()
         .iter()
@@ -871,10 +881,14 @@ async fn apply_recovery_operations(
                     doc_id,
                     payload,
                 } => {
-                    engine_for_apply.add_document_with_seq(&doc_id, payload, seq_no)?;
+                    engine_for_apply
+                        .add_document_with_seq(&doc_id, payload, seq_no)
+                        .map_err(ShardManager::local_storage_failure)?;
                 }
                 TargetOperation::Delete { seq_no, doc_id } => {
-                    engine_for_apply.delete_document_with_seq(&doc_id, seq_no)?;
+                    engine_for_apply
+                        .delete_document_with_seq(&doc_id, seq_no)
+                        .map_err(ShardManager::local_storage_failure)?;
                 }
             }
         }

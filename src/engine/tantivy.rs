@@ -17,6 +17,18 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, SegmentMeta, Tantiv
 use super::SearchEngine;
 use crate::wal::{HotTranslog, TranslogDurability, WriteAheadLog};
 
+#[derive(Debug, thiserror::Error)]
+#[error("authoritative shard schema validation failed: {message}")]
+pub(crate) struct AuthoritativeSchemaError {
+    message: String,
+}
+
+fn authoritative_schema_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(AuthoritativeSchemaError {
+        message: message.into(),
+    })
+}
+
 /// Dynamic field registry — maps user-facing field names to Tantivy Field handles.
 /// New fields are added on first encounter (dynamic mapping, like OpenSearch).
 struct FieldRegistry {
@@ -256,7 +268,7 @@ fn evolve_meta_json_schema(
     let schema_arr = meta
         .get_mut("schema")
         .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| anyhow::anyhow!("meta.json missing 'schema' array"))?;
+        .ok_or_else(|| authoritative_schema_error("meta.json missing 'schema' array"))?;
 
     // Collect names already in the stored schema.
     let existing_names: std::collections::HashSet<String> = schema_arr
@@ -316,7 +328,7 @@ fn validate_existing_schema_mappings(
     let stored_schema: Schema = serde_json::from_value(
         meta.get("schema")
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("meta.json missing 'schema' array"))?,
+            .ok_or_else(|| authoritative_schema_error("meta.json missing 'schema' array"))?,
     )?;
 
     for (name, mapping) in mappings {
@@ -351,7 +363,9 @@ fn validate_existing_schema_mappings(
             _ => false,
         };
         if !matches_mapping {
-            anyhow::bail!("schema does not match authoritative mappings for field '{name}'");
+            return Err(authoritative_schema_error(format!(
+                "schema does not match authoritative mappings for field '{name}'"
+            )));
         }
     }
     Ok(())
@@ -1738,6 +1752,15 @@ impl HotEngine {
             Ok(())
         })
         .expect("set append frame barrier");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_wal_write_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
+        self.with_translog("inject WAL write failure", |translog| {
+            translog.inject_write_io_failures_for_test(raw_os_error, attempts);
+            Ok(())
+        })
+        .expect("inject WAL write failure");
     }
 
     #[cfg(test)]

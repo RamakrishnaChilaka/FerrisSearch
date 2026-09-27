@@ -100,6 +100,7 @@ struct AssignedLocalShard {
     primary_term: u64,
     allow_empty_creation: bool,
     authoritative: bool,
+    primary_unavailable: bool,
 }
 
 pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
@@ -596,15 +597,28 @@ impl InternalTransport for TransportService {
             doc_id, req.index_name, req.shard_id
         );
 
-        let write_result = {
-            let engine = engine.clone();
-            let doc_id = doc_id.clone();
-            let payload = payload.clone();
-            self.worker_pools
-                .spawn_write(move || engine.add_document_with_receipt(&doc_id, payload))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
+        let write_result = match self.shard_manager.ensure_local_apply_allowed(
+            &activated_primary.index_uuid,
+            req.shard_id,
+            activated_primary.allocation_id,
+        ) {
+            Ok(()) => {
+                let engine = engine.clone();
+                let doc_id = doc_id.clone();
+                let payload = payload.clone();
+                self.worker_pools
+                    .spawn_write(move || engine.add_document_with_receipt(&doc_id, payload))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+            }
+            Err(error) => Err(error),
         };
+        let write_result = self.shard_manager.record_local_apply_result(
+            &activated_primary.index_uuid,
+            req.shard_id,
+            activated_primary.allocation_id,
+            write_result,
+        );
 
         match write_result {
             Ok(receipt) => {
@@ -658,12 +672,22 @@ impl InternalTransport for TransportService {
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
-            Err(e) => Ok(Response::new(ShardDocResponse {
-                success: false,
-                doc_id: String::new(),
-                error: e.to_string(),
-                seq_no: None,
-            })),
+            Err(e) => {
+                self.report_local_copy_failure(
+                    &req.index_name,
+                    &activated_primary.index_uuid,
+                    req.shard_id,
+                    activated_primary.allocation_id,
+                    &e,
+                )
+                .await;
+                Ok(Response::new(ShardDocResponse {
+                    success: false,
+                    doc_id: String::new(),
+                    error: e.to_string(),
+                    seq_no: None,
+                }))
+            }
         }
     }
 
@@ -762,14 +786,27 @@ impl InternalTransport for TransportService {
             req.shard_id
         );
 
-        let write_result = {
-            let engine = engine.clone();
-            let docs_for_write = docs.clone();
-            self.worker_pools
-                .spawn_write(move || engine.bulk_add_documents_with_receipt(docs_for_write))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
+        let write_result = match self.shard_manager.ensure_local_apply_allowed(
+            &activated_primary.index_uuid,
+            req.shard_id,
+            activated_primary.allocation_id,
+        ) {
+            Ok(()) => {
+                let engine = engine.clone();
+                let docs_for_write = docs.clone();
+                self.worker_pools
+                    .spawn_write(move || engine.bulk_add_documents_with_receipt(docs_for_write))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+            }
+            Err(error) => Err(error),
         };
+        let write_result = self.shard_manager.record_local_apply_result(
+            &activated_primary.index_uuid,
+            req.shard_id,
+            activated_primary.allocation_id,
+            write_result,
+        );
 
         match write_result {
             Ok(receipt) => {
@@ -834,12 +871,22 @@ impl InternalTransport for TransportService {
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
-            Err(e) => Ok(Response::new(ShardBulkResponse {
-                success: false,
-                doc_ids: vec![],
-                error: e.to_string(),
-                start_seq_no: None,
-            })),
+            Err(e) => {
+                self.report_local_copy_failure(
+                    &req.index_name,
+                    &activated_primary.index_uuid,
+                    req.shard_id,
+                    activated_primary.allocation_id,
+                    &e,
+                )
+                .await;
+                Ok(Response::new(ShardBulkResponse {
+                    success: false,
+                    doc_ids: vec![],
+                    error: e.to_string(),
+                    start_seq_no: None,
+                }))
+            }
         }
     }
 
@@ -899,14 +946,27 @@ impl InternalTransport for TransportService {
             req.doc_id, req.index_name, req.shard_id
         );
 
-        let delete_result = {
-            let engine = engine.clone();
-            let doc_id = req.doc_id.clone();
-            self.worker_pools
-                .spawn_write(move || engine.delete_document_with_receipt(&doc_id))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
+        let delete_result = match self.shard_manager.ensure_local_apply_allowed(
+            &activated_primary.index_uuid,
+            req.shard_id,
+            activated_primary.allocation_id,
+        ) {
+            Ok(()) => {
+                let engine = engine.clone();
+                let doc_id = req.doc_id.clone();
+                self.worker_pools
+                    .spawn_write(move || engine.delete_document_with_receipt(&doc_id))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+            }
+            Err(error) => Err(error),
         };
+        let delete_result = self.shard_manager.record_local_apply_result(
+            &activated_primary.index_uuid,
+            req.shard_id,
+            activated_primary.allocation_id,
+            delete_result,
+        );
 
         match delete_result {
             Ok(receipt) => {
@@ -958,12 +1018,22 @@ impl InternalTransport for TransportService {
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
-            Err(e) => Ok(Response::new(ShardDeleteResponse {
-                success: false,
-                deleted: 0,
-                error: e.to_string(),
-                seq_no: None,
-            })),
+            Err(e) => {
+                self.report_local_copy_failure(
+                    &req.index_name,
+                    &activated_primary.index_uuid,
+                    req.shard_id,
+                    activated_primary.allocation_id,
+                    &e,
+                )
+                .await;
+                Ok(Response::new(ShardDeleteResponse {
+                    success: false,
+                    deleted: 0,
+                    error: e.to_string(),
+                    seq_no: None,
+                }))
+            }
         }
     }
 
@@ -1827,9 +1897,7 @@ impl InternalTransport for TransportService {
                     },
                     |engine| {
                         if !docs.is_empty() {
-                            engine
-                                .bulk_add_documents_with_start_seq(docs, start_seq_no)
-                                .map_err(anyhow::Error::msg)?;
+                            engine.bulk_add_documents_with_start_seq(docs, start_seq_no)?;
                         }
                         Ok(engine.local_checkpoint())
                     },
@@ -2209,6 +2277,58 @@ impl InternalTransport for TransportService {
         }
     }
 
+    async fn mark_primary_unavailable(
+        &self,
+        request: Request<MarkPrimaryUnavailableRequest>,
+    ) -> Result<Response<MarkPrimaryUnavailableResponse>, Status> {
+        let req = request.into_inner();
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+        let allocation_id = req.allocation_id.ok_or_else(|| {
+            Status::invalid_argument("MarkPrimaryUnavailable requires an allocation ID")
+        })?;
+        if allocation_id == 0 {
+            return Err(Status::invalid_argument(
+                "MarkPrimaryUnavailable allocation ID must be greater than zero",
+            ));
+        }
+        let response = raft
+            .client_write(
+                crate::consensus::types::ClusterCommand::MarkPrimaryUnavailable {
+                    index_name: req.index_name,
+                    index_uuid: req.index_uuid,
+                    shard_id: req.shard_id,
+                    primary: req.primary_node_id,
+                    allocation_id,
+                },
+            )
+            .await
+            .map_err(|error| {
+                Status::internal(format!("Raft MarkPrimaryUnavailable failed: {error}"))
+            })?;
+        match response.data {
+            crate::consensus::types::ClusterResponse::Ok => {
+                Ok(Response::new(MarkPrimaryUnavailableResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                }))
+            }
+            crate::consensus::types::ClusterResponse::Error(error) => {
+                Ok(Response::new(MarkPrimaryUnavailableResponse {
+                    acknowledged: false,
+                    error,
+                }))
+            }
+        }
+    }
+
     async fn fail_shard_copy(
         &self,
         request: Request<FailShardCopyRequest>,
@@ -2237,15 +2357,33 @@ impl InternalTransport for TransportService {
             ));
         }
 
-        let response = raft
-            .client_write(crate::consensus::types::ClusterCommand::FailShardCopy {
+        let promotion_candidate = if req.promote_only {
+            let state = self.cluster_manager.get_state();
+            self.select_live_promotion_candidate(&state, &req.index_name, req.shard_id)
+        } else {
+            None
+        };
+        let command = if req.promote_only && promotion_candidate.is_none() {
+            crate::consensus::types::ClusterCommand::MarkPrimaryUnavailable {
+                index_name: req.index_name,
+                index_uuid: req.index_uuid,
+                shard_id: req.shard_id,
+                primary: req.node_id,
+                allocation_id,
+            }
+        } else {
+            crate::consensus::types::ClusterCommand::FailShardCopy {
                 index_name: req.index_name,
                 index_uuid: req.index_uuid,
                 shard_id: req.shard_id,
                 node: req.node_id,
                 allocation_id,
                 promote_only: req.promote_only,
-            })
+                promotion_candidate,
+            }
+        };
+        let response = raft
+            .client_write(command)
             .await
             .map_err(|error| Status::internal(format!("Raft FailShardCopy failed: {error}")))?;
         match response.data {
@@ -2898,6 +3036,21 @@ impl InternalTransport for TransportService {
 }
 
 impl TransportService {
+    fn select_live_promotion_candidate(
+        &self,
+        state: &crate::cluster::state::ClusterState,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Option<String> {
+        let metadata = state.indices.get(index_name)?;
+        let live_nodes = state.nodes.keys().cloned().collect();
+        let checkpoints = self
+            .shard_manager
+            .isr_tracker
+            .replica_checkpoints(index_name, shard_id);
+        metadata.select_live_promotion_candidate(shard_id, &checkpoints, &live_nodes)
+    }
+
     fn replica_apply_routing(
         &self,
         index_name: &str,
@@ -2957,6 +3110,7 @@ impl TransportService {
                     &self.local_node_id,
                 ),
             authoritative: ordinary_authoritative,
+            primary_unavailable: cluster_state.primary_unavailable(index_name, shard_id),
         })
     }
 
@@ -3001,6 +3155,7 @@ impl TransportService {
                 &self.local_node_id,
             ),
             authoritative: true,
+            primary_unavailable: cluster_state.primary_unavailable(index_name, shard_id),
         })
     }
 
@@ -3055,15 +3210,6 @@ impl TransportService {
                 "Failed to quarantine invalid local shard copy"
             );
         }
-        if promote_only && routing.in_sync_replicas.is_empty() {
-            tracing::warn!(
-                index = index_name,
-                shard_id,
-                allocation_id,
-                "Keeping failed primary routing unchanged because no in-sync promotion candidate exists"
-            );
-            return;
-        }
         const REPORT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let report_key = (index_uuid.to_string(), shard_id, allocation_id);
         let now = std::time::Instant::now();
@@ -3087,13 +3233,31 @@ impl TransportService {
             }
             reports.insert(report_key, now);
         }
+        let promotion_candidate = if promote_only {
+            self.select_live_promotion_candidate(&current, index_name, shard_id)
+        } else {
+            None
+        };
         let reason = error.to_string();
         let Some(raft) = self.raft.as_ref() else {
             return;
         };
         let result = if raft.is_leader() {
-            crate::consensus::client_write_checked(
-                raft,
+            let command = if promote_only && promotion_candidate.is_none() {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    allocation_id,
+                    "Keeping failed primary authority unchanged because no live in-sync promotion candidate exists"
+                );
+                crate::consensus::types::ClusterCommand::MarkPrimaryUnavailable {
+                    index_name: index_name.to_string(),
+                    index_uuid: index_uuid.to_string(),
+                    shard_id,
+                    primary: self.local_node_id.clone(),
+                    allocation_id,
+                }
+            } else {
                 crate::consensus::types::ClusterCommand::FailShardCopy {
                     index_name: index_name.to_string(),
                     index_uuid: index_uuid.to_string(),
@@ -3101,10 +3265,12 @@ impl TransportService {
                     node: self.local_node_id.clone(),
                     allocation_id,
                     promote_only,
-                },
-            )
-            .await
-            .map_err(anyhow::Error::msg)
+                    promotion_candidate,
+                }
+            };
+            crate::consensus::client_write_checked(raft, command)
+                .await
+                .map_err(anyhow::Error::msg)
         } else {
             let state = self.cluster_manager.get_state();
             let Some(master_id) = state.master_node.as_ref() else {
@@ -3191,6 +3357,7 @@ impl TransportService {
                 &self.local_node_id,
             ),
             authoritative: true,
+            primary_unavailable: cluster_state.primary_unavailable(index_name, shard_id),
         })
     }
 
@@ -3273,6 +3440,7 @@ impl TransportService {
             .unwrap_or_else(|error| error.into_inner())
             .get(&key)
             .is_some_and(|term| *term == current.primary_term)
+            && !current.primary_unavailable
         {
             return Ok(ActivatedPrimary {
                 index_uuid: current.index_uuid,
@@ -3341,6 +3509,7 @@ impl TransportService {
             .unwrap_or_else(|error| error.into_inner())
             .get(&key)
             .is_some_and(|term| *term == expected_term)
+            && !current.primary_unavailable
         {
             return Ok(ActivatedPrimary {
                 index_uuid,

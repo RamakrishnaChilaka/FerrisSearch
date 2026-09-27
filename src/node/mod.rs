@@ -195,6 +195,7 @@ fn should_attempt_failed_copy_report(
 async fn report_failed_shard_copies(
     failures: Vec<ShardCopyFailure>,
     cluster_manager: &ClusterManager,
+    shard_manager: &ShardManager,
     transport_client: &TransportClient,
     raft: &RaftInstance,
     recent_reports: &mut std::collections::HashMap<FailedCopyReportKey, Instant>,
@@ -219,19 +220,6 @@ async fn report_failed_shard_copies(
             );
             continue;
         }
-        if failure.promote_only
-            && current.indices[&failure.index_name].shard_routing[&failure.shard_id]
-                .in_sync_replicas
-                .is_empty()
-        {
-            tracing::warn!(
-                index = failure.index_name,
-                shard_id = failure.shard_id,
-                allocation_id = failure.allocation_id,
-                "Keeping failed primary routing unchanged because no in-sync promotion candidate exists"
-            );
-            continue;
-        }
         let report_key = (
             failure.index_uuid.clone(),
             failure.shard_id,
@@ -248,6 +236,16 @@ async fn report_failed_shard_copies(
             );
             continue;
         }
+        let promotion_candidate = if failure.promote_only {
+            let metadata = &current.indices[&failure.index_name];
+            let live_nodes = current.nodes.keys().cloned().collect();
+            let checkpoints = shard_manager
+                .isr_tracker
+                .replica_checkpoints(&failure.index_name, failure.shard_id);
+            metadata.select_live_promotion_candidate(failure.shard_id, &checkpoints, &live_nodes)
+        } else {
+            None
+        };
         tracing::error!(
             index = failure.index_name,
             shard_id = failure.shard_id,
@@ -256,13 +254,30 @@ async fn report_failed_shard_copies(
             reason = failure.reason,
             "Local authoritative shard copy failed closed"
         );
-        let command = ClusterCommand::FailShardCopy {
-            index_name: failure.index_name.clone(),
-            index_uuid: failure.index_uuid.clone(),
-            shard_id: failure.shard_id,
-            node: failure.node_id.clone(),
-            allocation_id: failure.allocation_id,
-            promote_only: failure.promote_only,
+        let command = if failure.promote_only && promotion_candidate.is_none() {
+            tracing::warn!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                allocation_id = failure.allocation_id,
+                "Keeping failed primary authority unchanged because no live in-sync promotion candidate exists"
+            );
+            ClusterCommand::MarkPrimaryUnavailable {
+                index_name: failure.index_name.clone(),
+                index_uuid: failure.index_uuid.clone(),
+                shard_id: failure.shard_id,
+                primary: failure.node_id.clone(),
+                allocation_id: failure.allocation_id,
+            }
+        } else {
+            ClusterCommand::FailShardCopy {
+                index_name: failure.index_name.clone(),
+                index_uuid: failure.index_uuid.clone(),
+                shard_id: failure.shard_id,
+                node: failure.node_id.clone(),
+                allocation_id: failure.allocation_id,
+                promote_only: failure.promote_only,
+                promotion_candidate,
+            }
         };
         let result = if raft.is_leader() {
             crate::consensus::client_write_checked(raft, command)
@@ -345,9 +360,9 @@ async fn activate_local_primaries(
 
 impl Node {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
-        if config.max_concurrent_peer_recoveries > 64 {
-            anyhow::bail!("max_concurrent_peer_recoveries must be between 0 and 64");
-        }
+        config
+            .validate_operational_limits()
+            .map_err(anyhow::Error::msg)?;
         let column_cache_percent = config.column_cache_size_percent;
         let column_cache_budget = tokio::task::spawn_blocking(move || {
             crate::engine::column_cache::resolve_column_cache_budget(column_cache_percent)
@@ -412,6 +427,10 @@ impl Node {
                 config.column_cache_populate_threshold,
             )),
         ));
+        shard_manager.configure_copy_retry_policy(
+            config.shard_io_failure_escalation_attempts,
+            Duration::from_millis(config.shard_io_failure_escalation_window_ms),
+        );
         let task_manager = Arc::new(crate::tasks::TaskManager::new());
 
         let storage_manager = Arc::new(match config.storage_uri.as_deref() {
@@ -681,6 +700,7 @@ impl Node {
             report_failed_shard_copies(
                 failures,
                 manager.as_ref(),
+                manager_clone.as_ref(),
                 &client,
                 raft.as_ref(),
                 &mut recent_failed_copy_reports,
@@ -718,6 +738,7 @@ impl Node {
                 report_failed_shard_copies(
                     failures,
                     manager.as_ref(),
+                    manager_clone.as_ref(),
                     &client,
                     raft.as_ref(),
                     &mut recent_failed_copy_reports,

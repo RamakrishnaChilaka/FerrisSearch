@@ -66,6 +66,14 @@ pub enum ClusterCommand {
         allocation_id: u64,
         expected_term: u64,
     },
+    /// Mark an exact allocated primary unavailable without changing routing.
+    MarkPrimaryUnavailable {
+        index_name: String,
+        index_uuid: String,
+        shard_id: u32,
+        primary: String,
+        allocation_id: u64,
+    },
     /// Conditionally remove a failed replica or promote away from a failed primary.
     /// Primary reports must set `promote_only` and cannot clear the last primary.
     FailShardCopy {
@@ -75,6 +83,7 @@ pub enum ClusterCommand {
         node: String,
         allocation_id: u64,
         promote_only: bool,
+        promotion_candidate: Option<String>,
     },
     /// Merge new field mappings into an existing index without replacing the
     /// entire metadata. This avoids TOCTOU races when concurrent documents
@@ -123,15 +132,25 @@ impl std::fmt::Display for ClusterCommand {
                 primary,
                 ..
             } => write!(f, "ActivatePrimary({index_name}/{shard_id}, {primary})"),
+            ClusterCommand::MarkPrimaryUnavailable {
+                index_name,
+                shard_id,
+                primary,
+                ..
+            } => write!(
+                f,
+                "MarkPrimaryUnavailable({index_name}/{shard_id}, {primary})"
+            ),
             ClusterCommand::FailShardCopy {
                 index_name,
                 shard_id,
                 node,
                 promote_only,
+                promotion_candidate,
                 ..
             } => write!(
                 f,
-                "FailShardCopy({index_name}/{shard_id}, {node}, promote_only={promote_only})"
+                "FailShardCopy({index_name}/{shard_id}, {node}, promote_only={promote_only}, candidate={promotion_candidate:?})"
             ),
             ClusterCommand::AddMappings {
                 index_name,
@@ -436,6 +455,14 @@ mod tests {
                 node: "node-2".into(),
                 allocation_id: 42,
                 promote_only: false,
+                promotion_candidate: None,
+            },
+            ClusterCommand::MarkPrimaryUnavailable {
+                index_name: "logs".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 2,
+                primary: "node-1".into(),
+                allocation_id: 41,
             },
         ];
 

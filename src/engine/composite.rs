@@ -395,6 +395,12 @@ impl CompositeEngine {
 }
 
 impl SearchEngine for CompositeEngine {
+    #[cfg(test)]
+    fn inject_wal_write_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
+        self.text
+            .inject_wal_write_failures_for_test(raw_os_error, attempts);
+    }
+
     fn add_document_with_receipt(
         &self,
         doc_id: &str,

@@ -829,6 +829,31 @@ impl TransportClient {
         Ok(())
     }
 
+    pub async fn forward_mark_primary_unavailable(
+        &self,
+        master: &NodeInfo,
+        request: MarkPrimaryUnavailableRequest,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
+        let response = client
+            .mark_primary_unavailable(tonic::Request::new(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("MarkPrimaryUnavailable RPC: {e}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.acknowledged {
+            return Err(anyhow::anyhow!(
+                "MarkPrimaryUnavailable was not acknowledged"
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn forward_fail_shard_copy(
         &self,
         master: &NodeInfo,

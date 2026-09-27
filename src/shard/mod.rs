@@ -45,6 +45,7 @@ fn definitive_shard_copy_failure(message: impl Into<String>) -> anyhow::Error {
 enum ShardCopyIoOperation {
     Open,
     Fence,
+    Apply,
     Recovery,
     PendingMarker,
     InstallMarker,
@@ -70,7 +71,7 @@ impl Default for ShardCopyRetryPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 3,
-            escalation_window: Duration::from_secs(15),
+            escalation_window: Duration::from_secs(60),
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(5),
         }
@@ -101,6 +102,13 @@ pub(crate) struct ShardCopyBackoff {
 pub(crate) struct PersistentShardCopyIoFailure {
     attempts: u32,
     elapsed_ms: u128,
+    #[source]
+    source: anyhow::Error,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("local shard storage I/O failed: {source}")]
+pub(crate) struct LocalShardStorageFailure {
     #[source]
     source: anyhow::Error,
 }
@@ -736,6 +744,15 @@ impl ShardManager {
         };
     }
 
+    pub fn configure_copy_retry_policy(&self, max_attempts: u32, escalation_window: Duration) {
+        let mut policy = self
+            .copy_retry_policy
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        policy.max_attempts = max_attempts;
+        policy.escalation_window = escalation_window;
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_assigned_open_io_failures(&self, raw_os_error: i32, attempts: usize) {
         *self
@@ -1124,6 +1141,9 @@ impl ShardManager {
                 || cause.downcast_ref::<serde_json::Error>().is_some()
                 || cause.downcast_ref::<std::num::ParseIntError>().is_some()
                 || cause
+                    .downcast_ref::<crate::engine::tantivy::AuthoritativeSchemaError>()
+                    .is_some()
+                || cause
                     .downcast_ref::<tantivy::TantivyError>()
                     .is_some_and(Self::tantivy_failure_is_definitive)
         })
@@ -1137,6 +1157,46 @@ impl ShardManager {
         Self::is_definitive_copy_failure(error) || Self::is_persistent_io_failure(error)
     }
 
+    pub(crate) fn ensure_local_apply_allowed(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        self.ensure_copy_io_attempt_allowed(&Self::copy_io_key(
+            index_uuid,
+            shard_id,
+            allocation_id,
+            ShardCopyIoOperation::Apply,
+        ))
+    }
+
+    pub(crate) fn record_local_apply_result<T>(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: AllocationId,
+        result: Result<T>,
+    ) -> Result<T> {
+        let retry_key = Self::copy_io_key(
+            index_uuid,
+            shard_id,
+            allocation_id,
+            ShardCopyIoOperation::Apply,
+        );
+        match result {
+            Ok(value) => {
+                self.clear_copy_io_failure(&retry_key);
+                Ok(value)
+            }
+            Err(error) if Self::is_definitive_copy_failure(&error) => Err(error),
+            Err(error) if Self::is_retryable_io_failure(&error) => {
+                Err(self.record_copy_io_failure(retry_key, error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn record_peer_recovery_failure(
         &self,
         index_uuid: &str,
@@ -1144,6 +1204,12 @@ impl ShardManager {
         allocation_id: AllocationId,
         error: anyhow::Error,
     ) -> anyhow::Error {
+        if Self::is_definitive_copy_failure(&error) {
+            return error;
+        }
+        if !error.is::<LocalShardStorageFailure>() {
+            return error;
+        }
         self.record_copy_io_failure(
             Self::copy_io_key(
                 index_uuid,
@@ -1153,6 +1219,12 @@ impl ShardManager {
             ),
             error,
         )
+    }
+
+    pub(crate) fn local_storage_failure(error: impl Into<anyhow::Error>) -> anyhow::Error {
+        anyhow::Error::new(LocalShardStorageFailure {
+            source: error.into(),
+        })
     }
 
     pub(crate) fn clear_peer_recovery_failure(
@@ -1880,7 +1952,9 @@ impl ShardManager {
             .get(&key)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("replica shard engine is not open"))?;
-        operation(engine)
+        self.ensure_local_apply_allowed(context.index_uuid, shard_id, context.allocation_id)?;
+        let result = operation(engine);
+        self.record_local_apply_result(context.index_uuid, shard_id, context.allocation_id, result)
     }
 
     pub async fn raise_copy_fence_blocking(
@@ -4470,6 +4544,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structural_tantivy_schema_failures_are_definitive() {
+        let missing_schema_dir = tempfile::tempdir().unwrap();
+        {
+            let manager = ShardManager::new(missing_schema_dir.path(), Duration::from_secs(60));
+            manager
+                .open_assigned_shard_with_settings(
+                    "idx",
+                    0,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "uuid-1",
+                    AssignedShardOpen {
+                        allocation_id: 7,
+                        primary_term: 2,
+                        allow_empty_creation: true,
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(
+            missing_schema_dir
+                .path()
+                .join("uuid-1/shard_0/index/meta.json"),
+            br#"{"segments":[]}"#,
+        )
+        .unwrap();
+        let restarted = ShardManager::new(missing_schema_dir.path(), Duration::from_secs(60));
+        let missing_schema = match restarted.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("missing Tantivy schema must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            ShardManager::is_definitive_copy_failure(&missing_schema),
+            "{missing_schema:#}"
+        );
+
+        let mapping_conflict_dir = tempfile::tempdir().unwrap();
+        let text_mapping = HashMap::from([(
+            "value".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        {
+            let manager = ShardManager::new(mapping_conflict_dir.path(), Duration::from_secs(60));
+            manager
+                .open_assigned_shard_with_settings(
+                    "idx",
+                    0,
+                    &text_mapping,
+                    &IndexSettings::default(),
+                    "uuid-1",
+                    AssignedShardOpen {
+                        allocation_id: 7,
+                        primary_term: 2,
+                        allow_empty_creation: true,
+                    },
+                )
+                .unwrap();
+        }
+        let integer_mapping = HashMap::from([(
+            "value".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Integer,
+                dimension: None,
+            },
+        )]);
+        let restarted = ShardManager::new(mapping_conflict_dir.path(), Duration::from_secs(60));
+        let mapping_conflict = match restarted.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &integer_mapping,
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("authoritative mapping conflict must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            ShardManager::is_definitive_copy_failure(&mapping_conflict),
+            "{mapping_conflict:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn retryable_recovery_cleanup_does_not_leave_a_failed_install_marker() {
         let dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
@@ -4604,5 +4780,233 @@ mod tests {
             !ShardManager::is_definitive_copy_failure(&error),
             "filesystem metadata I/O must remain retryable: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_replica_wal_io_escalates_under_apply_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine.inject_wal_write_failures_for_test(28, 3);
+
+        let mut reportable = Vec::new();
+        for seq_no in 0..3 {
+            let error = manager
+                .apply_replica_operation(
+                    "idx",
+                    0,
+                    ReplicaApplyContext {
+                        index_uuid: "uuid-1",
+                        allocation_id: 7,
+                        applied_view_term: 2,
+                        message_term: 2,
+                    },
+                    |engine| {
+                        engine
+                            .add_document_with_seq(
+                                "doc",
+                                serde_json::json!({"value": seq_no}),
+                                seq_no,
+                            )
+                            .map(|_| ())
+                    },
+                )
+                .unwrap_err();
+            reportable.push(ShardManager::should_report_copy_failure(&error));
+        }
+        assert_eq!(reportable, [false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn successful_replica_apply_clears_a_transient_apply_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(2, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine.inject_wal_write_failures_for_test(28, 1);
+        let first = manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| {
+                    engine
+                        .add_document_with_seq("doc", serde_json::json!({"value": 0}), 0)
+                        .map(|_| ())
+                },
+            )
+            .unwrap_err();
+        assert!(!ShardManager::should_report_copy_failure(&first));
+
+        manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| {
+                    engine
+                        .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
+                        .map(|_| ())
+                },
+            )
+            .unwrap();
+
+        engine.inject_wal_write_failures_for_test(28, 1);
+        let after_success = manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| {
+                    engine
+                        .add_document_with_seq("doc", serde_json::json!({"value": 2}), 1)
+                        .map(|_| ())
+                },
+            )
+            .unwrap_err();
+        assert!(!ShardManager::should_report_copy_failure(&after_success));
+
+        engine.inject_wal_write_failures_for_test(28, 1);
+        let persistent_after_reset = manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| {
+                    engine
+                        .add_document_with_seq("doc", serde_json::json!({"value": 3}), 1)
+                        .map(|_| ())
+                },
+            )
+            .unwrap_err();
+        assert!(ShardManager::should_report_copy_failure(
+            &persistent_after_reset
+        ));
+    }
+
+    #[tokio::test]
+    async fn apply_backoff_suppresses_repeated_engine_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(
+            3,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let apply = || {
+            manager.apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |_engine| -> Result<()> {
+                    attempts.fetch_add(1, AtomicOrdering::AcqRel);
+                    Err(std::io::Error::from_raw_os_error(28).into())
+                },
+            )
+        };
+        assert!(apply().is_err());
+        let backoff = apply().unwrap_err();
+        assert!(backoff.is::<ShardCopyBackoff>(), "{backoff:#}");
+        assert_eq!(attempts.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[test]
+    fn network_recovery_errors_do_not_consume_local_storage_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(2, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+
+        for _ in 0..3 {
+            let error = manager.record_peer_recovery_failure(
+                "uuid-1",
+                0,
+                7,
+                anyhow::anyhow!("recovery transport timed out"),
+            );
+            assert!(!ShardManager::should_report_copy_failure(&error));
+        }
+
+        let first_local = manager.record_peer_recovery_failure(
+            "uuid-1",
+            0,
+            7,
+            ShardManager::local_storage_failure(std::io::Error::from_raw_os_error(28)),
+        );
+        assert!(!ShardManager::should_report_copy_failure(&first_local));
+        let second_local = manager.record_peer_recovery_failure(
+            "uuid-1",
+            0,
+            7,
+            ShardManager::local_storage_failure(std::io::Error::from_raw_os_error(28)),
+        );
+        assert!(ShardManager::should_report_copy_failure(&second_local));
     }
 }

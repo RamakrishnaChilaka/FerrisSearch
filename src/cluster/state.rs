@@ -132,6 +132,10 @@ pub struct ShardAllocationIds {
     /// Set by the first successful allocation-bound ActivatePrimary command.
     #[serde(default)]
     pub primary_initialized: bool,
+    /// Status-only flag: the assigned primary could not serve from local
+    /// storage and no in-sync promotion candidate was available.
+    #[serde(default)]
+    pub primary_unavailable: bool,
 }
 
 impl ShardAllocationIds {
@@ -152,6 +156,7 @@ impl ShardAllocationIds {
                 .collect(),
             initial_allocation_id: allocation_id,
             primary_initialized: false,
+            primary_unavailable: false,
         })
     }
 
@@ -175,6 +180,11 @@ impl ShardAllocationIds {
         }
         if self.primary == Some(0) {
             return Err("primary allocation ID must be greater than zero".to_string());
+        }
+        if self.primary_unavailable && (!self.primary_initialized || self.primary.is_none()) {
+            return Err(
+                "primary unavailable status requires an initialized allocated primary".to_string(),
+            );
         }
         if self.replicas.len() != routing.replicas.len() {
             return Err(format!(
@@ -869,6 +879,29 @@ impl IndexMetadata {
             .or_else(|| routing.in_sync_replicas.first().cloned())
     }
 
+    pub fn select_live_promotion_candidate(
+        &self,
+        shard_id: u32,
+        replica_checkpoints: &[(String, u64)],
+        live_nodes: &std::collections::HashSet<NodeId>,
+    ) -> Option<NodeId> {
+        let routing = self.shard_routing.get(&shard_id)?;
+        replica_checkpoints
+            .iter()
+            .filter(|(node_id, _)| {
+                live_nodes.contains(node_id) && routing.is_replica_in_sync(node_id)
+            })
+            .max_by_key(|(_, checkpoint)| *checkpoint)
+            .map(|(node_id, _)| node_id.clone())
+            .or_else(|| {
+                routing
+                    .in_sync_replicas
+                    .iter()
+                    .find(|node_id| live_nodes.contains(*node_id))
+                    .cloned()
+            })
+    }
+
     /// Promote the first in-sync replica to primary for a given shard.
     /// Returns true if promotion occurred.
     pub fn promote_replica(&mut self, shard_id: u32) -> bool {
@@ -1125,6 +1158,11 @@ impl ClusterState {
     pub fn primary_initialized(&self, index_name: &str, shard_id: u32) -> bool {
         self.shard_allocation_ids(index_name, shard_id)
             .is_some_and(|allocation| allocation.primary_initialized)
+    }
+
+    pub fn primary_unavailable(&self, index_name: &str, shard_id: u32) -> bool {
+        self.shard_allocation_ids(index_name, shard_id)
+            .is_some_and(|allocation| allocation.primary_unavailable)
     }
 
     pub fn may_create_initial_empty_copy(
@@ -2971,6 +3009,13 @@ mod tests {
             .get_mut(&0)
             .unwrap()
             .primary_initialized = true;
+        state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_unavailable = true;
 
         let bytes = serde_json::to_vec(&state).unwrap();
         let restored: ClusterState = serde_json::from_slice(&bytes).unwrap();
@@ -2978,6 +3023,31 @@ mod tests {
         assert_eq!(restored.primary_allocation_id("idx", 0), Some(1));
         assert_eq!(restored.shard_allocation_id("idx", 0, "node-2"), Some(1));
         assert!(restored.primary_initialized("idx", 0));
+        assert!(restored.primary_unavailable("idx", 0));
+    }
+
+    #[test]
+    fn primary_unavailable_requires_initialized_allocated_primary() {
+        let mut state = ClusterState::new("unavailable-validation".into());
+        state.add_index(IndexMetadata::build_shard_routing(
+            "idx",
+            1,
+            0,
+            &["node-1".into()],
+        ));
+        let routing = state.indices["idx"].shard_routing[&0].clone();
+        let allocation = state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap();
+        allocation.primary_unavailable = true;
+        assert!(allocation.validate_for_routing(&routing).is_err());
+        allocation.primary_initialized = true;
+        assert!(allocation.validate_for_routing(&routing).is_ok());
+        allocation.primary = None;
+        assert!(allocation.validate_for_routing(&routing).is_err());
     }
 
     #[test]
@@ -3011,5 +3081,6 @@ mod tests {
         assert!(state.shard_allocations.is_empty());
         assert_eq!(state.primary_allocation_id("idx", 0), None);
         assert!(!state.may_create_initial_empty_copy("idx", 0, "node-1"));
+        assert!(!state.primary_unavailable("idx", 0));
     }
 }

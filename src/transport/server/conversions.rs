@@ -220,6 +220,9 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
                         primary_initialized: s
                             .shard_allocation_ids(&idx.name, *sid)
                             .is_some_and(|allocations| allocations.primary_initialized),
+                        primary_unavailable: s
+                            .shard_allocation_ids(&idx.name, *sid)
+                            .is_some_and(|allocations| allocations.primary_unavailable),
                         shard_id: *sid,
                         node_id: routing.primary.clone(),
                         primary_term: routing.primary_term,
@@ -317,6 +320,7 @@ pub fn proto_to_cluster_state(
                 replicas: replica_allocations,
                 initial_allocation_id,
                 primary_initialized: sa.primary_initialized,
+                primary_unavailable: sa.primary_unavailable,
             };
             allocations
                 .validate_for_routing(&routing)

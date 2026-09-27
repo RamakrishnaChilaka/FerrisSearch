@@ -1265,6 +1265,7 @@ async fn corrupt_in_sync_replica_is_failed_and_replication_resumes() {
     report_failed_shard_copies(
         vec![failure],
         &ClusterManager::with_shared_state(state_handle.clone()),
+        &restarted,
         &TransportClient::new(),
         raft.as_ref(),
         &mut std::collections::HashMap::new(),
@@ -1306,6 +1307,25 @@ async fn corrupt_primary_with_in_sync_replica_is_promoted() {
     while !raft.is_leader() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::task::yield_now().await;
+    }
+    for node_id in ["node-1", "node-2"] {
+        assert_eq!(
+            raft.client_write(ClusterCommand::AddNode {
+                node: crate::cluster::state::NodeInfo {
+                    id: node_id.into(),
+                    name: node_id.into(),
+                    host: "127.0.0.1".into(),
+                    transport_port: 0,
+                    http_port: 0,
+                    roles: vec![crate::cluster::state::NodeRole::Data],
+                    raft_node_id: 0,
+                },
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
     }
     let metadata = IndexMetadata {
         name: "idx".into(),
@@ -1411,6 +1431,7 @@ async fn corrupt_primary_with_in_sync_replica_is_promoted() {
     report_failed_shard_copies(
         vec![failure],
         &ClusterManager::with_shared_state(state_handle.clone()),
+        &restarted,
         &TransportClient::new(),
         raft.as_ref(),
         &mut std::collections::HashMap::new(),

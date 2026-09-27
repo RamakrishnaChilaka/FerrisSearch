@@ -277,6 +277,9 @@ pub trait WriteAheadLog: Send + Sync {
 
     /// Return the lowest currently pinned sequence boundary.
     fn min_retention_pin(&self) -> Option<u64>;
+
+    #[cfg(test)]
+    fn inject_write_io_failures_for_test(&self, _raw_os_error: i32, _attempts: usize) {}
 }
 
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
@@ -895,6 +898,8 @@ pub struct HotTranslog {
     recovery_scan_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
     #[cfg(test)]
     append_frame_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
+    #[cfg(test)]
+    write_io_failure: Arc<Mutex<Option<(i32, usize)>>>,
 }
 
 async fn sync_file_in_background(state: Arc<Mutex<TranslogState>>) -> std::io::Result<()> {
@@ -1037,7 +1042,23 @@ impl HotTranslog {
             recovery_scan_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             append_frame_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            write_io_failure: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_write_for_test(&self) -> Result<()> {
+        let mut failure = recover_lock(self.write_io_failure.as_ref(), "write I/O failure");
+        let Some((raw_os_error, remaining)) = failure.as_mut() else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            *failure = None;
+            return Ok(());
+        }
+        *remaining -= 1;
+        Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
     }
 
     /// Get the current (next) sequence number without incrementing.
@@ -1335,6 +1356,8 @@ impl HotTranslog {
 
 impl WriteAheadLog for HotTranslog {
     fn append(&self, op: WalOperation, payload: serde_json::Value) -> Result<TranslogEntry> {
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let seq_no = state.next_seq_no;
@@ -1380,6 +1403,8 @@ impl WriteAheadLog for HotTranslog {
         op: WalOperation,
         payload: serde_json::Value,
     ) -> Result<TranslogEntry> {
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let frame = encode_entry_borrowed(seq_no, op, &payload)?;
@@ -1402,6 +1427,8 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn append_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let start_seq_no = state.next_seq_no;
@@ -1445,6 +1472,8 @@ impl WriteAheadLog for HotTranslog {
         if ops.is_empty() {
             return Ok(None);
         }
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let start_seq_no = state.next_seq_no;
@@ -1485,6 +1514,8 @@ impl WriteAheadLog for HotTranslog {
                 .checked_add((ops.len() - 1) as u64)
                 .ok_or_else(|| anyhow::anyhow!("replica WAL sequence range overflows"))?;
         }
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let mut buf = Vec::with_capacity(ops.len() * 200);
@@ -1733,6 +1764,12 @@ impl WriteAheadLog for HotTranslog {
             .values()
             .copied()
             .min()
+    }
+
+    #[cfg(test)]
+    fn inject_write_io_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
+        *recover_lock(self.write_io_failure.as_ref(), "write I/O failure") =
+            Some((raw_os_error, attempts));
     }
 }
 

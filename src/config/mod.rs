@@ -79,6 +79,12 @@ pub struct AppConfig {
     /// Default: 2. Set to 0 to disable peer recovery.
     #[serde(default = "default_max_concurrent_peer_recoveries")]
     pub max_concurrent_peer_recoveries: usize,
+    /// Failed local shard I/O attempts required before persistent escalation.
+    #[serde(default = "default_shard_io_failure_escalation_attempts")]
+    pub shard_io_failure_escalation_attempts: u32,
+    /// Minimum elapsed failure window before persistent shard I/O escalation.
+    #[serde(default = "default_shard_io_failure_escalation_window_ms")]
+    pub shard_io_failure_escalation_window_ms: u64,
     /// Maximum docs to scan for GROUP BY queries that fall back to the
     /// tantivy_fast_fields path (expression GROUP BY, STDDEV_POP, etc.).
     /// Default: 1,000,000. Set to 0 for unlimited.
@@ -155,6 +161,14 @@ fn default_max_concurrent_peer_recoveries() -> usize {
     2
 }
 
+fn default_shard_io_failure_escalation_attempts() -> u32 {
+    3
+}
+
+fn default_shard_io_failure_escalation_window_ms() -> u64 {
+    60_000
+}
+
 fn default_sql_group_by_scan_limit() -> usize {
     1_000_000
 }
@@ -178,6 +192,8 @@ impl Default for AppConfig {
             column_cache_size_percent: 10,
             column_cache_populate_threshold: 5,
             max_concurrent_peer_recoveries: 2,
+            shard_io_failure_escalation_attempts: 3,
+            shard_io_failure_escalation_window_ms: 60_000,
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: true,
             transport_tls_enabled: false,
@@ -211,6 +227,14 @@ impl AppConfig {
                 "max_concurrent_peer_recoveries",
                 default.max_concurrent_peer_recoveries as u64,
             )?
+            .set_default(
+                "shard_io_failure_escalation_attempts",
+                default.shard_io_failure_escalation_attempts as u64,
+            )?
+            .set_default(
+                "shard_io_failure_escalation_window_ms",
+                default.shard_io_failure_escalation_window_ms,
+            )?
             .add_source(File::with_name("config/ferrissearch").required(false))
             .add_source(Environment::with_prefix("FERRISSEARCH"));
 
@@ -218,6 +242,23 @@ impl AppConfig {
         let app_config: AppConfig = config.try_deserialize()?;
 
         Ok(app_config)
+    }
+
+    pub fn validate_operational_limits(&self) -> Result<(), String> {
+        if self.max_concurrent_peer_recoveries > 64 {
+            return Err("max_concurrent_peer_recoveries must be between 0 and 64".to_string());
+        }
+        if self.shard_io_failure_escalation_attempts == 0 {
+            return Err(
+                "shard_io_failure_escalation_attempts must be greater than zero".to_string(),
+            );
+        }
+        if self.shard_io_failure_escalation_window_ms == 0 {
+            return Err(
+                "shard_io_failure_escalation_window_ms must be greater than zero".to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -410,6 +451,8 @@ mod tests {
         assert_eq!(config.column_cache_size_percent, 10);
         assert_eq!(config.column_cache_populate_threshold, 5);
         assert_eq!(config.max_concurrent_peer_recoveries, 2);
+        assert_eq!(config.shard_io_failure_escalation_attempts, 3);
+        assert_eq!(config.shard_io_failure_escalation_window_ms, 60_000);
     }
 
     #[test]
@@ -437,6 +480,8 @@ mod tests {
         assert_eq!(config.column_cache_size_percent, 10);
         assert_eq!(config.column_cache_populate_threshold, 5);
         assert_eq!(config.max_concurrent_peer_recoveries, 2);
+        assert_eq!(config.shard_io_failure_escalation_attempts, 3);
+        assert_eq!(config.shard_io_failure_escalation_window_ms, 60_000);
     }
 
     #[test]
@@ -449,6 +494,70 @@ mod tests {
         }"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.max_concurrent_peer_recoveries, 0);
+    }
+
+    #[test]
+    fn shard_io_escalation_deserializes_from_yaml_shape() {
+        let yaml = r#"
+node_name: n1
+cluster_name: test
+http_port: 9200
+transport_port: 9300
+data_dir: ./data
+seed_hosts: ["127.0.0.1:9300"]
+shard_io_failure_escalation_attempts: 5
+shard_io_failure_escalation_window_ms: 90000
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.shard_io_failure_escalation_attempts, 5);
+        assert_eq!(config.shard_io_failure_escalation_window_ms, 90_000);
+    }
+
+    #[test]
+    fn shard_io_escalation_environment_overrides() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        unsafe {
+            std::env::set_var("FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_ATTEMPTS", "7");
+            std::env::set_var(
+                "FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_WINDOW_MS",
+                "120000",
+            );
+        }
+        let config = AppConfig::load().unwrap();
+        unsafe {
+            std::env::remove_var("FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_ATTEMPTS");
+            std::env::remove_var("FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_WINDOW_MS");
+        }
+        assert_eq!(config.shard_io_failure_escalation_attempts, 7);
+        assert_eq!(config.shard_io_failure_escalation_window_ms, 120_000);
+    }
+
+    #[test]
+    fn shard_io_escalation_rejects_zero_values() {
+        let invalid_attempts = AppConfig {
+            shard_io_failure_escalation_attempts: 0,
+            ..Default::default()
+        };
+        assert!(
+            invalid_attempts
+                .validate_operational_limits()
+                .unwrap_err()
+                .contains("attempts")
+        );
+        let invalid_window = AppConfig {
+            shard_io_failure_escalation_window_ms: 0,
+            ..Default::default()
+        };
+        assert!(
+            invalid_window
+                .validate_operational_limits()
+                .unwrap_err()
+                .contains("window")
+        );
     }
 
     #[test]
