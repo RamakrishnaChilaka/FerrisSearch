@@ -306,6 +306,15 @@ join through peer recovery. Setting the limit to `0` keeps new indices
 single-copy for acknowledgement and promotion purposes until recovery is
 re-enabled and completes.
 
+Local shard-storage I/O uses bounded retry/backoff before routing escalation.
+`shard_io_failure_escalation_attempts` defaults to `3` and
+`shard_io_failure_escalation_window_ms` defaults to `60000`; both thresholds
+must be reached. The matching environment overrides are
+`FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_ATTEMPTS` and
+`FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_WINDOW_MS`. Corrupt storage metadata
+fails closed immediately, while network/transfer failures do not consume this
+local-storage budget.
+
 This pre-1.0 protocol does not adopt legacy shard directories or routing
 snapshots that lack allocation identity. Clusters created before this change
 must be recreated or reindexed; there is no rolling compatibility path.
