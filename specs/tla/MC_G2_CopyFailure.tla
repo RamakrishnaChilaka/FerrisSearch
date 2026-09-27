@@ -39,7 +39,8 @@ G2EmptyOpenProbe ==
     OpenAssignedEmptyCopy(LostNode)
 
 G2ReportFailure ==
-    ReportShardCopyFailure(LostNode)
+    \E candidate \in Nodes \cup {NoNode} :
+        ReportShardCopyFailure(LostNode, candidate)
 
 G2AllocateReplacement ==
     AllocateAfterLifecycle(MetadataLeader, LostNode)

@@ -194,9 +194,31 @@ CommittedAllocation(node) ==
         /\ raftLog[position].accepted
         /\ node \in raftLog[position].state.replicas
 
-FailShardCopyCommand(node, allocationId) ==
-    RaftCommand("FailShardCopy", node, node, NoNode, NoTerm, NoNode, {}, 0,
+FailShardCopyCommand(node, allocationId, promotionCandidate) ==
+    RaftCommand("FailShardCopy", node, node, NoNode, NoTerm,
+                promotionCandidate, {}, 0,
                 allocationId, EmptyAllocations)
+
+LeaderVisiblePromotionCandidates(failedNode) ==
+    LET leaderNode == IF raftLeader \in Nodes THEN raftLeader ELSE failedNode
+        leaderView == views[leaderNode]
+    IN {candidate \in leaderView.inSync \ {failedNode} : alive[candidate]}
+
+\* The leader's observed checkpoint tracker is abstracted by nextSeq.  Any
+\* highest-checkpoint tie remains nondeterministic, while the Raft state
+\* machine later validates only current in-sync membership.
+LeaderHighestCheckpointCandidates(failedNode) ==
+    LET candidates == LeaderVisiblePromotionCandidates(failedNode)
+    IN {candidate \in candidates :
+           \A other \in candidates : nextSeq[other] <= nextSeq[candidate]}
+
+LeaderSelectedFailureCandidate(failedNode, candidate) ==
+    LET leaderNode == IF raftLeader \in Nodes THEN raftLeader ELSE failedNode
+        leaderView == views[leaderNode]
+        candidates == LeaderVisiblePromotionCandidates(failedNode)
+    IN IF failedNode = leaderView.primary /\ candidates # {}
+       THEN candidate \in LeaderHighestCheckpointCandidates(failedNode)
+       ELSE candidate = NoNode
 
 LocalCopyMatchesView(node, local) ==
     /\ copyExists[node]
@@ -217,29 +239,34 @@ CopyFailureReportRequired(node) ==
     /\ AllocationIds
     /\ local.initialized
     /\ assigned
-    /\ ~LocalCopyMatchesView(node, local)
     \* A newly allocated out-of-sync replica is intentionally missing or may
     \* retain an old copy until recovery replaces it.  Authoritative copies
     \* and failed installs report; ordinary recovery targets do not churn.
     /\ (authoritative \/ failedInstall)
-    \* Persistent I/O is retryable until the bounded retry/window abstraction
-    \* reaches StorageFailed. Corruption is StorageFailed immediately.
-    /\ copyMode[node] # "StorageRetrying"
+    \* Persistent local I/O is retryable until the bounded retry/window
+    \* abstraction reaches StorageFailed or ApplyFailed. Corruption is
+    \* StorageFailed immediately.
+    /\ \/ ~LocalCopyMatchesView(node, local)
+       \/ copyMode[node] \in ReportableStorageFailureModes
+    /\ copyMode[node] \notin StorageRetryModes
 
 \* node::reconciliation::open_local_assigned_shards failure handling,
 \* TransportService::fail_shard_copy, and
 \* TransportClient::forward_fail_shard_copy.  The request carries the
-\* target-observed allocation ID; ClusterStateMachine::apply_command performs
-\* the exact match.
-ReportShardCopyFailure(node) ==
+\* target-observed allocation ID.  For a failed primary, the Raft leader also
+\* carries a live highest-checkpoint candidate from its view; the state machine
+\* performs the exact allocation and current in-sync checks.
+ReportShardCopyFailure(node, candidate) ==
     LET local == views[node]
         command ==
-            FailShardCopyCommand(node, local.allocations[node])
+            FailShardCopyCommand(node, local.allocations[node], candidate)
     IN
     /\ node \in Nodes
+    /\ candidate \in Nodes \cup {NoNode}
     /\ alive[node]
     /\ CanReachRaft(node)
     /\ CopyFailureReportRequired(node)
+    /\ LeaderSelectedFailureCandidate(node, candidate)
     /\ QueueRaft(command)
     /\ UNCHANGED
           <<routing, alive, epoch, raftConnected, activated,
@@ -279,8 +306,10 @@ CorruptShardStorage(node) ==
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
             FaultVars, PeerRecoveryVars>>
 
-\* A persistent EIO/open failure first enters bounded retry/backoff. The model
-\* abstracts the retry counter and time window as a separate escalation step.
+\* Persistent local I/O while opening a copy, persisting its fence, or reading
+\* recovery markers first enters bounded retry/backoff.  This copy-unavailable
+\* abstraction deliberately clears copyExists; apply-level failure below keeps
+\* the already-open copy readable.
 BeginPersistentStorageFailure(node) ==
     /\ FaultMode = "S1"
     /\ alive[node]
@@ -299,11 +328,49 @@ BeginPersistentStorageFailure(node) ==
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
             FaultVars, PeerRecoveryVars>>
 
+\* ShardManager::{ensure_local_apply_allowed,record_local_apply_result}, called
+\* by apply_replica_operation and the primary write handlers: the engine and
+\* identity are still open/readable, but every WAL/fsync/engine mutation fails.
+\* The first failed mutation moves ApplyFailing to ApplyRetrying.
+BeginPersistentApplyFailure(node) ==
+    /\ FaultMode = "S1"
+    /\ alive[node]
+    /\ copyExists[node]
+    /\ copyMode[node] = "Active"
+    /\ copyMode' = [copyMode EXCEPT ![node] = "ApplyFailing"]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            FaultVars, PeerRecoveryVars>>
+
 EscalatePersistentStorageFailure(node) ==
     /\ FaultMode = "S1"
     /\ alive[node]
     /\ copyMode[node] = "StorageRetrying"
     /\ copyMode' = [copyMode EXCEPT ![node] = "StorageFailed"]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            FaultVars, PeerRecoveryVars>>
+
+EscalatePersistentApplyFailure(node) ==
+    /\ FaultMode = "S1"
+    /\ alive[node]
+    /\ copyExists[node]
+    /\ copyMode[node] = "ApplyRetrying"
+    /\ copyMode' = [copyMode EXCEPT ![node] = "ApplyFailed"]
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -667,7 +734,7 @@ OpenAssignedEmptyCopy(node) ==
     /\ node \in Nodes
     /\ alive[node]
     /\ ~copyExists[node]
-    /\ copyMode[node] \notin {"StorageRetrying", "StorageFailed"}
+    /\ copyMode[node] \notin AllStorageFailureModes
     /\ IF AllocationIds
           THEN /\ assigned
                /\ initialCreateIndexAllocation
@@ -728,10 +795,13 @@ FaultCoreNext ==
            AllocateAfterLifecycle(leader, target)
     \/ \E target \in Nodes : ObserveAllocationAccepted(target)
     \/ \E target \in Nodes : ObserveAllocationRejected(target)
-    \/ \E node \in Nodes : ReportShardCopyFailure(node)
+    \/ \E node \in Nodes, candidate \in Nodes \cup {NoNode} :
+           ReportShardCopyFailure(node, candidate)
     \/ \E node \in Nodes : CorruptShardStorage(node)
     \/ \E node \in Nodes : BeginPersistentStorageFailure(node)
+    \/ \E node \in Nodes : BeginPersistentApplyFailure(node)
     \/ \E node \in Nodes : EscalatePersistentStorageFailure(node)
+    \/ \E node \in Nodes : EscalatePersistentApplyFailure(node)
     \/ \E node \in Nodes : LifecycleProposeActivation(node)
     \/ \E node \in Nodes : Flush(node)
     \/ \E node \in Nodes : DiskLoss(node)

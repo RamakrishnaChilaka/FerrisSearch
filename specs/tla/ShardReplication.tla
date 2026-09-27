@@ -35,7 +35,13 @@ AllWriteKinds == {"Put", "Delete"}
 WriteKinds == AllowedWriteKinds
 CopyModes ==
     {"Active", "Recovering", "Pending", "InstallMarker",
-     "StorageRetrying", "StorageFailed"}
+     "StorageRetrying", "StorageFailed",
+     "ApplyFailing", "ApplyRetrying", "ApplyFailed"}
+ApplyFailureModes == {"ApplyFailing", "ApplyRetrying", "ApplyFailed"}
+StorageRetryModes == {"StorageRetrying", "ApplyFailing", "ApplyRetrying"}
+ReportableStorageFailureModes == {"StorageFailed", "ApplyFailed"}
+AllStorageFailureModes ==
+    StorageRetryModes \cup ReportableStorageFailureModes
 MessageKinds == {"Replicate", "ReplicaAck", "ReplicaNack"}
 IndexUuid == "INDEX_UUID"
 NoIndexUuid == "NO_INDEX_UUID"
@@ -172,7 +178,10 @@ WriteMessages(writeId) ==
 
 BlocksLiveReplication(node) ==
     copyMode[node] \in
-        {"Recovering", "InstallMarker", "StorageRetrying", "StorageFailed"}
+        {"Recovering", "InstallMarker"} \cup AllStorageFailureModes
+
+ApplyMutationFails(node) ==
+    copyMode[node] \in ApplyFailureModes
 
 CopyAssignmentValid(node) ==
     \/ ~AllocationIds
@@ -324,7 +333,7 @@ ClientWrite(coordinator, doc, kind) ==
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic>>
 
-CanPrimaryAccept(writeId) ==
+CanPrimaryReachMutation(writeId) ==
     LET primaryNode == writeTarget[writeId]
     IN
     /\ writeStatus[writeId] = "Routed"
@@ -342,6 +351,12 @@ CanPrimaryAccept(writeId) ==
     /\ activated[primaryNode] = views[primaryNode].term
     /\ exclusiveHolder[primaryNode] = NoNode
     /\ nextSeq[primaryNode] < MaxWrites
+
+CanPrimaryAccept(writeId) ==
+    LET primaryNode == writeTarget[writeId]
+    IN
+    /\ CanPrimaryReachMutation(writeId)
+    /\ ~ApplyMutationFails(primaryNode)
 
 \* src/transport/server/mod.rs::{index_doc,bulk_index,delete_doc}
 \* ensure_primary_activated + peer_recovery_write_guard +
@@ -390,7 +405,7 @@ PrimaryAccept(writeId) ==
 PrimaryReject(writeId) ==
     /\ writeId \in WriteIds
     /\ writeStatus[writeId] = "Routed"
-    /\ ~CanPrimaryAccept(writeId)
+    /\ ~CanPrimaryReachMutation(writeId)
     /\ writeStatus' = [writeStatus EXCEPT ![writeId] = "Failed"]
     /\ failed' = failed \cup {writeId}
     /\ UNCHANGED
@@ -401,6 +416,34 @@ PrimaryReject(writeId) ==
             truncBelow, pins, copyExists, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic>>
+
+\* TransportService::{index_doc,bulk_index,delete_doc} after authority
+\* validation, plus ShardManager::record_local_apply_result, when the local
+\* primary's WAL/fsync/engine mutation returns persistent local-storage I/O.
+\* The first observed failure enters the shared retry state; no operation or
+\* replication message is published.
+PrimaryApplyFailure(writeId) ==
+    LET primaryNode == writeTarget[writeId]
+    IN
+    /\ writeId \in WriteIds
+    /\ CanPrimaryReachMutation(writeId)
+    /\ ApplyMutationFails(primaryNode)
+    /\ writeStatus' = [writeStatus EXCEPT ![writeId] = "Failed"]
+    /\ failed' = failed \cup {writeId}
+    /\ copyMode' =
+          [copyMode EXCEPT
+              ![primaryNode] =
+                  IF @ = "ApplyFailing" THEN "ApplyRetrying" ELSE @]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeDoc, writeKind, writeTarget,
+            writePrimary, writeEpoch, writeSeq, writeTerm, writeRequired,
+            writeWait, ops, durableOps, docValue, nextSeq, committed,
+            truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars,
+            termMonotonic>>
 
 \* src/transport/server/mod.rs::{replicate_doc,replicate_bulk}.  With
 \* ReplicaFencing = FALSE this preserves the merged no-term-check behavior.
@@ -464,6 +507,55 @@ ReplicaApply(message) ==
             failed, promotionSafe, admissionSafe, ackMembershipSafe,
             termMonotonic>>
 
+\* ShardManager::{apply_replica_operation,record_local_apply_result} after
+\* UUID/allocation/term validation, when WAL/fsync/engine mutation fails with
+\* persistent local-storage I/O. Validation may already have durably raised
+\* the replica fence, but the operation itself is not applied and the primary
+\* receives a NACK.
+ReplicaApplyFailure(message) ==
+    LET replica == message.to
+        response ==
+            Message("ReplicaNack", message.write, replica, message.from,
+                    message.seq, epoch[replica], message.fromEpoch,
+                    message.term, message.indexUuid,
+                    message.targetAllocation)
+    IN
+    /\ message \in messages
+    /\ message.kind = "Replicate"
+    /\ alive[replica]
+    /\ copyExists[replica]
+    /\ CopyAssignmentValid(replica)
+    /\ epoch[replica] = message.toEpoch
+    /\ epoch[message.from] = message.fromEpoch
+    /\ ApplyMutationFails(replica)
+    /\ ReplicaMessageValid(message)
+    /\ messages' = (messages \ {message}) \cup {response}
+    /\ copyMode' =
+          [copyMode EXCEPT
+              ![replica] =
+                  IF @ = "ApplyFailing" THEN "ApplyRetrying" ELSE @]
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![replica] =
+                  IF ReplicaFencing /\ @ < message.term
+                  THEN message.term
+                  ELSE @]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![replica] =
+                  IF ReplicaFencing /\ DurableReplicaFence /\ @ < message.term
+                  THEN message.term
+                  ELSE @]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation,
+            copyUuid, installMarker, sharedHolders, exclusiveHolder, acked,
+            failed, promotionSafe, admissionSafe, ackMembershipSafe,
+            ApplySafetyVars, termMonotonic>>
+
 \* Proposed transport/server replica fencing for
 \* TransportService::{replicate_doc,replicate_bulk}: reject UUID, allocation,
 \* recovery-gate, or stale-primary-term mismatches before WAL/engine mutation.
@@ -481,7 +573,8 @@ ReplicaReject(message) ==
     /\ copyExists[replica]
     /\ epoch[replica] = message.toEpoch
     /\ epoch[message.from] = message.fromEpoch
-    /\ \/ BlocksLiveReplication(replica)
+    /\ \/ /\ BlocksLiveReplication(replica)
+          /\ ~ApplyMutationFails(replica)
        \/ ~ReplicaMessageValid(message)
     /\ messages' = (messages \ {message}) \cup {response}
     /\ UNCHANGED
@@ -709,12 +802,10 @@ UpdateRoutingAccepted(current, command) ==
 SurvivingInSync(current, failedNode) ==
     current.inSync \ {failedNode}
 
-\* IndexMetadata::select_promotion_candidate is abstracted as a deterministic
-\* choice because checkpoint ranking is outside this bounded state.
-FailurePromotionCandidate(current, failedNode) ==
-    CHOOSE candidate \in SurvivingInSync(current, failedNode) : TRUE
-
 \* ClusterStateMachine::apply_command for ClusterCommand::FailShardCopy.
+\* For a failed primary, command.newPrimary carries the leader-selected live,
+\* highest-checkpoint candidate.  The state machine deliberately validates
+\* only current authoritative in-sync membership and the allocation CAS.
 FailShardCopyAccepted(current, command) ==
     /\ AllocationIds
     /\ current.initialized
@@ -726,17 +817,21 @@ FailShardCopyAccepted(current, command) ==
        current.allocations[command.target]
     /\ current.unassigned < Cardinality(Nodes)
     /\ IF command.target = current.primary
-       THEN /\ SurvivingInSync(current, command.target) # {}
+       THEN /\ command.newPrimary
+               \in SurvivingInSync(current, command.target)
             /\ current.term < MaxTerm
-       ELSE TRUE
+       ELSE command.newPrimary = NoNode
 
-AfterFailShardCopy(current, failedNode) ==
-    LET failedPrimary == failedNode = current.primary
+AfterFailShardCopy(current, command) ==
+    LET failedNode == command.target
+        failedPrimary == failedNode = current.primary
         survivors == SurvivingInSync(current, failedNode)
-        canPromote == failedPrimary /\ survivors # {}
+        canPromote ==
+            /\ failedPrimary
+            /\ command.newPrimary \in survivors
         nextPrimary ==
             IF canPromote
-            THEN FailurePromotionCandidate(current, failedNode)
+            THEN command.newPrimary
             ELSE current.primary
         nextReplicas ==
             IF canPromote
@@ -812,7 +907,7 @@ AfterAcceptedCommand(current, command) ==
                          current.unassigned, current.members,
                          current.allocations, current.initialized)
       [] command.kind = "FailShardCopy" ->
-            AfterFailShardCopy(current, command.target)
+            AfterFailShardCopy(current, command)
       [] command.kind = "RemoveNode" ->
             RoutingState(current.primary, current.term, current.replicas,
                          current.inSync, current.unassigned,
@@ -993,6 +1088,7 @@ ReplicationStableNext ==
            ClientWrite(coordinator, doc, kind)
     \/ \E writeId \in WriteIds : PrimaryAccept(writeId)
     \/ \E writeId \in WriteIds : PrimaryReject(writeId)
+    \/ \E writeId \in WriteIds : PrimaryApplyFailure(writeId)
     \/ \E message \in messages : ReplicaReject(message)
     \/ \E message \in messages : DeliverReplicaAck(message)
     \/ \E message \in messages : DeliverReplicaNack(message)
@@ -1003,6 +1099,7 @@ ReplicationStableNext ==
 
 ReplicationFenceChangingNext ==
     \/ \E message \in messages : ReplicaApply(message)
+    \/ \E message \in messages : ReplicaApplyFailure(message)
     \/ \E node \in Nodes : ObserveActivation(node)
     \/ \E command \in pendingRaft : CommitRaft(command)
     \/ \E node \in Nodes : DeliverView(node)

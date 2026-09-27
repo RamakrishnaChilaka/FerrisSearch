@@ -7,7 +7,7 @@ TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 DEFAULT_JAR="${XDG_CACHE_HOME:-$HOME/.cache}/ferrissearch-tla/v${TLA_VERSION}/tla2tools.jar"
-WORKERS="${TLA_WORKERS:-4}"
+WORKERS="${TLA_WORKERS:-8}"
 TIMEOUT_SECONDS="${TLA_TIMEOUT_SECONDS:-300}"
 LONG_TIMEOUT_SECONDS="${TLA_LONG_TIMEOUT_SECONDS:-1800}"
 SIMULATION_TRACES="${TLA_SIMULATION_TRACES:-10000}"
@@ -91,6 +91,10 @@ default_configs=(
     storage-replica
     storage-primary
     storage-primary-no-replica
+    storage-apply-replica
+    storage-apply-primary
+    storage-apply-primary-no-replica
+    storage-apply-no-escalation
     two-shard
 )
 
@@ -132,6 +136,10 @@ l2                      pass: fair recovery after one crash and restart
 storage-replica         pass: persistent replica storage failure is removed
 storage-primary         pass: persistent primary storage failure promotes
 storage-primary-no-replica pass: promote-only primary report is rejected
+storage-apply-replica   pass: open replica apply I/O escalates and is removed
+storage-apply-primary   pass: open primary apply I/O escalates and promotes
+storage-apply-primary-no-replica pass: no-candidate apply report is rejected
+storage-apply-no-escalation expected temporal failure without apply escalation
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -305,6 +313,26 @@ run_config() {
             module="MC_StorageFailure.tla"
             cfg="MC_StoragePrimaryNoReplica.cfg"
             expected="pass"
+            ;;
+        storage-apply-replica|MC_ApplyStorageReplica)
+            module="MC_ApplyStorageFailure.tla"
+            cfg="MC_ApplyStorageReplica.cfg"
+            expected="pass"
+            ;;
+        storage-apply-primary|MC_ApplyStoragePrimary)
+            module="MC_ApplyStorageFailure.tla"
+            cfg="MC_ApplyStoragePrimary.cfg"
+            expected="pass"
+            ;;
+        storage-apply-primary-no-replica|MC_ApplyStoragePrimaryNoReplica)
+            module="MC_ApplyStorageFailure.tla"
+            cfg="MC_ApplyStoragePrimaryNoReplica.cfg"
+            expected="pass"
+            ;;
+        storage-apply-no-escalation|MC_ApplyStorageReplicaNoEscalation)
+            module="MC_ApplyStorageFailure.tla"
+            cfg="MC_ApplyStorageReplicaNoEscalation.cfg"
+            expected="temporal"
             ;;
         two-shard|MC_TwoShardIsolation)
             module="MC_TwoShardIsolation.tla"

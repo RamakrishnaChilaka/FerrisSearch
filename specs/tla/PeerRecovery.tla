@@ -197,7 +197,7 @@ TargetNeedsRecovery(target, source) ==
     /\ targetView.primary = source
     /\ target \in targetView.replicas
     /\ target \notin targetView.inSync
-    /\ copyMode[target] \notin {"StorageRetrying", "StorageFailed"}
+    /\ copyMode[target] \notin AllStorageFailureModes
 
 AvailableRecoveryWrites(target, upperBound) ==
     LET source == sessionSource[target]
@@ -381,7 +381,7 @@ TargetBeginInstall(target) ==
     /\ sessionPhase[target] = "SnapshotReady"
     /\ alive[target]
     /\ copyMode[target]
-       \notin {"Pending", "StorageRetrying", "StorageFailed"}
+       \notin {"Pending"} \cup AllStorageFailureModes
     /\ IF RestorePendingOnRestart
           THEN ~PendingMarkerMatchesCopy(target)
           ELSE TRUE

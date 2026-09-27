@@ -59,7 +59,7 @@ G2StopFaults ==
 
 G2ReportFailure ==
     /\ ~FailureAccepted(TargetNode)
-    /\ ReportShardCopyFailure(TargetNode)
+    /\ ReportShardCopyFailure(TargetNode, NoNode)
     /\ UNCHANGED ApplySafetyVars
 
 G2Commit ==
@@ -80,7 +80,7 @@ G2ObserveAllocation ==
 \* has installed a fresh routing identity.
 G2SubmitStaleFailure ==
     LET stale ==
-            FailShardCopyCommand(TargetNode, 1)
+            FailShardCopyCommand(TargetNode, 1, NoNode)
     IN
     /\ routing.allocations[TargetNode] > 1
     /\ ~RejectedStaleFailure(TargetNode)

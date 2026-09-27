@@ -1,9 +1,9 @@
 -------------------------- MODULE MC_StorageFailure -------------------------
-\* R2-1 persistent storage-failure model. A live copy becomes unavailable
-\* because of either definitive corruption or persistent I/O. Persistent I/O
-\* first enters retry/backoff and then escalates nondeterministically after the
-\* bounded retry window. Replica reports remove the copy; primary reports are
-\* promote-only and require an in-sync survivor.
+\* R2-1 copy-unavailable storage-failure model. A live copy becomes unopenable
+\* because of either definitive corruption or persistent open/fence/marker
+\* I/O. Persistent I/O first enters retry/backoff and then escalates after the
+\* bounded retry window. Apply-level failure of an open copy is modeled
+\* separately by MC_ApplyStorageFailure.
 
 EXTENDS Invariants
 
@@ -79,7 +79,11 @@ StorageEscalates ==
 StorageReports ==
     /\ copyMode[FailedNode] = "StorageFailed"
     /\ (FailedNode = routing.primary \/ FailedNode \in routing.replicas)
-    /\ ReportShardCopyFailure(FailedNode)
+    /\ ReportShardCopyFailure(
+          FailedNode,
+          IF FailedNode = routing.primary /\ routing.inSync # {}
+          THEN CandidateNode
+          ELSE NoNode)
     /\ UNCHANGED ApplySafetyVars
 
 StorageCommit ==
