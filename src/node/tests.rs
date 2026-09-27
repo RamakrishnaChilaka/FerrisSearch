@@ -30,6 +30,33 @@ fn dead_node_removal_waits_for_routing_update_success() {
     );
 }
 
+#[test]
+fn failed_copy_reports_are_throttled_per_allocation() {
+    let mut reports = std::collections::HashMap::new();
+    let now = std::time::Instant::now();
+    let key = ("uuid-1".to_string(), 0, "node-1".to_string(), 7);
+    assert!(should_attempt_failed_copy_report(
+        &mut reports,
+        key.clone(),
+        now
+    ));
+    assert!(!should_attempt_failed_copy_report(
+        &mut reports,
+        key.clone(),
+        now + Duration::from_secs(59),
+    ));
+    assert!(should_attempt_failed_copy_report(
+        &mut reports,
+        key,
+        now + Duration::from_secs(60),
+    ));
+    assert!(should_attempt_failed_copy_report(
+        &mut reports,
+        ("uuid-1".to_string(), 0, "node-1".to_string(), 8),
+        now + Duration::from_secs(1),
+    ));
+}
+
 #[tokio::test]
 async fn open_local_assigned_shards_opens_unopened_local_shards() {
     let dir = tempfile::tempdir().unwrap();
@@ -116,8 +143,8 @@ fn open_local_assigned_shards_skips_missing_expected_uuid_dir_for_recovered_assi
     assert!(!dir.path().join("expected-uuid").exists());
 }
 
-#[test]
-fn failed_recovery_marker_reports_only_the_matching_inactive_assignment() {
+#[tokio::test]
+async fn failed_recovery_marker_reports_only_the_matching_inactive_assignment() {
     let dir = tempfile::tempdir().unwrap();
     let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
     let mut state = crate::cluster::state::ClusterState::new("node-test".into());
@@ -161,12 +188,18 @@ fn failed_recovery_marker_reports_only_the_matching_inactive_assignment() {
     )
     .unwrap();
 
-    assert!(shard_manager.begin_peer_recovery_target("idx", 0));
+    let shard_manager = Arc::new(shard_manager);
+    assert!(
+        shard_manager
+            .begin_peer_recovery_target_blocking("idx".into(), 0, "idx-uuid".into(), allocation_id,)
+            .await
+            .unwrap()
+    );
     assert!(
         open_local_assigned_shards(
             &state,
             "node-2",
-            &shard_manager,
+            shard_manager.as_ref(),
             &std::sync::Mutex::new(std::collections::HashSet::new()),
         )
         .is_empty(),
@@ -177,7 +210,7 @@ fn failed_recovery_marker_reports_only_the_matching_inactive_assignment() {
     let failures = open_local_assigned_shards(
         &state,
         "node-2",
-        &shard_manager,
+        shard_manager.as_ref(),
         &std::sync::Mutex::new(std::collections::HashSet::new()),
     );
     assert_eq!(failures.len(), 1);
@@ -197,7 +230,7 @@ fn failed_recovery_marker_reports_only_the_matching_inactive_assignment() {
         open_local_assigned_shards(
             &state,
             "node-2",
-            &shard_manager,
+            shard_manager.as_ref(),
             &std::sync::Mutex::new(std::collections::HashSet::new()),
         )
         .is_empty(),

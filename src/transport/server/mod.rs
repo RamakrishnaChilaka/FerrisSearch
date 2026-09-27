@@ -53,6 +53,7 @@ fn new_join_lock() -> Arc<Mutex<()>> {
 struct PrimaryActivationState {
     activated_terms: RwLock<HashMap<(String, u32, u64), u64>>,
     activation_lock: Mutex<()>,
+    failed_copy_reports: Mutex<HashMap<(String, u32, u64), std::time::Instant>>,
 }
 
 fn new_primary_activation_state() -> Arc<PrimaryActivationState> {
@@ -1584,7 +1585,7 @@ impl InternalTransport for TransportService {
                     &assigned_uuid,
                     req.shard_id,
                     allocation_id,
-                    &error.to_string(),
+                    &error,
                 )
                 .await;
             }
@@ -1742,7 +1743,7 @@ impl InternalTransport for TransportService {
                     &assigned_uuid,
                     req.shard_id,
                     allocation_id,
-                    &error.to_string(),
+                    &error,
                 )
                 .await;
             }
@@ -2984,8 +2985,42 @@ impl TransportService {
         index_uuid: &str,
         shard_id: u32,
         allocation_id: u64,
-        reason: &str,
+        error: &anyhow::Error,
     ) {
+        if !ShardManager::is_definitive_copy_failure(error) {
+            tracing::warn!(
+                index = index_name,
+                shard_id,
+                allocation_id,
+                error = %error,
+                "Local shard-copy error is retryable and was not reported to routing"
+            );
+            return;
+        }
+        const REPORT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        let report_key = (index_uuid.to_string(), shard_id, allocation_id);
+        let now = std::time::Instant::now();
+        {
+            let mut reports = self
+                .primary_activation_state
+                .failed_copy_reports
+                .lock()
+                .await;
+            if reports
+                .get(&report_key)
+                .is_some_and(|last| now.duration_since(*last) < REPORT_RETRY_INTERVAL)
+            {
+                tracing::debug!(
+                    index = index_name,
+                    shard_id,
+                    allocation_id,
+                    "Suppressing duplicate local shard-copy failure report"
+                );
+                return;
+            }
+            reports.insert(report_key, now);
+        }
+        let reason = error.to_string();
         if let Err(error) = self
             .shard_manager
             .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
@@ -3020,7 +3055,7 @@ impl TransportService {
                 tracing::warn!(
                     index = index_name,
                     shard_id,
-                    reason,
+                    reason = reason.as_str(),
                     "Cannot report local shard failure because no Raft leader is known"
                 );
                 return;
@@ -3029,7 +3064,7 @@ impl TransportService {
                 tracing::warn!(
                     index = index_name,
                     shard_id,
-                    reason,
+                    reason = reason.as_str(),
                     master = master_id,
                     "Cannot report local shard failure because the Raft leader is absent"
                 );
@@ -3053,7 +3088,7 @@ impl TransportService {
                 index = index_name,
                 shard_id,
                 allocation_id,
-                reason,
+                reason = reason.as_str(),
                 error = %error,
                 "Local shard-copy failure report was not applied"
             );
@@ -3129,7 +3164,7 @@ impl TransportService {
                 &current.index_uuid,
                 shard_id,
                 current.allocation_id,
-                &error.to_string(),
+                &error,
             )
             .await;
             return Err(format!("failed to open primary shard copy: {error}"));
@@ -3150,7 +3185,7 @@ impl TransportService {
                 &current.index_uuid,
                 shard_id,
                 current.allocation_id,
-                &error.to_string(),
+                &error,
             )
             .await;
             return Err(format!("failed to persist primary fence: {error}"));
@@ -3202,7 +3237,7 @@ impl TransportService {
                 &current.index_uuid,
                 shard_id,
                 current.allocation_id,
-                &error.to_string(),
+                &error,
             )
             .await;
             return Err(format!("failed to open primary shard copy: {error}"));
@@ -3223,7 +3258,7 @@ impl TransportService {
                 &current.index_uuid,
                 shard_id,
                 current.allocation_id,
-                &error.to_string(),
+                &error,
             )
             .await;
             return Err(format!("failed to persist primary fence: {error}"));
@@ -3357,7 +3392,7 @@ impl TransportService {
                 &index_uuid,
                 shard_id,
                 allocation_id,
-                &error.to_string(),
+                &error,
             )
             .await;
             return Err(format!(
@@ -3474,7 +3509,7 @@ impl TransportService {
                     &assigned.index_uuid,
                     shard_id,
                     assigned.allocation_id,
-                    &error.to_string(),
+                    &error,
                 )
                 .await;
                 return Err(Status::failed_precondition(error.to_string()));
@@ -3511,7 +3546,7 @@ impl TransportService {
                         &assigned.index_uuid,
                         shard_id,
                         assigned.allocation_id,
-                        &error.to_string(),
+                        &error,
                     )
                     .await;
                     Err(Status::internal(format!("Failed to open shard: {error}")))
@@ -3542,7 +3577,7 @@ impl TransportService {
                     &assigned.index_uuid,
                     shard_id,
                     assigned.allocation_id,
-                    &error.to_string(),
+                    &error,
                 )
                 .await;
                 Err(Status::internal(format!("Failed to open shard: {error}")))

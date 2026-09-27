@@ -171,15 +171,23 @@ impl PeerRecoveryDriver {
                         );
                     }
                     Err(error) => {
-                        if destructive_started.load(Ordering::Acquire) {
-                            let _ = shard_manager
-                                .abort_peer_recovery_target_blocking(
+                        if destructive_started.load(Ordering::Acquire)
+                            && let Err(cleanup_error) = shard_manager
+                                .reset_peer_recovery_target_for_retry_blocking(
                                     candidate.index_name.clone(),
                                     candidate.shard_id,
                                     candidate.metadata.uuid.to_string(),
                                     candidate.allocation_id,
                                 )
-                                .await;
+                                .await
+                        {
+                            tracing::warn!(
+                                index = candidate.index_name,
+                                shard_id = candidate.shard_id,
+                                allocation_id = candidate.allocation_id,
+                                error = %cleanup_error,
+                                "Peer recovery retry cleanup failed; retaining the active target gate"
+                            );
                         }
                         let mut retries = driver
                             .retries
@@ -224,8 +232,49 @@ impl PeerRecoveryDriver {
         let mut pending_keys = HashSet::new();
         for (key, target_state) in shard_manager.peer_recovery_target_states() {
             pending_keys.insert(key.clone());
-            let PeerRecoveryTargetState::FinalizedAwaitingMembership(pending) = target_state else {
-                continue;
+            let pending = match target_state {
+                PeerRecoveryTargetState::Recovering {
+                    index_uuid,
+                    allocation_id,
+                } => {
+                    {
+                        let mut active = self
+                            .active
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if !active.insert(key.clone()) {
+                            continue;
+                        }
+                    }
+                    let driver = self.clone();
+                    let shard_manager = shard_manager.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = shard_manager
+                            .reset_peer_recovery_target_for_retry_blocking(
+                                key.index.clone(),
+                                key.shard_id,
+                                index_uuid,
+                                allocation_id,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                index = key.index,
+                                shard_id = key.shard_id,
+                                allocation_id,
+                                error = %error,
+                                "Failed to clean a retryable peer recovery target"
+                            );
+                        }
+                        driver
+                            .active
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .remove(&key);
+                    });
+                    continue;
+                }
+                PeerRecoveryTargetState::FinalizedAwaitingMembership(pending) => pending,
             };
             let observation = observe_target_membership(state, &key, local_node_id, &pending);
             if observation == TargetMembershipObservation::Unknown {
@@ -347,6 +396,9 @@ fn observe_target_membership(
     {
         return TargetMembershipObservation::Admitted;
     }
+    if routing.primary != pending.primary_node_id || routing.primary_term > pending.primary_term {
+        return TargetMembershipObservation::Rejected;
+    }
     TargetMembershipObservation::Unknown
 }
 
@@ -406,7 +458,12 @@ async fn run_peer_recovery(
     validate_file_manifest(&start.files)?;
 
     if !shard_manager
-        .begin_peer_recovery_target_blocking(candidate.index_name.clone(), candidate.shard_id)
+        .begin_peer_recovery_target_blocking(
+            candidate.index_name.clone(),
+            candidate.shard_id,
+            candidate.metadata.uuid.to_string(),
+            candidate.allocation_id,
+        )
         .await?
     {
         anyhow::bail!("peer recovery target is already active");
@@ -597,6 +654,15 @@ async fn run_peer_recovery(
             }
         }
         TargetMembershipObservation::Rejected => {
+            shard_manager
+                .abort_peer_recovery_target_blocking(
+                    candidate.index_name.clone(),
+                    candidate.shard_id,
+                    pending.index_uuid,
+                    pending.allocation_id,
+                )
+                .await?;
+            destructive_started.store(false, Ordering::Release);
             anyhow::bail!("peer recovery membership was definitively rejected")
         }
         TargetMembershipObservation::Unknown => Ok(RecoveryRunOutcome::AwaitingMembership(stats)),
@@ -1375,6 +1441,343 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_target_rejects_newer_term_or_different_primary() {
+        let pending = PeerRecoveryAwaitingMembership {
+            index_uuid: "docs-uuid".into(),
+            allocation_id: 1,
+            primary_node_id: "primary-node".into(),
+            primary_term: 7,
+        };
+        let mut bumped = ClusterState::new("probe".into());
+        bumped.add_index(IndexMetadata {
+            name: "docs".into(),
+            uuid: IndexUuid::new("docs-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary-node".into(),
+                    primary_term: 8,
+                    replicas: vec!["replica-node".into()],
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        });
+        bumped
+            .shard_allocations
+            .get_mut("docs")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_initialized = true;
+        let mut changed = bumped.clone();
+        changed
+            .indices
+            .get_mut("docs")
+            .unwrap()
+            .shard_routing
+            .get_mut(&0)
+            .unwrap()
+            .primary = "other-primary".into();
+
+        assert_eq!(
+            observe_target_membership(&bumped, &ShardKey::new("docs", 0), "replica-node", &pending,),
+            TargetMembershipObservation::Rejected
+        );
+        assert_eq!(
+            observe_target_membership(
+                &changed,
+                &ShardKey::new("docs", 0),
+                "replica-node",
+                &pending,
+            ),
+            TargetMembershipObservation::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_pending_target_is_restored_before_recovery_scheduling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ClusterState::new("probe".into());
+        state.add_index(IndexMetadata {
+            name: "docs".into(),
+            uuid: IndexUuid::new("docs-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary-node".into(),
+                    primary_term: 7,
+                    replicas: vec!["replica-node".into()],
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        });
+        state
+            .shard_allocations
+            .get_mut("docs")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_initialized = true;
+        let allocation_id = state
+            .shard_allocation_id("docs", 0, "replica-node")
+            .unwrap();
+        {
+            let first = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+            let engine = first
+                .open_assigned_shard_with_settings(
+                    "docs",
+                    0,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "docs-uuid",
+                    crate::shard::AssignedShardOpen {
+                        allocation_id,
+                        primary_term: 7,
+                        allow_empty_creation: true,
+                    },
+                )
+                .unwrap();
+            engine
+                .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
+                .unwrap();
+            engine.refresh().unwrap();
+            engine.flush().unwrap();
+            assert!(first.begin_peer_recovery_target("docs", 0));
+            first
+                .mark_peer_recovery_awaiting_membership_blocking(
+                    "docs".into(),
+                    0,
+                    PeerRecoveryAwaitingMembership {
+                        index_uuid: "docs-uuid".into(),
+                        allocation_id,
+                        primary_node_id: "primary-node".into(),
+                        primary_term: 7,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let failures = crate::node::reconciliation::open_local_assigned_shards(
+            &state,
+            "replica-node",
+            &restarted,
+            &std::sync::Mutex::new(std::collections::HashSet::new()),
+        );
+        assert!(failures.is_empty());
+        assert!(
+            restarted.is_peer_recovery_target("docs", 0),
+            "durable pending marker must be restored before recovery scheduling"
+        );
+        assert!(
+            restarted.get_shard("docs", 0).is_some(),
+            "the finalized pending copy must reopen intact"
+        );
+        assert_eq!(
+            restarted
+                .get_shard("docs", 0)
+                .unwrap()
+                .get_document("doc")
+                .unwrap()
+                .unwrap()["value"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restarted_pending_target_is_not_recovered_again_over_transport() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut state = ClusterState::new("pending-restart-transport".into());
+        state.add_node(NodeInfo {
+            id: "primary-node".into(),
+            name: "primary-node".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 0,
+            http_port: 0,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 1,
+        });
+        state.add_node(NodeInfo {
+            id: "replica-node".into(),
+            name: "replica-node".into(),
+            host: "127.0.0.1".into(),
+            transport_port: 0,
+            http_port: 0,
+            roles: vec![NodeRole::Data],
+            raft_node_id: 2,
+        });
+        state.add_index(IndexMetadata {
+            name: "docs".into(),
+            uuid: IndexUuid::new("docs-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary-node".into(),
+                    primary_term: 7,
+                    replicas: vec!["replica-node".into()],
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        });
+        state
+            .shard_allocations
+            .get_mut("docs")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_initialized = true;
+        let source_allocation = state
+            .shard_allocation_id("docs", 0, "primary-node")
+            .unwrap();
+        let target_allocation = state
+            .shard_allocation_id("docs", 0, "replica-node")
+            .unwrap();
+
+        let source_shards = Arc::new(ShardManager::new(
+            source_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let source_engine = source_shards
+            .open_assigned_shard_with_settings(
+                "docs",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "docs-uuid",
+                crate::shard::AssignedShardOpen {
+                    allocation_id: source_allocation,
+                    primary_term: 7,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        source_engine
+            .add_document_with_seq("source-copy", serde_json::json!({"value": "source"}), 0)
+            .unwrap();
+        source_engine.refresh().unwrap();
+        source_engine.flush().unwrap();
+        let source_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+        source_manager.update_state(state.clone());
+        let source_service = create_transport_service_for_test(
+            source_manager.clone(),
+            source_shards,
+            TransportClient::new(),
+            Arc::new(TaskManager::new()),
+            "primary-node".into(),
+        );
+        let (source_address, source_server) = serve(source_service).await;
+        state.nodes.get_mut("primary-node").unwrap().transport_port = source_address.port();
+        source_manager.update_state(state.clone());
+
+        {
+            let first_target = Arc::new(ShardManager::new(
+                target_dir.path(),
+                Duration::from_secs(60),
+            ));
+            let target_engine = first_target
+                .open_assigned_shard_with_settings(
+                    "docs",
+                    0,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "docs-uuid",
+                    crate::shard::AssignedShardOpen {
+                        allocation_id: target_allocation,
+                        primary_term: 7,
+                        allow_empty_creation: true,
+                    },
+                )
+                .unwrap();
+            target_engine
+                .add_document_with_seq("pending-copy", serde_json::json!({"value": "pending"}), 0)
+                .unwrap();
+            target_engine.refresh().unwrap();
+            target_engine.flush().unwrap();
+            assert!(first_target.begin_peer_recovery_target("docs", 0));
+            first_target
+                .mark_peer_recovery_awaiting_membership_blocking(
+                    "docs".into(),
+                    0,
+                    PeerRecoveryAwaitingMembership {
+                        index_uuid: "docs-uuid".into(),
+                        allocation_id: target_allocation,
+                        primary_node_id: "primary-node".into(),
+                        primary_term: 7,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let restarted = Arc::new(ShardManager::new(
+            target_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let failures = crate::node::reconciliation::open_local_assigned_shards(
+            &state,
+            "replica-node",
+            restarted.as_ref(),
+            &std::sync::Mutex::new(std::collections::HashSet::new()),
+        );
+        assert!(failures.is_empty());
+        let target_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+        target_manager.update_state(state.clone());
+        PeerRecoveryDriver::new(1).reconcile(
+            &state,
+            "replica-node",
+            target_manager,
+            restarted.clone(),
+            TransportClient::new(),
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(engine) = restarted.get_shard("docs", 0)
+                && engine.get_document("pending-copy").unwrap().is_some()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the restarted pending target was wiped or never restored"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let shard_dir = restarted.shard_data_dir("docs", 0).unwrap();
+        assert!(
+            shard_dir
+                .join(crate::shard::PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER)
+                .exists()
+        );
+        assert!(
+            !shard_dir
+                .join(crate::shard::PEER_RECOVERY_IN_PROGRESS_MARKER)
+                .exists()
+        );
+        source_server.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn completion_timeout_keeps_target_open_until_committed_admission_is_observed() {
         let (raft, source_state_handle) =
@@ -1414,6 +1817,25 @@ mod tests {
             .data,
             ClusterResponse::Ok
         );
+        let primary_allocation_id = source_state_handle
+            .read()
+            .unwrap()
+            .primary_allocation_id("pending", 0)
+            .unwrap();
+        assert_eq!(
+            raft.client_write(ClusterCommand::ActivatePrimary {
+                index_name: "pending".into(),
+                index_uuid: "pending-uuid".into(),
+                shard_id: 0,
+                primary: "primary-node".into(),
+                allocation_id: primary_allocation_id,
+                expected_term: 1,
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
         let stale_target_state = source_state_handle.read().unwrap().clone();
         let allocation_id = stale_target_state
             .shard_allocation_id("pending", 0, "replica-node")
@@ -1426,7 +1848,7 @@ mod tests {
                 replica: "replica-node".into(),
                 allocation_id,
                 primary: "primary-node".into(),
-                primary_term: 1,
+                primary_term: 2,
             })
             .await
             .unwrap()
@@ -1450,7 +1872,7 @@ mod tests {
                 "pending-uuid",
                 crate::shard::AssignedShardOpen {
                     allocation_id,
-                    primary_term: 1,
+                    primary_term: 2,
                     allow_empty_creation: true,
                 },
             )
@@ -1464,7 +1886,7 @@ mod tests {
             index_uuid: "pending-uuid".into(),
             allocation_id,
             primary_node_id: "primary-node".into(),
-            primary_term: 1,
+            primary_term: 2,
         };
         target_shards
             .mark_peer_recovery_awaiting_membership_blocking("pending".into(), 0, pending.clone())
@@ -1534,7 +1956,7 @@ mod tests {
                 op: "index".into(),
                 seq_no: 1,
                 index_uuid: "pending-uuid".into(),
-                primary_term: Some(1),
+                primary_term: Some(2),
                 target_allocation_id: Some(allocation_id),
             }))
             .await
@@ -1707,28 +2129,32 @@ mod tests {
 
         let cluster_manager = Arc::new(ClusterManager::new("rejected".into()));
         let mut state = ClusterState::new("rejected".into());
-        state.indices.insert(
-            "rejected".into(),
-            IndexMetadata {
-                name: "rejected".into(),
-                uuid: IndexUuid::new("rejected-uuid"),
-                number_of_shards: 1,
-                number_of_replicas: 1,
-                shard_routing: HashMap::from([(
-                    0,
-                    ShardRoutingEntry {
-                        primary: "primary-node".into(),
-                        primary_term: 8,
-                        replicas: vec!["replica-node".into()],
-                        in_sync_replicas: Vec::new(),
-                        unassigned_replicas: 0,
-                    },
-                )]),
-                mappings: HashMap::new(),
-                dynamic: Default::default(),
-                settings: IndexSettings::default(),
-            },
-        );
+        state.add_index(IndexMetadata {
+            name: "rejected".into(),
+            uuid: IndexUuid::new("rejected-uuid"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary-node".into(),
+                    primary_term: 8,
+                    replicas: vec!["replica-node".into()],
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        });
+        state
+            .shard_allocations
+            .get_mut("rejected")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_initialized = true;
         cluster_manager.update_state(state.clone());
         let driver = PeerRecoveryDriver::new(2);
         driver.reconcile(

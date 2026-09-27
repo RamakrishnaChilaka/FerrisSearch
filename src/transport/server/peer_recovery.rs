@@ -763,6 +763,16 @@ impl TransportService {
                 }
                 return Ok(None);
             }
+            if session.finalize_preparing.load(Ordering::Acquire)
+                || session.barrier_guard.is_some()
+                || session.finalize_deadline.is_some()
+                || session.mark_submitted
+                || session.settlement_running
+            {
+                return Err(Status::failed_precondition(
+                    "peer recovery source session is already finalizing or settling",
+                ));
+            }
             session.last_activity = Instant::now();
             return Ok(Some(source_session_start_response(&active_id, &session)));
         }
@@ -2373,6 +2383,57 @@ mod tests {
             "only settlement may release an unresolved admission barrier"
         );
         assert!(state.registry.lock().await.sessions.contains_key("session"));
+    }
+
+    #[tokio::test]
+    async fn finalized_source_session_rejects_restarted_target_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _shards, cluster) = review_service(dir.path());
+        let allocation_id = cluster
+            .get_state()
+            .shard_allocation_id("idx", 0, "replica")
+            .unwrap();
+        let key = ("uuid-1".to_string(), 0);
+        let barrier = service.peer_recovery_state.barrier(key.clone()).await;
+        let barrier_guard = barrier.write_owned().await;
+        let session = Arc::new(Mutex::new(SourceSession {
+            index_name: "idx".into(),
+            index_uuid: key.0.clone(),
+            shard_id: key.1,
+            target_node_id: "replica".into(),
+            target_allocation_id: allocation_id,
+            primary_node_id: "primary".into(),
+            primary_term: 1,
+            snapshot_next_seq_no: 0,
+            snapshot_dir: dir.path().join("finalizing-session"),
+            files: HashMap::new(),
+            retention_pin: None,
+            last_activity: Instant::now(),
+            barrier_next_seq_no: Some(0),
+            barrier_guard: Some(barrier_guard),
+            finalize_deadline: Some(Instant::now() + Duration::from_secs(30)),
+            finalize_preparing: Arc::new(AtomicBool::new(false)),
+            mark_submitted: false,
+            settlement_running: false,
+        }));
+        {
+            let mut registry = service.peer_recovery_state.registry.lock().await;
+            registry.active_shards.insert(key.clone(), "session".into());
+            registry.sessions.insert("session".into(), session);
+        }
+
+        let error = match service
+            .source_start_status(&key, "replica", allocation_id)
+            .await
+        {
+            Ok(_) => panic!("a finalized source session must not be reattached"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("finalizing or settling"));
+        if let Some(removed) = service.peer_recovery_state.remove_session("session").await {
+            cleanup_session(removed).await;
+        }
     }
 
     fn move_primary(cluster: &ClusterManager) {

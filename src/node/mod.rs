@@ -174,13 +174,49 @@ fn dead_node_removal_allowed(routing_update_failed: bool) -> bool {
     !routing_update_failed
 }
 
+type FailedCopyReportKey = (String, u32, String, u64);
+const FAILED_COPY_REPORT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+fn should_attempt_failed_copy_report(
+    recent_reports: &mut std::collections::HashMap<FailedCopyReportKey, Instant>,
+    report_key: FailedCopyReportKey,
+    now: Instant,
+) -> bool {
+    if recent_reports
+        .get(&report_key)
+        .is_some_and(|last| now.duration_since(*last) < FAILED_COPY_REPORT_RETRY_INTERVAL)
+    {
+        return false;
+    }
+    recent_reports.insert(report_key, now);
+    true
+}
+
 async fn report_failed_shard_copies(
     failures: Vec<ShardCopyFailure>,
     cluster_manager: &ClusterManager,
     transport_client: &TransportClient,
     raft: &RaftInstance,
+    recent_reports: &mut std::collections::HashMap<FailedCopyReportKey, Instant>,
 ) {
+    let now = Instant::now();
     for failure in failures {
+        let report_key = (
+            failure.index_uuid.clone(),
+            failure.shard_id,
+            failure.node_id.clone(),
+            failure.allocation_id,
+        );
+        if !should_attempt_failed_copy_report(recent_reports, report_key, now) {
+            tracing::debug!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                node = failure.node_id,
+                allocation_id = failure.allocation_id,
+                "Suppressing duplicate lifecycle shard-copy failure report"
+            );
+            continue;
+        }
         tracing::error!(
             index = failure.index_name,
             shard_id = failure.shard_id,
@@ -571,6 +607,7 @@ impl Node {
             // freshly-created (empty) shard dirs as evidence that the
             // authoritative data is present.
             let pre_existing_uuid_dirs = snapshot_uuid_dirs(manager_clone.data_dir());
+            let mut recent_failed_copy_reports = std::collections::HashMap::new();
             let failures = open_local_assigned_shards_blocking(
                 state.clone(),
                 local_id.clone(),
@@ -578,7 +615,14 @@ impl Node {
                 guarded_missing_startup_shards.clone(),
             )
             .await;
-            report_failed_shard_copies(failures, manager.as_ref(), &client, raft.as_ref()).await;
+            report_failed_shard_copies(
+                failures,
+                manager.as_ref(),
+                &client,
+                raft.as_ref(),
+                &mut recent_failed_copy_reports,
+            )
+            .await;
             state = manager.get_state();
 
             let mut orphan_cleanup_done = cleanup_orphaned_data_if_authoritative_blocking(
@@ -606,8 +650,14 @@ impl Node {
                     guarded_missing_startup_shards.clone(),
                 )
                 .await;
-                report_failed_shard_copies(failures, manager.as_ref(), &client, raft.as_ref())
-                    .await;
+                report_failed_shard_copies(
+                    failures,
+                    manager.as_ref(),
+                    &client,
+                    raft.as_ref(),
+                    &mut recent_failed_copy_reports,
+                )
+                .await;
                 state = manager.get_state();
                 peer_recovery_driver.reconcile(
                     &state,

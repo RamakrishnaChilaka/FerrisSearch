@@ -184,16 +184,10 @@ impl ClusterStateMachine {
                         next_routing
                             .in_sync_replicas
                             .retain(|replica| replica != &next_routing.primary);
-                        candidate_allocation
+                        Some(candidate_allocation)
                     } else {
                         next_routing.primary_term = current_routing.primary_term;
-                        let Some(primary_allocation) = current_ids.primary else {
-                            return ClusterResponse::Error(format!(
-                                "primary '{}' has no allocation ID for index '{}' shard {}",
-                                current_routing.primary, metadata.name, shard_id
-                            ));
-                        };
-                        primary_allocation
+                        current_ids.primary
                     };
 
                     let mut next_replica_allocations = HashMap::new();
@@ -207,7 +201,7 @@ impl ClusterStateMachine {
                             .insert(replica.clone(), existing.unwrap_or(raft_log_index));
                     }
                     let next_ids = crate::cluster::state::ShardAllocationIds {
-                        primary: Some(next_primary_allocation),
+                        primary: next_primary_allocation,
                         replicas: next_replica_allocations,
                         initial_allocation_id: current_ids.initial_allocation_id,
                         primary_initialized: current_ids.primary_initialized,
@@ -247,6 +241,22 @@ impl ClusterStateMachine {
                 if *allocation_id == 0 {
                     return ClusterResponse::Error(format!(
                         "replica allocation ID must be greater than zero for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                let Some(allocation_state) = state.shard_allocation_ids(index_name, *shard_id)
+                else {
+                    return ClusterResponse::Error(format!(
+                        "index '{index_name}' shard {shard_id} has no allocation identity metadata"
+                    ));
+                };
+                if !allocation_state.primary_initialized {
+                    return ClusterResponse::Error(format!(
+                        "cannot admit a replica before the primary is initialized for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if allocation_state.primary.is_none() {
+                    return ClusterResponse::Error(format!(
+                        "cannot admit a replica without an allocated primary for index '{index_name}' shard {shard_id}"
                     ));
                 }
                 if state.shard_allocation_id(index_name, *shard_id, replica) != Some(*allocation_id)
@@ -951,6 +961,36 @@ mod tests {
             .unwrap()
             .shard_allocation_id("idx", 0, "node-2")
             .unwrap();
+        let pre_activation = ClusterCommand::MarkReplicaInSync {
+            index_name: "idx".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            replica: "node-2".into(),
+            allocation_id,
+            primary: "node-1".into(),
+            primary_term: 3,
+        };
+        assert!(matches!(
+            sm.apply_command(&pre_activation),
+            ClusterResponse::Error(error) if error.contains("before the primary is initialized")
+        ));
+        let primary_allocation_id = sm
+            .state_handle()
+            .read()
+            .unwrap()
+            .primary_allocation_id("idx", 0)
+            .unwrap();
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::ActivatePrimary {
+                index_name: "idx".into(),
+                index_uuid: index_uuid.clone(),
+                shard_id: 0,
+                primary: "node-1".into(),
+                allocation_id: primary_allocation_id,
+                expected_term: 3,
+            }),
+            ClusterResponse::Ok
+        );
         let version_before = sm.state_handle().read().unwrap().version;
 
         for command in [
@@ -961,7 +1001,7 @@ mod tests {
                 replica: "node-2".into(),
                 allocation_id,
                 primary: "node-1".into(),
-                primary_term: 3,
+                primary_term: 4,
             },
             ClusterCommand::MarkReplicaInSync {
                 index_name: "idx".into(),
@@ -970,7 +1010,7 @@ mod tests {
                 replica: "node-2".into(),
                 allocation_id,
                 primary: "wrong".into(),
-                primary_term: 3,
+                primary_term: 4,
             },
             ClusterCommand::MarkReplicaInSync {
                 index_name: "idx".into(),
@@ -988,7 +1028,7 @@ mod tests {
                 replica: "node-3".into(),
                 allocation_id,
                 primary: "node-1".into(),
-                primary_term: 3,
+                primary_term: 4,
             },
         ] {
             assert!(matches!(
@@ -1005,7 +1045,7 @@ mod tests {
             replica: "node-2".into(),
             allocation_id,
             primary: "node-1".into(),
-            primary_term: 3,
+            primary_term: 4,
         };
         assert_eq!(sm.apply_command(&command), ClusterResponse::Ok);
         assert_eq!(
@@ -1015,6 +1055,62 @@ mod tests {
         assert!(matches!(
             sm.apply_command(&command),
             ClusterResponse::Error(error) if error.contains("already in sync")
+        ));
+    }
+
+    #[test]
+    fn mark_replica_in_sync_rejects_a_red_shard_without_primary_allocation() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("red-admission");
+        metadata.number_of_replicas = 1;
+        metadata.shard_routing.get_mut(&0).unwrap().replicas = vec!["node-2".into()];
+        let index_uuid = metadata.uuid.to_string();
+        assert_eq!(
+            sm.apply_command_at(&ClusterCommand::CreateIndex { metadata }, 10),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::ActivatePrimary {
+                    index_name: "red-admission".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                    expected_term: 1,
+                },
+                11,
+            ),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::FailShardCopy {
+                    index_name: "red-admission".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    node: "node-1".into(),
+                    allocation_id: 10,
+                },
+                12,
+            ),
+            ClusterResponse::Ok
+        );
+        assert!(matches!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkReplicaInSync {
+                    index_name: "red-admission".into(),
+                    index_uuid,
+                    shard_id: 0,
+                    replica: "node-2".into(),
+                    allocation_id: 10,
+                    primary: "node-1".into(),
+                    primary_term: 2,
+                },
+                13,
+            ),
+            ClusterResponse::Error(error)
+                if error.contains("without an allocated primary")
         ));
     }
 
@@ -1413,6 +1509,155 @@ mod tests {
             state.indices["red"].shard_routing[&0].unassigned_replicas,
             1
         );
+    }
+
+    #[test]
+    fn red_sibling_shard_does_not_block_update_index() {
+        let sm = ClusterStateMachine::new("test".into());
+        for node_id in ["node-1", "node-2", "node-3"] {
+            assert_eq!(
+                sm.apply_command(&ClusterCommand::AddNode {
+                    node: make_node(node_id),
+                }),
+                ClusterResponse::Ok
+            );
+        }
+        let mut metadata = make_index("idx");
+        metadata.number_of_shards = 2;
+        metadata.number_of_replicas = 1;
+        metadata.shard_routing.insert(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 1,
+                replicas: vec!["node-2".into()],
+                in_sync_replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        metadata.shard_routing.insert(
+            1,
+            ShardRoutingEntry {
+                primary: "node-2".into(),
+                primary_term: 1,
+                replicas: vec!["node-1".into()],
+                in_sync_replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        );
+        let uuid = metadata.uuid.to_string();
+        assert_eq!(
+            sm.apply_command_at(&ClusterCommand::CreateIndex { metadata }, 10),
+            ClusterResponse::Ok
+        );
+        for (shard_id, primary, log_index) in [(0u32, "node-1", 11u64), (1, "node-2", 12)] {
+            assert_eq!(
+                sm.apply_command_at(
+                    &ClusterCommand::ActivatePrimary {
+                        index_name: "idx".into(),
+                        index_uuid: uuid.clone(),
+                        shard_id,
+                        primary: primary.into(),
+                        allocation_id: 10,
+                        expected_term: 1,
+                    },
+                    log_index,
+                ),
+                ClusterResponse::Ok
+            );
+        }
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkReplicaInSync {
+                    index_name: "idx".into(),
+                    index_uuid: uuid.clone(),
+                    shard_id: 1,
+                    replica: "node-1".into(),
+                    allocation_id: 10,
+                    primary: "node-2".into(),
+                    primary_term: 2,
+                },
+                13,
+            ),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::FailShardCopy {
+                    index_name: "idx".into(),
+                    index_uuid: uuid,
+                    shard_id: 0,
+                    node: "node-1".into(),
+                    allocation_id: 10,
+                },
+                14,
+            ),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.state_handle()
+                .read()
+                .unwrap()
+                .primary_allocation_id("idx", 0),
+            None
+        );
+
+        let mut updated = sm.state_handle().read().unwrap().indices["idx"].clone();
+        let orphaned = updated.remove_node(&"node-2".to_string());
+        assert_eq!(orphaned, vec![1]);
+        assert!(updated.promote_replica_to(1, "node-1"));
+        updated
+            .shard_routing
+            .get_mut(&1)
+            .unwrap()
+            .unassigned_replicas += 1;
+        updated.settings.refresh_interval_ms = Some(1234);
+        let response = sm.apply_command_at(&ClusterCommand::UpdateIndex { metadata: updated }, 15);
+
+        assert_eq!(
+            response,
+            ClusterResponse::Ok,
+            "healthy shard failover must not be blocked by a red sibling"
+        );
+        let state = sm.state_handle();
+        let state = state.read().unwrap();
+        assert_eq!(state.indices["idx"].shard_routing[&1].primary, "node-1");
+        assert_eq!(
+            state.indices["idx"].settings.refresh_interval_ms,
+            Some(1234)
+        );
+        drop(state);
+
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::RemoveNode {
+                    node_id: "node-2".into(),
+                },
+                16,
+            ),
+            ClusterResponse::Ok
+        );
+        let mut allocated = sm.state_handle().read().unwrap().indices["idx"].clone();
+        assert!(allocated.allocate_unassigned_replicas_for_shards(
+            &["node-1".into(), "node-3".into()],
+            &std::collections::HashSet::from([1]),
+        ));
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::UpdateIndex {
+                    metadata: allocated,
+                },
+                17,
+            ),
+            ClusterResponse::Ok,
+            "replica allocation for a healthy shard must not be blocked by a red sibling"
+        );
+        let state = sm.state_handle();
+        let state = state.read().unwrap();
+        assert!(!state.nodes.contains_key("node-2"));
+        assert!(state.indices["idx"].shard_routing[&0].replicas.is_empty());
+        assert_eq!(state.indices["idx"].shard_routing[&1].replicas, ["node-3"]);
+        assert_eq!(state.shard_allocation_id("idx", 1, "node-3"), Some(17));
     }
 
     #[test]

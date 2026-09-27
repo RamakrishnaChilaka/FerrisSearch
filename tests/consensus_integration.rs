@@ -834,6 +834,25 @@ async fn delayed_mark_replica_in_sync_rejects_same_node_reallocation_aba() {
         .unwrap()
         .shard_allocation_id("allocation-aba", 0, "node-2")
         .unwrap();
+    let primary_allocation_id = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("allocation-aba", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "allocation-aba".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: primary_allocation_id,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
 
     let delayed_admission = ClusterCommand::MarkReplicaInSync {
         index_name: "allocation-aba".into(),
@@ -842,7 +861,7 @@ async fn delayed_mark_replica_in_sync_rejects_same_node_reallocation_aba() {
         replica: "node-2".into(),
         allocation_id: delayed_allocation_id,
         primary: "node-1".into(),
-        primary_term: 1,
+        primary_term: 2,
     };
 
     let mut removed = state_handle.read().unwrap().indices["allocation-aba"].clone();
@@ -1292,6 +1311,25 @@ async fn grpc_delayed_admission_rejects_same_node_reallocation_from_stale_target
             .data,
         ClusterResponse::Ok
     );
+    let primary_allocation_id = source_state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("grpc-allocation-aba", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "grpc-allocation-aba".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: primary_allocation_id,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
     let target_manager = ClusterManager::new("stale-target".into());
     target_manager.update_state(source_state_handle.read().unwrap().clone());
     let stale_allocation_id = target_manager
@@ -1341,7 +1379,7 @@ async fn grpc_delayed_admission_rejects_same_node_reallocation_from_stale_target
             shard_id: 0,
             replica_node_id: "node-2".into(),
             primary_node_id: "node-1".into(),
-            primary_term: 1,
+            primary_term: 2,
             allocation_id: Some(stale_allocation_id),
         }))
         .await

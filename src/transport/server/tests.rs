@@ -24,12 +24,13 @@ async fn recover_replica_does_not_open_or_mutate_live_wal() {
     let index_name = "recover-live";
     let index_uuid = "recover-live-uuid";
     let shard_dir = dir.path().join(index_uuid).join("shard_0");
-    std::fs::create_dir_all(&shard_dir).unwrap();
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager
+        .initialize_copy_identity_for_test(index_name, 0, index_uuid, 1, 1)
+        .unwrap();
     let engine = Arc::new(CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap());
     engine.add_document("before", json!({"value": 0})).unwrap();
 
-    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    shard_manager.register_index_uuid(index_name, index_uuid);
     shard_manager.insert_shard_for_test(index_name, 0, engine.clone());
 
     let mut cluster_state = DomainClusterState::new("recover-live-cluster".into());
@@ -1930,6 +1931,123 @@ async fn create_index_returns_internal_when_no_data_nodes_are_available() {
     assert!(
         err.message()
             .contains("No data nodes available to assign shards")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transient_fence_persist_failure_does_not_fail_the_shard_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (raft, shared_state) = crate::consensus::create_raft_instance_mem(1, "fence-io".into())
+        .await
+        .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !raft.is_leader() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "test Raft leader was not elected"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let metadata = DomainIndexMetadata {
+        name: "fence-io".into(),
+        uuid: crate::cluster::state::IndexUuid::new("fence-io-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 1,
+                replicas: Vec::new(),
+                in_sync_replicas: Vec::new(),
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    };
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(crate::consensus::types::ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        crate::consensus::types::ClusterResponse::Ok
+    );
+    let allocation_id = shared_state
+        .read()
+        .unwrap()
+        .primary_allocation_id("fence-io", 0)
+        .unwrap();
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager
+        .open_assigned_shard_with_settings(
+            "fence-io",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            &index_uuid,
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        raft.client_write(crate::consensus::types::ClusterCommand::ActivatePrimary {
+            index_name: "fence-io".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        crate::consensus::types::ClusterResponse::Ok
+    );
+
+    let identity_temp = dir
+        .path()
+        .join(&index_uuid)
+        .join("shard_0")
+        .join(format!("{}.tmp", crate::shard::SHARD_COPY_IDENTITY_FILE));
+    std::fs::create_dir(&identity_temp).unwrap();
+    let cluster_manager = Arc::new(ClusterManager::with_shared_state(shared_state.clone()));
+    let service = TransportService {
+        cluster_manager,
+        shard_manager,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: Some(raft),
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    let error = match service.ensure_primary_activated("fence-io", 0).await {
+        Ok(_) => panic!("injected fence persistence failure must reject activation"),
+        Err(error) => error,
+    };
+    assert!(error.contains("failed to persist primary fence"));
+    assert_eq!(
+        shared_state
+            .read()
+            .unwrap()
+            .primary_allocation_id("fence-io", 0),
+        Some(allocation_id),
+        "transient fence persistence errors must not alter routing"
     );
 }
 

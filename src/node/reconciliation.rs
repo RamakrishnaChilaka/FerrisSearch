@@ -266,15 +266,51 @@ pub(super) fn open_local_assigned_shards(
             else {
                 if authoritative_here {
                     shard_manager.quarantine_shard_copy(index_name, *shard_id);
-                    tracing::error!(
-                        "Refusing to open authoritative shard {}/{} because its allocation ID is missing; pre-1.0 copies must be recreated or reindexed",
-                        index_name,
-                        shard_id
-                    );
+                    let red_primary = routing.primary == local_node_id
+                        && state.primary_initialized(index_name, *shard_id)
+                        && state.primary_allocation_id(index_name, *shard_id).is_none();
+                    if red_primary {
+                        tracing::debug!(
+                            "Skipping red primary shard {}/{} because no surviving primary allocation is assigned",
+                            index_name,
+                            shard_id
+                        );
+                    } else {
+                        tracing::error!(
+                            "Refusing to open authoritative shard {}/{} because allocation identity metadata is missing; pre-1.0 copies must be recreated or reindexed",
+                            index_name,
+                            shard_id
+                        );
+                    }
                 }
                 continue;
             };
             if !authoritative_here {
+                match shard_manager.restore_peer_recovery_awaiting_membership(
+                    index_name,
+                    *shard_id,
+                    &metadata.mappings,
+                    &metadata.settings,
+                    metadata.uuid.as_str(),
+                    crate::shard::AssignedShardOpen {
+                        allocation_id,
+                        primary_term: routing.primary_term,
+                        allow_empty_creation: false,
+                    },
+                ) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "Unable to restore finalized peer recovery target for {}/{} allocation {}: {}",
+                            index_name,
+                            shard_id,
+                            allocation_id,
+                            error
+                        );
+                        continue;
+                    }
+                }
                 if state.primary_initialized(index_name, *shard_id) {
                     match shard_manager.failed_peer_recovery_install_matches(
                         index_name,
@@ -310,15 +346,24 @@ pub(super) fn open_local_assigned_shards(
                     metadata.uuid.as_str(),
                     allocation_id,
                 ) {
-                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
-                    failures.push(ShardCopyFailure {
-                        index_name: index_name.clone(),
-                        index_uuid: metadata.uuid.to_string(),
-                        shard_id: *shard_id,
-                        node_id: local_node_id.to_string(),
-                        allocation_id,
-                        reason: error.to_string(),
-                    });
+                    if ShardManager::is_definitive_copy_failure(&error) {
+                        shard_manager.quarantine_shard_copy(index_name, *shard_id);
+                        failures.push(ShardCopyFailure {
+                            index_name: index_name.clone(),
+                            index_uuid: metadata.uuid.to_string(),
+                            shard_id: *shard_id,
+                            node_id: local_node_id.to_string(),
+                            allocation_id,
+                            reason: error.to_string(),
+                        });
+                    } else {
+                        tracing::warn!(
+                            "Retryable local shard identity validation failed for {}/{}: {}",
+                            index_name,
+                            shard_id,
+                            error
+                        );
+                    }
                 }
                 continue;
             }
@@ -339,14 +384,16 @@ pub(super) fn open_local_assigned_shards(
                     shard_id,
                     shard_dir
                 );
-                failures.push(ShardCopyFailure {
-                    index_name: index_name.clone(),
-                    index_uuid: metadata.uuid.to_string(),
-                    shard_id: *shard_id,
-                    node_id: local_node_id.to_string(),
-                    allocation_id,
-                    reason: format!("expected shard directory {shard_dir:?} is missing"),
-                });
+                if state.primary_initialized(index_name, *shard_id) {
+                    failures.push(ShardCopyFailure {
+                        index_name: index_name.clone(),
+                        index_uuid: metadata.uuid.to_string(),
+                        shard_id: *shard_id,
+                        node_id: local_node_id.to_string(),
+                        allocation_id,
+                        reason: format!("expected shard directory {shard_dir:?} is missing"),
+                    });
+                }
                 continue;
             }
 
@@ -362,21 +409,23 @@ pub(super) fn open_local_assigned_shards(
                     allow_empty_creation,
                 },
             ) {
-                shard_manager.quarantine_shard_copy(index_name, *shard_id);
                 tracing::warn!(
                     "Failed to reopen local shard {}/{} during lifecycle reconciliation: {}",
                     index_name,
                     shard_id,
                     error
                 );
-                failures.push(ShardCopyFailure {
-                    index_name: index_name.clone(),
-                    index_uuid: metadata.uuid.to_string(),
-                    shard_id: *shard_id,
-                    node_id: local_node_id.to_string(),
-                    allocation_id,
-                    reason: error.to_string(),
-                });
+                if ShardManager::is_definitive_copy_failure(&error) {
+                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
+                    failures.push(ShardCopyFailure {
+                        index_name: index_name.clone(),
+                        index_uuid: metadata.uuid.to_string(),
+                        shard_id: *shard_id,
+                        node_id: local_node_id.to_string(),
+                        allocation_id,
+                        reason: error.to_string(),
+                    });
+                }
             }
         }
     }
