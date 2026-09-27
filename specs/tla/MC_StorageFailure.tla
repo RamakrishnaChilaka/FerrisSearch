@@ -29,7 +29,7 @@ StorageClientWrite1 ==
 
 StorageClientWrite2 ==
     /\ nextWrite = 2
-    /\ copyMode[FailedNode] = "StorageFailed"
+    /\ copyMode[FailedNode] \in ReportableOpenStorageFailureModes
     /\ FailedNode # routing.primary
     /\ FailedNode \notin routing.inSync
     /\ activated[routing.primary] = views[routing.primary].term
@@ -77,7 +77,7 @@ StorageEscalates ==
     /\ UNCHANGED ApplySafetyVars
 
 StorageReports ==
-    /\ copyMode[FailedNode] = "StorageFailed"
+    /\ copyMode[FailedNode] \in ReportableOpenStorageFailureModes
     /\ (FailedNode = routing.primary \/ FailedNode \in routing.replicas)
     /\ ReportShardCopyFailure(
           FailedNode,
@@ -119,17 +119,17 @@ StorageNext ==
 
 FailedReplicaRemoved ==
     FailedNode # PrimaryNode =>
-        (copyMode[FailedNode] = "StorageFailed")
+        (copyMode[FailedNode] \in ReportableOpenStorageFailureModes)
         ~> /\ FailedNode \notin routing.replicas
            /\ FailedNode \notin routing.inSync
 
 FailedPrimaryReplaced ==
     FailedNode = PrimaryNode =>
-        (copyMode[FailedNode] = "StorageFailed")
+        (copyMode[FailedNode] \in ReportableOpenStorageFailureModes)
         ~> routing.primary = CandidateNode
 
 WritesResumeAfterStorageFailure ==
-    (copyMode[FailedNode] = "StorageFailed")
+    (copyMode[FailedNode] \in ReportableOpenStorageFailureModes)
     ~> (2 \in acked)
 
 StorageLivenessSpec ==
@@ -167,12 +167,12 @@ StorageNoReplicaNext ==
     \/ StorageCommit
 
 PrimaryReportNeverMakesRed ==
-    copyMode[PrimaryNode] = "StorageFailed" =>
+    copyMode[PrimaryNode] \in ReportableOpenStorageFailureModes =>
         /\ routing.primary = PrimaryNode
         /\ routing.allocations[PrimaryNode] > 0
 
 PrimaryReportEventuallyRejected ==
-    (copyMode[PrimaryNode] = "StorageFailed")
+    (copyMode[PrimaryNode] \in ReportableOpenStorageFailureModes)
     ~> CommittedResult("FailShardCopy", PrimaryNode, FALSE)
 
 StorageNoReplicaSpec ==

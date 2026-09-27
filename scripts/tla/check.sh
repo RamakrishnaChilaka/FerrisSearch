@@ -95,6 +95,10 @@ default_configs=(
     storage-apply-primary
     storage-apply-primary-no-replica
     storage-apply-no-escalation
+    s1-combined-replica
+    s1-combined-primary
+    s1-combined-liveness
+    s1-combined-liveness-no-timeout
     two-shard
 )
 
@@ -140,6 +144,10 @@ storage-apply-replica   pass: open replica apply I/O escalates and is removed
 storage-apply-primary   pass: open primary apply I/O escalates and promotes
 storage-apply-primary-no-replica pass: no-candidate apply report is rejected
 storage-apply-no-escalation expected temporal failure without apply escalation
+s1-combined-replica     pass: storage fault, crash/reset, repair, and recovery
+s1-combined-primary     pass: promote-only report across primary/leader crash
+s1-combined-liveness    pass: timeout, redetection, recovery, and resumed write
+s1-combined-liveness-no-timeout expected temporal failure: timeout assumption
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -332,6 +340,26 @@ run_config() {
         storage-apply-no-escalation|MC_ApplyStorageReplicaNoEscalation)
             module="MC_ApplyStorageFailure.tla"
             cfg="MC_ApplyStorageReplicaNoEscalation.cfg"
+            expected="temporal"
+            ;;
+        s1-combined-replica|MC_S1_CombinedReplica)
+            module="MC_S1_Combined.tla"
+            cfg="MC_S1_CombinedReplica.cfg"
+            expected="pass"
+            ;;
+        s1-combined-primary|MC_S1_CombinedPrimary)
+            module="MC_S1_Combined.tla"
+            cfg="MC_S1_CombinedPrimary.cfg"
+            expected="pass"
+            ;;
+        s1-combined-liveness|MC_S1_CombinedLiveness)
+            module="MC_S1_Combined.tla"
+            cfg="MC_S1_CombinedLiveness.cfg"
+            expected="pass"
+            ;;
+        s1-combined-liveness-no-timeout|MC_S1_CombinedLivenessNoTimeout)
+            module="MC_S1_Combined.tla"
+            cfg="MC_S1_CombinedLivenessNoTimeout.cfg"
             expected="temporal"
             ;;
         two-shard|MC_TwoShardIsolation)

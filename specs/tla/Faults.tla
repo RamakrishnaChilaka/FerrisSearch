@@ -12,7 +12,8 @@ VARIABLES
     partitionCount,
     diskLost,
     faultsStopped,
-    lifecyclePhase
+    lifecyclePhase,
+    storageFaultInjected
 
 LifecyclePhases ==
     {"Idle", "RoutingProposed", "RoutingCommitted", "RoutingRejected",
@@ -20,7 +21,8 @@ LifecyclePhases ==
      "RejoinProposed", "Rejoined", "AllocationProposed"}
 
 FaultVars ==
-    <<crashCount, partitionCount, diskLost, faultsStopped, lifecyclePhase>>
+    <<crashCount, partitionCount, diskLost, faultsStopped, lifecyclePhase,
+      storageFaultInjected>>
 
 FaultInit ==
     /\ crashCount = 0
@@ -28,6 +30,7 @@ FaultInit ==
     /\ diskLost = [n \in Nodes |-> FALSE]
     /\ faultsStopped = (FaultMode = "L1")
     /\ lifecyclePhase = [n \in Nodes |-> "Idle"]
+    /\ storageFaultInjected = FALSE
 
 WritesOwnedBy(node) ==
     {w \in WriteIds :
@@ -82,7 +85,7 @@ Crash(node) ==
             copyExists, copyAllocation, copyUuid, durableReplicaFence,
             acked, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, diskLost, partitionCount,
-            faultsStopped, lifecyclePhase>>
+            faultsStopped, lifecyclePhase, storageFaultInjected>>
 
 \* src/node startup plus HotTranslog::open/replay starts a new process
 \* incarnation while durable shard and pending-recovery markers survive.
@@ -106,7 +109,7 @@ Restart(node) ==
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
-            lifecyclePhase, PeerRecoveryVars>>
+            lifecyclePhase, storageFaultInjected, PeerRecoveryVars>>
 
 \* C2 only: metadata failure detector may suspect a live node whose local
 \* ClusterManager view stops advancing.  Data-plane RPC messages remain usable.
@@ -131,7 +134,8 @@ PartitionMetadata(node) ==
             replicaFence, durableReplicaFence, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
-            diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
+            diskLost, faultsStopped, lifecyclePhase, storageFaultInjected,
+            PeerRecoveryVars>>
 
 \* Successful Ping/JoinCluster/Raft connectivity restores metadata delivery.
 HealMetadata(node) ==
@@ -149,7 +153,8 @@ HealMetadata(node) ==
             replicaFence, durableReplicaFence, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
-            diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
+            diskLost, faultsStopped, lifecyclePhase, storageFaultInjected,
+            PeerRecoveryVars>>
 
 \* transport timeout/drop.  Delay is represented by simply not choosing a
 \* delivery action.
@@ -167,7 +172,8 @@ LoseMsg(message) ==
             replicaFence, durableReplicaFence, copyMode, installMarker,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe,             ackMembershipSafe, termMonotonic, crashCount, partitionCount,
-            diskLost, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
+            diskLost, faultsStopped, lifecyclePhase, storageFaultInjected,
+            PeerRecoveryVars>>
 
 FailureDetectorMayRemove(node) ==
     CASE FaultMode = "C2" -> ~alive[node] \/ ~raftConnected[node]
@@ -245,7 +251,7 @@ CopyFailureReportRequired(node) ==
     /\ (authoritative \/ failedInstall)
     \* Persistent local I/O is retryable until the bounded retry/window
     \* abstraction reaches StorageFailed or ApplyFailed. Corruption is
-    \* StorageFailed immediately.
+    \* StorageCorrupt immediately.
     /\ \/ ~LocalCopyMatchesView(node, local)
        \/ copyMode[node] \in ReportableStorageFailureModes
     /\ copyMode[node] \notin StorageRetryModes
@@ -278,17 +284,20 @@ ReportShardCopyFailure(node, candidate) ==
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
-            lifecyclePhase, PeerRecoveryVars>>
+            lifecyclePhase, storageFaultInjected, PeerRecoveryVars>>
 
 \* node::reconciliation storage-open classification. Corrupt manifest, frame,
 \* Tantivy metadata/segments, or marker decoding is definitive immediately.
 CorruptShardStorage(node) ==
     /\ FaultMode = "S1"
+    /\ ~faultsStopped
+    /\ ~storageFaultInjected
     /\ alive[node]
     /\ copyExists[node]
     /\ copyMode[node] = "Active"
     /\ copyExists' = [copyExists EXCEPT ![node] = FALSE]
-    /\ copyMode' = [copyMode EXCEPT ![node] = "StorageFailed"]
+    /\ copyMode' = [copyMode EXCEPT ![node] = "StorageCorrupt"]
+    /\ storageFaultInjected' = TRUE
     /\ ops' = [ops EXCEPT ![node] = {}]
     /\ durableOps' = [durableOps EXCEPT ![node] = {}]
     /\ docValue' =
@@ -304,7 +313,8 @@ CorruptShardStorage(node) ==
             replicaFence, durableReplicaFence, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
-            FaultVars, PeerRecoveryVars>>
+            crashCount, partitionCount, diskLost, faultsStopped,
+            lifecyclePhase, PeerRecoveryVars>>
 
 \* Persistent local I/O while opening a copy, persisting its fence, or reading
 \* recovery markers first enters bounded retry/backoff.  This copy-unavailable
@@ -312,11 +322,14 @@ CorruptShardStorage(node) ==
 \* the already-open copy readable.
 BeginPersistentStorageFailure(node) ==
     /\ FaultMode = "S1"
+    /\ ~faultsStopped
+    /\ ~storageFaultInjected
     /\ alive[node]
     /\ copyExists[node]
     /\ copyMode[node] = "Active"
     /\ copyExists' = [copyExists EXCEPT ![node] = FALSE]
     /\ copyMode' = [copyMode EXCEPT ![node] = "StorageRetrying"]
+    /\ storageFaultInjected' = TRUE
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -326,7 +339,8 @@ BeginPersistentStorageFailure(node) ==
             replicaFence, durableReplicaFence, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
-            FaultVars, PeerRecoveryVars>>
+            crashCount, partitionCount, diskLost, faultsStopped,
+            lifecyclePhase, PeerRecoveryVars>>
 
 \* ShardManager::{ensure_local_apply_allowed,record_local_apply_result}, called
 \* by apply_replica_operation and the primary write handlers: the engine and
@@ -334,10 +348,33 @@ BeginPersistentStorageFailure(node) ==
 \* The first failed mutation moves ApplyFailing to ApplyRetrying.
 BeginPersistentApplyFailure(node) ==
     /\ FaultMode = "S1"
+    /\ ~faultsStopped
+    /\ ~storageFaultInjected
     /\ alive[node]
     /\ copyExists[node]
     /\ copyMode[node] = "Active"
     /\ copyMode' = [copyMode EXCEPT ![node] = "ApplyFailing"]
+    /\ storageFaultInjected' = TRUE
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            crashCount, partitionCount, diskLost, faultsStopped,
+            lifecyclePhase, PeerRecoveryVars>>
+
+\* Process restart redetects the same persistent open/fence/marker fault with
+\* a fresh per-process retry budget.
+RedetectPersistentStorageFailure(node) ==
+    /\ FaultMode = "S1"
+    /\ alive[node]
+    /\ ~copyExists[node]
+    /\ copyMode[node] = "StorageFailing"
+    /\ copyMode' = [copyMode EXCEPT ![node] = "StorageRetrying"]
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -382,6 +419,26 @@ EscalatePersistentApplyFailure(node) ==
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
             FaultVars, PeerRecoveryVars>>
 
+\* After an exact-allocation failure has committed, an operator repair clears
+\* the persistent local fault. It remains enabled if allocation races ahead of
+\* repair; only peer recovery may install the fresh allocation identity.
+RepairPersistentStorageFault(node) ==
+    /\ FaultMode = "S1"
+    /\ alive[node]
+    /\ CommittedResult("FailShardCopy", node, TRUE)
+    /\ copyMode[node] \in AllStorageFailureModes
+    /\ copyMode' = [copyMode EXCEPT ![node] = "Active"]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            FaultVars, PeerRecoveryVars>>
+
 \* src/node/mod.rs lifecycle reconciliation proactively invokes
 \* ensure_primary_activated for every local primary whose incarnation-local
 \* activation record does not match its applied routing term.
@@ -410,7 +467,7 @@ ElectLeader(candidate) ==
     /\ UNCHANGED
           <<raftLog, pendingRaft, applied, views, raftVoters,
             ReplicationVars, PeerRecoveryVars, crashCount, partitionCount,
-            diskLost, faultsStopped, lifecyclePhase>>
+            diskLost, faultsStopped, lifecyclePhase, storageFaultInjected>>
 
 \* src/node/mod.rs dead-node loop + IndexMetadata::{remove_node,
 \* select_promotion_candidate,promote_replica_to}.  Checkpoint ranking is
@@ -469,7 +526,7 @@ SuspectAndRemove(leader, node, candidate) ==
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
-            PeerRecoveryVars>>
+            storageFaultInjected, PeerRecoveryVars>>
 
 \* client_write_checked(UpdateIndex) returned success to the dead-node loop.
 ObserveRoutingAccepted(node) ==
@@ -479,7 +536,7 @@ ObserveRoutingAccepted(node) ==
           [lifecyclePhase EXCEPT ![node] = "RoutingCommitted"]
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, faultsStopped>>
+            partitionCount, diskLost, faultsStopped, storageFaultInjected>>
 
 \* client_write_checked(UpdateIndex) returned the state-machine rejection.
 ObserveRoutingRejected(node) ==
@@ -489,7 +546,7 @@ ObserveRoutingRejected(node) ==
           [lifecyclePhase EXCEPT ![node] = "RoutingRejected"]
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, faultsStopped>>
+            partitionCount, diskLost, faultsStopped, storageFaultInjected>>
 
 \* src/node/mod.rs::dead-node loop defers RemoveNode after a rejected
 \* UpdateIndex and retries from a fresh view on a later lifecycle tick.
@@ -498,7 +555,7 @@ DeferRejectedRouting(node) ==
     /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![node] = "Idle"]
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, faultsStopped>>
+            partitionCount, diskLost, faultsStopped, storageFaultInjected>>
 
 \* src/node/mod.rs calls openraft::change_membership only after the routing
 \* update succeeds.  The abstraction performs the committed voter removal
@@ -520,7 +577,7 @@ ChangeRaftMembership(leader, node) ==
     /\ UNCHANGED
           <<raftLog, pendingRaft, applied, views, raftLeader,
             ReplicationVars, PeerRecoveryVars, crashCount, partitionCount,
-            diskLost, faultsStopped>>
+            diskLost, faultsStopped, storageFaultInjected>>
 
 \* src/node/mod.rs submits ClusterCommand::RemoveNode after membership removal.
 ProposeRemoveNode(leader, node) ==
@@ -548,7 +605,7 @@ ProposeRemoveNode(leader, node) ==
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
-            PeerRecoveryVars>>
+            storageFaultInjected, PeerRecoveryVars>>
 
 \* The leader observes successful ClusterCommand::RemoveNode application.
 ObserveNodeRemoved(node) ==
@@ -558,7 +615,7 @@ ObserveNodeRemoved(node) ==
     /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![node] = "Removed"]
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, faultsStopped>>
+            partitionCount, diskLost, faultsStopped, storageFaultInjected>>
 
 \* src/node/mod.rs follower JoinCluster retry.  A removed process must commit
 \* AddNode before the allocator may use it again.
@@ -584,7 +641,7 @@ Rejoin(node) ==
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
-            PeerRecoveryVars>>
+            storageFaultInjected, PeerRecoveryVars>>
 
 \* JoinCluster observes committed ClusterCommand::AddNode registration.
 ObserveRejoin(node) ==
@@ -595,7 +652,7 @@ ObserveRejoin(node) ==
     /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![node] = "Rejoined"]
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, faultsStopped>>
+            partitionCount, diskLost, faultsStopped, storageFaultInjected>>
 
 \* src/cluster/state.rs::allocate_unassigned_replicas and the allocator phase
 \* at the end of src/node/mod.rs's leader tick.  The target must be alive and
@@ -636,7 +693,7 @@ AllocateAfterLifecycle(leader, target) ==
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
-            PeerRecoveryVars>>
+            storageFaultInjected, PeerRecoveryVars>>
 
 \* The leader allocator observes successful UpdateIndex assignment.
 ObserveAllocationAccepted(target) ==
@@ -645,7 +702,7 @@ ObserveAllocationAccepted(target) ==
     /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![target] = "Idle"]
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, faultsStopped>>
+            partitionCount, diskLost, faultsStopped, storageFaultInjected>>
 
 \* The leader allocator observes a rejected stale UpdateIndex proposal.
 ObserveAllocationRejected(target) ==
@@ -654,7 +711,7 @@ ObserveAllocationRejected(target) ==
     /\ lifecyclePhase' = [lifecyclePhase EXCEPT ![target] = "Rejoined"]
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, faultsStopped>>
+            partitionCount, diskLost, faultsStopped, storageFaultInjected>>
 
 \* src/engine/tantivy.rs::flush_with_global_checkpoint and
 \* src/wal/mod.rs::{truncate,truncate_below}.  The model retains logical
@@ -684,7 +741,8 @@ Flush(node) ==
             durableReplicaFence, copyMode, installMarker, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
-            faultsStopped, lifecyclePhase, PeerRecoveryVars>>
+            faultsStopped, lifecyclePhase, storageFaultInjected,
+            PeerRecoveryVars>>
 
 \* C3 fault: the process identity survives while its shard disk is destroyed.
 DiskLoss(node) ==
@@ -714,7 +772,8 @@ DiskLoss(node) ==
             writeRequired, writeWait, pins, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic, crashCount,
-            partitionCount, faultsStopped, lifecyclePhase, PeerRecoveryVars>>
+            partitionCount, faultsStopped, lifecyclePhase,
+            storageFaultInjected, PeerRecoveryVars>>
 
 \* node::reconciliation::open_local_assigned_shards and
 \* ShardManager::open_assigned_shard_with_settings.  Without allocation IDs
@@ -763,7 +822,8 @@ OpenAssignedEmptyCopy(node) ==
             committed, truncBelow, pins, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, termMonotonic, crashCount, partitionCount, diskLost,
-            faultsStopped, lifecyclePhase, PeerRecoveryVars>>
+            faultsStopped, lifecyclePhase, storageFaultInjected,
+            PeerRecoveryVars>>
 
 FaultTypeOK ==
     /\ crashCount \in 0..MaxCrashes
@@ -771,6 +831,7 @@ FaultTypeOK ==
     /\ diskLost \in [Nodes -> BOOLEAN]
     /\ faultsStopped \in BOOLEAN
     /\ lifecyclePhase \in [Nodes -> LifecyclePhases]
+    /\ storageFaultInjected \in BOOLEAN
 
 FaultCoreNext ==
     \/ \E node \in Nodes : Crash(node)
@@ -800,8 +861,10 @@ FaultCoreNext ==
     \/ \E node \in Nodes : CorruptShardStorage(node)
     \/ \E node \in Nodes : BeginPersistentStorageFailure(node)
     \/ \E node \in Nodes : BeginPersistentApplyFailure(node)
+    \/ \E node \in Nodes : RedetectPersistentStorageFailure(node)
     \/ \E node \in Nodes : EscalatePersistentStorageFailure(node)
     \/ \E node \in Nodes : EscalatePersistentApplyFailure(node)
+    \/ \E node \in Nodes : RepairPersistentStorageFault(node)
     \/ \E node \in Nodes : LifecycleProposeActivation(node)
     \/ \E node \in Nodes : Flush(node)
     \/ \E node \in Nodes : DiskLoss(node)

@@ -56,7 +56,7 @@ PRStopFaults ==
     /\ faultsStopped' = TRUE
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, lifecyclePhase>>
+            partitionCount, diskLost, lifecyclePhase, storageFaultInjected>>
 
 PRRestorePending ==
     /\ RestorePendingMarker(TargetNode)

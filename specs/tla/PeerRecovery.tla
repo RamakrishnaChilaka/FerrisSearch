@@ -161,6 +161,16 @@ CrashRecoveryState(node) ==
               THEN "InstallMarker"
               ELSE IF target = node /\ copyMode[target] = "Pending"
               THEN "Active"
+              \* The durable fault survives while the process-local retry
+              \* count/window resets on restart.
+              ELSE IF target = node
+                      /\ copyMode[target]
+                         \in {"StorageRetrying", "StorageFailed"}
+              THEN "StorageFailing"
+              ELSE IF target = node
+                      /\ copyMode[target]
+                         \in {"ApplyRetrying", "ApplyFailed"}
+              THEN "ApplyFailing"
               ELSE copyMode[target]]
     /\ installMarker' =
           [target \in Nodes |->

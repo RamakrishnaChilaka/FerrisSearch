@@ -35,11 +35,14 @@ AllWriteKinds == {"Put", "Delete"}
 WriteKinds == AllowedWriteKinds
 CopyModes ==
     {"Active", "Recovering", "Pending", "InstallMarker",
-     "StorageRetrying", "StorageFailed",
+     "StorageCorrupt", "StorageFailing", "StorageRetrying", "StorageFailed",
      "ApplyFailing", "ApplyRetrying", "ApplyFailed"}
 ApplyFailureModes == {"ApplyFailing", "ApplyRetrying", "ApplyFailed"}
-StorageRetryModes == {"StorageRetrying", "ApplyFailing", "ApplyRetrying"}
-ReportableStorageFailureModes == {"StorageFailed", "ApplyFailed"}
+ReportableOpenStorageFailureModes == {"StorageCorrupt", "StorageFailed"}
+StorageRetryModes ==
+    {"StorageFailing", "StorageRetrying", "ApplyFailing", "ApplyRetrying"}
+ReportableStorageFailureModes ==
+    ReportableOpenStorageFailureModes \cup {"ApplyFailed"}
 AllStorageFailureModes ==
     StorageRetryModes \cup ReportableStorageFailureModes
 MessageKinds == {"Replicate", "ReplicaAck", "ReplicaNack"}

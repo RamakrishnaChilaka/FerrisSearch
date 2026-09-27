@@ -38,7 +38,7 @@ PromotionStopFaults ==
     /\ faultsStopped' = TRUE
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, lifecyclePhase>>
+            partitionCount, diskLost, lifecyclePhase, storageFaultInjected>>
 
 PromotionCommit ==
     \E command \in pendingRaft :

@@ -27,7 +27,7 @@ L2StopFaults ==
     /\ faultsStopped' = TRUE
     /\ UNCHANGED
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
-            partitionCount, diskLost, lifecyclePhase>>
+            partitionCount, diskLost, lifecyclePhase, storageFaultInjected>>
 
 L2RestorePending ==
     /\ RestorePendingMarker(TargetNode)
