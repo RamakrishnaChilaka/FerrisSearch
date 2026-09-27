@@ -115,6 +115,10 @@ pub trait WriteAheadLog: Send + Sync {
   Never call it against a shard with a live engine/writer. Runtime recovery and
   diagnostics must read through the live engine's captured generation state.
 - Unknown operation tags in persisted entries are corruption errors: reopen/replay must return `Err`, not panic
+- Manifest, frame, operation-tag, payload, sequence-watermark, and other
+  persisted WAL decode/validation failures carry a typed corruption cause so
+  shard lifecycle can fail the exact allocation immediately. Ordinary I/O
+  errors retain their source and enter bounded retry/backoff instead.
 - Persist the manifest before deleting obsolete generation files during `truncate()` / `truncate_below()` so crashes never leave startup without authoritative generation metadata
 - `translog.committed` should be persisted after each intermediate replay batch commit so replay remains idempotent across repeated crash recovery
 

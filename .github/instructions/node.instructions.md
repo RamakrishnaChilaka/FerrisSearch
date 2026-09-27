@@ -60,10 +60,16 @@ pub struct Node {
 3. Reopen only authoritative local copies whose durable UUID/allocation
    identity matches; only an initial CreateIndex primary may be created empty
    before the shard's first activation
-4. Report only definitive unopenable authoritative-copy failures with
-   allocation-bound `FailShardCopy`; transient engine/filesystem/fence I/O is
-   retryable and does not edit routing. Duplicate reports are throttled per
-   allocation.
+4. Report corruption-class decode/validation failures immediately. Retry other
+   engine/filesystem/fence I/O with shared per-copy exponential backoff and
+   escalate after at least three failed attempts spanning 15 seconds. Replica
+   reports remove the exact allocation; primary reports are promote-only and
+   are submitted only with an in-sync candidate. Duplicate reports are
+   throttled per allocation.
+5. Proactively invoke the shared primary-activation path for each local primary
+   after startup or promotion. The activation cache is keyed by
+   UUID/shard/allocation/term so lifecycle ticks and request handlers do not
+   issue repeated Raft term bumps.
 5. Allocate unassigned replicas only for shards with a live allocated primary
 
 ### Follower Duties (every 5s tick)
@@ -111,6 +117,11 @@ pub struct Node {
   Controlled retryable transfer failures remove their partial install and
   retry the same allocation; an inactive matching install marker represents an
   interrupted/crashed install and remains a definitive failure report.
+- If pending-marker publication reaches rename but directory fsync fails,
+  preserve or reconstruct `FinalizedAwaitingMembership` in memory; retry
+  cleanup must not leave a permanent `Recovering` gate.
+- A delayed abort checks the currently registered index UUID before touching
+  storage and never recreates a deleted/recreated index's old UUID directory.
 - An abandoned finalize session is made definitive by a source-side
   `ActivatePrimary` term bump. If no admission command was submitted, release
   the barrier first and bump asynchronously; after submission, keep the barrier

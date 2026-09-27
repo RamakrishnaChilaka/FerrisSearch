@@ -129,8 +129,9 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
 - `promote_replica*` removes the promoted node from `replicas` and
   `in_sync_replicas`; the new primary is authoritative implicitly.
 - Replica allocation is skipped when the shard has no live allocated primary.
-  `FailShardCopy` always accounts for the removed copy as unassigned; without
-  an in-sync promotion candidate, the cleared primary allocation makes health red.
+  Replica `FailShardCopy` accounts for the removed copy as unassigned. Primary
+  reports are promote-only: they promote an in-sync candidate or reject
+  without clearing the primary allocation.
 
 ## ClusterManager (src/cluster/manager.rs)
 ```rust

@@ -55,9 +55,10 @@ pub struct ShardManager {
   fence. Updates use temp write, file fsync, rename, and directory fsync.
 - Assigned opens load and validate the file before publishing an engine.
   Missing, malformed, or mismatched identity fails closed.
-- Definitive copy-identity/install failures are typed separately from transient
-  filesystem or engine I/O. Only the definitive class may drive
-  `FailShardCopy`.
+- Identity, marker, WAL, and Tantivy decode/validation failures are definitive.
+  Other filesystem/engine I/O uses a shared per-copy retry budget: exponential
+  1–5 second backoff, at least three failed attempts, and a 15-second minimum
+  window before persistent-I/O escalation.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.
@@ -99,6 +100,10 @@ rejection and closes the engine and restores `PEER_RECOVERY_IN_PROGRESS`.
 Lifecycle restoration of an exact marker happens before recovery candidate
 selection. Target begin and preparation recheck the marker under the per-shard
 lock before any engine eviction or directory removal.
+If marker rename succeeds but directory fsync fails, publish the in-memory
+pending state before returning the error; retry cleanup also restores that state
+from a matching marker. Delayed abort checks the registered UUID and must not
+recreate storage for a deleted/recreated index incarnation.
 
 `ShardManager::reopen_shard()` and async index-close wrappers invoke the
 registered source-session cleanup hook before replacing engines. Cleanup must

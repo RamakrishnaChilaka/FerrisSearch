@@ -269,8 +269,11 @@ coordinator-side merge semantics are required.
   allocation-bound conditional in-sync admission
 - Raft-owned shard-copy allocation IDs, durable local copy identity, and
   replica primary-term fencing before WAL mutation
-- Fail-closed copy startup plus allocation-bound failure reporting,
-  reallocation, and peer recovery after replica disk loss
+- Fail-closed copy startup with immediate corruption reporting, bounded
+  per-copy I/O retry/backoff, allocation-bound replica removal, and
+  promote-only primary failover
+- Proactive lifecycle activation of restarted or promoted primaries so idle
+  pending recoveries do not depend on a later client write
 - UUID-backed shard data directories and process-backed restart regression
 - Separate rayon pools for search and write engine work
 - Blocking wrappers for filesystem/recovery work on async call paths

@@ -25,6 +25,11 @@ OpenRaft transport success is not proof that the application command applied.
 Rejected conditional commands perform no partial mutation and do not bump the
 cluster-state version.
 
+`FailShardCopy.promote_only` is required for primary-copy reports. The state
+machine accepts such a report only when an in-sync replica can be promoted; it
+must reject rather than clear the last primary allocation. Replica reports set
+`promote_only = false`.
+
 ## When to use this recipe (vs. the data path)
 
 | Use the control-plane (this recipe) | Use the data path (docs/shards/WAL) |

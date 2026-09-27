@@ -167,6 +167,12 @@ cargo test -- test_name                         # Single test by name
   target/source refusal to reattach a settling session, transient fence I/O
   without routing failure, retry cleanup without a failed-install marker, stale
   identity-temp cleanup, and preservation of existing test-copy identity.
+- Round-2 allocation/fencing regressions cover corrupt WAL/Tantivy/marker
+  classification, persistent-I/O count/time escalation, shared request and
+  lifecycle open backoff, replica removal with resumed writes, promote-only
+  primary failover and no-survivor rejection, idle lifecycle activation after
+  primary restart, post-rename pending-state repair, and delete/recreate-safe
+  recovery abort.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

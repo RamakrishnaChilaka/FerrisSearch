@@ -115,8 +115,14 @@ pub async fn replicate_bulk(
   status polling refuse to reattach once finalization/admission/settlement has
   begun.
 - Controlled retryable recovery failures remove the partial target install and
-  retry the same allocation. Only definitive rejection or a crash-left inactive
-  matching install marker enters the allocation-bound copy-failure path.
+  retry the same allocation. Definitive pending rejection intentionally writes
+  the failed-install marker, causing allocation-bound replica failure and a
+  fresh recovery allocation; a crash-left inactive matching marker follows the
+  same path.
+- Corrupt storage is definitive immediately. Other local I/O uses shared
+  per-copy count/time retry state and exponential backoff. Persistent replica
+  I/O eventually fails the allocation; persistent primary I/O can only request
+  promote-only failover when an in-sync replacement exists.
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates but cannot grant membership.

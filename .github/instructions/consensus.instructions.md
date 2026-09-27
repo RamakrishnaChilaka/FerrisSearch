@@ -27,7 +27,7 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replicas, settings)
 - `MarkReplicaInSync { index_name, index_uuid, shard_id, replica, allocation_id, primary, primary_term }` — conditionally admit the exact recovered assignment
 - `ActivatePrimary { index_name, index_uuid, shard_id, primary, allocation_id, expected_term }` — conditionally bump the term and monotonically mark the shard initialized
-- `FailShardCopy { index_name, index_uuid, shard_id, node, allocation_id }` — conditionally remove an unopenable copy, promote an in-sync survivor, or leave a red primary
+- `FailShardCopy { index_name, index_uuid, shard_id, node, allocation_id, promote_only }` — conditionally remove an unopenable replica or promote an in-sync survivor; primary reports must be promote-only
 - `AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
 - `PutApiKey { record: SecurityApiKeyRecord }` — upsert a dynamic API key (stores only the hash) into `ClusterState.api_keys`
 - `DeleteApiKey { key_id: String }` — remove a dynamic API key
@@ -60,7 +60,7 @@ pub struct ClusterStateMachine {
 | `UpdateIndex` | preserve existing copy IDs (including an unchanged red shard's absent primary ID), assign the current log index to new copies, clear removed IDs, intersect in-sync membership, and reject out-of-sync promotion |
 | `MarkReplicaInSync` | add one assigned replica only when the shard is initialized, a primary allocation exists, and UUID, allocation ID, primary, and term match |
 | `ActivatePrimary` | increment the term and set `primary_initialized` only when UUID, allocation ID, primary, and expected term match |
-| `FailShardCopy` | after initialization, remove only the exact failed allocation; promote an in-sync replica with a term bump or clear the primary allocation and leave the shard red |
+| `FailShardCopy` | after initialization, remove only an exact failed replica allocation; a primary command must be promote-only and promotes an in-sync candidate with a term bump, otherwise it is rejected without clearing the primary allocation |
 | `AddMappings` | merge `new_fields` into `state.indices[name].mappings` via `.entry().or_insert()` |
 | `PutApiKey` / `DeleteApiKey` | `insert` / `remove` on `state.api_keys` |
 | `PutRole` / `DeleteRole` | `insert` / `remove` on `state.roles` |

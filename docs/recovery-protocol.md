@@ -159,9 +159,10 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > recovery gate before WAL mutation. CreateIndex replicas start out of sync,
 > first activation marks the shard initialized, and only the initial primary
 > allocation may be created empty before activation. An unopenable initialized
-> copy reports `FailShardCopy`; the exact allocation is removed, an in-sync
-> survivor is promoted when available, and otherwise the cleared primary
-> allocation leaves the shard red.
+> replica reports `FailShardCopy` and its exact allocation is removed. Primary
+> reports are promote-only: an in-sync survivor is promoted when available,
+> while a primary without a survivor retains its allocation and stays
+> unavailable rather than being converted into a metadata-red empty-copy path.
 >
 > Allocation IDs now resolve remove-and-re-add ABA for recovery start,
 > admission, pending-target observation, and copy-failure reports. Assigned
@@ -178,11 +179,11 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > awaiting-membership marker and reopens the finalized copy before scheduling
 > recovery. Target begin/prepare and source-session polling refuse to restart a
 > finalized or settling transfer. Controlled retryable recovery failures clean
-> their partial install and retain the same assignment; only definitive local
-> identity/install failures produce allocation-bound `FailShardCopy`.
-> Transient fence-persistence and general engine/filesystem I/O failures remain
-> request failures and are not converted into routing changes. Duplicate
-> failure reports are rate-limited per allocation.
+> their partial install and retain the same assignment. Definitive pending
+> rejection deliberately restores an install marker; lifecycle then fails the
+> replica allocation and schedules a fresh allocation rather than reusing a
+> recovery result produced under obsolete primary authority. Duplicate failure
+> reports are rate-limited per allocation.
 >
 > The pre-activation empty-primary rule depends on a node's applied routing view
 > not moving backward. Production startup constructs OpenRaft over the
@@ -190,6 +191,24 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > used for normal shard service. Losing `raft.db` and rejoining under the same
 > node name does not satisfy this assumption; retained shard storage must not be
 > treated as a fresh pre-activation allocation in that scenario.
+>
+> **Storage-failure and idle-activation corrections — September 27, 2026:**
+> identity, marker, WAL manifest/frame, and Tantivy metadata/segment
+> decode-validation failures are definitive immediately. Other filesystem and
+> engine I/O uses a shared per-copy exponential open/fence backoff (1 second up
+> to 5 seconds) and escalates only after at least three failed attempts spanning
+> 15 seconds. Replica escalation removes the exact allocation. Primary
+> escalation submits a promote-only failure only when an in-sync candidate
+> exists; otherwise routing is retained and the shard remains unavailable.
+> Request and lifecycle opens share the same retry state, so request traffic
+> cannot bypass backoff. Node lifecycle also invokes the same idempotent
+> primary-activation path used by writes after startup or promotion, allowing
+> an idle pending target to observe admission or a newer term. If publication
+> of the durable pending marker succeeds but its directory fsync reports an
+> error, the in-memory target state is still advanced (and retry cleanup can
+> reconstruct it from the marker) without a process restart. Recovery aborts
+> verify the currently registered index UUID before touching disk, so a delayed
+> abort cannot recreate a deleted index incarnation.
 
 The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including

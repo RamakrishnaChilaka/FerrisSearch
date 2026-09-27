@@ -126,9 +126,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   `INVALID_ARGUMENT`; valid requests still return immediately after enqueueing
   node-local background work.
 - The maintenance helper only operates on shards where `primary == local_node_id` or the node is in `replicas` — orphaned shards are skipped
-- The constructors require a local node ID and task manager; production uses
-  `create_transport_service_with_raft_and_storage()`, while
-  `create_transport_service_for_test()` supplies isolated defaults.
+- The constructors require a local node ID and task manager. Production uses
+  `create_transport_service_with_raft_and_storage_handle()` so the node
+  lifecycle and request handlers share one `TransportService` activation
+  cache; `create_transport_service_for_test()` supplies isolated defaults.
 
 ### Key Handler Patterns
 - **join_cluster**: If leader → serialize concurrent joins, validate `node_id` / `raft_node_id`, register the transport address with `add_learner()` for non-voters, apply `AddNode`, then recompute the latest full voter set before `change_membership()`. If promotion fails, roll back the `AddNode`. If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
@@ -195,10 +196,14 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   membership accepts live apply and remains open; its durable pending marker is
   reconciled to admitted/promoted or definitively rejected state after restart.
   The in-progress marker still prevents a partial install from being opened.
-- Local copy failure forwarding is restricted to typed definitive identity,
-  missing-copy, or matching failed-install conditions. Transient open/engine
-  I/O and fence-persistence failures remain retryable request failures and must
-  not trigger `FailShardCopy`.
+- Local copy failure forwarding reports corruption-class identity, marker, WAL,
+  and Tantivy decode/validation failures immediately. Other open/engine/fence
+  I/O remains retryable under shared per-copy backoff until the count/time
+  budget is exhausted. Replica escalation removes the copy; primary escalation
+  is promote-only and requires an in-sync candidate.
+- Production transport and node lifecycle share one primary-activation state.
+  Proactive lifecycle activation and request-triggered activation are
+  idempotent for the same UUID/shard/allocation/term.
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.
