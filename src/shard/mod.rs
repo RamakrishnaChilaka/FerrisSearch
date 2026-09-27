@@ -689,6 +689,12 @@ impl ShardManager {
             {
                 return true;
             }
+            if cause
+                .downcast_ref::<crate::engine::tantivy::TantivyCommitFailureError>()
+                .is_some()
+            {
+                return true;
+            }
             let Some(tantivy_error) = cause.downcast_ref::<tantivy::TantivyError>() else {
                 return false;
             };
@@ -4889,6 +4895,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_rebuild_does_not_append_while_another_instance_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let first = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        first
+            .add_document_with_receipt("baseline", serde_json::json!({"value": 0}))
+            .unwrap();
+        first.refresh().unwrap();
+        first.inject_writer_replacement_failures_for_test(28, 1);
+        assert!(first.force_merge(1).is_err());
+        let wal_before = first
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations
+            .len();
+
+        let second = crate::engine::CompositeEngine::open_existing_with_mappings(
+            dir.path().join("uuid-1/shard_0"),
+            Duration::from_secs(60),
+            &HashMap::new(),
+            crate::wal::TranslogDurability::Request,
+            Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        let blocked = first
+            .add_document_with_receipt("blocked", serde_json::json!({"value": 1}))
+            .unwrap_err();
+        assert!(!ShardManager::should_report_copy_failure(&blocked));
+        assert_eq!(
+            first
+                .peer_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .len(),
+            wal_before,
+            "a failed writer rebuild must not append a WAL entry"
+        );
+
+        drop(second);
+        first
+            .add_document_with_receipt("after-release", serde_json::json!({"value": 2}))
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn persistent_force_merge_writer_rebuild_failure_escalates_under_apply_key() {
         let dir = tempfile::tempdir().unwrap();
         let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
@@ -4929,6 +4994,123 @@ mod tests {
         }
         assert_eq!(reportable, [false, false, true]);
         assert_eq!(quarantine, [false, false, false]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transient_commit_failure_replays_acknowledged_writes_before_next_commit_and_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let assignment = AssignedShardOpen {
+            allocation_id: 7,
+            primary_term: 2,
+            allow_empty_creation: true,
+        };
+        {
+            let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+            let engine = manager
+                .open_assigned_shard_with_settings(
+                    "idx",
+                    0,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "uuid-1",
+                    assignment,
+                )
+                .unwrap();
+            engine
+                .add_document_with_receipt("pre-fault", serde_json::json!({"value": -1}))
+                .unwrap();
+            engine.refresh().unwrap();
+            let committed_path = dir.path().join("uuid-1/shard_0/translog.committed");
+            assert_eq!(std::fs::read_to_string(&committed_path).unwrap(), "1");
+
+            let index_dir = dir.path().join("uuid-1/shard_0/index");
+            std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let during_fault = engine
+                .add_document_with_receipt("during-fault", serde_json::json!({"value": 0}))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let failed_commit = engine.refresh();
+            std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let failed_commit = failed_commit.unwrap_err();
+            assert!(
+                failed_commit
+                    .chain()
+                    .any(|cause| cause.is::<crate::engine::tantivy::TantivyCommitFailureError>()),
+                "{failed_commit:#}"
+            );
+            assert!(
+                engine.writer_is_failed_for_test(),
+                "a failed commit must remove the writer before another write can queue"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&committed_path).unwrap(),
+                "1",
+                "a failed commit must not advance the persisted checkpoint"
+            );
+
+            let first_recovered_engine = engine.clone();
+            let first_recovered = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    first_recovered_engine
+                        .add_document_with_receipt("acked-0", serde_json::json!({"value": 0}))
+                }),
+            )
+            .await
+            .expect("the first write after a failed commit must not hang")
+            .expect("rebuild write task must not panic")
+            .unwrap();
+            assert_eq!(first_recovered.doc_id, "acked-0");
+            let mut acknowledged = vec!["acked-0".to_string()];
+            for attempt in 1..5 {
+                let id = format!("acked-{attempt}");
+                engine
+                    .add_document_with_receipt(&id, serde_json::json!({"value": attempt}))
+                    .unwrap();
+                acknowledged.push(id);
+            }
+            assert!(
+                !engine.writer_is_failed_for_test(),
+                "the first recovered write must replace the failed writer"
+            );
+            engine.refresh().unwrap();
+            assert!(engine.get_document("during-fault").unwrap().is_some());
+            for id in &acknowledged {
+                assert!(engine.get_document(id).unwrap().is_some(), "{id}");
+            }
+            engine.flush().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&committed_path).unwrap(),
+                (during_fault.seq_no + acknowledged.len() as u64 + 1).to_string()
+            );
+        }
+
+        let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let engine = restarted
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allow_empty_creation: false,
+                    ..assignment
+                },
+            )
+            .unwrap();
+        assert!(engine.get_document("during-fault").unwrap().is_some());
+        for attempt in 0..5 {
+            assert!(
+                engine
+                    .get_document(&format!("acked-{attempt}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[tokio::test]

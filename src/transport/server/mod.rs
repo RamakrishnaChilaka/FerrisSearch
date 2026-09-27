@@ -55,6 +55,8 @@ struct PrimaryActivationState {
     activation_lock: Mutex<()>,
     failed_copy_reports: Mutex<HashMap<(String, u32, u64), std::time::Instant>>,
     available_primary_reports: Mutex<HashMap<(String, u32, u64, u64), std::time::Instant>>,
+    #[cfg(test)]
+    available_report_tasks_spawned: std::sync::atomic::AtomicUsize,
 }
 
 fn new_primary_activation_state() -> Arc<PrimaryActivationState> {
@@ -3477,6 +3479,16 @@ impl TransportService {
         shard_id: u32,
         activated_primary: &ActivatedPrimary,
     ) {
+        if !self
+            .cluster_manager
+            .primary_unavailable(index_name, shard_id)
+        {
+            return;
+        }
+        #[cfg(test)]
+        self.primary_activation_state
+            .available_report_tasks_spawned
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let service = self.clone();
         let index_name = index_name.to_string();
         let activated_primary = activated_primary.clone();

@@ -259,6 +259,9 @@ pub(super) fn open_local_assigned_shards(
                     .iter()
                     .any(|node_id| node_id == local_node_id);
             if !assigned_here {
+                if shard_manager.get_shard(index_name, *shard_id).is_some() {
+                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
+                }
                 continue;
             }
             let authoritative_here =

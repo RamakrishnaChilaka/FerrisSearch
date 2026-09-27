@@ -59,6 +59,87 @@ fn failed_copy_reports_are_throttled_per_allocation() {
 }
 
 #[tokio::test]
+async fn reconciliation_closes_engine_after_local_allocation_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let mut state = crate::cluster::state::ClusterState::new("removed-copy".into());
+    state.add_index(IndexMetadata {
+        name: "idx".into(),
+        uuid: IndexUuid::new("idx-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 1,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 2,
+                replicas: vec!["node-2".into()],
+                in_sync_replicas: vec!["node-2".into()],
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: IndexSettings::default(),
+    });
+    let allocation_id = state.shard_allocation_id("idx", 0, "node-2").unwrap();
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "idx-uuid",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+
+    {
+        let routing = state
+            .indices
+            .get_mut("idx")
+            .unwrap()
+            .shard_routing
+            .get_mut(&0)
+            .unwrap();
+        routing.replicas.clear();
+        routing.in_sync_replicas.clear();
+        routing.unassigned_replicas = 1;
+    }
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .replicas
+        .remove("node-2");
+
+    assert!(
+        open_local_assigned_shards(
+            &state,
+            "node-2",
+            &shard_manager,
+            &std::sync::Mutex::new(std::collections::HashSet::new()),
+        )
+        .is_empty()
+    );
+    assert!(shard_manager.get_shard("idx", 0).is_none());
+    assert!(dir.path().join("idx-uuid/shard_0").exists());
+}
+
+#[tokio::test]
 async fn open_local_assigned_shards_opens_unopened_local_shards() {
     let dir = tempfile::tempdir().unwrap();
     let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));

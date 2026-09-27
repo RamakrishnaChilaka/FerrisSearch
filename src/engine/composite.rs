@@ -413,6 +413,11 @@ impl SearchEngine for CompositeEngine {
             .inject_engine_apply_failures_for_test(raw_os_error, attempts);
     }
 
+    #[cfg(test)]
+    fn writer_is_failed_for_test(&self) -> bool {
+        self.text.writer_is_failed_for_test()
+    }
+
     fn add_document_with_receipt(
         &self,
         doc_id: &str,
