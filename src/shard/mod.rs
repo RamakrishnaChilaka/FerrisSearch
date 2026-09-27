@@ -97,9 +97,10 @@ pub(crate) struct ShardCopyBackoff {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "persistent shard copy I/O failure after {attempts} attempts over {elapsed_ms} ms: {source}"
+    "persistent shard copy I/O failure during {operation:?} after {attempts} attempts over {elapsed_ms} ms: {source}"
 )]
 pub(crate) struct PersistentShardCopyIoFailure {
+    operation: ShardCopyIoOperation,
     attempts: u32,
     elapsed_ms: u128,
     #[source]
@@ -630,6 +631,7 @@ impl ShardManager {
 
     fn record_copy_io_failure(&self, key: ShardCopyIoKey, error: anyhow::Error) -> anyhow::Error {
         let now = Instant::now();
+        let operation = key.operation;
         let policy = *self
             .copy_retry_policy
             .read()
@@ -658,6 +660,7 @@ impl ShardManager {
             && elapsed >= policy.escalation_window
         {
             PersistentShardCopyIoFailure {
+                operation,
                 attempts,
                 elapsed_ms: elapsed.as_millis(),
                 source: error,
@@ -678,6 +681,12 @@ impl ShardManager {
     fn is_retryable_io_failure(error: &anyhow::Error) -> bool {
         error.chain().any(|cause| {
             if cause.downcast_ref::<std::io::Error>().is_some() {
+                return true;
+            }
+            if cause
+                .downcast_ref::<crate::engine::tantivy::TantivyWriterUnavailableError>()
+                .is_some()
+            {
                 return true;
             }
             let Some(tantivy_error) = cause.downcast_ref::<tantivy::TantivyError>() else {
@@ -1155,6 +1164,17 @@ impl ShardManager {
 
     pub(crate) fn should_report_copy_failure(error: &anyhow::Error) -> bool {
         Self::is_definitive_copy_failure(error) || Self::is_persistent_io_failure(error)
+    }
+
+    pub(crate) fn should_quarantine_copy_failure(error: &anyhow::Error) -> bool {
+        if Self::is_definitive_copy_failure(error) {
+            return true;
+        }
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<PersistentShardCopyIoFailure>()
+                .is_some_and(|failure| failure.operation != ShardCopyIoOperation::Apply)
+        })
     }
 
     pub(crate) fn ensure_local_apply_allowed(
@@ -4829,6 +4849,49 @@ mod tests {
             reportable.push(ShardManager::should_report_copy_failure(&error));
         }
         assert_eq!(reportable, [false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn failed_force_merge_writer_escalates_under_apply_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt("baseline", serde_json::json!({"value": 0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.inject_writer_replacement_failures_for_test(28, 1);
+        assert!(engine.force_merge(1).is_err());
+
+        let mut reportable = Vec::new();
+        let mut quarantine = Vec::new();
+        for attempt in 0..3 {
+            let result = engine.add_document_with_receipt(
+                &format!("after-{attempt}"),
+                serde_json::json!({"value": attempt}),
+            );
+            let error = manager
+                .record_local_apply_result("uuid-1", 0, 7, result)
+                .unwrap_err();
+            reportable.push(ShardManager::should_report_copy_failure(&error));
+            quarantine.push(ShardManager::should_quarantine_copy_failure(&error));
+        }
+        assert_eq!(reportable, [false, false, true]);
+        assert_eq!(quarantine, [false, false, false]);
     }
 
     #[tokio::test]

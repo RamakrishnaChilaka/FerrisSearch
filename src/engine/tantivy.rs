@@ -29,6 +29,13 @@ fn authoritative_schema_error(message: impl Into<String>) -> anyhow::Error {
     })
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Tantivy writer is unavailable during {context}: {reason}")]
+pub(crate) struct TantivyWriterUnavailableError {
+    context: String,
+    reason: String,
+}
+
 /// Dynamic field registry — maps user-facing field names to Tantivy Field handles.
 /// New fields are added on first encounter (dynamic mapping, like OpenSearch).
 struct FieldRegistry {
@@ -60,23 +67,25 @@ impl WriterState {
 
     fn writer_mut(&mut self, context: &str) -> Result<&mut IndexWriter> {
         self.writer.as_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Tantivy writer is unavailable during {context}: {}",
-                self.failure
-                    .as_deref()
-                    .unwrap_or("writer reinitialization is incomplete")
-            )
+            anyhow::Error::new(TantivyWriterUnavailableError {
+                context: context.to_string(),
+                reason: self
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| "writer reinitialization is incomplete".to_string()),
+            })
         })
     }
 
     fn take(&mut self, context: &str) -> Result<IndexWriter> {
         self.writer.take().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Tantivy writer is unavailable during {context}: {}",
-                self.failure
-                    .as_deref()
-                    .unwrap_or("writer reinitialization is incomplete")
-            )
+            anyhow::Error::new(TantivyWriterUnavailableError {
+                context: context.to_string(),
+                reason: self
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| "writer reinitialization is incomplete".to_string()),
+            })
         })
     }
 
@@ -121,6 +130,8 @@ pub struct HotEngine {
     force_merge_entry_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     force_merge_before_wait_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    writer_replacement_failure: Mutex<Option<(i32, usize)>>,
     #[cfg(test)]
     refresh_before_writer_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
@@ -566,6 +577,8 @@ impl HotEngine {
             #[cfg(test)]
             force_merge_before_wait_sender: Mutex::new(None),
             #[cfg(test)]
+            writer_replacement_failure: Mutex::new(None),
+            #[cfg(test)]
             refresh_before_writer_sender: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
@@ -653,6 +666,13 @@ impl HotEngine {
             let _ = sender.send(());
         }
         let wait_result = writer.wait_merging_threads();
+        #[cfg(test)]
+        if let Some(error) = self.maybe_fail_writer_replacement_for_test() {
+            let message =
+                format!("failed to reopen Tantivy writer after draining merge threads: {error}");
+            writer_state.fail(message.clone());
+            return Err(error).context(message);
+        }
         let replacement = match self.index.writer(TANTIVY_WRITER_HEAP_BYTES) {
             Ok(writer) => writer,
             Err(error) => {
@@ -1761,6 +1781,33 @@ impl HotEngine {
             Ok(())
         })
         .expect("inject WAL write failure");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_writer_replacement_failures_for_test(
+        &self,
+        raw_os_error: i32,
+        attempts: usize,
+    ) {
+        *self
+            .writer_replacement_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_writer_replacement_for_test(&self) -> Option<anyhow::Error> {
+        let mut failure = self
+            .writer_replacement_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (raw_os_error, remaining) = failure.as_mut()?;
+        if *remaining == 0 {
+            *failure = None;
+            return None;
+        }
+        *remaining -= 1;
+        Some(std::io::Error::from_raw_os_error(*raw_os_error).into())
     }
 
     #[cfg(test)]
@@ -6961,6 +7008,7 @@ mod tests {
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
             force_merge_entry_barrier: Mutex::new(None),
             force_merge_before_wait_sender: Mutex::new(None),
+            writer_replacement_failure: Mutex::new(None),
             refresh_before_writer_sender: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),

@@ -415,7 +415,65 @@ impl ClusterStateMachine {
                         "cannot mark an uninitialized primary unavailable for index '{index_name}' shard {shard_id}"
                     ));
                 }
+                if allocations.primary_unavailable {
+                    return ClusterResponse::Error(format!(
+                        "primary is already marked unavailable for index '{index_name}' shard {shard_id}"
+                    ));
+                }
                 allocations.primary_unavailable = true;
+                state.version += 1;
+                ClusterResponse::Ok
+            }
+            ClusterCommand::MarkPrimaryAvailable {
+                index_name,
+                index_uuid,
+                shard_id,
+                primary,
+                allocation_id,
+                primary_term,
+            } => {
+                let Some(metadata) = state.indices.get(index_name) else {
+                    return ClusterResponse::Error(format!("index '{index_name}' does not exist"));
+                };
+                if metadata.uuid.as_str() != index_uuid {
+                    return ClusterResponse::Error(format!("index '{index_name}' UUID mismatch"));
+                }
+                let Some(routing) = metadata.shard_routing.get(shard_id) else {
+                    return ClusterResponse::Error(format!(
+                        "index '{index_name}' has no shard {shard_id}"
+                    ));
+                };
+                if &routing.primary != primary {
+                    return ClusterResponse::Error(format!(
+                        "primary mismatch for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if routing.primary_term != *primary_term {
+                    return ClusterResponse::Error(format!(
+                        "primary term mismatch for index '{index_name}' shard {shard_id}: expected {}, got {}",
+                        routing.primary_term, primary_term
+                    ));
+                }
+                let Some(allocations) = state
+                    .shard_allocations
+                    .get_mut(index_name)
+                    .and_then(|shards| shards.get_mut(shard_id))
+                else {
+                    return ClusterResponse::Error(format!(
+                        "index '{index_name}' shard {shard_id} has no allocation identity metadata"
+                    ));
+                };
+                if allocations.primary != Some(*allocation_id) {
+                    return ClusterResponse::Error(format!(
+                        "primary allocation mismatch for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if !allocations.primary_unavailable {
+                    return ClusterResponse::Error(format!(
+                        "primary is not marked unavailable for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                allocations.primary_unavailable = false;
                 state.version += 1;
                 ClusterResponse::Ok
             }
@@ -1606,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_unavailable_is_status_only_and_activation_clears_it() {
+    fn primary_availability_is_conditional_and_never_changes_term() {
         let sm = ClusterStateMachine::new("test".into());
         let metadata = make_index("unavailable");
         let index_uuid = metadata.uuid.to_string();
@@ -1656,6 +1714,19 @@ mod tests {
             ),
             ClusterResponse::Ok
         );
+        assert!(matches!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkPrimaryUnavailable {
+                    index_name: "unavailable".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                },
+                14,
+            ),
+            ClusterResponse::Error(error) if error.contains("already marked unavailable")
+        ));
         {
             let state = sm.state_handle();
             let state = state.read().unwrap();
@@ -1670,6 +1741,90 @@ mod tests {
                 2
             );
         }
+        let unavailable_version = sm.state_handle().read().unwrap().version;
+        assert!(matches!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkPrimaryAvailable {
+                    index_name: "unavailable".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 9,
+                    primary_term: 2,
+                },
+                15,
+            ),
+            ClusterResponse::Error(error) if error.contains("allocation mismatch")
+        ));
+        assert!(matches!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkPrimaryAvailable {
+                    index_name: "unavailable".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                    primary_term: 3,
+                },
+                16,
+            ),
+            ClusterResponse::Error(error) if error.contains("term mismatch")
+        ));
+        assert_eq!(
+            sm.state_handle().read().unwrap().version,
+            unavailable_version
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkPrimaryAvailable {
+                    index_name: "unavailable".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                    primary_term: 2,
+                },
+                17,
+            ),
+            ClusterResponse::Ok
+        );
+        {
+            let state = sm.state_handle();
+            let state = state.read().unwrap();
+            assert!(!state.primary_unavailable("unavailable", 0));
+            assert_eq!(
+                state.indices["unavailable"].shard_routing[&0].primary_term,
+                2
+            );
+            assert_eq!(state.version, unavailable_version + 1);
+        }
+        assert!(matches!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkPrimaryAvailable {
+                    index_name: "unavailable".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                    primary_term: 2,
+                },
+                18,
+            ),
+            ClusterResponse::Error(error) if error.contains("not marked unavailable")
+        ));
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkPrimaryUnavailable {
+                    index_name: "unavailable".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                },
+                19,
+            ),
+            ClusterResponse::Ok
+        );
         assert_eq!(
             sm.apply_command_at(
                 &ClusterCommand::ActivatePrimary {
@@ -1680,15 +1835,16 @@ mod tests {
                     allocation_id: 10,
                     expected_term: 2,
                 },
-                14,
+                20,
             ),
             ClusterResponse::Ok
         );
-        assert!(
-            !sm.state_handle()
-                .read()
-                .unwrap()
-                .primary_unavailable("unavailable", 0)
+        let state = sm.state_handle();
+        let state = state.read().unwrap();
+        assert!(!state.primary_unavailable("unavailable", 0));
+        assert_eq!(
+            state.indices["unavailable"].shard_routing[&0].primary_term,
+            3
         );
     }
 

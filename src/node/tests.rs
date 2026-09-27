@@ -1655,6 +1655,7 @@ fn persistent_io_escalates_with_role_specific_failure_mode() {
     }
     assert_eq!(replica_failures.len(), 1);
     assert!(!replica_failures[0].promote_only);
+    assert!(replica_failures[0].quarantine);
     assert!(
         replica_failures[0]
             .reason
@@ -1677,6 +1678,7 @@ fn persistent_io_escalates_with_role_specific_failure_mode() {
     }
     assert_eq!(primary_failures.len(), 1);
     assert!(primary_failures[0].promote_only);
+    assert!(primary_failures[0].quarantine);
 }
 
 #[test]

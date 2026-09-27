@@ -10,9 +10,9 @@ use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::{
-    ActivatePrimaryRequest, FailShardCopyRequest, JoinRequest, MarkPrimaryUnavailableRequest,
-    MarkReplicaInSyncRequest, NodeInfo as ProtoNodeInfo, ShardDocRequest,
-    internal_transport_client::InternalTransportClient,
+    ActivatePrimaryRequest, FailShardCopyRequest, JoinRequest, MarkPrimaryAvailableRequest,
+    MarkPrimaryUnavailableRequest, MarkReplicaInSyncRequest, NodeInfo as ProtoNodeInfo,
+    ShardDocRequest, internal_transport_client::InternalTransportClient,
 };
 use ferrissearch::transport::server::create_transport_service_with_raft;
 
@@ -1613,7 +1613,7 @@ async fn grpc_promote_only_primary_failure_marks_unavailable_without_candidate()
 }
 
 #[tokio::test]
-async fn grpc_primary_unavailable_is_status_only_and_activation_clears_it() {
+async fn grpc_primary_availability_is_conditional_and_activation_still_clears_it() {
     let (raft, state_handle) =
         consensus::create_raft_instance_mem(1, "grpc-primary-unavailable".into())
             .await
@@ -1670,6 +1670,66 @@ async fn grpc_primary_unavailable_is_status_only_and_activation_clears_it() {
             .unwrap()
             .primary_unavailable("unavailable", 0)
     );
+    let term_before_available =
+        state_handle.read().unwrap().indices["unavailable"].shard_routing[&0].primary_term;
+    let stale_available = client
+        .mark_primary_available(tonic::Request::new(MarkPrimaryAvailableRequest {
+            index_name: "unavailable".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary_node_id: "node-1".into(),
+            allocation_id: Some(allocation_id),
+            primary_term: term_before_available + 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stale_available.acknowledged);
+    assert!(stale_available.error.contains("term mismatch"));
+
+    TransportClient::new()
+        .forward_mark_primary_available(
+            &NodeInfo {
+                id: "node-1".into(),
+                name: "node-1".into(),
+                host: addr.ip().to_string(),
+                transport_port: addr.port(),
+                http_port: 0,
+                roles: vec![NodeRole::Data],
+                raft_node_id: 1,
+            },
+            MarkPrimaryAvailableRequest {
+                index_name: "unavailable".into(),
+                index_uuid: index_uuid.clone(),
+                shard_id: 0,
+                primary_node_id: "node-1".into(),
+                allocation_id: Some(allocation_id),
+                primary_term: term_before_available,
+            },
+        )
+        .await
+        .unwrap();
+    {
+        let state = state_handle.read().unwrap();
+        assert!(!state.primary_unavailable("unavailable", 0));
+        assert_eq!(
+            state.indices["unavailable"].shard_routing[&0].primary_term,
+            term_before_available
+        );
+    }
+
+    let unavailable = client
+        .mark_primary_unavailable(tonic::Request::new(MarkPrimaryUnavailableRequest {
+            index_name: "unavailable".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary_node_id: "node-1".into(),
+            allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(unavailable.acknowledged, "{}", unavailable.error);
 
     let activated = client
         .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
@@ -1677,7 +1737,7 @@ async fn grpc_primary_unavailable_is_status_only_and_activation_clears_it() {
             index_uuid,
             shard_id: 0,
             primary_node_id: "node-1".into(),
-            expected_term: 2,
+            expected_term: term_before_available,
             allocation_id: Some(allocation_id),
         }))
         .await
@@ -1862,6 +1922,19 @@ async fn grpc_conditional_membership_rpcs_reject_non_leader() {
         .await
         .unwrap_err();
     assert_eq!(unavailable_error.code(), tonic::Code::FailedPrecondition);
+
+    let available_error = client
+        .mark_primary_available(tonic::Request::new(MarkPrimaryAvailableRequest {
+            index_name: "idx".into(),
+            index_uuid: "uuid".into(),
+            shard_id: 0,
+            primary_node_id: "node-2".into(),
+            allocation_id: Some(1),
+            primary_term: 1,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(available_error.code(), tonic::Code::FailedPrecondition);
 
     let fail_error = client
         .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {

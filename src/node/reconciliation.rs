@@ -11,6 +11,7 @@ pub(super) struct ShardCopyFailure {
     pub node_id: String,
     pub allocation_id: u64,
     pub promote_only: bool,
+    pub quarantine: bool,
     pub reason: String,
 }
 
@@ -319,6 +320,7 @@ pub(super) fn open_local_assigned_shards(
                                 node_id: local_node_id.to_string(),
                                 allocation_id,
                                 promote_only: false,
+                                quarantine: ShardManager::should_quarantine_copy_failure(&error),
                                 reason: error.to_string(),
                             });
                         }
@@ -339,6 +341,7 @@ pub(super) fn open_local_assigned_shards(
                             node_id: local_node_id.to_string(),
                             allocation_id,
                             promote_only: false,
+                            quarantine: true,
                             reason: "peer recovery install marker remains after target failure"
                                 .to_string(),
                         }),
@@ -359,6 +362,9 @@ pub(super) fn open_local_assigned_shards(
                                     node_id: local_node_id.to_string(),
                                     allocation_id,
                                     promote_only: false,
+                                    quarantine: ShardManager::should_quarantine_copy_failure(
+                                        &error,
+                                    ),
                                     reason: error.to_string(),
                                 });
                             }
@@ -375,7 +381,6 @@ pub(super) fn open_local_assigned_shards(
                     allocation_id,
                 ) {
                     if ShardManager::should_report_copy_failure(&error) {
-                        shard_manager.quarantine_shard_copy(index_name, *shard_id);
                         failures.push(ShardCopyFailure {
                             index_name: index_name.clone(),
                             index_uuid: metadata.uuid.to_string(),
@@ -383,6 +388,7 @@ pub(super) fn open_local_assigned_shards(
                             node_id: local_node_id.to_string(),
                             allocation_id,
                             promote_only: routing.primary == local_node_id,
+                            quarantine: ShardManager::should_quarantine_copy_failure(&error),
                             reason: error.to_string(),
                         });
                     } else {
@@ -422,6 +428,7 @@ pub(super) fn open_local_assigned_shards(
                         node_id: local_node_id.to_string(),
                         allocation_id,
                         promote_only: routing.primary == local_node_id,
+                        quarantine: true,
                         reason: format!("expected shard directory {shard_dir:?} is missing"),
                     });
                 }
@@ -447,7 +454,6 @@ pub(super) fn open_local_assigned_shards(
                     error
                 );
                 if ShardManager::should_report_copy_failure(&error) {
-                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
                     failures.push(ShardCopyFailure {
                         index_name: index_name.clone(),
                         index_uuid: metadata.uuid.to_string(),
@@ -455,6 +461,7 @@ pub(super) fn open_local_assigned_shards(
                         node_id: local_node_id.to_string(),
                         allocation_id,
                         promote_only: routing.primary == local_node_id,
+                        quarantine: ShardManager::should_quarantine_copy_failure(&error),
                         reason: error.to_string(),
                     });
                 }

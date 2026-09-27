@@ -54,6 +54,7 @@ struct PrimaryActivationState {
     activated_terms: RwLock<HashMap<(String, u32, u64), u64>>,
     activation_lock: Mutex<()>,
     failed_copy_reports: Mutex<HashMap<(String, u32, u64), std::time::Instant>>,
+    available_primary_reports: Mutex<HashMap<(String, u32, u64, u64), std::time::Instant>>,
 }
 
 fn new_primary_activation_state() -> Arc<PrimaryActivationState> {
@@ -624,6 +625,12 @@ impl InternalTransport for TransportService {
             Ok(receipt) => {
                 let id = receipt.doc_id;
                 let seq_no = receipt.seq_no;
+                self.report_primary_available_after_write(
+                    &req.index_name,
+                    req.shard_id,
+                    &activated_primary,
+                )
+                .await;
 
                 // Replicate to replica shards with seq_no
                 match crate::replication::replicate_write(
@@ -825,6 +832,12 @@ impl InternalTransport for TransportService {
                 let seq_no = last_seq_no.ok_or_else(|| {
                     Status::internal("non-empty bulk receipt has no last sequence")
                 })?;
+                self.report_primary_available_after_write(
+                    &req.index_name,
+                    req.shard_id,
+                    &activated_primary,
+                )
+                .await;
                 // Replicate to replica shards
                 match crate::replication::replicate_bulk(
                     &self.transport_client,
@@ -972,6 +985,12 @@ impl InternalTransport for TransportService {
             Ok(receipt) => {
                 let deleted = receipt.deleted;
                 let seq_no = receipt.seq_no;
+                self.report_primary_available_after_write(
+                    &req.index_name,
+                    req.shard_id,
+                    &activated_primary,
+                )
+                .await;
                 // Replicate delete to replica shards
                 match crate::replication::replicate_write(
                     &self.transport_client,
@@ -2299,6 +2318,28 @@ impl InternalTransport for TransportService {
                 "MarkPrimaryUnavailable allocation ID must be greater than zero",
             ));
         }
+        let state = self.cluster_manager.get_state();
+        if state.primary_unavailable(&req.index_name, req.shard_id)
+            && state.indices.get(&req.index_name).is_some_and(|metadata| {
+                metadata.uuid.as_str() == req.index_uuid
+                    && metadata
+                        .shard_routing
+                        .get(&req.shard_id)
+                        .is_some_and(|routing| {
+                            routing.primary == req.primary_node_id
+                                && state.shard_allocation_id(
+                                    &req.index_name,
+                                    req.shard_id,
+                                    &req.primary_node_id,
+                                ) == Some(allocation_id)
+                        })
+            })
+        {
+            return Ok(Response::new(MarkPrimaryUnavailableResponse {
+                acknowledged: true,
+                error: String::new(),
+            }));
+        }
         let response = raft
             .client_write(
                 crate::consensus::types::ClusterCommand::MarkPrimaryUnavailable {
@@ -2322,6 +2363,64 @@ impl InternalTransport for TransportService {
             }
             crate::consensus::types::ClusterResponse::Error(error) => {
                 Ok(Response::new(MarkPrimaryUnavailableResponse {
+                    acknowledged: false,
+                    error,
+                }))
+            }
+        }
+    }
+
+    async fn mark_primary_available(
+        &self,
+        request: Request<MarkPrimaryAvailableRequest>,
+    ) -> Result<Response<MarkPrimaryAvailableResponse>, Status> {
+        let req = request.into_inner();
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "This node is not the Raft leader — caller should forward",
+            ));
+        }
+        let allocation_id = req.allocation_id.ok_or_else(|| {
+            Status::invalid_argument("MarkPrimaryAvailable requires an allocation ID")
+        })?;
+        if allocation_id == 0 {
+            return Err(Status::invalid_argument(
+                "MarkPrimaryAvailable allocation ID must be greater than zero",
+            ));
+        }
+        if req.primary_term == 0 {
+            return Err(Status::invalid_argument(
+                "MarkPrimaryAvailable primary term must be greater than zero",
+            ));
+        }
+        let response = raft
+            .client_write(
+                crate::consensus::types::ClusterCommand::MarkPrimaryAvailable {
+                    index_name: req.index_name,
+                    index_uuid: req.index_uuid,
+                    shard_id: req.shard_id,
+                    primary: req.primary_node_id,
+                    allocation_id,
+                    primary_term: req.primary_term,
+                },
+            )
+            .await
+            .map_err(|error| {
+                Status::internal(format!("Raft MarkPrimaryAvailable failed: {error}"))
+            })?;
+        match response.data {
+            crate::consensus::types::ClusterResponse::Ok => {
+                Ok(Response::new(MarkPrimaryAvailableResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                }))
+            }
+            crate::consensus::types::ClusterResponse::Error(error) => {
+                Ok(Response::new(MarkPrimaryAvailableResponse {
                     acknowledged: false,
                     error,
                 }))
@@ -2359,7 +2458,31 @@ impl InternalTransport for TransportService {
 
         let promotion_candidate = if req.promote_only {
             let state = self.cluster_manager.get_state();
-            self.select_live_promotion_candidate(&state, &req.index_name, req.shard_id)
+            let promotion_candidate =
+                self.select_live_promotion_candidate(&state, &req.index_name, req.shard_id);
+            if promotion_candidate.is_none()
+                && state.primary_unavailable(&req.index_name, req.shard_id)
+                && state.indices.get(&req.index_name).is_some_and(|metadata| {
+                    metadata.uuid.as_str() == req.index_uuid
+                        && metadata
+                            .shard_routing
+                            .get(&req.shard_id)
+                            .is_some_and(|routing| {
+                                routing.primary == req.node_id
+                                    && state.shard_allocation_id(
+                                        &req.index_name,
+                                        req.shard_id,
+                                        &req.node_id,
+                                    ) == Some(allocation_id)
+                            })
+                })
+            {
+                return Ok(Response::new(FailShardCopyResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                }));
+            }
+            promotion_candidate
         } else {
             None
         };
@@ -3198,18 +3321,6 @@ impl TransportService {
             return;
         }
         let promote_only = routing.primary == self.local_node_id;
-        if let Err(quarantine_error) = self
-            .shard_manager
-            .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
-            .await
-        {
-            tracing::warn!(
-                index = index_name,
-                shard_id,
-                error = %quarantine_error,
-                "Failed to quarantine invalid local shard copy"
-            );
-        }
         const REPORT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let report_key = (index_uuid.to_string(), shard_id, allocation_id);
         let now = std::time::Instant::now();
@@ -3238,6 +3349,51 @@ impl TransportService {
         } else {
             None
         };
+        let repeated_unavailable = promote_only
+            && promotion_candidate.is_none()
+            && current.primary_unavailable(index_name, shard_id);
+        if promote_only && !current.primary_unavailable(index_name, shard_id) {
+            self.primary_activation_state
+                .available_primary_reports
+                .lock()
+                .await
+                .remove(&(
+                    index_uuid.to_string(),
+                    shard_id,
+                    allocation_id,
+                    routing.primary_term,
+                ));
+        }
+        if ShardManager::should_quarantine_copy_failure(error) {
+            if promote_only {
+                self.primary_activation_state
+                    .activated_terms
+                    .write()
+                    .unwrap_or_else(|lock_error| lock_error.into_inner())
+                    .remove(&(index_uuid.to_string(), shard_id, allocation_id));
+            }
+            if let Err(quarantine_error) = self
+                .shard_manager
+                .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
+                .await
+            {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    error = %quarantine_error,
+                    "Failed to quarantine invalid local shard copy"
+                );
+            }
+        }
+        if repeated_unavailable && self.raft.as_ref().is_some_and(|raft| raft.is_leader()) {
+            tracing::debug!(
+                index = index_name,
+                shard_id,
+                allocation_id,
+                "Primary is already marked unavailable for this allocation"
+            );
+            return;
+        }
         let reason = error.to_string();
         let Some(raft) = self.raft.as_ref() else {
             return;
@@ -3318,6 +3474,127 @@ impl TransportService {
         }
     }
 
+    async fn report_primary_available_after_write(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        activated_primary: &ActivatedPrimary,
+    ) {
+        let current = self.cluster_manager.get_state();
+        let Some(metadata) = current.indices.get(index_name) else {
+            return;
+        };
+        let Some(routing) = metadata.shard_routing.get(&shard_id) else {
+            return;
+        };
+        if metadata.uuid.as_str() != activated_primary.index_uuid
+            || routing.primary != self.local_node_id
+            || routing.primary_term != activated_primary.primary_term
+            || current.shard_allocation_id(index_name, shard_id, &self.local_node_id)
+                != Some(activated_primary.allocation_id)
+            || !current.primary_unavailable(index_name, shard_id)
+        {
+            return;
+        }
+
+        const REPORT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        let report_key = (
+            activated_primary.index_uuid.clone(),
+            shard_id,
+            activated_primary.allocation_id,
+            activated_primary.primary_term,
+        );
+        let now = std::time::Instant::now();
+        {
+            let mut reports = self
+                .primary_activation_state
+                .available_primary_reports
+                .lock()
+                .await;
+            if reports
+                .get(&report_key)
+                .is_some_and(|last| now.duration_since(*last) < REPORT_RETRY_INTERVAL)
+            {
+                return;
+            }
+            reports.insert(report_key, now);
+        }
+
+        let Some(raft) = self.raft.as_ref() else {
+            return;
+        };
+        let result = if raft.is_leader() {
+            crate::consensus::client_write_checked(
+                raft,
+                crate::consensus::types::ClusterCommand::MarkPrimaryAvailable {
+                    index_name: index_name.to_string(),
+                    index_uuid: activated_primary.index_uuid.clone(),
+                    shard_id,
+                    primary: self.local_node_id.clone(),
+                    allocation_id: activated_primary.allocation_id,
+                    primary_term: activated_primary.primary_term,
+                },
+            )
+            .await
+            .map_err(anyhow::Error::msg)
+        } else {
+            let Some(master_id) = current.master_node.as_ref() else {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    "Cannot clear primary-unavailable status because no Raft leader is known"
+                );
+                return;
+            };
+            let Some(master) = current.nodes.get(master_id) else {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    master = master_id,
+                    "Cannot clear primary-unavailable status because the Raft leader is absent"
+                );
+                return;
+            };
+            self.transport_client
+                .forward_mark_primary_available(
+                    master,
+                    MarkPrimaryAvailableRequest {
+                        index_name: index_name.to_string(),
+                        index_uuid: activated_primary.index_uuid.clone(),
+                        shard_id,
+                        primary_node_id: self.local_node_id.clone(),
+                        allocation_id: Some(activated_primary.allocation_id),
+                        primary_term: activated_primary.primary_term,
+                    },
+                )
+                .await
+        };
+
+        match result {
+            Ok(()) => {
+                self.primary_activation_state
+                    .failed_copy_reports
+                    .lock()
+                    .await
+                    .remove(&(
+                        activated_primary.index_uuid.clone(),
+                        shard_id,
+                        activated_primary.allocation_id,
+                    ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    allocation_id = activated_primary.allocation_id,
+                    primary_term = activated_primary.primary_term,
+                    error = %error,
+                    "Failed to clear primary-unavailable status after a successful local write"
+                );
+            }
+        }
+    }
+
     fn primary_routing(
         &self,
         index_name: &str,
@@ -3377,6 +3654,16 @@ impl TransportService {
         shard_id: u32,
     ) -> Result<ActivatedPrimary, String> {
         let current = self.primary_routing(index_name, shard_id)?;
+        let initial_key = (current.index_uuid.clone(), shard_id, current.allocation_id);
+        if current.primary_unavailable
+            && self.shard_manager.get_shard(index_name, shard_id).is_none()
+        {
+            self.primary_activation_state
+                .activated_terms
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&initial_key);
+        }
         if let Err(error) = self
             .shard_manager
             .open_assigned_shard_with_settings_blocking(
@@ -3432,7 +3719,7 @@ impl TransportService {
             });
         }
 
-        let key = (current.index_uuid.clone(), shard_id, current.allocation_id);
+        let key = initial_key;
         if self
             .primary_activation_state
             .activated_terms
@@ -3440,7 +3727,6 @@ impl TransportService {
             .unwrap_or_else(|error| error.into_inner())
             .get(&key)
             .is_some_and(|term| *term == current.primary_term)
-            && !current.primary_unavailable
         {
             return Ok(ActivatedPrimary {
                 index_uuid: current.index_uuid,
@@ -3509,7 +3795,6 @@ impl TransportService {
             .unwrap_or_else(|error| error.into_inner())
             .get(&key)
             .is_some_and(|term| *term == expected_term)
-            && !current.primary_unavailable
         {
             return Ok(ActivatedPrimary {
                 index_uuid,

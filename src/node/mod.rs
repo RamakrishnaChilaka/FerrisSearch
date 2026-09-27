@@ -236,6 +236,9 @@ async fn report_failed_shard_copies(
             );
             continue;
         }
+        if failure.quarantine {
+            shard_manager.quarantine_shard_copy(&failure.index_name, failure.shard_id);
+        }
         let promotion_candidate = if failure.promote_only {
             let metadata = &current.indices[&failure.index_name];
             let live_nodes = current.nodes.keys().cloned().collect();
@@ -246,6 +249,19 @@ async fn report_failed_shard_copies(
         } else {
             None
         };
+        if raft.is_leader()
+            && failure.promote_only
+            && promotion_candidate.is_none()
+            && current.primary_unavailable(&failure.index_name, failure.shard_id)
+        {
+            tracing::debug!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                allocation_id = failure.allocation_id,
+                "Primary is already marked unavailable for this allocation"
+            );
+            continue;
+        }
         tracing::error!(
             index = failure.index_name,
             shard_id = failure.shard_id,

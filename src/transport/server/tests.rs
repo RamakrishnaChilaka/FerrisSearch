@@ -2432,7 +2432,7 @@ async fn persistent_replica_bulk_wal_io_remains_typed_for_escalation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn persistent_primary_io_marks_unavailable_without_routing_change() {
+async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_clears_on_write() {
     let dir = tempfile::tempdir().unwrap();
     let (raft, shared_state) = crate::consensus::create_raft_instance_mem(1, "primary-io".into())
         .await
@@ -2507,7 +2507,6 @@ async fn persistent_primary_io_marks_unavailable_without_routing_change() {
             },
         )
         .unwrap();
-    primary_engine.inject_wal_write_failures_for_test(28, 3);
     let service = TransportService {
         cluster_manager: Arc::new(ClusterManager::with_shared_state(shared_state.clone())),
         shard_manager,
@@ -2522,6 +2521,9 @@ async fn persistent_primary_io_marks_unavailable_without_routing_change() {
         peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
+    service.ensure_primary_activated("idx", 0).await.unwrap();
+    let active_term = shared_state.read().unwrap().indices["idx"].shard_routing[&0].primary_term;
+    primary_engine.inject_wal_write_failures_for_test(28, usize::MAX);
     for _ in 0..3 {
         let response = service
             .index_doc(Request::new(ShardDocRequest {
@@ -2543,6 +2545,415 @@ async fn persistent_primary_io_marks_unavailable_without_routing_change() {
         shared_state.read().unwrap().primary_unavailable("idx", 0),
         "failed single-copy primary must be status-red without routing mutation"
     );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let unavailable_log_id = service
+        .raft
+        .as_ref()
+        .unwrap()
+        .metrics()
+        .borrow_watched()
+        .last_applied;
+
+    for interval in 0..2 {
+        service
+            .primary_activation_state
+            .failed_copy_reports
+            .lock()
+            .await
+            .clear();
+        service
+            .activate_primary_for_lifecycle("idx", 0)
+            .await
+            .unwrap();
+        for attempt in 0..3 {
+            let response = service
+                .index_doc(Request::new(ShardDocRequest {
+                    index_name: "idx".into(),
+                    shard_id: 0,
+                    doc_id: format!("still-failing-{interval}-{attempt}"),
+                    payload_json: serde_json::to_vec(&json!({"value": 2})).unwrap(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(!response.success);
+        }
+        let state = shared_state.read().unwrap();
+        assert_eq!(
+            state.indices["idx"].shard_routing[&0].primary_term,
+            active_term
+        );
+        assert!(state.primary_unavailable("idx", 0));
+        assert_eq!(
+            service
+                .raft
+                .as_ref()
+                .unwrap()
+                .metrics()
+                .borrow_watched()
+                .last_applied,
+            unavailable_log_id,
+            "an already-unavailable allocation must not receive another Raft report"
+        );
+    }
+
+    let version_before_repair = shared_state.read().unwrap().version;
+    primary_engine.inject_wal_write_failures_for_test(28, 0);
+    let repaired = service
+        .index_doc(Request::new(ShardDocRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            doc_id: "repaired".into(),
+            payload_json: serde_json::to_vec(&json!({"value": 3})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(repaired.success, "{}", repaired.error);
+    let state = shared_state.read().unwrap();
+    assert_eq!(
+        state.indices["idx"].shard_routing[&0].primary_term,
+        active_term
+    );
+    assert!(!state.primary_unavailable("idx", 0));
+    assert_eq!(
+        state.version,
+        version_before_repair + 1,
+        "the first successful write should commit one status-only clear"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repaired_open_fault_reactivates_primary_and_clears_unavailable_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let (raft, shared_state) =
+        crate::consensus::create_raft_instance_mem(1, "primary-open-repair".into())
+            .await
+            .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !raft.is_leader() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    let metadata = DomainIndexMetadata {
+        name: "idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("uuid-1"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 1,
+                replicas: Vec::new(),
+                in_sync_replicas: Vec::new(),
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    };
+    assert_eq!(
+        raft.client_write(crate::consensus::types::ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        crate::consensus::types::ClusterResponse::Ok
+    );
+    let allocation_id = shared_state
+        .read()
+        .unwrap()
+        .primary_allocation_id("idx", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(crate::consensus::types::ClusterCommand::ActivatePrimary {
+            index_name: "idx".into(),
+            index_uuid: "uuid-1".into(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        crate::consensus::types::ClusterResponse::Ok
+    );
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    let service = TransportService {
+        cluster_manager: Arc::new(ClusterManager::with_shared_state(shared_state.clone())),
+        shard_manager: shard_manager.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: Some(raft),
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    service.ensure_primary_activated("idx", 0).await.unwrap();
+    let active_term = shared_state.read().unwrap().indices["idx"].shard_routing[&0].primary_term;
+
+    shard_manager.quarantine_shard_copy("idx", 0);
+    shard_manager.inject_assigned_open_io_failures(5, 3);
+    for _ in 0..3 {
+        assert!(
+            service
+                .activate_primary_for_lifecycle("idx", 0)
+                .await
+                .is_err()
+        );
+    }
+    {
+        let state = shared_state.read().unwrap();
+        assert_eq!(
+            state.indices["idx"].shard_routing[&0].primary_term,
+            active_term
+        );
+        assert!(state.primary_unavailable("idx", 0));
+    }
+
+    shard_manager.inject_assigned_open_io_failures(5, 0);
+    service
+        .activate_primary_for_lifecycle("idx", 0)
+        .await
+        .unwrap();
+    let state = shared_state.read().unwrap();
+    assert_eq!(
+        state.indices["idx"].shard_routing[&0].primary_term,
+        active_term + 1
+    );
+    assert!(!state.primary_unavailable("idx", 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn primary_apply_escalation_keeps_reads_open_and_does_not_replay_failed_wal_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = DomainClusterState::new("apply-quarantine".into());
+    state.add_index(DomainIndexMetadata {
+        name: "idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("uuid-1"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 2,
+                replicas: Vec::new(),
+                in_sync_replicas: Vec::new(),
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+    let allocation_id = state.primary_allocation_id("idx", 0).unwrap();
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let cluster_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    cluster_manager.update_state(state);
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let engine = shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    engine
+        .add_document_with_receipt("baseline", json!({"value": 0}))
+        .unwrap();
+    engine.refresh().unwrap();
+    engine.inject_writer_replacement_failures_for_test(28, 1);
+    assert!(engine.force_merge(1).is_err());
+    assert!(
+        engine
+            .add_document_with_receipt("failed-after-wal", json!({"value": 1}))
+            .is_err()
+    );
+    assert!(engine.get_document("baseline").unwrap().is_some());
+    assert!(engine.get_document("failed-after-wal").unwrap().is_none());
+    assert!(
+        engine
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations
+            .iter()
+            .any(|operation| operation.payload["_doc_id"] == "failed-after-wal")
+    );
+
+    let mut persistent = None;
+    for _ in 0..3 {
+        persistent = Some(
+            shard_manager
+                .record_local_apply_result::<()>(
+                    "uuid-1",
+                    0,
+                    allocation_id,
+                    Err(std::io::Error::from_raw_os_error(28).into()),
+                )
+                .unwrap_err(),
+        );
+    }
+    let persistent = persistent.unwrap();
+    assert!(ShardManager::should_report_copy_failure(&persistent));
+    let service = TransportService {
+        cluster_manager,
+        shard_manager: shard_manager.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    service
+        .report_local_copy_failure("idx", "uuid-1", 0, allocation_id, &persistent)
+        .await;
+    let current = shard_manager.get_shard("idx", 0).unwrap();
+    assert!(Arc::ptr_eq(&current, &engine));
+    let same_engine = service.get_or_open_shard("idx", 0).await.unwrap();
+    assert!(Arc::ptr_eq(&same_engine, &engine));
+    assert!(same_engine.get_document("baseline").unwrap().is_some());
+    assert!(
+        same_engine
+            .get_document("failed-after-wal")
+            .unwrap()
+            .is_none(),
+        "failed post-WAL mutation must be replayed only by restart recovery"
+    );
+}
+
+#[tokio::test]
+async fn definitive_failure_quarantine_happens_only_after_report_throttle() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = DomainClusterState::new("definitive-quarantine".into());
+    state.add_index(DomainIndexMetadata {
+        name: "idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("uuid-1"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 2,
+                replicas: Vec::new(),
+                in_sync_replicas: Vec::new(),
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+    let allocation_id = state.primary_allocation_id("idx", 0).unwrap();
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let cluster_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    cluster_manager.update_state(state);
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    let service = TransportService {
+        cluster_manager,
+        shard_manager: shard_manager.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let error: anyhow::Error = serde_json::from_str::<serde_json::Value>("{not-json")
+        .unwrap_err()
+        .into();
+    service
+        .primary_activation_state
+        .failed_copy_reports
+        .lock()
+        .await
+        .insert(
+            ("uuid-1".into(), 0, allocation_id),
+            std::time::Instant::now(),
+        );
+    service
+        .report_local_copy_failure("idx", "uuid-1", 0, allocation_id, &error)
+        .await;
+    assert!(shard_manager.get_shard("idx", 0).is_some());
+
+    service
+        .primary_activation_state
+        .failed_copy_reports
+        .lock()
+        .await
+        .clear();
+    service
+        .report_local_copy_failure("idx", "uuid-1", 0, allocation_id, &error)
+        .await;
+    assert!(shard_manager.get_shard("idx", 0).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
