@@ -51,13 +51,15 @@ cargo test -- test_name                         # Single test by name
 - Historical counterexamples are living model regressions. The runner must fail if
   `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, `c4`, or
   `pending-restart-legacy` stops violating its named invariant, or if
-  `l2-primary-no-trigger` stops producing its temporal liveness violation;
-  those configurations intentionally retain historical protocol behavior.
+  `l2-primary-no-trigger` or `storage-apply-no-escalation` stops producing its
+  temporal liveness violation; those configurations intentionally retain
+  historical protocol behavior.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
   `g2-primary-no-replica`, `g2-liveness`, `pending-restart-fixed`, `l1-bump`,
   `l2-primary-idle`, `l2-promotion`, `storage-replica`, `storage-primary`,
-  `storage-primary-no-replica`, `two-shard`, `fixed-crash`, and
-  `fixed-partition` are expected-pass configurations.
+  `storage-primary-no-replica`, `storage-apply-replica`,
+  `storage-apply-primary`, `storage-apply-primary-no-replica`, `two-shard`,
+  `fixed-crash`, and `fixed-partition` are expected-pass configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
@@ -75,9 +77,13 @@ cargo test -- test_name                         # Single test by name
   no-survivor primary-report rejection, stale-report rejection, and fair
   replacement recovery.
 - Storage-failure checks must exercise both immediate corruption and
-  persistent-I/O escalation. Replica removal and candidate promotion must
-  preserve acknowledged history; a primary report without an in-sync
-  candidate must be rejected without clearing its allocation.
+  persistent-I/O escalation at open, fence, marker, and apply boundaries.
+  Apply-I/O checks keep the copy open while WAL/fsync/engine mutations fail,
+  retain a no-escalation temporal counterexample, and require writes to resume
+  after exact replica removal or primary promotion. The leader carries its
+  live highest-checkpoint candidate; the state machine validates current
+  in-sync membership. A primary report without a candidate must be rejected
+  without clearing its allocation.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt
@@ -168,11 +174,17 @@ cargo test -- test_name                         # Single test by name
   without routing failure, retry cleanup without a failed-install marker, stale
   identity-temp cleanup, and preservation of existing test-copy identity.
 - Round-2 allocation/fencing regressions cover corrupt WAL/Tantivy/marker
-  classification, persistent-I/O count/time escalation, shared request and
-  lifecycle open backoff, replica removal with resumed writes, promote-only
-  primary failover and no-survivor rejection, idle lifecycle activation after
-  primary restart, post-rename pending-state repair, and delete/recreate-safe
-  recovery abort.
+  classification, open/fence/marker-I/O count/time escalation, shared request
+  and lifecycle open backoff, replica removal with resumed writes,
+  promote-only primary failover and no-survivor rejection, idle lifecycle
+  activation after primary restart, post-rename pending-state repair, and
+  delete/recreate-safe recovery abort.
+- Round-3 allocation/fencing regressions cover persistent ENOSPC/read-only
+  apply failures on already-open primary and replica copies, transient apply
+  failure reset, bounded apply backoff, local-storage versus network recovery
+  accounting, structural Tantivy metadata/mapping corruption, exact replica
+  removal with resumed writes, leader-selected primary promotion, and
+  no-candidate status-only primary unavailability without routing change.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

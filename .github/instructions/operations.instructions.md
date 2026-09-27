@@ -25,6 +25,12 @@ defaults for new fields so older config files continue to load.
 - `max_concurrent_peer_recoveries` defaults to 2, is capped at 64, and uses
   `0` as an explicit per-node disable value. The environment override is
   `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES`.
+- `shard_io_failure_escalation_attempts` and
+  `shard_io_failure_escalation_window_ms` default to 3 attempts over 60,000 ms.
+  Both must be greater than zero; escalation requires both thresholds. Their
+  environment overrides are
+  `FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_ATTEMPTS` and
+  `FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_WINDOW_MS`.
 
 When adding config, cover default, YAML, environment, invalid, and
 feature-disabled behavior. Update `config/ferrissearch.yml` and README only for
@@ -132,10 +138,13 @@ local-only unless their bounds are reduced and re-recorded. Each invocation
 needs isolated Java and TLC temporary directories; parallel TLC processes
 otherwise race while extracting standard modules. Expected-violation
 configurations are successful only when they reproduce the documented
-invariant failure. Keep the bounded G1 empty-store and G2 copy-failure/liveness
-checks, pending-marker restart regression, term-change liveness checks, and
-minimal two-shard isolation check in the fast matrix. Keep corruption,
-persistent-I/O escalation, promote-only primary reporting, and the
+invariant failure. The runner defaults to eight TLC workers and permits a
+`TLA_WORKERS` override. Keep the bounded G1 empty-store and G2
+copy-failure/liveness checks, pending-marker restart regression, term-change
+liveness checks, and minimal two-shard isolation check in the fast matrix.
+Keep corruption,
+open/fence/marker/apply persistent-I/O escalation, promote-only primary
+reporting, the apply-I/O no-escalation temporal regression, and the
 no-lifecycle-activation temporal regression in that fast set.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
