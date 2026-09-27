@@ -35,7 +35,9 @@ must reject rather than clear the last primary allocation. Replica reports set
 exact initialized allocation without changing authority. `MarkPrimaryAvailable`
 clears it only when UUID, primary, allocation, and primary term still match and
 the flag is set; it never bumps the term. A successful local write is the proof
-used to propose this clear for an Apply-level failure, while repaired
+used to propose this clear for an Apply-level failure. That proposal is
+throttled, best-effort background work: leader discovery, forwarding, and Raft
+application must never delay the already-successful write response. Repaired
 open/fence failures require a fresh `ActivatePrimary`.
 
 ## When to use this recipe (vs. the data path)
