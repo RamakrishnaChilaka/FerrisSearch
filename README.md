@@ -315,6 +315,20 @@ must be reached. The matching environment overrides are
 fails closed immediately, while network/transfer failures do not consume this
 local-storage budget.
 
+When a failed primary has no live in-sync replacement, Raft records
+`primary_unavailable` without changing its allocation or term. A write-only
+failure keeps that red health status until the first later successful local
+write clears it conditionally at the same term. A definitive or open-level
+failure quarantines the copy after report throttling and clears the status only
+after repaired storage completes a fresh primary activation.
+
+Because replica acknowledgement is synchronous, a persistent write fault on an
+in-sync replica can fail every write to that shard for at least the default
+60-second escalation window before that exact allocation is removed. Recovery
+allocation can currently choose the same faulty node again; a
+MaxRetryAllocationDecider-style exclusion policy and
+`index.allocation.max_retries` setting are deferred.
+
 This pre-1.0 protocol does not adopt legacy shard directories or routing
 snapshots that lack allocation identity. Clusters created before this change
 must be recreated or reindexed; there is no rolling compatibility path.
@@ -394,9 +408,15 @@ production ready**. The most important limits are:
 
 - A primary can mutate before replica acknowledgement fails; write retry and
   acknowledgement semantics need a formal contract.
-- A WAL `write_all` or `sync_data` failure does not yet fail-stop the shard.
-  Continuing writes after a partial frame can create middle corruption that a
-  later restart correctly rejects; automatic handling is future work.
+- Synchronous WAL/fsync/engine failures fail the request and enter bounded
+  escalation, but an operation that reached the WAL and then failed engine
+  apply is not replayed into the live engine; restart recovery is the current
+  replay boundary. A partial frame followed by later writes can still create
+  middle corruption that restart correctly rejects.
+- Background Tantivy commit failures are logged but do not yet enter shard
+  failure escalation. With a fault confined to the index directory,
+  acknowledged WAL-backed writes can remain invisible to search on that copy
+  until a later successful commit or restart replay.
 - `_seq_no` now reports the primary WAL assignment, but `_version` and
   `_primary_term` compatibility fields remain placeholders. Gap-aware
   checkpoints, primary epochs, idempotent retries, `if_seq_no` /

@@ -18,7 +18,8 @@ Tantivy index.
 > implementations. Do not invent a new storage or replication path.
 
 Conditional shard-authority commands (`MarkReplicaInSync`, `ActivatePrimary`,
-and `FailShardCopy`) return `ClusterResponse::Error` when their
+`MarkPrimaryUnavailable`, `MarkPrimaryAvailable`, and `FailShardCopy`) return
+`ClusterResponse::Error` when their
 UUID/allocation/primary/term compare-and-set fails. Callers must inspect
 `client_write(...).data`; an
 OpenRaft transport success is not proof that the application command applied.
@@ -29,6 +30,13 @@ cluster-state version.
 machine accepts such a report only when an in-sync replica can be promoted; it
 must reject rather than clear the last primary allocation. Replica reports set
 `promote_only = false`.
+
+`primary_unavailable` is status only. `MarkPrimaryUnavailable` sets it for the
+exact initialized allocation without changing authority. `MarkPrimaryAvailable`
+clears it only when UUID, primary, allocation, and primary term still match and
+the flag is set; it never bumps the term. A successful local write is the proof
+used to propose this clear for an Apply-level failure, while repaired
+open/fence failures require a fresh `ActivatePrimary`.
 
 ## When to use this recipe (vs. the data path)
 

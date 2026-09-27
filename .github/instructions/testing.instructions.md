@@ -87,10 +87,11 @@ cargo test -- test_name                         # Single test by name
   persistent-I/O escalation at open, fence, marker, and apply boundaries.
   Apply-I/O checks keep the copy open while WAL/fsync/engine mutations fail,
   retain a no-escalation temporal counterexample, and require writes to resume
-  after exact replica removal or primary promotion. The leader carries its
-  live highest-checkpoint candidate; the state machine validates current
-  in-sync membership. A primary report without a candidate must be rejected
-  without clearing its allocation.
+  after exact replica removal or primary promotion. The leader carries a live
+  in-sync candidate and prefers its highest observed checkpoint only when it
+  hosts the primary and therefore has observations; the state machine validates
+  current in-sync membership. A primary report without a candidate must be
+  rejected without clearing its allocation.
 - Combined S1 checks must cover retry-budget reset across restart, reports
   pending across failed-primary or leader crash, repair that remains possible
   if allocation races ahead, fresh-allocation recovery, and a final
@@ -197,7 +198,13 @@ cargo test -- test_name                         # Single test by name
   failure reset, bounded apply backoff, local-storage versus network recovery
   accounting, structural Tantivy metadata/mapping corruption, exact replica
   removal with resumed writes, leader-selected primary promotion, and
-  no-candidate status-only primary unavailability without routing change.
+  no-candidate status-only primary unavailability   without routing change.
+- Round-4 allocation/fencing regressions cover stable unavailable status across
+  repeated write-only faults, same-term clearing after the first repaired
+  write, fresh activation after repaired open failure, stale availability CAS
+  rejection, throttled definitive quarantine, no Apply-level quarantine or
+  runtime WAL replay, readable failed-writer copies, and escalation of a
+  force-merge replacement failure through the Apply key.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

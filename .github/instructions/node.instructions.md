@@ -61,16 +61,22 @@ pub struct Node {
    identity matches; only an initial CreateIndex primary may be created empty
    before the shard's first activation
 4. Report corruption-class decode/validation failures immediately. Retry other
-   engine/filesystem/fence I/O with shared per-copy exponential backoff and
-   escalate after at least three failed attempts spanning 15 seconds. Replica
+   engine/filesystem/fence/apply I/O with operation-specific per-copy state and
+   shared exponential backoff. Escalation requires at least three failed
+   attempts spanning the configured window, 60 seconds by default. Replica
    reports remove the exact allocation; primary reports are promote-only and
    are submitted only with an in-sync candidate. Duplicate reports are
-   throttled per allocation.
+   throttled per allocation. Definitive/open-level quarantine occurs only
+   after that throttle; Apply escalation leaves the copy open for reads.
 5. Proactively invoke the shared primary-activation path for each local primary
    after startup or promotion. The activation cache is keyed by
    UUID/shard/allocation/term so lifecycle ticks and request handlers do not
-   issue repeated Raft term bumps.
-5. Allocate unassigned replicas only for shards with a live allocated primary
+   issue repeated Raft term bumps. `primary_unavailable` alone does not bypass
+   the cache. Repaired quarantined storage requires fresh activation; a
+   successful write on an Apply-failed copy clears status at the same term.
+6. Allocate unassigned replicas only for shards with a live allocated primary.
+   The current allocator may select the same faulty node again; bounded failed-
+   allocation exclusion is deferred.
 
 ### Follower Duties (every 5s tick)
 1. Ping master node for liveness check
@@ -142,9 +148,10 @@ pub struct Node {
 2. For each orphaned primary:
    - Restrict candidates to the Raft-authoritative
      `ShardRoutingEntry.in_sync_replicas` set.
-   - Prefer the eligible candidate with the highest locally observed ISR
-     checkpoint; if no eligible checkpoint is known, use the first in-sync
-     replica in routing order.
+   - If this leader also hosts the primary, prefer the eligible candidate with
+     the highest locally observed ISR checkpoint. Otherwise no local checkpoint
+     ranking is available, so use the first live in-sync replica in routing
+     order.
    - Call `IndexMetadata::promote_replica_to()`; it independently rejects
      out-of-sync candidates.
    - Increment `unassigned_replicas` for the promoted replica's old slot.

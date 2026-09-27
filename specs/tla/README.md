@@ -144,8 +144,10 @@ liveness configurations use neither symmetry nor a state constraint.
 - `FailShardCopy` omits index name, UUID, and shard ID from its abstract record
   because the model contains exactly one fixed-UUID shard. Allocation identity,
   conditional commit, leader-selected promotion candidate, unassignment, and
-  view lag remain explicit. `nextSeq` abstracts the leader's observed replica
-  checkpoints; equal highest checkpoints remain a nondeterministic tie.
+  view lag remain explicit. `nextSeq` abstracts checkpoint observations when
+  the reporting leader also hosts the primary. Without such observations, the
+  implementation may choose any live in-sync cluster member; the model permits
+  that unranked choice. Equal observed checkpoints remain a nondeterministic tie.
 
 ## Action-to-code mapping
 
@@ -163,7 +165,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | `ChangeRaftMembership`, `ProposeRemoveNode`, `ObserveNodeRemoved` | `Raft::change_membership`, followed by `ClusterCommand::RemoveNode`; removal is deferred after rejected routing updates. |
 | `Rejoin`, `ObserveRejoin` | Follower `JoinCluster` retry and committed `ClusterCommand::AddNode`. |
 | `AllocateAfterLifecycle`, `ObserveAllocationAccepted`, `ObserveAllocationRejected` | `IndexMetadata::allocate_unassigned_replicas` and the allocator phase of the leader lifecycle loop. |
-| `ReportShardCopyFailure` | `open_local_assigned_shards`, `TransportService::fail_shard_copy`, `TransportClient::forward_fail_shard_copy`, and leader-side live/highest-checkpoint promotion-candidate selection. |
+| `ReportShardCopyFailure` | `open_local_assigned_shards`, `TransportService::fail_shard_copy`, `TransportClient::forward_fail_shard_copy`, and leader-side live in-sync promotion-candidate selection with checkpoint preference when the leader has observations. |
 | `CorruptShardStorage`, `BeginPersistentStorageFailure`, `RedetectPersistentStorageFailure`, `EscalatePersistentStorageFailure` | Definitive storage decoding/validation failure and bounded persistent local I/O escalation while opening a copy or reading/persisting fence/marker state, including retry-budget reset and redetection after restart. |
 | `BeginPersistentApplyFailure`, `PrimaryApplyFailure`, `ReplicaApplyFailure`, `EscalatePersistentApplyFailure` | `ShardManager::{ensure_local_apply_allowed,record_local_apply_result,apply_replica_operation}` around primary and replica WAL/fsync/engine mutation; failed operations do not acknowledge or mutate the modeled logical history. |
 | `RepairPersistentStorageFault` | Operator/storage repair after an accepted exact-allocation failure; repair remains possible if fresh allocation races ahead of the repair action. |
@@ -264,9 +266,11 @@ G2 models `FailShardCopy(node, allocation_id)` as a conditional Raft command:
   out-of-sync recovery target does not;
 - an exact replica match removes it from `replicas` and `inSync`, clears its
   allocation, and increments `unassigned`;
-- an exact primary match carries the leader-selected live,
-  highest-observed-checkpoint candidate; the state machine accepts only if
-  that candidate is still in sync and the term can advance;
+- an exact primary match carries a leader-selected live in-sync candidate; when
+  the leader also hosts the primary it prefers the highest checkpoint it has
+  observed, otherwise it may choose any live in-sync cluster member. The state
+  machine accepts only if that candidate is still in sync and the term can
+  advance;
 - without a candidate, the promote-only command is rejected and cannot turn
   the shard red;
 - a stale allocation ID commits as a rejected command with unchanged routing;
@@ -296,10 +300,12 @@ retry count/window resets. Restart changes `StorageRetrying` or
 fault and starts a fresh retry budget. `StorageCorrupt`, `StorageFailed`, and
 `ApplyFailed` are reportable. Replica reports remove the exact allocation,
 after which writes no longer wait for that copy. Primary reports are
-promote-only: the leader chooses a live in-sync replica with the highest
-observed checkpoint and carries it in the command; the state machine validates
-current in-sync membership. Without a candidate the modeled command is
-rejected and routing remains unchanged.
+promote-only: the leader chooses a live in-sync replica and carries it in the
+command. When it hosts the primary it prefers the highest observed checkpoint;
+otherwise it has no local checkpoint observations and may choose any live
+in-sync cluster member. The state machine validates current in-sync membership.
+Without a candidate the modeled command is rejected and routing remains
+unchanged.
 
 The combined S1 checks permit one persistent storage fault per execution. An
 already queued failure command may commit after the failed process or Raft
@@ -339,9 +345,14 @@ assumption, not as evidence of a Rust defect.
 
 Rust additionally records an exact-allocation, Raft-replicated
 `primary_unavailable` health flag when no live promotion candidate exists.
-That status-only flag is outside the safety state modeled here: it may make
-health red and force activation to clear the status, but it does not allocate,
-promote, remove, or otherwise change shard authority.
+That status-only flag is outside the safety state modeled here. Apply-level
+failure leaves the activated copy open and does not bypass the activation
+cache; the first later successful local write conditionally clears the flag at
+the same allocation and term through `MarkPrimaryAvailable`. Definitive or
+open-level failure quarantines the copy after report throttling, invalidates
+its local activation cache, and clears the flag only after repaired storage
+successfully completes a fresh `ActivatePrimary`. Neither path changes
+authority merely by changing health status.
 
 ## Pending-target restart and observation
 
@@ -433,13 +444,17 @@ The combined Rust implementation must follow the model variant as one protocol:
 16. `FailShardCopy` changes routing only on an exact allocation match. Replica
     failure removes it from `replicas` and `inSync` and increments
     `unassigned`. For primary failure, the leader chooses a live in-sync
-    candidate with the highest observed checkpoint and carries that identity
-    in the command; the state machine validates that it is still in sync
-    before promotion and term bump. Without a candidate, promote-only
+    cluster member and carries that identity in the command. When the leader
+    also hosts the primary it prefers the highest checkpoint it has observed;
+    otherwise it may choose any live in-sync member. The state machine validates
+    that the candidate is still in sync before promotion and term bump. Without
+    a candidate, promote-only
     `FailShardCopy` is rejected and cannot clear the primary allocation or
     change authority. Rust may separately commit the exact-allocation,
-    Raft-replicated `primary_unavailable` flag; it is status-only, is cleared
-    by successful activation, and is intentionally outside this safety model.
+    Raft-replicated `primary_unavailable` flag; it is status-only. An exact
+    same-term `MarkPrimaryAvailable` clears an Apply-level flag after a
+    successful local write, while successful fresh activation clears an
+    open-level flag. Both are intentionally outside this safety model.
 17. Allocation after copy failure uses a fresh ID and requires a surviving
     allocated primary. The replacement remains out of sync until recovery
     installs matching durable identity and admission commits.
@@ -622,7 +637,7 @@ performance benchmarks.
 | `c4` | 3 / 1 / 1 | 1 primary crash; async WAL durability | Off | Expected `NoAckedLoss` violation | 32 / 21 | 9 | 1s |
 | `g1-empty-store` | 2 / 1 / 1 | CreateIndex; pre-activation crash/disk loss/restart; first activation | Both fixes + G1 | Safety and liveness pass | 14 / 14 | 13 | 1s |
 | `g2-replica` | 3 / 1 / 1 | In-sync replica disk loss; exact failure report; fresh allocation/recovery | Both fixes + G2 | Pass | 110,742 / 34,457 | 46 | 5s |
-| `g2-primary` | 3 / 1 / 1 | Primary disk loss; leader-selected live/highest-checkpoint in-sync promotion; fresh allocation/recovery | Both fixes + G2 | Pass | 198,944 / 70,420 | 46 | 7s |
+| `g2-primary` | 3 / 1 / 1 | Primary disk loss; leader-selected live in-sync promotion with observed-checkpoint preference when available; fresh allocation/recovery | Both fixes + G2 | Pass | 198,944 / 70,420 | 46 | 7s |
 | `g2-primary-no-replica` | 2 / 1 / 1 | Primary disk loss with no in-sync survivor | Both fixes + G2 | Report rejected; primary allocation retained | 23 / 20 | 13 | 1s |
 | `g2-liveness` | 2 / 1 / 1 | Replica disk loss; faults stop; stale report; write and recovery fairness | Both fixes + G2 | Safety and all liveness properties pass | 433 / 184 | 32 | 3s |
 | `pending-restart-legacy` | 2 / 1 / 1 | Pending target restarts; marker ignored; reattach/wipe plus delayed admission | Historical pending behavior | Expected `NoPartialServe` violation | 20 / 19 | 18 | 1s |
@@ -711,15 +726,26 @@ well below the CI budget.
   are abstracted as one nondeterministic escalation step; their concrete
   numeric policy is not verified here.
 - Apply-I/O failure is modeled as a failed logical mutation with no
-  acknowledged operation effect. Partial WAL/frame persistence followed by
-  engine failure and its restart reconstruction ordering remain acceptance
-  test work rather than a claim of this model.
-- The leader's checkpoint ranking uses `nextSeq` as the observation
-  abstraction and nondeterministically explores equal highest-checkpoint
-  candidates. Checkpoint transport freshness and tie-breaking order are not
-  modeled.
+  acknowledged operation effect. Rust keeps an Apply-failed copy open; an
+  operation that reached the WAL but failed engine apply is not replayed into
+  the live engine and is reconstructed only by restart recovery. Partial or
+  torn WAL-frame persistence and that restart ordering remain acceptance-test
+  work rather than a claim of this model.
+- Background Tantivy commit failures are only logged. With a fault confined to
+  the index directory, acknowledged WAL-backed writes may remain invisible to
+  search on that copy until a later successful commit or restart replay.
+- The allocator may assign a replacement back to the same faulty node. Retry is
+  bounded per attempt by recovery backoff and the storage escalation window;
+  excluding a node after a configured number of failed allocations is deferred.
+- With the default 60-second storage escalation window, a persistently
+  write-failing in-sync replica can synchronously fail every write to its shard
+  for at least 60 seconds before exact-allocation removal.
+- The leader's checkpoint preference uses `nextSeq` as the observation
+  abstraction when observations exist and nondeterministically explores equal
+  values. The unranked live in-sync fallback, checkpoint transport freshness,
+  and tie-breaking order are not modeled as distinct implementation states.
 - The Raft-recorded `primary_unavailable` health flag is omitted because it
-  changes status and activation retry behavior, not copy authority or routing.
+  changes status and repair signaling, not copy authority or routing.
 - Applied Raft views are monotonic. Loss of a node's durable `raft.db` followed
   by same-name rejoin is outside the model and requires separate identity and
   bootstrap handling.

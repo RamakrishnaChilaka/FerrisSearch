@@ -40,6 +40,8 @@ FetchRecoveryOps(FetchRecoveryOpsRequest) → FetchRecoveryOpsResponse
 PrepareFinalizeRecovery(PrepareFinalizeRecoveryRequest) → PrepareFinalizeRecoveryResponse
 CompleteFinalizeRecovery(CompleteFinalizeRecoveryRequest) → CompleteFinalizeRecoveryResponse
 FailShardCopy(FailShardCopyRequest) → FailShardCopyResponse
+MarkPrimaryUnavailable(MarkPrimaryUnavailableRequest) → MarkPrimaryUnavailableResponse
+MarkPrimaryAvailable(MarkPrimaryAvailableRequest) → MarkPrimaryAvailableResponse
 
 // Forwarded to leader
 UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
@@ -85,8 +87,9 @@ it losslessly and reject duplicate IDs, the primary ID, or any ID absent from
 `replica_node_ids` with `INVALID_ARGUMENT`. An absent field from pre-1.0 peers
 decodes as empty and therefore non-promotable.
 `ShardAssignment` also carries primary/replica allocation IDs, the initial
-CreateIndex allocation ID, and `primary_initialized`. Missing allocation
-metadata is rejected on join snapshots; pre-1.0 snapshots are not adopted.
+CreateIndex allocation ID, `primary_initialized`, and the status-only
+`primary_unavailable` flag. Missing allocation metadata is rejected on join
+snapshots; pre-1.0 snapshots are not adopted.
 
 ### Runtime And Code Generation
 
@@ -197,13 +200,19 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   reconciled to admitted/promoted or definitively rejected state after restart.
   The in-progress marker still prevents a partial install from being opened.
 - Local copy failure forwarding reports corruption-class identity, marker, WAL,
-  and Tantivy decode/validation failures immediately. Other open/engine/fence
-  I/O remains retryable under shared per-copy backoff until the count/time
-  budget is exhausted. Replica escalation removes the copy; primary escalation
-  is promote-only and requires an in-sync candidate.
+  and Tantivy decode/validation failures immediately. Other open/fence/marker
+  and Apply I/O remains retryable under operation-specific per-copy state until
+  the shared count/time policy is exhausted. Quarantine happens only after the
+  report throttle and only for definitive or open-level failures; Apply
+  escalation leaves the engine open for reads and never triggers runtime WAL
+  replay. Replica escalation removes the copy; primary escalation is
+  promote-only and requires an in-sync candidate.
 - Production transport and node lifecycle share one primary-activation state.
   Proactive lifecycle activation and request-triggered activation are
-  idempotent for the same UUID/shard/allocation/term.
+  idempotent for the same UUID/shard/allocation/term. The unavailable flag alone
+  does not bypass that cache. A repaired quarantined open-level failure forces a
+  fresh activation; a successful local write after an Apply-level failure
+  proposes throttled best-effort `MarkPrimaryAvailable` without a term bump.
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.
@@ -265,6 +274,7 @@ pub struct TransportClient {
 | `forward_delete_index()` | Forward index deletion to leader |
 | `forward_update_settings()` | Forward settings update to leader |
 | `forward_transfer_master()` | Forward leadership transfer |
+| `forward_mark_primary_available()` | Clear exact primary-unavailable status after a successful local write |
 | `forward_put_api_key()` | Forward dynamic API-key upsert to leader (control plane) |
 | `forward_delete_api_key()` | Forward dynamic API-key deletion to leader (control plane) |
 | `forward_put_role()` | Forward custom-role upsert to leader (control plane) |

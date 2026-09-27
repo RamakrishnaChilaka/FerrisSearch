@@ -57,8 +57,15 @@ pub struct ShardManager {
   Missing, malformed, or mismatched identity fails closed.
 - Identity, marker, WAL, and Tantivy decode/validation failures are definitive.
   Other filesystem/engine I/O uses a shared per-copy retry budget: exponential
-  1–5 second backoff, at least three failed attempts, and a 15-second minimum
+  1–5 second backoff, at least three failed attempts, and a 60-second minimum
   window before persistent-I/O escalation.
+- Retry state is keyed by operation. Apply-level WAL/fsync/engine failures,
+  including a writer left unavailable by failed force-merge replacement, use
+  the Apply key. Successful Apply clears that key. Apply escalation does not
+  quarantine or reopen the copy; reads remain available and failed post-WAL
+  mutations are replayed only by restart recovery. Definitive and open-level
+  failures may quarantine, but only after the report throttle admits the
+  attempt.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.
@@ -163,8 +170,10 @@ pub struct ReplicaCheckpoint {
    `ShardRoutingEntry.in_sync_replicas`
 2. Each replica returns its `local_checkpoint` after applying
 3. Primary calls `update_replica_checkpoints()` with returned values
-4. Leader may use `replica_checkpoints()` to rank only candidates already in
-   the authoritative in-sync set
+4. A leader that also hosts the primary may use `replica_checkpoints()` to
+   prefer the highest observed candidate within the authoritative in-sync set;
+   otherwise it chooses a live in-sync cluster member without checkpoint
+   ranking
 
 The current checkpoint values are highest-observed sequence watermarks, not
 proof that every lower sequence was applied. Do not describe ISR tracking,

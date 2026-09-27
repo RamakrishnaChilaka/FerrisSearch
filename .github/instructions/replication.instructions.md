@@ -123,9 +123,16 @@ pub async fn replicate_bulk(
   per-copy count/time retry state and exponential backoff. Persistent replica
   I/O eventually fails the allocation; persistent primary I/O can only request
   promote-only failover when an in-sync replacement exists.
+- Apply-level escalation leaves the open engine readable and does not trigger
+  runtime WAL replay. A single-copy primary is marked unavailable without
+  changing authority; the first later successful local write conditionally
+  clears that status at the same term. Definitive and open-level failures may
+  quarantine and require fresh activation after repair.
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
-  authoritative candidates but cannot grant membership.
+  authoritative candidates only when the reporting leader hosts the primary;
+  otherwise candidate selection falls back to a live in-sync cluster member.
+  Checkpoint observations cannot grant membership.
 - Primary shard handlers (`index_doc`, `bulk_index`, `delete_doc`) MUST return `success: false` when replication fails — never swallow replication errors
 - **Primary owns seq numbers**: replica WAL entries must preserve the seq_no assigned by the primary; never allocate replica-local seq_nos for replicated or recovered operations
 - Never derive an operation's sequence from `last_seq_no()` or a checkpoint after

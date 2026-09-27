@@ -27,7 +27,9 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replicas, settings)
 - `MarkReplicaInSync { index_name, index_uuid, shard_id, replica, allocation_id, primary, primary_term }` — conditionally admit the exact recovered assignment
 - `ActivatePrimary { index_name, index_uuid, shard_id, primary, allocation_id, expected_term }` — conditionally bump the term and monotonically mark the shard initialized
-- `FailShardCopy { index_name, index_uuid, shard_id, node, allocation_id, promote_only }` — conditionally remove an unopenable replica or promote an in-sync survivor; primary reports must be promote-only
+- `MarkPrimaryUnavailable { index_name, index_uuid, shard_id, primary, allocation_id }` — set status-only unavailability for the exact initialized primary allocation
+- `MarkPrimaryAvailable { index_name, index_uuid, shard_id, primary, allocation_id, primary_term }` — clear status-only unavailability only for the exact current primary allocation and term, without changing the term
+- `FailShardCopy { index_name, index_uuid, shard_id, node, allocation_id, promote_only, promotion_candidate }` — conditionally remove an unopenable replica or promote the leader-selected in-sync survivor; primary reports must be promote-only
 - `AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
 - `PutApiKey { record: SecurityApiKeyRecord }` — upsert a dynamic API key (stores only the hash) into `ClusterState.api_keys`
 - `DeleteApiKey { key_id: String }` — remove a dynamic API key
@@ -60,6 +62,8 @@ pub struct ClusterStateMachine {
 | `UpdateIndex` | preserve existing copy IDs (including an unchanged red shard's absent primary ID), assign the current log index to new copies, clear removed IDs, intersect in-sync membership, and reject out-of-sync promotion |
 | `MarkReplicaInSync` | add one assigned replica only when the shard is initialized, a primary allocation exists, and UUID, allocation ID, primary, and term match |
 | `ActivatePrimary` | increment the term and set `primary_initialized` only when UUID, allocation ID, primary, and expected term match |
+| `MarkPrimaryUnavailable` | set the status-only unavailable flag for the exact initialized primary allocation; reject an already-set flag |
+| `MarkPrimaryAvailable` | clear an already-set unavailable flag only when UUID, primary, allocation, and primary term match; never change the term |
 | `FailShardCopy` | after initialization, remove only an exact failed replica allocation; a primary command must be promote-only and promotes an in-sync candidate with a term bump, otherwise it is rejected without clearing the primary allocation |
 | `AddMappings` | merge `new_fields` into `state.indices[name].mappings` via `.entry().or_insert()` |
 | `PutApiKey` / `DeleteApiKey` | `insert` / `remove` on `state.api_keys` |

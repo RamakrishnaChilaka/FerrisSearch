@@ -195,9 +195,10 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > **Storage-failure and idle-activation corrections — September 27, 2026:**
 > identity, marker, WAL manifest/frame, and Tantivy metadata/segment
 > decode-validation failures are definitive immediately. Other filesystem and
-> engine I/O uses a shared per-copy exponential open/fence backoff (1 second up
-> to 5 seconds) and escalates only after at least three failed attempts spanning
-> 15 seconds. Replica escalation removes the exact allocation. Primary
+> engine I/O uses operation-specific per-copy retry state with exponential
+> backoff (1 second up to 5 seconds) and escalates only after at least three
+> failed attempts spanning the configured window, 60 seconds by default.
+> Replica escalation removes the exact allocation. Primary
 > escalation submits a promote-only failure only when an in-sync candidate
 > exists; otherwise routing is retained and the shard remains unavailable.
 > Request and lifecycle opens share the same retry state, so request traffic
@@ -209,6 +210,32 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > reconstruct it from the marker) without a process restart. Recovery aborts
 > verify the currently registered index UUID before touching disk, so a delayed
 > abort cannot recreate a deleted index incarnation.
+>
+> **Availability-status and Apply corrections — September 27, 2026:** a
+> write-only failure no longer bypasses the local activation cache or causes
+> periodic primary-term bumps. `primary_unavailable` remains set for the exact
+> allocation and term until the first successful local primary write commits a
+> conditional `MarkPrimaryAvailable`. Definitive and open-level failures are
+> quarantined only after report throttling; repaired storage then requires a
+> fresh `ActivatePrimary`, which clears the flag while advancing the term.
+> Apply-level escalation keeps the existing engine open for reads and does not
+> replay a WAL-appended but engine-failed operation at runtime. A force-merge
+> writer-replacement failure leaves a typed unavailable-writer state whose
+> later writes consume the Apply retry budget.
+>
+> Candidate selection requires a live, in-sync cluster member. A leader that
+> also hosts the primary prefers the highest replica checkpoint it has
+> observed; a metadata-only or other non-primary leader has no such local
+> observations and uses an unranked live in-sync member. Every in-sync member
+> has acknowledged every write required by the current synchronous write set.
+>
+> Background Tantivy commit failures remain log-only. With a fault confined to
+> the index directory, acknowledged WAL-backed writes can remain invisible to
+> search on that copy until a later successful commit or restart replay.
+> Allocation can also return a replacement to the same faulty node; a
+> MaxRetryAllocationDecider-style exclusion policy and
+> `index.allocation.max_retries` setting (OpenSearch defaults to five retries)
+> are deferred.
 
 The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including
@@ -218,11 +245,13 @@ therefore varies slightly with document ID and content. The 65 MiB decode-only
 ceiling exists solely so upgraded nodes can open and replay complete legacy
 frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
 
-**Known write-failure limit:** a failed WAL `write_all` or `sync_data` does not
-yet transition the shard into a fail-stopped state. If the process continues
-writing after a partial append, the torn frame can become middle corruption;
-restart then fails closed rather than skipping acknowledged history. Startup
-tail truncation repairs only a trailing incomplete frame with no later data.
+**Known write-failure limit:** synchronous WAL/fsync/engine failures now fail
+the request and enter bounded escalation, but a WAL entry whose later engine
+apply fails remains absent from the live reader and is replayed only during
+restart recovery. If a partial append is followed by later writes, the torn
+frame can become middle corruption; restart then fails closed rather than
+skipping acknowledged history. Startup tail truncation repairs only a trailing
+incomplete frame with no later data.
 
 ## 3. Reference Protocols And Intentional Differences
 
