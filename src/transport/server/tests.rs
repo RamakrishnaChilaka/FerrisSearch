@@ -2610,17 +2610,116 @@ async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_cl
         .unwrap()
         .into_inner();
     assert!(repaired.success, "{}", repaired.error);
-    let state = shared_state.read().unwrap();
-    assert_eq!(
-        state.indices["idx"].shard_routing[&0].primary_term,
-        active_term
-    );
-    assert!(!state.primary_unavailable("idx", 0));
-    assert_eq!(
-        state.version,
-        version_before_repair + 1,
-        "the first successful write should commit one status-only clear"
-    );
+    let clear_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let cleared = {
+            let state = shared_state.read().unwrap();
+            (!state.primary_unavailable("idx", 0)).then_some((
+                state.indices["idx"].shard_routing[&0].primary_term,
+                state.version,
+            ))
+        };
+        if let Some((primary_term, version)) = cleared {
+            assert_eq!(primary_term, active_term);
+            assert_eq!(
+                version,
+                version_before_repair + 1,
+                "the first successful write should commit one status-only clear"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < clear_deadline,
+            "background primary-available report did not clear the flag"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_write_does_not_wait_for_primary_available_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = DomainClusterState::new("available-report".into());
+    state.add_index(DomainIndexMetadata {
+        name: "idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("uuid-1"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 2,
+                replicas: Vec::new(),
+                in_sync_replicas: Vec::new(),
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+    let allocation_id = state.primary_allocation_id("idx", 0).unwrap();
+    {
+        let allocation = state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap();
+        allocation.primary_initialized = true;
+        allocation.primary_unavailable = true;
+    }
+    let cluster_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    cluster_manager.update_state(state);
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    let service = TransportService {
+        cluster_manager,
+        shard_manager,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let _blocked_report = service
+        .primary_activation_state
+        .available_primary_reports
+        .lock()
+        .await;
+    let response = tokio::time::timeout(
+        Duration::from_millis(250),
+        service.index_doc(Request::new(ShardDocRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            doc_id: "fast-response".into(),
+            payload_json: serde_json::to_vec(&json!({"value": 1})).unwrap(),
+        })),
+    )
+    .await
+    .expect("a successful write must not wait for primary-available reporting")
+    .unwrap()
+    .into_inner();
+    assert!(response.success, "{}", response.error);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2801,39 +2900,6 @@ async fn primary_apply_escalation_keeps_reads_open_and_does_not_replay_failed_wa
         .add_document_with_receipt("baseline", json!({"value": 0}))
         .unwrap();
     engine.refresh().unwrap();
-    engine.inject_writer_replacement_failures_for_test(28, 1);
-    assert!(engine.force_merge(1).is_err());
-    assert!(
-        engine
-            .add_document_with_receipt("failed-after-wal", json!({"value": 1}))
-            .is_err()
-    );
-    assert!(engine.get_document("baseline").unwrap().is_some());
-    assert!(engine.get_document("failed-after-wal").unwrap().is_none());
-    assert!(
-        engine
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
-            .unwrap()
-            .operations
-            .iter()
-            .any(|operation| operation.payload["_doc_id"] == "failed-after-wal")
-    );
-
-    let mut persistent = None;
-    for _ in 0..3 {
-        persistent = Some(
-            shard_manager
-                .record_local_apply_result::<()>(
-                    "uuid-1",
-                    0,
-                    allocation_id,
-                    Err(std::io::Error::from_raw_os_error(28).into()),
-                )
-                .unwrap_err(),
-        );
-    }
-    let persistent = persistent.unwrap();
-    assert!(ShardManager::should_report_copy_failure(&persistent));
     let service = TransportService {
         cluster_manager,
         shard_manager: shard_manager.clone(),
@@ -2848,21 +2914,52 @@ async fn primary_apply_escalation_keeps_reads_open_and_does_not_replay_failed_wa
         peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
-    service
-        .report_local_copy_failure("idx", "uuid-1", 0, allocation_id, &persistent)
-        .await;
+    engine.inject_engine_apply_failures_for_test(28, 3);
+    for attempt in 0..3 {
+        let response = service
+            .index_doc(Request::new(ShardDocRequest {
+                index_name: "idx".into(),
+                shard_id: 0,
+                doc_id: format!("failed-after-wal-{attempt}"),
+                payload_json: serde_json::to_vec(&json!({"value": attempt})).unwrap(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.success);
+    }
+    assert!(engine.get_document("baseline").unwrap().is_some());
+    for attempt in 0..3 {
+        assert!(
+            engine
+                .get_document(&format!("failed-after-wal-{attempt}"))
+                .unwrap()
+                .is_none()
+        );
+    }
+    let wal_operations = engine
+        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .unwrap()
+        .operations;
+    for attempt in 0..3 {
+        assert!(wal_operations.iter().any(|operation| {
+            operation.payload["_doc_id"] == format!("failed-after-wal-{attempt}")
+        }));
+    }
     let current = shard_manager.get_shard("idx", 0).unwrap();
     assert!(Arc::ptr_eq(&current, &engine));
     let same_engine = service.get_or_open_shard("idx", 0).await.unwrap();
     assert!(Arc::ptr_eq(&same_engine, &engine));
     assert!(same_engine.get_document("baseline").unwrap().is_some());
-    assert!(
-        same_engine
-            .get_document("failed-after-wal")
-            .unwrap()
-            .is_none(),
-        "failed post-WAL mutation must be replayed only by restart recovery"
-    );
+    for attempt in 0..3 {
+        assert!(
+            same_engine
+                .get_document(&format!("failed-after-wal-{attempt}"))
+                .unwrap()
+                .is_none(),
+            "failed post-WAL mutation must be replayed only by restart recovery"
+        );
+    }
 }
 
 #[tokio::test]

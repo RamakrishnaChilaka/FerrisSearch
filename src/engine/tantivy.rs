@@ -133,6 +133,8 @@ pub struct HotEngine {
     #[cfg(test)]
     writer_replacement_failure: Mutex<Option<(i32, usize)>>,
     #[cfg(test)]
+    engine_apply_failure: Mutex<Option<(i32, usize)>>,
+    #[cfg(test)]
     refresh_before_writer_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
     peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
@@ -579,6 +581,8 @@ impl HotEngine {
             #[cfg(test)]
             writer_replacement_failure: Mutex::new(None),
             #[cfg(test)]
+            engine_apply_failure: Mutex::new(None),
+            #[cfg(test)]
             refresh_before_writer_sender: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
@@ -635,6 +639,59 @@ impl HotEngine {
             .map_err(|_| anyhow::anyhow!("maintenance lock poisoned during {context}"))
     }
 
+    fn open_replacement_writer(
+        &self,
+        context: &str,
+        merge_policy: Box<dyn MergePolicy>,
+    ) -> Result<IndexWriter> {
+        #[cfg(test)]
+        if let Some(error) = self.maybe_fail_writer_replacement_for_test() {
+            return Err(error).with_context(|| context.to_string());
+        }
+        let writer = self
+            .index
+            .writer(TANTIVY_WRITER_HEAP_BYTES)
+            .with_context(|| context.to_string())?;
+        writer.set_merge_policy(merge_policy);
+        Ok(writer)
+    }
+
+    fn writer_state_for_write(
+        &self,
+        context: &str,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, WriterState>> {
+        let automatic_policy = self
+            .automatic_merge_policy
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut writer_state = self
+            .writer
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if writer_state.writer.is_none() {
+            let previous_failure = writer_state
+                .failure
+                .clone()
+                .unwrap_or_else(|| "writer reinitialization is incomplete".to_string());
+            let rebuild_context = format!("failed to rebuild Tantivy writer during {context}");
+            let replacement = match self.open_replacement_writer(
+                &rebuild_context,
+                Box::new(SharedMergePolicy(automatic_policy)),
+            ) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    writer_state.fail(format!(
+                        "{rebuild_context}: {error:#}; previous writer failure: {previous_failure}"
+                    ));
+                    return Err(error).context(rebuild_context);
+                }
+            };
+            writer_state.replace(replacement);
+        }
+        Ok(writer_state)
+    }
+
     fn pause_and_drain_automatic_merges(&self) -> Result<()> {
         let automatic_policy = self
             .automatic_merge_policy
@@ -666,24 +723,16 @@ impl HotEngine {
             let _ = sender.send(());
         }
         let wait_result = writer.wait_merging_threads();
-        #[cfg(test)]
-        if let Some(error) = self.maybe_fail_writer_replacement_for_test() {
-            let message =
-                format!("failed to reopen Tantivy writer after draining merge threads: {error}");
-            writer_state.fail(message.clone());
-            return Err(error).context(message);
-        }
-        let replacement = match self.index.writer(TANTIVY_WRITER_HEAP_BYTES) {
-            Ok(writer) => writer,
-            Err(error) => {
-                let message = format!(
-                    "failed to reopen Tantivy writer after draining merge threads: {error}"
-                );
-                writer_state.fail(message.clone());
-                return Err(anyhow::anyhow!(message));
-            }
-        };
-        replacement.set_merge_policy(Box::new(NoMergePolicy));
+        let reopen_context = "failed to reopen Tantivy writer after draining merge threads";
+        let replacement =
+            match self.open_replacement_writer(reopen_context, Box::new(NoMergePolicy)) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    let message = format!("{reopen_context}: {error:#}");
+                    writer_state.fail(message.clone());
+                    return Err(error).context(message);
+                }
+            };
         writer_state.replace(replacement);
 
         if let Err(error) = wait_result {
@@ -1796,6 +1845,14 @@ impl HotEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_engine_apply_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
+        *self
+            .engine_apply_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+    }
+
+    #[cfg(test)]
     fn maybe_fail_writer_replacement_for_test(&self) -> Option<anyhow::Error> {
         let mut failure = self
             .writer_replacement_failure
@@ -1808,6 +1865,23 @@ impl HotEngine {
         }
         *remaining -= 1;
         Some(std::io::Error::from_raw_os_error(*raw_os_error).into())
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_engine_apply_for_test(&self) -> Result<()> {
+        let mut failure = self
+            .engine_apply_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((raw_os_error, remaining)) = failure.as_mut() else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            *failure = None;
+            return Ok(());
+        }
+        *remaining -= 1;
+        Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
     }
 
     #[cfg(test)]
@@ -5507,11 +5581,15 @@ impl super::SearchEngine for HotEngine {
         // section so refresh/flush cannot commit past a translog entry that has
         // not yet been applied to the Tantivy writer.
         let seq_no = self.with_translog("document indexing", |tl| {
+            let mut writer_state = self.writer_state_for_write("document indexing")?;
+            let writer = writer_state.writer_mut("document indexing")?;
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
                 "_source": payload
             });
             let receipt = tl.append(crate::wal::WalOperation::Index, wal_entry)?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
 
             // 2. Delete any existing doc with same _id (upsert semantics)
             let id_field = self
@@ -5519,8 +5597,6 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("document indexing")?;
             writer.delete_term(Term::from_field_text(id_field, doc_id));
 
             // 3. Write to Tantivy in-memory buffer
@@ -5543,19 +5619,21 @@ impl super::SearchEngine for HotEngine {
     ) -> Result<String> {
         self.validate_keyword_documents(std::iter::once(&payload))?;
         self.with_translog("replica document indexing", |tl| {
+            let mut writer_state = self.writer_state_for_write("replica document indexing")?;
+            let writer = writer_state.writer_mut("replica document indexing")?;
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
                 "_source": payload
             });
             tl.append_with_seq(seq_no, crate::wal::WalOperation::Index, wal_entry)?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
 
             let id_field = self
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("replica document indexing")?;
             writer.delete_term(Term::from_field_text(id_field, doc_id));
 
             let doc = self.build_tantivy_doc(doc_id, &payload)?;
@@ -5583,16 +5661,17 @@ impl super::SearchEngine for HotEngine {
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
         let start_seq_no = self.with_translog("bulk indexing", |tl| {
-            let start_seq_no = tl.write_bulk_with_receipt(&ops)?;
-
             // 2. Write all docs to Tantivy in-memory buffer under one lock
             // Acquire registry once for the entire batch (not per-doc)
             let registry = self
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer_state_for_write("bulk indexing")?;
             let writer = writer_state.writer_mut("bulk indexing")?;
+            let start_seq_no = tl.write_bulk_with_receipt(&ops)?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
             for (doc_id, payload) in &docs {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
                 let doc = Self::build_tantivy_doc_inner(
@@ -5630,14 +5709,15 @@ impl super::SearchEngine for HotEngine {
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
         self.with_translog("replica bulk indexing", |tl| {
-            tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
-
             let registry = self
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer_state_for_write("replica bulk indexing")?;
             let writer = writer_state.writer_mut("replica bulk indexing")?;
+            tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
             for (doc_id, payload) in &docs {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
                 let doc = Self::build_tantivy_doc_inner(
@@ -5657,10 +5737,14 @@ impl super::SearchEngine for HotEngine {
 
     fn delete_document_with_receipt(&self, doc_id: &str) -> Result<super::DeleteWriteReceipt> {
         let seq_no = self.with_translog("document delete", |tl| {
+            let mut writer_state = self.writer_state_for_write("document delete")?;
+            let writer = writer_state.writer_mut("document delete")?;
             let receipt = tl.append(
                 crate::wal::WalOperation::Delete,
                 serde_json::json!({ "_doc_id": doc_id }),
             )?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
 
             // 2. Delete from Tantivy
             let id_field = self
@@ -5668,8 +5752,6 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("document delete")?;
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             // delete_term returns an OpStamp, not a count — we report 1 optimistically
             let _ = opstamp;
@@ -5680,19 +5762,21 @@ impl super::SearchEngine for HotEngine {
 
     fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
         self.with_translog("replica document delete", |tl| {
+            let mut writer_state = self.writer_state_for_write("replica document delete")?;
+            let writer = writer_state.writer_mut("replica document delete")?;
             tl.append_with_seq(
                 seq_no,
                 crate::wal::WalOperation::Delete,
                 serde_json::json!({ "_doc_id": doc_id }),
             )?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
 
             let id_field = self
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("replica document delete")?;
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             let _ = opstamp;
             Ok(())
@@ -7009,6 +7093,7 @@ mod tests {
             force_merge_entry_barrier: Mutex::new(None),
             force_merge_before_wait_sender: Mutex::new(None),
             writer_replacement_failure: Mutex::new(None),
+            engine_apply_failure: Mutex::new(None),
             refresh_before_writer_sender: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),

@@ -233,6 +233,9 @@ pub trait SearchEngine: Send + Sync {
     #[cfg(test)]
     fn inject_writer_replacement_failures_for_test(&self, _raw_os_error: i32, _attempts: usize) {}
 
+    #[cfg(test)]
+    fn inject_engine_apply_failures_for_test(&self, _raw_os_error: i32, _attempts: usize) {}
+
     /// Index a single document with a given ID. Returns the document ID.
     /// Implementations should handle both text and vector fields.
     fn add_document(&self, doc_id: &str, payload: serde_json::Value) -> Result<String> {

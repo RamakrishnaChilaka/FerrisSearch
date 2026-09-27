@@ -625,12 +625,11 @@ impl InternalTransport for TransportService {
             Ok(receipt) => {
                 let id = receipt.doc_id;
                 let seq_no = receipt.seq_no;
-                self.report_primary_available_after_write(
+                self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
                     &activated_primary,
-                )
-                .await;
+                );
 
                 // Replicate to replica shards with seq_no
                 match crate::replication::replicate_write(
@@ -832,12 +831,11 @@ impl InternalTransport for TransportService {
                 let seq_no = last_seq_no.ok_or_else(|| {
                     Status::internal("non-empty bulk receipt has no last sequence")
                 })?;
-                self.report_primary_available_after_write(
+                self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
                     &activated_primary,
-                )
-                .await;
+                );
                 // Replicate to replica shards
                 match crate::replication::replicate_bulk(
                     &self.transport_client,
@@ -985,12 +983,11 @@ impl InternalTransport for TransportService {
             Ok(receipt) => {
                 let deleted = receipt.deleted;
                 let seq_no = receipt.seq_no;
-                self.report_primary_available_after_write(
+                self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
                     &activated_primary,
-                )
-                .await;
+                );
                 // Replicate delete to replica shards
                 match crate::replication::replicate_write(
                     &self.transport_client,
@@ -3472,6 +3469,22 @@ impl TransportService {
                 "Local shard-copy failure report was not applied"
             );
         }
+    }
+
+    fn spawn_primary_available_report_after_write(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        activated_primary: &ActivatedPrimary,
+    ) {
+        let service = self.clone();
+        let index_name = index_name.to_string();
+        let activated_primary = activated_primary.clone();
+        tokio::spawn(async move {
+            service
+                .report_primary_available_after_write(&index_name, shard_id, &activated_primary)
+                .await;
+        });
     }
 
     async fn report_primary_available_after_write(

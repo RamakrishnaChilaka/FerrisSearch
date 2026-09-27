@@ -4852,7 +4852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_force_merge_writer_escalates_under_apply_key() {
+    async fn transient_force_merge_writer_failure_rebuilds_on_next_write() {
         let dir = tempfile::tempdir().unwrap();
         let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
         manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
@@ -4875,6 +4875,43 @@ mod tests {
             .unwrap();
         engine.refresh().unwrap();
         engine.inject_writer_replacement_failures_for_test(28, 1);
+        assert!(engine.force_merge(1).is_err());
+
+        let rebuilt = manager
+            .record_local_apply_result(
+                "uuid-1",
+                0,
+                7,
+                engine.add_document_with_receipt("after-rebuild", serde_json::json!({"value": 1})),
+            )
+            .unwrap();
+        assert_eq!(rebuilt.doc_id, "after-rebuild");
+    }
+
+    #[tokio::test]
+    async fn persistent_force_merge_writer_rebuild_failure_escalates_under_apply_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt("baseline", serde_json::json!({"value": 0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.inject_writer_replacement_failures_for_test(28, usize::MAX);
         assert!(engine.force_merge(1).is_err());
 
         let mut reportable = Vec::new();
