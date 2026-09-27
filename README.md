@@ -322,6 +322,11 @@ write clears it conditionally at the same term. A definitive or open-level
 failure quarantines the copy after report throttling and clears the status only
 after repaired storage completes a fresh primary activation.
 
+This makes FerrisSearch red health intentionally broader than OpenSearch red
+health. For example, a write-only fault can leave the assigned primary open and
+serving reads while writes are unavailable. OpenSearch red means the affected
+primary is unassigned, so that shard serves neither reads nor writes.
+
 Because replica acknowledgement is synchronous, a persistent write fault on an
 in-sync replica can fail every write to that shard for at least the default
 60-second escalation window before that exact allocation is removed. Recovery

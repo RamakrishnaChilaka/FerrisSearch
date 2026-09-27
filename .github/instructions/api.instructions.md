@@ -129,7 +129,15 @@ Replica in-sync membership and allocation identity are Raft metadata; engine ava
 runtime observation. The `ShardState` enum (`Started` / `Unassigned`) represents
 allocation intent. `_cat/indices` and `/_cluster/health` are yellow for any
 unassigned or assigned-out-of-sync replica and red when a primary's node is
-missing or its primary allocation is cleared.
+missing, its primary allocation is cleared, or its exact allocation is marked
+`primary_unavailable`.
+
+FerrisSearch red health is therefore broader than OpenSearch red health. A
+write-only storage fault can set `primary_unavailable` while the primary remains
+assigned, open, and able to serve reads; writes remain unavailable until repair
+is proven. In OpenSearch, red denotes an unassigned primary, so that affected
+shard serves neither reads nor writes. Do not infer FerrisSearch read
+unavailability from the color alone.
 
 ### Cat Endpoint Fan-Out Collection
 By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `GetShardStats` to collect real doc counts (mirrors OpenSearch behavior). `_cat/segments` also fans out to all nodes via `GetSegmentStats` and must list every segment row reported by each started shard copy in the cluster.

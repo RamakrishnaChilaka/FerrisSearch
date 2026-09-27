@@ -226,6 +226,11 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > heal there, while persistent rebuild I/O consumes the Apply retry budget.
 > Status-only `MarkPrimaryAvailable` reporting runs in the background so leader
 > discovery or forwarding cannot delay an already-successful write response.
+> This status introduces an intentional health-semantics difference from
+> OpenSearch. FerrisSearch can report red for a write-only fault while the exact
+> primary allocation remains assigned, open, and readable; mutations are
+> unavailable until repair is proven. OpenSearch red denotes an unassigned
+> primary, so the affected shard serves neither reads nor writes.
 >
 > Candidate selection requires a live, in-sync cluster member. A leader that
 > also hosts the primary prefers the highest replica checkpoint it has
