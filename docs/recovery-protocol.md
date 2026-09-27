@@ -167,6 +167,29 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > admission, pending-target observation, and copy-failure reports. Assigned
 > read/write/replication opens validate UUID and allocation identity even when
 > an engine is already present.
+>
+> **Allocation/fencing review corrections — September 27, 2026:** an unchanged
+> red shard now preserves its absent primary allocation through `UpdateIndex`,
+> so healthy sibling shards can fail over, allocate replicas, and receive
+> settings changes. Pending recovery observation checks admission first, then
+> rejects an exact target allocation when the observed primary changed or its
+> term advanced; `MarkReplicaInSync` additionally requires an initialized shard
+> with a present primary allocation. Target restart restores an exact matching
+> awaiting-membership marker and reopens the finalized copy before scheduling
+> recovery. Target begin/prepare and source-session polling refuse to restart a
+> finalized or settling transfer. Controlled retryable recovery failures clean
+> their partial install and retain the same assignment; only definitive local
+> identity/install failures produce allocation-bound `FailShardCopy`.
+> Transient fence-persistence and general engine/filesystem I/O failures remain
+> request failures and are not converted into routing changes. Duplicate
+> failure reports are rate-limited per allocation.
+>
+> The pre-activation empty-primary rule depends on a node's applied routing view
+> not moving backward. Production startup constructs OpenRaft over the
+> persistent `raft.db`, and OpenRaft replays committed state before that view is
+> used for normal shard service. Losing `raft.db` and rejoining under the same
+> node name does not satisfy this assumption; retained shard storage must not be
+> treated as a fresh pre-activation allocation in that scenario.
 
 The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including

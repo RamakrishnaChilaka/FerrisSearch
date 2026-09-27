@@ -106,8 +106,17 @@ pub async fn replicate_bulk(
   a primary operation. Oversized explicit-sequence single or bulk writes fail
   validation before replica WAL mutation.
 - Pending-target reconciliation admits only the same allocation when in sync or
-  after promotion. Missing or different allocation identity is definitive
-  rejection; otherwise the result remains unknown.
+  after promotion. Admission is checked first; otherwise missing/different
+  allocation identity, a different primary, or a strictly newer observed term
+  is definitive rejection. An older view or the same primary/term remains
+  unknown.
+- Restart restores an exact matching durable pending marker and opens that
+  finalized copy before scheduling recovery. Target begin/prepare and source
+  status polling refuse to reattach once finalization/admission/settlement has
+  begun.
+- Controlled retryable recovery failures remove the partial target install and
+  retry the same allocation. Only definitive rejection or a crash-left inactive
+  matching install marker enters the allocation-bound copy-failure path.
 - Failed replication returns `Err(Vec<String>)` with per-replica error messages
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates but cannot grant membership.

@@ -297,7 +297,11 @@ capacity; it is not a total-process memory limit.
 `max_concurrent_peer_recoveries` limits target-side recovery sessions per node
 (default `2`, maximum `64`). Set it to `0`, or set
 `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES=0`, to keep assigned replicas
-`INITIALIZING` without automatic recovery.
+`INITIALIZING` without automatic recovery. A new `local_shards` index therefore
+starts with only its primary in the authoritative write set; initial replicas
+join through peer recovery. Setting the limit to `0` keeps new indices
+single-copy for acknowledgement and promotion purposes until recovery is
+re-enabled and completes.
 
 This pre-1.0 protocol does not adopt legacy shard directories or routing
 snapshots that lack allocation identity. Clusters created before this change

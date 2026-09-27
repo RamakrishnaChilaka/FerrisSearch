@@ -170,7 +170,7 @@ proposed protocol or production parity.
 |---|---|---|
 | A02, R01, R02, R08 (partial) | Real-gRPC/real-engine `node::peer_recovery::tests::file_recovery_copies_flushed_state_catches_up_and_admits_target`; process-backed `added_replica_recovers_files_and_survives_primary_loss` and `rejoining_stale_replica_is_recovered_before_primary_failover`. They cover 20 writes, flush, five writes, concurrent acknowledged writes/deletes, file install, suffix replay, admission, exact values, rejoin with stale same-directory data, primary loss, and one post-failover write. | Snapshot-plus-suffix only; no verified common-history operation-only path, resumable transfer, allocation/history identity, or contiguous-prefix proof. |
 | H01, H02, H03 (partial) | `wal::tests::retention_pin_bounds_checkpoint_and_full_truncation`, `zero_retention_pin_prevents_pruning_any_history`, `engine::tantivy::tests::peer_recovery_pin_is_respected_by_every_flush_path`, and `peer_recovery_snapshot_has_exact_boundary_and_retained_suffix`. Pin registration occurs under the translog lock before snapshot release; every current truncation path respects the minimum pin. | Pins are in-memory, time-bounded to the source session, and not byte-budgeted or transferred across source failure. H02 is snapshot fallback for new/stale copies, not negotiated path selection. |
-| M04, M07 (partial) | Primary handlers hold a shared per-shard write guard through replication; `PrepareFinalizeRecovery` takes the exclusive guard and `CompleteFinalizeRecovery` observes committed membership before release. Unknown admission retries under the barrier and uses allocation-bound `ActivatePrimary` to make the stale command impossible. Phase-A real-Raft `conditional_membership_rejects_stale_promotion_and_old_primary_term` fences an old-term admission. Target regressions `completion_timeout_keeps_target_open_until_committed_admission_is_observed`, `restarted_pending_target_observed_as_promoted_is_admitted`, and `definitive_term_bump_rejects_and_marks_pending_target` preserve availability while local ordered state catches up. | No configuration generation or transition ID; settlement remains term-based and source-session state remains process-local. |
+| M04, M07 (partial) | Primary handlers hold a shared per-shard write guard through replication; `PrepareFinalizeRecovery` takes the exclusive guard and `CompleteFinalizeRecovery` observes committed membership before release. Unknown admission retries under the barrier and uses allocation-bound `ActivatePrimary` to make the stale command impossible. Phase-A real-Raft `conditional_membership_rejects_stale_promotion_and_old_primary_term` fences an old-term admission. Target regressions `completion_timeout_keeps_target_open_until_committed_admission_is_observed`, `restarted_pending_target_observed_as_promoted_is_admitted`, `definitive_term_bump_rejects_and_marks_pending_target`, and `pending_target_rejects_newer_term_or_different_primary` cover admission-first observation followed by exact-allocation, newer-term, and changed-primary rejection. | No configuration generation or transition ID; settlement remains term-based and source-session state remains process-local. |
 | S01, S04, S05, S08 (partial) | `peer_recovery_snapshot_has_exact_boundary_and_retained_suffix`, `shard::tests::peer_recovery_marker_blocks_normal_shard_open`, `finalized_peer_recovery_install_opens_exact_snapshot`, `strict_recovery_open_refuses_schema_mismatch_without_wiping`, `recovery_file_names_reject_traversal_and_separators`, and `corrupted_recovery_file_checksum_is_rejected`. | Install replaces only an out-of-sync copy and uses a persistent marker rather than a retained previous generation. Source hard links must be supported; vector state is rebuilt under the existing cap. |
 | O02, O04, O05 (partial) | Per-node `max_concurrent_peer_recoveries` (default 2, zero disables, max 64), bounded 1 MiB chunks, bounded operation batches, 5–60 second backoff, ten-minute session expiry, Tokio blocking-pool file/engine work, and `expired_source_session_releases_pin_and_snapshot`. | No byte reservation, throttling, resumable progress, unified admission governor, or persisted session recovery. |
 | F07 (retained) | `peer_recovery_disabled_replica_is_not_promoted_and_primary_rejoin_restores_data` sets `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES=0` on prospective replica nodes and preserves the fail-closed red-shard/original-primary-return behavior. | Forced stale-primary recovery remains unsupported. |
@@ -237,23 +237,33 @@ starts legacy `RecoverReplica`, verifies the RPC enters the live engine read
 path without shrinking the file, then proves the completed append and all
 acknowledged documents survive engine reopen.
 
+The September 27 allocation/fencing review adds
+`red_sibling_shard_does_not_block_update_index`,
+`mark_replica_in_sync_rejects_a_red_shard_without_primary_allocation`,
+`restarted_pending_target_is_restored_before_recovery_scheduling`,
+`restarted_pending_target_is_not_recovered_again_over_transport`,
+`matching_pending_marker_refuses_new_recovery_begin_and_prepare`,
+`finalized_source_session_rejects_restarted_target_start`,
+`transient_fence_persist_failure_does_not_fail_the_shard_copy`,
+`retryable_recovery_cleanup_does_not_leave_a_failed_install_marker`,
+`stale_identity_temp_does_not_block_initial_primary_creation`, and
+`local_test_open_preserves_an_existing_allocation_identity`. These regressions
+cover two-shard routing isolation, non-vacuous pending rejection, durable
+pending restoration before recovery scheduling, two-sided refusal to reattach
+or wipe a settling copy, and the distinction between definitive identity
+failure and retryable I/O.
+
 The non-blocking WAL write-failure case remains unimplemented: a partial
 `write_all` or failed `sync_data` does not yet fail-stop the shard, so later
 writes could convert a repairable trailing fragment into fail-closed middle
 corruption. This is separate from the closed startup-tail and live-read cases.
 
-The remove-and-re-add ABA case is a safety as well as liveness limitation:
-without allocation IDs, a finalized pending target cannot distinguish the old
-assignment from a replacement assignment. Bounded model checking found a
-schedule where the target rejects the old pending state and writes its install
-marker, then the old source settlement admits the newly assigned same-name
-copy.
-The generic shard-open fast path also remains keyed by index name and shard ID;
-outside the reviewed coordinator/reopen ordering, a non-coordinator with a
-stale same-name engine does not yet validate the requested UUID. Full
-allocation identity is still required for that boundary.
+The remove-and-re-add ABA and generic shard-open identity gaps described by the
+September 26 counterexamples are closed in the allocation-identity slice below.
+The historical traces remain evidence for the old node-name-only design, not a
+current limitation of the implemented assigned-open path.
 
-### Bounded TLA+ Evidence Record (September 26, 2026)
+### Bounded TLA+ Evidence Record (September 27, 2026)
 
 This evidence is exhaustive only within the finite bounds recorded in
 [`../specs/tla/README.md`](../specs/tla/README.md). It is not an implementation
@@ -266,17 +276,26 @@ test, an unbounded proof, an Apalache inductive check, or a TLAPS proof.
 | F02 | Node-name-only and allocation-ID-only variants allow a lower-term replication request after metadata partition and promotion. The combined allocation-ID plus replica-fencing variant rejects it and passes the same bounded C2 schedule. | Allocation identity does not replace primary-term fencing on `ReplicateDoc`/bulk apply. Retained trace: [`C2-stale-primary-unique-seq.md`](../specs/tla/traces/C2-stale-primary-unique-seq.md). |
 | F03 | A replica learns term 3 from a valid replication request while its Raft view remains at term 1, crashes, restarts, and receives a term-1 retry. A volatile fence permits the request; a durable fence rejects it. | The local replica fence must be persisted before acknowledging a higher-term apply and restored before serving replication. Retained trace: [`Fence-volatile-restart-stale-probe.md`](../specs/tla/traces/Fence-volatile-restart-stale-probe.md). |
 | I05 | Same-name restart with an empty disk violates `NoAckedLoss` without durable local allocation identity. The allocation-ID variant fails the empty copy closed and passes the bounded check. | Confirms the node-name identity gap within this fault model; it does not prove filesystem or process behavior beyond the abstraction. |
-| G1 initial empty store | Starting from CreateIndex with `initialized = false`, one pre-activation primary crash/disk loss/restart, allocation-matched first activation, and the first write passes 14 distinct states to depth 13 under weak fairness. | Rust uses the stricter primary-only form: the initial primary allocation may be recreated empty before first activation because no write can yet be acknowledged. Initial replicas recover from the primary. Initialization is monotonic and later empty authoritative recreation is forbidden. |
-| G2 replica copy failure | The three-voter replica-loss model passes 33,877 distinct states to depth 46 after an acknowledged write, disk loss, exact-allocation failure report, fresh allocation, and possible peer recovery. | A disk-lost in-sync replica cannot reopen empty under its old allocation. Exact failure removes it from `replicas`/`inSync`, increments `unassigned`, and permits fresh recovery allocation. |
+| G1 initial empty store | Starting from CreateIndex with `initialized = false`, one pre-activation primary crash/disk loss/restart, allocation-matched first activation, and the first write passes 14 distinct states to depth 13 under weak fairness. | Rust uses the stricter primary-only form: the initial primary allocation may be recreated empty before first activation because no write can yet be acknowledged. Initial replicas recover from the primary, so a new index is single-copy until recovery completes; `max_concurrent_peer_recoveries = 0` leaves it single-copy. Initialization is monotonic and later empty authoritative recreation is forbidden. |
+| G2 replica copy failure | The three-voter replica-loss model passes 34,457 distinct states to depth 46 after an acknowledged write, disk loss, exact-allocation failure report, fresh allocation, and possible peer recovery. | A disk-lost in-sync replica cannot reopen empty under its old allocation. Exact failure removes it from `replicas`/`inSync`, increments `unassigned`, and permits fresh recovery allocation. |
 | G2 primary copy failure | The three-voter primary-loss model passes 17,863 distinct states to depth 46; the surviving in-sync copy is the only eligible promoted authority and retains all acknowledged writes. The no-survivor variant passes 20 distinct states to depth 13 with the primary allocation cleared. | Exact primary failure promotes with a term bump, or leaves the shard red when no authoritative copy survives. |
 | G2 stale failure report | The fair replica-loss model commits a delayed `FailShardCopy` for allocation 1 after allocation 3 exists; `StaleFailShardCopyRejected` requires the command to be rejected. | Failure reports require exact allocation identity and cannot remove a replacement assignment. |
 | G2 recovery liveness | With one weakly fair replica crash/disk loss/restart and permanent fault cessation, 184 distinct states to depth 32 satisfy resumed writes, stale-report rejection, and eventual admission of the fresh replacement. | Liveness depends on weak fairness for reporting, Raft commit/view delivery, allocation, the resumed write, and every recovery phase. No symmetry or state constraint is used. |
+| B1 red-sibling isolation | A standalone two-shard index-state slice reaches red shard 0, promotes shard 1's in-sync replica, and allocates a fresh shard 1 replica in 4 distinct states to depth 4. | The per-shard update predicate carries an unchanged missing primary allocation exactly instead of rejecting the entire index update. This slice does not duplicate WAL or recovery state for both shards. |
+| B2 settlement deadline | The reviewer `MaxTerm = 2` L1 variant previously produced an 18-state liveness counterexample after the deadline term bump. With target rejection restored, it passes 50 distinct states to depth 18. | Admission wins first; otherwise a newer term or different primary is definitive rejection. Retained historical trace: [`B2-settlement-deadline-pending-unknown.md`](../specs/tla/traces/B2-settlement-deadline-pending-unknown.md). |
+| B2 primary restart/promotion | Forced primary restart/reactivation passes 49 distinct states to depth 22; forced promotion of a different in-sync replica passes 29 distinct states to depth 19. | The old pending record reaches admission or definitive rejection after ordered view delivery rather than remaining unknown. |
+| B3 pending-target restart | Ignoring the durable pending marker reproduces `NoPartialServe`: a restarted target reattaches, wipes the finalized copy, and the delayed admission makes it in sync. Restoring a matching marker passes 31 distinct states to depth 22. | Marker UUID/allocation must match durable copy identity and current assignment; matching markers block new recovery and destructive prepare. Retained trace: [`B3-pending-restart-wipe.md`](../specs/tla/traces/B3-pending-restart-wipe.md). |
 | D05 | Asynchronous durability acknowledges an operation that the committed primary can lose on crash. | Documents the weaker mode; request-durability results must not be inferred from this configuration. |
-| Fixed design, crash | The unrestricted three-voter model with allocation identity, durable fencing, and the G1/G2 rules, two writes, one crash, one recovery, and message loss/delay passes 11,366,697 distinct states to depth 41. | Bounded safety evidence only; optional recovery setup/cancellation/expiry injection is disabled for this state-space run. |
-| Fixed design, partition | The unrestricted three-voter model with the same rules, two writes, one live-node partition, one recovery, and message loss/delay passes 12,887,671 distinct states to depth 42. | Covers erroneous live-node suspicion under the bounded partition model. |
+| Fixed design, crash | The unrestricted three-voter model with allocation identity, durable fencing, G1/G2, and pending-marker restoration, two writes, one crash, one recovery, and message loss/delay passes 12,495,758 distinct states to depth 42. | Bounded safety evidence only; optional recovery setup/cancellation/expiry injection is disabled for this state-space run. |
+| Fixed design, partition | The unrestricted three-voter model with the same rules, two writes, one live-node partition, one recovery, and message loss/delay passes 13,133,936 distinct states to depth 42. | Covers erroneous live-node suspicion under the bounded partition model. |
 | Retired global-term property | `NoStaleReplicaApply` stopped the fixed partition run after 1,511 distinct states because it classified a pre-promotion in-flight operation against unseen global state. | This was a model-property error. It was replaced by `NoApplyBelowObservedFence` and `ActivePrimaryRejectsOldTerm`; the trace remains at [`Fixed-partition-prepromotion-inflight-apply.md`](../specs/tla/traces/Fixed-partition-prepromotion-inflight-apply.md). |
-| Fixed-design simulation | Seed `20260926`, depth 80, 10,000 requested traces, 1,721,246 states checked with larger write/crash/recovery/log bounds and no violation. | Random simulation supplements but does not replace exhaustive checks. |
-| M04 liveness | Under fault-free weak fairness, and separately with one weakly fair target crash/restart followed by permanent fault cessation, the barrier releases, the assigned target becomes in sync, and persistent pending state resolves. | Liveness results apply only to the two-node, zero-write bounds and the stated scheduling assumptions. |
+| Fixed-design simulation | Seed `20260926`, depth 80, 10,000 requested traces, 1,576,169 states checked with larger write/crash/recovery/log bounds and no violation. | Random simulation supplements but does not replace exhaustive checks. |
+| M04 liveness | Fault-free L1 covers one term-1 attempt reaching admission, promotion, or definitive rejection. L2 adds one target crash/restart and matching-marker restoration. Separate bounded checks force deadline bump, primary reactivation, and different-replica promotion. | These checks use weak fairness, no symmetry, and no state constraint. They do not prove arbitrary retry convergence or recovery after failure-detector removal. |
+
+The model assumes every node's applied cluster view is a monotonic prefix of
+its durable Raft log. Restart may replay a lagging prefix but cannot move the
+view backward. Losing `raft.db` and rejoining under the same node name is
+outside this evidence.
 
 ### Allocation Identity And Replica Fencing Evidence (September 26, 2026)
 
@@ -290,7 +309,7 @@ RP-3/RP-5 acceptance matrix.
 | I04, I05, I07 | Raft state-machine tests assign IDs from log positions, clear them on removal, create a fresh ID on same-node reallocation, reject stale admission/failure IDs, and preserve them through snapshots and JoinCluster transport. `assigned_copy_missing_or_malformed_identity_fails_closed` and `initialized_assignment_never_creates_a_missing_empty_copy` enforce local storage identity. | Allocation identity covers the current one-shard-copy protocol; history UUID, operation identity, and contiguous prefixes remain future work. |
 | F02, F03 | `stale_primary_replication_is_rejected_by_promoted_target`, `replica_apply_rejects_uuid_allocation_term_and_missing_identity_fields`, `bulk_replication_validates_common_identity_before_first_mutation`, and `replica_fence_is_persisted_before_ack_and_restored_on_restart` cross real gRPC handlers with separate state views. | Fencing is local-view plus durable-fence based, as modeled; it is not the complete promotion inventory protocol proposed later in this document. |
 | M04, M07 | `delayed_mark_replica_in_sync_rejects_same_node_reallocation_aba`, `grpc_delayed_admission_rejects_same_node_reallocation_from_stale_target_view`, and `stale_target_allocation_recovery_start_is_rejected_before_snapshot_setup` cover the two-sided allocation handshake and exact admission CAS. | Source sessions remain process-local and retention pins are not transferred across source failure. |
-| G1/G2, I05 | `grpc_disk_loss_fails_closed_and_failure_report_restores_write_set`, `node::tests::failed_recovery_marker_reports_only_the_matching_inactive_assignment`, and process-backed `in_sync_replica_disk_loss_is_failed_reallocated_and_recovered` cover missing disk, failed-install classification, exact failure reporting, fresh allocation, resumed writes, peer recovery, and exact acknowledged documents. | A failed primary without an in-sync survivor intentionally remains red; there is no forced stale-copy promotion or legacy identity adoption. |
+| G1/G2, I05 | `grpc_disk_loss_fails_closed_and_failure_report_restores_write_set`, `node::tests::failed_recovery_marker_reports_only_the_matching_inactive_assignment`, `transient_fence_persist_failure_does_not_fail_the_shard_copy`, `retryable_recovery_cleanup_does_not_leave_a_failed_install_marker`, and process-backed `in_sync_replica_disk_loss_is_failed_reallocated_and_recovered` cover missing disk, exact failed-install classification, retryable-I/O isolation, fresh allocation, resumed writes, peer recovery, and exact acknowledged documents. | A failed primary without an in-sync survivor intentionally remains red; there is no forced stale-copy promotion or legacy identity adoption. |
 
 ### Modeled Requirements For The Rust Fencing Work
 
@@ -313,24 +332,37 @@ they are not claims that the complete proposed recovery protocol is finished:
    all retain that same allocation ID.
 7. Admission compares the exact allocation ID in addition to index UUID,
    primary node, and primary term.
-8. Target observation admits the same allocation when in sync, or the same
-   copy after promotion; a missing or different allocation is definitive
-   rejection. Other lagging observations remain unknown.
-9. CreateIndex routing records `initialized = false`; the first successful
+8. Target observation first admits the same allocation when in sync, or the
+   target after promotion. Otherwise it rejects a missing/different
+   allocation, a strictly newer applied term, or a different applied primary.
+   It remains unknown only while the same primary, term, and allocation are
+   still possible, including a red view at that same primary and term.
+9. Restart restores pending runtime state only from a durable marker whose
+   UUID and allocation match the durable copy and current assignment. A
+   matching marker blocks new recovery start and destructive target prepare,
+   and a finalized/settling source session rejects target reattachment.
+10. CreateIndex routing records `initialized = false`; the first successful
    allocation-matched `ActivatePrimary` sets it true monotonically. Initial
    replicas remain out of sync until recovery.
-10. Rust permits empty local creation only for the initial CreateIndex primary
+11. Rust permits empty local creation only for the initial CreateIndex primary
     allocation before first activation. Missing or mismatched authoritative
     copies after initialization fail closed; initial and later out-of-sync
     replicas are populated only through recovery.
-11. An unopenable authoritative copy reports index name, UUID, shard ID, node,
-    and its observed allocation ID through a leader-forwarded
-    `FailShardCopy`.
-12. `FailShardCopy` is applied only on an exact allocation match. Replica
+12. `MarkReplicaInSync` additionally requires an initialized shard and a
+    present primary allocation.
+13. Only definitive identity, missing-copy, or matching interrupted-install
+    failures report index name, UUID, shard ID, node, and observed allocation
+    ID through leader-forwarded `FailShardCopy`. Transient engine/filesystem
+    and fence-persistence I/O remains retryable; reports are throttled per
+    allocation.
+14. `FailShardCopy` is applied only on an exact allocation match. Replica
     failure removes it from replica/in-sync membership and increments
     unassigned; primary failure promotes an in-sync copy with a term bump or
     leaves the shard red with a cleared primary allocation.
-13. The allocator requires a surviving allocated primary, assigns a fresh
+15. `UpdateIndex` preserves an unchanged red shard's absent primary allocation,
+    so sibling routing, allocation, dead-node removal, and settings changes are
+    not rejected by that red shard.
+16. The allocator requires a surviving allocated primary, assigns a fresh
     allocation ID, and leaves the replacement out of sync until peer recovery
     installs matching durable identity and admission commits.
 

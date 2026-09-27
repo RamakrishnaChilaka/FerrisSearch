@@ -60,8 +60,10 @@ pub struct Node {
 3. Reopen only authoritative local copies whose durable UUID/allocation
    identity matches; only an initial CreateIndex primary may be created empty
    before the shard's first activation
-4. Report unopenable authoritative copies with allocation-bound
-   `FailShardCopy`
+4. Report only definitive unopenable authoritative-copy failures with
+   allocation-bound `FailShardCopy`; transient engine/filesystem/fence I/O is
+   retryable and does not edit routing. Duplicate reports are throttled per
+   allocation.
 5. Allocate unassigned replicas only for shards with a live allocated primary
 
 ### Follower Duties (every 5s tick)
@@ -101,7 +103,14 @@ pub struct Node {
   finalized-awaiting-membership marker, accepts live replication, and is
   excluded from new recovery scheduling until local ordered state says
   admitted/promoted or definitively rejected. This state is reconstructed when
-  the target restarts.
+  the target restarts, before recovery candidates are selected.
+- Pending observation checks admission first. With the same current allocation,
+  a strictly newer observed term or a different primary is definitive
+  rejection; an older view or the same primary/term remains unknown.
+- A matching durable pending marker blocks target begin and target preparation.
+  Controlled retryable transfer failures remove their partial install and
+  retry the same allocation; an inactive matching install marker represents an
+  interrupted/crashed install and remains a definitive failure report.
 - An abandoned finalize session is made definitive by a source-side
   `ActivatePrimary` term bump. If no admission command was submitted, release
   the barrier first and bump asynchronously; after submission, keep the barrier
@@ -109,6 +118,10 @@ pub struct Node {
 - Recovery start, source session, install, pending marker, admission, and target
   observation retain one exact allocation ID. Same-node remove/re-add is a
   definitive mismatch rather than an ABA-ambiguous `Unknown`.
+- The G1 empty-primary exception assumes the local applied Raft view is
+  monotonic. Normal startup replays persistent `raft.db`; losing that database
+  and rejoining under the same node name does not justify treating retained
+  shard storage as a fresh pre-activation copy.
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every

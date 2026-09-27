@@ -43,6 +43,11 @@ pub struct ShardManager {
 - `raise_copy_fence_blocking(...)` — atomically persist a monotonic replica fence
 - `apply_replica_operation(...)` — serialize identity/gate/fence validation with replica mutation
 - `quarantine_shard_copy_blocking(...)` — stop serving an invalid copy without deleting evidence
+- `restore_peer_recovery_awaiting_membership(...)` — validate an exact durable
+  pending marker, restore its in-memory gate, and reopen the finalized existing
+  copy before recovery scheduling
+- `reset_peer_recovery_target_for_retry_blocking(...)` — remove a controlled
+  partial install without manufacturing a failed-copy report
 
 ### Durable Copy Identity
 - Every served assigned copy has `<data_dir>/<uuid>/shard_<id>/SHARD_COPY_IDENTITY.json`.
@@ -50,11 +55,17 @@ pub struct ShardManager {
   fence. Updates use temp write, file fsync, rename, and directory fsync.
 - Assigned opens load and validate the file before publishing an engine.
   Missing, malformed, or mismatched identity fails closed.
+- Definitive copy-identity/install failures are typed separately from transient
+  filesystem or engine I/O. Only the definitive class may drive
+  `FailShardCopy`.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.
 - Pre-1.0 copies without this file are not adopted; clusters must be recreated
   or reindexed.
+- A stale exact `SHARD_COPY_IDENTITY.json.tmp` is removed before the
+  initial-primary empty-directory check. Local/test helpers load and preserve
+  an existing durable identity rather than overwriting it with allocation `1`.
 
 ### UUID-Based Data Directories
 - On-disk path: `<data_dir>/<uuid>/shard_<id>` (NOT `<data_dir>/<index_name>/shard_<id>`)
@@ -83,8 +94,11 @@ After CompleteFinalize is sent, `PEER_RECOVERY_AWAITING_MEMBERSHIP` preserves
 the caught-up copy across target restart. This marker permits open and live
 replica apply. Reconcile removes it without closing the engine when the node is
 in-sync or promoted with the same allocation ID; missing/different allocation
-identity is definitive rejection
-closes the engine and restores `PEER_RECOVERY_IN_PROGRESS`.
+identity, a different primary, or a strictly newer observed term is definitive
+rejection and closes the engine and restores `PEER_RECOVERY_IN_PROGRESS`.
+Lifecycle restoration of an exact marker happens before recovery candidate
+selection. Target begin and preparation recheck the marker under the per-shard
+lock before any engine eviction or directory removal.
 
 `ShardManager::reopen_shard()` and async index-close wrappers invoke the
 registered source-session cleanup hook before replacing engines. Cleanup must

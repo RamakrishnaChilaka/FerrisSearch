@@ -57,8 +57,8 @@ pub struct ClusterStateMachine {
 | `CreateIndex` | assign initial copy IDs from the committed log index; replicas start out of sync |
 | `DeleteIndex` | remove from `state.indices` |
 | `SetMaster` | set `state.master_node` |
-| `UpdateIndex` | preserve existing copy IDs, assign the current log index to new copies, clear removed IDs, intersect in-sync membership, and reject out-of-sync promotion |
-| `MarkReplicaInSync` | add one assigned replica only when UUID, allocation ID, primary, and term match |
+| `UpdateIndex` | preserve existing copy IDs (including an unchanged red shard's absent primary ID), assign the current log index to new copies, clear removed IDs, intersect in-sync membership, and reject out-of-sync promotion |
+| `MarkReplicaInSync` | add one assigned replica only when the shard is initialized, a primary allocation exists, and UUID, allocation ID, primary, and term match |
 | `ActivatePrimary` | increment the term and set `primary_initialized` only when UUID, allocation ID, primary, and expected term match |
 | `FailShardCopy` | after initialization, remove only the exact failed allocation; promote an in-sync replica with a term bump or clear the primary allocation and leave the shard red |
 | `AddMappings` | merge `new_fields` into `state.indices[name].mappings` via `.entry().or_insert()` |

@@ -168,6 +168,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - Snapshot preparation failures are retained and returned once on the next
   poll, so the target enters normal recovery backoff instead of relaunching
   setup in a tight loop.
+- `StartPeerRecovery` may poll a safe pre-finalize session, but it must reject
+  reattachment to the same session once finalization, admission, or settlement
+  has begun.
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **get_remote_store_leaf_status**: Report whether the local node is root/leaf-capable plus per-split artifact/reader warmth and current `StorageManager` load counters
 - **search_remote_store_splits**: Validate the remote_store index/UUID, batch split execution through the shared leaf helper, and return per-split hits, totals, partial aggs, and per-split errors
@@ -192,6 +195,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   membership accepts live apply and remains open; its durable pending marker is
   reconciled to admitted/promoted or definitively rejected state after restart.
   The in-progress marker still prevents a partial install from being opened.
+- Local copy failure forwarding is restricted to typed definitive identity,
+  missing-copy, or matching failed-install conditions. Transient open/engine
+  I/O and fence-persistence failures remain retryable request failures and must
+  not trigger `FailShardCopy`.
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.

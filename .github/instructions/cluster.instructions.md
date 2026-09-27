@@ -108,12 +108,18 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
 - `UpdateIndex` can only remove in-sync members by intersecting the current set
   with the submitted replica assignments. It cannot add members. A primary
   change is accepted only when the candidate is in the current in-sync set.
+  An unchanged primary preserves its allocation entry exactly, including
+  `None` for an initialized red shard, so that shard cannot block unrelated
+  routing, settings, or allocation changes for siblings in the same index.
 - Allocation IDs are state-machine owned. CreateIndex assigns its committed log
   index to initial copies; UpdateIndex preserves surviving IDs and assigns its
   own log index to every new copy. Removed copies lose their IDs.
 - `MarkReplicaInSync`, `ActivatePrimary`, and `FailShardCopy` are
   UUID/allocation-bound conditional Raft commands. Rejected commands perform no
   partial mutation and do not bump `ClusterState.version`.
+- `MarkReplicaInSync` also requires `primary_initialized = true` and a present
+  primary allocation. An out-of-sync target cannot be admitted into a red or
+  never-activated shard.
 - `primary_initialized` starts false and becomes true only through an exact
   allocation-bound `ActivatePrimary`. Only the initial primary allocation may
   be created empty before that transition; initial replicas recover from it.

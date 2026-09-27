@@ -35,6 +35,8 @@ cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
 ./scripts/tla/check.sh c1-aba-fixed c2-fixed l2  # Selected fixed-design checks
 ./scripts/tla/check.sh g1-empty-store g2-replica g2-primary g2-liveness
+./scripts/tla/check.sh l1-bump l2-primary-restart l2-promotion
+./scripts/tla/check.sh pending-restart-legacy pending-restart-fixed two-shard
 ./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
 ./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
 ```
@@ -46,20 +48,22 @@ cargo test -- test_name                         # Single test by name
 - `scripts/tla/check.sh` verifies the pinned TLA+ tools jar before execution
   and uses isolated Java/TLC temporary directories.
 - Historical counterexamples are living model regressions. The runner must fail if
-  `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, or `c4`
-  stops violating its named invariant; those configurations intentionally retain
-  the old protocol after the Rust implementation moves to the fixed variant.
+  `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, `c4`, or
+  `pending-restart-legacy` stops violating its named invariant; those
+  configurations intentionally retain historical protocol behavior.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
-  `g2-primary-red`, `g2-liveness`, `fixed-crash`, and `fixed-partition` are
-  expected-pass configurations for the allocation-ID, durable-fencing,
-  empty-store, and copy-failure design.
+  `g2-primary-red`, `g2-liveness`, `pending-restart-fixed`, `l1-bump`,
+  `l2-primary-restart`, `l2-promotion`, `two-shard`, `fixed-crash`, and
+  `fixed-partition` are expected-pass configurations for the allocation-ID,
+  durable-fencing, empty-store, copy-failure, and pending-marker design.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
 - Safety runs may use a documented state constraint and valid node symmetry.
   Liveness runs use neither; declare the exact fairness assumptions instead.
 - Keep action comments and `specs/tla/README.md` mapped to the current Rust
-  functions. Model-only protocol variants must be labeled unimplemented.
+  functions. Label each protocol variant as current, historical, or proposed;
+  never imply that a model-only transition is implemented.
 - Replica-fencing checks use local knowledge: reject below the durable local
   fence or applied local term. Do not compare every in-flight apply against an
   unseen globally committed term; the retained retired-property trace explains
@@ -67,6 +71,13 @@ cargo test -- test_name                         # Single test by name
 - G1/G2 checks must cover CreateIndex before first activation, disk loss of
   primary and in-sync replica copies, exact-allocation `FailShardCopy`,
   no-survivor red state, stale-report rejection, and fair replacement recovery.
+- Pending-target liveness must cover the settlement deadline, source-primary
+  restart/reactivation, promotion of a different replica, and target restart
+  with durable marker restoration. `RecoveryConverges` means one attempt
+  reaches admission, promotion, or definitive rejection; retry convergence is
+  a separate configuration.
+- The minimal `two-shard` check covers index-level routing isolation only; do
+  not cite it as a two-shard WAL, replication, or recovery proof.
 
 ## Unit Test Conventions
 - Tests live in `#[cfg(test)] mod tests` at the bottom of each source file
@@ -141,6 +152,12 @@ cargo test -- test_name                         # Single test by name
   PrepareFinalize, settlement-safe idle reaping, queued index/bulk/delete after
   primary change, marker creation during open, live-generation reads after a
   failed manifest publish, and routing-update rejection before node removal.
+- Allocation/fencing review regressions cover two-shard red-sibling routing
+  isolation, initialized/present-primary admission guards, newer-term and
+  changed-primary pending rejection, restart restoration before recovery,
+  target/source refusal to reattach a settling session, transient fence I/O
+  without routing failure, retry cleanup without a failed-install marker, stale
+  identity-temp cleanup, and preservation of existing test-copy identity.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary
