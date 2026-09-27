@@ -44,6 +44,8 @@ Pause and load the owning instructions before changing:
 
 - Raft commands or `ClusterState`
 - WAL sequence ownership or recovery
+- shard-copy allocation IDs, replica fences, or peer-recovery admission
+- TLA+ model transitions or the runner's expected results
 - shard UUID paths and startup cleanup
 - manifest publication or object deletion
 - transport serialization

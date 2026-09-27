@@ -57,6 +57,18 @@ pub(crate) struct WalFrameTooLargeError {
     max_bytes: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("WAL storage validation failed: {message}")]
+pub(crate) struct WalCorruptionError {
+    message: String,
+}
+
+fn wal_corruption(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(WalCorruptionError {
+        message: message.into(),
+    })
+}
+
 /// The type of WAL operation.
 ///
 /// This enum replaces the previous stringly-typed `"index"` / `"delete"` convention.
@@ -103,6 +115,50 @@ pub struct TranslogEntry {
     pub op: WalOperation,
     /// The full document payload
     pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WalDocumentOperation<'a> {
+    Index {
+        doc_id: &'a str,
+        source: &'a serde_json::Value,
+    },
+    Delete {
+        doc_id: &'a str,
+    },
+}
+
+impl<'a> WalDocumentOperation<'a> {
+    pub(crate) fn doc_id(self) -> &'a str {
+        match self {
+            Self::Index { doc_id, .. } | Self::Delete { doc_id } => doc_id,
+        }
+    }
+}
+
+pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOperation<'_>> {
+    let doc_id = entry
+        .payload
+        .get("_doc_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            wal_corruption(format!(
+                "translog operation {} has no _doc_id",
+                entry.seq_no
+            ))
+        })?;
+    match entry.op {
+        WalOperation::Index => {
+            let source = entry.payload.get("_source").ok_or_else(|| {
+                wal_corruption(format!(
+                    "index translog operation {} has no _source",
+                    entry.seq_no
+                ))
+            })?;
+            Ok(WalDocumentOperation::Index { doc_id, source })
+        }
+        WalOperation::Delete => Ok(WalDocumentOperation::Delete { doc_id }),
+    }
 }
 
 #[derive(Clone)]
@@ -157,16 +213,21 @@ impl WireEntry {
     }
 
     fn into_translog(self) -> Result<TranslogEntry> {
+        let seq_no = self.seq_no;
+        let op = WalOperation::parse(&self.op).map_err(|error| {
+            wal_corruption(format!(
+                "failed to decode translog entry seq_no {seq_no}: {error}"
+            ))
+        })?;
+        let payload = serde_json::from_str(&self.payload_json).map_err(|error| {
+            wal_corruption(format!(
+                "failed to decode translog payload seq_no {seq_no}: {error}"
+            ))
+        })?;
         Ok(TranslogEntry {
-            seq_no: self.seq_no,
-            op: WalOperation::parse(&self.op).map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to decode translog entry seq_no {}: {}",
-                    self.seq_no,
-                    error
-                )
-            })?,
-            payload: serde_json::from_str(&self.payload_json)?,
+            seq_no,
+            op,
+            payload,
         })
     }
 }
@@ -260,6 +321,9 @@ pub trait WriteAheadLog: Send + Sync {
 
     /// Return the lowest currently pinned sequence boundary.
     fn min_retention_pin(&self) -> Option<u64>;
+
+    #[cfg(test)]
+    fn inject_write_io_failures_for_test(&self, _raw_os_error: i32, _attempts: usize) {}
 }
 
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
@@ -310,12 +374,13 @@ fn checked_frame_bytes(payload_len: usize, max_bytes: usize) -> Result<usize> {
 
 fn decode_wire_entry(payload: &[u8]) -> Result<WireEntry> {
     let (wire, consumed): (WireEntry, usize) =
-        bincode_next::serde::decode_from_slice(payload, BINCODE_CONFIG)?;
+        bincode_next::serde::decode_from_slice(payload, BINCODE_CONFIG)
+            .map_err(|error| wal_corruption(format!("decode translog frame: {error}")))?;
     if consumed != payload.len() {
-        anyhow::bail!(
+        return Err(wal_corruption(format!(
             "translog frame has {} trailing payload bytes",
             payload.len() - consumed
-        );
+        )));
     }
     Ok(wire)
 }
@@ -345,29 +410,41 @@ fn read_next_entry<R: Read>(
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    reader
-        .read_exact(&mut len_buf[1..])
-        .context("incomplete translog frame length prefix")?;
+    reader.read_exact(&mut len_buf[1..]).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            wal_corruption("incomplete translog frame length prefix")
+        } else {
+            error.into()
+        }
+    })?;
     let payload_len = u32::from_le_bytes(len_buf) as usize;
-    let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+    let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)
+        .map_err(|error| wal_corruption(error.to_string()))?;
     if let Some(remaining) = remaining_file_bytes
         && frame_bytes as u64 > remaining
     {
-        anyhow::bail!(
+        return Err(wal_corruption(format!(
             "incomplete translog frame: declared {frame_bytes} bytes with only {remaining} bytes remaining"
-        );
+        )));
     }
     let mut payload_buf = vec![0u8; payload_len];
-    reader
-        .read_exact(&mut payload_buf)
-        .with_context(|| format!("incomplete translog frame payload of {payload_len} bytes"))?;
+    reader.read_exact(&mut payload_buf).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            wal_corruption(format!(
+                "incomplete translog frame payload of {payload_len} bytes"
+            ))
+        } else {
+            error.into()
+        }
+    })?;
     let wire = decode_wire_entry(&payload_buf)?;
     Ok(Some((wire.into_translog()?, frame_bytes)))
 }
 
 fn decode_wire_seq_no(prefix: &[u8]) -> Result<u64> {
     let ((seq_no,), _): ((u64,), _) =
-        bincode_next::serde::decode_from_slice(prefix, BINCODE_CONFIG)?;
+        bincode_next::serde::decode_from_slice(prefix, BINCODE_CONFIG)
+            .map_err(|error| wal_corruption(format!("decode translog sequence prefix: {error}")))?;
     Ok(seq_no)
 }
 
@@ -382,7 +459,9 @@ fn decode_wire_entry_with_prefix<R: Read>(
     reader.read_exact(&mut prefix[prefix_len..])?;
     let wire = decode_wire_entry(&prefix)?;
     if wire.seq_no != expected_seq_no {
-        anyhow::bail!("translog frame sequence changed while decoding");
+        return Err(wal_corruption(
+            "translog frame sequence changed while decoding",
+        ));
     }
     Ok(wire)
 }
@@ -673,10 +752,11 @@ fn scan_active_generation_from_path(path: &Path) -> Result<ActiveGenerationScan>
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf)?;
         let payload_len = u32::from_le_bytes(len_buf) as usize;
-        let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+        let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)
+            .map_err(|error| wal_corruption(error.to_string()))?;
         let frame_end = frame_start
             .checked_add(frame_bytes as u64)
-            .ok_or_else(|| anyhow::anyhow!("translog frame offset overflow"))?;
+            .ok_or_else(|| wal_corruption("translog frame offset overflow"))?;
         if frame_end > file_len {
             return Ok(ActiveGenerationScan {
                 generation,
@@ -718,8 +798,11 @@ fn load_translog_manifest(data_dir: &Path) -> Result<Option<TranslogManifest>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let manifest = serde_json::from_slice::<TranslogManifest>(&bytes)?;
-    manifest.validate()?;
+    let manifest = serde_json::from_slice::<TranslogManifest>(&bytes)
+        .map_err(|error| wal_corruption(format!("decode translog manifest {path:?}: {error}")))?;
+    manifest
+        .validate()
+        .map_err(|error| wal_corruption(format!("validate translog manifest {path:?}: {error}")))?;
     Ok(Some(manifest))
 }
 
@@ -783,12 +866,15 @@ fn generations_from_manifest(
     let mut generations = Vec::with_capacity(manifest.generations.len());
     for generation in &manifest.generations {
         let mut info = generation.clone().into_generation_info(data_dir);
-        let metadata = fs::metadata(&info.path).map_err(|e| {
-            anyhow::anyhow!(
-                "manifest references missing translog generation {:?}: {}",
-                info.path,
-                e
-            )
+        let metadata = fs::metadata(&info.path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                wal_corruption(format!(
+                    "manifest references missing translog generation {:?}",
+                    info.path
+                ))
+            } else {
+                error.into()
+            }
         })?;
         info.size_bytes = metadata.len();
         generations.push(info);
@@ -856,6 +942,8 @@ pub struct HotTranslog {
     recovery_scan_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
     #[cfg(test)]
     append_frame_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
+    #[cfg(test)]
+    write_io_failure: Arc<Mutex<Option<(i32, usize)>>>,
 }
 
 async fn sync_file_in_background(state: Arc<Mutex<TranslogState>>) -> std::io::Result<()> {
@@ -888,9 +976,9 @@ impl HotTranslog {
         let persisted_seq = if seq_no_path.exists() {
             let s = fs::read_to_string(&seq_no_path)?;
             s.trim().parse::<u64>().map_err(|error| {
-                anyhow::anyhow!(
+                wal_corruption(format!(
                     "invalid translog sequence high-water mark {seq_no_path:?}: {error}"
-                )
+                ))
             })?
         } else {
             0
@@ -908,9 +996,9 @@ impl HotTranslog {
                     .iter_mut()
                     .find(|generation| generation.id == active_generation_id)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
+                        wal_corruption(format!(
                             "manifest active generation {active_generation_id} missing after generation load"
-                        )
+                        ))
                     })?;
             let active_scan = scan_active_generation_from_path(&active_generation.path)?;
             if active_scan.trailing_bytes > 0 {
@@ -935,9 +1023,9 @@ impl HotTranslog {
         } else {
             let existing_generations = discover_generation_files(data_dir)?;
             if !existing_generations.is_empty() {
-                anyhow::bail!(
+                return Err(wal_corruption(format!(
                     "generation-based translog files exist in {data_dir:?} without manifest {manifest_path:?}"
-                );
+                )));
             }
 
             let (generation, active_file) = create_empty_generation(data_dir, 0)?;
@@ -998,7 +1086,23 @@ impl HotTranslog {
             recovery_scan_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             append_frame_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            write_io_failure: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_write_for_test(&self) -> Result<()> {
+        let mut failure = recover_lock(self.write_io_failure.as_ref(), "write I/O failure");
+        let Some((raw_os_error, remaining)) = failure.as_mut() else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            *failure = None;
+            return Ok(());
+        }
+        *remaining -= 1;
+        Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
     }
 
     /// Get the current (next) sequence number without incrementing.
@@ -1296,6 +1400,8 @@ impl HotTranslog {
 
 impl WriteAheadLog for HotTranslog {
     fn append(&self, op: WalOperation, payload: serde_json::Value) -> Result<TranslogEntry> {
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let seq_no = state.next_seq_no;
@@ -1341,6 +1447,8 @@ impl WriteAheadLog for HotTranslog {
         op: WalOperation,
         payload: serde_json::Value,
     ) -> Result<TranslogEntry> {
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let frame = encode_entry_borrowed(seq_no, op, &payload)?;
@@ -1363,6 +1471,8 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn append_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let start_seq_no = state.next_seq_no;
@@ -1406,6 +1516,8 @@ impl WriteAheadLog for HotTranslog {
         if ops.is_empty() {
             return Ok(None);
         }
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let start_seq_no = state.next_seq_no;
@@ -1446,6 +1558,8 @@ impl WriteAheadLog for HotTranslog {
                 .checked_add((ops.len() - 1) as u64)
                 .ok_or_else(|| anyhow::anyhow!("replica WAL sequence range overflows"))?;
         }
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
         let mut buf = Vec::with_capacity(ops.len() * 200);
@@ -1694,6 +1808,12 @@ impl WriteAheadLog for HotTranslog {
             .values()
             .copied()
             .min()
+    }
+
+    #[cfg(test)]
+    fn inject_write_io_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
+        *recover_lock(self.write_io_failure.as_ref(), "write I/O failure") =
+            Some((raw_os_error, attempts));
     }
 }
 
@@ -2883,6 +3003,7 @@ mod tests {
             Ok(_) => panic!("open should fail for unknown WAL operation type"),
             Err(err) => err,
         };
+        assert!(err.is::<WalCorruptionError>());
         assert!(
             err.to_string()
                 .contains("unknown WAL operation type: bogus")
@@ -2975,6 +3096,7 @@ mod tests {
             Ok(_) => panic!("open accepted a complete corrupt middle frame"),
             Err(error) => error,
         };
+        assert!(error.is::<WalCorruptionError>());
         assert!(
             error
                 .to_string()

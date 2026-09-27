@@ -53,6 +53,7 @@ pub enum ClusterCommand {
         index_uuid: String,
         shard_id: u32,
         replica: String,
+        allocation_id: u64,
         primary: String,
         primary_term: u64,
     },
@@ -62,7 +63,36 @@ pub enum ClusterCommand {
         index_uuid: String,
         shard_id: u32,
         primary: String,
+        allocation_id: u64,
         expected_term: u64,
+    },
+    /// Mark an exact allocated primary unavailable without changing routing.
+    MarkPrimaryUnavailable {
+        index_name: String,
+        index_uuid: String,
+        shard_id: u32,
+        primary: String,
+        allocation_id: u64,
+    },
+    /// Clear status-only unavailability after the exact primary serves a write.
+    MarkPrimaryAvailable {
+        index_name: String,
+        index_uuid: String,
+        shard_id: u32,
+        primary: String,
+        allocation_id: u64,
+        primary_term: u64,
+    },
+    /// Conditionally remove a failed replica or promote away from a failed primary.
+    /// Primary reports must set `promote_only` and cannot clear the last primary.
+    FailShardCopy {
+        index_name: String,
+        index_uuid: String,
+        shard_id: u32,
+        node: String,
+        allocation_id: u64,
+        promote_only: bool,
+        promotion_candidate: Option<String>,
     },
     /// Merge new field mappings into an existing index without replacing the
     /// entire metadata. This avoids TOCTOU races when concurrent documents
@@ -111,6 +141,35 @@ impl std::fmt::Display for ClusterCommand {
                 primary,
                 ..
             } => write!(f, "ActivatePrimary({index_name}/{shard_id}, {primary})"),
+            ClusterCommand::MarkPrimaryUnavailable {
+                index_name,
+                shard_id,
+                primary,
+                ..
+            } => write!(
+                f,
+                "MarkPrimaryUnavailable({index_name}/{shard_id}, {primary})"
+            ),
+            ClusterCommand::MarkPrimaryAvailable {
+                index_name,
+                shard_id,
+                primary,
+                ..
+            } => write!(
+                f,
+                "MarkPrimaryAvailable({index_name}/{shard_id}, {primary})"
+            ),
+            ClusterCommand::FailShardCopy {
+                index_name,
+                shard_id,
+                node,
+                promote_only,
+                promotion_candidate,
+                ..
+            } => write!(
+                f,
+                "FailShardCopy({index_name}/{shard_id}, {node}, promote_only={promote_only}, candidate={promotion_candidate:?})"
+            ),
             ClusterCommand::AddMappings {
                 index_name,
                 new_fields,
@@ -395,6 +454,7 @@ mod tests {
                 index_uuid: "uuid-1".into(),
                 shard_id: 2,
                 replica: "node-2".into(),
+                allocation_id: 42,
                 primary: "node-1".into(),
                 primary_term: 7,
             },
@@ -403,7 +463,32 @@ mod tests {
                 index_uuid: "uuid-1".into(),
                 shard_id: 2,
                 primary: "node-1".into(),
+                allocation_id: 41,
                 expected_term: 7,
+            },
+            ClusterCommand::FailShardCopy {
+                index_name: "logs".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 2,
+                node: "node-2".into(),
+                allocation_id: 42,
+                promote_only: false,
+                promotion_candidate: None,
+            },
+            ClusterCommand::MarkPrimaryUnavailable {
+                index_name: "logs".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 2,
+                primary: "node-1".into(),
+                allocation_id: 41,
+            },
+            ClusterCommand::MarkPrimaryAvailable {
+                index_name: "logs".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 2,
+                primary: "node-1".into(),
+                allocation_id: 41,
+                primary_term: 7,
             },
         ];
 

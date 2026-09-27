@@ -58,6 +58,13 @@ impl ClusterManager {
             .nodes
             .contains_key(node_id)
     }
+
+    pub fn primary_unavailable(&self, index_name: &str, shard_id: u32) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .primary_unavailable(index_name, shard_id)
+    }
 }
 
 #[cfg(test)]
@@ -146,5 +153,11 @@ mod tests {
 
         assert!(cm.contains_node("n1"));
         assert!(!cm.contains_node("missing"));
+    }
+
+    #[test]
+    fn primary_unavailable_reads_without_cloning_state() {
+        let cm = ClusterManager::new("test".into());
+        assert!(!cm.primary_unavailable("missing", 0));
     }
 }

@@ -1,6 +1,6 @@
 ---
-description: "Use for integration, restart, SQL logic, transport, object-store, and subsystem regression tests."
-applyTo: "tests/**,src/**/tests.rs"
+description: "Use for integration, restart, SQL logic, transport, object-store, TLA+, and subsystem regression tests."
+applyTo: "tests/**,src/**/tests.rs,specs/tla/**,scripts/tla/**"
 ---
 
 # Testing Patterns
@@ -14,6 +14,7 @@ applyTo: "tests/**,src/**/tests.rs"
 - Process-backed restart regression (`cargo test --test restart_regression`)
 - SQL correctness through sqllogictest (`cargo test --test sql_correctness`)
 - S3-compatible remote-store integration (`cargo test --test remote_store_s3_integration`), skipped unless `FERRIS_RUSTFS_ENDPOINT` is set
+- Bounded shard replication/recovery model checking (`./scripts/tla/check.sh`)
 
 Do not hard-code suite or assertion counts in instructions or README. They
 become stale after ordinary test additions; report the command and observed
@@ -31,7 +32,91 @@ cargo test --test replication_integration --features transport-tls  # Replicatio
 cargo test --test rest_api_integration          # REST API integration tests
 cargo test --test restart_regression            # Real restart/rejoin regression
 cargo test -- test_name                         # Single test by name
+./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
+./scripts/tla/check.sh c1-aba-fixed c2-fixed l2  # Selected fixed-design checks
+./scripts/tla/check.sh g1-empty-store g2-replica g2-primary g2-liveness
+./scripts/tla/check.sh l1-bump l2-primary-idle l2-promotion
+./scripts/tla/check.sh pending-restart-legacy pending-restart-fixed two-shard
+./scripts/tla/check.sh storage-replica storage-primary storage-primary-no-replica
+./scripts/tla/check.sh storage-apply-replica storage-apply-primary storage-apply-primary-no-replica
+./scripts/tla/check.sh s1-combined-replica s1-combined-primary s1-combined-liveness
+./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
+./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
 ```
+
+## TLA+ Model Checks
+
+- TLC passes are exhaustive only for the exact finite constants in the
+  selected `.cfg`; never describe them as proofs for arbitrary cluster sizes.
+- `scripts/tla/check.sh` verifies the pinned TLA+ tools jar before execution
+  and uses isolated Java/TLC temporary directories.
+- Historical counterexamples are living model regressions. The runner must fail if
+  `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, `c4`, or
+  `pending-restart-legacy` stops violating its named invariant, or if
+  `l2-primary-no-trigger`, `storage-apply-no-escalation`, or
+  `s1-combined-liveness-no-timeout` stops producing its temporal liveness
+  violation. The S1 no-timeout case is a modeling-assumption regression, not a
+  historical Rust defect.
+- `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
+  `g2-primary-no-replica`, `g2-liveness`, `pending-restart-fixed`, `l1-bump`,
+  `l2-primary-idle`, `l2-promotion`, `storage-replica`, `storage-primary`,
+  `storage-primary-no-replica`, `storage-apply-replica`,
+  `storage-apply-primary`, `storage-apply-primary-no-replica`,
+  `s1-combined-replica`, `s1-combined-primary`, `s1-combined-liveness`,
+  `two-shard`, `fixed-crash`, and `fixed-partition` are expected-pass
+  configurations.
+- An expected-pass failure stops the modeling task. Preserve the raw trace,
+  decide whether the model or implementation is wrong, and do not weaken an
+  invariant or transition merely to obtain green output.
+- Numeric liveness-bound exhaustion is the exception: increase only the
+  exhausted Raft/message/term/allocation/recovery bound, preserve the trace,
+  and record the old and new values. Safety failures and non-bound liveness
+  failures still stop immediately.
+- Safety runs may use a documented state constraint and valid node symmetry.
+  Liveness runs use neither; declare the exact fairness assumptions instead.
+- When you add a model variable, add it to every action's `UNCHANGED` tuple,
+  including scenario-wrapper actions such as `G2StopFaults`. Round 3 missed
+  `storageFaultInjected` in those wrappers and `g2-liveness` failed. Rerun the
+  full fast matrix after adding a variable.
+- `FaultMode` enables one fault class per configuration. Before you describe a
+  fault combination as checked, confirm it in the fault-class coverage table in
+  `specs/tla/README.md`. The `fixed-crash` and `fixed-partition` runs use C1
+  and C2, so they include neither storage (S1) nor disk-loss faults.
+- Keep action comments and `specs/tla/README.md` mapped to the current Rust
+  functions. Label each protocol variant as current, historical, or proposed;
+  never imply that a model-only transition is implemented.
+- Replica-fencing checks use local knowledge: reject below the durable local
+  fence or applied local term. Do not compare every in-flight apply against an
+  unseen globally committed term; the retained retired-property trace explains
+  why that assertion is too strong.
+- G1/G2 checks must cover CreateIndex before first activation, disk loss of
+  primary and in-sync replica copies, exact-allocation `FailShardCopy`,
+  no-survivor primary-report rejection, stale-report rejection, and fair
+  replacement recovery.
+- Storage-failure checks must exercise both immediate corruption and
+  persistent-I/O escalation at open, fence, marker, and apply boundaries.
+  Apply-I/O checks keep the copy open while WAL/fsync/engine mutations fail,
+  retain a no-escalation temporal counterexample, and require writes to resume
+  after exact replica removal or primary promotion. The leader carries a live
+  in-sync candidate and prefers its highest observed checkpoint only when it
+  hosts the primary and therefore has observations; the state machine validates
+  current in-sync membership. A primary report without a candidate must be
+  rejected without clearing its allocation.
+- Combined S1 checks must cover retry-budget reset across restart, reports
+  pending across failed-primary or leader crash, repair that remains possible
+  if allocation races ahead, fresh-allocation recovery, and a final
+  acknowledged write. Timeout fairness is permitted only when a required
+  target is down, has restarted past the request epoch, or its transport
+  message was dropped.
+- Pending-target liveness must cover the settlement deadline, source-primary
+  restart/reactivation, promotion of a different replica, and target restart
+  with durable marker restoration. `RecoveryConverges` means one attempt
+  reaches admission, promotion, or definitive rejection; retry convergence is
+  a separate configuration.
+- Idle-primary liveness must attach weak fairness to the proactive node
+  lifecycle activation action, not assume a future client or recovery request.
+- The minimal `two-shard` check covers index-level routing isolation only; do
+  not cite it as a two-shard WAL, replication, or recovery proof.
 
 ## Unit Test Conventions
 - Tests live in `#[cfg(test)] mod tests` at the bottom of each source file
@@ -82,6 +167,15 @@ cargo test -- test_name                         # Single test by name
   targeting. Add a real three-process flush -> allocate replica -> primary loss
   -> red shard -> original-primary rejoin regression that verifies exact
   acknowledged values.
+- For allocation identity and replica fencing, retain fail-first evidence for
+  the C1 same-node admission ABA and C2 stale-primary apply. Cover log-position
+  ID assignment, exact-ID recovery start/session/install/pending/admission,
+  G1 pre-activation empty creation, malformed/missing identity rejection,
+  allocation-bound `FailShardCopy`, active-versus-failed-versus-stale install
+  marker classification, UUID/allocation/term/missing-field replica
+  rejection, bulk pre-mutation validation, durable fence restart, separate
+  source/target state handles, and a real-process in-sync replica disk-loss
+  recovery with exact acknowledged documents.
 - For file-based peer recovery, cover WAL pins on every truncation path,
   exact snapshot boundary under concurrent writes, marker/strict-open
   semantics, file name/offset/length/hash validation, ordered bounded operation
@@ -97,6 +191,44 @@ cargo test -- test_name                         # Single test by name
   PrepareFinalize, settlement-safe idle reaping, queued index/bulk/delete after
   primary change, marker creation during open, live-generation reads after a
   failed manifest publish, and routing-update rejection before node removal.
+- Allocation/fencing review regressions cover two-shard red-sibling routing
+  isolation, initialized/present-primary admission guards, newer-term and
+  changed-primary pending rejection, restart restoration before recovery,
+  target/source refusal to reattach a settling session, transient fence I/O
+  without routing failure, retry cleanup without a failed-install marker, stale
+  identity-temp cleanup, and preservation of existing test-copy identity.
+- Round-2 allocation/fencing regressions cover corrupt WAL/Tantivy/marker
+  classification, open/fence/marker-I/O count/time escalation, shared request
+  and lifecycle open backoff, replica removal with resumed writes,
+  promote-only primary failover and no-survivor rejection, idle lifecycle
+  activation after primary restart, post-rename pending-state repair, and
+  delete/recreate-safe recovery abort.
+- Round-3 allocation/fencing regressions cover persistent ENOSPC/read-only
+  apply failures on already-open primary and replica copies, transient apply
+  failure reset, bounded apply backoff, local-storage versus network recovery
+  accounting, structural Tantivy metadata/mapping corruption, exact replica
+  removal with resumed writes, leader-selected primary promotion, and
+  no-candidate status-only primary unavailability   without routing change.
+- Round-4 allocation/fencing regressions cover stable unavailable status across
+  repeated write-only faults, same-term clearing after the first repaired
+  write, fresh activation after repaired open failure, stale availability CAS
+  rejection, throttled definitive quarantine, no Apply-level quarantine or
+  runtime WAL replay, readable failed-writer copies, and escalation of a
+  force-merge replacement failure through the Apply key.
+- Round-5 allocation/fencing regressions cover a one-shot force-merge
+  replacement failure rebuilding successfully on the next write, persistent
+  rebuild failure remaining reportable under the Apply budget, and successful
+  write responses remaining independent of a blocked or slow
+  `MarkPrimaryAvailable` report.
+- Round-6 storage regressions use a real Tantivy commit failure to prove the
+  writer is removed, the persisted checkpoint does not advance, five later
+  acknowledged writes survive the next commit and restart, and a failed
+  replica retains every acknowledged write after promotion.
+- Round-7 storage regressions cover delete-preserving startup and failed-writer
+  replay, malformed WAL document envelopes, idempotent replay with deletes,
+  replica delete survival through promotion, idle refresh/snapshot healing,
+  full transport recovery after a transient source refresh-commit failure, and
+  operation-correct legacy `RecoverReplica` encoding.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

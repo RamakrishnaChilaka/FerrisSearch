@@ -17,7 +17,7 @@ pub struct ClusterHealth {
 /// Compute cluster health status based on shard allocation.
 /// - "green": all primaries exist and all desired replicas are assigned and in sync
 /// - "yellow": all primaries exist, but some replicas are unassigned or out of sync
-/// - "red": no data nodes, or a primary shard is assigned to a missing node
+/// - "red": no data nodes, a primary shard is missing, or primary storage is unavailable
 fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
     let data_node_ids: std::collections::HashSet<&String> = cs
         .nodes
@@ -41,14 +41,24 @@ fn compute_health_status(cs: &ClusterState) -> (&'static str, u32) {
         // Count explicitly tracked unassigned replicas
         total_unassigned += index_meta.unassigned_replica_count();
 
-        for routing in index_meta.shard_routing.values() {
+        for (shard_id, routing) in &index_meta.shard_routing {
             // Primary assigned to a node that no longer exists → red
-            if !data_node_ids.contains(&routing.primary) {
+            if !data_node_ids.contains(&routing.primary)
+                || cs
+                    .shard_allocation_id(&index_meta.name, *shard_id, &routing.primary)
+                    .is_none()
+                || cs.primary_unavailable(&index_meta.name, *shard_id)
+            {
                 primary_missing = true;
             }
             // Missing or out-of-sync replicas are unavailable copies.
             for replica in &routing.replicas {
-                if !data_node_ids.contains(replica) || !routing.is_replica_in_sync(replica) {
+                if !data_node_ids.contains(replica)
+                    || !routing.is_replica_in_sync(replica)
+                    || cs
+                        .shard_allocation_id(&index_meta.name, *shard_id, replica)
+                        .is_none()
+                {
                     total_unassigned += 1;
                 }
             }
@@ -256,5 +266,39 @@ mod tests {
         let mut routing = in_sync_routing();
         routing.primary = "missing-node".into();
         assert_eq!(compute_health_status(&health_state(routing)), ("red", 0));
+    }
+
+    #[test]
+    fn health_is_red_when_primary_allocation_is_cleared() {
+        let mut state = health_state(in_sync_routing());
+        state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary = None;
+        state
+            .indices
+            .get_mut("idx")
+            .unwrap()
+            .shard_routing
+            .get_mut(&0)
+            .unwrap()
+            .unassigned_replicas = 1;
+        assert_eq!(compute_health_status(&state), ("red", 1));
+    }
+
+    #[test]
+    fn health_is_red_when_primary_storage_is_unavailable() {
+        let mut state = health_state(in_sync_routing());
+        state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_unavailable = true;
+        assert_eq!(compute_health_status(&state), ("red", 0));
     }
 }

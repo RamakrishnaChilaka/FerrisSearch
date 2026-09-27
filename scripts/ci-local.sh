@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== 1/4 Check formatting ==="
+echo "=== 1/5 Check formatting ==="
 cargo fmt --check
 
-echo "=== 2/4 Clippy lints ==="
+echo "=== 2/5 Clippy lints ==="
 cargo clippy --all-targets --all-features -- -D warnings
 
-echo "=== 3/4 Build ==="
+echo "=== 3/5 Build ==="
 cargo build
 
-echo "=== 4/4 Run tests ==="
+echo "=== 4/5 Run tests ==="
 cargo test
+
+echo "=== 5/5 Run bounded TLA+ checks ==="
+./scripts/tla/check.sh
 
 # ── Change-locality advisory ──────────────────────────────────────────
 # Flag PRs that touch many top-level directories — a sign of coupling.

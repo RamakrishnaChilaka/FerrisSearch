@@ -1,0 +1,220 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 12 and seed 5169182036808585202 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 41553] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_L2_PrimaryRestart_NoTrigger.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_L2_PrimaryRestart.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_L1.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/l2-primary-no-trigger/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/l2-primary-no-trigger/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/l2-primary-no-trigger/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/l2-primary-no-trigger/java-tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RaftLog
+Semantic processing of module ShardReplication
+Semantic processing of module PeerRecovery
+Semantic processing of module Faults
+Semantic processing of module Invariants
+Semantic processing of module MC_L1
+Semantic processing of module MC_L2_PrimaryRestart
+Semantic processing of module MC_L2_PrimaryRestart_NoTrigger
+Starting... (2026-09-27 07:32:22)
+Implied-temporal checking--satisfiability problem has 8 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-27 07:32:22.
+Progress(22) at 2026-09-27 07:32:23: 94 states generated, 49 distinct states found, 0 states left on queue.
+Checking 8 branches of temporal properties for the complete state space with 392 total distinct states at (2026-09-27 07:32:23)
+Error: Temporal properties were violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ pendingRaft = {}
+/\ raftVoters = {n1, n2}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ copyAllocation = (n1 :> 1 @@ n2 :> 1)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = << >>
+/\ writeEpoch = << >>
+/\ staleApplySafe = TRUE
+/\ raftLeader = n1
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  replicas |-> {n2},
+  inSync |-> {},
+  term |-> 1,
+  initialized |-> TRUE,
+  allocations |-> (n1 :> 1 @@ n2 :> 1),
+  unassigned |-> 0,
+  members |-> {n1, n2} ]
+/\ faultsStopped = FALSE
+/\ replicaFence = (n1 :> 1 @@ n2 :> 1)
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = << >>
+/\ writeSeq = << >>
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0)
+/\ pins = (n1 :> {} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ copyUuid = (n1 :> "INDEX_UUID" @@ n2 :> "INDEX_UUID")
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = << >>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = << >>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 1
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None")
+/\ recoveryAttempts = 0
+/\ writeTarget = << >>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ durableReplicaFence = (n1 :> 1 @@ n2 :> 1)
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = << >>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 0)
+/\ activePrimaryApplySafe = TRUE
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = << >>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        replicas |-> {n2},
+        inSync |-> {},
+        term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2} ] @@
+  n2 :>
+      [ primary |-> n1,
+        replicas |-> {n2},
+        inSync |-> {},
+        term |-> 1,
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2} ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle")
+/\ writeWait = << >>
+
+State 2: <L1Start line 20, col 5 to line 21, col 26 of module MC_L1>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 1)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Starting")
+/\ recoveryAttempts = 1
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+
+State 3: <L1Snapshot line 24, col 5 to line 27, col 78 of module MC_L1>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "SnapshotReady")
+
+State 4: <L1BeginInstall line 30, col 5 to line 33, col 78 of module MC_L1>
+/\ installMarker = (n1 :> FALSE @@ n2 :> TRUE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Installing")
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Recovering")
+
+State 5: <L1Install line 36, col 5 to line 38, col 78 of module MC_L1>
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "CatchingUp")
+
+State 6: <L1FinishCatchUp line 53, col 5 to line 56, col 78 of module MC_L1>
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Ready")
+
+State 7: <L1BeginPrepare line 59, col 5 to line 62, col 78 of module MC_L1>
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Preparing")
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> TRUE)
+
+State 8: <L1AcquireBarrier line 65, col 5 to line 68, col 78 of module MC_L1>
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Finalizing")
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+
+State 9: <L1TargetComplete line 77, col 5 to line 80, col 59 of module MC_L1>
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 1)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "AwaitingComplete")
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+
+State 10: <L1BeginSettlement line 83, col 5 to line 86, col 78 of module MC_L1>
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+
+State 11: <L1ProposeMark line 89, col 5 to line 92, col 78 of module MC_L1>
+/\ pendingRaft = { [ kind |-> "MarkReplicaInSync",
+    expectedTerm |-> 1,
+    expectedAllocation |-> 1,
+    target |-> n2,
+    actor |-> n1,
+    newReplicas |-> {},
+    newPrimary |-> n1,
+    newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 0 @@ n2 :> 0),
+    expectedPrimary |-> n1 ] }
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> TRUE)
+
+State 12: <PR2CrashPrimary line 19, col 5 to line 22, col 32 of module MC_L2_PrimaryRestart>
+/\ raftLeader = "NO_NODE"
+/\ pins = (n1 :> {} @@ n2 :> {})
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ crashCount = 1
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ activated = (n1 :> 0 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ raftConnected = (n1 :> FALSE @@ n2 :> TRUE)
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None")
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 0)
+/\ alive = (n1 :> FALSE @@ n2 :> TRUE)
+
+State 13: <PR2RestartPrimary line 25, col 5 to line 26, col 32 of module MC_L2_PrimaryRestart>
+/\ epoch = (n1 :> 1 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+
+State 14: <PR2ElectPrimary line 29, col 5 to line 30, col 32 of module MC_L2_PrimaryRestart>
+/\ raftLeader = n1
+
+State 15: <PR2StopFaults line 33, col 5 to line 40, col 54 of module MC_L2_PrimaryRestart>
+/\ faultsStopped = TRUE
+
+State 16: Stuttering
+Finished checking temporal properties in 00s at 2026-09-27 07:32:23
+94 states generated, 49 distinct states found, 0 states left on queue.
+Finished in 02s at (2026-09-27 07:32:23)

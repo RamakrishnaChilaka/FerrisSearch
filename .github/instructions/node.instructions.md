@@ -57,8 +57,29 @@ pub struct Node {
    - Nodes not seen for 15s → dead
    - Remove from Raft membership before cluster state; if membership removal fails or would empty the voter set, leave the node registered
    - Shard failover for orphaned primaries (see shard failover section)
-3. Reopen any locally assigned shards that are still not open
-4. Allocate unassigned replicas to available data nodes
+3. Reopen only authoritative local copies whose durable UUID/allocation
+   identity matches; only an initial CreateIndex primary may be created empty
+   before the shard's first activation
+4. Report corruption-class decode/validation failures immediately. Retry other
+   engine/filesystem/fence/apply I/O with operation-specific per-copy state and
+   shared exponential backoff. Escalation requires at least three failed
+   attempts spanning the configured window, 60 seconds by default. Replica
+   reports remove the exact allocation; primary reports are promote-only and
+   are submitted only with an in-sync candidate. Duplicate reports are
+   throttled per allocation. Definitive/open-level quarantine occurs only
+   after that throttle; Apply escalation leaves the copy open for reads.
+5. Proactively invoke the shared primary-activation path for each local primary
+   after startup or promotion. The activation cache is keyed by
+   UUID/shard/allocation/term so lifecycle ticks and request handlers do not
+   issue repeated Raft term bumps. `primary_unavailable` alone does not bypass
+   the cache. Repaired quarantined storage requires fresh activation; a
+   successful write on an Apply-failed copy clears status at the same term.
+6. Allocate unassigned replicas only for shards with a live allocated primary.
+   The current allocator may select the same faulty node again; bounded failed-
+   allocation exclusion is deferred.
+7. When applied routing removes a local shard copy, remove its engine from the
+   serving map without deleting its on-disk evidence. This closes copies removed
+   after Apply-level escalation instead of retaining an unreachable open engine.
 
 ### Follower Duties (every 5s tick)
 1. Ping master node for liveness check
@@ -70,10 +91,14 @@ pub struct Node {
 - The lifecycle loop itself stays on Tokio because it coordinates Raft/control-plane work, but shard reopen and orphan cleanup perform blocking filesystem/Tantivy recovery work.
 - On Tokio call sites, use `open_local_assigned_shards_blocking()` and `cleanup_orphaned_data_if_authoritative_blocking()` so the actual shard-manager work runs on Tokio's blocking pool.
 - Do NOT move Raft heartbeats or master pings onto rayon; keep control-plane futures on Tokio and offload only the blocking shard work.
-- Recovered-node startup assignments must fail closed when the authoritative shard UUID path is missing: do not create a fresh shard directory during restart reconciliation, and do not run orphan cleanup while locally assigned UUID paths are missing.
+- Recovered-node startup assignments must fail closed when durable
+  UUID/allocation identity is missing, malformed, or mismatched. The sole
+  exception is an uninitialized allocation created by CreateIndex, before any
+  write can be acknowledged.
 - The guarded startup-assignment set must come from the node's pre-join recovered state, not the later authoritative join snapshot. Otherwise fresh assignments learned during rejoin can be permanently misclassified as guarded startup shards and stay stuck in `INITIALIZING`.
 - Do not clear the recovered startup-assignment guard after bootstrap or rejoin. Authoritative cluster state confirms shard ownership, not the continued existence of the local shard data; only assignments that were never part of the recovered local state may create fresh UUID directories later in the lifecycle loop.
-- Later shard assignments may create their UUID directories during the lifecycle loop so new primaries/replicas can come online after startup.
+- Later out-of-sync replica assignments do not create empty engines; verified
+  peer recovery installs their identity and data.
 
 ## Peer Recovery Driver
 - The lifecycle loop schedules recovery on every node for each local
@@ -82,22 +107,44 @@ pub struct Node {
   `0` disables); failures back off from 5 seconds to 60 seconds.
 - File download, fsync, shard close/open, vector rebuild, and recovery apply run
   through Tokio's blocking facilities rather than the fixed search/write pools.
+- Source snapshot preparation can rebuild a failed Tantivy writer and replay
+  the retained WAL suffix while the shard is idle. A transient source commit
+  failure must not leave replica recovery dependent on a later client write.
 - A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
+  An inactive marker whose embedded allocation ID matches the current
+  out-of-sync assignment is reported through `FailShardCopy`; an active target,
+  a fresh target with no marker, or a stale marker from another allocation is
+  not reported.
   Successful finalization clears the in-memory target gate only after the
   primary reports settled admission.
 - Completion timeout is not rejection. A caught-up target persists a
   finalized-awaiting-membership marker, accepts live replication, and is
   excluded from new recovery scheduling until local ordered state says
   admitted/promoted or definitively rejected. This state is reconstructed when
-  the target restarts.
+  the target restarts, before recovery candidates are selected.
+- Pending observation checks admission first. With the same current allocation,
+  a strictly newer observed term or a different primary is definitive
+  rejection; an older view or the same primary/term remains unknown.
+- A matching durable pending marker blocks target begin and target preparation.
+  Controlled retryable transfer failures remove their partial install and
+  retry the same allocation; an inactive matching install marker represents an
+  interrupted/crashed install and remains a definitive failure report.
+- If pending-marker publication reaches rename but directory fsync fails,
+  preserve or reconstruct `FinalizedAwaitingMembership` in memory; retry
+  cleanup must not leave a permanent `Recovering` gate.
+- A delayed abort checks the currently registered index UUID before touching
+  storage and never recreates a deleted/recreated index's old UUID directory.
 - An abandoned finalize session is made definitive by a source-side
   `ActivatePrimary` term bump. If no admission command was submitted, release
   the barrier first and bump asynchronously; after submission, keep the barrier
   until admission or the newer term is observed.
-- Remove-and-re-add of the same node while a finalized target is pending can
-  remain `Unknown`: routing has node IDs but no allocation IDs, so the target
-  cannot distinguish the old assignment from its replacement. Keep it pending
-  rather than guessing until allocation identity exists.
+- Recovery start, source session, install, pending marker, admission, and target
+  observation retain one exact allocation ID. Same-node remove/re-add is a
+  definitive mismatch rather than an ABA-ambiguous `Unknown`.
+- The G1 empty-primary exception assumes the local applied Raft view is
+  monotonic. Normal startup replays persistent `raft.db`; losing that database
+  and rejoining under the same node name does not justify treating retained
+  shard storage as a fresh pre-activation copy.
 
 ## Shard Failover Algorithm (leader only)
 1. `IndexMetadata::remove_node(dead_node)` removes the dead node from every
@@ -107,9 +154,10 @@ pub struct Node {
 2. For each orphaned primary:
    - Restrict candidates to the Raft-authoritative
      `ShardRoutingEntry.in_sync_replicas` set.
-   - Prefer the eligible candidate with the highest locally observed ISR
-     checkpoint; if no eligible checkpoint is known, use the first in-sync
-     replica in routing order.
+   - If this leader also hosts the primary, prefer the eligible candidate with
+     the highest locally observed ISR checkpoint. Otherwise no local checkpoint
+     ranking is available, so use the first live in-sync replica in routing
+     order.
    - Call `IndexMetadata::promote_replica_to()`; it independently rejects
      out-of-sync candidates.
    - Increment `unassigned_replicas` for the promoted replica's old slot.

@@ -9,7 +9,7 @@ mod reconciliation;
 mod tests;
 
 use crate::cluster::manager::ClusterManager;
-use crate::cluster::state::{NodeInfo, NodeRole};
+use crate::cluster::state::{ClusterState, NodeInfo, NodeRole};
 use crate::config::AppConfig;
 use crate::consensus::types::{ClusterCommand, RaftInstance};
 use crate::shard::ShardManager;
@@ -18,8 +18,9 @@ use crate::wal::TranslogDurability;
 
 use lifecycle::{remote_seed_hosts, try_join_cluster};
 use reconciliation::{
-    build_guarded_startup_shards, cleanup_orphaned_data_if_authoritative_blocking,
-    open_local_assigned_shards_blocking, should_retry_cluster_join, snapshot_uuid_dirs,
+    ShardCopyFailure, build_guarded_startup_shards,
+    cleanup_orphaned_data_if_authoritative_blocking, open_local_assigned_shards_blocking,
+    should_retry_cluster_join, snapshot_uuid_dirs,
 };
 
 #[cfg(test)]
@@ -173,11 +174,211 @@ fn dead_node_removal_allowed(routing_update_failed: bool) -> bool {
     !routing_update_failed
 }
 
+type FailedCopyReportKey = (String, u32, String, u64);
+const FAILED_COPY_REPORT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+fn should_attempt_failed_copy_report(
+    recent_reports: &mut std::collections::HashMap<FailedCopyReportKey, Instant>,
+    report_key: FailedCopyReportKey,
+    now: Instant,
+) -> bool {
+    if recent_reports
+        .get(&report_key)
+        .is_some_and(|last| now.duration_since(*last) < FAILED_COPY_REPORT_RETRY_INTERVAL)
+    {
+        return false;
+    }
+    recent_reports.insert(report_key, now);
+    true
+}
+
+async fn report_failed_shard_copies(
+    failures: Vec<ShardCopyFailure>,
+    cluster_manager: &ClusterManager,
+    shard_manager: &ShardManager,
+    transport_client: &TransportClient,
+    raft: &RaftInstance,
+    recent_reports: &mut std::collections::HashMap<FailedCopyReportKey, Instant>,
+) {
+    let now = Instant::now();
+    for failure in failures {
+        let current = cluster_manager.get_state();
+        let report_is_current = current
+            .indices
+            .get(&failure.index_name)
+            .is_some_and(|metadata| metadata.uuid.as_str() == failure.index_uuid)
+            && current.primary_initialized(&failure.index_name, failure.shard_id)
+            && current.shard_allocation_id(&failure.index_name, failure.shard_id, &failure.node_id)
+                == Some(failure.allocation_id);
+        if !report_is_current {
+            tracing::debug!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                node = failure.node_id,
+                allocation_id = failure.allocation_id,
+                "Skipping stale or uninitialized lifecycle shard-copy failure report"
+            );
+            continue;
+        }
+        let report_key = (
+            failure.index_uuid.clone(),
+            failure.shard_id,
+            failure.node_id.clone(),
+            failure.allocation_id,
+        );
+        if !should_attempt_failed_copy_report(recent_reports, report_key, now) {
+            tracing::debug!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                node = failure.node_id,
+                allocation_id = failure.allocation_id,
+                "Suppressing duplicate lifecycle shard-copy failure report"
+            );
+            continue;
+        }
+        if failure.quarantine {
+            shard_manager.quarantine_shard_copy(&failure.index_name, failure.shard_id);
+        }
+        let promotion_candidate = if failure.promote_only {
+            let metadata = &current.indices[&failure.index_name];
+            let live_nodes = current.nodes.keys().cloned().collect();
+            let checkpoints = shard_manager
+                .isr_tracker
+                .replica_checkpoints(&failure.index_name, failure.shard_id);
+            metadata.select_live_promotion_candidate(failure.shard_id, &checkpoints, &live_nodes)
+        } else {
+            None
+        };
+        if raft.is_leader()
+            && failure.promote_only
+            && promotion_candidate.is_none()
+            && current.primary_unavailable(&failure.index_name, failure.shard_id)
+        {
+            tracing::debug!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                allocation_id = failure.allocation_id,
+                "Primary is already marked unavailable for this allocation"
+            );
+            continue;
+        }
+        tracing::error!(
+            index = failure.index_name,
+            shard_id = failure.shard_id,
+            node = failure.node_id,
+            allocation_id = failure.allocation_id,
+            reason = failure.reason,
+            "Local authoritative shard copy failed closed"
+        );
+        let command = if failure.promote_only && promotion_candidate.is_none() {
+            tracing::warn!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                allocation_id = failure.allocation_id,
+                "Keeping failed primary authority unchanged because no live in-sync promotion candidate exists"
+            );
+            ClusterCommand::MarkPrimaryUnavailable {
+                index_name: failure.index_name.clone(),
+                index_uuid: failure.index_uuid.clone(),
+                shard_id: failure.shard_id,
+                primary: failure.node_id.clone(),
+                allocation_id: failure.allocation_id,
+            }
+        } else {
+            ClusterCommand::FailShardCopy {
+                index_name: failure.index_name.clone(),
+                index_uuid: failure.index_uuid.clone(),
+                shard_id: failure.shard_id,
+                node: failure.node_id.clone(),
+                allocation_id: failure.allocation_id,
+                promote_only: failure.promote_only,
+                promotion_candidate,
+            }
+        };
+        let result = if raft.is_leader() {
+            crate::consensus::client_write_checked(raft, command)
+                .await
+                .map_err(anyhow::Error::msg)
+        } else {
+            let state = cluster_manager.get_state();
+            let Some(master_id) = state.master_node.as_ref() else {
+                tracing::warn!(
+                    index = failure.index_name,
+                    shard_id = failure.shard_id,
+                    "Cannot report failed shard copy because no Raft leader is known"
+                );
+                continue;
+            };
+            let Some(master) = state.nodes.get(master_id) else {
+                tracing::warn!(
+                    index = failure.index_name,
+                    shard_id = failure.shard_id,
+                    master = master_id,
+                    "Cannot report failed shard copy because the Raft leader is absent"
+                );
+                continue;
+            };
+            transport_client
+                .forward_fail_shard_copy(
+                    master,
+                    crate::transport::proto::FailShardCopyRequest {
+                        index_name: failure.index_name.clone(),
+                        index_uuid: failure.index_uuid.clone(),
+                        shard_id: failure.shard_id,
+                        node_id: failure.node_id.clone(),
+                        allocation_id: Some(failure.allocation_id),
+                        promote_only: failure.promote_only,
+                    },
+                )
+                .await
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                allocation_id = failure.allocation_id,
+                error = %error,
+                "Failed shard-copy report was not applied"
+            );
+        }
+    }
+}
+
+async fn activate_local_primaries(
+    state: &ClusterState,
+    local_node_id: &str,
+    activation_service: &crate::transport::server::TransportService,
+) {
+    for (index_name, metadata) in &state.indices {
+        if !metadata.settings.engine.uses_local_shards() {
+            continue;
+        }
+        for (shard_id, routing) in &metadata.shard_routing {
+            if routing.primary != local_node_id
+                || state.primary_allocation_id(index_name, *shard_id).is_none()
+            {
+                continue;
+            }
+            if let Err(error) = activation_service
+                .activate_primary_for_lifecycle(index_name, *shard_id)
+                .await
+            {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    error,
+                    "Lifecycle primary activation has not completed"
+                );
+            }
+        }
+    }
+}
+
 impl Node {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
-        if config.max_concurrent_peer_recoveries > 64 {
-            anyhow::bail!("max_concurrent_peer_recoveries must be between 0 and 64");
-        }
+        config
+            .validate_operational_limits()
+            .map_err(anyhow::Error::msg)?;
         let column_cache_percent = config.column_cache_size_percent;
         let column_cache_budget = tokio::task::spawn_blocking(move || {
             crate::engine::column_cache::resolve_column_cache_budget(column_cache_percent)
@@ -242,6 +443,10 @@ impl Node {
                 config.column_cache_populate_threshold,
             )),
         ));
+        shard_manager.configure_copy_retry_policy(
+            config.shard_io_failure_escalation_attempts,
+            Duration::from_millis(config.shard_io_failure_escalation_window_ms),
+        );
         let task_manager = Arc::new(crate::tasks::TaskManager::new());
 
         let storage_manager = Arc::new(match config.storage_uri.as_deref() {
@@ -308,8 +513,8 @@ impl Node {
         };
 
         // 1. Start internal gRPC Transport Server (Port 9300)
-        let transport_service =
-            crate::transport::server::create_transport_service_with_raft_and_storage(
+        let (transport_service, primary_activation_service) =
+            crate::transport::server::create_transport_service_with_raft_and_storage_handle(
                 self.cluster_manager.clone(),
                 self.shard_manager.clone(),
                 self.transport_client.clone(),
@@ -487,7 +692,7 @@ impl Node {
             }
 
             let has_authoritative_startup_state = startup_state.is_some();
-            let state = startup_state.clone().unwrap_or_else(|| manager.get_state());
+            let mut state = startup_state.clone().unwrap_or_else(|| manager.get_state());
             let guarded_missing_startup_shards =
                 build_guarded_startup_shards(recovered_guard_state.as_ref(), &local_id);
             // Keep the recovered-startup guard in place even after we obtain
@@ -500,13 +705,26 @@ impl Node {
             // freshly-created (empty) shard dirs as evidence that the
             // authoritative data is present.
             let pre_existing_uuid_dirs = snapshot_uuid_dirs(manager_clone.data_dir());
-            open_local_assigned_shards_blocking(
+            let mut recent_failed_copy_reports = std::collections::HashMap::new();
+            let failures = open_local_assigned_shards_blocking(
                 state.clone(),
                 local_id.clone(),
                 manager_clone.clone(),
                 guarded_missing_startup_shards.clone(),
             )
             .await;
+            report_failed_shard_copies(
+                failures,
+                manager.as_ref(),
+                manager_clone.as_ref(),
+                &client,
+                raft.as_ref(),
+                &mut recent_failed_copy_reports,
+            )
+            .await;
+            state = manager.get_state();
+            activate_local_primaries(&state, &local_id, &primary_activation_service).await;
+            state = manager.get_state();
 
             let mut orphan_cleanup_done = cleanup_orphaned_data_if_authoritative_blocking(
                 Some(state.clone()),
@@ -525,14 +743,26 @@ impl Node {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
-                let state = manager.get_state();
-                open_local_assigned_shards_blocking(
+                let mut state = manager.get_state();
+                let failures = open_local_assigned_shards_blocking(
                     state.clone(),
                     local_id.clone(),
                     manager_clone.clone(),
                     guarded_missing_startup_shards.clone(),
                 )
                 .await;
+                report_failed_shard_copies(
+                    failures,
+                    manager.as_ref(),
+                    manager_clone.as_ref(),
+                    &client,
+                    raft.as_ref(),
+                    &mut recent_failed_copy_reports,
+                )
+                .await;
+                state = manager.get_state();
+                activate_local_primaries(&state, &local_id, &primary_activation_service).await;
+                state = manager.get_state();
                 peer_recovery_driver.reconcile(
                     &state,
                     &local_id,
@@ -801,7 +1031,28 @@ impl Node {
                         for idx_meta in alloc_state.indices.values() {
                             if idx_meta.unassigned_replica_count() > 0 {
                                 let mut updated = idx_meta.clone();
-                                if updated.allocate_unassigned_replicas(&data_nodes) {
+                                let eligible_shards = idx_meta
+                                    .shard_routing
+                                    .keys()
+                                    .copied()
+                                    .filter(|shard_id| {
+                                        idx_meta.shard_routing.get(shard_id).is_some_and(
+                                            |routing| {
+                                                alloc_state.nodes.contains_key(&routing.primary)
+                                                    && alloc_state
+                                                        .primary_allocation_id(
+                                                            &idx_meta.name,
+                                                            *shard_id,
+                                                        )
+                                                        .is_some()
+                                            },
+                                        )
+                                    })
+                                    .collect();
+                                if updated.allocate_unassigned_replicas_for_shards(
+                                    &data_nodes,
+                                    &eligible_shards,
+                                ) {
                                     tracing::info!(
                                         "Allocating unassigned replicas for index '{}' ({} remaining)",
                                         updated.name,

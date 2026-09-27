@@ -39,6 +39,9 @@ FetchRecoveryFileChunk(FetchRecoveryFileChunkRequest) → FetchRecoveryFileChunk
 FetchRecoveryOps(FetchRecoveryOpsRequest) → FetchRecoveryOpsResponse
 PrepareFinalizeRecovery(PrepareFinalizeRecoveryRequest) → PrepareFinalizeRecoveryResponse
 CompleteFinalizeRecovery(CompleteFinalizeRecoveryRequest) → CompleteFinalizeRecoveryResponse
+FailShardCopy(FailShardCopyRequest) → FailShardCopyResponse
+MarkPrimaryUnavailable(MarkPrimaryUnavailableRequest) → MarkPrimaryUnavailableResponse
+MarkPrimaryAvailable(MarkPrimaryAvailableRequest) → MarkPrimaryAvailableResponse
 
 // Forwarded to leader
 UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
@@ -83,6 +86,10 @@ acknowledgement/promotion set in JoinCluster snapshots. Conversion must preserve
 it losslessly and reject duplicate IDs, the primary ID, or any ID absent from
 `replica_node_ids` with `INVALID_ARGUMENT`. An absent field from pre-1.0 peers
 decodes as empty and therefore non-promotable.
+`ShardAssignment` also carries primary/replica allocation IDs, the initial
+CreateIndex allocation ID, `primary_initialized`, and the status-only
+`primary_unavailable` flag. Missing allocation metadata is rejected on join
+snapshots; pre-1.0 snapshots are not adopted.
 
 ### Runtime And Code Generation
 
@@ -122,9 +129,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   `INVALID_ARGUMENT`; valid requests still return immediately after enqueueing
   node-local background work.
 - The maintenance helper only operates on shards where `primary == local_node_id` or the node is in `replicas` — orphaned shards are skipped
-- The constructors require a local node ID and task manager; production uses
-  `create_transport_service_with_raft_and_storage()`, while
-  `create_transport_service_for_test()` supplies isolated defaults.
+- The constructors require a local node ID and task manager. Production uses
+  `create_transport_service_with_raft_and_storage_handle()` so the node
+  lifecycle and request handlers share one `TransportService` activation
+  cache; `create_transport_service_for_test()` supplies isolated defaults.
 
 ### Key Handler Patterns
 - **join_cluster**: If leader → serialize concurrent joins, validate `node_id` / `raft_node_id`, register the transport address with `add_learner()` for non-voters, apply `AddNode`, then recompute the latest full voter set before `change_membership()`. If promotion fails, roll back the `AddNode`. If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
@@ -136,11 +144,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   `success: false` if replication fails** — write is only acknowledged after all
   in-sync replicas confirm (synchronous replication contract). Assigned
   out-of-sync replicas receive no live writes and cannot fail the request.
-- **replicate_doc / replicate_bulk**: Apply to local replica engine using the
-  seq_no supplied by the primary, persist that same seq_no in the replica WAL,
-  return the current local high-water mark. Bulk apply rejects empty-range
-  overflow, non-contiguous/out-of-order sequences, and non-index operations
-  before mutation.
+- **replicate_doc / replicate_bulk**: Require index UUID, sender primary term,
+  and target allocation ID. Revalidate the current local assignment inside the
+  write worker; then validate durable identity, recovery gate, and term fence
+  before WAL/engine mutation. A higher term is fsynced before mutation. Bulk
+  validates the shared envelope and every item before the first mutation and
+  advances the fence once.
 - **recover_replica**: Read the live engine's captured generation snapshot and
   return operations above the requested checkpoint. Never construct a second
   `HotTranslog` on the live shard directory: open performs startup repair and
@@ -151,7 +160,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   on a copy installed from files), when a concurrent flush removes a needed
   generation, or when a legacy frame above the 32 MiB transfer limit falls in
   the requested range.
-- **peer recovery RPCs**: source sessions are UUID/target/primary-term bound,
+- Modern peer-recovery catch-up and legacy `RecoverReplica` share the strict WAL
+  document decoder. Missing `_doc_id`, or missing `_source` on an index
+  operation, fails closed; delete operations carry no synthetic source and
+  must never be converted back into indexed documents.
+- **peer recovery RPCs**: source sessions are
+  UUID/target/allocation/primary-term bound,
   file chunks are at most 1 MiB, operation batches are bounded by count and
   bytes, and stale authority aborts the session. Prepare holds the exclusive
   shard write barrier; Complete keeps it until conditional membership is
@@ -162,6 +176,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - Snapshot preparation failures are retained and returned once on the next
   poll, so the target enters normal recovery backoff instead of relaunching
   setup in a tight loop.
+- Snapshot preparation on a repaired idle primary rebuilds a failed writer and
+  replays its retained WAL suffix before committing the source snapshot; it
+  does not require an unrelated client write to heal the source.
+- `StartPeerRecovery` may poll a safe pre-finalize session, but it must reject
+  reattachment to the same session once finalization, admission, or settlement
+  has begun.
 - **search_shard / search_shard_dsl**: Execute local shard search, return results
 - **get_remote_store_leaf_status**: Report whether the local node is root/leaf-capable plus per-split artifact/reader warmth and current `StorageManager` load counters
 - **search_remote_store_splits**: Validate the remote_store index/UUID, batch split execution through the shared leaf helper, and return per-split hits, totals, partial aggs, and per-split errors
@@ -178,10 +198,33 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc` and
   `replicate_bulk` must call the explicit-seq engine methods. Do not route
   replicated writes through local seq allocation APIs.
+- **Replica apply is allocation- and term-fenced**: missing identity fields,
+  UUID/allocation mismatches, installing targets, and terms below
+  `max(applied_view_term, durable_fence)` reject before mutation and propagate
+  through the synchronous replication failure path.
 - **Installing targets reject live replica apply.** A finalized target awaiting
   membership accepts live apply and remains open; its durable pending marker is
   reconciled to admitted/promoted or definitively rejected state after restart.
   The in-progress marker still prevents a partial install from being opened.
+- Local copy failure forwarding reports corruption-class identity, marker, WAL,
+  and Tantivy decode/validation failures immediately. Other open/fence/marker
+  and Apply I/O remains retryable under operation-specific per-copy state until
+  the shared count/time policy is exhausted. Quarantine happens only after the
+  report throttle and only for definitive or open-level failures; Apply
+  escalation leaves the engine open for reads and never triggers runtime WAL
+  replay. Replica escalation removes the copy; primary escalation is
+  promote-only and requires an in-sync candidate.
+- Production transport and node lifecycle share one primary-activation state.
+  Proactive lifecycle activation and request-triggered activation are
+  idempotent for the same UUID/shard/allocation/term. The unavailable flag alone
+  does not bypass that cache. A repaired quarantined open-level failure forces a
+  fresh activation; a successful local write after an Apply-level failure
+  spawns throttled best-effort `MarkPrimaryAvailable` reporting without a term
+  bump. The already-successful write response must not wait for Raft leadership
+  discovery, forwarding, or the transport timeout of that status-only report.
+  Check `primary_unavailable` through the shared applied-state read lock before
+  cloning the service or spawning the task, so ordinary writes allocate no
+  status-report work.
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.
@@ -243,6 +286,7 @@ pub struct TransportClient {
 | `forward_delete_index()` | Forward index deletion to leader |
 | `forward_update_settings()` | Forward settings update to leader |
 | `forward_transfer_master()` | Forward leadership transfer |
+| `forward_mark_primary_available()` | Clear exact primary-unavailable status after a successful local write |
 | `forward_put_api_key()` | Forward dynamic API-key upsert to leader (control plane) |
 | `forward_delete_api_key()` | Forward dynamic API-key deletion to leader (control plane) |
 | `forward_put_role()` | Forward custom-role upsert to leader (control plane) |

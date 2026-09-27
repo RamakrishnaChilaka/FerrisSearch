@@ -1,6 +1,6 @@
 ---
 description: "Use for README, architecture and roadmap documents, benchmark reports, agent instructions, and public compatibility or maturity claims."
-applyTo: "README.md,docs/**,.github/**/*.md,AGENTS.md,CLAUDE.md"
+applyTo: "README.md,docs/**,specs/tla/**,.github/**/*.md,AGENTS.md,CLAUDE.md"
 ---
 
 # Documentation And Evidence Instructions
@@ -56,6 +56,46 @@ as exploratory. Prefer ranges/distributions over a single best run.
 Do not hard-code total test counts in long-lived documentation. They drift as
 normal tests are added. Name suites and record observed results in releases or
 benchmark artifacts.
+
+## Formal-Model Evidence
+
+- Describe TLC results as bounded model checking, with exact node/write/fault
+  bounds, state counts, depth, tool version, and run date.
+- A TLC pass covers every reachable behavior only within those constants. It
+  is not an unbounded proof, an implementation test, an Apalache inductive
+  check, or a TLAPS proof.
+- Preserve expected counterexample traces and map their steps to source
+  functions. Distinguish implementation-faithful failures from model errors.
+- Retain traces that invalidate an over-strong property, but label the property
+  retired and do not cite the failed run as evidence against the implementation.
+- For empty-store/copy-failure evidence, state whether the run begins before or
+  after first activation, whether a surviving in-sync copy exists, and the
+  fairness assumed for failure reporting, allocation, and recovery.
+- Pending-target evidence must distinguish admission, definitive rejection,
+  and later retry convergence. State whether durable marker restoration,
+  deadline bumps, primary reactivation, or promotion is included.
+- Storage-failure evidence must distinguish immediate corruption from
+  retry-budget escalation, open/fence/marker I/O from mutation-time apply I/O,
+  replica removal from promote-only primary handling, and permanent failure
+  from transient recovery. Apply-I/O evidence must state that the copy remains
+  open/readable while mutations fail and preserve the no-escalation liveness
+  trace.
+- Combined-fault evidence must include a fault-class table. State explicitly
+  which modes enable crash, metadata partition, message loss/delay, disk loss,
+  storage open/apply failure, and asynchronous durability, and name
+  combinations that are never checked together.
+- Storage/crash liveness evidence must document process-local retry-budget
+  reset, persistent-fault redetection, repair eligibility, the guarded
+  transport-timeout assumption, and any numeric bound raised after a retained
+  bound-exhaustion trace.
+- Activation liveness claims must name the proactive lifecycle trigger and
+  preserve the no-trigger stutter trace as bounded counterevidence.
+- Record the monotonic applied-Raft-view assumption. Loss of `raft.db` followed
+  by same-name rejoin is outside the current model.
+- Label model-only fixes, including allocation-ID fencing, as proposed until
+  the Rust domain, persistence, transport, and recovery paths implement them.
+- Do not infer timing probability from an untimed TLA+ trace. State only that
+  the ordering is reachable under the documented timing assumptions.
 
 ## README Standard
 

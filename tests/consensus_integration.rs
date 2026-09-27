@@ -10,7 +10,8 @@ use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::{
-    ActivatePrimaryRequest, JoinRequest, MarkReplicaInSyncRequest, NodeInfo as ProtoNodeInfo,
+    ActivatePrimaryRequest, FailShardCopyRequest, JoinRequest, MarkPrimaryAvailableRequest,
+    MarkPrimaryUnavailableRequest, MarkReplicaInSyncRequest, NodeInfo as ProtoNodeInfo,
     ShardDocRequest, internal_transport_client::InternalTransportClient,
 };
 use ferrissearch::transport::server::create_transport_service_with_raft;
@@ -643,12 +644,14 @@ async fn update_index_promotes_replica_after_primary_death() {
     wait_for_leader(&raft).await;
 
     // Create index with primary=node-A, replicas=[node-B, node-C]
-    let idx = IndexMetadata::build_shard_routing(
+    let mut idx = IndexMetadata::build_shard_routing(
         "promo",
         1,
         2,
         &["node-A".into(), "node-B".into(), "node-C".into()],
     );
+    idx.shard_routing.get_mut(&0).unwrap().in_sync_replicas =
+        vec!["node-B".into(), "node-C".into()];
     raft.client_write(ClusterCommand::CreateIndex { metadata: idx })
         .await
         .unwrap();
@@ -723,6 +726,16 @@ async fn conditional_membership_rejects_stale_promotion_and_old_primary_term() {
         .await
         .unwrap();
     assert_eq!(create.data, ClusterResponse::Ok);
+    let primary_allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("conditional", 0, "node-1")
+        .unwrap();
+    let replica_allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("conditional", 0, "node-2")
+        .unwrap();
 
     let mut stale_promotion = metadata.clone();
     {
@@ -747,6 +760,7 @@ async fn conditional_membership_rejects_stale_promotion_and_old_primary_term() {
             index_uuid: index_uuid.clone(),
             shard_id: 0,
             primary: "node-1".into(),
+            allocation_id: primary_allocation_id,
             expected_term: 1,
         })
         .await
@@ -759,6 +773,7 @@ async fn conditional_membership_rejects_stale_promotion_and_old_primary_term() {
             index_uuid: index_uuid.clone(),
             shard_id: 0,
             replica: "node-2".into(),
+            allocation_id: replica_allocation_id,
             primary: "node-1".into(),
             primary_term: 1,
         })
@@ -775,6 +790,7 @@ async fn conditional_membership_rejects_stale_promotion_and_old_primary_term() {
             index_uuid,
             shard_id: 0,
             replica: "node-2".into(),
+            allocation_id: replica_allocation_id,
             primary: "node-1".into(),
             primary_term: 2,
         })
@@ -787,6 +803,100 @@ async fn conditional_membership_rejects_stale_promotion_and_old_primary_term() {
     assert_eq!(routing.primary, "node-1");
     assert_eq!(routing.primary_term, 2);
     assert_eq!(routing.in_sync_replicas, ["node-2"]);
+}
+
+#[tokio::test]
+async fn delayed_mark_replica_in_sync_rejects_same_node_reallocation_aba() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "allocation-aba".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19367".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let mut metadata = make_index("allocation-aba");
+    metadata.number_of_replicas = 1;
+    {
+        let routing = metadata.shard_routing.get_mut(&0).unwrap();
+        routing.replicas = vec!["node-2".into()];
+        routing.in_sync_replicas.clear();
+    }
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let delayed_allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("allocation-aba", 0, "node-2")
+        .unwrap();
+    let primary_allocation_id = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("allocation-aba", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "allocation-aba".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: primary_allocation_id,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+
+    let delayed_admission = ClusterCommand::MarkReplicaInSync {
+        index_name: "allocation-aba".into(),
+        index_uuid,
+        shard_id: 0,
+        replica: "node-2".into(),
+        allocation_id: delayed_allocation_id,
+        primary: "node-1".into(),
+        primary_term: 2,
+    };
+
+    let mut removed = state_handle.read().unwrap().indices["allocation-aba"].clone();
+    {
+        let routing = removed.shard_routing.get_mut(&0).unwrap();
+        routing.replicas.clear();
+        routing.in_sync_replicas.clear();
+        routing.unassigned_replicas = 1;
+    }
+    assert_eq!(
+        raft.client_write(ClusterCommand::UpdateIndex { metadata: removed })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+
+    let mut reallocated = state_handle.read().unwrap().indices["allocation-aba"].clone();
+    assert!(reallocated.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]));
+    assert_eq!(
+        raft.client_write(ClusterCommand::UpdateIndex {
+            metadata: reallocated,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+
+    let response = raft.client_write(delayed_admission).await.unwrap();
+    assert!(
+        matches!(response.data, ClusterResponse::Error(_)),
+        "a delayed admission for the removed assignment must not admit the replacement"
+    );
 }
 
 #[tokio::test]
@@ -1127,6 +1237,16 @@ async fn grpc_conditional_membership_rpcs_apply_on_leader() {
             .data,
         ClusterResponse::Ok
     );
+    let primary_allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("grpc-conditional", 0, "node-1")
+        .unwrap();
+    let replica_allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("grpc-conditional", 0, "node-2")
+        .unwrap();
 
     let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
     let mut client = connect_grpc(addr).await;
@@ -1138,6 +1258,7 @@ async fn grpc_conditional_membership_rpcs_apply_on_leader() {
             shard_id: 0,
             primary_node_id: "node-1".into(),
             expected_term: 1,
+            allocation_id: Some(primary_allocation_id),
         }))
         .await
         .unwrap()
@@ -1152,6 +1273,7 @@ async fn grpc_conditional_membership_rpcs_apply_on_leader() {
             replica_node_id: "node-2".into(),
             primary_node_id: "node-1".into(),
             primary_term: 2,
+            allocation_id: Some(replica_allocation_id),
         }))
         .await
         .unwrap()
@@ -1162,6 +1284,595 @@ async fn grpc_conditional_membership_rpcs_apply_on_leader() {
     let routing = &state.indices["grpc-conditional"].shard_routing[&0];
     assert_eq!(routing.primary_term, 2);
     assert_eq!(routing.in_sync_replicas, ["node-2"]);
+}
+
+#[tokio::test]
+async fn grpc_delayed_admission_rejects_same_node_reallocation_from_stale_target_view() {
+    let (raft, source_state_handle) =
+        consensus::create_raft_instance_mem(1, "grpc-allocation-aba".into())
+            .await
+            .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19368".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let mut metadata = make_index("grpc-allocation-aba");
+    metadata.number_of_replicas = 1;
+    {
+        let routing = metadata.shard_routing.get_mut(&0).unwrap();
+        routing.replicas = vec!["node-2".into()];
+        routing.in_sync_replicas.clear();
+    }
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let primary_allocation_id = source_state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("grpc-allocation-aba", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "grpc-allocation-aba".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: primary_allocation_id,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    let target_manager = ClusterManager::new("stale-target".into());
+    target_manager.update_state(source_state_handle.read().unwrap().clone());
+    let stale_allocation_id = target_manager
+        .get_state()
+        .shard_allocation_id("grpc-allocation-aba", 0, "node-2")
+        .unwrap();
+
+    let mut removed = source_state_handle.read().unwrap().indices["grpc-allocation-aba"].clone();
+    {
+        let routing = removed.shard_routing.get_mut(&0).unwrap();
+        routing.replicas.clear();
+        routing.in_sync_replicas.clear();
+        routing.unassigned_replicas = 1;
+    }
+    assert_eq!(
+        raft.client_write(ClusterCommand::UpdateIndex { metadata: removed })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let mut reallocated =
+        source_state_handle.read().unwrap().indices["grpc-allocation-aba"].clone();
+    assert!(reallocated.allocate_unassigned_replicas(&["node-1".into(), "node-2".into()]));
+    assert_eq!(
+        raft.client_write(ClusterCommand::UpdateIndex {
+            metadata: reallocated,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    let current_allocation_id = source_state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("grpc-allocation-aba", 0, "node-2")
+        .unwrap();
+    assert_ne!(stale_allocation_id, current_allocation_id);
+
+    let addr = start_raft_grpc_server(raft, source_state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+    let response = client
+        .mark_replica_in_sync(tonic::Request::new(MarkReplicaInSyncRequest {
+            index_name: "grpc-allocation-aba".into(),
+            index_uuid,
+            shard_id: 0,
+            replica_node_id: "node-2".into(),
+            primary_node_id: "node-1".into(),
+            primary_term: 2,
+            allocation_id: Some(stale_allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!response.acknowledged);
+    assert!(response.error.contains("allocation mismatch"));
+    assert!(
+        source_state_handle.read().unwrap().indices["grpc-allocation-aba"].shard_routing[&0]
+            .in_sync_replicas
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn grpc_fail_shard_copy_removes_exact_replica_allocation() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-fail-copy".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19369".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let mut metadata = IndexMetadata::build_shard_routing(
+        "grpc-fail-copy",
+        1,
+        1,
+        &["node-1".into(), "node-2".into()],
+    );
+    metadata.shard_routing.get_mut(&0).unwrap().in_sync_replicas = vec!["node-2".into()];
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("grpc-fail-copy", 0, "node-2")
+        .unwrap();
+    let primary_allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("grpc-fail-copy", 0, "node-1")
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "grpc-fail-copy".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: primary_allocation_id,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+
+    let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+    let response = client
+        .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
+            index_name: "grpc-fail-copy".into(),
+            index_uuid,
+            shard_id: 0,
+            node_id: "node-2".into(),
+            allocation_id: Some(allocation_id),
+            promote_only: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.acknowledged, "{}", response.error);
+    let state = state_handle.read().unwrap();
+    let routing = &state.indices["grpc-fail-copy"].shard_routing[&0];
+    assert!(routing.replicas.is_empty());
+    assert!(routing.in_sync_replicas.is_empty());
+    assert_eq!(routing.unassigned_replicas, 1);
+    assert_eq!(
+        state.shard_allocation_id("grpc-fail-copy", 0, "node-2"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn grpc_promote_only_primary_failure_marks_unavailable_without_candidate() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-promote-only".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19372".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+    for node_id in ["node-1", "node-2"] {
+        assert_eq!(
+            raft.client_write(ClusterCommand::AddNode {
+                node: NodeInfo {
+                    id: node_id.into(),
+                    name: node_id.into(),
+                    host: "127.0.0.1".into(),
+                    transport_port: 0,
+                    http_port: 0,
+                    roles: vec![NodeRole::Data],
+                    raft_node_id: 0,
+                },
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+    }
+
+    let mut metadata = make_index("promote-only");
+    metadata.number_of_replicas = 1;
+    {
+        let routing = metadata.shard_routing.get_mut(&0).unwrap();
+        routing.replicas = vec!["node-2".into()];
+        routing.in_sync_replicas = vec!["node-2".into()];
+    }
+
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let promote_allocation = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("promote-only", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "promote-only".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: promote_allocation,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+
+    let addr = start_raft_grpc_server(raft.clone(), state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+    let promoted = client
+        .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
+            index_name: "promote-only".into(),
+            index_uuid,
+            shard_id: 0,
+            node_id: "node-1".into(),
+            allocation_id: Some(promote_allocation),
+            promote_only: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(promoted.acknowledged, "{}", promoted.error);
+    assert_eq!(
+        state_handle.read().unwrap().indices["promote-only"].shard_routing[&0].primary,
+        "node-2"
+    );
+
+    let metadata = make_index("single-copy");
+    let single_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let single_allocation = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("single-copy", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "single-copy".into(),
+            index_uuid: single_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: single_allocation,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    let rejected = client
+        .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
+            index_name: "single-copy".into(),
+            index_uuid: single_uuid,
+            shard_id: 0,
+            node_id: "node-1".into(),
+            allocation_id: Some(single_allocation),
+            promote_only: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(rejected.acknowledged, "{}", rejected.error);
+    assert_eq!(
+        state_handle
+            .read()
+            .unwrap()
+            .primary_allocation_id("single-copy", 0),
+        Some(single_allocation)
+    );
+    assert!(
+        state_handle
+            .read()
+            .unwrap()
+            .primary_unavailable("single-copy", 0)
+    );
+}
+
+#[tokio::test]
+async fn grpc_primary_availability_is_conditional_and_activation_still_clears_it() {
+    let (raft, state_handle) =
+        consensus::create_raft_instance_mem(1, "grpc-primary-unavailable".into())
+            .await
+            .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19373".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+    let metadata = make_index("unavailable");
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let allocation_id = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("unavailable", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "unavailable".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+    let unavailable = client
+        .mark_primary_unavailable(tonic::Request::new(MarkPrimaryUnavailableRequest {
+            index_name: "unavailable".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary_node_id: "node-1".into(),
+            allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(unavailable.acknowledged, "{}", unavailable.error);
+    assert!(
+        state_handle
+            .read()
+            .unwrap()
+            .primary_unavailable("unavailable", 0)
+    );
+    let term_before_available =
+        state_handle.read().unwrap().indices["unavailable"].shard_routing[&0].primary_term;
+    let stale_available = client
+        .mark_primary_available(tonic::Request::new(MarkPrimaryAvailableRequest {
+            index_name: "unavailable".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary_node_id: "node-1".into(),
+            allocation_id: Some(allocation_id),
+            primary_term: term_before_available + 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stale_available.acknowledged);
+    assert!(stale_available.error.contains("term mismatch"));
+
+    TransportClient::new()
+        .forward_mark_primary_available(
+            &NodeInfo {
+                id: "node-1".into(),
+                name: "node-1".into(),
+                host: addr.ip().to_string(),
+                transport_port: addr.port(),
+                http_port: 0,
+                roles: vec![NodeRole::Data],
+                raft_node_id: 1,
+            },
+            MarkPrimaryAvailableRequest {
+                index_name: "unavailable".into(),
+                index_uuid: index_uuid.clone(),
+                shard_id: 0,
+                primary_node_id: "node-1".into(),
+                allocation_id: Some(allocation_id),
+                primary_term: term_before_available,
+            },
+        )
+        .await
+        .unwrap();
+    {
+        let state = state_handle.read().unwrap();
+        assert!(!state.primary_unavailable("unavailable", 0));
+        assert_eq!(
+            state.indices["unavailable"].shard_routing[&0].primary_term,
+            term_before_available
+        );
+    }
+
+    let unavailable = client
+        .mark_primary_unavailable(tonic::Request::new(MarkPrimaryUnavailableRequest {
+            index_name: "unavailable".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary_node_id: "node-1".into(),
+            allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(unavailable.acknowledged, "{}", unavailable.error);
+
+    let activated = client
+        .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
+            index_name: "unavailable".into(),
+            index_uuid,
+            shard_id: 0,
+            primary_node_id: "node-1".into(),
+            expected_term: term_before_available,
+            allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(activated.acknowledged, "{}", activated.error);
+    assert!(
+        !state_handle
+            .read()
+            .unwrap()
+            .primary_unavailable("unavailable", 0)
+    );
+}
+
+#[tokio::test]
+async fn grpc_disk_loss_fails_closed_and_failure_report_restores_write_set() {
+    let (target_raft, target_state_handle) =
+        consensus::create_raft_instance_mem(1, "grpc-disk-loss-target".into())
+            .await
+            .unwrap();
+    consensus::bootstrap_single_node(&target_raft, 1, "127.0.0.1:19370".into())
+        .await
+        .unwrap();
+    wait_for_leader(&target_raft).await;
+
+    let mut metadata = IndexMetadata::build_shard_routing(
+        "grpc-disk-loss",
+        1,
+        1,
+        &["primary-node".into(), "replica-node".into()],
+    );
+    metadata.shard_routing.get_mut(&0).unwrap().in_sync_replicas = vec!["replica-node".into()];
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        target_raft
+            .client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let primary_allocation_id = target_state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("grpc-disk-loss", 0, "primary-node")
+        .unwrap();
+    assert_eq!(
+        target_raft
+            .client_write(ClusterCommand::ActivatePrimary {
+                index_name: "grpc-disk-loss".into(),
+                index_uuid: index_uuid.clone(),
+                shard_id: 0,
+                primary: "primary-node".into(),
+                allocation_id: primary_allocation_id,
+                expected_term: 1,
+            })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target_shards = Arc::new(ShardManager::new(
+        target_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let (target_addr, target_server) = start_raft_grpc_server_with_shard_manager(
+        target_raft,
+        target_state_handle.clone(),
+        target_shards.clone(),
+        "replica-node",
+    )
+    .await;
+
+    let source_manager = ClusterManager::new("grpc-disk-loss-source".into());
+    let mut source_state = target_state_handle.read().unwrap().clone();
+    source_state.add_node(NodeInfo {
+        id: "replica-node".into(),
+        name: "replica-node".into(),
+        host: "127.0.0.1".into(),
+        transport_port: target_addr.port(),
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    source_manager.update_state(source_state);
+
+    let failed = ferrissearch::replication::replicate_write(
+        &TransportClient::new(),
+        &source_manager.get_state(),
+        "grpc-disk-loss",
+        0,
+        "blocked",
+        &serde_json::json!({"value": 1}),
+        "index",
+        0,
+    )
+    .await;
+    assert!(failed.is_err(), "missing replica disk must fail the write");
+    assert!(!target_dir.path().join(&index_uuid).join("shard_0").exists());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = target_state_handle.read().unwrap().clone();
+        if state.indices["grpc-disk-loss"].shard_routing[&0]
+            .replicas
+            .is_empty()
+        {
+            source_manager.update_state(state);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "FailShardCopy did not remove the disk-lost replica"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let resumed = ferrissearch::replication::replicate_write(
+        &TransportClient::new(),
+        &source_manager.get_state(),
+        "grpc-disk-loss",
+        0,
+        "resumed",
+        &serde_json::json!({"value": 2}),
+        "index",
+        1,
+    )
+    .await;
+    assert!(
+        resumed.is_ok(),
+        "the failed copy must leave the required acknowledgement set"
+    );
+    target_server.abort();
 }
 
 #[tokio::test]
@@ -1180,6 +1891,7 @@ async fn grpc_conditional_membership_rpcs_reject_non_leader() {
             shard_id: 0,
             primary_node_id: "node-2".into(),
             expected_term: 1,
+            allocation_id: Some(1),
         }))
         .await
         .unwrap_err();
@@ -1193,10 +1905,49 @@ async fn grpc_conditional_membership_rpcs_reject_non_leader() {
             replica_node_id: "node-3".into(),
             primary_node_id: "node-2".into(),
             primary_term: 1,
+            allocation_id: Some(1),
         }))
         .await
         .unwrap_err();
     assert_eq!(mark_error.code(), tonic::Code::FailedPrecondition);
+
+    let unavailable_error = client
+        .mark_primary_unavailable(tonic::Request::new(MarkPrimaryUnavailableRequest {
+            index_name: "idx".into(),
+            index_uuid: "uuid".into(),
+            shard_id: 0,
+            primary_node_id: "node-2".into(),
+            allocation_id: Some(1),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unavailable_error.code(), tonic::Code::FailedPrecondition);
+
+    let available_error = client
+        .mark_primary_available(tonic::Request::new(MarkPrimaryAvailableRequest {
+            index_name: "idx".into(),
+            index_uuid: "uuid".into(),
+            shard_id: 0,
+            primary_node_id: "node-2".into(),
+            allocation_id: Some(1),
+            primary_term: 1,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(available_error.code(), tonic::Code::FailedPrecondition);
+
+    let fail_error = client
+        .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
+            index_name: "idx".into(),
+            index_uuid: "uuid".into(),
+            shard_id: 0,
+            node_id: "node-2".into(),
+            allocation_id: Some(1),
+            promote_only: false,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(fail_error.code(), tonic::Code::FailedPrecondition);
 }
 
 #[tokio::test]

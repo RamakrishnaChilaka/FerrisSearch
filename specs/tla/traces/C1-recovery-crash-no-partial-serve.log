@@ -1,0 +1,1972 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 7 and seed 5674188202452674610 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 94014] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RaftLog
+Semantic processing of module ShardReplication
+Semantic processing of module PeerRecovery
+Semantic processing of module Faults
+Semantic processing of module Invariants
+Starting... (2026-09-26 15:05:22)
+Computing initial states...
+Finished computing initial states: 2 states generated, with 1 of them distinct at 2026-09-26 15:05:22.
+Progress(20) at 2026-09-26 15:05:25: 196,179 states generated (196,179 s/min), 48,698 distinct states found (48,698 ds/min), 12,149 states left on queue.
+Error: Invariant NoPartialServe is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Unused">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 1
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None")
+/\ recoveryAttempts = 0
+/\ writeTarget = <<"NO_NODE">>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 0)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 2: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None")
+/\ recoveryAttempts = 0
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 0)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 3: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Starting")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 4: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "SnapshotReady")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 5: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> TRUE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Installing")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Recovering")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 6: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "CatchingUp")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Recovering")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 7: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Ready")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Recovering")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 8: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Preparing")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> TRUE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Recovering")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 9: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Finalizing")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Recovering")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 10: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "AwaitingComplete")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 11: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 12: <Crash line 38, col 5 to line 70, col 27 of module Faults>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> FALSE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> FALSE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 13: <SuspectAndRemove line 171, col 5 to line 194, col 30 of module Faults>
+/\ pendingRaft = { [ target |-> n2,
+    actor |-> n1,
+    kind |-> "UpdateRouting",
+    newReplicas |-> {},
+    newPrimary |-> n1,
+    newUnassigned |-> 1,
+    expectedPrimary |-> "NO_NODE",
+    expectedTerm |-> 0 ] }
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> FALSE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> FALSE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 14: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {},
+  unassigned |-> 1,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> FALSE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = << [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {},
+           unassigned |-> 1,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 1,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ] >>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> FALSE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 15: <Restart line 73, col 5 to line 90, col 30 of module Faults>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {},
+  unassigned |-> 1,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 1)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = << [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {},
+           unassigned |-> 1,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 1,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ] >>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 16: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 1)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {},
+  unassigned |-> 1,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 1)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = << [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {},
+           unassigned |-> 1,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 1,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ] >>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {},
+        unassigned |-> 1,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 17: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+/\ pendingRaft = { [ target |-> n2,
+    actor |-> n2,
+    kind |-> "UpdateRouting",
+    newReplicas |-> {n2},
+    newPrimary |-> n1,
+    newUnassigned |-> 0,
+    expectedPrimary |-> "NO_NODE",
+    expectedTerm |-> 0 ] }
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 1)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {},
+  unassigned |-> 1,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 1)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = << [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {},
+           unassigned |-> 1,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 1,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ] >>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {},
+        unassigned |-> 1,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 18: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 1)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 1)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = << [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {},
+           unassigned |-> 1,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 1,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ],
+   [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {n2},
+           unassigned |-> 0,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n2,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {n2},
+           newPrimary |-> n1,
+           newUnassigned |-> 0,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ] >>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {},
+        unassigned |-> 1,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 19: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = { [ target |-> n2,
+    actor |-> n1,
+    kind |-> "MarkReplicaInSync",
+    newReplicas |-> {},
+    newPrimary |-> n1,
+    newUnassigned |-> 0,
+    expectedPrimary |-> n1,
+    expectedTerm |-> 1 ] }
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 1)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 1)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = << [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {},
+           unassigned |-> 1,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 1,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ],
+   [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {n2},
+           unassigned |-> 0,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n2,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {n2},
+           newPrimary |-> n1,
+           newUnassigned |-> 0,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ] >>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {},
+        unassigned |-> 1,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 20: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingRaft = { [ target |-> n2,
+    actor |-> n1,
+    kind |-> "MarkReplicaInSync",
+    newReplicas |-> {},
+    newPrimary |-> n1,
+    newUnassigned |-> 0,
+    expectedPrimary |-> n1,
+    expectedTerm |-> 1 ] }
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 1)
+/\ installMarker = (n1 :> FALSE @@ n2 :> TRUE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 1)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = << [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {},
+           unassigned |-> 1,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 1,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ],
+   [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {n2},
+           unassigned |-> 0,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n2,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {n2},
+           newPrimary |-> n1,
+           newUnassigned |-> 0,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ] >>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "InstallMarker")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {},
+        unassigned |-> 1,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+State 21: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+/\ pendingRaft = {}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = <<"Put">>
+/\ writeEpoch = <<0>>
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 1)
+/\ installMarker = (n1 :> FALSE @@ n2 :> TRUE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  inSync |-> {n2},
+  replicas |-> {n2},
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = FALSE
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE">>
+/\ writeSeq = <<0>>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 1)
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 1
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeStatus = <<"Routed">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ writeRequired = <<{}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 2
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+/\ recoveryAttempts = 1
+/\ writeTarget = <<n1>>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = <<0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = <<d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = << [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {},
+           unassigned |-> 1,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 1,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ],
+   [ state |->
+         [ primary |-> n1,
+           inSync |-> {},
+           replicas |-> {n2},
+           unassigned |-> 0,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n2,
+           kind |-> "UpdateRouting",
+           newReplicas |-> {n2},
+           newPrimary |-> n1,
+           newUnassigned |-> 0,
+           expectedPrimary |-> "NO_NODE",
+           expectedTerm |-> 0 ],
+     accepted |-> TRUE ],
+   [ state |->
+         [ primary |-> n1,
+           inSync |-> {n2},
+           replicas |-> {n2},
+           unassigned |-> 0,
+           members |-> {n1, n2},
+           term |-> 1 ],
+     command |->
+         [ target |-> n2,
+           actor |-> n1,
+           kind |-> "MarkReplicaInSync",
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 0,
+           expectedPrimary |-> n1,
+           expectedTerm |-> 1 ],
+     accepted |-> TRUE ] >>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "InstallMarker")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {n2},
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        inSync |-> {},
+        replicas |-> {},
+        unassigned |-> 1,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeWait = <<{}>>
+
+317748 states generated, 77049 distinct states found, 16711 states left on queue.
+The depth of the complete state graph search is 22.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 9 and the 95th percentile is 3).
+Finished in 05s at (2026-09-26 15:05:27)

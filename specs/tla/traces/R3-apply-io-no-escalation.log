@@ -1,0 +1,416 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 4 and seed 5384932247377979352 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 53037] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_ApplyStorageFailure.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
+Parsing file /tmp/ferrissearch-tla.YkcBPL/storage-apply-no-escalation/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.YkcBPL/storage-apply-no-escalation/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.YkcBPL/storage-apply-no-escalation/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.YkcBPL/storage-apply-no-escalation/java-tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RaftLog
+Semantic processing of module ShardReplication
+Semantic processing of module PeerRecovery
+Semantic processing of module Faults
+Semantic processing of module Invariants
+Semantic processing of module MC_ApplyStorageFailure
+Starting... (2026-09-27 11:16:55)
+Implied-temporal checking--satisfiability problem has 2 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-27 11:16:56.
+Progress(21) at 2026-09-27 11:16:56: 65 states generated, 53 distinct states found, 0 states left on queue.
+Checking 2 branches of temporal properties for the complete state space with 106 total distinct states at (2026-09-27 11:16:56)
+Error: Temporal properties were violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ pendingRaft = {}
+/\ raftVoters = {n1, n2, n3}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0) @@ n3 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ copyAllocation = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ writeKind = <<"Put", "Put", "Put">>
+/\ writeEpoch = <<0, 0, 0>>
+/\ staleApplySafe = TRUE
+/\ raftLeader = n1
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ routing = [ initialized |-> TRUE,
+  primary |-> n1,
+  inSync |-> {n2, n3},
+  term |-> 1,
+  replicas |-> {n2, n3},
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+  unassigned |-> 0,
+  members |-> {n1, n2, n3} ]
+/\ faultsStopped = FALSE
+/\ replicaFence = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE", "NO_NODE", "NO_NODE">>
+/\ writeSeq = <<0, 0, 0>>
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ pins = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ copyUuid = (n1 :> "INDEX_UUID" @@ n2 :> "INDEX_UUID" @@ n3 :> "INDEX_UUID")
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ writeStatus = <<"Unused", "Unused", "Unused">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ writeRequired = <<{}, {}, {}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ nextWrite = 1
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "None")
+/\ recoveryAttempts = 0
+/\ writeTarget = <<"NO_NODE", "NO_NODE", "NO_NODE">>
+/\ committed = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ failed = {}
+/\ durableReplicaFence = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
+/\ ops = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ writeTerm = <<0, 0, 0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ activePrimaryApplySafe = TRUE
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ writeDoc = <<d1, d1, d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ initialized |-> TRUE,
+        primary |-> n1,
+        inSync |-> {n2, n3},
+        term |-> 1,
+        replicas |-> {n2, n3},
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2, n3} ] @@
+  n2 :>
+      [ initialized |-> TRUE,
+        primary |-> n1,
+        inSync |-> {n2, n3},
+        term |-> 1,
+        replicas |-> {n2, n3},
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2, n3} ] @@
+  n3 :>
+      [ initialized |-> TRUE,
+        primary |-> n1,
+        inSync |-> {n2, n3},
+        term |-> 1,
+        replicas |-> {n2, n3},
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2, n3} ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Idle")
+/\ writeWait = <<{}, {}, {}>>
+
+State 2: <ApplyStorageClientWrite1 line 24, col 5 to line 28, col 58 of module MC_ApplyStorageFailure>
+/\ writeStatus = <<"Routed", "Unused", "Unused">>
+/\ nextWrite = 2
+/\ writeTarget = <<n1, "NO_NODE", "NO_NODE">>
+
+State 3: <ApplyStoragePrimaryAccept line 62, col 9 to line 65, col 62 of module MC_ApplyStorageFailure>
+/\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 0) @@ n3 :> (d1 :> 0))
+/\ nextSeq = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 0)
+/\ durableOps = (n1 :> {1} @@ n2 :> {} @@ n3 :> {})
+/\ writePrimary = <<n1, "NO_NODE", "NO_NODE">>
+/\ writeStatus = <<"Replicating", "Unused", "Unused">>
+/\ writeRequired = <<{n2, n3}, {}, {}>>
+/\ ops = (n1 :> {1} @@ n2 :> {} @@ n3 :> {})
+/\ writeTerm = <<1, 0, 0>>
+/\ sharedHolders = (n1 :> {1} @@ n2 :> {} @@ n3 :> {})
+/\ messages = { [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n2,
+    targetAllocation |-> 1,
+    write |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n3,
+    targetAllocation |-> 1,
+    write |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{n2, n3}, {}, {}>>
+
+State 4: <ApplyStorageReplicaApply line 77, col 5 to line 80, col 71 of module MC_ApplyStorageFailure>
+/\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 0))
+/\ nextSeq = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0)
+/\ durableOps = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {})
+/\ ops = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {})
+/\ messages = { [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n3,
+    targetAllocation |-> 1,
+    write |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ term |-> 1,
+    kind |-> "ReplicaAck",
+    from |-> n2,
+    to |-> n1,
+    targetAllocation |-> 1,
+    write |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 5: <ApplyStorageReplicaApply line 77, col 5 to line 80, col 71 of module MC_ApplyStorageFailure>
+/\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
+/\ nextSeq = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
+/\ durableOps = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {1})
+/\ ops = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {1})
+/\ messages = { [ term |-> 1,
+    kind |-> "ReplicaAck",
+    from |-> n2,
+    to |-> n1,
+    targetAllocation |-> 1,
+    write |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ term |-> 1,
+    kind |-> "ReplicaAck",
+    from |-> n3,
+    to |-> n1,
+    targetAllocation |-> 1,
+    write |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 6: <ApplyStorageDeliverAck line 92, col 5 to line 96, col 62 of module MC_ApplyStorageFailure>
+/\ messages = { [ term |-> 1,
+    kind |-> "ReplicaAck",
+    from |-> n3,
+    to |-> n1,
+    targetAllocation |-> 1,
+    write |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{n3}, {}, {}>>
+
+State 7: <ApplyStorageDeliverAck line 92, col 5 to line 96, col 62 of module MC_ApplyStorageFailure>
+/\ messages = {}
+/\ writeWait = <<{}, {}, {}>>
+
+State 8: <ApplyStoragePrimaryAck line 107, col 9 to line 110, col 62 of module MC_ApplyStorageFailure>
+/\ acked = {1}
+/\ writeStatus = <<"Acked", "Unused", "Unused">>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+
+State 9: <ApplyStorageFailureOccurs line 113, col 5 to line 116, col 32 of module MC_ApplyStorageFailure>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "ApplyFailing" @@ n3 :> "Active")
+
+State 10: <ApplyStorageClientWrite2 line 31, col 5 to line 36, col 58 of module MC_ApplyStorageFailure>
+/\ writeStatus = <<"Acked", "Routed", "Unused">>
+/\ nextWrite = 3
+/\ writeTarget = <<n1, n1, "NO_NODE">>
+
+State 11: <ApplyStoragePrimaryAccept line 62, col 9 to line 65, col 62 of module MC_ApplyStorageFailure>
+/\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
+/\ nextSeq = (n1 :> 2 @@ n2 :> 1 @@ n3 :> 1)
+/\ durableOps = (n1 :> {1, 2} @@ n2 :> {1} @@ n3 :> {1})
+/\ writePrimary = <<n1, n1, "NO_NODE">>
+/\ writeSeq = <<0, 1, 0>>
+/\ writeStatus = <<"Acked", "Replicating", "Unused">>
+/\ writeRequired = <<{n2, n3}, {n2, n3}, {}>>
+/\ ops = (n1 :> {1, 2} @@ n2 :> {1} @@ n3 :> {1})
+/\ writeTerm = <<1, 1, 0>>
+/\ sharedHolders = (n1 :> {2} @@ n2 :> {} @@ n3 :> {})
+/\ messages = { [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n2,
+    targetAllocation |-> 1,
+    write |-> 2,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n3,
+    targetAllocation |-> 1,
+    write |-> 2,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{}, {n2, n3}, {}>>
+
+State 12: <ApplyStorageReplicaApply line 77, col 5 to line 80, col 71 of module MC_ApplyStorageFailure>
+/\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 2))
+/\ nextSeq = (n1 :> 2 @@ n2 :> 1 @@ n3 :> 2)
+/\ durableOps = (n1 :> {1, 2} @@ n2 :> {1} @@ n3 :> {1, 2})
+/\ ops = (n1 :> {1, 2} @@ n2 :> {1} @@ n3 :> {1, 2})
+/\ messages = { [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n2,
+    targetAllocation |-> 1,
+    write |-> 2,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ term |-> 1,
+    kind |-> "ReplicaAck",
+    from |-> n3,
+    to |-> n1,
+    targetAllocation |-> 1,
+    write |-> 2,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 13: <ApplyStorageReplicaMutationFails line 86, col 5 to line 89, col 71 of module MC_ApplyStorageFailure>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "ApplyRetrying" @@ n3 :> "Active")
+/\ messages = { [ term |-> 1,
+    kind |-> "ReplicaAck",
+    from |-> n3,
+    to |-> n1,
+    targetAllocation |-> 1,
+    write |-> 2,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ term |-> 1,
+    kind |-> "ReplicaNack",
+    from |-> n2,
+    to |-> n1,
+    targetAllocation |-> 1,
+    write |-> 2,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 14: <ApplyStorageDeliverNack line 99, col 5 to line 103, col 62 of module MC_ApplyStorageFailure>
+/\ writeStatus = <<"Acked", "Failed", "Unused">>
+/\ failed = {2}
+/\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ messages = {}
+
+State 15: <ApplyStorageRetryClientWrite line 52, col 5 to line 58, col 58 of module MC_ApplyStorageFailure>
+/\ writeStatus = <<"Acked", "Failed", "Routed">>
+/\ nextWrite = 4
+/\ writeTarget = <<n1, n1, n1>>
+
+State 16: <ApplyStoragePrimaryAccept line 62, col 9 to line 65, col 62 of module MC_ApplyStorageFailure>
+/\ docValue = (n1 :> (d1 :> 3) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 2))
+/\ nextSeq = (n1 :> 3 @@ n2 :> 1 @@ n3 :> 2)
+/\ durableOps = (n1 :> {1, 2, 3} @@ n2 :> {1} @@ n3 :> {1, 2})
+/\ writePrimary = <<n1, n1, n1>>
+/\ writeSeq = <<0, 1, 2>>
+/\ writeStatus = <<"Acked", "Failed", "Replicating">>
+/\ writeRequired = <<{n2, n3}, {n2, n3}, {n2, n3}>>
+/\ ops = (n1 :> {1, 2, 3} @@ n2 :> {1} @@ n3 :> {1, 2})
+/\ writeTerm = <<1, 1, 1>>
+/\ sharedHolders = (n1 :> {3} @@ n2 :> {} @@ n3 :> {})
+/\ messages = { [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n2,
+    targetAllocation |-> 1,
+    write |-> 3,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n3,
+    targetAllocation |-> 1,
+    write |-> 3,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{}, {n2, n3}, {n2, n3}>>
+
+State 17: <ApplyStorageReplicaMutationFails line 86, col 5 to line 89, col 71 of module MC_ApplyStorageFailure>
+/\ messages = { [ term |-> 1,
+    kind |-> "Replicate",
+    from |-> n1,
+    to |-> n3,
+    targetAllocation |-> 1,
+    write |-> 3,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ term |-> 1,
+    kind |-> "ReplicaNack",
+    from |-> n2,
+    to |-> n1,
+    targetAllocation |-> 1,
+    write |-> 3,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    toEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 18: <ApplyStorageDeliverNack line 99, col 5 to line 103, col 62 of module MC_ApplyStorageFailure>
+/\ writeStatus = <<"Acked", "Failed", "Failed">>
+/\ failed = {2, 3}
+/\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ messages = {}
+
+State 19: Stuttering
+Finished checking temporal properties in 00s at 2026-09-27 11:16:56
+65 states generated, 53 distinct states found, 0 states left on queue.
+Finished in 02s at (2026-09-27 11:16:56)

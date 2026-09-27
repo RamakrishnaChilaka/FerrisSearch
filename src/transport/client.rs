@@ -591,27 +591,16 @@ impl TransportClient {
     }
 
     /// Replicate a single document operation to a replica shard on a remote node.
-    #[allow(clippy::too_many_arguments)]
     pub async fn replicate_to_shard(
         &self,
         node: &NodeInfo,
-        index_name: &str,
-        shard_id: u32,
-        doc_id: &str,
-        payload: &serde_json::Value,
-        op: &str,
-        seq_no: u64,
+        request: ReplicateDocRequest,
     ) -> Result<u64, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let request = tonic::Request::new(ReplicateDocRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            doc_id: doc_id.to_string(),
-            payload_json: serde_json::to_vec(payload)?,
-            op: op.to_string(),
-            seq_no,
-        });
-        let response = client.replicate_doc(request).await?.into_inner();
+        let response = client
+            .replicate_doc(tonic::Request::new(request))
+            .await?
+            .into_inner();
         if response.success {
             Ok(response.local_checkpoint)
         } else {
@@ -623,32 +612,13 @@ impl TransportClient {
     pub async fn replicate_bulk_to_shard(
         &self,
         node: &NodeInfo,
-        index_name: &str,
-        shard_id: u32,
-        docs: &[(String, serde_json::Value)],
-        start_seq_no: u64,
+        request: ReplicateBulkRequest,
     ) -> Result<u64, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let ops: Vec<ReplicateDocRequest> = docs
-            .iter()
-            .enumerate()
-            .map(|(i, (id, payload))| {
-                Ok::<ReplicateDocRequest, serde_json::Error>(ReplicateDocRequest {
-                    index_name: index_name.to_string(),
-                    shard_id,
-                    doc_id: id.clone(),
-                    payload_json: serde_json::to_vec(payload)?,
-                    op: "index".to_string(),
-                    seq_no: start_seq_no + i as u64,
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        let request = tonic::Request::new(ReplicateBulkRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            ops,
-        });
-        let response = client.replicate_bulk(request).await?.into_inner();
+        let response = client
+            .replicate_bulk(tonic::Request::new(request))
+            .await?
+            .into_inner();
         if response.success {
             Ok(response.local_checkpoint)
         } else {
@@ -839,24 +809,14 @@ impl TransportClient {
     pub async fn forward_activate_primary(
         &self,
         master: &NodeInfo,
-        index_name: &str,
-        index_uuid: &str,
-        shard_id: u32,
-        primary_node_id: &str,
-        expected_term: u64,
+        request: ActivatePrimaryRequest,
     ) -> Result<(), anyhow::Error> {
         let mut client = self
             .connect(&master.host, master.transport_port)
             .await
             .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
         let response = client
-            .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
-                index_name: index_name.to_string(),
-                index_uuid: index_uuid.to_string(),
-                shard_id,
-                primary_node_id: primary_node_id.to_string(),
-                expected_term,
-            }))
+            .activate_primary(tonic::Request::new(request))
             .await
             .map_err(|e| anyhow::anyhow!("ActivatePrimary RPC: {e}"))?
             .into_inner();
@@ -865,6 +825,77 @@ impl TransportClient {
         }
         if !response.acknowledged {
             return Err(anyhow::anyhow!("ActivatePrimary was not acknowledged"));
+        }
+        Ok(())
+    }
+
+    pub async fn forward_mark_primary_unavailable(
+        &self,
+        master: &NodeInfo,
+        request: MarkPrimaryUnavailableRequest,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
+        let response = client
+            .mark_primary_unavailable(tonic::Request::new(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("MarkPrimaryUnavailable RPC: {e}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.acknowledged {
+            return Err(anyhow::anyhow!(
+                "MarkPrimaryUnavailable was not acknowledged"
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn forward_mark_primary_available(
+        &self,
+        master: &NodeInfo,
+        request: MarkPrimaryAvailableRequest,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
+        let response = client
+            .mark_primary_available(tonic::Request::new(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("MarkPrimaryAvailable RPC: {e}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.acknowledged {
+            return Err(anyhow::anyhow!("MarkPrimaryAvailable was not acknowledged"));
+        }
+        Ok(())
+    }
+
+    pub async fn forward_fail_shard_copy(
+        &self,
+        master: &NodeInfo,
+        request: FailShardCopyRequest,
+    ) -> Result<(), anyhow::Error> {
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
+        let response = client
+            .fail_shard_copy(tonic::Request::new(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("FailShardCopy RPC: {e}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        if !response.acknowledged {
+            return Err(anyhow::anyhow!("FailShardCopy was not acknowledged"));
         }
         Ok(())
     }

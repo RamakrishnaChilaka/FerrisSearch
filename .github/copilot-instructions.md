@@ -55,6 +55,7 @@ lives in [`docs/ai-agent-guide.md`](../docs/ai-agent-guide.md).
 | Config, workers, tasks, metrics, CI | `operations.instructions.md` |
 | CLI | `cli.instructions.md` |
 | Tests | `testing.instructions.md` |
+| TLA+ replication and recovery model | `testing.instructions.md`, `documentation.instructions.md`, `specs/tla/README.md` |
 | Docs and benchmark claims | `documentation.instructions.md` |
 
 ## Architecture At A Glance
@@ -93,10 +94,20 @@ architecture decision.
   and automatic promotion use only `ShardRoutingEntry.in_sync_replicas`; an
   assigned but out-of-sync copy is never promotable. If no in-sync copy
   survives, keep the shard unavailable rather than promoting stale data.
+- **Shard-copy authority includes an allocation ID.** Every primary and replica
+  assignment has a Raft-owned ID derived from the assigning log position.
+  Removal clears it, same-node reassignment gets a fresh ID, and recovery,
+  admission, open, replication, activation, and failure reporting compare the
+  exact current ID.
+- **Local copy identity and replica fences are durable.** Each served
+  `local_shards` copy atomically persists index UUID, allocation ID, and the
+  highest accepted primary term. Missing, malformed, or mismatched identity
+  fails closed; replica RPCs reject below the maximum of applied-view term and
+  durable fence before WAL or engine mutation.
 - **Peer recovery admission is barriered and conditional.** A target installs a
   committed Tantivy file snapshot, replays the pinned WAL suffix, reaches the
   primary's exclusive write-barrier head, and enters the in-sync set only
-  through a `(primary, primary_term)` Raft compare-and-set. Never release an
+  through an `(allocation_id, primary, primary_term)` Raft compare-and-set. Never release an
   unresolved admission barrier by guessing whether membership committed.
   Idle/session reaping cannot release a settling barrier; only settlement may
   release it after observing admission/impossibility or fencing the old term.
@@ -161,6 +172,7 @@ Choose checks by risk; do not run a full Rust gate for unrelated prose changes.
 | Localized Rust behavior | Formatting and the narrowest result-level regression |
 | Public traits, persistence, transport, or concurrency | Compile affected consumers/features and add boundary-level regressions |
 | Broad cross-module Rust changes | Focused checks first, then the canonical CI checks below |
+| Replication, recovery, routing, allocation, or fencing protocol | Affected Rust suites plus `./scripts/tla/check.sh`; update the contract in `specs/tla/README.md` when behavior changes |
 
 Do not weaken assertions, ignore failures, or suppress lints to obtain a pass.
 Rerun checks affected by subsequent edits, not equivalent successful commands
@@ -174,8 +186,12 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build
 cargo test
+./scripts/tla/check.sh
 ```
 
+`./scripts/tla/check.sh` runs the fast bounded TLA+ matrix. It needs Java. It
+downloads the pinned TLA+ tools jar when it is missing, or uses
+`TLA2TOOLS_JAR`, and verifies the jar's SHA-256 before running.
 `./scripts/ci-local.sh` mirrors CI. Start with the narrowest relevant command,
 then widen based on impact. Examples:
 
@@ -208,6 +224,7 @@ do not report a skipped external-service suite as exercised.
 | `src/transport/`, `proto/` | Internal gRPC protocol and clients |
 | `src/wal/` | Generation-based translog and recovery reads |
 | `tests/` | Integration, restart, SQL logic, and object-store coverage |
+| `specs/tla/`, `scripts/tla/` | Bounded TLA+ model of shard replication and recovery, and its runner |
 | `docs/` | Architecture, operations, evidence, and roadmap |
 
 `src/indexing/` is currently a placeholder; do not describe it as a completed

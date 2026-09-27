@@ -150,19 +150,130 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > or unreferenced-generation deletion against an active writer. Test-only live
 > WAL inspections use the same non-mutating engine path.
 >
-> **Known liveness limit:** remove-and-re-add of a target node while its
-> finalized copy is awaiting membership can remain `Unknown`. Current routing
-> identifies copies by node ID, so the target cannot prove whether it is still
-> the old assignment or a replacement. It remains caught up but
-> `INITIALIZING`/yellow rather than risking destructive recovery. Allocation IDs
-> are required to resolve this ABA case.
+> **Round-7 corrections — September 27, 2026:** WAL replay now validates the
+> internal `_doc_id` and operation payload, deletes that ID for every
+> operation, and adds a document back only for an index operation. Startup,
+> failed-writer reconstruction, peer-recovery catch-up, and legacy
+> `RecoverReplica` therefore preserve deletes and fail closed on malformed
+> operation envelopes. Blocking maintenance and snapshot preparation acquire
+> the writer through the same rebuild-and-replay path as document writes, so
+> an idle repaired primary can recover and serve peer recovery without an
+> unrelated client mutation. Replay holds the shard translog lock for the
+> entire retained suffix, blocking writes to that shard; this can be a long
+> critical section when refresh is disabled.
 >
-> **Known same-name reuse limit:** the generic shard-open fast path is still
-> keyed by `(index_name, shard_id)` and does not verify a requested UUID when an
-> engine is already present. The reviewed detached-reopen path is fenced, but a
-> non-coordinator that observes delete/recreate ordering late can still retain
-> a pre-existing same-name engine. UUID/allocation validation on every open
-> path remains future work.
+> Both the startup delete-resurrection defect and the transient-commit
+> acknowledged-write loss existed at the `8f17172` main baseline.
+>
+> **Allocation identity and replica fencing — September 26, 2026:** Raft now
+> assigns every shard copy an allocation ID derived from the assigning log
+> position. Recovery start, source sessions, install state, pending membership,
+> admission, activation, replication, and copy-failure reports retain that
+> identity. Local copies atomically persist index UUID, allocation ID, and a
+> monotonic replica term fence; replica RPCs validate those fields and the
+> recovery gate before WAL mutation. CreateIndex replicas start out of sync,
+> first activation marks the shard initialized, and only the initial primary
+> allocation may be created empty before activation. An unopenable initialized
+> replica reports `FailShardCopy` and its exact allocation is removed. Primary
+> reports are promote-only: an in-sync survivor is promoted when available,
+> while a primary without a survivor retains its allocation and stays
+> unavailable rather than being converted into a metadata-red empty-copy path.
+>
+> Allocation IDs now resolve remove-and-re-add ABA for recovery start,
+> admission, pending-target observation, and copy-failure reports. Assigned
+> read/write/replication opens validate UUID and allocation identity even when
+> an engine is already present.
+>
+> **Allocation/fencing review corrections — September 27, 2026:** an unchanged
+> red shard now preserves its absent primary allocation through `UpdateIndex`,
+> so healthy sibling shards can fail over, allocate replicas, and receive
+> settings changes. Pending recovery observation checks admission first, then
+> rejects an exact target allocation when the observed primary changed or its
+> term advanced; `MarkReplicaInSync` additionally requires an initialized shard
+> with a present primary allocation. Target restart restores an exact matching
+> awaiting-membership marker and reopens the finalized copy before scheduling
+> recovery. Target begin/prepare and source-session polling refuse to restart a
+> finalized or settling transfer. Controlled retryable recovery failures clean
+> their partial install and retain the same assignment. Definitive pending
+> rejection deliberately restores an install marker; lifecycle then fails the
+> replica allocation and schedules a fresh allocation rather than reusing a
+> recovery result produced under obsolete primary authority. Duplicate failure
+> reports are rate-limited per allocation.
+>
+> The pre-activation empty-primary rule depends on a node's applied routing view
+> not moving backward. Production startup constructs OpenRaft over the
+> persistent `raft.db`, and OpenRaft replays committed state before that view is
+> used for normal shard service. Losing `raft.db` and rejoining under the same
+> node name does not satisfy this assumption; retained shard storage must not be
+> treated as a fresh pre-activation allocation in that scenario.
+>
+> **Storage-failure and idle-activation corrections — September 27, 2026:**
+> identity, marker, WAL manifest/frame, and Tantivy metadata/segment
+> decode-validation failures are definitive immediately. Other filesystem and
+> engine I/O uses operation-specific per-copy retry state with exponential
+> backoff (1 second up to 5 seconds) and escalates only after at least three
+> failed attempts spanning the configured window, 60 seconds by default.
+> Replica escalation removes the exact allocation. Primary
+> escalation submits a promote-only failure only when an in-sync candidate
+> exists; otherwise routing is retained and the shard remains unavailable.
+> Request and lifecycle opens share the same retry state, so request traffic
+> cannot bypass backoff. Node lifecycle also invokes the same idempotent
+> primary-activation path used by writes after startup or promotion, allowing
+> an idle pending target to observe admission or a newer term. If publication
+> of the durable pending marker succeeds but its directory fsync reports an
+> error, the in-memory target state is still advanced (and retry cleanup can
+> reconstruct it from the marker) without a process restart. Recovery aborts
+> verify the currently registered index UUID before touching disk, so a delayed
+> abort cannot recreate a deleted index incarnation.
+>
+> **Availability-status and Apply corrections — September 27, 2026:** a
+> write-only failure no longer bypasses the local activation cache or causes
+> periodic primary-term bumps. `primary_unavailable` remains set for the exact
+> allocation and term until the first successful local primary write commits a
+> conditional `MarkPrimaryAvailable`. Definitive and open-level failures are
+> quarantined only after report throttling; repaired storage then requires a
+> fresh `ActivatePrimary`, which clears the flag while advancing the term.
+> Apply-level escalation keeps the existing engine open for reads and does not
+> itself quarantine, reopen, or replay a WAL-appended but engine-failed
+> operation. Such an operation has an unknown outcome. In production this
+> failure means the Tantivy writer was killed, so the next commit fails, the
+> rebuilt writer replays the operation on this copy, and restart replay applies
+> it too. When the failure is on the primary, replicas never receive the
+> operation, so copies diverge. A force-merge
+> writer-replacement failure leaves a typed unavailable-writer state. The next
+> write or blocking maintenance/snapshot operation rebuilds the writer with the
+> normal heap budget and automatic merge policy, then replays the retained WAL
+> suffix before continuing. Transient failure can heal there. Persistent
+> rebuild or replay I/O consumes the Apply retry budget only when a write
+> triggers the rebuild; maintenance-triggered rebuilds log and retry on each
+> maintenance tick without escalating.
+> Status-only `MarkPrimaryAvailable` reporting runs in the background so leader
+> discovery or forwarding cannot delay an already-successful write response.
+> This status introduces an intentional health-semantics difference from
+> OpenSearch. FerrisSearch can report red for a write-only fault while the exact
+> primary allocation remains assigned, open, and readable; mutations are
+> unavailable until repair is proven. OpenSearch red denotes an unassigned
+> primary, so the affected shard serves neither reads nor writes.
+>
+> Candidate selection requires a live, in-sync cluster member. A leader that
+> also hosts the primary prefers the highest replica checkpoint it has
+> observed; a metadata-only or other non-primary leader has no such local
+> observations and uses an unranked live in-sync member. Every in-sync member
+> has acknowledged every write required by the current synchronous write set.
+>
+> A failed Tantivy commit is logged and also invalidates the writer. It does not
+> advance `translog.committed` or authorize WAL truncation. The next write,
+> blocking maintenance operation, or peer-recovery snapshot rebuilds the writer
+> and replays the retained suffix with the same idempotent path used at
+> startup. Only a write-triggered rebuild enters the Apply retry budget; an
+> idle copy with a persistent fault logs and retries on each maintenance tick
+> until a write arrives. Replay holds the shard translog lock for the whole
+> suffix, so blocked writes also occupy write-pool threads and can delay other
+> shards on the node.
+> Allocation can also return a replacement to the same faulty node; a
+> MaxRetryAllocationDecider-style exclusion policy and
+> `index.allocation.max_retries` setting (OpenSearch defaults to five retries)
+> are deferred.
 
 The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including
@@ -172,11 +283,19 @@ therefore varies slightly with document ID and content. The 65 MiB decode-only
 ceiling exists solely so upgraded nodes can open and replay complete legacy
 frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
 
-**Known write-failure limit:** a failed WAL `write_all` or `sync_data` does not
-yet transition the shard into a fail-stopped state. If the process continues
-writing after a partial append, the torn frame can become middle corruption;
-restart then fails closed rather than skipping acknowledged history. Startup
-tail truncation repairs only a trailing incomplete frame with no later data.
+**Known write-failure limit:** synchronous WAL/fsync/engine failures now fail
+the request and enter bounded escalation, but a WAL entry whose later engine
+apply fails has an unknown outcome. In production this failure means the
+Tantivy writer was killed. The next commit then fails, and the rebuilt writer
+replays the entry on this copy, as does a restart. If the failure happened on
+the primary, replicas never receive the entry, because replication starts only
+after local success. In-sync copies can therefore diverge on up to one refresh
+interval of client-failed writes, or longer with refresh disabled, and peer
+recovery from this copy can ship the retained entry to a new copy. If a partial
+append is followed by later writes, the torn frame can become middle
+corruption; restart then fails closed rather than skipping acknowledged
+history. Startup tail truncation repairs only a trailing incomplete frame with
+no later data.
 
 ## 3. Reference Protocols And Intentional Differences
 
@@ -760,11 +879,13 @@ unsealed trailing attempt beyond the durability frontier can be discarded under
 the restart rule in Section 5.
 New fields are not silently defaulted into a valid epoch, allocation, or history.
 
-Existing old-format data can be opened for a deliberate conversion/export path,
-but must not be labelled protocol-safe by assuming a term of zero or a complete
-prefix from a maximum sequence. The proposed first release requires offline
-conversion/reindexing or a fresh test cluster; no rolling mixed-protocol support
-is implied. Final format/conversion details belong to FS-005 before implementation.
+Existing old-format data can be opened only by a future deliberate
+conversion/export path and must not be labelled protocol-safe by assuming a
+term of zero or a complete prefix from a maximum sequence. The current pre-1.0
+implementation requires reindexing or a fresh cluster when routing snapshots or
+local copies lack allocation identity; no rolling mixed-protocol support or
+legacy adoption path is provided. Broader format/conversion details remain part
+of FS-005.
 
 Ordinary process restart and same-version recovery remain required. File
 deletion and old-generation cleanup must wait until atomic-install and retention

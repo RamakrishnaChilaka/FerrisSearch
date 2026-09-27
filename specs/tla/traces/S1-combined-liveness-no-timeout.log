@@ -1,0 +1,409 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 32 and seed -2282615648436309522 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 2804] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_S1_Combined.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
+Parsing file /tmp/ferrissearch-tla.7Bjkkm/s1-combined-liveness-no-timeout/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.7Bjkkm/s1-combined-liveness-no-timeout/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.7Bjkkm/s1-combined-liveness-no-timeout/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.7Bjkkm/s1-combined-liveness-no-timeout/java-tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RaftLog
+Semantic processing of module ShardReplication
+Semantic processing of module PeerRecovery
+Semantic processing of module Faults
+Semantic processing of module Invariants
+Semantic processing of module MC_S1_Combined
+Starting... (2026-09-27 11:54:28)
+Implied-temporal checking--satisfiability problem has 3 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-27 11:54:29.
+Progress(20) at 2026-09-27 11:54:29: 49 states generated, 41 distinct states found, 0 states left on queue.
+Checking 3 branches of temporal properties for the complete state space with 123 total distinct states at (2026-09-27 11:54:29)
+Error: Temporal properties were violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ pendingRaft = {}
+/\ storageFaultInjected = FALSE
+/\ raftVoters = {n1, n2, n3}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0) @@ n3 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ copyAllocation = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ writeKind = <<"Put", "Put", "Put", "Put", "Put">>
+/\ writeEpoch = <<0, 0, 0, 0, 0>>
+/\ staleApplySafe = TRUE
+/\ raftLeader = n1
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ routing = [ initialized |-> TRUE,
+  primary |-> n1,
+  inSync |-> {n2, n3},
+  allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+  replicas |-> {n2, n3},
+  term |-> 1,
+  unassigned |-> 0,
+  members |-> {n1, n2, n3} ]
+/\ faultsStopped = FALSE
+/\ replicaFence = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE", "NO_NODE", "NO_NODE", "NO_NODE", "NO_NODE">>
+/\ writeSeq = <<0, 0, 0, 0, 0>>
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ pins = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ copyUuid = (n1 :> "INDEX_UUID" @@ n2 :> "INDEX_UUID" @@ n3 :> "INDEX_UUID")
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ writeStatus = <<"Unused", "Unused", "Unused", "Unused", "Unused">>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ writeRequired = <<{}, {}, {}, {}, {}>>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ nextWrite = 1
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "None")
+/\ recoveryAttempts = 0
+/\ writeTarget = <<"NO_NODE", "NO_NODE", "NO_NODE", "NO_NODE", "NO_NODE">>
+/\ committed = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ failed = {}
+/\ durableReplicaFence = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
+/\ ops = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ writeTerm = <<0, 0, 0, 0, 0>>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ activePrimaryApplySafe = TRUE
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
+/\ writeDoc = <<d1, d1, d1, d1, d1>>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ initialized |-> TRUE,
+        primary |-> n1,
+        inSync |-> {n2, n3},
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        replicas |-> {n2, n3},
+        term |-> 1,
+        unassigned |-> 0,
+        members |-> {n1, n2, n3} ] @@
+  n2 :>
+      [ initialized |-> TRUE,
+        primary |-> n1,
+        inSync |-> {n2, n3},
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        replicas |-> {n2, n3},
+        term |-> 1,
+        unassigned |-> 0,
+        members |-> {n1, n2, n3} ] @@
+  n3 :>
+      [ initialized |-> TRUE,
+        primary |-> n1,
+        inSync |-> {n2, n3},
+        allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
+        replicas |-> {n2, n3},
+        term |-> 1,
+        unassigned |-> 0,
+        members |-> {n1, n2, n3} ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Idle")
+/\ writeWait = <<{}, {}, {}, {}, {}>>
+
+State 2: <S1ClientWrite1 line 45, col 5 to line 49, col 58 of module MC_S1_Combined>
+/\ writeStatus = <<"Routed", "Unused", "Unused", "Unused", "Unused">>
+/\ nextWrite = 2
+/\ writeTarget = <<n1, "NO_NODE", "NO_NODE", "NO_NODE", "NO_NODE">>
+
+State 3: <S1PrimaryAccept line 95, col 9 to line 98, col 62 of module MC_S1_Combined>
+/\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 0) @@ n3 :> (d1 :> 0))
+/\ nextSeq = (n1 :> 1 @@ n2 :> 0 @@ n3 :> 0)
+/\ durableOps = (n1 :> {1} @@ n2 :> {} @@ n3 :> {})
+/\ writePrimary = <<n1, "NO_NODE", "NO_NODE", "NO_NODE", "NO_NODE">>
+/\ writeStatus = <<"Replicating", "Unused", "Unused", "Unused", "Unused">>
+/\ writeRequired = <<{n2, n3}, {}, {}, {}, {}>>
+/\ ops = (n1 :> {1} @@ n2 :> {} @@ n3 :> {})
+/\ writeTerm = <<1, 0, 0, 0, 0>>
+/\ sharedHolders = (n1 :> {1} @@ n2 :> {} @@ n3 :> {})
+/\ messages = { [ kind |-> "Replicate",
+    write |-> 1,
+    to |-> n2,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ kind |-> "Replicate",
+    write |-> 1,
+    to |-> n3,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{n2, n3}, {}, {}, {}, {}>>
+
+State 4: <S1ReplicaApply line 115, col 5 to line 118, col 71 of module MC_S1_Combined>
+/\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 0))
+/\ nextSeq = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 0)
+/\ durableOps = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {})
+/\ ops = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {})
+/\ messages = { [ kind |-> "Replicate",
+    write |-> 1,
+    to |-> n3,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ kind |-> "ReplicaAck",
+    write |-> 1,
+    to |-> n1,
+    from |-> n2,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 5: <S1ReplicaApply line 115, col 5 to line 118, col 71 of module MC_S1_Combined>
+/\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
+/\ nextSeq = (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1)
+/\ durableOps = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {1})
+/\ ops = (n1 :> {1} @@ n2 :> {1} @@ n3 :> {1})
+/\ messages = { [ kind |-> "ReplicaAck",
+    write |-> 1,
+    to |-> n1,
+    from |-> n2,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ kind |-> "ReplicaAck",
+    write |-> 1,
+    to |-> n1,
+    from |-> n3,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 6: <S1DeliverAck line 134, col 5 to line 138, col 62 of module MC_S1_Combined>
+/\ messages = { [ kind |-> "ReplicaAck",
+    write |-> 1,
+    to |-> n1,
+    from |-> n2,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 0,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{n2}, {}, {}, {}, {}>>
+
+State 7: <S1DeliverAck line 134, col 5 to line 138, col 62 of module MC_S1_Combined>
+/\ messages = {}
+/\ writeWait = <<{}, {}, {}, {}, {}>>
+
+State 8: <S1PrimaryAck line 149, col 9 to line 152, col 62 of module MC_S1_Combined>
+/\ acked = {1}
+/\ writeStatus = <<"Acked", "Unused", "Unused", "Unused", "Unused">>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+
+State 9: <S1ApplyFailureOccurs line 199, col 5 to line 201, col 32 of module MC_S1_Combined>
+/\ storageFaultInjected = TRUE
+/\ copyMode = (n1 :> "Active" @@ n2 :> "ApplyFailing" @@ n3 :> "Active")
+
+State 10: <S1LivenessFirstApplyWrite line 74, col 5 to line 76, col 35 of module MC_S1_Combined>
+/\ writeStatus = <<"Acked", "Routed", "Unused", "Unused", "Unused">>
+/\ nextWrite = 3
+/\ writeTarget = <<n1, n1, "NO_NODE", "NO_NODE", "NO_NODE">>
+
+State 11: <S1PrimaryAccept line 95, col 9 to line 98, col 62 of module MC_S1_Combined>
+/\ docValue = (n1 :> (d1 :> 2) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
+/\ nextSeq = (n1 :> 2 @@ n2 :> 1 @@ n3 :> 1)
+/\ durableOps = (n1 :> {1, 2} @@ n2 :> {1} @@ n3 :> {1})
+/\ writePrimary = <<n1, n1, "NO_NODE", "NO_NODE", "NO_NODE">>
+/\ writeSeq = <<0, 1, 0, 0, 0>>
+/\ writeStatus = <<"Acked", "Replicating", "Unused", "Unused", "Unused">>
+/\ writeRequired = <<{n2, n3}, {n2, n3}, {}, {}, {}>>
+/\ ops = (n1 :> {1, 2} @@ n2 :> {1} @@ n3 :> {1})
+/\ writeTerm = <<1, 1, 0, 0, 0>>
+/\ sharedHolders = (n1 :> {2} @@ n2 :> {} @@ n3 :> {})
+/\ messages = { [ kind |-> "Replicate",
+    write |-> 2,
+    to |-> n2,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ kind |-> "Replicate",
+    write |-> 2,
+    to |-> n3,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{}, {n2, n3}, {}, {}, {}>>
+
+State 12: <S1ReplicaMutationFails line 121, col 5 to line 124, col 71 of module MC_S1_Combined>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "ApplyRetrying" @@ n3 :> "Active")
+/\ messages = { [ kind |-> "Replicate",
+    write |-> 2,
+    to |-> n3,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ kind |-> "ReplicaNack",
+    write |-> 2,
+    to |-> n1,
+    from |-> n2,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 1,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 13: <S1DeliverNack line 141, col 5 to line 145, col 62 of module MC_S1_Combined>
+/\ writeStatus = <<"Acked", "Failed", "Unused", "Unused", "Unused">>
+/\ failed = {2}
+/\ sharedHolders = (n1 :> {} @@ n2 :> {} @@ n3 :> {})
+/\ messages = {}
+
+State 14: <S1CrashBeforeEscalation line 214, col 5 to line 217, col 32 of module MC_S1_Combined>
+/\ crashCount = 1
+/\ raftConnected = (n1 :> TRUE @@ n2 :> FALSE @@ n3 :> TRUE)
+/\ copyMode = (n1 :> "Active" @@ n2 :> "ApplyFailing" @@ n3 :> "Active")
+/\ alive = (n1 :> TRUE @@ n2 :> FALSE @@ n3 :> TRUE)
+
+State 15: <S1LivenessUnavailableWrite line 81, col 5 to line 84, col 35 of module MC_S1_Combined>
+/\ writeStatus = <<"Acked", "Failed", "Routed", "Unused", "Unused">>
+/\ nextWrite = 4
+/\ writeTarget = <<n1, n1, n1, "NO_NODE", "NO_NODE">>
+
+State 16: <S1PrimaryAccept line 95, col 9 to line 98, col 62 of module MC_S1_Combined>
+/\ docValue = (n1 :> (d1 :> 3) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 1))
+/\ nextSeq = (n1 :> 3 @@ n2 :> 1 @@ n3 :> 1)
+/\ durableOps = (n1 :> {1, 2, 3} @@ n2 :> {1} @@ n3 :> {1})
+/\ writePrimary = <<n1, n1, n1, "NO_NODE", "NO_NODE">>
+/\ writeSeq = <<0, 1, 2, 0, 0>>
+/\ writeStatus = <<"Acked", "Failed", "Replicating", "Unused", "Unused">>
+/\ writeRequired = <<{n2, n3}, {n2, n3}, {n2, n3}, {}, {}>>
+/\ ops = (n1 :> {1, 2, 3} @@ n2 :> {1} @@ n3 :> {1})
+/\ writeTerm = <<1, 1, 1, 0, 0>>
+/\ sharedHolders = (n1 :> {3} @@ n2 :> {} @@ n3 :> {})
+/\ messages = { [ kind |-> "Replicate",
+    write |-> 3,
+    to |-> n2,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ kind |-> "Replicate",
+    write |-> 3,
+    to |-> n3,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{}, {n2, n3}, {n2, n3}, {}, {}>>
+
+State 17: <S1ReplicaApply line 115, col 5 to line 118, col 71 of module MC_S1_Combined>
+/\ docValue = (n1 :> (d1 :> 3) @@ n2 :> (d1 :> 1) @@ n3 :> (d1 :> 3))
+/\ nextSeq = (n1 :> 3 @@ n2 :> 1 @@ n3 :> 3)
+/\ durableOps = (n1 :> {1, 2, 3} @@ n2 :> {1} @@ n3 :> {1, 3})
+/\ ops = (n1 :> {1, 2, 3} @@ n2 :> {1} @@ n3 :> {1, 3})
+/\ messages = { [ kind |-> "Replicate",
+    write |-> 3,
+    to |-> n2,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ],
+  [ kind |-> "ReplicaAck",
+    write |-> 3,
+    to |-> n1,
+    from |-> n3,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+
+State 18: <S1DeliverAck line 134, col 5 to line 138, col 62 of module MC_S1_Combined>
+/\ messages = { [ kind |-> "Replicate",
+    write |-> 3,
+    to |-> n2,
+    from |-> n1,
+    toEpoch |-> 0,
+    term |-> 1,
+    targetAllocation |-> 1,
+    seq |-> 2,
+    fromEpoch |-> 0,
+    indexUuid |-> "INDEX_UUID" ] }
+/\ writeWait = <<{}, {n2, n3}, {n2}, {}, {}>>
+
+State 19: Stuttering
+Finished checking temporal properties in 00s at 2026-09-27 11:54:29
+49 states generated, 41 distinct states found, 0 states left on queue.
+Finished in 02s at (2026-09-27 11:54:29)

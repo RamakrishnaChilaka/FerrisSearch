@@ -8,7 +8,6 @@ use ferrissearch::cluster::manager::ClusterManager;
 use ferrissearch::cluster::state::{
     FieldMapping, FieldType, IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
 };
-use ferrissearch::engine::{CompositeEngine, SearchEngine};
 use ferrissearch::search::{QueryClause, SearchRequest};
 use ferrissearch::shard::ShardManager;
 #[cfg(feature = "transport-tls")]
@@ -18,7 +17,7 @@ use ferrissearch::transport::proto::internal_transport_client::InternalTransport
 use ferrissearch::transport::proto::{
     self, JoinRequest, ReplicateBulkRequest, ReplicateDocRequest, ShardBulkRequest,
     ShardDeleteRequest, ShardDocRequest, ShardGetRequest, ShardSearchDslRequest,
-    ShardSearchRequest,
+    ShardSearchRequest, StartPeerRecoveryRequest,
 };
 use ferrissearch::transport::server::create_transport_service_for_test;
 use futures::TryStreamExt;
@@ -125,11 +124,28 @@ async fn start_primary_grpc_server(
     start_grpc_server_for_node(cluster_manager, shard_manager, "primary-node").await
 }
 
+async fn start_replica_grpc_server(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+) -> std::net::SocketAddr {
+    start_grpc_server_for_node(cluster_manager, shard_manager, "replica-node").await
+}
+
 async fn start_grpc_server_for_node(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
     local_node_id: &str,
 ) -> std::net::SocketAddr {
+    start_grpc_server_for_node_with_handle(cluster_manager, shard_manager, local_node_id)
+        .await
+        .0
+}
+
+async fn start_grpc_server_for_node_with_handle(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    local_node_id: &str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -143,7 +159,7 @@ async fn start_grpc_server_for_node(
         local_node_id.into(),
     );
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming(incoming)
@@ -153,7 +169,7 @@ async fn start_grpc_server_for_node(
 
     // Give the server a moment to start
     tokio::time::sleep(Duration::from_millis(50)).await;
-    addr
+    (addr, handle)
 }
 
 #[cfg(feature = "transport-tls")]
@@ -373,6 +389,81 @@ fn setup_two_node_cluster_state_with_membership(
     });
     primary_cm.update_state(cs.clone());
     replica_cm.update_state(cs);
+}
+
+fn setup_replica_target_state(cm: &ClusterManager, index_name: &str, primary_term: u64) {
+    let mut state = cm.get_state();
+    state.add_node(DomainNodeInfo {
+        id: "primary-node".into(),
+        name: "primary".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 0,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    state.add_node(DomainNodeInfo {
+        id: "replica-node".into(),
+        name: "replica".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 0,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    state.add_index(IndexMetadata {
+        name: index_name.into(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new(format!("{index_name}-uuid")),
+        number_of_shards: 1,
+        number_of_replicas: 1,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "primary-node".into(),
+                primary_term,
+                replicas: vec!["replica-node".into()],
+                in_sync_replicas: vec!["replica-node".into()],
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    state
+        .shard_allocations
+        .get_mut(index_name)
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    cm.update_state(state);
+}
+
+fn install_recovered_replica_fixture(
+    cluster_manager: &ClusterManager,
+    shard_manager: &ShardManager,
+    index_name: &str,
+) {
+    let state = cluster_manager.get_state();
+    let metadata = &state.indices[index_name];
+    assert!(
+        metadata.shard_routing[&0].is_replica_in_sync("replica-node"),
+        "fixture must represent an already-recovered replica"
+    );
+    assert_eq!(
+        state.shard_allocation_id(index_name, 0, "replica-node"),
+        Some(1)
+    );
+    shard_manager
+        .open_shard_with_settings(
+            index_name,
+            0,
+            &metadata.mappings,
+            &metadata.settings,
+            metadata.uuid.as_str(),
+        )
+        .unwrap();
 }
 
 // ─── Single-node integration tests ─────────────────────────────────────────
@@ -682,6 +773,9 @@ async fn replicate_doc_index_via_grpc() {
             payload_json: serde_json::to_vec(&payload).unwrap(),
             op: "index".into(),
             seq_no: 0,
+            index_uuid: "replica-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         }))
         .await
         .unwrap()
@@ -737,6 +831,9 @@ async fn replicate_doc_delete_via_grpc() {
             payload_json: serde_json::to_vec(&payload).unwrap(),
             op: "index".into(),
             seq_no: 0,
+            index_uuid: "rep-del-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         }))
         .await
         .unwrap();
@@ -750,6 +847,9 @@ async fn replicate_doc_delete_via_grpc() {
             payload_json: vec![],
             op: "delete".into(),
             seq_no: 0,
+            index_uuid: "rep-del-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         }))
         .await
         .unwrap()
@@ -784,12 +884,15 @@ async fn replicate_bulk_via_grpc() {
     // ReplicateBulkRequest uses repeated ReplicateDocRequest as ops
     let ops: Vec<ReplicateDocRequest> = (0..3)
         .map(|i| ReplicateDocRequest {
-            index_name: String::new(), // ignored — set on the outer request
+            index_name: "bulk-rep-idx".into(),
             shard_id: 0,
             doc_id: format!("bulk-rep-{i}"),
             payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
             op: "index".into(),
             seq_no: i,
+            index_uuid: "bulk-rep-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         })
         .collect();
 
@@ -798,6 +901,9 @@ async fn replicate_bulk_via_grpc() {
             index_name: "bulk-rep-idx".into(),
             shard_id: 0,
             ops,
+            index_uuid: "bulk-rep-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         }))
         .await
         .unwrap()
@@ -832,6 +938,449 @@ async fn replicate_bulk_via_grpc() {
     assert_eq!(entries[0].seq_no, 0);
     assert_eq!(entries[1].seq_no, 1);
     assert_eq!(entries[2].seq_no, 2);
+}
+
+#[tokio::test]
+async fn stale_primary_replication_is_rejected_by_promoted_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_cm = Arc::new(ClusterManager::new("stale-primary-source".into()));
+    let target_cm = Arc::new(ClusterManager::new("stale-primary-target".into()));
+    let target_sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let mut target_state = target_cm.get_state();
+    target_state.add_node(DomainNodeInfo {
+        id: "old-primary".into(),
+        name: "old-primary".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 29998,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    target_state.add_node(DomainNodeInfo {
+        id: "promoted-target".into(),
+        name: "promoted-target".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 0,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    target_state.add_index(IndexMetadata {
+        name: "stale-primary".into(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new("stale-primary-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 1,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "old-primary".into(),
+                primary_term: 1,
+                replicas: vec!["promoted-target".into()],
+                in_sync_replicas: vec!["promoted-target".into()],
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    {
+        let routing = target_state
+            .indices
+            .get_mut("stale-primary")
+            .unwrap()
+            .shard_routing
+            .get_mut(&0)
+            .unwrap();
+        routing.primary = "promoted-target".into();
+        routing.primary_term = 3;
+        routing.replicas.clear();
+        routing.in_sync_replicas.clear();
+    }
+    target_cm.update_state(target_state);
+    target_sm
+        .open_shard_with_settings(
+            "stale-primary",
+            0,
+            &HashMap::new(),
+            &ferrissearch::cluster::state::IndexSettings::default(),
+            "stale-primary-uuid",
+        )
+        .unwrap();
+
+    let target_addr =
+        start_grpc_server_for_node(target_cm, target_sm.clone(), "promoted-target").await;
+
+    let mut source_state = ClusterManager::new("source-template".into()).get_state();
+    source_state.add_node(DomainNodeInfo {
+        id: "old-primary".into(),
+        name: "old-primary".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 29998,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    source_state.add_node(DomainNodeInfo {
+        id: "promoted-target".into(),
+        name: "promoted-target".into(),
+        host: "127.0.0.1".into(),
+        transport_port: target_addr.port(),
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    source_state.add_index(IndexMetadata {
+        name: "stale-primary".into(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new("stale-primary-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 1,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "old-primary".into(),
+                primary_term: 1,
+                replicas: vec!["promoted-target".into()],
+                in_sync_replicas: vec!["promoted-target".into()],
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    source_cm.update_state(source_state);
+
+    let result = ferrissearch::replication::replicate_write(
+        &TransportClient::new(),
+        &source_cm.get_state(),
+        "stale-primary",
+        0,
+        "stale-write",
+        &serde_json::json!({"value": "old-primary"}),
+        "index",
+        0,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the promoted target must reject replication from the stale primary term"
+    );
+    assert!(
+        target_sm
+            .get_shard("stale-primary", 0)
+            .unwrap()
+            .get_document("stale-write")
+            .unwrap()
+            .is_none(),
+        "stale-primary replication must not mutate the promoted copy"
+    );
+}
+
+#[tokio::test]
+async fn stale_target_allocation_recovery_start_is_rejected_before_snapshot_setup() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_cm = Arc::new(ClusterManager::new("recovery-source".into()));
+    let target_cm = Arc::new(ClusterManager::new("recovery-target".into()));
+    let source_sm = Arc::new(ShardManager::new(
+        source_dir.path(),
+        Duration::from_secs(60),
+    ));
+
+    let mut target_state = target_cm.get_state();
+    target_state.add_node(DomainNodeInfo {
+        id: "primary-node".into(),
+        name: "primary".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 0,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    target_state.add_node(DomainNodeInfo {
+        id: "replica-node".into(),
+        name: "replica".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 0,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    target_state.add_index(IndexMetadata {
+        name: "recovery-aba".into(),
+        uuid: ferrissearch::cluster::state::IndexUuid::new("recovery-aba-uuid"),
+        number_of_shards: 1,
+        number_of_replicas: 1,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "primary-node".into(),
+                primary_term: 1,
+                replicas: vec!["replica-node".into()],
+                in_sync_replicas: vec![],
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: ferrissearch::cluster::state::IndexSettings::default(),
+    });
+    let target_allocation_id = target_state
+        .shard_allocation_id("recovery-aba", 0, "replica-node")
+        .unwrap();
+    target_cm.update_state(target_state.clone());
+
+    let mut source_state = target_state;
+    source_state
+        .shard_allocations
+        .get_mut("recovery-aba")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .replicas
+        .insert("replica-node".into(), target_allocation_id + 1);
+    source_cm.update_state(source_state);
+
+    let source_addr = start_grpc_server_for_node(source_cm, source_sm, "primary-node").await;
+    let mut client = connect_client(source_addr).await;
+    let error = client
+        .start_peer_recovery(tonic::Request::new(StartPeerRecoveryRequest {
+            index_name: "recovery-aba".into(),
+            index_uuid: "recovery-aba-uuid".into(),
+            shard_id: 0,
+            target_node_id: "replica-node".into(),
+            target_allocation_id: Some(target_allocation_id),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("allocation"));
+}
+
+#[tokio::test]
+async fn replica_apply_rejects_uuid_allocation_term_and_missing_identity_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("replica-fence-validation".into()));
+    setup_replica_target_state(&cm, "fenced-replica", 3);
+    let shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shards
+        .open_shard_with_settings(
+            "fenced-replica",
+            0,
+            &HashMap::new(),
+            &ferrissearch::cluster::state::IndexSettings::default(),
+            "fenced-replica-uuid",
+        )
+        .unwrap();
+    let address = start_grpc_server_for_node(cm, shards.clone(), "replica-node").await;
+    let mut client = connect_client(address).await;
+
+    let request = |doc_id: &str,
+                   index_uuid: &str,
+                   primary_term: Option<u64>,
+                   allocation_id: Option<u64>| ReplicateDocRequest {
+        index_name: "fenced-replica".into(),
+        shard_id: 0,
+        doc_id: doc_id.into(),
+        payload_json: serde_json::to_vec(&serde_json::json!({"value": doc_id})).unwrap(),
+        op: "index".into(),
+        seq_no: 0,
+        index_uuid: index_uuid.into(),
+        primary_term,
+        target_allocation_id: allocation_id,
+    };
+
+    for invalid in [
+        request("wrong-uuid", "other-uuid", Some(3), Some(1)),
+        request("wrong-allocation", "fenced-replica-uuid", Some(3), Some(2)),
+        request("stale-term", "fenced-replica-uuid", Some(2), Some(1)),
+    ] {
+        let response = client
+            .replicate_doc(tonic::Request::new(invalid))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.success, "invalid replica identity was accepted");
+    }
+    for missing in [
+        request("missing-term", "fenced-replica-uuid", None, Some(1)),
+        request("missing-allocation", "fenced-replica-uuid", Some(3), None),
+    ] {
+        let error = client
+            .replicate_doc(tonic::Request::new(missing))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    let engine = shards.get_shard("fenced-replica", 0).unwrap();
+    assert_eq!(engine.doc_count(), 0);
+    assert!(
+        engine
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_cm = Arc::new(ClusterManager::new("durable-fence".into()));
+    setup_replica_target_state(&first_cm, "durable-fence", 1);
+    let first_shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    first_shards
+        .open_shard_with_settings(
+            "durable-fence",
+            0,
+            &HashMap::new(),
+            &ferrissearch::cluster::state::IndexSettings::default(),
+            "durable-fence-uuid",
+        )
+        .unwrap();
+    let (first_address, first_server) =
+        start_grpc_server_for_node_with_handle(first_cm, first_shards.clone(), "replica-node")
+            .await;
+    let mut first_client = connect_client(first_address).await;
+    let accepted = first_client
+        .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+            index_name: "durable-fence".into(),
+            shard_id: 0,
+            doc_id: "new-term".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 3})).unwrap(),
+            op: "index".into(),
+            seq_no: 0,
+            index_uuid: "durable-fence-uuid".into(),
+            primary_term: Some(3),
+            target_allocation_id: Some(1),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(accepted.success, "{}", accepted.error);
+    assert_eq!(
+        first_shards
+            .copy_identity("durable-fence", 0)
+            .unwrap()
+            .replica_fence,
+        3
+    );
+    drop(first_client);
+    first_server.abort();
+    let _ = first_server.await;
+    first_shards.quarantine_shard_copy("durable-fence", 0);
+    drop(first_shards);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let restarted_cm = Arc::new(ClusterManager::new("durable-fence".into()));
+    setup_replica_target_state(&restarted_cm, "durable-fence", 1);
+    let restarted_shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let restarted_address =
+        start_grpc_server_for_node(restarted_cm, restarted_shards.clone(), "replica-node").await;
+    let mut restarted_client = connect_client(restarted_address).await;
+    let rejected = restarted_client
+        .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+            index_name: "durable-fence".into(),
+            shard_id: 0,
+            doc_id: "stale-after-restart".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            op: "index".into(),
+            seq_no: 1,
+            index_uuid: "durable-fence-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!rejected.success);
+    assert!(
+        rejected.error.contains("below local fence"),
+        "{}",
+        rejected.error
+    );
+    let engine = restarted_shards.get_shard("durable-fence", 0).unwrap();
+    assert!(engine.get_document("new-term").unwrap().is_some());
+    assert!(
+        engine
+            .get_document("stale-after-restart")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn bulk_replication_validates_common_identity_before_first_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("bulk-fence".into()));
+    setup_replica_target_state(&cm, "bulk-fence", 1);
+    let shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shards
+        .open_shard_with_settings(
+            "bulk-fence",
+            0,
+            &HashMap::new(),
+            &ferrissearch::cluster::state::IndexSettings::default(),
+            "bulk-fence-uuid",
+        )
+        .unwrap();
+    let address = start_grpc_server_for_node(cm, shards.clone(), "replica-node").await;
+    let mut client = connect_client(address).await;
+    let operation = |doc_id: &str, seq_no: u64, allocation_id: u64| ReplicateDocRequest {
+        index_name: "bulk-fence".into(),
+        shard_id: 0,
+        doc_id: doc_id.into(),
+        payload_json: serde_json::to_vec(&serde_json::json!({"value": doc_id})).unwrap(),
+        op: "index".into(),
+        seq_no,
+        index_uuid: "bulk-fence-uuid".into(),
+        primary_term: Some(2),
+        target_allocation_id: Some(allocation_id),
+    };
+    let missing_term = client
+        .replicate_bulk(tonic::Request::new(ReplicateBulkRequest {
+            index_name: "bulk-fence".into(),
+            shard_id: 0,
+            ops: vec![operation("missing-term", 0, 1)],
+            index_uuid: "bulk-fence-uuid".into(),
+            primary_term: None,
+            target_allocation_id: Some(1),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing_term.code(), tonic::Code::InvalidArgument);
+    let error = client
+        .replicate_bulk(tonic::Request::new(ReplicateBulkRequest {
+            index_name: "bulk-fence".into(),
+            shard_id: 0,
+            ops: vec![
+                operation("first", 0, 1),
+                operation("wrong-allocation", 1, 2),
+            ],
+            index_uuid: "bulk-fence-uuid".into(),
+            primary_term: Some(2),
+            target_allocation_id: Some(1),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    let engine = shards.get_shard("bulk-fence", 0).unwrap();
+    assert!(engine.get_document("first").unwrap().is_none());
+    assert!(
+        engine
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
+    assert_eq!(
+        shards.copy_identity("bulk-fence", 0).unwrap().replica_fence,
+        1,
+        "invalid bulk must not raise the fence before envelope validation completes"
+    );
 }
 
 #[tokio::test]
@@ -881,7 +1430,7 @@ async fn primary_write_replicates_to_replica_node() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
@@ -896,6 +1445,7 @@ async fn primary_write_replicates_to_replica_node() {
         "replicated-idx",
         replica_addr.port(),
     );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "replicated-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -952,7 +1502,7 @@ async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("out-of-sync".into()));
@@ -1065,7 +1615,7 @@ async fn primary_delete_replicates_to_replica_node() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
@@ -1080,6 +1630,7 @@ async fn primary_delete_replicates_to_replica_node() {
         "del-repl-idx",
         replica_addr.port(),
     );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "del-repl-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -1131,7 +1682,7 @@ async fn primary_bulk_replicates_to_replica_node() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("repl-cluster".into()));
@@ -1146,6 +1697,7 @@ async fn primary_bulk_replicates_to_replica_node() {
         "bulk-repl-idx",
         replica_addr.port(),
     );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "bulk-repl-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
@@ -1575,9 +2127,17 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
     let test_uuid = "restart-replay-uuid";
 
     {
-        let shard_dir = dir.path().join(test_uuid).join("shard_0");
-        std::fs::create_dir_all(&shard_dir).unwrap();
-        let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.register_index_uuid("restart-replay-idx", test_uuid);
+        let engine = manager
+            .open_shard_with_settings(
+                "restart-replay-idx",
+                0,
+                &HashMap::new(),
+                &ferrissearch::cluster::state::IndexSettings::default(),
+                test_uuid,
+            )
+            .unwrap();
         engine
             .add_document(
                 "d1",
@@ -2563,6 +3123,9 @@ async fn replicate_doc_returns_local_checkpoint() {
             payload_json: serde_json::to_vec(&payload).unwrap(),
             op: "index".into(),
             seq_no: 5,
+            index_uuid: "cp-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         }))
         .await
         .unwrap()
@@ -2584,6 +3147,9 @@ async fn replicate_doc_returns_local_checkpoint() {
             payload_json: serde_json::to_vec(&payload2).unwrap(),
             op: "index".into(),
             seq_no: 10,
+            index_uuid: "cp-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         }))
         .await
         .unwrap()
@@ -2608,12 +3174,15 @@ async fn replicate_bulk_returns_local_checkpoint() {
 
     let ops: Vec<ReplicateDocRequest> = (0..3)
         .map(|i| ReplicateDocRequest {
-            index_name: String::new(),
+            index_name: "bulk-cp-idx".into(),
             shard_id: 0,
             doc_id: format!("bulk-cp-{i}"),
             payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
             op: "index".into(),
             seq_no: 100 + i as u64,
+            index_uuid: "bulk-cp-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         })
         .collect();
 
@@ -2622,6 +3191,9 @@ async fn replicate_bulk_returns_local_checkpoint() {
             index_name: "bulk-cp-idx".into(),
             shard_id: 0,
             ops,
+            index_uuid: "bulk-cp-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
         }))
         .await
         .unwrap()
@@ -2642,7 +3214,7 @@ async fn primary_write_advances_global_checkpoint() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("gc-cluster".into()));
@@ -2652,6 +3224,7 @@ async fn primary_write_advances_global_checkpoint() {
     ));
 
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "gc-idx", replica_addr.port());
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "gc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -2696,7 +3269,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("receipt-cluster".into()));
     let primary_sm = Arc::new(ShardManager::new(
@@ -2718,6 +3291,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         );
         manager.update_state(state);
     }
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, index);
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
     let seed = client
@@ -2867,6 +3441,9 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
         payload_json: serde_json::to_vec(&serde_json::json!({"body": "value"})).unwrap(),
         op: op.to_string(),
         seq_no,
+        index_uuid: format!("{index}-uuid"),
+        primary_term: Some(1),
+        target_allocation_id: Some(1),
     };
     for ops in [
         vec![operation(10, "index"), operation(12, "index")],
@@ -2878,6 +3455,9 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
                 index_name: index.into(),
                 shard_id: 0,
                 ops,
+                index_uuid: format!("{index}-uuid"),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
             }))
             .await
             .unwrap_err();
@@ -2995,7 +3575,7 @@ async fn bulk_replication_advances_global_checkpoint() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("bulk-gc".into()));
@@ -3004,6 +3584,7 @@ async fn bulk_replication_advances_global_checkpoint() {
         Duration::from_secs(60),
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "bgc-idx", replica_addr.port());
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "bgc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -3048,7 +3629,7 @@ async fn delete_replication_advances_global_checkpoint() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("del-gc".into()));
@@ -3057,6 +3638,7 @@ async fn delete_replication_advances_global_checkpoint() {
         Duration::from_secs(60),
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "dgc-idx", replica_addr.port());
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "dgc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -3108,7 +3690,7 @@ async fn isr_tracker_updated_after_replication() {
         replica_dir.path(),
         Duration::from_secs(60),
     ));
-    let replica_addr = start_grpc_server(replica_cm.clone(), replica_sm).await;
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
 
     let primary_dir = tempfile::tempdir().unwrap();
     let primary_cm = Arc::new(ClusterManager::new("isr-it".into()));
@@ -3117,6 +3699,7 @@ async fn isr_tracker_updated_after_replication() {
         Duration::from_secs(60),
     ));
     setup_two_node_cluster_state(&primary_cm, &replica_cm, "isr-idx", replica_addr.port());
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "isr-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
@@ -3160,7 +3743,19 @@ async fn recover_replica_ops_have_correct_fields() {
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
 
-    // Index a doc, then delete it
+    // Reserve seq_no 0 so legacy recovery can request the index and delete
+    // operations from local checkpoint 0.
+    client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "opf-idx".into(),
+            shard_id: 0,
+            doc_id: "baseline".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"title": "baseline"})).unwrap(),
+        }))
+        .await
+        .unwrap();
+
+    // Index a doc, then delete it.
     let payload = serde_json::json!({"title": "recover-test"});
     client
         .index_doc(tonic::Request::new(ShardDocRequest {
@@ -3181,7 +3776,7 @@ async fn recover_replica_ops_have_correct_fields() {
         .await
         .unwrap();
 
-    // Recover from seq_no 0 — should get both index and delete ops
+    // Recover from seq_no 0 — should get the later index and delete ops.
     let resp = client
         .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
             index_name: "opf-idx".into(),
@@ -3193,18 +3788,23 @@ async fn recover_replica_ops_have_correct_fields() {
         .into_inner();
 
     assert!(resp.success);
-    assert!(!resp.operations.is_empty(), "should have recovery ops");
-
-    // Verify each op has required fields
-    for op in &resp.operations {
-        assert!(op.seq_no <= 10, "seq_no should be reasonable");
-        assert!(
-            op.op == "index" || op.op == "delete",
-            "op should be index or delete, got: {}",
-            op.op
-        );
-        assert!(!op.doc_id.is_empty(), "doc_id should not be empty");
-    }
+    assert_eq!(resp.operations.len(), 2);
+    let index = &resp.operations[0];
+    assert_eq!(index.seq_no, 1);
+    assert_eq!(index.op, "index");
+    assert_eq!(index.doc_id, "opf-1");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&index.payload_json).unwrap(),
+        payload
+    );
+    let delete = &resp.operations[1];
+    assert_eq!(delete.seq_no, 2);
+    assert_eq!(delete.op, "delete");
+    assert_eq!(delete.doc_id, "opf-1");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&delete.payload_json).unwrap(),
+        serde_json::json!({})
+    );
 }
 
 // ─── Shard Stats integration tests ─────────────────────────────────────────

@@ -41,6 +41,7 @@ struct SourceRegistry {
 
 struct SourceSetup {
     target_node_id: String,
+    target_allocation_id: u64,
     primary_term: u64,
     last_activity: Instant,
     abort_handle: Option<tokio::task::AbortHandle>,
@@ -392,6 +393,7 @@ struct SourceSession {
     index_uuid: String,
     shard_id: u32,
     target_node_id: String,
+    target_allocation_id: u64,
     primary_node_id: String,
     primary_term: u64,
     snapshot_next_seq_no: u64,
@@ -413,6 +415,7 @@ struct SourceSessionAuthority {
     index_uuid: String,
     shard_id: u32,
     target_node_id: String,
+    target_allocation_id: u64,
     primary_node_id: String,
     primary_term: u64,
 }
@@ -424,6 +427,7 @@ impl From<&SourceSession> for SourceSessionAuthority {
             index_uuid: session.index_uuid.clone(),
             shard_id: session.shard_id,
             target_node_id: session.target_node_id.clone(),
+            target_allocation_id: session.target_allocation_id,
             primary_node_id: session.primary_node_id.clone(),
             primary_term: session.primary_term,
         }
@@ -539,29 +543,16 @@ async fn record_setup_failure(
     }
 }
 
-fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverReplicaOp, Status> {
-    let doc_id = entry
-        .payload
-        .get("_doc_id")
-        .or_else(|| entry.payload.get("_id"))
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            Status::internal(format!(
-                "translog operation {} has no document id",
-                entry.seq_no
-            ))
-        })?
-        .to_string();
-    let payload = match entry.op {
-        crate::wal::WalOperation::Index => {
-            entry.payload.get("_source").cloned().ok_or_else(|| {
-                Status::internal(format!(
-                    "index translog operation {} has no _source",
-                    entry.seq_no
-                ))
-            })?
+pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverReplicaOp, Status> {
+    let operation = crate::wal::document_operation(&entry)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let (doc_id, payload) = match operation {
+        crate::wal::WalDocumentOperation::Index { doc_id, source } => {
+            (doc_id.to_string(), source.clone())
         }
-        crate::wal::WalOperation::Delete => serde_json::json!({}),
+        crate::wal::WalDocumentOperation::Delete { doc_id } => {
+            (doc_id.to_string(), serde_json::json!({}))
+        }
     };
     Ok(RecoverReplicaOp {
         seq_no: entry.seq_no,
@@ -595,6 +586,7 @@ fn source_session_start_response(
             .collect(),
         error: String::new(),
         preparing: false,
+        target_allocation_id: Some(session.target_allocation_id),
     }
 }
 
@@ -605,7 +597,12 @@ enum MembershipObservation {
 }
 
 impl TransportService {
-    fn target_still_needs_recovery(&self, key: &ShardIdentity, target_node_id: &str) -> bool {
+    fn target_still_needs_recovery(
+        &self,
+        key: &ShardIdentity,
+        target_node_id: &str,
+        target_allocation_id: u64,
+    ) -> bool {
         let state = self.cluster_manager.get_state();
         let Some(metadata) = state
             .indices
@@ -622,6 +619,8 @@ impl TransportService {
                 .in_sync_replicas
                 .iter()
                 .any(|node| node == target_node_id)
+            && state.shard_allocation_id(&metadata.name, key.1, target_node_id)
+                == Some(target_allocation_id)
     }
 
     async fn reap_peer_recovery_sessions(&self) {
@@ -707,6 +706,7 @@ impl TransportService {
         &self,
         key: &ShardIdentity,
         target_node_id: &str,
+        target_allocation_id: u64,
     ) -> Result<Option<StartPeerRecoveryResponse>, Status> {
         let active_id = self
             .peer_recovery_state
@@ -726,13 +726,16 @@ impl TransportService {
         };
         if let Some(session) = existing_session {
             let mut session = session.lock().await;
-            if session.target_node_id != target_node_id {
+            if session.target_node_id != target_node_id
+                || session.target_allocation_id != target_allocation_id
+            {
                 let old_target = session.target_node_id.clone();
+                let old_allocation = session.target_allocation_id;
                 let replaceable = !session.finalize_preparing.load(Ordering::Acquire)
                     && session.barrier_guard.is_none()
                     && !session.settlement_running;
                 drop(session);
-                if self.target_still_needs_recovery(key, &old_target) {
+                if self.target_still_needs_recovery(key, &old_target, old_allocation) {
                     return Err(Status::already_exists(
                         "a peer recovery source session already exists for a different active target",
                     ));
@@ -747,20 +750,30 @@ impl TransportService {
                 }
                 return Ok(None);
             }
+            if session.finalize_preparing.load(Ordering::Acquire)
+                || session.barrier_guard.is_some()
+                || session.finalize_deadline.is_some()
+                || session.mark_submitted
+                || session.settlement_running
+            {
+                return Err(Status::failed_precondition(
+                    "peer recovery source session is already finalizing or settling",
+                ));
+            }
             session.last_activity = Instant::now();
             return Ok(Some(source_session_start_response(&active_id, &session)));
         }
 
-        let setup_target = {
+        let (setup_target, setup_allocation) = {
             let mut registry = self.peer_recovery_state.registry.lock().await;
             let Some(setup) = registry.setups.get_mut(&active_id) else {
                 registry.active_shards.remove(key);
                 return Ok(None);
             };
-            setup.target_node_id.clone()
+            (setup.target_node_id.clone(), setup.target_allocation_id)
         };
-        if setup_target != target_node_id {
-            if self.target_still_needs_recovery(key, &setup_target) {
+        if setup_target != target_node_id || setup_allocation != target_allocation_id {
+            if self.target_still_needs_recovery(key, &setup_target, setup_allocation) {
                 return Err(Status::already_exists(
                     "a peer recovery snapshot is being prepared for a different active target",
                 ));
@@ -797,6 +810,7 @@ impl TransportService {
             files: Vec::new(),
             error: String::new(),
             preparing: true,
+            target_allocation_id: Some(setup.target_allocation_id),
         }))
     }
 
@@ -809,11 +823,15 @@ impl TransportService {
         engine: Arc<dyn SearchEngine>,
         snapshot_dir: PathBuf,
     ) -> Result<(), Status> {
+        let target_allocation_id = request
+            .target_allocation_id
+            .expect("peer recovery allocation validated before setup launch");
         let lifetime = Arc::new(SetupLifetime::default());
         let (start_tx, start_rx) = oneshot::channel();
         let state = self.peer_recovery_state.clone();
         let local_node_id = self.local_node_id.clone();
         let setup_target_node_id = request.target_node_id.clone();
+        let setup_target_allocation_id = target_allocation_id;
         let task_session_id = session_id.clone();
         let task_key = key.clone();
         let task_lifetime = lifetime.clone();
@@ -918,6 +936,7 @@ impl TransportService {
                 index_uuid: request.index_uuid,
                 shard_id: request.shard_id,
                 target_node_id: request.target_node_id,
+                target_allocation_id,
                 primary_node_id: local_node_id,
                 primary_term,
                 snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
@@ -961,6 +980,7 @@ impl TransportService {
                 session_id.clone(),
                 SourceSetup {
                     target_node_id: setup_target_node_id,
+                    target_allocation_id: setup_target_allocation_id,
                     primary_term,
                     last_activity: Instant::now(),
                     abort_handle: Some(abort_handle),
@@ -1030,6 +1050,11 @@ impl TransportService {
         routing.primary == session.primary_node_id
             && routing.primary_term == session.primary_term
             && routing.replicas.contains(&session.target_node_id)
+            && state.shard_allocation_id(
+                &session.index_name,
+                session.shard_id,
+                &session.target_node_id,
+            ) == Some(session.target_allocation_id)
     }
 
     fn observe_membership(&self, session: &SourceSessionAuthority) -> MembershipObservation {
@@ -1043,6 +1068,14 @@ impl TransportService {
         let Some(routing) = metadata.shard_routing.get(&session.shard_id) else {
             return MembershipObservation::Impossible;
         };
+        let target_allocation = state.shard_allocation_id(
+            &session.index_name,
+            session.shard_id,
+            &session.target_node_id,
+        );
+        if target_allocation != Some(session.target_allocation_id) {
+            return MembershipObservation::Impossible;
+        }
         if routing.in_sync_replicas.contains(&session.target_node_id) {
             return MembershipObservation::InSync;
         }
@@ -1068,6 +1101,7 @@ impl TransportService {
                     index_uuid: session.index_uuid.clone(),
                     shard_id: session.shard_id,
                     replica: session.target_node_id.clone(),
+                    allocation_id: session.target_allocation_id,
                     primary: session.primary_node_id.clone(),
                     primary_term: session.primary_term,
                 })
@@ -1094,6 +1128,7 @@ impl TransportService {
                         replica_node_id: session.target_node_id.clone(),
                         primary_node_id: session.primary_node_id.clone(),
                         primary_term: session.primary_term,
+                        allocation_id: Some(session.target_allocation_id),
                     },
                 )
                 .await
@@ -1109,12 +1144,22 @@ impl TransportService {
             return Err("Raft is not initialized".to_string());
         };
         if raft.is_leader() {
+            let state = self.cluster_manager.get_state();
             let response = raft
                 .client_write(ClusterCommand::ActivatePrimary {
                     index_name: session.index_name.clone(),
                     index_uuid: session.index_uuid.clone(),
                     shard_id: session.shard_id,
                     primary: session.primary_node_id.clone(),
+                    allocation_id: state
+                        .shard_allocation_id(
+                            &session.index_name,
+                            session.shard_id,
+                            &session.primary_node_id,
+                        )
+                        .ok_or_else(|| {
+                            "primary allocation ID is missing during settlement".to_string()
+                        })?,
                     expected_term: session.primary_term,
                 })
                 .await
@@ -1130,14 +1175,24 @@ impl TransportService {
                 .nodes
                 .get(master_id)
                 .ok_or_else(|| format!("Raft leader '{master_id}' is absent"))?;
+            let primary_allocation_id = state
+                .shard_allocation_id(
+                    &session.index_name,
+                    session.shard_id,
+                    &session.primary_node_id,
+                )
+                .ok_or_else(|| "primary allocation ID is missing during settlement".to_string())?;
             self.transport_client
                 .forward_activate_primary(
                     master,
-                    &session.index_name,
-                    &session.index_uuid,
-                    session.shard_id,
-                    &session.primary_node_id,
-                    session.primary_term,
+                    crate::transport::proto::ActivatePrimaryRequest {
+                        index_name: session.index_name.clone(),
+                        index_uuid: session.index_uuid.clone(),
+                        shard_id: session.shard_id,
+                        primary_node_id: session.primary_node_id.clone(),
+                        expected_term: session.primary_term,
+                        allocation_id: Some(primary_allocation_id),
+                    },
                 )
                 .await
                 .map_err(|error| error.to_string())
@@ -1151,6 +1206,14 @@ impl TransportService {
         if request.index_uuid.is_empty() || request.target_node_id.is_empty() {
             return Err(Status::invalid_argument(
                 "peer recovery requires index UUID and target node",
+            ));
+        }
+        let target_allocation_id = request.target_allocation_id.ok_or_else(|| {
+            Status::invalid_argument("peer recovery requires a target allocation ID")
+        })?;
+        if target_allocation_id == 0 {
+            return Err(Status::invalid_argument(
+                "peer recovery target allocation ID must be greater than zero",
             ));
         }
         self.ensure_primary_activated(&request.index_name, request.shard_id)
@@ -1186,6 +1249,16 @@ impl TransportService {
                 "peer recovery target is already in sync",
             ));
         }
+        if state.shard_allocation_id(
+            &request.index_name,
+            request.shard_id,
+            &request.target_node_id,
+        ) != Some(target_allocation_id)
+        {
+            return Err(Status::failed_precondition(
+                "peer recovery target allocation no longer matches the source view",
+            ));
+        }
         let primary_term = routing.primary_term;
         drop(state);
 
@@ -1205,7 +1278,7 @@ impl TransportService {
         }
         let _source_recovery_guard = source_recovery_lock.lock_owned().await;
         if let Some(response) = self
-            .source_start_status(&key, &request.target_node_id)
+            .source_start_status(&key, &request.target_node_id, target_allocation_id)
             .await?
         {
             return Ok(response);
@@ -1256,6 +1329,7 @@ impl TransportService {
             files: Vec::new(),
             error: String::new(),
             preparing: true,
+            target_allocation_id: Some(target_allocation_id),
         })
     }
 
@@ -1651,34 +1725,31 @@ mod tests {
                 },
             );
         }
-        state.indices.insert(
-            "idx".into(),
-            IndexMetadata {
-                name: "idx".into(),
-                uuid: IndexUuid::new("uuid-1"),
-                number_of_shards: 1,
-                number_of_replicas: 1,
-                shard_routing: HashMap::from([(
-                    0,
-                    ShardRoutingEntry {
-                        primary: primary.into(),
-                        primary_term: term,
-                        replicas: vec!["replica".into()],
-                        in_sync_replicas: Vec::new(),
-                        unassigned_replicas: 0,
-                    },
-                )]),
-                mappings: HashMap::from([(
-                    "value".to_string(),
-                    crate::cluster::state::FieldMapping {
-                        field_type: crate::cluster::state::FieldType::Integer,
-                        dimension: None,
-                    },
-                )]),
-                dynamic: Default::default(),
-                settings: IndexSettings::default(),
-            },
-        );
+        state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("uuid-1"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: primary.into(),
+                    primary_term: term,
+                    replicas: vec!["replica".into()],
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::from([(
+                "value".to_string(),
+                crate::cluster::state::FieldMapping {
+                    field_type: crate::cluster::state::FieldType::Integer,
+                    dimension: None,
+                },
+            )]),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        });
         state
     }
 
@@ -1715,6 +1786,7 @@ mod tests {
             index_uuid: "uuid-1".into(),
             shard_id: 0,
             target_node_id: "replica".into(),
+            target_allocation_id: Some(1),
         }
     }
 
@@ -1791,6 +1863,7 @@ mod tests {
                 HashMap::new(),
                 IndexSettings::default(),
                 "uuid-1".into(),
+                1,
             )
             .await
             .unwrap();
@@ -1920,10 +1993,21 @@ mod tests {
             .get_mut(&0)
             .unwrap()
             .replicas = vec!["replacement".into()];
+        {
+            let allocations = replaced
+                .shard_allocations
+                .get_mut("idx")
+                .unwrap()
+                .get_mut(&0)
+                .unwrap();
+            allocations.replicas.remove("replica");
+            allocations.replicas.insert("replacement".into(), 2);
+        }
         cluster.update_state(replaced);
 
         let mut replacement_request = review_start_request();
         replacement_request.target_node_id = "replacement".into();
+        replacement_request.target_allocation_id = Some(2);
         let replacement = service
             .start_peer_recovery_inner(replacement_request.clone())
             .await
@@ -2007,6 +2091,7 @@ mod tests {
                     HashMap::new(),
                     IndexSettings::default(),
                     "uuid-1".into(),
+                    1,
                 )
                 .await
         });
@@ -2099,6 +2184,7 @@ mod tests {
                     )]),
                     IndexSettings::default(),
                     "uuid-1".into(),
+                    1,
                 )
                 .await
         });
@@ -2183,6 +2269,7 @@ mod tests {
             index_uuid: settlement_key.0.clone(),
             shard_id: settlement_key.1,
             target_node_id: "replica".into(),
+            target_allocation_id: 1,
             primary_node_id: "primary".into(),
             primary_term: 1,
             snapshot_next_seq_no: 0,
@@ -2258,6 +2345,7 @@ mod tests {
                 index_uuid: "uuid-1".into(),
                 shard_id: 0,
                 target_node_id: "replica".into(),
+                target_allocation_id: 1,
                 primary_node_id: "primary".into(),
                 primary_term: 1,
                 snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
@@ -2282,6 +2370,57 @@ mod tests {
             "only settlement may release an unresolved admission barrier"
         );
         assert!(state.registry.lock().await.sessions.contains_key("session"));
+    }
+
+    #[tokio::test]
+    async fn finalized_source_session_rejects_restarted_target_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _shards, cluster) = review_service(dir.path());
+        let allocation_id = cluster
+            .get_state()
+            .shard_allocation_id("idx", 0, "replica")
+            .unwrap();
+        let key = ("uuid-1".to_string(), 0);
+        let barrier = service.peer_recovery_state.barrier(key.clone()).await;
+        let barrier_guard = barrier.write_owned().await;
+        let session = Arc::new(Mutex::new(SourceSession {
+            index_name: "idx".into(),
+            index_uuid: key.0.clone(),
+            shard_id: key.1,
+            target_node_id: "replica".into(),
+            target_allocation_id: allocation_id,
+            primary_node_id: "primary".into(),
+            primary_term: 1,
+            snapshot_next_seq_no: 0,
+            snapshot_dir: dir.path().join("finalizing-session"),
+            files: HashMap::new(),
+            retention_pin: None,
+            last_activity: Instant::now(),
+            barrier_next_seq_no: Some(0),
+            barrier_guard: Some(barrier_guard),
+            finalize_deadline: Some(Instant::now() + Duration::from_secs(30)),
+            finalize_preparing: Arc::new(AtomicBool::new(false)),
+            mark_submitted: false,
+            settlement_running: false,
+        }));
+        {
+            let mut registry = service.peer_recovery_state.registry.lock().await;
+            registry.active_shards.insert(key.clone(), "session".into());
+            registry.sessions.insert("session".into(), session);
+        }
+
+        let error = match service
+            .source_start_status(&key, "replica", allocation_id)
+            .await
+        {
+            Ok(_) => panic!("a finalized source session must not be reattached"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("finalizing or settling"));
+        if let Some(removed) = service.peer_recovery_state.remove_session("session").await {
+            cleanup_session(removed).await;
+        }
     }
 
     fn move_primary(cluster: &ClusterManager) {
@@ -2433,16 +2572,26 @@ mod tests {
                 .data,
             ClusterResponse::Ok
         );
+        let primary_allocation_id = state_handle
+            .read()
+            .unwrap()
+            .shard_allocation_id("idx", 0, "primary")
+            .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
         shard_manager
-            .open_shard_with_settings(
+            .open_assigned_shard_with_settings(
                 "idx",
                 0,
                 &HashMap::new(),
                 &IndexSettings::default(),
                 "uuid-1",
+                crate::shard::AssignedShardOpen {
+                    allocation_id: primary_allocation_id,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
             )
             .unwrap();
         let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
@@ -2557,16 +2706,26 @@ mod tests {
                 .data,
             ClusterResponse::Ok
         );
+        let primary_allocation_id = state_handle
+            .read()
+            .unwrap()
+            .shard_allocation_id("idx", 0, "primary")
+            .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
         shard_manager
-            .open_shard_with_settings(
+            .open_assigned_shard_with_settings(
                 "idx",
                 0,
                 &HashMap::new(),
                 &IndexSettings::default(),
                 "uuid-old",
+                crate::shard::AssignedShardOpen {
+                    allocation_id: primary_allocation_id,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
             )
             .unwrap();
         let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
@@ -2855,6 +3014,7 @@ mod tests {
             index_uuid: "uuid-1".into(),
             shard_id: 0,
             target_node_id: "replica".into(),
+            target_allocation_id: 1,
             primary_node_id: "primary".into(),
             primary_term: 1,
             snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
@@ -2959,16 +3119,26 @@ mod tests {
                 .data,
             ClusterResponse::Ok
         );
+        let primary_allocation_id = state_handle
+            .read()
+            .unwrap()
+            .shard_allocation_id("idx", 0, "primary")
+            .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
         let engine = shard_manager
-            .open_shard_with_settings(
+            .open_assigned_shard_with_settings(
                 "idx",
                 0,
                 &HashMap::new(),
                 &IndexSettings::default(),
                 "uuid-1",
+                crate::shard::AssignedShardOpen {
+                    allocation_id: primary_allocation_id,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
             )
             .unwrap();
         let snapshot_dir = dir.path().join("uuid-1/shard_0/peer-recovery/session");
@@ -2999,11 +3169,17 @@ mod tests {
             .barrier(("uuid-1".into(), 0))
             .await;
         let guard = barrier.clone().write_owned().await;
+        let target_allocation_id = state_handle
+            .read()
+            .unwrap()
+            .shard_allocation_id("idx", 0, "replica")
+            .unwrap();
         let session = Arc::new(Mutex::new(SourceSession {
             index_name: "idx".into(),
             index_uuid: "uuid-1".into(),
             shard_id: 0,
             target_node_id: "replica".into(),
+            target_allocation_id,
             primary_node_id: "primary".into(),
             primary_term: 1,
             snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
@@ -3079,6 +3255,7 @@ mod tests {
                 index_uuid: "uuid-1".into(),
                 shard_id: 0,
                 target_node_id: "replica".into(),
+                target_allocation_id: 1,
                 primary_node_id: "primary".into(),
                 primary_term: 1,
                 snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
@@ -3138,28 +3315,25 @@ mod tests {
         let first_file = snapshot.files[0].clone();
 
         let mut cluster_state = ClusterState::new("test".into());
-        cluster_state.indices.insert(
-            "idx".into(),
-            IndexMetadata {
-                name: "idx".into(),
-                uuid: IndexUuid::new("uuid-1"),
-                number_of_shards: 1,
-                number_of_replicas: 1,
-                shard_routing: HashMap::from([(
-                    0,
-                    ShardRoutingEntry {
-                        primary: "primary".into(),
-                        primary_term: 1,
-                        replicas: vec!["replica".into()],
-                        in_sync_replicas: Vec::new(),
-                        unassigned_replicas: 0,
-                    },
-                )]),
-                mappings: HashMap::new(),
-                dynamic: Default::default(),
-                settings: IndexSettings::default(),
-            },
-        );
+        cluster_state.add_index(IndexMetadata {
+            name: "idx".into(),
+            uuid: IndexUuid::new("uuid-1"),
+            number_of_shards: 1,
+            number_of_replicas: 1,
+            shard_routing: HashMap::from([(
+                0,
+                ShardRoutingEntry {
+                    primary: "primary".into(),
+                    primary_term: 1,
+                    replicas: vec!["replica".into()],
+                    in_sync_replicas: Vec::new(),
+                    unassigned_replicas: 0,
+                },
+            )]),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings::default(),
+        });
         let cluster_manager = Arc::new(ClusterManager::new("test".into()));
         cluster_manager.update_state(cluster_state);
         let peer_recovery_state = PeerRecoveryTransportState::new();
@@ -3176,6 +3350,10 @@ mod tests {
                 index_uuid: "uuid-1".into(),
                 shard_id: 0,
                 target_node_id: "replica".into(),
+                target_allocation_id: cluster_manager
+                    .get_state()
+                    .shard_allocation_id("idx", 0, "replica")
+                    .unwrap(),
                 primary_node_id: "primary".into(),
                 primary_term: 1,
                 snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
@@ -3223,6 +3401,11 @@ mod tests {
                 payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
                 op: "index".into(),
                 seq_no: snapshot.snapshot_next_seq_no,
+                index_uuid: "uuid-1".into(),
+                primary_term: Some(1),
+                target_allocation_id: cluster_manager
+                    .get_state()
+                    .shard_allocation_id("idx", 0, "primary"),
             }))
             .await
             .unwrap()

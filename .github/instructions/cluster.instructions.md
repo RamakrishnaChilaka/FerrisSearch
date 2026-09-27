@@ -22,10 +22,11 @@ RemoteStoreSettings { object_store_uri, manifest_path, manifest_generation, mani
 IndexSettings { engine: IndexEngine, refresh_interval_ms: Option<u64>, flush_threshold_bytes: Option<u64>, remote_store: Option<RemoteStoreSettings> }  // engine defaults to LocalShards
 ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary, primary_term, replicas, in_sync_replicas, unassigned_replicas }
+ShardAllocationIds { primary, replicas, initial_allocation_id, primary_initialized }
 IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, dynamic, settings }
 SecurityApiKeyRecord { id, name, hash_sha256, roles, indices, created_at_millis }   // hash only, never plaintext
 SecurityRoleDefinition { name, cluster, indices, index_privileges }                 // custom role
-ClusterState { cluster_name, version, master_node, nodes, indices, last_seen, api_keys, roles }
+ClusterState { cluster_name, version, master_node, nodes, indices, shard_allocations, last_seen, api_keys, roles }
 ```
 
 ### Control-Plane Config Fields (snapshotted for free)
@@ -57,6 +58,9 @@ ClusterState { cluster_name, version, master_node, nodes, indices, last_seen, ap
 - `ping_node(node_id)` — update `last_seen` timestamp
 - `add_index(metadata)`, `delete_index(name) -> Option<IndexMetadata>`
 - `last_seen` is `#[serde(skip)]` — transient, not replicated by Raft
+- `shard_allocation_id(index, shard, node)`, `primary_allocation_id(...)`,
+  `primary_initialized(...)`, and `may_create_initial_empty_copy(...)` expose
+  the Raft-owned copy identity and G1 empty-store decision.
 
 ### Key IndexMetadata Methods
 ```rust
@@ -78,6 +82,7 @@ fn promote_replica_to(&mut self, shard_id: u32, new_primary: &str) -> bool  // t
 // Replica management
 fn update_number_of_replicas(&mut self, new_count: u32) -> Vec<(u32, String)>  // returns deleted slots
 fn allocate_unassigned_replicas(&mut self, data_nodes: &[String]) -> bool
+fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eligible_shards: &HashSet<u32>) -> bool
 ```
 
 ### Authoritative In-Sync Membership
@@ -86,12 +91,13 @@ fn allocate_unassigned_replicas(&mut self, data_nodes: &[String]) -> bool
   implicitly authoritative and never appears in this vector.
 - The vector must contain no duplicates and must be a subset of `replicas`.
   Transport snapshot decoding rejects violations.
-- Replicas assigned by `build_shard_routing()` at index creation are in sync
-  because they receive the write history from sequence zero under the
-  all-in-sync acknowledgement rule.
+- Replicas assigned by `build_shard_routing()` start out of sync. They become
+  authoritative only after allocation-bound peer recovery and
+  `MarkReplicaInSync`; initial assignment alone never grants promotion or
+  acknowledgement eligibility.
 - `allocate_unassigned_replicas()` adds assigned copies but does not add them to
-  the in-sync set. Until file-based recovery and admission land, later-added
-  replicas remain `INITIALIZING`, receive no live writes, and are not
+  the in-sync set. The node recovery driver installs and admits them; until
+  then they remain `INITIALIZING`, receive no live writes, and are not
   promotable.
 - Missing `in_sync_replicas` in pre-1.0 serde metadata defaults to empty. This
   deliberately fails closed; legacy replicas do not inherit eligibility.
@@ -102,14 +108,30 @@ fn allocate_unassigned_replicas(&mut self, data_nodes: &[String]) -> bool
 - `UpdateIndex` can only remove in-sync members by intersecting the current set
   with the submitted replica assignments. It cannot add members. A primary
   change is accepted only when the candidate is in the current in-sync set.
-- `MarkReplicaInSync` and `ActivatePrimary` are UUID/primary/term conditional
-  Raft commands. Recovery admission and per-process primary activation must use
-  them instead of replacing routing metadata directly.
+  An unchanged primary preserves its allocation entry exactly, including
+  `None` for an initialized red shard, so that shard cannot block unrelated
+  routing, settings, or allocation changes for siblings in the same index.
+- Allocation IDs are state-machine owned. CreateIndex assigns its committed log
+  index to initial copies; UpdateIndex preserves surviving IDs and assigns its
+  own log index to every new copy. Removed copies lose their IDs.
+- `MarkReplicaInSync`, `ActivatePrimary`, and `FailShardCopy` are
+  UUID/allocation-bound conditional Raft commands. Rejected commands perform no
+  partial mutation and do not bump `ClusterState.version`.
+- `MarkReplicaInSync` also requires `primary_initialized = true` and a present
+  primary allocation. An out-of-sync target cannot be admitted into a red or
+  never-activated shard.
+- `primary_initialized` starts false and becomes true only through an exact
+  allocation-bound `ActivatePrimary`. Only the initial primary allocation may
+  be created empty before that transition; initial replicas recover from it.
 - Node removal deletes that node from both replica collections while preserving
   per-shard lost-slot accounting. Replica-count decreases remove unassigned
   slots first, then assigned out-of-sync copies before in-sync copies.
 - `promote_replica*` removes the promoted node from `replicas` and
   `in_sync_replicas`; the new primary is authoritative implicitly.
+- Replica allocation is skipped when the shard has no live allocated primary.
+  Replica `FailShardCopy` accounts for the removed copy as unassigned. Primary
+  reports are promote-only: they promote an in-sync candidate or reject
+  without clearing the primary allocation.
 
 ## ClusterManager (src/cluster/manager.rs)
 ```rust

@@ -264,9 +264,16 @@ coordinator-side merge semantics are required.
 - Primary write receipts propagated to REST `_seq_no` responses, including bulk
   ranges, with replica WAL sequence preservation
 - Monotonic sequence high-watermark tracking
-- Bounded file-based peer recovery for later-added/rejoining replicas:
+- Bounded file-based peer recovery for initial, later-added, and rejoining replicas:
   committed Tantivy files, pinned WAL suffix, final write barrier, and
-  conditional in-sync admission
+  allocation-bound conditional in-sync admission
+- Raft-owned shard-copy allocation IDs, durable local copy identity, and
+  replica primary-term fencing before WAL mutation
+- Fail-closed copy startup with immediate corruption reporting, bounded
+  per-copy I/O retry/backoff, allocation-bound replica removal, and
+  promote-only primary failover
+- Proactive lifecycle activation of restarted or promoted primaries so idle
+  pending recoveries do not depend on a later client write
 - UUID-backed shard data directories and process-backed restart regression
 - Separate rayon pools for search and write engine work
 - Blocking wrappers for filesystem/recovery work on async call paths
@@ -293,7 +300,43 @@ capacity; it is not a total-process memory limit.
 `max_concurrent_peer_recoveries` limits target-side recovery sessions per node
 (default `2`, maximum `64`). Set it to `0`, or set
 `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES=0`, to keep assigned replicas
-`INITIALIZING` without automatic recovery.
+`INITIALIZING` without automatic recovery. A new `local_shards` index therefore
+starts with only its primary in the authoritative write set; initial replicas
+join through peer recovery. Setting the limit to `0` keeps new indices
+single-copy for acknowledgement and promotion purposes until recovery is
+re-enabled and completes.
+
+Local shard-storage I/O uses bounded retry/backoff before routing escalation.
+`shard_io_failure_escalation_attempts` defaults to `3` and
+`shard_io_failure_escalation_window_ms` defaults to `60000`; both thresholds
+must be reached. The matching environment overrides are
+`FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_ATTEMPTS` and
+`FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_WINDOW_MS`. Corrupt storage metadata
+fails closed immediately, while network/transfer failures do not consume this
+local-storage budget.
+
+When a failed primary has no live in-sync replacement, Raft records
+`primary_unavailable` without changing its allocation or term. A write-only
+failure keeps that red health status until the first later successful local
+write clears it conditionally at the same term. A definitive or open-level
+failure quarantines the copy after report throttling and clears the status only
+after repaired storage completes a fresh primary activation.
+
+This makes FerrisSearch red health intentionally broader than OpenSearch red
+health. For example, a write-only fault can leave the assigned primary open and
+serving reads while writes are unavailable. OpenSearch red means the affected
+primary is unassigned, so that shard serves neither reads nor writes.
+
+Because replica acknowledgement is synchronous, a persistent write fault on an
+in-sync replica can fail every write to that shard for at least the default
+60-second escalation window before that exact allocation is removed. Recovery
+allocation can currently choose the same faulty node again; a
+MaxRetryAllocationDecider-style exclusion policy and
+`index.allocation.max_retries` setting are deferred.
+
+This pre-1.0 protocol does not adopt legacy shard directories or routing
+snapshots that lack allocation identity. Clusters created before this change
+must be recreated or reindexed; there is no rolling compatibility path.
 
 For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
 the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable
@@ -370,9 +413,33 @@ production ready**. The most important limits are:
 
 - A primary can mutate before replica acknowledgement fails; write retry and
   acknowledgement semantics need a formal contract.
-- A WAL `write_all` or `sync_data` failure does not yet fail-stop the shard.
-  Continuing writes after a partial frame can create middle corruption that a
-  later restart correctly rejects; automatic handling is future work.
+- Synchronous WAL/fsync/engine failures fail the request and enter bounded
+  escalation. An operation that reached the WAL and then failed engine apply
+  has an unknown outcome. In production this failure means the Tantivy writer
+  was killed: the next commit fails, the rebuilt writer replays the operation
+  on this copy, and restart replay applies it too. When the failure is on the
+  primary, replicas never receive the operation, because replication starts
+  only after local success. In-sync copies can therefore diverge on up to one
+  refresh interval of client-failed writes, or longer with refresh disabled,
+  and peer recovery from this copy can ship the retained entry to a new copy.
+  A partial frame followed by later writes can still create middle corruption
+  that restart correctly rejects.
+- A failed Tantivy commit invalidates the writer without advancing
+  `translog.committed` or truncating the WAL. The next write, blocking
+  maintenance operation, or peer-recovery snapshot rebuilds the writer and
+  replays the retained suffix. Replay deletes each document ID first and adds
+  content back only for index operations; malformed operation payloads fail
+  closed. Persistent rebuild or replay I/O enters the Apply escalation budget
+  only when a write triggers the rebuild. A rebuild triggered by refresh,
+  flush, or snapshot preparation logs an error and retries on the next
+  maintenance tick without escalating, so an idle copy with a persistent fault
+  retries until a write arrives. Replay holds the shard translog lock for the
+  entire suffix. Writes to that shard block while it runs and occupy
+  write-pool threads, so a long replay can also delay writes to other shards
+  on the node. The suffix can be large when refresh is disabled.
+- At the `8f17172` main baseline, startup replay resurrected acknowledged
+  deletes and one transient Tantivy commit failure could lose later
+  acknowledged writes. Both defects are fixed on this branch.
 - `_seq_no` now reports the primary WAL assignment, but `_version` and
   `_primary_term` compatibility fields remain placeholders. Gap-aware
   checkpoints, primary epochs, idempotent retries, `if_seq_no` /

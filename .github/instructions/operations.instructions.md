@@ -1,6 +1,6 @@
 ---
-description: "Use for configuration, server TLS, metrics, worker pools, background tasks, CI, development clusters, and operational resource controls."
-applyTo: "src/config/**,src/metrics/**,src/tasks.rs,src/worker.rs,config/**,Dockerfile,.github/workflows/**,scripts/ci-local.sh,dev_cluster*.sh"
+description: "Use for configuration, server TLS, metrics, worker pools, background tasks, CI, TLA+ runners, development clusters, and operational resource controls."
+applyTo: "src/config/**,src/metrics/**,src/tasks.rs,src/worker.rs,config/**,Dockerfile,.github/workflows/**,scripts/ci-local.sh,scripts/tla/**,dev_cluster*.sh"
 ---
 
 # Operations, Configuration, And Resource Instructions
@@ -25,6 +25,12 @@ defaults for new fields so older config files continue to load.
 - `max_concurrent_peer_recoveries` defaults to 2, is capped at 64, and uses
   `0` as an explicit per-node disable value. The environment override is
   `FERRISSEARCH_MAX_CONCURRENT_PEER_RECOVERIES`.
+- `shard_io_failure_escalation_attempts` and
+  `shard_io_failure_escalation_window_ms` default to 3 attempts over 60,000 ms.
+  Both must be greater than zero; escalation requires both thresholds. Their
+  environment overrides are
+  `FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_ATTEMPTS` and
+  `FERRISSEARCH_SHARD_IO_FAILURE_ESCALATION_WINDOW_MS`.
 
 When adding config, cover default, YAML, environment, invalid, and
 feature-disabled behavior. Update `config/ferrissearch.yml` and README only for
@@ -124,6 +130,24 @@ cargo test
 S3-compatible tests remain explicitly gated and must report skip vs pass
 accurately. Development cluster scripts must give every node a unique data
 directory, HTTP port, transport port, Raft ID, and complete seed-host list.
+
+The separate TLA+ CI job runs `scripts/tla/check.sh` with Java 25 and caches
+the checksum-pinned TLA+ tools 1.7.4 jar. Keep the default matrix below five
+minutes; `fixed-crash`, `fixed-partition`, and `fixed-simulation` are
+local-only unless their bounds are reduced and re-recorded. Each invocation
+needs isolated Java and TLC temporary directories; parallel TLC processes
+otherwise race while extracting standard modules. Expected-violation
+configurations are successful only when they reproduce the documented
+invariant failure. The runner defaults to eight TLC workers and permits a
+`TLA_WORKERS` override. Keep the bounded G1 empty-store and G2
+copy-failure/liveness checks, pending-marker restart regression, term-change
+liveness checks, and minimal two-shard isolation check in the fast matrix.
+Keep corruption,
+open/fence/marker/apply persistent-I/O escalation, promote-only primary
+reporting, the apply-I/O no-escalation temporal regression, and the
+no-lifecycle-activation temporal regression in that fast set. Also keep the
+combined S1 crash/restart/recovery safety and liveness checks plus the
+no-timeout modeling-assumption regression in the fast matrix.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with

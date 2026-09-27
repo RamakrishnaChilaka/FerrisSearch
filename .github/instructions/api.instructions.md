@@ -120,15 +120,24 @@ The `_cat/shards` endpoint shows three possible shard states:
 - **`INITIALIZING`**: The shard is assigned to a live node but either is not in
   the authoritative in-sync set or its engine is not open yet. An out-of-sync
   replica remains `INITIALIZING` even if an empty local engine has opened.
-- **`UNASSIGNED`**: The assigned node doesn't exist in the cluster (node left or shard not yet placed).
+- **`UNASSIGNED`**: The assigned node doesn't exist, or the routed copy has no
+  current allocation identity.
 
 State is determined by `shard_display_state()` — a single function used for both primaries and replicas. In distributed mode (default), the state is derived from whether the assigned node reported that specific shard copy in the `collect_shard_doc_counts()` fan-out results. The fan-out map is keyed by `(node_id, index, shard_id)`, not just `(index, shard_id)`, so one started copy must not make another assigned-but-unopened copy appear `STARTED`. In `?local` mode, it checks whether `shard_manager.get_shard()` returns the engine.
 
-Replica in-sync membership is Raft metadata; engine availability remains a
+Replica in-sync membership and allocation identity are Raft metadata; engine availability remains a
 runtime observation. The `ShardState` enum (`Started` / `Unassigned`) represents
 allocation intent. `_cat/indices` and `/_cluster/health` are yellow for any
 unassigned or assigned-out-of-sync replica and red when a primary's node is
-missing.
+missing, its primary allocation is cleared, or its exact allocation is marked
+`primary_unavailable`.
+
+FerrisSearch red health is therefore broader than OpenSearch red health. A
+write-only storage fault can set `primary_unavailable` while the primary remains
+assigned, open, and able to serve reads; writes remain unavailable until repair
+is proven. In OpenSearch, red denotes an unassigned primary, so that affected
+shard serves neither reads nor writes. Do not infer FerrisSearch read
+unavailability from the color alone.
 
 ### Cat Endpoint Fan-Out Collection
 By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `GetShardStats` to collect real doc counts (mirrors OpenSearch behavior). `_cat/segments` also fans out to all nodes via `GetSegmentStats` and must list every segment row reported by each started shard copy in the cluster.
@@ -163,7 +172,9 @@ values return `400 illegal_argument_exception` without enqueueing work.
 
 ### Local Shard Reopen Rule
 - `ensure_local_index_shards_open()` is async and must be awaited by search/count/SQL read paths.
-- When an API handler needs to reopen local shards, use `ShardManager::open_shard_with_settings_blocking()` rather than calling the synchronous shard-open helper inline on an async task.
+- When an API handler needs to reopen local shards, use
+  `ShardManager::open_assigned_shard_with_settings_blocking()` with the current
+  allocation ID rather than calling a synchronous shard-open helper inline.
 - Read and maintenance paths must fail closed when the authoritative shard UUID path is missing. Do not create a fresh shard directory on `/_search`, `/_count`, SQL, or maintenance fan-out just because a local reopen is needed.
 
 ### Document Operations — src/api/index/mod.rs (routed to shard primary)

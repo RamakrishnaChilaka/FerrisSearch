@@ -2,7 +2,7 @@ use super::*;
 use crate::cluster::state::{
     ClusterState, IndexEngine, IndexSettings, NodeInfo, NodeRole, ShardRoutingEntry,
 };
-use crate::engine::{CompositeEngine, SearchEngine};
+use crate::shard::ShardManager;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -716,15 +716,23 @@ async fn fan_out_maintenance_keeps_local_target_without_node_entry() {
     cluster_state.add_index(make_test_metadata(Some("node-1")));
 
     let (temp_dir, state) = make_test_app_state(cluster_state).await;
-    let shard_dir = temp_dir.path().join("idx-uuid").join("shard_0");
-    std::fs::create_dir_all(&shard_dir).unwrap();
-
-    let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
-    engine
-        .add_document("doc-1", serde_json::json!({"title": "maintenance reopen"}))
-        .unwrap();
-    engine.refresh().unwrap();
-    drop(engine);
+    {
+        let persisted = ShardManager::new(temp_dir.path(), Duration::from_secs(60));
+        persisted.register_index_uuid("idx", "idx-uuid");
+        let engine = persisted
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "idx-uuid",
+            )
+            .unwrap();
+        engine
+            .add_document("doc-1", serde_json::json!({"title": "maintenance reopen"}))
+            .unwrap();
+        engine.refresh().unwrap();
+    }
 
     let (successful, failed) =
         fan_out_maintenance(&state, "idx", MaintenanceDispatchOp::Flush).await;
@@ -739,15 +747,23 @@ async fn enqueue_force_merge_tasks_keeps_local_target_without_node_entry() {
     cluster_state.add_index(make_test_metadata(Some("node-1")));
 
     let (temp_dir, state) = make_test_app_state(cluster_state).await;
-    let shard_dir = temp_dir.path().join("idx-uuid").join("shard_0");
-    std::fs::create_dir_all(&shard_dir).unwrap();
-
-    let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
-    engine
-        .add_document("doc-1", serde_json::json!({"title": "maintenance reopen"}))
-        .unwrap();
-    engine.refresh().unwrap();
-    drop(engine);
+    {
+        let persisted = ShardManager::new(temp_dir.path(), Duration::from_secs(60));
+        persisted.register_index_uuid("idx", "idx-uuid");
+        let engine = persisted
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "idx-uuid",
+            )
+            .unwrap();
+        engine
+            .add_document("doc-1", serde_json::json!({"title": "maintenance reopen"}))
+            .unwrap();
+        engine.refresh().unwrap();
+    }
 
     let dispatch = enqueue_force_merge_tasks(&state, "idx", 1).await;
 

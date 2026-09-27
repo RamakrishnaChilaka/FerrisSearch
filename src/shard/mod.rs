@@ -3,25 +3,116 @@
 //! The ShardManager owns all local shard engines on this node.
 
 use crate::cluster::settings::SettingsManager;
-use crate::cluster::state::IndexSettings;
+use crate::cluster::state::{AllocationId, IndexSettings};
 use crate::engine::{CompositeEngine, SearchEngine};
 use crate::wal::{HotTranslog, TranslogDurability};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX: &str = "api_delete_index";
 pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_delete_index_rpc";
 pub const SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP: &str = "orphan_cleanup_unknown_uuid";
+pub const SHARD_DATA_REMOVE_REASON_STALE_UUID_REPLACEMENT: &str = "stale_index_uuid_replacement";
 pub const PEER_RECOVERY_IN_PROGRESS_MARKER: &str = "PEER_RECOVERY_IN_PROGRESS";
 pub const PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER: &str = "PEER_RECOVERY_AWAITING_MEMBERSHIP";
+pub const SHARD_COPY_IDENTITY_FILE: &str = "SHARD_COPY_IDENTITY.json";
+const SHARD_COPY_IDENTITY_VERSION: u32 = 1;
 type SourceRecoveryIdentity = (String, u32);
 type SourceRecoveryLock = Arc<tokio::sync::Mutex<()>>;
 type SourceRecoveryLockMap = HashMap<SourceRecoveryIdentity, SourceRecoveryLock>;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct DefinitiveShardCopyFailure {
+    message: String,
+}
+
+fn definitive_shard_copy_failure(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(DefinitiveShardCopyFailure {
+        message: message.into(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ShardCopyIoOperation {
+    Open,
+    Fence,
+    Apply,
+    Recovery,
+    PendingMarker,
+    InstallMarker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShardCopyIoKey {
+    index_uuid: String,
+    shard_id: u32,
+    allocation_id: AllocationId,
+    operation: ShardCopyIoOperation,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShardCopyRetryPolicy {
+    max_attempts: u32,
+    escalation_window: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl Default for ShardCopyRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            escalation_window: Duration::from_secs(60),
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShardCopyRetryState {
+    attempts: u32,
+    first_failure: Instant,
+    next_attempt: Instant,
+    delay: Duration,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "assigned shard copy operation is backing off after {attempts} failures; retry in {retry_after_ms} ms"
+)]
+pub(crate) struct ShardCopyBackoff {
+    attempts: u32,
+    retry_after_ms: u128,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "persistent shard copy I/O failure during {operation:?} after {attempts} attempts over {elapsed_ms} ms: {source}"
+)]
+pub(crate) struct PersistentShardCopyIoFailure {
+    operation: ShardCopyIoOperation,
+    attempts: u32,
+    elapsed_ms: u128,
+    #[source]
+    source: anyhow::Error,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("local shard storage I/O failed: {source}")]
+pub(crate) struct LocalShardStorageFailure {
+    #[source]
+    source: anyhow::Error,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("shard reopen aborted for [{index}][{shard_id}] with UUID [{expected_uuid}]: {reason}")]
@@ -38,16 +129,53 @@ enum CompositeOpenMode {
     ExistingOnly,
 }
 
+#[derive(Clone, Copy)]
+enum ShardOpenAuthority {
+    Local { allow_schema_reset: bool },
+    Assigned(AssignedShardOpen),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerRecoveryAwaitingMembership {
     pub index_uuid: String,
+    pub allocation_id: AllocationId,
     pub primary_node_id: String,
     pub primary_term: u64,
 }
 
+impl PeerRecoveryAwaitingMembership {
+    fn validate(&self) -> Result<()> {
+        if self.index_uuid.is_empty() {
+            return Err(definitive_shard_copy_failure(
+                "peer recovery awaiting-membership marker has an empty index UUID",
+            ));
+        }
+        if self.allocation_id == 0 {
+            return Err(definitive_shard_copy_failure(
+                "peer recovery awaiting-membership marker has a zero allocation ID",
+            ));
+        }
+        if self.primary_node_id.is_empty() {
+            return Err(definitive_shard_copy_failure(
+                "peer recovery awaiting-membership marker has an empty primary node",
+            ));
+        }
+        if self.primary_term == 0 {
+            return Err(definitive_shard_copy_failure(
+                "peer recovery awaiting-membership marker has a zero primary term",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRecoveryTargetState {
-    Recovering,
+    Recovering {
+        index_uuid: String,
+        allocation_id: AllocationId,
+    },
     FinalizedAwaitingMembership(PeerRecoveryAwaitingMembership),
 }
 
@@ -70,9 +198,119 @@ pub struct PeerRecoveryTargetInstall {
     pub mappings: HashMap<String, crate::cluster::state::FieldMapping>,
     pub settings: IndexSettings,
     pub index_uuid: String,
+    pub allocation_id: AllocationId,
+    pub primary_term: u64,
     pub shard_dir: PathBuf,
     pub snapshot_next_seq_no: u64,
     pub expected_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AssignedShardOpen {
+    pub allocation_id: AllocationId,
+    pub primary_term: u64,
+    pub allow_empty_creation: bool,
+}
+
+pub(crate) struct ReplicaApplyContext<'a> {
+    pub index_uuid: &'a str,
+    pub allocation_id: AllocationId,
+    pub applied_view_term: u64,
+    pub message_term: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardCopyIdentity {
+    pub version: u32,
+    pub index_uuid: String,
+    pub allocation_id: AllocationId,
+    pub replica_fence: u64,
+}
+
+impl ShardCopyIdentity {
+    fn new(index_uuid: &str, allocation_id: AllocationId, replica_fence: u64) -> Result<Self> {
+        let identity = Self {
+            version: SHARD_COPY_IDENTITY_VERSION,
+            index_uuid: index_uuid.to_string(),
+            allocation_id,
+            replica_fence,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.version != SHARD_COPY_IDENTITY_VERSION {
+            return Err(definitive_shard_copy_failure(format!(
+                "unsupported shard copy identity version {}",
+                self.version
+            )));
+        }
+        if self.index_uuid.is_empty() {
+            return Err(definitive_shard_copy_failure(
+                "shard copy identity has an empty index UUID",
+            ));
+        }
+        if self.allocation_id == 0 {
+            return Err(definitive_shard_copy_failure(
+                "shard copy identity has a zero allocation ID",
+            ));
+        }
+        if self.replica_fence == 0 {
+            return Err(definitive_shard_copy_failure(
+                "shard copy identity has a zero replica fence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_expected(&self, index_uuid: &str, allocation_id: AllocationId) -> Result<()> {
+        self.validate()?;
+        if self.index_uuid != index_uuid {
+            return Err(definitive_shard_copy_failure(format!(
+                "local shard copy UUID mismatch: expected {index_uuid}, found {}",
+                self.index_uuid
+            )));
+        }
+        if self.allocation_id != allocation_id {
+            return Err(definitive_shard_copy_failure(format!(
+                "local shard copy allocation mismatch: expected {allocation_id}, found {}",
+                self.allocation_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerRecoveryInstallMarker {
+    version: u32,
+    index_uuid: String,
+    allocation_id: AllocationId,
+}
+
+impl PeerRecoveryInstallMarker {
+    fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            return Err(definitive_shard_copy_failure(format!(
+                "unsupported peer recovery install marker version {}",
+                self.version
+            )));
+        }
+        if self.index_uuid.is_empty() {
+            return Err(definitive_shard_copy_failure(
+                "peer recovery install marker has an empty index UUID",
+            ));
+        }
+        if self.allocation_id == 0 {
+            return Err(definitive_shard_copy_failure(
+                "peer recovery install marker has a zero allocation ID",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Key uniquely identifying a shard: (index_name, shard_id)
@@ -224,6 +462,11 @@ pub struct ShardManager {
     settings_managers: RwLock<HashMap<String, Arc<SettingsManager>>>,
     /// Maps index_name → index UUID (used for on-disk directory names).
     index_uuids: RwLock<HashMap<String, String>>,
+    /// Validated durable identity for each currently open shard copy.
+    copy_identities: RwLock<HashMap<ShardKey, ShardCopyIdentity>>,
+    copy_io_retries: Mutex<HashMap<ShardCopyIoKey, ShardCopyRetryState>>,
+    copy_io_attempt_locks: Mutex<HashMap<ShardCopyIoKey, Arc<Mutex<()>>>>,
+    copy_retry_policy: RwLock<ShardCopyRetryPolicy>,
     /// Serializes concurrent open attempts for the same shard key so only
     /// one thread performs the expensive CompositeEngine creation at a time.
     open_locks: Mutex<HashMap<ShardKey, Arc<Mutex<()>>>>,
@@ -244,6 +487,10 @@ pub struct ShardManager {
     reopen_before_lifecycle_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
     close_lifecycle_waiting_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    assigned_open_io_failure: Mutex<Option<(i32, usize)>>,
+    #[cfg(test)]
+    assigned_open_attempts: AtomicUsize,
     peer_recovery_targets: RwLock<HashMap<ShardKey, PeerRecoveryTargetState>>,
     source_recovery_cleanup: RwLock<Option<Arc<dyn SourceRecoverySessionCleanup>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
@@ -282,6 +529,10 @@ impl ShardManager {
             shards: RwLock::new(HashMap::new()),
             settings_managers: RwLock::new(HashMap::new()),
             index_uuids: RwLock::new(HashMap::new()),
+            copy_identities: RwLock::new(HashMap::new()),
+            copy_io_retries: Mutex::new(HashMap::new()),
+            copy_io_attempt_locks: Mutex::new(HashMap::new()),
+            copy_retry_policy: RwLock::new(ShardCopyRetryPolicy::default()),
             open_locks: Mutex::new(HashMap::new()),
             source_recovery_locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -300,6 +551,10 @@ impl ShardManager {
             reopen_before_lifecycle_sender: Mutex::new(None),
             #[cfg(test)]
             close_lifecycle_waiting_sender: Mutex::new(None),
+            #[cfg(test)]
+            assigned_open_io_failure: Mutex::new(None),
+            #[cfg(test)]
+            assigned_open_attempts: AtomicUsize::new(0),
             peer_recovery_targets: RwLock::new(HashMap::new()),
             source_recovery_cleanup: RwLock::new(None),
             isr_tracker: IsrTracker::new(1000),
@@ -321,6 +576,726 @@ impl ShardManager {
     /// Configured maximum capacity of the shared column cache.
     pub fn column_cache_max_capacity(&self) -> u64 {
         self.column_cache.max_capacity()
+    }
+
+    fn shard_open_lock(&self, key: &ShardKey) -> Arc<Mutex<()>> {
+        self.open_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .clone()
+    }
+
+    fn copy_io_key(
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: AllocationId,
+        operation: ShardCopyIoOperation,
+    ) -> ShardCopyIoKey {
+        ShardCopyIoKey {
+            index_uuid: index_uuid.to_string(),
+            shard_id,
+            allocation_id,
+            operation,
+        }
+    }
+
+    fn ensure_copy_io_attempt_allowed(&self, key: &ShardCopyIoKey) -> Result<()> {
+        let now = Instant::now();
+        let retries = self
+            .copy_io_retries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(retry) = retries.get(key) else {
+            return Ok(());
+        };
+        if now >= retry.next_attempt {
+            return Ok(());
+        }
+        Err(ShardCopyBackoff {
+            attempts: retry.attempts,
+            retry_after_ms: retry.next_attempt.duration_since(now).as_millis(),
+        }
+        .into())
+    }
+
+    fn copy_io_attempt_lock(&self, key: &ShardCopyIoKey) -> Arc<Mutex<()>> {
+        self.copy_io_attempt_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .clone()
+    }
+
+    fn record_copy_io_failure(&self, key: ShardCopyIoKey, error: anyhow::Error) -> anyhow::Error {
+        let now = Instant::now();
+        let operation = key.operation;
+        let policy = *self
+            .copy_retry_policy
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut retries = self
+            .copy_io_retries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let retry = retries.entry(key).or_insert(ShardCopyRetryState {
+            attempts: 0,
+            first_failure: now,
+            next_attempt: now,
+            delay: policy.initial_backoff,
+        });
+        retry.attempts = retry.attempts.saturating_add(1);
+        if retry.attempts > 1 {
+            retry.delay = (retry.delay * 2).min(policy.max_backoff);
+        }
+        retry.next_attempt = now + retry.delay;
+        let elapsed = now.duration_since(retry.first_failure);
+        let attempts = retry.attempts;
+        drop(retries);
+
+        if Self::is_retryable_io_failure(&error)
+            && attempts >= policy.max_attempts
+            && elapsed >= policy.escalation_window
+        {
+            PersistentShardCopyIoFailure {
+                operation,
+                attempts,
+                elapsed_ms: elapsed.as_millis(),
+                source: error,
+            }
+            .into()
+        } else {
+            error
+        }
+    }
+
+    fn clear_copy_io_failure(&self, key: &ShardCopyIoKey) {
+        self.copy_io_retries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(key);
+    }
+
+    fn is_retryable_io_failure(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            if cause.downcast_ref::<std::io::Error>().is_some() {
+                return true;
+            }
+            if cause
+                .downcast_ref::<crate::engine::tantivy::TantivyWriterUnavailableError>()
+                .is_some()
+            {
+                return true;
+            }
+            if cause
+                .downcast_ref::<crate::engine::tantivy::TantivyCommitFailureError>()
+                .is_some()
+            {
+                return true;
+            }
+            let Some(tantivy_error) = cause.downcast_ref::<tantivy::TantivyError>() else {
+                return false;
+            };
+            matches!(
+                tantivy_error,
+                tantivy::TantivyError::IoError(_)
+                    | tantivy::TantivyError::OpenDirectoryError(
+                        tantivy::directory::error::OpenDirectoryError::FailedToCreateTempDir(_)
+                            | tantivy::directory::error::OpenDirectoryError::IoError { .. }
+                    )
+                    | tantivy::TantivyError::OpenReadError(
+                        tantivy::directory::error::OpenReadError::IoError { .. }
+                    )
+                    | tantivy::TantivyError::OpenWriteError(
+                        tantivy::directory::error::OpenWriteError::IoError { .. }
+                    )
+                    | tantivy::TantivyError::LockFailure(
+                        tantivy::directory::error::LockError::IoError(_),
+                        _
+                    )
+            )
+        })
+    }
+
+    fn tantivy_failure_is_definitive(error: &tantivy::TantivyError) -> bool {
+        matches!(
+            error,
+            tantivy::TantivyError::DataCorruption(_)
+                | tantivy::TantivyError::FieldNotFound(_)
+                | tantivy::TantivyError::InvalidArgument(_)
+                | tantivy::TantivyError::IndexBuilderMissingArgument(_)
+                | tantivy::TantivyError::SchemaError(_)
+                | tantivy::TantivyError::IncompatibleIndex(_)
+                | tantivy::TantivyError::DeserializeError(_)
+                | tantivy::TantivyError::OpenDirectoryError(
+                    tantivy::directory::error::OpenDirectoryError::DoesNotExist(_)
+                        | tantivy::directory::error::OpenDirectoryError::NotADirectory(_)
+                )
+                | tantivy::TantivyError::OpenReadError(
+                    tantivy::directory::error::OpenReadError::FileDoesNotExist(_)
+                        | tantivy::directory::error::OpenReadError::IncompatibleIndex(_)
+                )
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_copy_retry_policy_for_test(
+        &self,
+        max_attempts: u32,
+        escalation_window: Duration,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) {
+        *self
+            .copy_retry_policy
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = ShardCopyRetryPolicy {
+            max_attempts,
+            escalation_window,
+            initial_backoff,
+            max_backoff,
+        };
+    }
+
+    pub fn configure_copy_retry_policy(&self, max_attempts: u32, escalation_window: Duration) {
+        let mut policy = self
+            .copy_retry_policy
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        policy.max_attempts = max_attempts;
+        policy.escalation_window = escalation_window;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_assigned_open_io_failures(&self, raw_os_error: i32, attempts: usize) {
+        *self
+            .assigned_open_io_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+        self.assigned_open_attempts
+            .store(0, AtomicOrdering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assigned_open_attempts_for_test(&self) -> usize {
+        self.assigned_open_attempts.load(AtomicOrdering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn maybe_inject_assigned_open_io_failure(&self) -> Result<()> {
+        self.assigned_open_attempts
+            .fetch_add(1, AtomicOrdering::AcqRel);
+        let mut injection = self
+            .assigned_open_io_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((raw_os_error, remaining)) = injection.as_mut() else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            *injection = None;
+            return Ok(());
+        }
+        *remaining -= 1;
+        Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
+    }
+
+    fn copy_identity_path(shard_dir: &std::path::Path) -> PathBuf {
+        shard_dir.join(SHARD_COPY_IDENTITY_FILE)
+    }
+
+    fn persist_copy_identity(
+        shard_dir: &std::path::Path,
+        identity: &ShardCopyIdentity,
+    ) -> Result<()> {
+        identity.validate()?;
+        std::fs::create_dir_all(shard_dir)?;
+        let path = Self::copy_identity_path(shard_dir);
+        let temporary_path = shard_dir.join(format!("{SHARD_COPY_IDENTITY_FILE}.tmp"));
+        let bytes = serde_json::to_vec(identity)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary_path, &path)?;
+        std::fs::File::open(shard_dir)?.sync_all()?;
+        Ok(())
+    }
+
+    fn load_copy_identity(shard_dir: &std::path::Path) -> Result<ShardCopyIdentity> {
+        let path = Self::copy_identity_path(shard_dir);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(definitive_shard_copy_failure(format!(
+                    "assigned shard copy is missing durable identity {path:?}"
+                )));
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "read shard copy identity {path:?}: {error}"
+                ));
+            }
+        };
+        let identity: ShardCopyIdentity = serde_json::from_slice(&bytes).map_err(|error| {
+            definitive_shard_copy_failure(format!("decode shard copy identity {path:?}: {error}"))
+        })?;
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn load_peer_recovery_install_marker(
+        shard_dir: &std::path::Path,
+    ) -> Result<Option<PeerRecoveryInstallMarker>> {
+        let marker_path = shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER);
+        let bytes = match std::fs::read(&marker_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "read peer recovery install marker {marker_path:?}: {error}"
+                ));
+            }
+        };
+        let marker: PeerRecoveryInstallMarker =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                definitive_shard_copy_failure(format!(
+                    "decode peer recovery install marker {marker_path:?}: {error}"
+                ))
+            })?;
+        marker.validate()?;
+        Ok(Some(marker))
+    }
+
+    fn ensure_no_current_peer_recovery_install(
+        shard_dir: &std::path::Path,
+        index: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        assignment: Option<AssignedShardOpen>,
+    ) -> Result<()> {
+        let Some(marker) = Self::load_peer_recovery_install_marker(shard_dir)? else {
+            return Ok(());
+        };
+        if let Some(assignment) = assignment {
+            let reason = if marker.index_uuid == index_uuid
+                && marker.allocation_id == assignment.allocation_id
+            {
+                "its current allocation".to_string()
+            } else {
+                format!(
+                    "a different allocation (marker UUID {}, allocation {})",
+                    marker.index_uuid, marker.allocation_id
+                )
+            };
+            return Err(definitive_shard_copy_failure(format!(
+                "shard {index}/{shard_id} has an incomplete peer recovery installation for {reason}"
+            )));
+        }
+        anyhow::bail!(
+            "shard {index}/{shard_id} has an incomplete peer recovery installation for a different allocation"
+        );
+    }
+
+    fn load_peer_recovery_awaiting_membership(
+        shard_dir: &std::path::Path,
+    ) -> Result<Option<PeerRecoveryAwaitingMembership>> {
+        let marker_path = shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER);
+        let bytes = match std::fs::read(&marker_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "read peer recovery awaiting-membership marker {marker_path:?}: {error}"
+                ));
+            }
+        };
+        let pending: PeerRecoveryAwaitingMembership =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                definitive_shard_copy_failure(format!(
+                    "decode peer recovery awaiting-membership marker {marker_path:?}: {error}"
+                ))
+            })?;
+        pending.validate()?;
+        Ok(Some(pending))
+    }
+
+    fn matching_peer_recovery_awaiting_membership(
+        shard_dir: &std::path::Path,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<Option<PeerRecoveryAwaitingMembership>> {
+        Ok(
+            Self::load_peer_recovery_awaiting_membership(shard_dir)?.filter(|pending| {
+                pending.index_uuid == index_uuid && pending.allocation_id == allocation_id
+            }),
+        )
+    }
+
+    fn remove_stale_copy_identity_temp(shard_dir: &std::path::Path) -> Result<()> {
+        let temporary_path = shard_dir.join(format!("{SHARD_COPY_IDENTITY_FILE}.tmp"));
+        match std::fs::remove_file(&temporary_path) {
+            Ok(()) => std::fs::File::open(shard_dir)?.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "remove stale shard copy identity temporary file {temporary_path:?}: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn directory_tree_is_empty(path: &std::path::Path) -> Result<bool> {
+        if !path.try_exists()? {
+            return Ok(true);
+        }
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry.file_type()?.is_dir() {
+                if !Self::directory_tree_is_empty(&entry_path)? {
+                    return Ok(false);
+                }
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn cache_copy_identity(&self, key: &ShardKey, identity: ShardCopyIdentity) {
+        self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key.clone(), identity);
+    }
+
+    fn validated_cached_copy_identity(
+        &self,
+        key: &ShardKey,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<ShardCopyIdentity> {
+        let identities = self
+            .copy_identities
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let identity = identities.get(key).ok_or_else(|| {
+            definitive_shard_copy_failure(format!(
+                "open shard {}/{} has no validated local copy identity",
+                key.index, key.shard_id
+            ))
+        })?;
+        identity.validate_expected(index_uuid, allocation_id)?;
+        Ok(identity.clone())
+    }
+
+    fn prepare_assigned_copy_identity(
+        &self,
+        key: &ShardKey,
+        shard_dir: &std::path::Path,
+        index_uuid: &str,
+        assignment: AssignedShardOpen,
+    ) -> Result<ShardCopyIdentity> {
+        if assignment.allocation_id == 0 {
+            anyhow::bail!("assigned shard copy has a zero allocation ID");
+        }
+        if assignment.primary_term == 0 {
+            anyhow::bail!("assigned shard copy has a zero primary term");
+        }
+        if !assignment.allow_empty_creation {
+            match std::fs::metadata(shard_dir) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(definitive_shard_copy_failure(format!(
+                        "assigned shard copy {}/{} path {shard_dir:?} is not a directory",
+                        key.index, key.shard_id
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(definitive_shard_copy_failure(format!(
+                        "assigned shard copy {}/{} is missing its shard directory {shard_dir:?}",
+                        key.index, key.shard_id
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let identity_path = Self::copy_identity_path(shard_dir);
+        let identity = if identity_path.try_exists()? {
+            let identity = Self::load_copy_identity(shard_dir)?;
+            identity.validate_expected(index_uuid, assignment.allocation_id)?;
+            identity
+        } else {
+            if !assignment.allow_empty_creation {
+                return Err(definitive_shard_copy_failure(format!(
+                    "assigned shard copy {}/{} is missing durable identity",
+                    key.index, key.shard_id
+                )));
+            }
+            Self::remove_stale_copy_identity_temp(shard_dir)?;
+            if !Self::directory_tree_is_empty(shard_dir)? {
+                return Err(definitive_shard_copy_failure(format!(
+                    "assigned shard copy {}/{} has data but no durable identity",
+                    key.index, key.shard_id
+                )));
+            }
+            let identity = ShardCopyIdentity::new(
+                index_uuid,
+                assignment.allocation_id,
+                assignment.primary_term,
+            )?;
+            Self::persist_copy_identity(shard_dir, &identity)?;
+            identity
+        };
+        if !assignment.allow_empty_creation {
+            let meta_path = shard_dir.join("index").join("meta.json");
+            match std::fs::metadata(&meta_path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => {
+                    return Err(definitive_shard_copy_failure(format!(
+                        "assigned shard copy {}/{} Tantivy metadata path {meta_path:?} is not a file",
+                        key.index, key.shard_id
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(definitive_shard_copy_failure(format!(
+                        "assigned shard copy {}/{} is missing Tantivy metadata {meta_path:?}",
+                        key.index, key.shard_id
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.cache_copy_identity(key, identity.clone());
+        Ok(identity)
+    }
+
+    fn ensure_local_test_identity(
+        &self,
+        key: &ShardKey,
+        shard_dir: &std::path::Path,
+        index_uuid: &str,
+    ) -> Result<ShardCopyIdentity> {
+        if let Some(identity) = self
+            .copy_identities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .cloned()
+        {
+            identity.validate()?;
+            if identity.index_uuid != index_uuid {
+                anyhow::bail!(
+                    "local test shard copy UUID mismatch: expected {index_uuid}, found {}",
+                    identity.index_uuid
+                );
+            }
+            return Ok(identity);
+        }
+        if Self::copy_identity_path(shard_dir).try_exists()? {
+            let identity = Self::load_copy_identity(shard_dir)?;
+            if identity.index_uuid != index_uuid {
+                anyhow::bail!(
+                    "local test shard copy UUID mismatch: expected {index_uuid}, found {}",
+                    identity.index_uuid
+                );
+            }
+            self.cache_copy_identity(key, identity.clone());
+            return Ok(identity);
+        }
+        Self::remove_stale_copy_identity_temp(shard_dir)?;
+        if !Self::directory_tree_is_empty(shard_dir)? {
+            anyhow::bail!(
+                "local test shard copy {}/{} has data but no durable identity",
+                key.index,
+                key.shard_id
+            );
+        }
+        let identity = ShardCopyIdentity::new(index_uuid, 1, 1)?;
+        Self::persist_copy_identity(shard_dir, &identity)?;
+        self.cache_copy_identity(key, identity.clone());
+        Ok(identity)
+    }
+
+    pub fn copy_identity(&self, index: &str, shard_id: u32) -> Option<ShardCopyIdentity> {
+        self.copy_identities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&ShardKey::new(index, shard_id))
+            .cloned()
+    }
+
+    pub fn validate_open_copy_identity(
+        &self,
+        index: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        self.validated_cached_copy_identity(
+            &ShardKey::new(index, shard_id),
+            index_uuid,
+            allocation_id,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn is_definitive_copy_failure(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause.downcast_ref::<DefinitiveShardCopyFailure>().is_some()
+                || cause
+                    .downcast_ref::<crate::wal::WalCorruptionError>()
+                    .is_some()
+                || cause.downcast_ref::<serde_json::Error>().is_some()
+                || cause.downcast_ref::<std::num::ParseIntError>().is_some()
+                || cause
+                    .downcast_ref::<crate::engine::tantivy::AuthoritativeSchemaError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<tantivy::TantivyError>()
+                    .is_some_and(Self::tantivy_failure_is_definitive)
+        })
+    }
+
+    pub(crate) fn is_persistent_io_failure(error: &anyhow::Error) -> bool {
+        error.is::<PersistentShardCopyIoFailure>()
+    }
+
+    pub(crate) fn should_report_copy_failure(error: &anyhow::Error) -> bool {
+        Self::is_definitive_copy_failure(error) || Self::is_persistent_io_failure(error)
+    }
+
+    pub(crate) fn should_quarantine_copy_failure(error: &anyhow::Error) -> bool {
+        if Self::is_definitive_copy_failure(error) {
+            return true;
+        }
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<PersistentShardCopyIoFailure>()
+                .is_some_and(|failure| failure.operation != ShardCopyIoOperation::Apply)
+        })
+    }
+
+    pub(crate) fn ensure_local_apply_allowed(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        self.ensure_copy_io_attempt_allowed(&Self::copy_io_key(
+            index_uuid,
+            shard_id,
+            allocation_id,
+            ShardCopyIoOperation::Apply,
+        ))
+    }
+
+    pub(crate) fn record_local_apply_result<T>(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: AllocationId,
+        result: Result<T>,
+    ) -> Result<T> {
+        let retry_key = Self::copy_io_key(
+            index_uuid,
+            shard_id,
+            allocation_id,
+            ShardCopyIoOperation::Apply,
+        );
+        match result {
+            Ok(value) => {
+                self.clear_copy_io_failure(&retry_key);
+                Ok(value)
+            }
+            Err(error) if Self::is_definitive_copy_failure(&error) => Err(error),
+            Err(error) if Self::is_retryable_io_failure(&error) => {
+                Err(self.record_copy_io_failure(retry_key, error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn record_peer_recovery_failure(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: AllocationId,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if Self::is_definitive_copy_failure(&error) {
+            return error;
+        }
+        if !error.is::<LocalShardStorageFailure>() {
+            return error;
+        }
+        self.record_copy_io_failure(
+            Self::copy_io_key(
+                index_uuid,
+                shard_id,
+                allocation_id,
+                ShardCopyIoOperation::Recovery,
+            ),
+            error,
+        )
+    }
+
+    pub(crate) fn local_storage_failure(error: impl Into<anyhow::Error>) -> anyhow::Error {
+        anyhow::Error::new(LocalShardStorageFailure {
+            source: error.into(),
+        })
+    }
+
+    pub(crate) fn clear_peer_recovery_failure(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: AllocationId,
+    ) {
+        self.clear_copy_io_failure(&Self::copy_io_key(
+            index_uuid,
+            shard_id,
+            allocation_id,
+            ShardCopyIoOperation::Recovery,
+        ));
+    }
+
+    pub fn quarantine_shard_copy(&self, index: &str, shard_id: u32) {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.shards
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.isr_tracker.remove_shard(index, shard_id);
+    }
+
+    pub async fn quarantine_shard_copy_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            shard_manager.quarantine_shard_copy(&index, shard_id);
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("blocking shard quarantine failed: {error}"))?;
+        Ok(())
     }
 
     pub(crate) fn register_source_recovery_cleanup(
@@ -431,7 +1406,13 @@ impl ShardManager {
         }
     }
 
-    fn ensure_reopen_target(&self, index: &str, shard_id: u32, expected_uuid: &str) -> Result<()> {
+    fn ensure_reopen_target(
+        &self,
+        index: &str,
+        shard_id: u32,
+        expected_uuid: &str,
+        expected_allocation_id: AllocationId,
+    ) -> Result<()> {
         let registered_uuid = self.index_uuid(index);
         if registered_uuid.as_deref() != Some(expected_uuid) {
             return Err(ShardReopenAborted {
@@ -470,6 +1451,9 @@ impl ShardManager {
             }
             .into());
         }
+        let identity = Self::load_copy_identity(&shard_dir)?;
+        identity.validate_expected(expected_uuid, expected_allocation_id)?;
+        self.cache_copy_identity(&key, identity);
         let meta_path = shard_dir.join("index").join("meta.json");
         if !meta_path.is_file() {
             return Err(ShardReopenAborted {
@@ -619,7 +1603,16 @@ impl ShardManager {
         settings: &IndexSettings,
         index_uuid: &str,
     ) -> Result<Arc<dyn SearchEngine>> {
-        self.open_shard_with_settings_mode(index, shard_id, mappings, settings, index_uuid, true)
+        self.open_shard_with_settings_mode(
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            ShardOpenAuthority::Local {
+                allow_schema_reset: true,
+            },
+        )
     }
 
     pub fn open_shard_with_settings_strict(
@@ -630,7 +1623,56 @@ impl ShardManager {
         settings: &IndexSettings,
         index_uuid: &str,
     ) -> Result<Arc<dyn SearchEngine>> {
-        self.open_shard_with_settings_mode(index, shard_id, mappings, settings, index_uuid, false)
+        self.open_shard_with_settings_mode(
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            ShardOpenAuthority::Local {
+                allow_schema_reset: false,
+            },
+        )
+    }
+
+    pub fn open_assigned_shard_with_settings(
+        &self,
+        index: &str,
+        shard_id: u32,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: &IndexSettings,
+        index_uuid: &str,
+        assignment: AssignedShardOpen,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let retry_key = Self::copy_io_key(
+            index_uuid,
+            shard_id,
+            assignment.allocation_id,
+            ShardCopyIoOperation::PendingMarker,
+        );
+        let attempt_lock = self.copy_io_attempt_lock(&retry_key);
+        let _attempt_guard = attempt_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.ensure_copy_io_attempt_allowed(&retry_key)?;
+        #[cfg(test)]
+        if let Err(error) = self.maybe_inject_assigned_open_io_failure() {
+            return Err(self.record_copy_io_failure(retry_key, error));
+        }
+        match self.open_shard_with_settings_mode(
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            ShardOpenAuthority::Assigned(assignment),
+        ) {
+            Ok(engine) => {
+                self.clear_copy_io_failure(&retry_key);
+                Ok(engine)
+            }
+            Err(error) => Err(self.record_copy_io_failure(retry_key, error)),
+        }
     }
 
     fn open_shard_with_settings_mode(
@@ -640,21 +1682,45 @@ impl ShardManager {
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
         settings: &IndexSettings,
         index_uuid: &str,
-        allow_schema_reset: bool,
+        authority: ShardOpenAuthority,
     ) -> Result<Arc<dyn SearchEngine>> {
+        let (assignment, open_mode) = match authority {
+            ShardOpenAuthority::Local { allow_schema_reset } => {
+                (None, CompositeOpenMode::CreateOrOpen { allow_schema_reset })
+            }
+            ShardOpenAuthority::Assigned(assignment) => (
+                Some(assignment),
+                if assignment.allow_empty_creation {
+                    CompositeOpenMode::CreateOrOpen {
+                        allow_schema_reset: false,
+                    }
+                } else {
+                    CompositeOpenMode::ExistingOnly
+                },
+            ),
+        };
         let key = ShardKey::new(index, shard_id);
         let shard_dir = self
             .data_dir
             .join(index_uuid)
             .join(format!("shard_{shard_id}"));
-        if shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists() {
-            anyhow::bail!("shard {index}/{shard_id} has an incomplete peer recovery installation");
-        }
+        Self::ensure_no_current_peer_recovery_install(
+            &shard_dir, index, shard_id, index_uuid, assignment,
+        )?;
 
         // Fast path: shard already open.
         {
             let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
             if let Some(engine) = shards.get(&key) {
+                if let Some(assignment) = assignment {
+                    self.validated_cached_copy_identity(
+                        &key,
+                        index_uuid,
+                        assignment.allocation_id,
+                    )?;
+                } else {
+                    self.ensure_local_test_identity(&key, &shard_dir, index_uuid)?;
+                }
                 return Ok(engine.clone());
             }
         }
@@ -681,10 +1747,7 @@ impl ShardManager {
                 let _ = release.recv();
             }
         }
-        let per_shard_lock = {
-            let mut locks = self.open_locks.lock().unwrap_or_else(|e| e.into_inner());
-            locks.entry(key.clone()).or_default().clone()
-        };
+        let per_shard_lock = self.shard_open_lock(&key);
         let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         // Re-check after acquiring the per-shard lock — a concurrent caller
@@ -692,26 +1755,45 @@ impl ShardManager {
         {
             let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
             if let Some(engine) = shards.get(&key) {
+                if let Some(assignment) = assignment {
+                    self.validated_cached_copy_identity(
+                        &key,
+                        index_uuid,
+                        assignment.allocation_id,
+                    )?;
+                } else {
+                    self.ensure_local_test_identity(&key, &shard_dir, index_uuid)?;
+                }
                 return Ok(engine.clone());
             }
         }
 
-        if shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists() {
-            anyhow::bail!("shard {index}/{shard_id} has an incomplete peer recovery installation");
-        }
-        let awaiting_membership_path = shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER);
-        let awaiting_membership = if awaiting_membership_path.exists() {
-            let pending: PeerRecoveryAwaitingMembership =
-                serde_json::from_slice(&std::fs::read(&awaiting_membership_path)?)?;
+        Self::ensure_no_current_peer_recovery_install(
+            &shard_dir, index, shard_id, index_uuid, assignment,
+        )?;
+        let awaiting_membership = if let Some(pending) =
+            Self::load_peer_recovery_awaiting_membership(&shard_dir)?
+        {
             if pending.index_uuid != index_uuid {
                 anyhow::bail!(
                     "peer recovery awaiting-membership marker UUID does not match shard metadata"
+                );
+            }
+            if let Some(assignment) = assignment
+                && pending.allocation_id != assignment.allocation_id
+            {
+                anyhow::bail!(
+                    "peer recovery awaiting-membership marker allocation does not match shard metadata"
                 );
             }
             Some(pending)
         } else {
             None
         };
+
+        if let Some(assignment) = assignment {
+            self.prepare_assigned_copy_identity(&key, &shard_dir, index_uuid, assignment)?;
+        }
 
         self.register_index_uuid(index, index_uuid);
 
@@ -721,7 +1803,10 @@ impl ShardManager {
         let refresh_rx = settings_mgr.watch_refresh_interval();
         let flush_threshold_rx = settings_mgr.watch_flush_threshold();
 
-        std::fs::create_dir_all(&shard_dir)?;
+        if assignment.is_none() {
+            std::fs::create_dir_all(&shard_dir)?;
+            self.ensure_local_test_identity(&key, &shard_dir, index_uuid)?;
+        }
         let stale_snapshot_dir = shard_dir.join("peer-recovery");
         if stale_snapshot_dir.exists() {
             Self::remove_dir_all_with_retry(&stale_snapshot_dir)?;
@@ -733,7 +1818,7 @@ impl ShardManager {
             &shard_dir,
             refresh_interval,
             mappings,
-            CompositeOpenMode::CreateOrOpen { allow_schema_reset },
+            open_mode,
         )?;
         CompositeEngine::start_refresh_loop_reactive(
             engine.clone(),
@@ -746,13 +1831,17 @@ impl ShardManager {
         let has_vectors = mappings
             .values()
             .any(|m| matches!(m.field_type, crate::cluster::state::FieldType::KnnVector));
-        if has_vectors && let Err(e) = engine.rebuild_vectors() {
-            tracing::warn!(
-                "Failed to rebuild vectors for {}/shard_{}: {}",
-                index,
-                shard_id,
-                e
-            );
+        if has_vectors {
+            if assignment.is_some() {
+                engine.rebuild_vectors()?;
+            } else if let Err(e) = engine.rebuild_vectors() {
+                tracing::warn!(
+                    "Failed to rebuild vectors for {}/shard_{}: {}",
+                    index,
+                    shard_id,
+                    e
+                );
+            }
         }
 
         tracing::info!(
@@ -798,6 +1887,26 @@ impl ShardManager {
         .map_err(|e| anyhow::anyhow!("blocking shard open task failed: {e}"))?
     }
 
+    pub async fn open_assigned_shard_with_settings_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: IndexSettings,
+        index_uuid: impl Into<String> + Send + 'static,
+        assignment: AssignedShardOpen,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let shard_manager = self.clone();
+        let uuid_str = index_uuid.into();
+        tokio::task::spawn_blocking(move || {
+            shard_manager.open_assigned_shard_with_settings(
+                &index, shard_id, &mappings, &settings, &uuid_str, assignment,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking assigned shard open task failed: {e}"))?
+    }
+
     pub async fn open_shard_with_settings_strict_blocking(
         self: &Arc<Self>,
         index: String,
@@ -816,14 +1925,250 @@ impl ShardManager {
         .map_err(|e| anyhow::anyhow!("blocking strict shard open task failed: {e}"))?
     }
 
+    pub(crate) fn apply_replica_operation<T, F>(
+        &self,
+        index: &str,
+        shard_id: u32,
+        context: ReplicaApplyContext<'_>,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(Arc<dyn SearchEngine>) -> Result<T>,
+    {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut identity =
+            self.validated_cached_copy_identity(&key, context.index_uuid, context.allocation_id)?;
+        if self.rejects_live_replication(index, shard_id) {
+            anyhow::bail!("replica is installing a peer recovery snapshot");
+        }
+        let required_term = context.applied_view_term.max(identity.replica_fence);
+        if context.message_term < required_term {
+            anyhow::bail!(
+                "replication primary term {} is below local fence {required_term}",
+                context.message_term
+            );
+        }
+        if context.message_term > identity.replica_fence {
+            identity.replica_fence = context.message_term;
+            let shard_dir = self
+                .data_dir
+                .join(context.index_uuid)
+                .join(format!("shard_{shard_id}"));
+            let retry_key = Self::copy_io_key(
+                context.index_uuid,
+                shard_id,
+                context.allocation_id,
+                ShardCopyIoOperation::Fence,
+            );
+            self.ensure_copy_io_attempt_allowed(&retry_key)?;
+            if let Err(error) = Self::persist_copy_identity(&shard_dir, &identity) {
+                return Err(self.record_copy_io_failure(retry_key, error));
+            }
+            self.clear_copy_io_failure(&retry_key);
+            self.cache_copy_identity(&key, identity);
+        }
+        let engine = self
+            .shards
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("replica shard engine is not open"))?;
+        self.ensure_local_apply_allowed(context.index_uuid, shard_id, context.allocation_id)?;
+        let result = operation(engine);
+        self.record_local_apply_result(context.index_uuid, shard_id, context.allocation_id, result)
+    }
+
+    pub async fn raise_copy_fence_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+        term: u64,
+    ) -> Result<()> {
+        if term == 0 {
+            anyhow::bail!("replica fence term must be greater than zero");
+        }
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = ShardKey::new(&index, shard_id);
+            let per_shard_lock = shard_manager.shard_open_lock(&key);
+            let _guard = per_shard_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut identity =
+                shard_manager.validated_cached_copy_identity(&key, &index_uuid, allocation_id)?;
+            if term > identity.replica_fence {
+                identity.replica_fence = term;
+                let shard_dir = shard_manager
+                    .data_dir
+                    .join(&index_uuid)
+                    .join(format!("shard_{shard_id}"));
+                let retry_key = Self::copy_io_key(
+                    &index_uuid,
+                    shard_id,
+                    allocation_id,
+                    ShardCopyIoOperation::Fence,
+                );
+                shard_manager.ensure_copy_io_attempt_allowed(&retry_key)?;
+                if let Err(error) = Self::persist_copy_identity(&shard_dir, &identity) {
+                    return Err(shard_manager.record_copy_io_failure(retry_key, error));
+                }
+                shard_manager.clear_copy_io_failure(&retry_key);
+                shard_manager.cache_copy_identity(&key, identity);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("blocking replica fence update failed: {error}"))?
+    }
+
+    pub async fn begin_peer_recovery_target_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+    ) -> Result<bool> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = ShardKey::new(&index, shard_id);
+            let per_shard_lock = shard_manager.shard_open_lock(&key);
+            let _guard = per_shard_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let shard_dir = shard_manager
+                .data_dir
+                .join(&index_uuid)
+                .join(format!("shard_{shard_id}"));
+            if let Some(pending) = Self::matching_peer_recovery_awaiting_membership(
+                &shard_dir,
+                &index_uuid,
+                allocation_id,
+            )? {
+                shard_manager
+                    .peer_recovery_targets
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .entry(key)
+                    .or_insert(PeerRecoveryTargetState::FinalizedAwaitingMembership(
+                        pending,
+                    ));
+                return Ok(false);
+            }
+            let mut targets = shard_manager
+                .peer_recovery_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            if let std::collections::hash_map::Entry::Vacant(entry) = targets.entry(key) {
+                entry.insert(PeerRecoveryTargetState::Recovering {
+                    index_uuid,
+                    allocation_id,
+                });
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("blocking peer recovery target start failed: {error}"))?
+    }
+
+    pub fn restore_peer_recovery_awaiting_membership(
+        &self,
+        index: &str,
+        shard_id: u32,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: &IndexSettings,
+        index_uuid: &str,
+        assignment: AssignedShardOpen,
+    ) -> Result<bool> {
+        let retry_key = Self::copy_io_key(
+            index_uuid,
+            shard_id,
+            assignment.allocation_id,
+            ShardCopyIoOperation::Open,
+        );
+        self.ensure_copy_io_attempt_allowed(&retry_key)?;
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let shard_dir = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"));
+        let pending = match Self::matching_peer_recovery_awaiting_membership(
+            &shard_dir,
+            index_uuid,
+            assignment.allocation_id,
+        ) {
+            Ok(Some(pending)) => pending,
+            Ok(None) => {
+                self.clear_copy_io_failure(&retry_key);
+                return Ok(false);
+            }
+            Err(error) => return Err(self.record_copy_io_failure(retry_key, error)),
+        };
+        {
+            let mut targets = self
+                .peer_recovery_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            match targets.get(&key) {
+                Some(PeerRecoveryTargetState::FinalizedAwaitingMembership(existing))
+                    if existing == &pending => {}
+                Some(PeerRecoveryTargetState::Recovering { .. }) => return Ok(false),
+                Some(PeerRecoveryTargetState::FinalizedAwaitingMembership(_)) => {
+                    anyhow::bail!(
+                        "in-memory peer recovery pending state does not match its durable marker"
+                    );
+                }
+                None => {
+                    targets.insert(
+                        key,
+                        PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
+                    );
+                }
+            }
+        }
+        drop(guard);
+        self.clear_copy_io_failure(&retry_key);
+        self.open_assigned_shard_with_settings(
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            AssignedShardOpen {
+                allocation_id: assignment.allocation_id,
+                primary_term: assignment.primary_term,
+                allow_empty_creation: false,
+            },
+        )?;
+        Ok(true)
+    }
+
     pub fn begin_peer_recovery_target(&self, index: &str, shard_id: u32) -> bool {
         let key = ShardKey::new(index, shard_id);
+        let Some(identity) = self.copy_identity(index, shard_id) else {
+            return false;
+        };
         let mut targets = self
             .peer_recovery_targets
             .write()
             .unwrap_or_else(|e| e.into_inner());
         if let std::collections::hash_map::Entry::Vacant(entry) = targets.entry(key) {
-            entry.insert(PeerRecoveryTargetState::Recovering);
+            entry.insert(PeerRecoveryTargetState::Recovering {
+                index_uuid: identity.index_uuid,
+                allocation_id: identity.allocation_id,
+            });
             true
         } else {
             false
@@ -847,13 +2192,66 @@ impl ShardManager {
             .contains_key(&ShardKey::new(index, shard_id))
     }
 
+    pub fn failed_peer_recovery_install_matches(
+        &self,
+        index: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<bool> {
+        let retry_key = Self::copy_io_key(
+            index_uuid,
+            shard_id,
+            allocation_id,
+            ShardCopyIoOperation::InstallMarker,
+        );
+        self.ensure_copy_io_attempt_allowed(&retry_key)?;
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self
+            .peer_recovery_targets
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&key)
+        {
+            return Ok(false);
+        }
+        let shard_dir = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"));
+        let marker = match Self::load_peer_recovery_install_marker(&shard_dir) {
+            Ok(Some(marker)) => marker,
+            Ok(None) => {
+                self.clear_copy_io_failure(&retry_key);
+                return Ok(false);
+            }
+            Err(error) => return Err(self.record_copy_io_failure(retry_key, error)),
+        };
+        self.clear_copy_io_failure(&retry_key);
+        Ok(marker.index_uuid == index_uuid && marker.allocation_id == allocation_id)
+    }
+
     pub fn rejects_live_replication(&self, index: &str, shard_id: u32) -> bool {
         matches!(
             self.peer_recovery_targets
                 .read()
                 .unwrap_or_else(|error| error.into_inner())
                 .get(&ShardKey::new(index, shard_id)),
-            Some(PeerRecoveryTargetState::Recovering)
+            Some(PeerRecoveryTargetState::Recovering { .. })
+        )
+    }
+
+    pub fn accepts_live_replication_while_pending(&self, index: &str, shard_id: u32) -> bool {
+        matches!(
+            self.peer_recovery_targets
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&ShardKey::new(index, shard_id)),
+            Some(PeerRecoveryTargetState::FinalizedAwaitingMembership(_))
         )
     }
 
@@ -864,6 +2262,54 @@ impl ShardManager {
             .iter()
             .map(|(key, state)| (key.clone(), state.clone()))
             .collect()
+    }
+
+    fn peer_recovery_target_matches(
+        &self,
+        key: &ShardKey,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> bool {
+        match self
+            .peer_recovery_targets
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+        {
+            Some(PeerRecoveryTargetState::Recovering {
+                index_uuid: active_uuid,
+                allocation_id: active_allocation,
+            }) => active_uuid == index_uuid && *active_allocation == allocation_id,
+            Some(PeerRecoveryTargetState::FinalizedAwaitingMembership(pending)) => {
+                pending.index_uuid == index_uuid && pending.allocation_id == allocation_id
+            }
+            None => false,
+        }
+    }
+
+    fn remove_peer_recovery_target_if_matches(
+        &self,
+        key: &ShardKey,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) {
+        let mut targets = self
+            .peer_recovery_targets
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let matches = match targets.get(key) {
+            Some(PeerRecoveryTargetState::Recovering {
+                index_uuid: active_uuid,
+                allocation_id: active_allocation,
+            }) => active_uuid == index_uuid && *active_allocation == allocation_id,
+            Some(PeerRecoveryTargetState::FinalizedAwaitingMembership(pending)) => {
+                pending.index_uuid == index_uuid && pending.allocation_id == allocation_id
+            }
+            None => false,
+        };
+        if matches {
+            targets.remove(key);
+        }
     }
 
     pub async fn mark_peer_recovery_awaiting_membership_blocking(
@@ -881,7 +2327,7 @@ impl ShardManager {
                     .read()
                     .unwrap_or_else(|error| error.into_inner())
                     .get(&key),
-                Some(PeerRecoveryTargetState::Recovering)
+                Some(PeerRecoveryTargetState::Recovering { .. })
             ) {
                 anyhow::bail!(
                     "peer recovery target is not in the recovering state before completion"
@@ -903,7 +2349,7 @@ impl ShardManager {
             marker.write_all(&bytes)?;
             marker.sync_all()?;
             std::fs::rename(&temporary_path, &marker_path)?;
-            std::fs::File::open(&shard_dir)?.sync_all()?;
+            let directory_sync = std::fs::File::open(&shard_dir).and_then(|dir| dir.sync_all());
             shard_manager
                 .peer_recovery_targets
                 .write()
@@ -912,6 +2358,7 @@ impl ShardManager {
                     key,
                     PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
                 );
+            directory_sync?;
             Ok(())
         })
         .await
@@ -957,37 +2404,62 @@ impl ShardManager {
         index: String,
         shard_id: u32,
         index_uuid: String,
+        allocation_id: AllocationId,
     ) -> Result<PathBuf> {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
+            if allocation_id == 0 {
+                anyhow::bail!("peer recovery target has a zero allocation ID");
+            }
             let key = ShardKey::new(&index, shard_id);
-            let per_shard_lock = {
-                let mut locks = shard_manager
-                    .open_locks
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                locks.entry(key.clone()).or_default().clone()
-            };
+            let per_shard_lock = shard_manager.shard_open_lock(&key);
             let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let shard_dir = shard_manager
+                .data_dir
+                .join(&index_uuid)
+                .join(format!("shard_{shard_id}"));
+            if Self::matching_peer_recovery_awaiting_membership(
+                &shard_dir,
+                &index_uuid,
+                allocation_id,
+            )?
+            .is_some()
+            {
+                anyhow::bail!("peer recovery target is already finalized and awaiting membership");
+            }
             shard_manager
                 .shards
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
+            shard_manager
+                .copy_identities
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
             shard_manager.isr_tracker.remove_shard(&index, shard_id);
             shard_manager.register_index_uuid(&index, &index_uuid);
 
-            let shard_dir = shard_manager
-                .data_dir
-                .join(&index_uuid)
-                .join(format!("shard_{shard_id}"));
-            if shard_dir.exists() {
+            if shard_dir.try_exists()? {
                 Self::remove_dir_all_with_retry(&shard_dir)?;
             }
             std::fs::create_dir_all(shard_dir.join("index"))?;
             let marker_path = shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER);
-            let marker = std::fs::File::create(&marker_path)?;
-            marker.sync_all()?;
+            let temporary_path = marker_path.with_extension("tmp");
+            let marker = PeerRecoveryInstallMarker {
+                version: 1,
+                index_uuid,
+                allocation_id,
+            };
+            let bytes = serde_json::to_vec(&marker)?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary_path, &marker_path)?;
             std::fs::File::open(&shard_dir)?.sync_all()?;
             Ok(shard_dir)
         })
@@ -1007,6 +2479,8 @@ impl ShardManager {
                 mappings,
                 settings,
                 index_uuid,
+                allocation_id,
+                primary_term,
                 shard_dir,
                 snapshot_next_seq_no,
                 mut expected_files,
@@ -1020,8 +2494,21 @@ impl ShardManager {
                 locks.entry(key.clone()).or_default().clone()
             };
             let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
-            if !shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists() {
-                anyhow::bail!("peer recovery marker disappeared before install finalization");
+            let marker_path = shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER);
+            if !marker_path.try_exists()? {
+                return Err(definitive_shard_copy_failure(
+                    "peer recovery marker disappeared before install finalization",
+                ));
+            }
+            let marker: PeerRecoveryInstallMarker =
+                serde_json::from_slice(&std::fs::read(&marker_path)?).map_err(|error| {
+                    definitive_shard_copy_failure(format!("decode peer recovery marker: {error}"))
+                })?;
+            marker.validate()?;
+            if marker.index_uuid != index_uuid || marker.allocation_id != allocation_id {
+                return Err(definitive_shard_copy_failure(
+                    "peer recovery install marker does not match the target allocation",
+                ));
             }
 
             HotTranslog::initialize_empty_at(
@@ -1074,7 +2561,9 @@ impl ShardManager {
                 engine.rebuild_vectors()?;
             }
 
-            std::fs::remove_file(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER))?;
+            let identity = ShardCopyIdentity::new(&index_uuid, allocation_id, primary_term)?;
+            Self::persist_copy_identity(&shard_dir, &identity)?;
+            std::fs::remove_file(&marker_path)?;
             std::fs::File::open(&shard_dir)?.sync_all()?;
 
             CompositeEngine::start_refresh_loop_reactive(
@@ -1083,6 +2572,7 @@ impl ShardManager {
                 flush_threshold_rx,
             );
             let dynamic_engine: Arc<dyn SearchEngine> = engine;
+            shard_manager.cache_copy_identity(&key, identity);
             shard_manager
                 .shards
                 .write()
@@ -1099,10 +2589,25 @@ impl ShardManager {
         index: String,
         shard_id: u32,
         index_uuid: String,
+        allocation_id: AllocationId,
     ) -> Result<()> {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let key = ShardKey::new(&index, shard_id);
+            let per_shard_lock = shard_manager.shard_open_lock(&key);
+            let _guard = per_shard_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if shard_manager.index_uuid(&index).as_deref() != Some(index_uuid.as_str())
+                || !shard_manager.peer_recovery_target_matches(&key, &index_uuid, allocation_id)
+            {
+                shard_manager.remove_peer_recovery_target_if_matches(
+                    &key,
+                    &index_uuid,
+                    allocation_id,
+                );
+                return Ok(());
+            }
             shard_manager
                 .shards
                 .write()
@@ -1113,9 +2618,14 @@ impl ShardManager {
                 .write()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&key);
+            shard_manager
+                .copy_identities
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
             let shard_dir = shard_manager
                 .data_dir
-                .join(index_uuid)
+                .join(&index_uuid)
                 .join(format!("shard_{shard_id}"));
             std::fs::create_dir_all(&shard_dir)?;
             match std::fs::remove_file(shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER)) {
@@ -1123,13 +2633,162 @@ impl ShardManager {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            let marker = std::fs::File::create(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER))?;
-            marker.sync_all()?;
+            let marker_path = shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER);
+            let temporary_path = marker_path.with_extension("tmp");
+            let marker = PeerRecoveryInstallMarker {
+                version: 1,
+                index_uuid,
+                allocation_id,
+            };
+            let bytes = serde_json::to_vec(&marker)?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary_path, &marker_path)?;
             std::fs::File::open(shard_dir)?.sync_all()?;
             Ok(())
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking peer recovery abort failed: {e}"))?
+    }
+
+    pub async fn reset_peer_recovery_target_for_retry_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = ShardKey::new(&index, shard_id);
+            let per_shard_lock = shard_manager.shard_open_lock(&key);
+            let _guard = per_shard_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if shard_manager.index_uuid(&index).as_deref() != Some(index_uuid.as_str()) {
+                shard_manager.remove_peer_recovery_target_if_matches(
+                    &key,
+                    &index_uuid,
+                    allocation_id,
+                );
+                return Ok(());
+            }
+            let shard_dir = shard_manager
+                .data_dir
+                .join(&index_uuid)
+                .join(format!("shard_{shard_id}"));
+            if let Some(pending) = Self::matching_peer_recovery_awaiting_membership(
+                &shard_dir,
+                &index_uuid,
+                allocation_id,
+            )? {
+                let mut targets = shard_manager
+                    .peer_recovery_targets
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner());
+                match targets.get(&key) {
+                    Some(PeerRecoveryTargetState::Recovering {
+                        index_uuid: active_uuid,
+                        allocation_id: active_allocation,
+                    }) if active_uuid == &index_uuid && *active_allocation == allocation_id => {
+                        targets.insert(
+                            key,
+                            PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
+                        );
+                        shard_manager.clear_peer_recovery_failure(
+                            &index_uuid,
+                            shard_id,
+                            allocation_id,
+                        );
+                        return Ok(());
+                    }
+                    Some(PeerRecoveryTargetState::FinalizedAwaitingMembership(existing))
+                        if existing == &pending =>
+                    {
+                        shard_manager.clear_peer_recovery_failure(
+                            &index_uuid,
+                            shard_id,
+                            allocation_id,
+                        );
+                        return Ok(());
+                    }
+                    Some(_) => {
+                        anyhow::bail!(
+                            "refusing retry cleanup for a different recovery allocation"
+                        );
+                    }
+                    None => {
+                        targets.insert(
+                            key,
+                            PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
+                        );
+                        shard_manager.clear_peer_recovery_failure(
+                            &index_uuid,
+                            shard_id,
+                            allocation_id,
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            {
+                let targets = shard_manager
+                    .peer_recovery_targets
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                match targets.get(&key) {
+                    Some(PeerRecoveryTargetState::Recovering {
+                        index_uuid: active_uuid,
+                        allocation_id: active_allocation,
+                    }) if active_uuid == &index_uuid && *active_allocation == allocation_id => {}
+                    Some(PeerRecoveryTargetState::FinalizedAwaitingMembership(_)) => {
+                        anyhow::bail!(
+                            "refusing retry cleanup for a finalized target awaiting membership"
+                        );
+                    }
+                    Some(PeerRecoveryTargetState::Recovering { .. }) => {
+                        anyhow::bail!(
+                            "refusing retry cleanup for a different recovery allocation"
+                        );
+                    }
+                    None => return Ok(()),
+                }
+            }
+            if let Some(marker) = Self::load_peer_recovery_install_marker(&shard_dir)?
+                && (marker.index_uuid != index_uuid || marker.allocation_id != allocation_id)
+            {
+                anyhow::bail!(
+                    "refusing retry cleanup because the install marker belongs to another allocation"
+                );
+            }
+            shard_manager
+                .shards
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+            shard_manager
+                .copy_identities
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+            shard_manager.isr_tracker.remove_shard(&index, shard_id);
+            if shard_dir.try_exists()? {
+                Self::remove_dir_all_with_retry(&shard_dir)?;
+            }
+            shard_manager
+                .peer_recovery_targets
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("blocking peer recovery retry cleanup failed: {error}"))?
     }
 
     /// Close an existing shard engine and reopen it with updated mappings.
@@ -1144,6 +2803,7 @@ impl ShardManager {
         mappings: HashMap<String, crate::cluster::state::FieldMapping>,
         settings: IndexSettings,
         index_uuid: String,
+        allocation_id: AllocationId,
     ) -> Result<Arc<dyn SearchEngine>> {
         let shard_manager = self.clone();
         tokio::spawn(async move {
@@ -1159,7 +2819,7 @@ impl ShardManager {
             let source_recovery_lock =
                 shard_manager.source_recovery_lifecycle_lock(&index_uuid, shard_id);
             let _source_recovery_guard = source_recovery_lock.lock_owned().await;
-            shard_manager.ensure_reopen_target(&index, shard_id, &index_uuid)?;
+            shard_manager.ensure_reopen_target(&index, shard_id, &index_uuid, allocation_id)?;
             shard_manager
                 .abort_source_recovery_for_shard(&index_uuid, shard_id)
                 .await?;
@@ -1193,7 +2853,12 @@ impl ShardManager {
             let blocking_manager = shard_manager.clone();
             tokio::task::spawn_blocking(move || {
                 let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
-                blocking_manager.ensure_reopen_target(&index, shard_id, &index_uuid)?;
+                blocking_manager.ensure_reopen_target(
+                    &index,
+                    shard_id,
+                    &index_uuid,
+                    allocation_id,
+                )?;
                 let old_engine = {
                     let shards = blocking_manager
                         .shards
@@ -1308,6 +2973,39 @@ impl ShardManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn initialize_copy_identity_for_test(
+        &self,
+        index: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+        primary_term: u64,
+    ) -> Result<()> {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let shard_dir = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"));
+        std::fs::create_dir_all(&shard_dir)?;
+        self.prepare_assigned_copy_identity(
+            &key,
+            &shard_dir,
+            index_uuid,
+            AssignedShardOpen {
+                allocation_id,
+                primary_term,
+                allow_empty_creation: true,
+            },
+        )?;
+        self.register_index_uuid(index, index_uuid);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_shard_for_test(
         &self,
         index: &str,
@@ -1315,6 +3013,14 @@ impl ShardManager {
         engine: Arc<dyn SearchEngine>,
     ) {
         let key = ShardKey::new(index, shard_id);
+        if let Some(index_uuid) = self.index_uuid(index) {
+            let shard_dir = self
+                .data_dir
+                .join(&index_uuid)
+                .join(format!("shard_{shard_id}"));
+            self.ensure_local_test_identity(&key, &shard_dir, &index_uuid)
+                .expect("test shard identity should persist");
+        }
         self.shards
             .write()
             .unwrap_or_else(|error| error.into_inner())
@@ -1362,6 +3068,10 @@ impl ShardManager {
             shards.remove(key);
         }
         drop(shards);
+        self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|key, _| key.index != index);
 
         // Clean ISR tracking for this index
         self.isr_tracker.remove_index(index);
@@ -1382,6 +3092,14 @@ impl ShardManager {
         };
 
         if let Some(uuid) = uuid {
+            self.copy_io_retries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|key, _| key.index_uuid != uuid);
+            self.copy_io_attempt_locks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|key, _| key.index_uuid != uuid);
             let index_dir = self.data_dir.join(&uuid);
             if index_dir.exists() {
                 tracing::warn!(
@@ -1688,6 +3406,7 @@ mod tests {
                     HashMap::new(),
                     IndexSettings::default(),
                     "uuid-old".into(),
+                    1,
                 )
                 .await
         });
@@ -1733,6 +3452,7 @@ mod tests {
                     HashMap::new(),
                     IndexSettings::default(),
                     "uuid-old".into(),
+                    1,
                 )
                 .await
         });
@@ -1823,6 +3543,7 @@ mod tests {
                     HashMap::new(),
                     IndexSettings::default(),
                     "uuid-old".into(),
+                    1,
                 )
                 .await
         });
@@ -2297,7 +4018,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
         let shard_dir = manager
-            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into())
+            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into(), 1)
             .await
             .unwrap();
 
@@ -2341,7 +4062,16 @@ mod tests {
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let shard_dir = dir.path().join("uuid-1/shard_0");
         std::fs::create_dir_all(&shard_dir).unwrap();
-        std::fs::File::create(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER)).unwrap();
+        std::fs::write(
+            shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "index_uuid": "uuid-1",
+                "allocation_id": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         release_tx.send(()).unwrap();
 
         let error = match open.join().unwrap() {
@@ -2362,6 +4092,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let shard_dir = dir.path().join("uuid-1").join("shard_0");
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager
+            .initialize_copy_identity_for_test("idx", 0, "uuid-1", 1, 1)
+            .unwrap();
         let original_mappings = HashMap::from([(
             "value".to_string(),
             FieldMapping {
@@ -2385,7 +4119,6 @@ mod tests {
         }
         let meta_before = std::fs::read(shard_dir.join("index/meta.json")).unwrap();
 
-        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
         let incompatible = HashMap::from([(
             "value".to_string(),
             FieldMapping {
@@ -2440,7 +4173,7 @@ mod tests {
             Duration::from_secs(60),
         ));
         let shard_dir = manager
-            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into())
+            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into(), 1)
             .await
             .unwrap();
         for file in &snapshot.files {
@@ -2459,6 +4192,8 @@ mod tests {
                 mappings: HashMap::new(),
                 settings: IndexSettings::default(),
                 index_uuid: "uuid-1".into(),
+                allocation_id: 1,
+                primary_term: 1,
                 shard_dir: shard_dir.clone(),
                 snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
                 expected_files: snapshot
@@ -2474,5 +4209,1177 @@ mod tests {
         source
             .release_peer_recovery_pin(snapshot.retention_pin_id)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn assigned_copy_identity_and_fence_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager.copy_identity("idx", 0),
+            Some(ShardCopyIdentity {
+                version: SHARD_COPY_IDENTITY_VERSION,
+                index_uuid: "uuid-1".into(),
+                allocation_id: 7,
+                replica_fence: 2,
+            })
+        );
+        manager
+            .raise_copy_fence_blocking("idx".into(), 0, "uuid-1".into(), 7, 5)
+            .await
+            .unwrap();
+        drop(engine);
+        drop(manager);
+
+        let restarted = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        restarted
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(restarted.copy_identity("idx", 0).unwrap().replica_fence, 5);
+    }
+
+    #[test]
+    fn assigned_copy_missing_or_malformed_identity_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let shard_dir = dir.path().join("uuid-1/shard_0");
+        std::fs::create_dir_all(shard_dir.join("index")).unwrap();
+        std::fs::write(shard_dir.join("legacy-data"), b"legacy").unwrap();
+
+        let error = match manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        ) {
+            Ok(_) => panic!("legacy data without identity must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("data but no durable identity"));
+        assert!(manager.get_shard("idx", 0).is_none());
+
+        std::fs::remove_file(shard_dir.join("legacy-data")).unwrap();
+        std::fs::write(shard_dir.join(SHARD_COPY_IDENTITY_FILE), b"{not-json").unwrap();
+        let error = match manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("malformed identity must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("decode shard copy identity"));
+        assert!(manager.get_shard("idx", 0).is_none());
+    }
+
+    #[test]
+    fn initialized_assignment_never_creates_a_missing_empty_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let shard_dir = dir.path().join("uuid-1/shard_0");
+
+        let error = match manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("initialized missing copy must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("missing its shard directory"));
+        assert!(!shard_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_identity_temp_does_not_block_initial_primary_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let shard_dir = dir.path().join("uuid-1/shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::write(
+            shard_dir.join(format!("{SHARD_COPY_IDENTITY_FILE}.tmp")),
+            b"{\"version\":1",
+        )
+        .unwrap();
+
+        let result = manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "a stale identity temp file must not block initial creation: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_test_open_preserves_an_existing_allocation_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+            manager
+                .open_assigned_shard_with_settings(
+                    "idx",
+                    0,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "uuid-1",
+                    AssignedShardOpen {
+                        allocation_id: 7,
+                        primary_term: 3,
+                        allow_empty_creation: true,
+                    },
+                )
+                .unwrap();
+        }
+
+        let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+        restarted
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        assert_eq!(
+            restarted.copy_identity("idx", 0).unwrap().allocation_id,
+            7,
+            "local test helpers must not overwrite a durable allocation identity with 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_pending_marker_refuses_new_recovery_begin_and_prepare() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 3,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_seq("preserved", serde_json::json!({"value": 1}), 0)
+            .unwrap();
+        engine.refresh().unwrap();
+        assert!(manager.begin_peer_recovery_target("idx", 0));
+        manager
+            .mark_peer_recovery_awaiting_membership_blocking(
+                "idx".into(),
+                0,
+                PeerRecoveryAwaitingMembership {
+                    index_uuid: "uuid-1".into(),
+                    allocation_id: 7,
+                    primary_node_id: "primary".into(),
+                    primary_term: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !manager
+                .begin_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into(), 7)
+                .await
+                .unwrap()
+        );
+        let prepare_error = manager
+            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into(), 7)
+            .await
+            .unwrap_err();
+        assert!(
+            prepare_error
+                .to_string()
+                .contains("already finalized and awaiting membership")
+        );
+        assert!(
+            manager
+                .get_shard("idx", 0)
+                .unwrap()
+                .get_document("preserved")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn authoritative_open_classifies_a_stale_install_marker_as_definitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let shard_dir = dir.path().join("uuid-1/shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::write(
+            shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "index_uuid": "old-uuid",
+                "allocation_id": 3,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = match manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 3,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("an authoritative copy with a stale install marker must fail closed"),
+            Err(error) => error,
+        };
+        assert!(ShardManager::is_definitive_copy_failure(&error));
+        assert!(error.to_string().contains("a different allocation"));
+    }
+
+    #[test]
+    fn malformed_pending_marker_and_tantivy_metadata_are_definitive() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker_manager = ShardManager::new(marker_dir.path(), Duration::from_secs(60));
+        let shard_dir = marker_dir.path().join("uuid-1/shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::write(
+            shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER),
+            b"{not-json",
+        )
+        .unwrap();
+        let marker_error = marker_manager
+            .restore_peer_recovery_awaiting_membership(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: false,
+                },
+            )
+            .unwrap_err();
+        assert!(ShardManager::is_definitive_copy_failure(&marker_error));
+
+        let index_dir = tempfile::tempdir().unwrap();
+        {
+            let manager = ShardManager::new(index_dir.path(), Duration::from_secs(60));
+            manager
+                .initialize_copy_identity_for_test("idx", 0, "uuid-1", 7, 2)
+                .unwrap();
+            CompositeEngine::new(
+                index_dir.path().join("uuid-1/shard_0"),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            index_dir.path().join("uuid-1/shard_0/index/meta.json"),
+            b"{not-json",
+        )
+        .unwrap();
+        let restarted = ShardManager::new(index_dir.path(), Duration::from_secs(60));
+        let meta_error = match restarted.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("corrupt Tantivy metadata must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            ShardManager::is_definitive_copy_failure(&meta_error),
+            "{meta_error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structural_tantivy_schema_failures_are_definitive() {
+        let missing_schema_dir = tempfile::tempdir().unwrap();
+        {
+            let manager = ShardManager::new(missing_schema_dir.path(), Duration::from_secs(60));
+            manager
+                .open_assigned_shard_with_settings(
+                    "idx",
+                    0,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "uuid-1",
+                    AssignedShardOpen {
+                        allocation_id: 7,
+                        primary_term: 2,
+                        allow_empty_creation: true,
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(
+            missing_schema_dir
+                .path()
+                .join("uuid-1/shard_0/index/meta.json"),
+            br#"{"segments":[]}"#,
+        )
+        .unwrap();
+        let restarted = ShardManager::new(missing_schema_dir.path(), Duration::from_secs(60));
+        let missing_schema = match restarted.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("missing Tantivy schema must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            ShardManager::is_definitive_copy_failure(&missing_schema),
+            "{missing_schema:#}"
+        );
+
+        let mapping_conflict_dir = tempfile::tempdir().unwrap();
+        let text_mapping = HashMap::from([(
+            "value".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        {
+            let manager = ShardManager::new(mapping_conflict_dir.path(), Duration::from_secs(60));
+            manager
+                .open_assigned_shard_with_settings(
+                    "idx",
+                    0,
+                    &text_mapping,
+                    &IndexSettings::default(),
+                    "uuid-1",
+                    AssignedShardOpen {
+                        allocation_id: 7,
+                        primary_term: 2,
+                        allow_empty_creation: true,
+                    },
+                )
+                .unwrap();
+        }
+        let integer_mapping = HashMap::from([(
+            "value".to_string(),
+            crate::cluster::state::FieldMapping {
+                field_type: crate::cluster::state::FieldType::Integer,
+                dimension: None,
+            },
+        )]);
+        let restarted = ShardManager::new(mapping_conflict_dir.path(), Duration::from_secs(60));
+        let mapping_conflict = match restarted.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &integer_mapping,
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("authoritative mapping conflict must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            ShardManager::is_definitive_copy_failure(&mapping_conflict),
+            "{mapping_conflict:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_recovery_cleanup_does_not_leave_a_failed_install_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 3,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        assert!(
+            manager
+                .begin_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into(), 7)
+                .await
+                .unwrap()
+        );
+        manager
+            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into(), 7)
+            .await
+            .unwrap();
+        assert!(
+            dir.path()
+                .join("uuid-1/shard_0")
+                .join(PEER_RECOVERY_IN_PROGRESS_MARKER)
+                .exists()
+        );
+
+        manager
+            .reset_peer_recovery_target_for_retry_blocking("idx".into(), 0, "uuid-1".into(), 7)
+            .await
+            .unwrap();
+        assert!(!manager.is_peer_recovery_target("idx", 0));
+        assert!(
+            !manager
+                .failed_peer_recovery_install_matches("idx", 0, "uuid-1", 7)
+                .unwrap(),
+            "handled retryable recovery failures must not look like crashed installs"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_after_delete_recreate_does_not_recreate_old_uuid_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "old-uuid",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        assert!(manager.begin_peer_recovery_target("idx", 0));
+        manager
+            .mark_peer_recovery_awaiting_membership_blocking(
+                "idx".into(),
+                0,
+                PeerRecoveryAwaitingMembership {
+                    index_uuid: "old-uuid".into(),
+                    allocation_id: 7,
+                    primary_node_id: "node-1".into(),
+                    primary_term: 2,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .close_index_shards_with_reason("idx", SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX)
+            .unwrap();
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "new-uuid",
+                AssignedShardOpen {
+                    allocation_id: 9,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+
+        manager
+            .abort_peer_recovery_target_blocking("idx".into(), 0, "old-uuid".into(), 7)
+            .await
+            .unwrap();
+        assert!(!dir.path().join("old-uuid").exists());
+        assert!(dir.path().join("new-uuid/shard_0").is_dir());
+        assert_eq!(manager.copy_identity("idx", 0).unwrap().allocation_id, 9);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shard_directory_metadata_io_error_is_not_classified_as_missing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let uuid_dir = dir.path().join("uuid-1");
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+        let shard_dir = uuid_dir.join("shard_0");
+        symlink("shard_0", &shard_dir).unwrap();
+
+        let error = manager
+            .prepare_assigned_copy_identity(
+                &ShardKey::new("idx", 0),
+                &shard_dir,
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: false,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            !ShardManager::is_definitive_copy_failure(&error),
+            "filesystem metadata I/O must remain retryable: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_replica_wal_io_escalates_under_apply_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine.inject_wal_write_failures_for_test(28, 3);
+
+        let mut reportable = Vec::new();
+        for seq_no in 0..3 {
+            let error = manager
+                .apply_replica_operation(
+                    "idx",
+                    0,
+                    ReplicaApplyContext {
+                        index_uuid: "uuid-1",
+                        allocation_id: 7,
+                        applied_view_term: 2,
+                        message_term: 2,
+                    },
+                    |engine| {
+                        engine
+                            .add_document_with_seq(
+                                "doc",
+                                serde_json::json!({"value": seq_no}),
+                                seq_no,
+                            )
+                            .map(|_| ())
+                    },
+                )
+                .unwrap_err();
+            reportable.push(ShardManager::should_report_copy_failure(&error));
+        }
+        assert_eq!(reportable, [false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn transient_force_merge_writer_failure_rebuilds_on_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt("baseline", serde_json::json!({"value": 0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.inject_writer_replacement_failures_for_test(28, 1);
+        assert!(engine.force_merge(1).is_err());
+
+        let rebuilt = manager
+            .record_local_apply_result(
+                "uuid-1",
+                0,
+                7,
+                engine.add_document_with_receipt("after-rebuild", serde_json::json!({"value": 1})),
+            )
+            .unwrap();
+        assert_eq!(rebuilt.doc_id, "after-rebuild");
+    }
+
+    #[tokio::test]
+    async fn writer_rebuild_does_not_append_while_another_instance_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let first = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        first
+            .add_document_with_receipt("baseline", serde_json::json!({"value": 0}))
+            .unwrap();
+        first.refresh().unwrap();
+        first.inject_writer_replacement_failures_for_test(28, 1);
+        assert!(first.force_merge(1).is_err());
+        let wal_before = first
+            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations
+            .len();
+
+        let second = crate::engine::CompositeEngine::open_existing_with_mappings(
+            dir.path().join("uuid-1/shard_0"),
+            Duration::from_secs(60),
+            &HashMap::new(),
+            crate::wal::TranslogDurability::Request,
+            Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        let blocked = first
+            .add_document_with_receipt("blocked", serde_json::json!({"value": 1}))
+            .unwrap_err();
+        assert!(!ShardManager::should_report_copy_failure(&blocked));
+        assert_eq!(
+            first
+                .peer_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .len(),
+            wal_before,
+            "a failed writer rebuild must not append a WAL entry"
+        );
+
+        drop(second);
+        first
+            .add_document_with_receipt("after-release", serde_json::json!({"value": 2}))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_force_merge_writer_rebuild_failure_escalates_under_apply_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt("baseline", serde_json::json!({"value": 0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.inject_writer_replacement_failures_for_test(28, usize::MAX);
+        assert!(engine.force_merge(1).is_err());
+
+        let mut reportable = Vec::new();
+        let mut quarantine = Vec::new();
+        for attempt in 0..3 {
+            let result = engine.add_document_with_receipt(
+                &format!("after-{attempt}"),
+                serde_json::json!({"value": attempt}),
+            );
+            let error = manager
+                .record_local_apply_result("uuid-1", 0, 7, result)
+                .unwrap_err();
+            reportable.push(ShardManager::should_report_copy_failure(&error));
+            quarantine.push(ShardManager::should_quarantine_copy_failure(&error));
+        }
+        assert_eq!(reportable, [false, false, true]);
+        assert_eq!(quarantine, [false, false, false]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transient_commit_failure_replays_acknowledged_writes_before_next_commit_and_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let assignment = AssignedShardOpen {
+            allocation_id: 7,
+            primary_term: 2,
+            allow_empty_creation: true,
+        };
+        {
+            let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+            let engine = manager
+                .open_assigned_shard_with_settings(
+                    "idx",
+                    0,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "uuid-1",
+                    assignment,
+                )
+                .unwrap();
+            engine
+                .add_document_with_receipt("pre-fault", serde_json::json!({"value": -1}))
+                .unwrap();
+            engine.refresh().unwrap();
+            let committed_path = dir.path().join("uuid-1/shard_0/translog.committed");
+            assert_eq!(std::fs::read_to_string(&committed_path).unwrap(), "1");
+
+            let index_dir = dir.path().join("uuid-1/shard_0/index");
+            std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let during_fault = engine
+                .add_document_with_receipt("during-fault", serde_json::json!({"value": 0}))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let failed_commit = engine.refresh();
+            std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let failed_commit = failed_commit.unwrap_err();
+            assert!(
+                failed_commit
+                    .chain()
+                    .any(|cause| cause.is::<crate::engine::tantivy::TantivyCommitFailureError>()),
+                "{failed_commit:#}"
+            );
+            assert!(
+                engine.writer_is_failed_for_test(),
+                "a failed commit must remove the writer before another write can queue"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&committed_path).unwrap(),
+                "1",
+                "a failed commit must not advance the persisted checkpoint"
+            );
+
+            let first_recovered_engine = engine.clone();
+            let first_recovered = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    first_recovered_engine
+                        .add_document_with_receipt("acked-0", serde_json::json!({"value": 0}))
+                }),
+            )
+            .await
+            .expect("the first write after a failed commit must not hang")
+            .expect("rebuild write task must not panic")
+            .unwrap();
+            assert_eq!(first_recovered.doc_id, "acked-0");
+            let mut acknowledged = vec!["acked-0".to_string()];
+            for attempt in 1..5 {
+                let id = format!("acked-{attempt}");
+                engine
+                    .add_document_with_receipt(&id, serde_json::json!({"value": attempt}))
+                    .unwrap();
+                acknowledged.push(id);
+            }
+            assert!(
+                !engine.writer_is_failed_for_test(),
+                "the first recovered write must replace the failed writer"
+            );
+            engine.refresh().unwrap();
+            assert!(engine.get_document("during-fault").unwrap().is_some());
+            for id in &acknowledged {
+                assert!(engine.get_document(id).unwrap().is_some(), "{id}");
+            }
+            engine.flush().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&committed_path).unwrap(),
+                (during_fault.seq_no + acknowledged.len() as u64 + 1).to_string()
+            );
+        }
+
+        let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let engine = restarted
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allow_empty_creation: false,
+                    ..assignment
+                },
+            )
+            .unwrap();
+        assert!(engine.get_document("during-fault").unwrap().is_some());
+        for attempt in 0..5 {
+            assert!(
+                engine
+                    .get_document(&format!("acked-{attempt}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_survives_runtime_commit_failure_rebuild_and_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt("victim", serde_json::json!({"value": 1}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.delete_document_with_receipt("victim").unwrap();
+
+        let index_dir = dir.path().join("uuid-1/shard_0/index");
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed_commit = engine.refresh();
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failed_commit.is_err());
+        assert!(engine.writer_is_failed_for_test());
+
+        engine
+            .add_document_with_receipt("trigger", serde_json::json!({"value": 2}))
+            .unwrap();
+        engine.refresh().unwrap();
+        assert!(
+            engine.get_document("victim").unwrap().is_none(),
+            "runtime WAL replay must not resurrect an acknowledged delete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_failed_writer_recovers_on_refresh_and_snapshot_without_client_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt("committed", serde_json::json!({"value": 0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine
+            .add_document_with_receipt("acked-before-fault", serde_json::json!({"value": 1}))
+            .unwrap();
+
+        let index_dir = dir.path().join("uuid-1/shard_0/index");
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed_commit = engine.refresh();
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failed_commit.is_err());
+        assert!(engine.writer_is_failed_for_test());
+
+        engine
+            .refresh()
+            .expect("idle refresh must rebuild the writer and replay the WAL suffix");
+        assert!(engine.get_document("acked-before-fault").unwrap().is_some());
+        let snapshot_dir = dir.path().join("idle-recovery-snapshot");
+        let snapshot = engine
+            .prepare_peer_recovery_snapshot(&snapshot_dir)
+            .expect("peer recovery snapshot must succeed after idle writer repair");
+        assert_eq!(snapshot.snapshot_next_seq_no, 2);
+    }
+
+    #[tokio::test]
+    async fn successful_replica_apply_clears_a_transient_apply_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(2, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine.inject_wal_write_failures_for_test(28, 1);
+        let first = manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| {
+                    engine
+                        .add_document_with_seq("doc", serde_json::json!({"value": 0}), 0)
+                        .map(|_| ())
+                },
+            )
+            .unwrap_err();
+        assert!(!ShardManager::should_report_copy_failure(&first));
+
+        manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| {
+                    engine
+                        .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
+                        .map(|_| ())
+                },
+            )
+            .unwrap();
+
+        engine.inject_wal_write_failures_for_test(28, 1);
+        let after_success = manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| {
+                    engine
+                        .add_document_with_seq("doc", serde_json::json!({"value": 2}), 1)
+                        .map(|_| ())
+                },
+            )
+            .unwrap_err();
+        assert!(!ShardManager::should_report_copy_failure(&after_success));
+
+        engine.inject_wal_write_failures_for_test(28, 1);
+        let persistent_after_reset = manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| {
+                    engine
+                        .add_document_with_seq("doc", serde_json::json!({"value": 3}), 1)
+                        .map(|_| ())
+                },
+            )
+            .unwrap_err();
+        assert!(ShardManager::should_report_copy_failure(
+            &persistent_after_reset
+        ));
+    }
+
+    #[tokio::test]
+    async fn apply_backoff_suppresses_repeated_engine_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(
+            3,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let apply = || {
+            manager.apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |_engine| -> Result<()> {
+                    attempts.fetch_add(1, AtomicOrdering::AcqRel);
+                    Err(std::io::Error::from_raw_os_error(28).into())
+                },
+            )
+        };
+        assert!(apply().is_err());
+        let backoff = apply().unwrap_err();
+        assert!(backoff.is::<ShardCopyBackoff>(), "{backoff:#}");
+        assert_eq!(attempts.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[test]
+    fn network_recovery_errors_do_not_consume_local_storage_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager.set_copy_retry_policy_for_test(2, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+
+        for _ in 0..3 {
+            let error = manager.record_peer_recovery_failure(
+                "uuid-1",
+                0,
+                7,
+                anyhow::anyhow!("recovery transport timed out"),
+            );
+            assert!(!ShardManager::should_report_copy_failure(&error));
+        }
+
+        let first_local = manager.record_peer_recovery_failure(
+            "uuid-1",
+            0,
+            7,
+            ShardManager::local_storage_failure(std::io::Error::from_raw_os_error(28)),
+        );
+        assert!(!ShardManager::should_report_copy_failure(&first_local));
+        let second_local = manager.record_peer_recovery_failure(
+            "uuid-1",
+            0,
+            7,
+            ShardManager::local_storage_failure(std::io::Error::from_raw_os_error(28)),
+        );
+        assert!(ShardManager::should_report_copy_failure(&second_local));
     }
 }

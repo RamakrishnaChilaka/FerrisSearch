@@ -15,7 +15,41 @@ use tantivy::schema::{FAST, Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, SegmentMeta, TantivyDocument, Term};
 
 use super::SearchEngine;
-use crate::wal::{HotTranslog, TranslogDurability, WriteAheadLog};
+use crate::wal::{
+    HotTranslog, TranslogDurability, WalDocumentOperation, WriteAheadLog, document_operation,
+};
+
+#[derive(Debug, thiserror::Error)]
+#[error("authoritative shard schema validation failed: {message}")]
+pub(crate) struct AuthoritativeSchemaError {
+    message: String,
+}
+
+fn authoritative_schema_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(AuthoritativeSchemaError {
+        message: message.into(),
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Tantivy writer is unavailable during {context}: {reason}")]
+pub(crate) struct TantivyWriterUnavailableError {
+    context: String,
+    reason: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Tantivy commit failed during {context}: {source}")]
+pub(crate) struct TantivyCommitFailureError {
+    context: String,
+    #[source]
+    source: tantivy::TantivyError,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommittedTantivyBoundary {
+    next_seq_no: u64,
+}
 
 /// Dynamic field registry — maps user-facing field names to Tantivy Field handles.
 /// New fields are added on first encounter (dynamic mapping, like OpenSearch).
@@ -48,23 +82,25 @@ impl WriterState {
 
     fn writer_mut(&mut self, context: &str) -> Result<&mut IndexWriter> {
         self.writer.as_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Tantivy writer is unavailable during {context}: {}",
-                self.failure
-                    .as_deref()
-                    .unwrap_or("writer reinitialization is incomplete")
-            )
+            anyhow::Error::new(TantivyWriterUnavailableError {
+                context: context.to_string(),
+                reason: self
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| "writer reinitialization is incomplete".to_string()),
+            })
         })
     }
 
     fn take(&mut self, context: &str) -> Result<IndexWriter> {
         self.writer.take().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Tantivy writer is unavailable during {context}: {}",
-                self.failure
-                    .as_deref()
-                    .unwrap_or("writer reinitialization is incomplete")
-            )
+            anyhow::Error::new(TantivyWriterUnavailableError {
+                context: context.to_string(),
+                reason: self
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| "writer reinitialization is incomplete".to_string()),
+            })
         })
     }
 
@@ -110,6 +146,10 @@ pub struct HotEngine {
     #[cfg(test)]
     force_merge_before_wait_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
+    writer_replacement_failure: Mutex<Option<(i32, usize)>>,
+    #[cfg(test)]
+    engine_apply_failure: Mutex<Option<(i32, usize)>>,
+    #[cfg(test)]
     refresh_before_writer_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
     peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
@@ -129,7 +169,10 @@ pub struct HotEngine {
     column_cache: Arc<super::column_cache::ColumnCache>,
 }
 
-const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 10_000;
+// Stay well below Tantivy's document-channel capacity so a replay against a
+// persistently failing writer reaches a commit error instead of blocking while
+// holding the translog lock.
+const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 1_000;
 const TANTIVY_WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
 struct AutomaticMergePolicyRestore<'a> {
@@ -256,7 +299,7 @@ fn evolve_meta_json_schema(
     let schema_arr = meta
         .get_mut("schema")
         .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| anyhow::anyhow!("meta.json missing 'schema' array"))?;
+        .ok_or_else(|| authoritative_schema_error("meta.json missing 'schema' array"))?;
 
     // Collect names already in the stored schema.
     let existing_names: std::collections::HashSet<String> = schema_arr
@@ -316,7 +359,7 @@ fn validate_existing_schema_mappings(
     let stored_schema: Schema = serde_json::from_value(
         meta.get("schema")
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("meta.json missing 'schema' array"))?,
+            .ok_or_else(|| authoritative_schema_error("meta.json missing 'schema' array"))?,
     )?;
 
     for (name, mapping) in mappings {
@@ -351,7 +394,9 @@ fn validate_existing_schema_mappings(
             _ => false,
         };
         if !matches_mapping {
-            anyhow::bail!("schema does not match authoritative mappings for field '{name}'");
+            return Err(authoritative_schema_error(format!(
+                "schema does not match authoritative mappings for field '{name}'"
+            )));
         }
     }
     Ok(())
@@ -552,6 +597,10 @@ impl HotEngine {
             #[cfg(test)]
             force_merge_before_wait_sender: Mutex::new(None),
             #[cfg(test)]
+            writer_replacement_failure: Mutex::new(None),
+            #[cfg(test)]
+            engine_apply_failure: Mutex::new(None),
+            #[cfg(test)]
             refresh_before_writer_sender: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
@@ -608,7 +657,170 @@ impl HotEngine {
             .map_err(|_| anyhow::anyhow!("maintenance lock poisoned during {context}"))
     }
 
-    fn pause_and_drain_automatic_merges(&self) -> Result<()> {
+    fn open_replacement_writer(
+        &self,
+        context: &str,
+        merge_policy: Box<dyn MergePolicy>,
+    ) -> Result<IndexWriter> {
+        #[cfg(test)]
+        if let Some(error) = self.maybe_fail_writer_replacement_for_test() {
+            return Err(error).with_context(|| context.to_string());
+        }
+        let writer = self
+            .index
+            .writer(TANTIVY_WRITER_HEAP_BYTES)
+            .with_context(|| context.to_string())?;
+        writer.set_merge_policy(merge_policy);
+        Ok(writer)
+    }
+
+    fn commit_writer_at_boundary(
+        &self,
+        writer_state: &mut WriterState,
+        context: &str,
+        next_seq_no: u64,
+    ) -> Result<CommittedTantivyBoundary> {
+        let commit_result = {
+            let writer = writer_state.writer_mut(context)?;
+            writer.commit()
+        };
+        match commit_result {
+            Ok(_) => Ok(CommittedTantivyBoundary { next_seq_no }),
+            Err(source) => {
+                let failure = TantivyCommitFailureError {
+                    context: context.to_string(),
+                    source,
+                };
+                writer_state.fail(failure.to_string());
+                Err(failure.into())
+            }
+        }
+    }
+
+    fn validate_truncation_boundary(
+        &self,
+        translog: &dyn WriteAheadLog,
+        boundary: CommittedTantivyBoundary,
+    ) -> Result<()> {
+        let persisted = self.load_committed_next_seq_no()?;
+        if persisted != boundary.next_seq_no {
+            anyhow::bail!(
+                "refusing WAL truncation: persisted committed checkpoint {persisted} does not match successful Tantivy commit boundary {}",
+                boundary.next_seq_no
+            );
+        }
+        let wal_next_seq_no = translog.next_seq_no();
+        if boundary.next_seq_no != wal_next_seq_no {
+            anyhow::bail!(
+                "refusing WAL truncation: successful Tantivy commit boundary {} does not match WAL next sequence {wal_next_seq_no}",
+                boundary.next_seq_no
+            );
+        }
+        Ok(())
+    }
+
+    fn replay_translog_suffix_locked(
+        &self,
+        translog: &dyn WriteAheadLog,
+        writer_state: &mut WriterState,
+        context: &str,
+    ) -> Result<u64> {
+        let committed_next_seq = self.load_committed_next_seq_no()?;
+        let wal_next_seq = translog.next_seq_no();
+        if committed_next_seq > wal_next_seq {
+            anyhow::bail!(
+                "committed translog checkpoint {committed_next_seq} exceeds WAL next sequence {wal_next_seq}"
+            );
+        }
+        if committed_next_seq == wal_next_seq {
+            return Ok(0);
+        }
+
+        let mut replayed: u64 = 0;
+        let mut last_seq: u64 = committed_next_seq;
+        let mut batch_count: u64 = 0;
+        let mut last_committed_boundary = None;
+        let id_field = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .id_field;
+        let replay_result = translog.for_each_from(committed_next_seq, &mut |entry| {
+            if replayed == 0 {
+                tracing::warn!(
+                    "Replaying translog entries from seq_no {} during {}...",
+                    committed_next_seq,
+                    context
+                );
+            }
+
+            let operation = document_operation(&entry)?;
+            let doc_id = operation.doc_id();
+
+            {
+                let writer = writer_state.writer_mut(context)?;
+                writer.delete_term(Term::from_field_text(id_field, doc_id));
+                if let WalDocumentOperation::Index { source, .. } = operation {
+                    let doc = self.build_tantivy_doc(doc_id, source)?;
+                    writer.add_document(doc)?;
+                }
+            }
+
+            last_seq = entry.seq_no;
+            replayed += 1;
+            batch_count += 1;
+            if batch_count >= TRANSLOG_REPLAY_BATCH_SIZE {
+                let boundary =
+                    self.commit_writer_at_boundary(writer_state, context, last_seq + 1)?;
+                self.persist_committed_boundary(boundary)?;
+                last_committed_boundary = Some(boundary);
+                batch_count = 0;
+            }
+            Ok(())
+        });
+        if let Err(error) = replay_result {
+            let message = format!("translog replay failed during {context}: {error}");
+            writer_state.fail(format!("{message}: {error:#}"));
+            return Err(error).context(message);
+        }
+        if replayed == 0 || last_seq.checked_add(1) != Some(wal_next_seq) {
+            let message = format!(
+                "translog replay during {context} did not reach WAL head {wal_next_seq} from committed checkpoint {committed_next_seq}"
+            );
+            writer_state.fail(message.clone());
+            anyhow::bail!(message);
+        }
+        if batch_count > 0 {
+            last_committed_boundary =
+                Some(self.commit_writer_at_boundary(writer_state, context, last_seq + 1)?);
+        }
+        if let Err(error) = self.reader.reload() {
+            writer_state.fail(format!("reader reload failed after {context}: {error}"));
+            return Err(error).with_context(|| format!("reader reload failed after {context}"));
+        }
+        let committed_boundary = last_committed_boundary
+            .expect("a non-empty successful replay has a committed boundary");
+        if let Err(error) = self.persist_committed_boundary(committed_boundary) {
+            writer_state.fail(format!(
+                "committed checkpoint persistence failed after {context}: {error:#}"
+            ));
+            return Err(error).with_context(|| {
+                format!("committed checkpoint persistence failed after {context}")
+            });
+        }
+        tracing::info!(
+            "Translog replay during {} recovered {} operations.",
+            context,
+            replayed
+        );
+        Ok(replayed)
+    }
+
+    fn writer_state_with_replay(
+        &self,
+        translog: &dyn WriteAheadLog,
+        context: &str,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, WriterState>> {
         let automatic_policy = self
             .automatic_merge_policy
             .read()
@@ -618,15 +830,60 @@ impl HotEngine {
             .writer
             .write()
             .unwrap_or_else(|error| error.into_inner());
-
-        {
-            let writer = writer_state.writer_mut("force-merge preparation")?;
-            writer.set_merge_policy(Box::new(NoMergePolicy));
-            if let Err(error) = writer.commit() {
-                writer.set_merge_policy(Box::new(SharedMergePolicy(automatic_policy)));
-                return Err(error).context("failed to commit before draining Tantivy merges");
+        if writer_state.writer.is_none() {
+            let previous_failure = writer_state
+                .failure
+                .clone()
+                .unwrap_or_else(|| "writer reinitialization is incomplete".to_string());
+            let rebuild_context = format!("failed to rebuild Tantivy writer during {context}");
+            let replacement = match self.open_replacement_writer(
+                &rebuild_context,
+                Box::new(SharedMergePolicy(automatic_policy)),
+            ) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    writer_state.fail(format!(
+                        "{rebuild_context}: {error:#}; previous writer failure: {previous_failure}"
+                    ));
+                    return Err(error).context(rebuild_context);
+                }
+            };
+            writer_state.replace(replacement);
+            if let Err(error) =
+                self.replay_translog_suffix_locked(translog, &mut writer_state, context)
+            {
+                if writer_state.writer.is_some() {
+                    writer_state.fail(format!(
+                        "failed to replay WAL after rebuilding writer during {context}: {error:#}"
+                    ));
+                }
+                return Err(error);
             }
         }
+        Ok(writer_state)
+    }
+
+    fn pause_and_drain_automatic_merges(
+        &self,
+        translog: &dyn WriteAheadLog,
+        committed_next_seq: u64,
+    ) -> Result<CommittedTantivyBoundary> {
+        let automatic_policy = self
+            .automatic_merge_policy
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut writer_state =
+            self.writer_state_with_replay(translog, "force-merge preparation")?;
+
+        writer_state
+            .writer_mut("force-merge preparation")?
+            .set_merge_policy(Box::new(NoMergePolicy));
+        let committed_boundary = self.commit_writer_at_boundary(
+            &mut writer_state,
+            "force-merge preparation",
+            committed_next_seq,
+        )?;
 
         let writer = writer_state.take("force-merge merge-thread drain")?;
         #[cfg(test)]
@@ -639,17 +896,16 @@ impl HotEngine {
             let _ = sender.send(());
         }
         let wait_result = writer.wait_merging_threads();
-        let replacement = match self.index.writer(TANTIVY_WRITER_HEAP_BYTES) {
-            Ok(writer) => writer,
-            Err(error) => {
-                let message = format!(
-                    "failed to reopen Tantivy writer after draining merge threads: {error}"
-                );
-                writer_state.fail(message.clone());
-                return Err(anyhow::anyhow!(message));
-            }
-        };
-        replacement.set_merge_policy(Box::new(NoMergePolicy));
+        let reopen_context = "failed to reopen Tantivy writer after draining merge threads";
+        let replacement =
+            match self.open_replacement_writer(reopen_context, Box::new(NoMergePolicy)) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    let message = format!("{reopen_context}: {error:#}");
+                    writer_state.fail(message.clone());
+                    return Err(error).context(message);
+                }
+            };
         writer_state.replace(replacement);
 
         if let Err(error) = wait_result {
@@ -659,7 +915,7 @@ impl HotEngine {
             return Err(error).context("failed while draining Tantivy merge threads");
         }
 
-        Ok(())
+        Ok(committed_boundary)
     }
 
     fn restore_automatic_merge_policy(&self) -> Result<()> {
@@ -1547,75 +1803,11 @@ impl HotEngine {
     /// fashion — entries are never all held in memory at once.
     /// Called on startup to recover from an unclean shutdown.
     fn replay_translog(&self) -> Result<()> {
-        let committed_next_seq = self.load_committed_next_seq_no()?;
-
-        let mut replayed: u64 = 0;
-        let mut last_seq: u64 = committed_next_seq;
-        let mut batch_count: u64 = 0;
-
-        let id_field = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .id_field;
-
         self.with_translog("startup translog replay", |tl| {
             let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("startup translog replay")?;
-
-            tl.for_each_from(committed_next_seq, &mut |entry| {
-                if replayed == 0 {
-                    tracing::warn!(
-                        "Replaying translog entries from seq_no {} after restart...",
-                        committed_next_seq
-                    );
-                }
-
-                let doc_id = entry
-                    .payload
-                    .get("_doc_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let source = entry.payload.get("_source").unwrap_or(&entry.payload);
-
-                // Delete-before-add (upsert) so replay is idempotent even if
-                // a previous replay was interrupted after an intermediate commit.
-                writer.delete_term(Term::from_field_text(id_field, doc_id));
-                let doc = self.build_tantivy_doc(doc_id, source)?;
-                writer.add_document(doc)?;
-
-                last_seq = entry.seq_no;
-                replayed += 1;
-                batch_count += 1;
-
-                // Intermediate commit to cap writer memory usage.
-                // Persist the checkpoint so a crash here won't re-replay
-                // entries that are already committed to Tantivy segments.
-                if batch_count >= TRANSLOG_REPLAY_BATCH_SIZE {
-                    writer.commit()?;
-                    self.persist_committed_next_seq_no(last_seq + 1)?;
-                    batch_count = 0;
-                }
-
-                Ok(())
-            })?;
-
-            // Final commit for any remaining entries
-            if batch_count > 0 {
-                writer.commit()?;
-            }
+            self.replay_translog_suffix_locked(tl, &mut writer_state, "startup translog replay")?;
             Ok(())
-        })?;
-
-        if replayed > 0 {
-            self.reader.reload()?;
-            self.persist_committed_next_seq_no(last_seq + 1)?;
-            tracing::info!(
-                "Translog replay complete. {} documents recovered.",
-                replayed
-            );
-        }
-        Ok(())
+        })
     }
 
     fn load_committed_next_seq_no(&self) -> Result<u64> {
@@ -1632,18 +1824,21 @@ impl HotEngine {
         })
     }
 
-    fn persist_committed_next_seq_no(&self, next_seq_no: u64) -> Result<()> {
-        std::fs::write(&self.committed_seq_no_path, next_seq_no.to_string())?;
+    fn persist_committed_boundary(&self, boundary: CommittedTantivyBoundary) -> Result<()> {
+        std::fs::write(
+            &self.committed_seq_no_path,
+            boundary.next_seq_no.to_string(),
+        )?;
         Ok(())
     }
 
-    fn persist_committed_next_seq_no_durable(&self, next_seq_no: u64) -> Result<()> {
+    fn persist_committed_boundary_durable(&self, boundary: CommittedTantivyBoundary) -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&self.committed_seq_no_path)?;
-        write!(file, "{next_seq_no}")?;
+        write!(file, "{}", boundary.next_seq_no)?;
         file.sync_all()?;
         Ok(())
     }
@@ -1712,6 +1907,15 @@ impl HotEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn writer_is_failed_for_test(&self) -> bool {
+        self.writer
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .writer
+            .is_none()
+    }
+
+    #[cfg(test)]
     pub(crate) fn notify_before_refresh_writer_for_test(
         &self,
         sender: tokio::sync::oneshot::Sender<()>,
@@ -1738,6 +1942,67 @@ impl HotEngine {
             Ok(())
         })
         .expect("set append frame barrier");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_wal_write_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
+        self.with_translog("inject WAL write failure", |translog| {
+            translog.inject_write_io_failures_for_test(raw_os_error, attempts);
+            Ok(())
+        })
+        .expect("inject WAL write failure");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_writer_replacement_failures_for_test(
+        &self,
+        raw_os_error: i32,
+        attempts: usize,
+    ) {
+        *self
+            .writer_replacement_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_engine_apply_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
+        *self
+            .engine_apply_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_writer_replacement_for_test(&self) -> Option<anyhow::Error> {
+        let mut failure = self
+            .writer_replacement_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (raw_os_error, remaining) = failure.as_mut()?;
+        if *remaining == 0 {
+            *failure = None;
+            return None;
+        }
+        *remaining -= 1;
+        Some(std::io::Error::from_raw_os_error(*raw_os_error).into())
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_engine_apply_for_test(&self) -> Result<()> {
+        let mut failure = self
+            .engine_apply_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((raw_os_error, remaining)) = failure.as_mut() else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            *failure = None;
+            return Ok(());
+        }
+        *remaining -= 1;
+        Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
     }
 
     #[cfg(test)]
@@ -2035,11 +2300,18 @@ impl HotEngine {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
-        let writer = writer_state.writer_mut("checkpoint-aware flush")?;
-        writer.commit()?;
+        if writer_state.writer.is_none() {
+            return Ok(false);
+        }
+        let committed_boundary = self.commit_writer_at_boundary(
+            &mut writer_state,
+            "checkpoint-aware flush",
+            committed_next_seq,
+        )?;
         drop(writer_state);
         self.reader.reload()?;
-        self.persist_committed_next_seq_no(committed_next_seq)?;
+        self.persist_committed_boundary(committed_boundary)?;
+        self.validate_truncation_boundary(&*tl, committed_boundary)?;
         if global_checkpoint > 0 {
             tl.truncate_below(global_checkpoint)?;
         } else {
@@ -2052,12 +2324,16 @@ impl HotEngine {
         let _maintenance = self.maintenance_guard("checkpoint-aware flush")?;
         self.with_translog("checkpoint-aware flush", |tl| {
             let committed_next_seq = tl.next_seq_no();
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("checkpoint-aware flush")?;
-            writer.commit()?;
+            let mut writer_state = self.writer_state_with_replay(tl, "checkpoint-aware flush")?;
+            let committed_boundary = self.commit_writer_at_boundary(
+                &mut writer_state,
+                "checkpoint-aware flush",
+                committed_next_seq,
+            )?;
             drop(writer_state);
             self.reader.reload()?;
-            self.persist_committed_next_seq_no(committed_next_seq)?;
+            self.persist_committed_boundary(committed_boundary)?;
+            self.validate_truncation_boundary(tl, committed_boundary)?;
             if global_checkpoint > 0 {
                 tl.truncate_below(global_checkpoint)?;
             } else {
@@ -5427,6 +5703,11 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
 }
 
 impl super::SearchEngine for HotEngine {
+    #[cfg(test)]
+    fn writer_is_failed_for_test(&self) -> bool {
+        HotEngine::writer_is_failed_for_test(self)
+    }
+
     fn add_document_with_receipt(
         &self,
         doc_id: &str,
@@ -5437,11 +5718,15 @@ impl super::SearchEngine for HotEngine {
         // section so refresh/flush cannot commit past a translog entry that has
         // not yet been applied to the Tantivy writer.
         let seq_no = self.with_translog("document indexing", |tl| {
+            let mut writer_state = self.writer_state_with_replay(tl, "document indexing")?;
+            let writer = writer_state.writer_mut("document indexing")?;
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
                 "_source": payload
             });
             let receipt = tl.append(crate::wal::WalOperation::Index, wal_entry)?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
 
             // 2. Delete any existing doc with same _id (upsert semantics)
             let id_field = self
@@ -5449,8 +5734,6 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("document indexing")?;
             writer.delete_term(Term::from_field_text(id_field, doc_id));
 
             // 3. Write to Tantivy in-memory buffer
@@ -5473,19 +5756,22 @@ impl super::SearchEngine for HotEngine {
     ) -> Result<String> {
         self.validate_keyword_documents(std::iter::once(&payload))?;
         self.with_translog("replica document indexing", |tl| {
+            let mut writer_state =
+                self.writer_state_with_replay(tl, "replica document indexing")?;
+            let writer = writer_state.writer_mut("replica document indexing")?;
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
                 "_source": payload
             });
             tl.append_with_seq(seq_no, crate::wal::WalOperation::Index, wal_entry)?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
 
             let id_field = self
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("replica document indexing")?;
             writer.delete_term(Term::from_field_text(id_field, doc_id));
 
             let doc = self.build_tantivy_doc(doc_id, &payload)?;
@@ -5513,16 +5799,17 @@ impl super::SearchEngine for HotEngine {
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
         let start_seq_no = self.with_translog("bulk indexing", |tl| {
-            let start_seq_no = tl.write_bulk_with_receipt(&ops)?;
-
             // 2. Write all docs to Tantivy in-memory buffer under one lock
             // Acquire registry once for the entire batch (not per-doc)
             let registry = self
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer_state_with_replay(tl, "bulk indexing")?;
             let writer = writer_state.writer_mut("bulk indexing")?;
+            let start_seq_no = tl.write_bulk_with_receipt(&ops)?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
             for (doc_id, payload) in &docs {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
                 let doc = Self::build_tantivy_doc_inner(
@@ -5560,14 +5847,15 @@ impl super::SearchEngine for HotEngine {
             .collect();
         let mut doc_ids = Vec::with_capacity(docs.len());
         self.with_translog("replica bulk indexing", |tl| {
-            tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
-
             let registry = self
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer_state_with_replay(tl, "replica bulk indexing")?;
             let writer = writer_state.writer_mut("replica bulk indexing")?;
+            tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
             for (doc_id, payload) in &docs {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
                 let doc = Self::build_tantivy_doc_inner(
@@ -5587,10 +5875,14 @@ impl super::SearchEngine for HotEngine {
 
     fn delete_document_with_receipt(&self, doc_id: &str) -> Result<super::DeleteWriteReceipt> {
         let seq_no = self.with_translog("document delete", |tl| {
+            let mut writer_state = self.writer_state_with_replay(tl, "document delete")?;
+            let writer = writer_state.writer_mut("document delete")?;
             let receipt = tl.append(
                 crate::wal::WalOperation::Delete,
                 serde_json::json!({ "_doc_id": doc_id }),
             )?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
 
             // 2. Delete from Tantivy
             let id_field = self
@@ -5598,8 +5890,6 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("document delete")?;
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             // delete_term returns an OpStamp, not a count — we report 1 optimistically
             let _ = opstamp;
@@ -5610,19 +5900,21 @@ impl super::SearchEngine for HotEngine {
 
     fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
         self.with_translog("replica document delete", |tl| {
+            let mut writer_state = self.writer_state_with_replay(tl, "replica document delete")?;
+            let writer = writer_state.writer_mut("replica document delete")?;
             tl.append_with_seq(
                 seq_no,
                 crate::wal::WalOperation::Delete,
                 serde_json::json!({ "_doc_id": doc_id }),
             )?;
+            #[cfg(test)]
+            self.maybe_fail_engine_apply_for_test()?;
 
             let id_field = self
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .id_field;
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("replica document delete")?;
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             let _ = opstamp;
             Ok(())
@@ -5655,7 +5947,7 @@ impl super::SearchEngine for HotEngine {
 
     fn refresh(&self) -> Result<()> {
         let _maintenance = self.maintenance_guard("refresh")?;
-        let committed_next_seq = self.with_translog("refresh", |tl| {
+        let committed_boundary = self.with_translog("refresh", |tl| {
             let next_seq = tl.next_seq_no();
             #[cfg(test)]
             if let Some(sender) = self
@@ -5666,12 +5958,10 @@ impl super::SearchEngine for HotEngine {
             {
                 let _ = sender.send(());
             }
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("refresh")?;
-            writer.commit()?;
-            Ok(next_seq)
+            let mut writer_state = self.writer_state_with_replay(tl, "refresh")?;
+            self.commit_writer_at_boundary(&mut writer_state, "refresh", next_seq)
         })?;
-        self.persist_committed_next_seq_no(committed_next_seq)?;
+        self.persist_committed_boundary(committed_boundary)?;
         self.reader.reload()?;
         Ok(())
     }
@@ -5680,12 +5970,13 @@ impl super::SearchEngine for HotEngine {
         let _maintenance = self.maintenance_guard("flush")?;
         self.with_translog("flush", |tl| {
             let committed_next_seq = tl.next_seq_no();
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("flush")?;
-            writer.commit()?;
+            let mut writer_state = self.writer_state_with_replay(tl, "flush")?;
+            let committed_boundary =
+                self.commit_writer_at_boundary(&mut writer_state, "flush", committed_next_seq)?;
             drop(writer_state); // release lock before reader reload
             self.reader.reload()?;
-            self.persist_committed_next_seq_no(committed_next_seq)?;
+            self.persist_committed_boundary(committed_boundary)?;
+            self.validate_truncation_boundary(tl, committed_boundary)?;
             tl.truncate()?;
             Ok(())
         })
@@ -5707,10 +5998,9 @@ impl super::SearchEngine for HotEngine {
         }
 
         let _maintenance = self.maintenance_guard("force merge")?;
-        let committed_next_seq = self.with_translog("force merge", |translog| {
+        let committed_boundary = self.with_translog("force merge", |translog| {
             let next_seq = translog.next_seq_no();
-            self.pause_and_drain_automatic_merges()?;
-            Ok(next_seq)
+            self.pause_and_drain_automatic_merges(translog, next_seq)
         })?;
         let restore_policy = AutomaticMergePolicyRestore {
             engine: self,
@@ -5718,7 +6008,7 @@ impl super::SearchEngine for HotEngine {
         };
 
         let merge_result = (|| {
-            self.persist_committed_next_seq_no(committed_next_seq)?;
+            self.persist_committed_boundary(committed_boundary)?;
             self.reader.reload()?;
 
             loop {
@@ -6024,49 +6314,55 @@ impl super::SearchEngine for HotEngine {
         std::fs::create_dir_all(snapshot_dir)?;
 
         let _maintenance = self.maintenance_guard("peer recovery snapshot")?;
-        let (snapshot_next_seq_no, retention_pin_id, file_names) =
-            self.with_translog("peer recovery snapshot", |translog| {
-                let snapshot_next_seq_no = translog.next_seq_no();
-                let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
-                writer_state
-                    .writer_mut("peer recovery snapshot")?
-                    .commit()?;
-                drop(writer_state);
-                self.persist_committed_next_seq_no_durable(snapshot_next_seq_no)?;
-                let retention_pin_id =
-                    translog.register_retention_pin(snapshot_next_seq_no)?;
+        let preparation = self.with_translog("peer recovery snapshot", |translog| {
+            let snapshot_next_seq_no = translog.next_seq_no();
+            let mut writer_state =
+                self.writer_state_with_replay(translog, "peer recovery snapshot")?;
+            let committed_boundary = self.commit_writer_at_boundary(
+                &mut writer_state,
+                "peer recovery snapshot",
+                snapshot_next_seq_no,
+            )?;
+            drop(writer_state);
+            self.persist_committed_boundary_durable(committed_boundary)?;
+            let retention_pin_id = translog.register_retention_pin(snapshot_next_seq_no)?;
 
-                let result = (|| {
-                    let file_names = self.peer_recovery_file_names()?;
-                    let index_path = self
-                        .committed_seq_no_path
-                        .parent()
-                        .expect("committed checkpoint path has a parent")
-                        .join("index");
-                    for name in &file_names {
-                        let source = index_path.join(name);
-                        let destination = snapshot_dir.join(name);
-                        std::fs::hard_link(&source, &destination).with_context(|| {
-                            format!(
-                                "hard-link peer recovery file {source:?} to {destination:?}; unlocked copies are not permitted"
-                            )
-                        })?;
-                    }
-                    std::fs::File::open(snapshot_dir)?.sync_all()?;
-                    Ok(file_names)
-                })();
-
-                match result {
-                    Ok(file_names) => {
-                        Ok((snapshot_next_seq_no, retention_pin_id, file_names))
-                    }
-                    Err(error) => {
-                        let _ = translog.release_retention_pin(retention_pin_id);
-                        let _ = std::fs::remove_dir_all(snapshot_dir);
-                        Err(error)
-                    }
+            let result = (|| {
+                let file_names = self.peer_recovery_file_names()?;
+                let index_path = self
+                    .committed_seq_no_path
+                    .parent()
+                    .expect("committed checkpoint path has a parent")
+                    .join("index");
+                for name in &file_names {
+                    let source = index_path.join(name);
+                    let destination = snapshot_dir.join(name);
+                    std::fs::hard_link(&source, &destination).with_context(|| {
+                        format!(
+                            "hard-link peer recovery file {source:?} to {destination:?}; unlocked copies are not permitted"
+                        )
+                    })?;
                 }
-            })?;
+                std::fs::File::open(snapshot_dir)?.sync_all()?;
+                Ok(file_names)
+            })();
+
+            match result {
+                Ok(file_names) => Ok((snapshot_next_seq_no, retention_pin_id, file_names)),
+                Err(error) => {
+                    let _ = translog.release_retention_pin(retention_pin_id);
+                    let _ = std::fs::remove_dir_all(snapshot_dir);
+                    Err(error)
+                }
+            }
+        });
+        let (snapshot_next_seq_no, retention_pin_id, file_names) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(snapshot_dir);
+                return Err(error);
+            }
+        };
         drop(_maintenance);
         Ok(super::PeerRecoverySnapshotPreparation {
             snapshot_next_seq_no,
@@ -6938,6 +7234,8 @@ mod tests {
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
             force_merge_entry_barrier: Mutex::new(None),
             force_merge_before_wait_sender: Mutex::new(None),
+            writer_replacement_failure: Mutex::new(None),
+            engine_apply_failure: Mutex::new(None),
             refresh_before_writer_sender: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
@@ -8058,13 +8356,15 @@ mod tests {
                 .map(|i| (format!("d-{i}"), json!({"n": i})))
                 .collect();
             engine.bulk_add_documents(docs).unwrap();
+            engine.delete_document("d-0").unwrap();
         }
 
         // First reopen replays the full translog into Tantivy segments.
         {
             let engine2 = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
             engine2.refresh().unwrap();
-            assert_eq!(engine2.doc_count(), doc_count);
+            assert_eq!(engine2.doc_count(), doc_count - 1);
+            assert!(engine2.get_document("d-0").unwrap().is_none());
         }
 
         // Simulate a stale checkpoint left behind by an interrupted replay after
@@ -8080,16 +8380,77 @@ mod tests {
         engine3.refresh().unwrap();
         assert_eq!(
             engine3.doc_count(),
-            doc_count,
-            "replaying a committed suffix must not create duplicates"
+            doc_count - 1,
+            "replaying a committed suffix must not create duplicates or resurrect deletes"
         );
-        assert!(engine3.get_document("d-0").unwrap().is_some());
+        assert!(engine3.get_document("d-0").unwrap().is_none());
         assert!(
             engine3
                 .get_document(&format!("d-{}", doc_count - 1))
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn startup_replay_preserves_uncommitted_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+            engine.add_document("victim", json!({"value": 1})).unwrap();
+            engine.refresh().unwrap();
+            engine.delete_document("victim").unwrap();
+        }
+
+        let reopened = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+        assert!(
+            reopened.get_document("victim").unwrap().is_none(),
+            "startup WAL replay must preserve an acknowledged delete"
+        );
+    }
+
+    #[test]
+    fn startup_replay_rejects_malformed_document_operations() {
+        for (operation, payload, expected) in [
+            (
+                crate::wal::WalOperation::Index,
+                json!({"_source": {"value": 1}}),
+                "has no _doc_id",
+            ),
+            (
+                crate::wal::WalOperation::Index,
+                json!({"_id": "legacy-only", "_source": {"value": 1}}),
+                "has no _doc_id",
+            ),
+            (
+                crate::wal::WalOperation::Index,
+                json!({"_doc_id": "missing-source"}),
+                "has no _source",
+            ),
+            (
+                crate::wal::WalOperation::Delete,
+                json!({}),
+                "has no _doc_id",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let translog =
+                HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
+            translog.append(operation, payload).unwrap();
+            drop(translog);
+
+            let error = match HotEngine::new(dir.path(), Duration::from_secs(3600)) {
+                Ok(_) => panic!("startup replay accepted malformed WAL operation"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<crate::wal::WalCorruptionError>()),
+                "{error:#}"
+            );
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     // ── doc_count ───────────────────────────────────────────────────────

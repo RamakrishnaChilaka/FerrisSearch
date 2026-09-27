@@ -13,6 +13,10 @@ transport_port: 9300
 # column_cache_size_percent: 10
 # column_cache_populate_threshold: 5
 # max_concurrent_peer_recoveries: 2
+# Persistent local shard I/O escalates only after both thresholds are met.
+# Corruption remains immediately definitive; network recovery errors do not count.
+# shard_io_failure_escalation_attempts: 3
+# shard_io_failure_escalation_window_ms: 60000
 #
 # Default is true. Set to false if you want exact coordinator-side merge
 # instead of approximate shard-level top-K pruning for eligible GROUP BY queries.

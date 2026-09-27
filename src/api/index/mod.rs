@@ -98,18 +98,43 @@ pub(crate) async fn ensure_local_index_shards_open(
     metadata: &IndexMetadata,
     context: &str,
 ) -> Vec<(u32, Arc<dyn crate::engine::SearchEngine>)> {
+    let cluster_state = state.cluster_manager.get_state();
     for (shard_id, routing) in &metadata.shard_routing {
-        let assigned_here = routing.primary == state.local_node_id
-            || routing
-                .replicas
-                .iter()
-                .any(|node_id| node_id == &state.local_node_id);
-        if !assigned_here
-            || state
-                .shard_manager
-                .get_shard(index_name, *shard_id)
-                .is_some()
+        let authoritative_here = routing.primary == state.local_node_id
+            || routing.is_replica_in_sync(&state.local_node_id);
+        if !authoritative_here {
+            continue;
+        }
+        let Some(allocation_id) =
+            cluster_state.shard_allocation_id(index_name, *shard_id, &state.local_node_id)
+        else {
+            tracing::error!(
+                "{}: refusing to serve {}/{} because the local assignment has no allocation ID",
+                context,
+                index_name,
+                shard_id
+            );
+            continue;
+        };
+        if state
+            .shard_manager
+            .get_shard(index_name, *shard_id)
+            .is_some()
         {
+            if let Err(error) = state.shard_manager.validate_open_copy_identity(
+                index_name,
+                *shard_id,
+                metadata.uuid.as_str(),
+                allocation_id,
+            ) {
+                tracing::error!(
+                    "{}: refusing to serve {}/{} because the local copy identity is invalid: {}",
+                    context,
+                    index_name,
+                    shard_id,
+                    error
+                );
+            }
             continue;
         }
 
@@ -131,12 +156,17 @@ pub(crate) async fn ensure_local_index_shards_open(
 
         if let Err(e) = state
             .shard_manager
-            .open_shard_with_settings_blocking(
+            .open_assigned_shard_with_settings_blocking(
                 index_name.to_string(),
                 *shard_id,
                 metadata.mappings.clone(),
                 metadata.settings.clone(),
                 metadata.uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id,
+                    primary_term: routing.primary_term,
+                    allow_empty_creation: false,
+                },
             )
             .await
         {
@@ -150,7 +180,33 @@ pub(crate) async fn ensure_local_index_shards_open(
         }
     }
 
-    state.shard_manager.get_index_shards(index_name)
+    metadata
+        .shard_routing
+        .iter()
+        .filter_map(|(shard_id, routing)| {
+            let authoritative_here = routing.primary == state.local_node_id
+                || routing.is_replica_in_sync(&state.local_node_id);
+            let allocation_id =
+                cluster_state.shard_allocation_id(index_name, *shard_id, &state.local_node_id)?;
+            if !authoritative_here
+                || state
+                    .shard_manager
+                    .validate_open_copy_identity(
+                        index_name,
+                        *shard_id,
+                        metadata.uuid.as_str(),
+                        allocation_id,
+                    )
+                    .is_err()
+            {
+                return None;
+            }
+            state
+                .shard_manager
+                .get_shard(index_name, *shard_id)
+                .map(|engine| (*shard_id, engine))
+        })
+        .collect()
 }
 
 async fn wait_for_index_metadata(state: &AppState, index_name: &str) -> Option<IndexMetadata> {
@@ -249,20 +305,28 @@ async fn auto_create_index(
             .unwrap_or_else(|| m.clone())
     };
 
+    let committed_state = state.cluster_manager.get_state();
     if let Some(routing) = created_metadata.shard_routing.get(&0)
-        && (routing.primary == state.local_node_id
-            || routing
-                .replicas
-                .iter()
-                .any(|node_id| node_id == &state.local_node_id))
+        && routing.primary == state.local_node_id
+        && let Some(allocation_id) =
+            committed_state.shard_allocation_id(index_name, 0, &state.local_node_id)
         && let Err(e) = state
             .shard_manager
-            .open_shard_with_settings_blocking(
+            .open_assigned_shard_with_settings_blocking(
                 created_metadata.name.clone(),
                 0,
                 created_metadata.mappings.clone(),
                 created_metadata.settings.clone(),
                 created_metadata.uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id,
+                    primary_term: routing.primary_term,
+                    allow_empty_creation: committed_state.may_create_initial_empty_copy(
+                        index_name,
+                        0,
+                        &state.local_node_id,
+                    ),
+                },
             )
             .await
     {
@@ -401,10 +465,7 @@ pub async fn create_index(
             Err(error) => return create_index_error_response(error),
         };
 
-    let shard_assignment = metadata.shard_routing.clone();
-    let index_mappings = metadata.mappings.clone();
     let index_settings = metadata.settings.clone();
-    let index_uuid = metadata.uuid.clone();
     let replica_count = metadata.number_of_replicas;
 
     // Coordinator: forward to leader or write locally via Raft
@@ -435,18 +496,41 @@ pub async fn create_index(
         return e;
     }
 
-    // Open local shard engines for shards assigned to this node (primary or replica)
-    for (shard_id, routing) in &shard_assignment {
-        if (routing.primary == state.local_node_id
-            || routing.replicas.contains(&state.local_node_id))
+    let committed_state = state.cluster_manager.get_state();
+    let Some(committed_metadata) = committed_state.indices.get(index_name.as_str()) else {
+        return crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "master_not_discovered_exception",
+            format!("Index [{index_name}] was committed but is not visible locally"),
+        );
+    };
+
+    // Only the initial primary may create an empty local copy. Initial replicas
+    // remain out of sync and are populated by peer recovery.
+    for (shard_id, routing) in &committed_metadata.shard_routing {
+        if routing.primary == state.local_node_id
+            && let Some(allocation_id) = committed_state.shard_allocation_id(
+                index_name.as_str(),
+                *shard_id,
+                &state.local_node_id,
+            )
             && let Err(e) = state
                 .shard_manager
-                .open_shard_with_settings_blocking(
+                .open_assigned_shard_with_settings_blocking(
                     index_name.to_string(),
                     *shard_id,
-                    index_mappings.clone(),
-                    index_settings.clone(),
-                    index_uuid.clone(),
+                    committed_metadata.mappings.clone(),
+                    committed_metadata.settings.clone(),
+                    committed_metadata.uuid.clone(),
+                    crate::shard::AssignedShardOpen {
+                        allocation_id,
+                        primary_term: routing.primary_term,
+                        allow_empty_creation: committed_state.may_create_initial_empty_copy(
+                            index_name.as_str(),
+                            *shard_id,
+                            &state.local_node_id,
+                        ),
+                    },
                 )
                 .await
         {
@@ -463,7 +547,7 @@ pub async fn create_index(
         "Created index '{}' with engine {}, {} shards, {} replicas",
         index_name,
         index_settings.engine,
-        shard_assignment.len(),
+        committed_metadata.shard_routing.len(),
         replica_count
     );
 
