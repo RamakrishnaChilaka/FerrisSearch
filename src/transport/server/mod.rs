@@ -2015,26 +2015,10 @@ impl InternalTransport for TransportService {
         let ops_count = entries.len() as u64;
 
         // Convert translog entries to proto operations for the replica to replay
-        let operations: Vec<RecoverReplicaOp> = entries
-            .iter()
-            .map(|e| {
-                // Extract doc_id from payload (stored in _doc_id or _id field)
-                let doc_id = e
-                    .payload
-                    .get("_doc_id")
-                    .or_else(|| e.payload.get("_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Ok::<RecoverReplicaOp, serde_json::Error>(RecoverReplicaOp {
-                    seq_no: e.seq_no,
-                    op: e.op.as_str().to_string(),
-                    doc_id,
-                    payload_json: serde_json::to_vec(&e.payload)?,
-                })
-            })
-            .collect::<Result<_, _>>()
-            .map_err(|e| Status::internal(format!("serialize recovery op: {e}")))?;
+        let operations = entries
+            .into_iter()
+            .map(peer_recovery::recovery_op)
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Response::new(RecoverReplicaResponse {
             success: true,

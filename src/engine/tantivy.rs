@@ -15,7 +15,9 @@ use tantivy::schema::{FAST, Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, SegmentMeta, TantivyDocument, Term};
 
 use super::SearchEngine;
-use crate::wal::{HotTranslog, TranslogDurability, WriteAheadLog};
+use crate::wal::{
+    HotTranslog, TranslogDurability, WalDocumentOperation, WriteAheadLog, document_operation,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("authoritative shard schema validation failed: {message}")]
@@ -752,18 +754,16 @@ impl HotEngine {
                 );
             }
 
-            let doc_id = entry
-                .payload
-                .get("_doc_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown");
-            let source = entry.payload.get("_source").unwrap_or(&entry.payload);
+            let operation = document_operation(&entry)?;
+            let doc_id = operation.doc_id();
 
             {
                 let writer = writer_state.writer_mut(context)?;
                 writer.delete_term(Term::from_field_text(id_field, doc_id));
-                let doc = self.build_tantivy_doc(doc_id, source)?;
-                writer.add_document(doc)?;
+                if let WalDocumentOperation::Index { source, .. } = operation {
+                    let doc = self.build_tantivy_doc(doc_id, source)?;
+                    writer.add_document(doc)?;
+                }
             }
 
             last_seq = entry.seq_no;
@@ -816,7 +816,7 @@ impl HotEngine {
         Ok(replayed)
     }
 
-    fn writer_state_for_write(
+    fn writer_state_with_replay(
         &self,
         translog: &dyn WriteAheadLog,
         context: &str,
@@ -865,6 +865,7 @@ impl HotEngine {
 
     fn pause_and_drain_automatic_merges(
         &self,
+        translog: &dyn WriteAheadLog,
         committed_next_seq: u64,
     ) -> Result<CommittedTantivyBoundary> {
         let automatic_policy = self
@@ -872,10 +873,8 @@ impl HotEngine {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        let mut writer_state = self
-            .writer
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut writer_state =
+            self.writer_state_with_replay(translog, "force-merge preparation")?;
 
         writer_state
             .writer_mut("force-merge preparation")?
@@ -2301,6 +2300,9 @@ impl HotEngine {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
+        if writer_state.writer.is_none() {
+            return Ok(false);
+        }
         let committed_boundary = self.commit_writer_at_boundary(
             &mut writer_state,
             "checkpoint-aware flush",
@@ -2322,7 +2324,7 @@ impl HotEngine {
         let _maintenance = self.maintenance_guard("checkpoint-aware flush")?;
         self.with_translog("checkpoint-aware flush", |tl| {
             let committed_next_seq = tl.next_seq_no();
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer_state_with_replay(tl, "checkpoint-aware flush")?;
             let committed_boundary = self.commit_writer_at_boundary(
                 &mut writer_state,
                 "checkpoint-aware flush",
@@ -5716,7 +5718,7 @@ impl super::SearchEngine for HotEngine {
         // section so refresh/flush cannot commit past a translog entry that has
         // not yet been applied to the Tantivy writer.
         let seq_no = self.with_translog("document indexing", |tl| {
-            let mut writer_state = self.writer_state_for_write(tl, "document indexing")?;
+            let mut writer_state = self.writer_state_with_replay(tl, "document indexing")?;
             let writer = writer_state.writer_mut("document indexing")?;
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
@@ -5754,7 +5756,8 @@ impl super::SearchEngine for HotEngine {
     ) -> Result<String> {
         self.validate_keyword_documents(std::iter::once(&payload))?;
         self.with_translog("replica document indexing", |tl| {
-            let mut writer_state = self.writer_state_for_write(tl, "replica document indexing")?;
+            let mut writer_state =
+                self.writer_state_with_replay(tl, "replica document indexing")?;
             let writer = writer_state.writer_mut("replica document indexing")?;
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
@@ -5802,7 +5805,7 @@ impl super::SearchEngine for HotEngine {
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer_state_for_write(tl, "bulk indexing")?;
+            let mut writer_state = self.writer_state_with_replay(tl, "bulk indexing")?;
             let writer = writer_state.writer_mut("bulk indexing")?;
             let start_seq_no = tl.write_bulk_with_receipt(&ops)?;
             #[cfg(test)]
@@ -5848,7 +5851,7 @@ impl super::SearchEngine for HotEngine {
                 .field_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer_state_for_write(tl, "replica bulk indexing")?;
+            let mut writer_state = self.writer_state_with_replay(tl, "replica bulk indexing")?;
             let writer = writer_state.writer_mut("replica bulk indexing")?;
             tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
             #[cfg(test)]
@@ -5872,7 +5875,7 @@ impl super::SearchEngine for HotEngine {
 
     fn delete_document_with_receipt(&self, doc_id: &str) -> Result<super::DeleteWriteReceipt> {
         let seq_no = self.with_translog("document delete", |tl| {
-            let mut writer_state = self.writer_state_for_write(tl, "document delete")?;
+            let mut writer_state = self.writer_state_with_replay(tl, "document delete")?;
             let writer = writer_state.writer_mut("document delete")?;
             let receipt = tl.append(
                 crate::wal::WalOperation::Delete,
@@ -5897,7 +5900,7 @@ impl super::SearchEngine for HotEngine {
 
     fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
         self.with_translog("replica document delete", |tl| {
-            let mut writer_state = self.writer_state_for_write(tl, "replica document delete")?;
+            let mut writer_state = self.writer_state_with_replay(tl, "replica document delete")?;
             let writer = writer_state.writer_mut("replica document delete")?;
             tl.append_with_seq(
                 seq_no,
@@ -5955,7 +5958,7 @@ impl super::SearchEngine for HotEngine {
             {
                 let _ = sender.send(());
             }
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer_state_with_replay(tl, "refresh")?;
             self.commit_writer_at_boundary(&mut writer_state, "refresh", next_seq)
         })?;
         self.persist_committed_boundary(committed_boundary)?;
@@ -5967,7 +5970,7 @@ impl super::SearchEngine for HotEngine {
         let _maintenance = self.maintenance_guard("flush")?;
         self.with_translog("flush", |tl| {
             let committed_next_seq = tl.next_seq_no();
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state = self.writer_state_with_replay(tl, "flush")?;
             let committed_boundary =
                 self.commit_writer_at_boundary(&mut writer_state, "flush", committed_next_seq)?;
             drop(writer_state); // release lock before reader reload
@@ -5997,7 +6000,7 @@ impl super::SearchEngine for HotEngine {
         let _maintenance = self.maintenance_guard("force merge")?;
         let committed_boundary = self.with_translog("force merge", |translog| {
             let next_seq = translog.next_seq_no();
-            self.pause_and_drain_automatic_merges(next_seq)
+            self.pause_and_drain_automatic_merges(translog, next_seq)
         })?;
         let restore_policy = AutomaticMergePolicyRestore {
             engine: self,
@@ -6313,7 +6316,8 @@ impl super::SearchEngine for HotEngine {
         let _maintenance = self.maintenance_guard("peer recovery snapshot")?;
         let preparation = self.with_translog("peer recovery snapshot", |translog| {
             let snapshot_next_seq_no = translog.next_seq_no();
-            let mut writer_state = self.writer.write().unwrap_or_else(|e| e.into_inner());
+            let mut writer_state =
+                self.writer_state_with_replay(translog, "peer recovery snapshot")?;
             let committed_boundary = self.commit_writer_at_boundary(
                 &mut writer_state,
                 "peer recovery snapshot",
@@ -8352,13 +8356,15 @@ mod tests {
                 .map(|i| (format!("d-{i}"), json!({"n": i})))
                 .collect();
             engine.bulk_add_documents(docs).unwrap();
+            engine.delete_document("d-0").unwrap();
         }
 
         // First reopen replays the full translog into Tantivy segments.
         {
             let engine2 = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
             engine2.refresh().unwrap();
-            assert_eq!(engine2.doc_count(), doc_count);
+            assert_eq!(engine2.doc_count(), doc_count - 1);
+            assert!(engine2.get_document("d-0").unwrap().is_none());
         }
 
         // Simulate a stale checkpoint left behind by an interrupted replay after
@@ -8374,16 +8380,77 @@ mod tests {
         engine3.refresh().unwrap();
         assert_eq!(
             engine3.doc_count(),
-            doc_count,
-            "replaying a committed suffix must not create duplicates"
+            doc_count - 1,
+            "replaying a committed suffix must not create duplicates or resurrect deletes"
         );
-        assert!(engine3.get_document("d-0").unwrap().is_some());
+        assert!(engine3.get_document("d-0").unwrap().is_none());
         assert!(
             engine3
                 .get_document(&format!("d-{}", doc_count - 1))
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn startup_replay_preserves_uncommitted_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+            engine.add_document("victim", json!({"value": 1})).unwrap();
+            engine.refresh().unwrap();
+            engine.delete_document("victim").unwrap();
+        }
+
+        let reopened = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+        assert!(
+            reopened.get_document("victim").unwrap().is_none(),
+            "startup WAL replay must preserve an acknowledged delete"
+        );
+    }
+
+    #[test]
+    fn startup_replay_rejects_malformed_document_operations() {
+        for (operation, payload, expected) in [
+            (
+                crate::wal::WalOperation::Index,
+                json!({"_source": {"value": 1}}),
+                "has no _doc_id",
+            ),
+            (
+                crate::wal::WalOperation::Index,
+                json!({"_id": "legacy-only", "_source": {"value": 1}}),
+                "has no _doc_id",
+            ),
+            (
+                crate::wal::WalOperation::Index,
+                json!({"_doc_id": "missing-source"}),
+                "has no _source",
+            ),
+            (
+                crate::wal::WalOperation::Delete,
+                json!({}),
+                "has no _doc_id",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let translog =
+                HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
+            translog.append(operation, payload).unwrap();
+            drop(translog);
+
+            let error = match HotEngine::new(dir.path(), Duration::from_secs(3600)) {
+                Ok(_) => panic!("startup replay accepted malformed WAL operation"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<crate::wal::WalCorruptionError>()),
+                "{error:#}"
+            );
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     // ── doc_count ───────────────────────────────────────────────────────

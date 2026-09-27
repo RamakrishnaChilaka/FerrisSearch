@@ -2937,7 +2937,7 @@ async fn repaired_open_fault_reactivates_primary_and_clears_unavailable_status()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn primary_apply_escalation_keeps_reads_open_and_does_not_replay_failed_wal_entry() {
+async fn primary_apply_escalation_keeps_reads_open_without_immediate_wal_replay() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = DomainClusterState::new("apply-quarantine".into());
     state.add_index(DomainIndexMetadata {
@@ -3046,14 +3046,14 @@ async fn primary_apply_escalation_keeps_reads_open_and_does_not_replay_failed_wa
                 .get_document(&format!("failed-after-wal-{attempt}"))
                 .unwrap()
                 .is_none(),
-            "failed post-WAL mutation must be replayed only by restart recovery"
+            "failed post-WAL mutation must remain absent before writer rebuild or replay"
         );
     }
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replica_commit_failure_recovers_acknowledged_writes_before_promotion() {
+async fn replica_commit_failure_recovers_writes_and_deletes_before_promotion() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -3116,32 +3116,75 @@ async fn replica_commit_failure_recovers_acknowledged_writes_before_promotion() 
         peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
-    let replicate = |doc_id: String, seq_no: u64| ReplicateDocRequest {
-        index_name: "idx".into(),
-        shard_id: 0,
-        doc_id,
-        payload_json: serde_json::to_vec(&json!({"value": seq_no})).unwrap(),
-        op: "index".into(),
-        seq_no,
-        index_uuid: "uuid-1".into(),
-        primary_term: Some(2),
-        target_allocation_id: Some(replica_allocation),
+    let replicate = |doc_id: String,
+                     seq_no: u64,
+                     op: &str,
+                     payload: serde_json::Value|
+     -> ReplicateDocRequest {
+        ReplicateDocRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            doc_id,
+            payload_json: serde_json::to_vec(&payload).unwrap(),
+            op: op.into(),
+            seq_no,
+            index_uuid: "uuid-1".into(),
+            primary_term: Some(2),
+            target_allocation_id: Some(replica_allocation),
+        }
     };
     assert!(
         service
-            .replicate_doc(Request::new(replicate("pre-fault".into(), 0)))
+            .replicate_doc(Request::new(replicate(
+                "pre-fault".into(),
+                0,
+                "index",
+                json!({"value": 0}),
+            )))
             .await
             .unwrap()
             .into_inner()
             .success
     );
     engine.refresh().unwrap();
+    assert!(
+        service
+            .replicate_doc(Request::new(replicate(
+                "victim".into(),
+                1,
+                "index",
+                json!({"value": 1}),
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .success
+    );
+    engine.refresh().unwrap();
+    assert!(
+        service
+            .replicate_doc(Request::new(replicate(
+                "victim".into(),
+                2,
+                "delete",
+                json!({}),
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .success
+    );
 
     let index_dir = dir.path().join("uuid-1/shard_0/index");
     std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     assert!(
         service
-            .replicate_doc(Request::new(replicate("during-fault".into(), 1)))
+            .replicate_doc(Request::new(replicate(
+                "during-fault".into(),
+                3,
+                "index",
+                json!({"value": 3}),
+            )))
             .await
             .unwrap()
             .into_inner()
@@ -3156,7 +3199,12 @@ async fn replica_commit_failure_recovers_acknowledged_writes_before_promotion() 
     for offset in 0..5 {
         let id = format!("acked-{offset}");
         let response = service
-            .replicate_doc(Request::new(replicate(id.clone(), offset + 2)))
+            .replicate_doc(Request::new(replicate(
+                id.clone(),
+                offset + 4,
+                "index",
+                json!({"value": offset + 4}),
+            )))
             .await
             .unwrap()
             .into_inner();
@@ -3209,6 +3257,10 @@ async fn replica_commit_failure_recovers_acknowledged_writes_before_promotion() 
             "promoted replica lost acknowledged document {id}"
         );
     }
+    assert!(
+        engine.get_document("victim").unwrap().is_none(),
+        "promoted replica resurrected an acknowledged delete"
+    );
 }
 
 #[tokio::test]

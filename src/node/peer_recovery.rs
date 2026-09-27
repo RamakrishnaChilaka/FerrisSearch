@@ -2233,8 +2233,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn file_recovery_copies_flushed_state_catches_up_and_admits_target() {
+        use std::os::unix::fs::PermissionsExt;
+
         let (raft, state_handle) =
             consensus::create_raft_instance_mem(1, "peer-recovery-it".into())
                 .await
@@ -2390,6 +2393,31 @@ mod tests {
             .into_inner();
         assert!(delete_seed.success, "{}", delete_seed.error);
 
+        let index_dir = source_dir.path().join("docs-uuid/shard_0/index");
+        let idle_before_recovery = source_client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "docs".into(),
+                shard_id: 0,
+                doc_id: "idle-before-recovery".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({
+                    "value": "idle-before-recovery"
+                }))
+                .unwrap(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            idle_before_recovery.success,
+            "{}",
+            idle_before_recovery.error
+        );
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed_snapshot_commit = source_engine.refresh();
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failed_snapshot_commit.is_err());
+        assert!(source_engine.writer_is_failed_for_test());
+
         let current_metadata = state_handle.read().unwrap().indices["docs"].clone();
         let candidate = RecoveryCandidate {
             index_name: "docs".into(),
@@ -2491,7 +2519,7 @@ mod tests {
         for id in concurrent_ids
             .iter()
             .map(String::as_str)
-            .chain(std::iter::once("post-finalize"))
+            .chain(["idle-before-recovery", "post-finalize"])
         {
             assert_eq!(
                 source_engine.get_document(id).unwrap(),

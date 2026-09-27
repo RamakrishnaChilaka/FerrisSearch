@@ -117,6 +117,50 @@ pub struct TranslogEntry {
     pub payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WalDocumentOperation<'a> {
+    Index {
+        doc_id: &'a str,
+        source: &'a serde_json::Value,
+    },
+    Delete {
+        doc_id: &'a str,
+    },
+}
+
+impl<'a> WalDocumentOperation<'a> {
+    pub(crate) fn doc_id(self) -> &'a str {
+        match self {
+            Self::Index { doc_id, .. } | Self::Delete { doc_id } => doc_id,
+        }
+    }
+}
+
+pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOperation<'_>> {
+    let doc_id = entry
+        .payload
+        .get("_doc_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            wal_corruption(format!(
+                "translog operation {} has no _doc_id",
+                entry.seq_no
+            ))
+        })?;
+    match entry.op {
+        WalOperation::Index => {
+            let source = entry.payload.get("_source").ok_or_else(|| {
+                wal_corruption(format!(
+                    "index translog operation {} has no _source",
+                    entry.seq_no
+                ))
+            })?;
+            Ok(WalDocumentOperation::Index { doc_id, source })
+        }
+        WalOperation::Delete => Ok(WalDocumentOperation::Delete { doc_id }),
+    }
+}
+
 #[derive(Clone)]
 pub struct TranslogReadSnapshot {
     next_seq_no: u64,

@@ -5113,6 +5113,97 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_survives_runtime_commit_failure_rebuild_and_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt("victim", serde_json::json!({"value": 1}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.delete_document_with_receipt("victim").unwrap();
+
+        let index_dir = dir.path().join("uuid-1/shard_0/index");
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed_commit = engine.refresh();
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failed_commit.is_err());
+        assert!(engine.writer_is_failed_for_test());
+
+        engine
+            .add_document_with_receipt("trigger", serde_json::json!({"value": 2}))
+            .unwrap();
+        engine.refresh().unwrap();
+        assert!(
+            engine.get_document("victim").unwrap().is_none(),
+            "runtime WAL replay must not resurrect an acknowledged delete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_failed_writer_recovers_on_refresh_and_snapshot_without_client_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt("committed", serde_json::json!({"value": 0}))
+            .unwrap();
+        engine.refresh().unwrap();
+        engine
+            .add_document_with_receipt("acked-before-fault", serde_json::json!({"value": 1}))
+            .unwrap();
+
+        let index_dir = dir.path().join("uuid-1/shard_0/index");
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed_commit = engine.refresh();
+        std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failed_commit.is_err());
+        assert!(engine.writer_is_failed_for_test());
+
+        engine
+            .refresh()
+            .expect("idle refresh must rebuild the writer and replay the WAL suffix");
+        assert!(engine.get_document("acked-before-fault").unwrap().is_some());
+        let snapshot_dir = dir.path().join("idle-recovery-snapshot");
+        let snapshot = engine
+            .prepare_peer_recovery_snapshot(&snapshot_dir)
+            .expect("peer recovery snapshot must succeed after idle writer repair");
+        assert_eq!(snapshot.snapshot_next_seq_no, 2);
+    }
+
     #[tokio::test]
     async fn successful_replica_apply_clears_a_transient_apply_failure() {
         let dir = tempfile::tempdir().unwrap();

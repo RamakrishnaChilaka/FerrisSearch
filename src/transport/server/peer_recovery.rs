@@ -543,29 +543,16 @@ async fn record_setup_failure(
     }
 }
 
-fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverReplicaOp, Status> {
-    let doc_id = entry
-        .payload
-        .get("_doc_id")
-        .or_else(|| entry.payload.get("_id"))
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            Status::internal(format!(
-                "translog operation {} has no document id",
-                entry.seq_no
-            ))
-        })?
-        .to_string();
-    let payload = match entry.op {
-        crate::wal::WalOperation::Index => {
-            entry.payload.get("_source").cloned().ok_or_else(|| {
-                Status::internal(format!(
-                    "index translog operation {} has no _source",
-                    entry.seq_no
-                ))
-            })?
+pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverReplicaOp, Status> {
+    let operation = crate::wal::document_operation(&entry)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let (doc_id, payload) = match operation {
+        crate::wal::WalDocumentOperation::Index { doc_id, source } => {
+            (doc_id.to_string(), source.clone())
         }
-        crate::wal::WalOperation::Delete => serde_json::json!({}),
+        crate::wal::WalDocumentOperation::Delete { doc_id } => {
+            (doc_id.to_string(), serde_json::json!({}))
+        }
     };
     Ok(RecoverReplicaOp {
         seq_no: entry.seq_no,

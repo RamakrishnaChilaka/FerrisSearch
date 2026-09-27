@@ -3743,7 +3743,19 @@ async fn recover_replica_ops_have_correct_fields() {
     let addr = start_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
 
-    // Index a doc, then delete it
+    // Reserve seq_no 0 so legacy recovery can request the index and delete
+    // operations from local checkpoint 0.
+    client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "opf-idx".into(),
+            shard_id: 0,
+            doc_id: "baseline".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"title": "baseline"})).unwrap(),
+        }))
+        .await
+        .unwrap();
+
+    // Index a doc, then delete it.
     let payload = serde_json::json!({"title": "recover-test"});
     client
         .index_doc(tonic::Request::new(ShardDocRequest {
@@ -3764,7 +3776,7 @@ async fn recover_replica_ops_have_correct_fields() {
         .await
         .unwrap();
 
-    // Recover from seq_no 0 — should get both index and delete ops
+    // Recover from seq_no 0 — should get the later index and delete ops.
     let resp = client
         .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
             index_name: "opf-idx".into(),
@@ -3776,18 +3788,23 @@ async fn recover_replica_ops_have_correct_fields() {
         .into_inner();
 
     assert!(resp.success);
-    assert!(!resp.operations.is_empty(), "should have recovery ops");
-
-    // Verify each op has required fields
-    for op in &resp.operations {
-        assert!(op.seq_no <= 10, "seq_no should be reasonable");
-        assert!(
-            op.op == "index" || op.op == "delete",
-            "op should be index or delete, got: {}",
-            op.op
-        );
-        assert!(!op.doc_id.is_empty(), "doc_id should not be empty");
-    }
+    assert_eq!(resp.operations.len(), 2);
+    let index = &resp.operations[0];
+    assert_eq!(index.seq_no, 1);
+    assert_eq!(index.op, "index");
+    assert_eq!(index.doc_id, "opf-1");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&index.payload_json).unwrap(),
+        payload
+    );
+    let delete = &resp.operations[1];
+    assert_eq!(delete.seq_no, 2);
+    assert_eq!(delete.op, "delete");
+    assert_eq!(delete.doc_id, "opf-1");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&delete.payload_json).unwrap(),
+        serde_json::json!({})
+    );
 }
 
 // ─── Shard Stats integration tests ─────────────────────────────────────────
