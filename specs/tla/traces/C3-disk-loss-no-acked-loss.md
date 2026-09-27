@@ -1,6 +1,6 @@
 # C3 disk-loss counterexample: `NoAckedLoss`
 
-**Date:** September 26, 2026
+**Date:** September 27, 2026
 
 **Configuration:** `MC_C3.cfg`
 
@@ -8,7 +8,7 @@
 
 **Raw trace:** [`C3-disk-loss-no-acked-loss.log`](C3-disk-loss-no-acked-loss.log)
 
-**Raw trace SHA-256:** `21dec85e1ad075b793a65c2063314af1ad6069112ede6eb8d8d1b64bdc0b980e`
+**Raw trace SHA-256:** `6ee7d53c0be1a1d646a3f2bd8b4b8e54565ddbffc2926e790e109dc1fff0c6b7`
 
 | State range | Model action | Rust behavior represented |
 | --- | --- | --- |

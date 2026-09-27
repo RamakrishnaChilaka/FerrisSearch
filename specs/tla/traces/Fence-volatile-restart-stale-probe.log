@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 45 and seed -2396982098921908365 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 37478] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 28 and seed -8485681573762367009 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 86755] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_FenceDurability.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C2.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
@@ -7,10 +7,10 @@ Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/fence-volatile/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/fence-volatile/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/fence-volatile/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/fence-volatile/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/fence-volatile/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/fence-volatile/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/fence-volatile/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/fence-volatile/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -22,9 +22,9 @@ Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C2
 Semantic processing of module MC_FenceDurability
-Starting... (2026-09-26 19:37:21)
+Starting... (2026-09-27 06:28:27)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-26 19:37:21.
+Finished computing initial states: 1 distinct state generated at 2026-09-27 06:28:28.
 Error: Invariant FenceRejectsStaleProbe is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -535,4 +535,4 @@ State 15: <FenceDurabilityNext line 106, col 8 to line 109, col 61 of module MC_
 17 states generated, 17 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 15.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 2 and the 95th percentile is 2).
-Finished in 01s at (2026-09-26 19:37:21)
+Finished in 01s at (2026-09-27 06:28:28)

@@ -1,15 +1,15 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 36 and seed 1528856926687909547 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 37783] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 37 and seed 8844054268363456502 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 87044] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C4.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/c4/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/c4/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/c4/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/c4/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/c4/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/c4/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/c4/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/c4/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -20,9 +20,9 @@ Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C4
-Starting... (2026-09-26 19:37:29)
+Starting... (2026-09-27 06:28:36)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-26 19:37:30.
+Finished computing initial states: 1 distinct state generated at 2026-09-27 06:28:37.
 Error: Invariant NoAckedLoss is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -340,4 +340,4 @@ State 9: <C4Next line 35, col 8 to line 37, col 35 of module MC_C4>
 32 states generated, 21 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 9.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 3 and the 95th percentile is 3).
-Finished in 01s at (2026-09-26 19:37:30)
+Finished in 01s at (2026-09-27 06:28:37)

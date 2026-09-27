@@ -1,6 +1,6 @@
 # C4 asynchronous-durability counterexample: `NoAckedLoss`
 
-**Date:** September 26, 2026
+**Date:** September 27, 2026
 
 **Configuration:** `MC_C4.cfg`
 
@@ -8,7 +8,7 @@
 
 **Raw trace:** [`C4-async-durability-no-acked-loss.log`](C4-async-durability-no-acked-loss.log)
 
-**Raw trace SHA-256:** `a653fa1ecc4ec96d4ea77fb0f43272a1f2e54eff1994efa9c3a4343dd6ee7141`
+**Raw trace SHA-256:** `23ada25fc653306ebd543751c6e213aa72c99ac50bcff912c9f75fdf4b71e579`
 
 | State range | Model action | Rust behavior represented |
 | --- | --- | --- |

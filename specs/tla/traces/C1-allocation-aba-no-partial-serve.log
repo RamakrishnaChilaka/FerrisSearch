@@ -1,14 +1,14 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 50 and seed -3356957239742341129 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 36296] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 98 and seed -3404924778779019334 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 86351] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/c1-aba/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/c1-aba/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/c1-aba/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.YOjWCK/c1-aba/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/c1-aba/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/c1-aba/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/c1-aba/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.uM8qZl/c1-aba/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -18,14 +18,14 @@ Semantic processing of module ShardReplication
 Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
-Starting... (2026-09-26 19:35:57)
+Starting... (2026-09-27 06:26:54)
 Computing initial states...
 Computed 2 initial states...
 Computed 4 initial states...
 Computed 8 initial states...
 Computed 16 initial states...
-Finished computing initial states: 18 states generated, with 3 of them distinct at 2026-09-26 19:35:58.
-Progress(21) at 2026-09-26 19:36:01: 68,181 states generated (68,181 s/min), 23,922 distinct states found (23,922 ds/min), 7,027 states left on queue.
+Finished computing initial states: 18 states generated, with 3 of them distinct at 2026-09-27 06:26:55.
+Progress(20) at 2026-09-27 06:26:58: 41,937 states generated (41,937 s/min), 15,078 distinct states found (15,078 ds/min), 4,109 states left on queue.
 Error: Invariant NoPartialServe is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -146,44 +146,12 @@ State 3: <Next line 14, col 8 to line 15, col 29 of module Invariants>
 /\ pins = (n1 :> {0} @@ n2 :> {} @@ n3 :> {})
 /\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "SnapshotReady")
 
-State 4: <Next line 14, col 8 to line 15, col 29 of module Invariants>
-/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
-/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Installing")
-/\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "Recovering")
-
-State 5: <Next line 14, col 8 to line 15, col 29 of module Invariants>
-/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
-/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "CatchingUp")
-
-State 6: <Next line 14, col 8 to line 15, col 29 of module Invariants>
-/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Ready")
-
-State 7: <Next line 14, col 8 to line 15, col 29 of module Invariants>
-/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Preparing")
-/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
-
-State 8: <Next line 14, col 8 to line 15, col 29 of module Invariants>
-/\ exclusiveHolder = (n1 :> n3 @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
-/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Finalizing")
-/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
-
-State 9: <Next line 14, col 8 to line 15, col 29 of module Invariants>
-/\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
-/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> n1)
-/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
-/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "AwaitingComplete")
-/\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "Pending")
-
-State 10: <Next line 14, col 8 to line 15, col 29 of module Invariants>
-/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
-/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Settling")
-
-State 11: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
+State 4: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
 /\ crashCount = 1
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> FALSE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> FALSE)
 
-State 12: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
+State 5: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
 /\ pendingRaft = { [ kind |-> "UpdateRouting",
     expectedAllocation |-> 0,
     target |-> n3,
@@ -196,7 +164,7 @@ State 12: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
     expectedTerm |-> 0 ] }
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RoutingProposed")
 
-State 13: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+State 6: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ pendingRaft = {}
 /\ applied = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 0)
 /\ routing = [ initialized |-> TRUE,
@@ -256,12 +224,17 @@ State 13: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
-State 14: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
+State 7: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
 /\ epoch = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 
-State 15: <Next line 12, col 8 to line 13, col 51 of module Invariants>
+State 8: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Installing")
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "Recovering")
+
+State 9: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ applied = (n1 :> 0 @@ n2 :> 1 @@ n3 :> 1)
 /\ views = ( n1 :>
       [ initialized |-> TRUE,
@@ -291,15 +264,42 @@ State 15: <Next line 12, col 8 to line 13, col 51 of module Invariants>
         members |-> {n1, n2, n3},
         term |-> 1 ] )
 
+State 10: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "CatchingUp")
+
+State 11: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
+/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RoutingCommitted")
+
+State 12: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Ready")
+
+State 13: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Preparing")
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
+
+State 14: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ exclusiveHolder = (n1 :> n3 @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Finalizing")
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
+
+State 15: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> n1)
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 1)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "AwaitingComplete")
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "Pending")
+
 State 16: <Next line 14, col 8 to line 15, col 29 of module Invariants>
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None" @@ n3 :> "Settling")
+
+State 17: <Next line 14, col 8 to line 15, col 29 of module Invariants>
 /\ installMarker = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> TRUE)
 /\ pendingTerm = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
 /\ pendingAllocation = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ copyMode = (n1 :> "Active" @@ n2 :> "Active" @@ n3 :> "InstallMarker")
-
-State 17: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
-/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "RoutingCommitted")
 
 State 18: <FaultNext line 655, col 5 to line 656, col 32 of module Faults>
 /\ raftVoters = {n1, n2}
@@ -881,7 +881,7 @@ State 28: <Next line 12, col 8 to line 13, col 51 of module Invariants>
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "AllocationProposed")
 /\ writeWait = << >>
 
-598150 states generated, 177762 distinct states found, 27619 states left on queue.
-The depth of the complete state graph search is 28.
+604307 states generated, 184096 distinct states found, 31463 states left on queue.
+The depth of the complete state graph search is 29.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 7 and the 95th percentile is 3).
-Finished in 15s at (2026-09-26 19:36:11)
+Finished in 17s at (2026-09-27 06:27:10)

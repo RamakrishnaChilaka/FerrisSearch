@@ -1,0 +1,358 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 89 and seed -8847651255981980198 with 4 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 4794] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/MC_L1_Bump.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/MC_L1.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/Invariants.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/Faults.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/PeerRecovery.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/ShardReplication.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/RaftLog.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/java/Naturals.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/java/Sequences.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/java/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla-review-b2.YcirCh/java/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RaftLog
+Semantic processing of module ShardReplication
+Semantic processing of module PeerRecovery
+Semantic processing of module Faults
+Semantic processing of module Invariants
+Semantic processing of module MC_L1
+Semantic processing of module MC_L1_Bump
+Starting... (2026-09-26 23:25:21)
+Implied-temporal checking--satisfiability problem has 6 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-26 23:25:21.
+Progress(18) at 2026-09-26 23:25:21: 66 states generated, 44 distinct states found, 0 states left on queue.
+Checking 6 branches of temporal properties for the complete state space with 264 total distinct states at (2026-09-26 23:25:21)
+Error: Temporal properties were violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ pendingRaft = {}
+/\ raftVoters = {n1, n2}
+/\ docValue = (n1 :> (d1 :> 0) @@ n2 :> (d1 :> 0))
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ copyAllocation = (n1 :> 1 @@ n2 :> 1)
+/\ sessionHead = (n1 :> 0 @@ n2 :> 0)
+/\ admissionSafe = TRUE
+/\ nextSeq = (n1 :> 0 @@ n2 :> 0)
+/\ writeKind = << >>
+/\ writeEpoch = << >>
+/\ staleApplySafe = TRUE
+/\ raftLeader = n1
+/\ sessionSourceEpoch = (n1 :> 0 @@ n2 :> 0)
+/\ applied = (n1 :> 0 @@ n2 :> 0)
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 0)
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (n1 :> {} @@ n2 :> {})
+/\ truncBelow = (n1 :> 0 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  replicas |-> {n2},
+  inSync |-> {},
+  initialized |-> TRUE,
+  allocations |-> (n1 :> 1 @@ n2 :> 1),
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 1 ]
+/\ faultsStopped = TRUE
+/\ replicaFence = (n1 :> 1 @@ n2 :> 1)
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ writePrimary = << >>
+/\ writeSeq = << >>
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 0)
+/\ pins = (n1 :> {} @@ n2 :> {})
+/\ epoch = (n1 :> 0 @@ n2 :> 0)
+/\ copyUuid = (n1 :> "INDEX_UUID" @@ n2 :> "INDEX_UUID")
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ copyExists = (n1 :> TRUE @@ n2 :> TRUE)
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeStatus = << >>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ sessionBoundary = (n1 :> 0 @@ n2 :> 0)
+/\ termMonotonic = TRUE
+/\ activated = (n1 :> 1 @@ n2 :> 0)
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ writeRequired = << >>
+/\ sessionFetched = (n1 :> 0 @@ n2 :> 0)
+/\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
+/\ activationPending = (n1 :> 0 @@ n2 :> 0)
+/\ nextWrite = 1
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None")
+/\ recoveryAttempts = 0
+/\ writeTarget = << >>
+/\ committed = (n1 :> 0 @@ n2 :> 0)
+/\ failed = {}
+/\ durableReplicaFence = (n1 :> 1 @@ n2 :> 1)
+/\ ops = (n1 :> {} @@ n2 :> {})
+/\ sessionSnapshot = (n1 :> {} @@ n2 :> {})
+/\ writeTerm = << >>
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 0)
+/\ activePrimaryApplySafe = TRUE
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionCursor = (n1 :> 0 @@ n2 :> 0)
+/\ writeDoc = << >>
+/\ sharedHolders = (n1 :> {} @@ n2 :> {})
+/\ raftLog = <<>>
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        replicas |-> {n2},
+        inSync |-> {},
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] @@
+  n2 :>
+      [ primary |-> n1,
+        replicas |-> {n2},
+        inSync |-> {},
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+/\ alive = (n1 :> TRUE @@ n2 :> TRUE)
+/\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
+/\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle")
+/\ writeWait = << >>
+
+State 2: <L1Start line 20, col 5 to line 21, col 26 of module MC_L1>
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 1)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Starting")
+/\ recoveryAttempts = 1
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 1)
+
+State 3: <L1Snapshot line 24, col 5 to line 27, col 78 of module MC_L1>
+/\ pins = (n1 :> {0} @@ n2 :> {})
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "SnapshotReady")
+
+State 4: <L1BeginInstall line 30, col 5 to line 33, col 78 of module MC_L1>
+/\ installMarker = (n1 :> FALSE @@ n2 :> TRUE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Installing")
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Recovering")
+
+State 5: <L1Install line 36, col 5 to line 38, col 78 of module MC_L1>
+/\ installMarker = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "CatchingUp")
+
+State 6: <L1FinishCatchUp line 53, col 5 to line 56, col 78 of module MC_L1>
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Ready")
+
+State 7: <L1BeginPrepare line 59, col 5 to line 62, col 78 of module MC_L1>
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Preparing")
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> TRUE)
+
+State 8: <L1AcquireBarrier line 65, col 5 to line 68, col 78 of module MC_L1>
+/\ exclusiveHolder = (n1 :> n2 @@ n2 :> "NO_NODE")
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Finalizing")
+/\ sessionFinalizePreparing = (n1 :> FALSE @@ n2 :> FALSE)
+
+State 9: <L1TargetComplete line 77, col 5 to line 80, col 59 of module MC_L1>
+/\ pendingTerm = (n1 :> 0 @@ n2 :> 1)
+/\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
+/\ pendingAllocation = (n1 :> 0 @@ n2 :> 1)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "AwaitingComplete")
+/\ copyMode = (n1 :> "Active" @@ n2 :> "Pending")
+
+State 10: <L1BeginSettlement line 83, col 5 to line 86, col 78 of module MC_L1>
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> TRUE)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "Settling")
+
+State 11: <L1ProposeMark line 89, col 5 to line 92, col 78 of module MC_L1>
+/\ pendingRaft = { [ kind |-> "MarkReplicaInSync",
+    expectedAllocation |-> 1,
+    target |-> n2,
+    actor |-> n1,
+    newReplicas |-> {},
+    newPrimary |-> n1,
+    newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 0 @@ n2 :> 0),
+    expectedPrimary |-> n1,
+    expectedTerm |-> 1 ] }
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> TRUE)
+
+State 12: <L1Deadline line 7, col 5 to line 10, col 78 of module MC_L1_Bump>
+/\ pendingRaft = { [ kind |-> "ActivatePrimary",
+    expectedAllocation |-> 1,
+    target |-> n1,
+    actor |-> n1,
+    newReplicas |-> {},
+    newPrimary |-> n1,
+    newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 0 @@ n2 :> 0),
+    expectedPrimary |-> n1,
+    expectedTerm |-> 1 ],
+  [ kind |-> "MarkReplicaInSync",
+    expectedAllocation |-> 1,
+    target |-> n2,
+    actor |-> n1,
+    newReplicas |-> {},
+    newPrimary |-> n1,
+    newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 0 @@ n2 :> 0),
+    expectedPrimary |-> n1,
+    expectedTerm |-> 1 ] }
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> TRUE)
+
+State 13: <L1Commit line 110, col 5 to line 111, col 74 of module MC_L1>
+/\ pendingRaft = { [ kind |-> "MarkReplicaInSync",
+    expectedAllocation |-> 1,
+    target |-> n2,
+    actor |-> n1,
+    newReplicas |-> {},
+    newPrimary |-> n1,
+    newUnassigned |-> 0,
+    newAllocations |-> (n1 :> 0 @@ n2 :> 0),
+    expectedPrimary |-> n1,
+    expectedTerm |-> 1 ] }
+/\ applied = (n1 :> 1 @@ n2 :> 0)
+/\ routing = [ primary |-> n1,
+  replicas |-> {n2},
+  inSync |-> {},
+  initialized |-> TRUE,
+  allocations |-> (n1 :> 1 @@ n2 :> 1),
+  unassigned |-> 0,
+  members |-> {n1, n2},
+  term |-> 2 ]
+/\ replicaFence = (n1 :> 2 @@ n2 :> 1)
+/\ durableReplicaFence = (n1 :> 2 @@ n2 :> 1)
+/\ raftLog = << [ command |->
+         [ kind |-> "ActivatePrimary",
+           expectedAllocation |-> 1,
+           target |-> n1,
+           actor |-> n1,
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0),
+           expectedPrimary |-> n1,
+           expectedTerm |-> 1 ],
+     state |->
+         [ primary |-> n1,
+           replicas |-> {n2},
+           inSync |-> {},
+           initialized |-> TRUE,
+           allocations |-> (n1 :> 1 @@ n2 :> 1),
+           unassigned |-> 0,
+           members |-> {n1, n2},
+           term |-> 2 ],
+     accepted |-> TRUE ] >>
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        replicas |-> {n2},
+        inSync |-> {},
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 2 ] @@
+  n2 :>
+      [ primary |-> n1,
+        replicas |-> {n2},
+        inSync |-> {},
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 1 ] )
+
+State 14: <L1Commit line 110, col 5 to line 111, col 74 of module MC_L1>
+/\ pendingRaft = {}
+/\ applied = (n1 :> 2 @@ n2 :> 0)
+/\ raftLog = << [ command |->
+         [ kind |-> "ActivatePrimary",
+           expectedAllocation |-> 1,
+           target |-> n1,
+           actor |-> n1,
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0),
+           expectedPrimary |-> n1,
+           expectedTerm |-> 1 ],
+     state |->
+         [ primary |-> n1,
+           replicas |-> {n2},
+           inSync |-> {},
+           initialized |-> TRUE,
+           allocations |-> (n1 :> 1 @@ n2 :> 1),
+           unassigned |-> 0,
+           members |-> {n1, n2},
+           term |-> 2 ],
+     accepted |-> TRUE ],
+   [ command |->
+         [ kind |-> "MarkReplicaInSync",
+           expectedAllocation |-> 1,
+           target |-> n2,
+           actor |-> n1,
+           newReplicas |-> {},
+           newPrimary |-> n1,
+           newUnassigned |-> 0,
+           newAllocations |-> (n1 :> 0 @@ n2 :> 0),
+           expectedPrimary |-> n1,
+           expectedTerm |-> 1 ],
+     state |->
+         [ primary |-> n1,
+           replicas |-> {n2},
+           inSync |-> {},
+           initialized |-> TRUE,
+           allocations |-> (n1 :> 1 @@ n2 :> 1),
+           unassigned |-> 0,
+           members |-> {n1, n2},
+           term |-> 2 ],
+     accepted |-> FALSE ] >>
+
+State 15: <L1ObserveAdmission line 95, col 5 to line 98, col 59 of module MC_L1>
+/\ sessionBumpSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ pins = (n1 :> {} @@ n2 :> {})
+/\ exclusiveHolder = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ sessionMarkSubmitted = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionSource = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
+/\ sessionSettlementRunning = (n1 :> FALSE @@ n2 :> FALSE)
+/\ sessionAllocation = (n1 :> 0 @@ n2 :> 0)
+/\ sessionPhase = (n1 :> "None" @@ n2 :> "None")
+/\ sessionTerm = (n1 :> 0 @@ n2 :> 0)
+
+State 16: <L1DeliverTargetView line 114, col 5 to line 115, col 74 of module MC_L1>
+/\ applied = (n1 :> 2 @@ n2 :> 1)
+/\ views = ( n1 :>
+      [ primary |-> n1,
+        replicas |-> {n2},
+        inSync |-> {},
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 2 ] @@
+  n2 :>
+      [ primary |-> n1,
+        replicas |-> {n2},
+        inSync |-> {},
+        initialized |-> TRUE,
+        allocations |-> (n1 :> 1 @@ n2 :> 1),
+        unassigned |-> 0,
+        members |-> {n1, n2},
+        term |-> 2 ] )
+
+State 17: <L1DeliverTargetView line 114, col 5 to line 115, col 74 of module MC_L1>
+/\ applied = (n1 :> 2 @@ n2 :> 2)
+
+State 18: Stuttering
+Finished checking temporal properties in 00s at 2026-09-26 23:25:21
+66 states generated, 44 distinct states found, 0 states left on queue.
+Finished in 01s at (2026-09-26 23:25:21)

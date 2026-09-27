@@ -71,6 +71,11 @@ benchmark artifacts.
 - For empty-store/copy-failure evidence, state whether the run begins before or
   after first activation, whether a surviving in-sync copy exists, and the
   fairness assumed for failure reporting, allocation, and recovery.
+- Pending-target evidence must distinguish admission, definitive rejection,
+  and later retry convergence. State whether durable marker restoration,
+  deadline bumps, primary reactivation, or promotion is included.
+- Record the monotonic applied-Raft-view assumption. Loss of `raft.db` followed
+  by same-name rejoin is outside the current model.
 - Label model-only fixes, including allocation-ID fencing, as proposed until
   the Rust domain, persistence, transport, and recovery paths implement them.
 - Do not infer timing probability from an untimed TLA+ trace. State only that

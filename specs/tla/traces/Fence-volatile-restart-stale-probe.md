@@ -1,6 +1,6 @@
 # Volatile replica-fence counterexample
 
-**Date:** September 26, 2026
+**Date:** September 27, 2026
 
 **Configuration:** `MC_Fence_volatile.cfg`
 
@@ -8,7 +8,7 @@
 
 **Raw trace:** [`Fence-volatile-restart-stale-probe.log`](Fence-volatile-restart-stale-probe.log)
 
-**Raw trace SHA-256:** `4fbbf36b79a15780756c375a6a13a0ad9cea6d9b4815bfebcb0c2985c13d43c2`
+**Raw trace SHA-256:** `3823d4b7472a2d7acade8fb24c043e6100ca8a7e59d10d7ace39ae9d146b6c79`
 
 | State range | Model action | Rust requirement represented |
 | --- | --- | --- |

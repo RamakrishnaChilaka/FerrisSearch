@@ -1,6 +1,6 @@
 # C1 allocation ABA counterexample: `NoPartialServe`
 
-**Date:** September 26, 2026
+**Date:** September 27, 2026
 
 **Configuration:** `MC_C1_ABA.cfg`
 
@@ -8,7 +8,7 @@
 
 **Raw trace:** [`C1-allocation-aba-no-partial-serve.log`](C1-allocation-aba-no-partial-serve.log)
 
-**Raw trace SHA-256:** `1e551eb6d1419235c5bd9e827174d728ceb50fe18d4e63e59a6fac4626757d7d`
+**Raw trace SHA-256:** `0f769b5c1e4f19b0a9dff58518200b93a288ba208e630ec9d5019e87eb04f81c`
 
 This trace uses three Raft voters. Every committed command has a live leader
 and a live voter majority. Dead-node processing follows the merged

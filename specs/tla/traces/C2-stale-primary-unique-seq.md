@@ -1,6 +1,6 @@
 # C2 stale-primary counterexample: `UniqueAckedSeq`
 
-**Date:** September 26, 2026
+**Date:** September 27, 2026
 
 **Configurations:** `MC_C2_fast.cfg`, `MC_C2_allocation_ids.cfg`
 
@@ -9,9 +9,9 @@
 Raw traces:
 
 - [`C2-stale-primary-unfenced-message.log`](C2-stale-primary-unfenced-message.log),
-  SHA-256 `39e28c4bd0eeee0d6d703d29bab25d8c8e3ab19cf15d639090fbd2b1ae9e506f`
+  SHA-256 `a4d1cfdbc8953d69bee3d5f079833cebf0411662bf417c3608e943c6f52f362f`
 - [`C2-stale-primary-allocation-only-message.log`](C2-stale-primary-allocation-only-message.log),
-  SHA-256 `af2c2c1e1ca402388188bfea9dad619a2b4ff92b58e5fd6000fdc221c3ad5481`
+  SHA-256 `1170e3cef6613bba346b57778aa655d6d78059cad796e8ee9f0c1c87bc3ab4f1`
 
 These current traces stop at `C2RejectsStaleMessage`: the lower-term
 replication request is accepted by the replica validation predicate. The
