@@ -72,11 +72,9 @@ NoLostAllocationReopenedEmpty ==
         /\ routing.allocations[node] = 1
         => ~copyExists[node]
 
-FailedPrimaryPromotesOrStaysRed ==
+FailedPrimaryIsPromoteOnly ==
     /\ diskLost[PrimaryNode]
-    /\ routing.allocations[PrimaryNode] = 0
     => \/ routing.primary # PrimaryNode
-       \/ /\ routing.primary = PrimaryNode
-          /\ routing.inSync = {}
+       \/ routing.allocations[PrimaryNode] > 0
 
 =============================================================================

@@ -39,11 +39,8 @@ PR2StopFaults ==
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
             partitionCount, diskLost, lifecyclePhase>>
 
-PR2ProposeActivation ==
-    /\ ProposeActivate(PrimaryNode)
-    /\ UNCHANGED
-          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            ApplySafetyVars, PeerRecoveryVars, FaultVars>>
+PR2LifecycleActivation ==
+    LifecycleProposeActivation(PrimaryNode)
 
 PR2ObserveActivation ==
     /\ ObserveActivation(PrimaryNode)
@@ -65,7 +62,7 @@ PR2Next ==
     \/ PR2RestartPrimary
     \/ PR2ElectPrimary
     \/ PR2StopFaults
-    \/ PR2ProposeActivation
+    \/ PR2LifecycleActivation
     \/ PR2Commit
     \/ PR2ObserveActivation
 
@@ -86,7 +83,7 @@ PrimaryRestartSpec ==
     /\ WF_vars(PR2RestartPrimary)
     /\ WF_vars(PR2ElectPrimary)
     /\ WF_vars(PR2StopFaults)
-    /\ WF_vars(PR2ProposeActivation)
+    /\ WF_vars(PR2LifecycleActivation)
     /\ WF_vars(PR2Commit)
     /\ WF_vars(PR2ObserveActivation)
     /\ WF_vars(L1ObserveAdmission)

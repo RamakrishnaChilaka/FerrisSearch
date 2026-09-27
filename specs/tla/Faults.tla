@@ -222,8 +222,11 @@ CopyFailureReportRequired(node) ==
     \* retain an old copy until recovery replaces it.  Authoritative copies
     \* and failed installs report; ordinary recovery targets do not churn.
     /\ (authoritative \/ failedInstall)
+    \* Persistent I/O is retryable until the bounded retry/window abstraction
+    \* reaches StorageFailed. Corruption is StorageFailed immediately.
+    /\ copyMode[node] # "StorageRetrying"
 
-\* Proposed node::reconciliation::open_local_assigned_shards failure handling,
+\* node::reconciliation::open_local_assigned_shards failure handling,
 \* TransportService::fail_shard_copy, and
 \* TransportClient::forward_fail_shard_copy.  The request carries the
 \* target-observed allocation ID; ClusterStateMachine::apply_command performs
@@ -249,6 +252,84 @@ ReportShardCopyFailure(node) ==
             promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
             crashCount, partitionCount, diskLost, faultsStopped,
             lifecyclePhase, PeerRecoveryVars>>
+
+\* node::reconciliation storage-open classification. Corrupt manifest, frame,
+\* Tantivy metadata/segments, or marker decoding is definitive immediately.
+CorruptShardStorage(node) ==
+    /\ FaultMode = "S1"
+    /\ alive[node]
+    /\ copyExists[node]
+    /\ copyMode[node] = "Active"
+    /\ copyExists' = [copyExists EXCEPT ![node] = FALSE]
+    /\ copyMode' = [copyMode EXCEPT ![node] = "StorageFailed"]
+    /\ ops' = [ops EXCEPT ![node] = {}]
+    /\ durableOps' = [durableOps EXCEPT ![node] = {}]
+    /\ docValue' =
+          [docValue EXCEPT ![node] = [doc \in Docs |-> NoWrite]]
+    /\ nextSeq' = [nextSeq EXCEPT ![node] = 0]
+    /\ committed' = [committed EXCEPT ![node] = 0]
+    /\ truncBelow' = [truncBelow EXCEPT ![node] = 0]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, pins, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            FaultVars, PeerRecoveryVars>>
+
+\* A persistent EIO/open failure first enters bounded retry/backoff. The model
+\* abstracts the retry counter and time window as a separate escalation step.
+BeginPersistentStorageFailure(node) ==
+    /\ FaultMode = "S1"
+    /\ alive[node]
+    /\ copyExists[node]
+    /\ copyMode[node] = "Active"
+    /\ copyExists' = [copyExists EXCEPT ![node] = FALSE]
+    /\ copyMode' = [copyMode EXCEPT ![node] = "StorageRetrying"]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            FaultVars, PeerRecoveryVars>>
+
+EscalatePersistentStorageFailure(node) ==
+    /\ FaultMode = "S1"
+    /\ alive[node]
+    /\ copyMode[node] = "StorageRetrying"
+    /\ copyMode' = [copyMode EXCEPT ![node] = "StorageFailed"]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            FaultVars, PeerRecoveryVars>>
+
+\* src/node/mod.rs lifecycle reconciliation proactively invokes
+\* ensure_primary_activated for every local primary whose incarnation-local
+\* activation record does not match its applied routing term.
+LifecycleActivationNeeded(node) ==
+    /\ node \in Nodes
+    /\ alive[node]
+    /\ views[node].primary = node
+    /\ activated[node] # views[node].term
+
+LifecycleProposeActivation(node) ==
+    /\ LifecycleActivationNeeded(node)
+    /\ ProposeActivate(node)
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            ApplySafetyVars, PeerRecoveryVars, FaultVars>>
 
 \* openraft leader election abstraction.  Election details are delegated to
 \* openraft; the model elects one connected live voter only after the previous
@@ -586,6 +667,7 @@ OpenAssignedEmptyCopy(node) ==
     /\ node \in Nodes
     /\ alive[node]
     /\ ~copyExists[node]
+    /\ copyMode[node] \notin {"StorageRetrying", "StorageFailed"}
     /\ IF AllocationIds
           THEN /\ assigned
                /\ initialCreateIndexAllocation
@@ -647,6 +729,10 @@ FaultCoreNext ==
     \/ \E target \in Nodes : ObserveAllocationAccepted(target)
     \/ \E target \in Nodes : ObserveAllocationRejected(target)
     \/ \E node \in Nodes : ReportShardCopyFailure(node)
+    \/ \E node \in Nodes : CorruptShardStorage(node)
+    \/ \E node \in Nodes : BeginPersistentStorageFailure(node)
+    \/ \E node \in Nodes : EscalatePersistentStorageFailure(node)
+    \/ \E node \in Nodes : LifecycleProposeActivation(node)
     \/ \E node \in Nodes : Flush(node)
     \/ \E node \in Nodes : DiskLoss(node)
     \/ \E node \in Nodes : OpenAssignedEmptyCopy(node)

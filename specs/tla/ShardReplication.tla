@@ -33,7 +33,9 @@ DefaultDoc == CHOOSE d \in Docs : TRUE
 WriteStatuses == {"Unused", "Routed", "Replicating", "Acked", "Failed"}
 AllWriteKinds == {"Put", "Delete"}
 WriteKinds == AllowedWriteKinds
-CopyModes == {"Active", "Recovering", "Pending", "InstallMarker"}
+CopyModes ==
+    {"Active", "Recovering", "Pending", "InstallMarker",
+     "StorageRetrying", "StorageFailed"}
 MessageKinds == {"Replicate", "ReplicaAck", "ReplicaNack"}
 IndexUuid == "INDEX_UUID"
 NoIndexUuid == "NO_INDEX_UUID"
@@ -169,7 +171,8 @@ WriteMessages(writeId) ==
     {m \in messages : m.write = writeId}
 
 BlocksLiveReplication(node) ==
-    copyMode[node] \in {"Recovering", "InstallMarker"}
+    copyMode[node] \in
+        {"Recovering", "InstallMarker", "StorageRetrying", "StorageFailed"}
 
 CopyAssignmentValid(node) ==
     \/ ~AllocationIds
@@ -723,8 +726,8 @@ FailShardCopyAccepted(current, command) ==
        current.allocations[command.target]
     /\ current.unassigned < Cardinality(Nodes)
     /\ IF command.target = current.primary
-          /\ SurvivingInSync(current, command.target) # {}
-       THEN current.term < MaxTerm
+       THEN /\ SurvivingInSync(current, command.target) # {}
+            /\ current.term < MaxTerm
        ELSE TRUE
 
 AfterFailShardCopy(current, failedNode) ==

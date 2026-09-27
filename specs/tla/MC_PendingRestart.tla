@@ -64,9 +64,6 @@ PRRestorePending ==
 
 PRCommitFixed ==
     /\ RestorePendingOnRestart
-    /\ alive[TargetNode]
-    /\ epoch[TargetNode] = 1
-    /\ copyMode[TargetNode] = "Pending"
     /\ L1Commit
 
 PRLegacyWipeAndDelayedAdmission ==

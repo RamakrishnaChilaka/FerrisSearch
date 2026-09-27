@@ -78,15 +78,19 @@ default_configs=(
     g1-empty-store
     g2-replica
     g2-primary
-    g2-primary-red
+    g2-primary-no-replica
     g2-liveness
     pending-restart-legacy
     pending-restart-fixed
     l1
     l1-bump
-    l2-primary-restart
+    l2-primary-no-trigger
+    l2-primary-idle
     l2-promotion
     l2
+    storage-replica
+    storage-primary
+    storage-primary-no-replica
     two-shard
 )
 
@@ -114,15 +118,20 @@ c4                      expected NoAckedLoss violation: asynchronous durability
 g1-empty-store          pass: pre-activation empty-store disk loss is harmless
 g2-replica              pass: in-sync replica disk loss and copy failure
 g2-primary              pass: primary disk loss promotes an in-sync replica
-g2-primary-red          pass: primary disk loss without a survivor stays red
+g2-primary-no-replica   pass: no-survivor primary failure report is rejected
 g2-liveness             pass: fair failure report, stale rejection, and recovery
 pending-restart-legacy  expected NoPartialServe: pending marker ignored on restart
 pending-restart-fixed   pass: matching pending marker is restored before recovery
 l1                      pass: fair fault-free recovery liveness
 l1-bump                 pass: settlement deadline resolves pending target
-l2-primary-restart      pass: pending target resolves after primary reactivation
+l2-primary-no-trigger   expected temporal failure without lifecycle activation
+l2-primary-idle         pass: lifecycle activation resolves idle pending target
+l2-primary-restart      alias: lifecycle activation resolves idle pending target
 l2-promotion            pass: pending target resolves after another replica promotes
 l2                      pass: fair recovery after one crash and restart
+storage-replica         pass: persistent replica storage failure is removed
+storage-primary         pass: persistent primary storage failure promotes
+storage-primary-no-replica pass: promote-only primary report is rejected
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -227,9 +236,9 @@ run_config() {
             cfg="MC_G2_Primary.cfg"
             expected="pass"
             ;;
-        g2-primary-red|MC_G2_PrimaryRed)
+        g2-primary-no-replica|g2-primary-red|MC_G2_PrimaryNoReplica|MC_G2_PrimaryRed)
             module="MC_G2_CopyFailure.tla"
-            cfg="MC_G2_PrimaryRed.cfg"
+            cfg="MC_G2_PrimaryNoReplica.cfg"
             expected="pass"
             ;;
         g2-liveness|MC_G2_Liveness)
@@ -257,9 +266,19 @@ run_config() {
             cfg="MC_L1_Bump.cfg"
             expected="pass"
             ;;
+        l2-primary-no-trigger|MC_L2_PrimaryRestart_NoTrigger)
+            module="MC_L2_PrimaryRestart_NoTrigger.tla"
+            cfg="MC_L2_PrimaryRestart_NoTrigger.cfg"
+            expected="temporal"
+            ;;
         l2-primary-restart|MC_L2_PrimaryRestart)
             module="MC_L2_PrimaryRestart.tla"
             cfg="MC_L2_PrimaryRestart.cfg"
+            expected="pass"
+            ;;
+        l2-primary-idle|MC_L2_PrimaryRestart_IdleShard)
+            module="MC_L2_PrimaryRestart_IdleShard.tla"
+            cfg="MC_L2_PrimaryRestart_IdleShard.cfg"
             expected="pass"
             ;;
         l2-promotion|MC_L2_Promotion)
@@ -270,6 +289,21 @@ run_config() {
         l2|MC_L2)
             module="MC_L2.tla"
             cfg="MC_L2.cfg"
+            expected="pass"
+            ;;
+        storage-replica|MC_StorageReplica)
+            module="MC_StorageFailure.tla"
+            cfg="MC_StorageReplica.cfg"
+            expected="pass"
+            ;;
+        storage-primary|MC_StoragePrimary)
+            module="MC_StorageFailure.tla"
+            cfg="MC_StoragePrimary.cfg"
+            expected="pass"
+            ;;
+        storage-primary-no-replica|MC_StoragePrimaryNoReplica)
+            module="MC_StorageFailure.tla"
+            cfg="MC_StoragePrimaryNoReplica.cfg"
             expected="pass"
             ;;
         two-shard|MC_TwoShardIsolation)
@@ -356,6 +390,12 @@ run_config() {
             grep -Fq "Error:" "$log" ||
             ! grep -Fq "Finished in " "$log"; then
             echo "TLA+ configuration '$name' was expected to pass" >&2
+            return 1
+        fi
+    elif [[ "$expected" == "temporal" ]]; then
+        if [[ $status -eq 0 ]] ||
+            ! grep -Fq "Error: Temporal properties were violated." "$log"; then
+            echo "TLA+ configuration '$name' must retain its expected temporal violation" >&2
             return 1
         fi
     else
