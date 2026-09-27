@@ -205,6 +205,11 @@ cargo test -- test_name                         # Single test by name
   rejection, throttled definitive quarantine, no Apply-level quarantine or
   runtime WAL replay, readable failed-writer copies, and escalation of a
   force-merge replacement failure through the Apply key.
+- Round-5 allocation/fencing regressions cover a one-shot force-merge
+  replacement failure rebuilding successfully on the next write, persistent
+  rebuild failure remaining reportable under the Apply budget, and successful
+  write responses remaining independent of a blocked or slow
+  `MarkPrimaryAvailable` report.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

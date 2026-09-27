@@ -212,7 +212,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   idempotent for the same UUID/shard/allocation/term. The unavailable flag alone
   does not bypass that cache. A repaired quarantined open-level failure forces a
   fresh activation; a successful local write after an Apply-level failure
-  proposes throttled best-effort `MarkPrimaryAvailable` without a term bump.
+  spawns throttled best-effort `MarkPrimaryAvailable` reporting without a term
+  bump. The already-successful write response must not wait for Raft leadership
+  discovery, forwarding, or the transport timeout of that status-only report.
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.

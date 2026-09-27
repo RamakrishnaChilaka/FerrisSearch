@@ -220,8 +220,12 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > fresh `ActivatePrimary`, which clears the flag while advancing the term.
 > Apply-level escalation keeps the existing engine open for reads and does not
 > replay a WAL-appended but engine-failed operation at runtime. A force-merge
-> writer-replacement failure leaves a typed unavailable-writer state whose
-> later writes consume the Apply retry budget.
+> writer-replacement failure leaves a typed unavailable-writer state. The next
+> write tries once to rebuild the writer with the normal heap budget and
+> automatic merge policy before adding a new WAL entry; transient failure can
+> heal there, while persistent rebuild I/O consumes the Apply retry budget.
+> Status-only `MarkPrimaryAvailable` reporting runs in the background so leader
+> discovery or forwarding cannot delay an already-successful write response.
 >
 > Candidate selection requires a live, in-sync cluster member. A leader that
 > also hosts the primary prefers the highest replica checkpoint it has

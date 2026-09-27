@@ -144,10 +144,12 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   a lock needed by merge completion, and restores the prior automatic policy on
   success or failure. Refresh and flush share the same shard-local maintenance
   lock so they cannot invalidate the requested final segment bound.
-- If force merge cannot replace the drained writer, later write attempts return
-  a typed local writer-unavailable error. Primary and replica write handlers
-  account that error under the shard Apply retry key rather than treating it as
-  an unclassified application error.
+- If force merge cannot replace the drained writer, the next document write
+  attempts one writer rebuild before appending a new WAL operation, using the
+  normal writer heap budget and automatic merge policy. A transient replacement
+  failure can therefore heal on that write. Rebuild I/O failures retain typed
+  causes, and primary/replica handlers account persistent failures under the
+  shard Apply retry key.
 - Background refresh/commit failures are currently logged only. A fault
   confined to the Tantivy index directory can leave acknowledged WAL-backed
   writes invisible to search on that copy until a later successful commit or

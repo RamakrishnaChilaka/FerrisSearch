@@ -61,11 +61,13 @@ pub struct ShardManager {
   window before persistent-I/O escalation.
 - Retry state is keyed by operation. Apply-level WAL/fsync/engine failures,
   including a writer left unavailable by failed force-merge replacement, use
-  the Apply key. Successful Apply clears that key. Apply escalation does not
-  quarantine or reopen the copy; reads remain available and failed post-WAL
-  mutations are replayed only by restart recovery. Definitive and open-level
-  failures may quarantine, but only after the report throttle admits the
-  attempt.
+  the Apply key. A write first attempts one failed-writer rebuild before adding
+  a new WAL entry; transient replacement failure can self-heal, while persistent
+  rebuild I/O consumes the same Apply budget. Successful Apply clears that key.
+  Apply escalation does not quarantine or reopen the copy; reads remain
+  available and failed post-WAL mutations are replayed only by restart recovery.
+  Definitive and open-level failures may quarantine, but only after the report
+  throttle admits the attempt.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.
