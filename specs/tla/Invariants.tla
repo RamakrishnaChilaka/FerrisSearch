@@ -107,6 +107,12 @@ NoPartialServe ==
             /\ node \notin routing.inSync
             /\ BlocksLiveReplication(node)
 
+PendingMarkerProtectsCopy ==
+    RestorePendingOnRestart =>
+        \A node \in Nodes :
+            PendingMarkerMatchesCopy(node) =>
+                copyMode[node] # "Recovering"
+
 NoApplyBelowObservedFence == staleApplySafe
 
 ActivePrimaryRejectsOldTerm == activePrimaryApplySafe
@@ -119,12 +125,19 @@ BarrierReleased ==
 RecoveryConverges ==
     \A node \in Nodes :
         (node \in routing.replicas)
-        ~> (node \in routing.inSync \/ node = routing.primary)
+        ~> (node \in routing.inSync
+            \/ node = routing.primary
+            \/ copyMode[node] = "InstallMarker")
 
 PendingResolves ==
     \A node \in Nodes :
         (copyMode[node] = "Pending")
         ~> (copyMode[node] # "Pending")
+
+PendingMarkerResolves ==
+    \A node \in Nodes :
+        PendingMarkerPresent(node)
+        ~> ~PendingMarkerPresent(node)
 
 SafetyConstraint ==
     /\ Len(raftLog) <= MaxRaftEntries

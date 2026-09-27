@@ -8,7 +8,7 @@
 
 EXTENDS ShardReplication
 
-CONSTANT MaxRecoveries
+CONSTANTS MaxRecoveries, RestorePendingOnRestart
 
 SessionPhases ==
     {"None", "Starting", "SetupFailed", "SnapshotReady", "Installing",
@@ -66,6 +66,22 @@ PeerRecoveryInit ==
     /\ pendingTerm = [n \in Nodes |-> NoTerm]
     /\ pendingAllocation = [n \in Nodes |-> 0]
     /\ authoritativeWipeSafe = TRUE
+
+PendingMarkerPresent(target) ==
+    pendingAllocation[target] > 0
+
+\* The one-shard model has one fixed IndexUuid, so UUID matching is represented
+\* by the durable local copy UUID equaling IndexUuid.  Allocation matching is
+\* explicit against both durable copy identity and the target's applied view.
+PendingMarkerMatchesCopy(target) ==
+    /\ PendingMarkerPresent(target)
+    /\ copyExists[target]
+    /\ copyUuid[target] = IndexUuid
+    /\ copyAllocation[target] = pendingAllocation[target]
+
+PendingMarkerMatchesView(target) ==
+    /\ PendingMarkerMatchesCopy(target)
+    /\ views[target].allocations[target] = pendingAllocation[target]
 
 ActiveRecoveryTargets ==
     {target \in Nodes : sessionPhase[target] # "None"}
@@ -143,6 +159,8 @@ CrashRecoveryState(node) ==
           [target \in Nodes |->
               IF target \in cleared /\ copyMode[target] = "Recovering"
               THEN "InstallMarker"
+              ELSE IF target = node /\ copyMode[target] = "Pending"
+              THEN "Active"
               ELSE copyMode[target]]
     /\ installMarker' =
           [target \in Nodes |->
@@ -217,7 +235,9 @@ TargetObservation(target) ==
           [] /\ target \in local.inSync
              /\ allocationMatches -> "Admitted"
           [] \/ local.allocations[target] = 0
-             \/ ~allocationMatches -> "Rejected"
+             \/ ~allocationMatches
+             \/ local.term > pendingTerm[target]
+             \/ local.primary # pendingPrimary[target] -> "Rejected"
           [] OTHER -> "Unknown"
     ELSE
         CASE target = local.primary \/ target \in local.inSync -> "Admitted"
@@ -269,6 +289,9 @@ StartRecovery(target, source) ==
     /\ views[source].term = activated[source]
     /\ target \in views[source].replicas
     /\ target \notin views[source].inSync
+    /\ IF RestorePendingOnRestart
+          THEN ~PendingMarkerMatchesCopy(target)
+          ELSE TRUE
     \* Allocation-aware StartPeerRecovery carries the target-observed ID.
     \* The source rejects a stale request until both views name the same
     \* current assignment, after which the target retries.
@@ -357,6 +380,9 @@ TargetBeginInstall(target) ==
     /\ sessionPhase[target] = "SnapshotReady"
     /\ alive[target]
     /\ copyMode[target] # "Pending"
+    /\ IF RestorePendingOnRestart
+          THEN ~PendingMarkerMatchesCopy(target)
+          ELSE TRUE
     /\ sessionPhase' = [sessionPhase EXCEPT ![target] = "Installing"]
     /\ copyMode' = [copyMode EXCEPT ![target] = "Recovering"]
     /\ installMarker' = [installMarker EXCEPT ![target] = TRUE]
@@ -620,6 +646,34 @@ TargetComplete(target) ==
             sessionSettlementRunning, sessionBumpSubmitted,
             authoritativeWipeSafe>>
 
+\* node::reconciliation::open_local_assigned_shards calls
+\* ShardManager::open_assigned_shard_with_settings, which reloads the durable
+\* awaiting-membership marker. The runtime registration is restored only when
+\* UUID and allocation match.
+RestorePendingMarker(target) ==
+    /\ RestorePendingOnRestart
+    /\ alive[target]
+    /\ copyMode[target] # "Pending"
+    /\ PendingMarkerMatchesView(target)
+    /\ pendingPrimary[target] \in Nodes
+    /\ pendingTerm[target] > NoTerm
+    /\ copyMode' = [copyMode EXCEPT ![target] = "Pending"]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, termMonotonic,
+            recoveryAttempts, sessionPhase, sessionSource,
+            sessionSourceEpoch, sessionTerm, sessionAllocation,
+            sessionBoundary, sessionCursor, sessionHead, sessionSnapshot,
+            sessionFetched, sessionFinalizePreparing, sessionMarkSubmitted,
+            sessionSettlementRunning, sessionBumpSubmitted, pendingPrimary,
+            pendingTerm, pendingAllocation, authoritativeWipeSafe>>
+
 \* src/transport/server/peer_recovery.rs::
 \* complete_finalize_recovery_inner starts the settlement task.
 BeginSettlement(target) ==
@@ -855,6 +909,7 @@ ExpireFinalizeWithoutMark(target) ==
 
 PeerRecoveryTypeOK ==
     /\ recoveryAttempts \in 0..MaxRecoveries
+    /\ RestorePendingOnRestart \in BOOLEAN
     /\ sessionPhase \in [Nodes -> SessionPhases]
     /\ sessionSource \in [Nodes -> Nodes \cup {NoNode}]
     /\ sessionSourceEpoch \in [Nodes -> Nat]
@@ -940,6 +995,7 @@ PeerRecoveryCoreNext ==
            /\ UNCHANGED
                  <<copyAllocation, copyUuid, replicaFence,
                    durableReplicaFence, sessionAllocation>>
+    \/ \E target \in Nodes : RestorePendingMarker(target)
     \/ \E target \in Nodes :
            /\ BeginSettlement(target)
            /\ UNCHANGED

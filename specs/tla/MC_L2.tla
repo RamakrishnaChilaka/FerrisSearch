@@ -29,11 +29,16 @@ L2StopFaults ==
           <<RaftVars, ReplicationVars, PeerRecoveryVars, crashCount,
             partitionCount, diskLost, lifecyclePhase>>
 
+L2RestorePending ==
+    /\ RestorePendingMarker(TargetNode)
+    /\ UNCHANGED <<ApplySafetyVars, FaultVars>>
+
 L2Next ==
     \/ L1Next
     \/ L2Crash
     \/ L2Restart
     \/ L2StopFaults
+    \/ L2RestorePending
 
 CrashLivenessSpec ==
     /\ L2Init
@@ -41,6 +46,7 @@ CrashLivenessSpec ==
     /\ WF_vars(L2Crash)
     /\ WF_vars(L2Restart)
     /\ WF_vars(L2StopFaults)
+    /\ WF_vars(L2RestorePending)
     /\ WF_vars(L1Start)
     /\ WF_vars(L1Snapshot)
     /\ WF_vars(L1BeginInstall)
@@ -55,5 +61,6 @@ CrashLivenessSpec ==
     /\ WF_vars(L1ObserveAdmission)
     /\ WF_vars(L1DeliverTargetView)
     /\ WF_vars(L1TargetAdmitted)
+    /\ WF_vars(L1TargetRejected)
 
 =============================================================================

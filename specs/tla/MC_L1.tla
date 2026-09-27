@@ -103,6 +103,12 @@ L1TargetAdmitted ==
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
             ApplySafetyVars, sessionAllocation, FaultVars>>
 
+L1TargetRejected ==
+    /\ TargetObserveRejected(TargetNode)
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            ApplySafetyVars, sessionAllocation, FaultVars>>
+
 CommitPending ==
     \E command \in pendingRaft : CommitRaft(command)
 
@@ -114,7 +120,7 @@ L1DeliverTargetView ==
     /\ DeliverView(TargetNode)
     /\ UNCHANGED <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
 
-L1CoreNext ==
+L1RecoveryNext ==
     \/ L1Start
     \/ L1Snapshot
     \/ L1BeginInstall
@@ -128,10 +134,14 @@ L1CoreNext ==
     \/ L1TargetComplete
     \/ L1BeginSettlement
     \/ L1ProposeMark
-    \/ L1Commit
     \/ L1ObserveAdmission
     \/ L1DeliverTargetView
     \/ L1TargetAdmitted
+    \/ L1TargetRejected
+
+L1CoreNext ==
+    \/ L1RecoveryNext
+    \/ L1Commit
 
 L1Next == L1CoreNext
 
@@ -152,5 +162,6 @@ LivenessSpec ==
     /\ WF_vars(L1ObserveAdmission)
     /\ WF_vars(L1DeliverTargetView)
     /\ WF_vars(L1TargetAdmitted)
+    /\ WF_vars(L1TargetRejected)
 
 =============================================================================

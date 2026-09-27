@@ -80,8 +80,14 @@ default_configs=(
     g2-primary
     g2-primary-red
     g2-liveness
+    pending-restart-legacy
+    pending-restart-fixed
     l1
+    l1-bump
+    l2-primary-restart
+    l2-promotion
     l2
+    two-shard
 )
 
 all_configs=(
@@ -110,8 +116,14 @@ g2-replica              pass: in-sync replica disk loss and copy failure
 g2-primary              pass: primary disk loss promotes an in-sync replica
 g2-primary-red          pass: primary disk loss without a survivor stays red
 g2-liveness             pass: fair failure report, stale rejection, and recovery
+pending-restart-legacy  expected NoPartialServe: pending marker ignored on restart
+pending-restart-fixed   pass: matching pending marker is restored before recovery
 l1                      pass: fair fault-free recovery liveness
+l1-bump                 pass: settlement deadline resolves pending target
+l2-primary-restart      pass: pending target resolves after primary reactivation
+l2-promotion            pass: pending target resolves after another replica promotes
 l2                      pass: fair recovery after one crash and restart
+two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
 fixed-simulation        pass: seeded depth-80 simulation of larger fixed bounds
@@ -225,14 +237,44 @@ run_config() {
             cfg="MC_G2_Liveness.cfg"
             expected="pass"
             ;;
+        pending-restart-legacy|MC_PendingRestart_legacy)
+            module="MC_PendingRestart.tla"
+            cfg="MC_PendingRestart_legacy.cfg"
+            expected="NoPartialServe"
+            ;;
+        pending-restart-fixed|MC_PendingRestart_fixed)
+            module="MC_PendingRestart.tla"
+            cfg="MC_PendingRestart_fixed.cfg"
+            expected="pass"
+            ;;
         l1|MC_L1)
             module="MC_L1.tla"
             cfg="MC_L1.cfg"
             expected="pass"
             ;;
+        l1-bump|MC_L1_Bump)
+            module="MC_L1_Bump.tla"
+            cfg="MC_L1_Bump.cfg"
+            expected="pass"
+            ;;
+        l2-primary-restart|MC_L2_PrimaryRestart)
+            module="MC_L2_PrimaryRestart.tla"
+            cfg="MC_L2_PrimaryRestart.cfg"
+            expected="pass"
+            ;;
+        l2-promotion|MC_L2_Promotion)
+            module="MC_L2_Promotion.tla"
+            cfg="MC_L2_Promotion.cfg"
+            expected="pass"
+            ;;
         l2|MC_L2)
             module="MC_L2.tla"
             cfg="MC_L2.cfg"
+            expected="pass"
+            ;;
+        two-shard|MC_TwoShardIsolation)
+            module="MC_TwoShardIsolation.tla"
+            cfg="MC_TwoShardIsolation.cfg"
             expected="pass"
             ;;
         fixed-crash|MC_Fixed_Crash)
