@@ -1663,14 +1663,26 @@ impl InternalTransport for TransportService {
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
-            Err(e) => Ok(Response::new(ReplicateDocResponse {
-                success: false,
-                error: e.to_string(),
-                local_checkpoint: self
-                    .shard_manager
-                    .get_shard(&req.index_name, req.shard_id)
-                    .map_or(0, |engine| engine.local_checkpoint()),
-            })),
+            Err(e) => {
+                if assigned_authoritative {
+                    self.report_local_copy_failure(
+                        &req.index_name,
+                        &assigned_uuid,
+                        req.shard_id,
+                        allocation_id,
+                        &e,
+                    )
+                    .await;
+                }
+                Ok(Response::new(ReplicateDocResponse {
+                    success: false,
+                    error: e.to_string(),
+                    local_checkpoint: self
+                        .shard_manager
+                        .get_shard(&req.index_name, req.shard_id)
+                        .map_or(0, |engine| engine.local_checkpoint()),
+                }))
+            }
         }
     }
 
@@ -1835,14 +1847,26 @@ impl InternalTransport for TransportService {
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
-            Err(e) => Ok(Response::new(ReplicateBulkResponse {
-                success: false,
-                error: e.to_string(),
-                local_checkpoint: self
-                    .shard_manager
-                    .get_shard(&req.index_name, req.shard_id)
-                    .map_or(0, |engine| engine.local_checkpoint()),
-            })),
+            Err(e) => {
+                if assigned_authoritative {
+                    self.report_local_copy_failure(
+                        &req.index_name,
+                        &assigned_uuid,
+                        req.shard_id,
+                        allocation_id,
+                        &e,
+                    )
+                    .await;
+                }
+                Ok(Response::new(ReplicateBulkResponse {
+                    success: false,
+                    error: e.to_string(),
+                    local_checkpoint: self
+                        .shard_manager
+                        .get_shard(&req.index_name, req.shard_id)
+                        .map_or(0, |engine| engine.local_checkpoint()),
+                }))
+            }
         }
     }
 
@@ -2220,6 +2244,7 @@ impl InternalTransport for TransportService {
                 shard_id: req.shard_id,
                 node: req.node_id,
                 allocation_id,
+                promote_only: req.promote_only,
             })
             .await
             .map_err(|error| Status::internal(format!("Raft FailShardCopy failed: {error}")))?;
@@ -2987,7 +3012,7 @@ impl TransportService {
         allocation_id: u64,
         error: &anyhow::Error,
     ) {
-        if !ShardManager::is_definitive_copy_failure(error) {
+        if !ShardManager::should_report_copy_failure(error) {
             tracing::warn!(
                 index = index_name,
                 shard_id,
@@ -2997,6 +3022,27 @@ impl TransportService {
             );
             return;
         }
+        let current = self.cluster_manager.get_state();
+        let Some(metadata) = current.indices.get(index_name) else {
+            return;
+        };
+        let Some(routing) = metadata.shard_routing.get(&shard_id) else {
+            return;
+        };
+        if metadata.uuid.as_str() != index_uuid
+            || !current.primary_initialized(index_name, shard_id)
+            || current.shard_allocation_id(index_name, shard_id, &self.local_node_id)
+                != Some(allocation_id)
+        {
+            tracing::debug!(
+                index = index_name,
+                shard_id,
+                allocation_id,
+                "Skipping stale or uninitialized local shard-copy failure report"
+            );
+            return;
+        }
+        let promote_only = routing.primary == self.local_node_id;
         if let Err(quarantine_error) = self
             .shard_manager
             .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
@@ -3009,20 +3055,12 @@ impl TransportService {
                 "Failed to quarantine invalid local shard copy"
             );
         }
-        let current = self.cluster_manager.get_state();
-        let report_is_current = current
-            .indices
-            .get(index_name)
-            .is_some_and(|metadata| metadata.uuid.as_str() == index_uuid)
-            && current.primary_initialized(index_name, shard_id)
-            && current.shard_allocation_id(index_name, shard_id, &self.local_node_id)
-                == Some(allocation_id);
-        if !report_is_current {
-            tracing::debug!(
+        if promote_only && routing.in_sync_replicas.is_empty() {
+            tracing::warn!(
                 index = index_name,
                 shard_id,
                 allocation_id,
-                "Skipping stale or uninitialized local shard-copy failure report"
+                "Keeping failed primary routing unchanged because no in-sync promotion candidate exists"
             );
             return;
         }
@@ -3062,6 +3100,7 @@ impl TransportService {
                     shard_id,
                     node: self.local_node_id.clone(),
                     allocation_id,
+                    promote_only,
                 },
             )
             .await
@@ -3096,6 +3135,7 @@ impl TransportService {
                         shard_id,
                         node_id: self.local_node_id.clone(),
                         allocation_id: Some(allocation_id),
+                        promote_only,
                     },
                 )
                 .await
@@ -3152,6 +3192,16 @@ impl TransportService {
             ),
             authoritative: true,
         })
+    }
+
+    pub(crate) async fn activate_primary_for_lifecycle(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Result<(), String> {
+        self.ensure_primary_activated(index_name, shard_id)
+            .await
+            .map(|_| ())
     }
 
     async fn ensure_primary_activated(
@@ -4030,6 +4080,27 @@ pub fn create_transport_service_with_raft_and_storage(
     remote_store_resources: RemoteStoreTransportResources,
     local_node_id: String,
 ) -> InternalTransportServer<TransportService> {
+    create_transport_service_with_raft_and_storage_handle(
+        cluster_manager,
+        shard_manager,
+        transport_client,
+        raft,
+        task_manager,
+        remote_store_resources,
+        local_node_id,
+    )
+    .0
+}
+
+pub(crate) fn create_transport_service_with_raft_and_storage_handle(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    transport_client: crate::transport::TransportClient,
+    raft: Arc<RaftInstance>,
+    task_manager: Arc<crate::tasks::TaskManager>,
+    remote_store_resources: RemoteStoreTransportResources,
+    local_node_id: String,
+) -> (InternalTransportServer<TransportService>, TransportService) {
     let peer_recovery_state = peer_recovery::new_peer_recovery_transport_state();
     shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
     let service = TransportService {
@@ -4047,9 +4118,13 @@ pub fn create_transport_service_with_raft_and_storage(
         join_lock: new_join_lock(),
     };
     peer_recovery::start_peer_recovery_reaper(service.clone());
-    InternalTransportServer::new(service)
-        .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+    let handle = service.clone();
+    (
+        InternalTransportServer::new(service)
+            .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE),
+        handle,
+    )
 }
 
 #[cfg(test)]

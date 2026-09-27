@@ -10,6 +10,7 @@ pub(super) struct ShardCopyFailure {
     pub shard_id: u32,
     pub node_id: String,
     pub allocation_id: u64,
+    pub promote_only: bool,
     pub reason: String,
 }
 
@@ -308,6 +309,19 @@ pub(super) fn open_local_assigned_shards(
                             allocation_id,
                             error
                         );
+                        if state.primary_initialized(index_name, *shard_id)
+                            && ShardManager::should_report_copy_failure(&error)
+                        {
+                            failures.push(ShardCopyFailure {
+                                index_name: index_name.clone(),
+                                index_uuid: metadata.uuid.to_string(),
+                                shard_id: *shard_id,
+                                node_id: local_node_id.to_string(),
+                                allocation_id,
+                                promote_only: false,
+                                reason: error.to_string(),
+                            });
+                        }
                         continue;
                     }
                 }
@@ -324,17 +338,31 @@ pub(super) fn open_local_assigned_shards(
                             shard_id: *shard_id,
                             node_id: local_node_id.to_string(),
                             allocation_id,
+                            promote_only: false,
                             reason: "peer recovery install marker remains after target failure"
                                 .to_string(),
                         }),
                         Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            "Unable to classify peer recovery install marker for {}/{} allocation {}: {}",
-                            index_name,
-                            shard_id,
-                            allocation_id,
-                            error
-                        ),
+                        Err(error) => {
+                            tracing::warn!(
+                                "Unable to classify peer recovery install marker for {}/{} allocation {}: {}",
+                                index_name,
+                                shard_id,
+                                allocation_id,
+                                error
+                            );
+                            if ShardManager::should_report_copy_failure(&error) {
+                                failures.push(ShardCopyFailure {
+                                    index_name: index_name.clone(),
+                                    index_uuid: metadata.uuid.to_string(),
+                                    shard_id: *shard_id,
+                                    node_id: local_node_id.to_string(),
+                                    allocation_id,
+                                    promote_only: false,
+                                    reason: error.to_string(),
+                                });
+                            }
+                        }
                     }
                 }
                 continue;
@@ -346,7 +374,7 @@ pub(super) fn open_local_assigned_shards(
                     metadata.uuid.as_str(),
                     allocation_id,
                 ) {
-                    if ShardManager::is_definitive_copy_failure(&error) {
+                    if ShardManager::should_report_copy_failure(&error) {
                         shard_manager.quarantine_shard_copy(index_name, *shard_id);
                         failures.push(ShardCopyFailure {
                             index_name: index_name.clone(),
@@ -354,6 +382,7 @@ pub(super) fn open_local_assigned_shards(
                             shard_id: *shard_id,
                             node_id: local_node_id.to_string(),
                             allocation_id,
+                            promote_only: routing.primary == local_node_id,
                             reason: error.to_string(),
                         });
                     } else {
@@ -374,7 +403,8 @@ pub(super) fn open_local_assigned_shards(
                 .join(format!("shard_{shard_id}"));
             let allow_empty_creation =
                 state.may_create_initial_empty_copy(index_name, *shard_id, local_node_id);
-            if !shard_dir.exists()
+            let shard_dir_missing = shard_dir.try_exists().is_ok_and(|exists| !exists);
+            if shard_dir_missing
                 && guard_set.contains(&(index_name.clone(), *shard_id, metadata.uuid.to_string()))
                 && !allow_empty_creation
             {
@@ -391,6 +421,7 @@ pub(super) fn open_local_assigned_shards(
                         shard_id: *shard_id,
                         node_id: local_node_id.to_string(),
                         allocation_id,
+                        promote_only: routing.primary == local_node_id,
                         reason: format!("expected shard directory {shard_dir:?} is missing"),
                     });
                 }
@@ -415,7 +446,7 @@ pub(super) fn open_local_assigned_shards(
                     shard_id,
                     error
                 );
-                if ShardManager::is_definitive_copy_failure(&error) {
+                if ShardManager::should_report_copy_failure(&error) {
                     shard_manager.quarantine_shard_copy(index_name, *shard_id);
                     failures.push(ShardCopyFailure {
                         index_name: index_name.clone(),
@@ -423,6 +454,7 @@ pub(super) fn open_local_assigned_shards(
                         shard_id: *shard_id,
                         node_id: local_node_id.to_string(),
                         allocation_id,
+                        promote_only: routing.primary == local_node_id,
                         reason: error.to_string(),
                     });
                 }

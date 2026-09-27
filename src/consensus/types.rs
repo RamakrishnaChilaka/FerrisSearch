@@ -66,13 +66,15 @@ pub enum ClusterCommand {
         allocation_id: u64,
         expected_term: u64,
     },
-    /// Conditionally remove a locally failed shard copy from authoritative routing.
+    /// Conditionally remove a failed replica or promote away from a failed primary.
+    /// Primary reports must set `promote_only` and cannot clear the last primary.
     FailShardCopy {
         index_name: String,
         index_uuid: String,
         shard_id: u32,
         node: String,
         allocation_id: u64,
+        promote_only: bool,
     },
     /// Merge new field mappings into an existing index without replacing the
     /// entire metadata. This avoids TOCTOU races when concurrent documents
@@ -125,8 +127,12 @@ impl std::fmt::Display for ClusterCommand {
                 index_name,
                 shard_id,
                 node,
+                promote_only,
                 ..
-            } => write!(f, "FailShardCopy({index_name}/{shard_id}, {node})"),
+            } => write!(
+                f,
+                "FailShardCopy({index_name}/{shard_id}, {node}, promote_only={promote_only})"
+            ),
             ClusterCommand::AddMappings {
                 index_name,
                 new_fields,
@@ -429,6 +435,7 @@ mod tests {
                 shard_id: 2,
                 node: "node-2".into(),
                 allocation_id: 42,
+                promote_only: false,
             },
         ];
 

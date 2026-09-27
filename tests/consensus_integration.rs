@@ -1453,6 +1453,7 @@ async fn grpc_fail_shard_copy_removes_exact_replica_allocation() {
             shard_id: 0,
             node_id: "node-2".into(),
             allocation_id: Some(allocation_id),
+            promote_only: false,
         }))
         .await
         .unwrap()
@@ -1466,6 +1467,122 @@ async fn grpc_fail_shard_copy_removes_exact_replica_allocation() {
     assert_eq!(
         state.shard_allocation_id("grpc-fail-copy", 0, "node-2"),
         None
+    );
+}
+
+#[tokio::test]
+async fn grpc_promote_only_primary_failure_requires_an_in_sync_replica() {
+    let (raft, state_handle) = consensus::create_raft_instance_mem(1, "grpc-promote-only".into())
+        .await
+        .unwrap();
+    consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19372".into())
+        .await
+        .unwrap();
+    wait_for_leader(&raft).await;
+
+    let mut metadata = make_index("promote-only");
+    metadata.number_of_replicas = 1;
+    {
+        let routing = metadata.shard_routing.get_mut(&0).unwrap();
+        routing.replicas = vec!["node-2".into()];
+        routing.in_sync_replicas = vec!["node-2".into()];
+    }
+    let index_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let promote_allocation = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("promote-only", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "promote-only".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: promote_allocation,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+
+    let addr = start_raft_grpc_server(raft.clone(), state_handle.clone()).await;
+    let mut client = connect_grpc(addr).await;
+    let promoted = client
+        .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
+            index_name: "promote-only".into(),
+            index_uuid,
+            shard_id: 0,
+            node_id: "node-1".into(),
+            allocation_id: Some(promote_allocation),
+            promote_only: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(promoted.acknowledged, "{}", promoted.error);
+    assert_eq!(
+        state_handle.read().unwrap().indices["promote-only"].shard_routing[&0].primary,
+        "node-2"
+    );
+
+    let metadata = make_index("single-copy");
+    let single_uuid = metadata.uuid.to_string();
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let single_allocation = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("single-copy", 0)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "single-copy".into(),
+            index_uuid: single_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: single_allocation,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    let rejected = client
+        .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
+            index_name: "single-copy".into(),
+            index_uuid: single_uuid,
+            shard_id: 0,
+            node_id: "node-1".into(),
+            allocation_id: Some(single_allocation),
+            promote_only: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!rejected.acknowledged);
+    assert!(rejected.error.contains("without an in-sync replica"));
+    assert_eq!(
+        state_handle
+            .read()
+            .unwrap()
+            .primary_allocation_id("single-copy", 0),
+        Some(single_allocation)
     );
 }
 
@@ -1635,6 +1752,7 @@ async fn grpc_conditional_membership_rpcs_reject_non_leader() {
             shard_id: 0,
             node_id: "node-2".into(),
             allocation_id: Some(1),
+            promote_only: false,
         }))
         .await
         .unwrap_err();

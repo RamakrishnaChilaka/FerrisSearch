@@ -137,6 +137,11 @@ impl PeerRecoveryDriver {
 
                 match result {
                     Ok(RecoveryRunOutcome::Admitted(stats)) => {
+                        shard_manager.clear_peer_recovery_failure(
+                            candidate.metadata.uuid.as_str(),
+                            candidate.shard_id,
+                            candidate.allocation_id,
+                        );
                         driver
                             .retries
                             .lock()
@@ -154,6 +159,11 @@ impl PeerRecoveryDriver {
                         );
                     }
                     Ok(RecoveryRunOutcome::AwaitingMembership(stats)) => {
+                        shard_manager.clear_peer_recovery_failure(
+                            candidate.metadata.uuid.as_str(),
+                            candidate.shard_id,
+                            candidate.allocation_id,
+                        );
                         driver
                             .retries
                             .lock()
@@ -171,23 +181,47 @@ impl PeerRecoveryDriver {
                         );
                     }
                     Err(error) => {
-                        if destructive_started.load(Ordering::Acquire)
-                            && let Err(cleanup_error) = shard_manager
-                                .reset_peer_recovery_target_for_retry_blocking(
-                                    candidate.index_name.clone(),
-                                    candidate.shard_id,
-                                    candidate.metadata.uuid.to_string(),
-                                    candidate.allocation_id,
-                                )
-                                .await
-                        {
-                            tracing::warn!(
-                                index = candidate.index_name,
-                                shard_id = candidate.shard_id,
-                                allocation_id = candidate.allocation_id,
-                                error = %cleanup_error,
-                                "Peer recovery retry cleanup failed; retaining the active target gate"
-                            );
+                        let destructive = destructive_started.load(Ordering::Acquire);
+                        let error = if destructive {
+                            shard_manager.record_peer_recovery_failure(
+                                candidate.metadata.uuid.as_str(),
+                                candidate.shard_id,
+                                candidate.allocation_id,
+                                error,
+                            )
+                        } else {
+                            error
+                        };
+                        if destructive {
+                            let cleanup_result = if ShardManager::should_report_copy_failure(&error)
+                            {
+                                shard_manager
+                                    .abort_peer_recovery_target_blocking(
+                                        candidate.index_name.clone(),
+                                        candidate.shard_id,
+                                        candidate.metadata.uuid.to_string(),
+                                        candidate.allocation_id,
+                                    )
+                                    .await
+                            } else {
+                                shard_manager
+                                    .reset_peer_recovery_target_for_retry_blocking(
+                                        candidate.index_name.clone(),
+                                        candidate.shard_id,
+                                        candidate.metadata.uuid.to_string(),
+                                        candidate.allocation_id,
+                                    )
+                                    .await
+                            };
+                            if let Err(cleanup_error) = cleanup_result {
+                                tracing::warn!(
+                                    index = candidate.index_name,
+                                    shard_id = candidate.shard_id,
+                                    allocation_id = candidate.allocation_id,
+                                    error = %cleanup_error,
+                                    "Peer recovery cleanup failed; retaining the active target gate"
+                                );
+                            }
                         }
                         let mut retries = driver
                             .retries

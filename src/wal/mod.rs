@@ -57,6 +57,18 @@ pub(crate) struct WalFrameTooLargeError {
     max_bytes: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("WAL storage validation failed: {message}")]
+pub(crate) struct WalCorruptionError {
+    message: String,
+}
+
+fn wal_corruption(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(WalCorruptionError {
+        message: message.into(),
+    })
+}
+
 /// The type of WAL operation.
 ///
 /// This enum replaces the previous stringly-typed `"index"` / `"delete"` convention.
@@ -157,16 +169,21 @@ impl WireEntry {
     }
 
     fn into_translog(self) -> Result<TranslogEntry> {
+        let seq_no = self.seq_no;
+        let op = WalOperation::parse(&self.op).map_err(|error| {
+            wal_corruption(format!(
+                "failed to decode translog entry seq_no {seq_no}: {error}"
+            ))
+        })?;
+        let payload = serde_json::from_str(&self.payload_json).map_err(|error| {
+            wal_corruption(format!(
+                "failed to decode translog payload seq_no {seq_no}: {error}"
+            ))
+        })?;
         Ok(TranslogEntry {
-            seq_no: self.seq_no,
-            op: WalOperation::parse(&self.op).map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to decode translog entry seq_no {}: {}",
-                    self.seq_no,
-                    error
-                )
-            })?,
-            payload: serde_json::from_str(&self.payload_json)?,
+            seq_no,
+            op,
+            payload,
         })
     }
 }
@@ -310,12 +327,13 @@ fn checked_frame_bytes(payload_len: usize, max_bytes: usize) -> Result<usize> {
 
 fn decode_wire_entry(payload: &[u8]) -> Result<WireEntry> {
     let (wire, consumed): (WireEntry, usize) =
-        bincode_next::serde::decode_from_slice(payload, BINCODE_CONFIG)?;
+        bincode_next::serde::decode_from_slice(payload, BINCODE_CONFIG)
+            .map_err(|error| wal_corruption(format!("decode translog frame: {error}")))?;
     if consumed != payload.len() {
-        anyhow::bail!(
+        return Err(wal_corruption(format!(
             "translog frame has {} trailing payload bytes",
             payload.len() - consumed
-        );
+        )));
     }
     Ok(wire)
 }
@@ -345,29 +363,41 @@ fn read_next_entry<R: Read>(
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    reader
-        .read_exact(&mut len_buf[1..])
-        .context("incomplete translog frame length prefix")?;
+    reader.read_exact(&mut len_buf[1..]).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            wal_corruption("incomplete translog frame length prefix")
+        } else {
+            error.into()
+        }
+    })?;
     let payload_len = u32::from_le_bytes(len_buf) as usize;
-    let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+    let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)
+        .map_err(|error| wal_corruption(error.to_string()))?;
     if let Some(remaining) = remaining_file_bytes
         && frame_bytes as u64 > remaining
     {
-        anyhow::bail!(
+        return Err(wal_corruption(format!(
             "incomplete translog frame: declared {frame_bytes} bytes with only {remaining} bytes remaining"
-        );
+        )));
     }
     let mut payload_buf = vec![0u8; payload_len];
-    reader
-        .read_exact(&mut payload_buf)
-        .with_context(|| format!("incomplete translog frame payload of {payload_len} bytes"))?;
+    reader.read_exact(&mut payload_buf).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            wal_corruption(format!(
+                "incomplete translog frame payload of {payload_len} bytes"
+            ))
+        } else {
+            error.into()
+        }
+    })?;
     let wire = decode_wire_entry(&payload_buf)?;
     Ok(Some((wire.into_translog()?, frame_bytes)))
 }
 
 fn decode_wire_seq_no(prefix: &[u8]) -> Result<u64> {
     let ((seq_no,), _): ((u64,), _) =
-        bincode_next::serde::decode_from_slice(prefix, BINCODE_CONFIG)?;
+        bincode_next::serde::decode_from_slice(prefix, BINCODE_CONFIG)
+            .map_err(|error| wal_corruption(format!("decode translog sequence prefix: {error}")))?;
     Ok(seq_no)
 }
 
@@ -382,7 +412,9 @@ fn decode_wire_entry_with_prefix<R: Read>(
     reader.read_exact(&mut prefix[prefix_len..])?;
     let wire = decode_wire_entry(&prefix)?;
     if wire.seq_no != expected_seq_no {
-        anyhow::bail!("translog frame sequence changed while decoding");
+        return Err(wal_corruption(
+            "translog frame sequence changed while decoding",
+        ));
     }
     Ok(wire)
 }
@@ -673,10 +705,11 @@ fn scan_active_generation_from_path(path: &Path) -> Result<ActiveGenerationScan>
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf)?;
         let payload_len = u32::from_le_bytes(len_buf) as usize;
-        let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+        let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)
+            .map_err(|error| wal_corruption(error.to_string()))?;
         let frame_end = frame_start
             .checked_add(frame_bytes as u64)
-            .ok_or_else(|| anyhow::anyhow!("translog frame offset overflow"))?;
+            .ok_or_else(|| wal_corruption("translog frame offset overflow"))?;
         if frame_end > file_len {
             return Ok(ActiveGenerationScan {
                 generation,
@@ -718,8 +751,11 @@ fn load_translog_manifest(data_dir: &Path) -> Result<Option<TranslogManifest>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let manifest = serde_json::from_slice::<TranslogManifest>(&bytes)?;
-    manifest.validate()?;
+    let manifest = serde_json::from_slice::<TranslogManifest>(&bytes)
+        .map_err(|error| wal_corruption(format!("decode translog manifest {path:?}: {error}")))?;
+    manifest
+        .validate()
+        .map_err(|error| wal_corruption(format!("validate translog manifest {path:?}: {error}")))?;
     Ok(Some(manifest))
 }
 
@@ -783,12 +819,15 @@ fn generations_from_manifest(
     let mut generations = Vec::with_capacity(manifest.generations.len());
     for generation in &manifest.generations {
         let mut info = generation.clone().into_generation_info(data_dir);
-        let metadata = fs::metadata(&info.path).map_err(|e| {
-            anyhow::anyhow!(
-                "manifest references missing translog generation {:?}: {}",
-                info.path,
-                e
-            )
+        let metadata = fs::metadata(&info.path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                wal_corruption(format!(
+                    "manifest references missing translog generation {:?}",
+                    info.path
+                ))
+            } else {
+                error.into()
+            }
         })?;
         info.size_bytes = metadata.len();
         generations.push(info);
@@ -888,9 +927,9 @@ impl HotTranslog {
         let persisted_seq = if seq_no_path.exists() {
             let s = fs::read_to_string(&seq_no_path)?;
             s.trim().parse::<u64>().map_err(|error| {
-                anyhow::anyhow!(
+                wal_corruption(format!(
                     "invalid translog sequence high-water mark {seq_no_path:?}: {error}"
-                )
+                ))
             })?
         } else {
             0
@@ -908,9 +947,9 @@ impl HotTranslog {
                     .iter_mut()
                     .find(|generation| generation.id == active_generation_id)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
+                        wal_corruption(format!(
                             "manifest active generation {active_generation_id} missing after generation load"
-                        )
+                        ))
                     })?;
             let active_scan = scan_active_generation_from_path(&active_generation.path)?;
             if active_scan.trailing_bytes > 0 {
@@ -935,9 +974,9 @@ impl HotTranslog {
         } else {
             let existing_generations = discover_generation_files(data_dir)?;
             if !existing_generations.is_empty() {
-                anyhow::bail!(
+                return Err(wal_corruption(format!(
                     "generation-based translog files exist in {data_dir:?} without manifest {manifest_path:?}"
-                );
+                )));
             }
 
             let (generation, active_file) = create_empty_generation(data_dir, 0)?;
@@ -2883,6 +2922,7 @@ mod tests {
             Ok(_) => panic!("open should fail for unknown WAL operation type"),
             Err(err) => err,
         };
+        assert!(err.is::<WalCorruptionError>());
         assert!(
             err.to_string()
                 .contains("unknown WAL operation type: bogus")
@@ -2975,6 +3015,7 @@ mod tests {
             Ok(_) => panic!("open accepted a complete corrupt middle frame"),
             Err(error) => error,
         };
+        assert!(error.is::<WalCorruptionError>());
         assert!(
             error
                 .to_string()

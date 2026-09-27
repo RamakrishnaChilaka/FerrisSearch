@@ -9,7 +9,7 @@ mod reconciliation;
 mod tests;
 
 use crate::cluster::manager::ClusterManager;
-use crate::cluster::state::{NodeInfo, NodeRole};
+use crate::cluster::state::{ClusterState, NodeInfo, NodeRole};
 use crate::config::AppConfig;
 use crate::consensus::types::{ClusterCommand, RaftInstance};
 use crate::shard::ShardManager;
@@ -219,6 +219,19 @@ async fn report_failed_shard_copies(
             );
             continue;
         }
+        if failure.promote_only
+            && current.indices[&failure.index_name].shard_routing[&failure.shard_id]
+                .in_sync_replicas
+                .is_empty()
+        {
+            tracing::warn!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                allocation_id = failure.allocation_id,
+                "Keeping failed primary routing unchanged because no in-sync promotion candidate exists"
+            );
+            continue;
+        }
         let report_key = (
             failure.index_uuid.clone(),
             failure.shard_id,
@@ -249,6 +262,7 @@ async fn report_failed_shard_copies(
             shard_id: failure.shard_id,
             node: failure.node_id.clone(),
             allocation_id: failure.allocation_id,
+            promote_only: failure.promote_only,
         };
         let result = if raft.is_leader() {
             crate::consensus::client_write_checked(raft, command)
@@ -282,6 +296,7 @@ async fn report_failed_shard_copies(
                         shard_id: failure.shard_id,
                         node_id: failure.node_id.clone(),
                         allocation_id: Some(failure.allocation_id),
+                        promote_only: failure.promote_only,
                     },
                 )
                 .await
@@ -294,6 +309,36 @@ async fn report_failed_shard_copies(
                 error = %error,
                 "Failed shard-copy report was not applied"
             );
+        }
+    }
+}
+
+async fn activate_local_primaries(
+    state: &ClusterState,
+    local_node_id: &str,
+    activation_service: &crate::transport::server::TransportService,
+) {
+    for (index_name, metadata) in &state.indices {
+        if !metadata.settings.engine.uses_local_shards() {
+            continue;
+        }
+        for (shard_id, routing) in &metadata.shard_routing {
+            if routing.primary != local_node_id
+                || state.primary_allocation_id(index_name, *shard_id).is_none()
+            {
+                continue;
+            }
+            if let Err(error) = activation_service
+                .activate_primary_for_lifecycle(index_name, *shard_id)
+                .await
+            {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    error,
+                    "Lifecycle primary activation has not completed"
+                );
+            }
         }
     }
 }
@@ -433,8 +478,8 @@ impl Node {
         };
 
         // 1. Start internal gRPC Transport Server (Port 9300)
-        let transport_service =
-            crate::transport::server::create_transport_service_with_raft_and_storage(
+        let (transport_service, primary_activation_service) =
+            crate::transport::server::create_transport_service_with_raft_and_storage_handle(
                 self.cluster_manager.clone(),
                 self.shard_manager.clone(),
                 self.transport_client.clone(),
@@ -642,6 +687,8 @@ impl Node {
             )
             .await;
             state = manager.get_state();
+            activate_local_primaries(&state, &local_id, &primary_activation_service).await;
+            state = manager.get_state();
 
             let mut orphan_cleanup_done = cleanup_orphaned_data_if_authoritative_blocking(
                 Some(state.clone()),
@@ -676,6 +723,8 @@ impl Node {
                     &mut recent_failed_copy_reports,
                 )
                 .await;
+                state = manager.get_state();
+                activate_local_primaries(&state, &local_id, &primary_activation_service).await;
                 state = manager.get_state();
                 peer_recovery_driver.reconcile(
                     &state,

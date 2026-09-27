@@ -373,6 +373,7 @@ impl ClusterStateMachine {
                 shard_id,
                 node,
                 allocation_id,
+                promote_only,
             } => {
                 if *allocation_id == 0 {
                     return ClusterResponse::Error(format!(
@@ -416,6 +417,11 @@ impl ClusterStateMachine {
                 let mut allocations = current_allocations;
                 let is_primary = metadata.shard_routing[shard_id].primary == *node;
                 if is_primary {
+                    if !*promote_only {
+                        return ClusterResponse::Error(format!(
+                            "primary shard failure must be promote-only for index '{index_name}' shard {shard_id}"
+                        ));
+                    }
                     let candidate = metadata.select_promotion_candidate(*shard_id, &[]);
                     if let Some(candidate) = candidate {
                         let Some(candidate_allocation) =
@@ -451,20 +457,16 @@ impl ClusterStateMachine {
                         };
                         routing.unassigned_replicas = next_unassigned;
                     } else {
-                        allocations.primary = None;
-                        let routing = metadata
-                            .shard_routing
-                            .get_mut(shard_id)
-                            .expect("validated routing exists");
-                        let Some(next_unassigned) = routing.unassigned_replicas.checked_add(1)
-                        else {
-                            return ClusterResponse::Error(format!(
-                                "unassigned copy count exhausted for index '{index_name}' shard {shard_id}"
-                            ));
-                        };
-                        routing.unassigned_replicas = next_unassigned;
+                        return ClusterResponse::Error(format!(
+                            "cannot apply promote-only primary failure for index '{index_name}' shard {shard_id} without an in-sync replica"
+                        ));
                     }
                 } else {
+                    if *promote_only {
+                        return ClusterResponse::Error(format!(
+                            "promote-only shard failure requires the current primary for index '{index_name}' shard {shard_id}"
+                        ));
+                    }
                     let Some(routing) = metadata.shard_routing.get_mut(shard_id) else {
                         return ClusterResponse::Error(format!(
                             "index '{index_name}' has no shard {shard_id}"
@@ -1083,19 +1085,15 @@ mod tests {
             ),
             ClusterResponse::Ok
         );
-        assert_eq!(
-            sm.apply_command_at(
-                &ClusterCommand::FailShardCopy {
-                    index_name: "red-admission".into(),
-                    index_uuid: index_uuid.clone(),
-                    shard_id: 0,
-                    node: "node-1".into(),
-                    allocation_id: 10,
-                },
-                12,
-            ),
-            ClusterResponse::Ok
-        );
+        sm.state_handle()
+            .write()
+            .unwrap()
+            .shard_allocations
+            .get_mut("red-admission")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary = None;
         assert!(matches!(
             sm.apply_command_at(
                 &ClusterCommand::MarkReplicaInSync {
@@ -1318,6 +1316,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 9,
+                    promote_only: false,
                 },
                 12,
             ),
@@ -1331,6 +1330,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 10,
+                    promote_only: false,
                 },
                 13,
             ),
@@ -1371,6 +1371,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 10,
+                    promote_only: false,
                 },
                 15,
             ),
@@ -1404,6 +1405,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    promote_only: false,
                 },
                 11,
             ),
@@ -1417,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn fail_primary_promotes_in_sync_copy_or_leaves_red_without_one() {
+    fn fail_primary_promotes_in_sync_copy() {
         let sm = ClusterStateMachine::new("test".into());
         let mut metadata = make_index("promote");
         metadata.number_of_replicas = 1;
@@ -1453,8 +1455,9 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    promote_only: true,
                 },
-                12,
+                13,
             ),
             ClusterResponse::Ok
         );
@@ -1467,47 +1470,68 @@ mod tests {
             assert_eq!(routing.unassigned_replicas, 1);
             assert_eq!(state.primary_allocation_id("promote", 0), Some(10));
         }
+    }
 
-        let metadata = make_index("red");
-        let red_uuid = metadata.uuid.to_string();
+    #[test]
+    fn promote_only_primary_failure_never_clears_the_last_primary_allocation() {
+        let sm = ClusterStateMachine::new("test".into());
+        let metadata = make_index("single-copy");
+        let index_uuid = metadata.uuid.to_string();
         assert_eq!(
-            sm.apply_command_at(&ClusterCommand::CreateIndex { metadata }, 20),
+            sm.apply_command_at(&ClusterCommand::CreateIndex { metadata }, 10),
             ClusterResponse::Ok
         );
         assert_eq!(
             sm.apply_command_at(
                 &ClusterCommand::ActivatePrimary {
-                    index_name: "red".into(),
-                    index_uuid: red_uuid.clone(),
+                    index_name: "single-copy".into(),
+                    index_uuid: index_uuid.clone(),
                     shard_id: 0,
                     primary: "node-1".into(),
-                    allocation_id: 20,
+                    allocation_id: 10,
                     expected_term: 1,
                 },
-                21,
+                11,
             ),
             ClusterResponse::Ok
         );
-        assert_eq!(
+        let version_before = sm.state_handle().read().unwrap().version;
+
+        assert!(matches!(
             sm.apply_command_at(
                 &ClusterCommand::FailShardCopy {
-                    index_name: "red".into(),
-                    index_uuid: red_uuid,
+                    index_name: "single-copy".into(),
+                    index_uuid: index_uuid.clone(),
                     shard_id: 0,
                     node: "node-1".into(),
-                    allocation_id: 20,
+                    allocation_id: 10,
+                    promote_only: false,
                 },
-                22,
+                12,
             ),
-            ClusterResponse::Ok
-        );
+            ClusterResponse::Error(error) if error.contains("must be promote-only")
+        ));
+        assert!(matches!(
+            sm.apply_command_at(
+                &ClusterCommand::FailShardCopy {
+                    index_name: "single-copy".into(),
+                    index_uuid,
+                    shard_id: 0,
+                    node: "node-1".into(),
+                    allocation_id: 10,
+                    promote_only: true,
+                },
+                13,
+            ),
+            ClusterResponse::Error(error) if error.contains("without an in-sync replica")
+        ));
         let state = sm.state_handle();
         let state = state.read().unwrap();
-        assert_eq!(state.indices["red"].shard_routing[&0].primary, "node-1");
-        assert_eq!(state.primary_allocation_id("red", 0), None);
+        assert_eq!(state.version, version_before);
+        assert_eq!(state.primary_allocation_id("single-copy", 0), Some(10));
         assert_eq!(
-            state.indices["red"].shard_routing[&0].unassigned_replicas,
-            1
+            state.indices["single-copy"].shard_routing[&0].unassigned_replicas,
+            0
         );
     }
 
@@ -1581,19 +1605,25 @@ mod tests {
             ),
             ClusterResponse::Ok
         );
-        assert_eq!(
-            sm.apply_command_at(
-                &ClusterCommand::FailShardCopy {
-                    index_name: "idx".into(),
-                    index_uuid: uuid,
-                    shard_id: 0,
-                    node: "node-1".into(),
-                    allocation_id: 10,
-                },
-                14,
-            ),
-            ClusterResponse::Ok
-        );
+        {
+            let state = sm.state_handle();
+            let mut state = state.write().unwrap();
+            state
+                .shard_allocations
+                .get_mut("idx")
+                .unwrap()
+                .get_mut(&0)
+                .unwrap()
+                .primary = None;
+            state
+                .indices
+                .get_mut("idx")
+                .unwrap()
+                .shard_routing
+                .get_mut(&0)
+                .unwrap()
+                .unassigned_replicas = 1;
+        }
         assert_eq!(
             sm.state_handle()
                 .read()

@@ -419,6 +419,7 @@ message FailShardCopyRequest {
     uint32 shard_id = 3;
     string node_id = 4;
     optional uint64 allocation_id = 5;
+    bool promote_only = 6;  // required for primary-copy failure reports
 }
 
 message FailShardCopyResponse {
