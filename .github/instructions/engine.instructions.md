@@ -166,8 +166,10 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   flush, force-merge preparation, or peer-snapshot commit proceeds, a failed
   writer is rebuilt and the retained suffix
   `[translog.committed, WAL next_seq)` is replayed and committed with the
-  normal automatic merge policy. Persistent rebuild or replay I/O remains an
-  Apply failure. Best-effort `try_flush_with_global_checkpoint()` may return
+  normal automatic merge policy. Persistent rebuild or replay I/O is an Apply
+  failure only on the write path; a rebuild triggered by refresh, flush, or
+  snapshot preparation logs and retries on the next maintenance tick without
+  escalating. Best-effort `try_flush_with_global_checkpoint()` may return
   `Ok(false)` instead of rebuilding.
 - `force_merge(0)` is invalid. Successful force merge must verify the final
   searchable segment count is at most the requested positive bound while

@@ -235,15 +235,18 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > fresh `ActivatePrimary`, which clears the flag while advancing the term.
 > Apply-level escalation keeps the existing engine open for reads and does not
 > itself quarantine, reopen, or replay a WAL-appended but engine-failed
-> operation. Such an operation has an unknown outcome: it is initially absent
-> from the live reader, a later successful commit can advance past it, and a
-> later writer-invalidating commit failure can cause suffix replay to apply it
-> on this copy while another copy still lacks it. A force-merge
+> operation. Such an operation has an unknown outcome. In production this
+> failure means the Tantivy writer was killed, so the next commit fails, the
+> rebuilt writer replays the operation on this copy, and restart replay applies
+> it too. When the failure is on the primary, replicas never receive the
+> operation, so copies diverge. A force-merge
 > writer-replacement failure leaves a typed unavailable-writer state. The next
 > write or blocking maintenance/snapshot operation rebuilds the writer with the
 > normal heap budget and automatic merge policy, then replays the retained WAL
-> suffix before continuing. Transient failure can heal there, while persistent
-> rebuild or replay I/O consumes the Apply retry budget.
+> suffix before continuing. Transient failure can heal there. Persistent
+> rebuild or replay I/O consumes the Apply retry budget only when a write
+> triggers the rebuild; maintenance-triggered rebuilds log and retry on each
+> maintenance tick without escalating.
 > Status-only `MarkPrimaryAvailable` reporting runs in the background so leader
 > discovery or forwarding cannot delay an already-successful write response.
 > This status introduces an intentional health-semantics difference from
@@ -259,10 +262,14 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > has acknowledged every write required by the current synchronous write set.
 >
 > A failed Tantivy commit is logged and also invalidates the writer. It does not
-> advance `translog.committed` or authorize WAL truncation. Before accepting the
-> next write, FerrisSearch rebuilds the writer and replays the retained suffix
-> with the same idempotent path used at startup; persistent rebuild/replay I/O
-> enters the Apply retry budget.
+> advance `translog.committed` or authorize WAL truncation. The next write,
+> blocking maintenance operation, or peer-recovery snapshot rebuilds the writer
+> and replays the retained suffix with the same idempotent path used at
+> startup. Only a write-triggered rebuild enters the Apply retry budget; an
+> idle copy with a persistent fault logs and retries on each maintenance tick
+> until a write arrives. Replay holds the shard translog lock for the whole
+> suffix, so blocked writes also occupy write-pool threads and can delay other
+> shards on the node.
 > Allocation can also return a replacement to the same faulty node; a
 > MaxRetryAllocationDecider-style exclusion policy and
 > `index.allocation.max_retries` setting (OpenSearch defaults to five retries)
@@ -278,14 +285,17 @@ frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
 
 **Known write-failure limit:** synchronous WAL/fsync/engine failures now fail
 the request and enter bounded escalation, but a WAL entry whose later engine
-apply fails has an unknown outcome. It starts absent from the live reader. A
-later successful commit can advance the committed checkpoint past it, while a
-later failed commit can invalidate the writer and cause suffix replay to apply
-it on this copy. Retained peer-recovery history can also apply it on another
-copy, so copies can diverge. If a partial append is followed by later writes,
-the torn frame can become middle corruption; restart then fails closed rather
-than skipping acknowledged history. Startup tail truncation repairs only a
-trailing incomplete frame with no later data.
+apply fails has an unknown outcome. In production this failure means the
+Tantivy writer was killed. The next commit then fails, and the rebuilt writer
+replays the entry on this copy, as does a restart. If the failure happened on
+the primary, replicas never receive the entry, because replication starts only
+after local success. In-sync copies can therefore diverge on up to one refresh
+interval of client-failed writes, or longer with refresh disabled, and peer
+recovery from this copy can ship the retained entry to a new copy. If a partial
+append is followed by later writes, the torn frame can become middle
+corruption; restart then fails closed rather than skipping acknowledged
+history. Startup tail truncation repairs only a trailing incomplete frame with
+no later data.
 
 ## 3. Reference Protocols And Intentional Differences
 

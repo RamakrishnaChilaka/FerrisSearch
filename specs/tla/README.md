@@ -728,9 +728,10 @@ well below the CI budget.
 - Apply-I/O failure is modeled as a failed logical mutation with no
   acknowledged operation effect. Rust keeps an Apply-failed copy open, but an
   operation that reached the WAL and then failed engine apply has an unknown
-  outcome: it begins absent from the live reader, a later commit can advance
-  past it, a later writer-invalidating commit failure can replay it on this
-  copy, and retained peer-recovery history can apply it on another copy.
+  outcome. In production this failure means the Tantivy writer was killed; the
+  next commit fails, and rebuild or restart replay applies the operation on
+  this copy. On a primary, replicas never receive it, and peer recovery from
+  this copy can ship the retained entry to a new copy.
   Resulting cross-copy divergence and partial or torn WAL-frame persistence
   remain outside the model.
 - The Rust implementation assumes `translog.committed` never advances beyond

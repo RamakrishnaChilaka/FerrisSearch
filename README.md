@@ -415,10 +415,13 @@ production ready**. The most important limits are:
   acknowledgement semantics need a formal contract.
 - Synchronous WAL/fsync/engine failures fail the request and enter bounded
   escalation. An operation that reached the WAL and then failed engine apply
-  has an unknown outcome: it starts absent from the live reader, a later
-  successful commit can advance past it, a later writer-invalidating commit
-  failure can replay it on this copy, and retained peer-recovery history can
-  apply it on another copy. Copies can therefore diverge after this failure.
+  has an unknown outcome. In production this failure means the Tantivy writer
+  was killed: the next commit fails, the rebuilt writer replays the operation
+  on this copy, and restart replay applies it too. When the failure is on the
+  primary, replicas never receive the operation, because replication starts
+  only after local success. In-sync copies can therefore diverge on up to one
+  refresh interval of client-failed writes, or longer with refresh disabled,
+  and peer recovery from this copy can ship the retained entry to a new copy.
   A partial frame followed by later writes can still create middle corruption
   that restart correctly rejects.
 - A failed Tantivy commit invalidates the writer without advancing
@@ -426,9 +429,14 @@ production ready**. The most important limits are:
   maintenance operation, or peer-recovery snapshot rebuilds the writer and
   replays the retained suffix. Replay deletes each document ID first and adds
   content back only for index operations; malformed operation payloads fail
-  closed. Persistent rebuild or replay I/O enters the Apply escalation budget.
-  Replay holds the shard translog lock for the entire suffix, blocking writes
-  to that shard; the suffix can be large when refresh is disabled.
+  closed. Persistent rebuild or replay I/O enters the Apply escalation budget
+  only when a write triggers the rebuild. A rebuild triggered by refresh,
+  flush, or snapshot preparation logs an error and retries on the next
+  maintenance tick without escalating, so an idle copy with a persistent fault
+  retries until a write arrives. Replay holds the shard translog lock for the
+  entire suffix. Writes to that shard block while it runs and occupy
+  write-pool threads, so a long replay can also delay writes to other shards
+  on the node. The suffix can be large when refresh is disabled.
 - At the `8f17172` main baseline, startup replay resurrected acknowledged
   deletes and one transient Tantivy commit failure could lose later
   acknowledged writes. Both defects are fixed on this branch.

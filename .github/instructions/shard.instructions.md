@@ -68,9 +68,10 @@ pub struct ShardManager {
   available. A writer-invalidating commit failure rebuilds and replays the
   retained WAL suffix before the next write or blocking maintenance/snapshot
   commit. A separate engine-apply failure after WAL append has an unknown
-  outcome: it starts absent from the live reader, a later commit can advance
-  past it, a later writer-invalidating commit failure can replay it locally,
-  and peer recovery can apply the retained entry on another copy.
+  outcome. In production it means the Tantivy writer was killed, so the next
+  commit fails and rebuild or restart replay applies the entry on this copy.
+  On a primary, replicas never receive it, so copies can diverge; peer
+  recovery from this copy can ship the retained entry to a new copy.
   Definitive and open-level failures may quarantine, but only after the report
   throttle admits the attempt.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty

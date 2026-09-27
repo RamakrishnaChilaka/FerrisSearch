@@ -111,8 +111,9 @@ pub trait WriteAheadLog: Send + Sync {
   a new operation, or before blocking maintenance/snapshot commit continues,
   writer reconstruction replays `[translog.committed, next_seq_no)` with the
   same idempotent replay logic used at startup. Best-effort try-flush may defer
-  instead. Persistent rebuild/replay I/O is reported through the Apply retry
-  budget.
+  instead. Persistent rebuild/replay I/O reaches the Apply retry budget only
+  when a write triggers the rebuild; maintenance-triggered failures log and
+  retry on the next tick without escalating.
 - WAL document interpretation is shared by startup/runtime replay, peer
   recovery, and legacy `RecoverReplica`. Every operation requires `_doc_id`;
   index operations additionally require `_source`. Missing fields are typed
