@@ -415,13 +415,14 @@ production ready**. The most important limits are:
   acknowledgement semantics need a formal contract.
 - Synchronous WAL/fsync/engine failures fail the request and enter bounded
   escalation, but an operation that reached the WAL and then failed engine
-  apply is not replayed into the live engine; restart recovery is the current
-  replay boundary. A partial frame followed by later writes can still create
-  middle corruption that restart correctly rejects.
-- Background Tantivy commit failures are logged but do not yet enter shard
-  failure escalation. With a fault confined to the index directory,
-  acknowledged WAL-backed writes can remain invisible to search on that copy
-  until a later successful commit or restart replay.
+  apply is not automatically restored to the live reader. A later successful
+  commit can advance past that entry, while a retained peer-recovery WAL suffix
+  can still transmit it to another copy. A partial frame followed by later
+  writes can still create middle corruption that restart correctly rejects.
+- A failed Tantivy commit invalidates the writer without advancing
+  `translog.committed` or truncating the WAL. Before accepting the next write,
+  FerrisSearch rebuilds the writer and replays the retained suffix; persistent
+  rebuild or replay I/O enters the Apply escalation budget.
 - `_seq_no` now reports the primary WAL assignment, but `_version` and
   `_primary_term` compatibility fields remain placeholders. Gap-aware
   checkpoints, primary epochs, idempotent retries, `if_seq_no` /

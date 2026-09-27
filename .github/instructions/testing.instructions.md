@@ -220,6 +220,10 @@ cargo test -- test_name                         # Single test by name
   rebuild failure remaining reportable under the Apply budget, and successful
   write responses remaining independent of a blocked or slow
   `MarkPrimaryAvailable` report.
+- Round-6 storage regressions use a real Tantivy commit failure to prove the
+  writer is removed, the persisted checkpoint does not advance, five later
+  acknowledged writes survive the next commit and restart, and a failed
+  replica retains every acknowledged write after promotion.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

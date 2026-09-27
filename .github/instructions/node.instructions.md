@@ -77,6 +77,9 @@ pub struct Node {
 6. Allocate unassigned replicas only for shards with a live allocated primary.
    The current allocator may select the same faulty node again; bounded failed-
    allocation exclusion is deferred.
+7. When applied routing removes a local shard copy, remove its engine from the
+   serving map without deleting its on-disk evidence. This closes copies removed
+   after Apply-level escalation instead of retaining an unreachable open engine.
 
 ### Follower Duties (every 5s tick)
 1. Ping master node for liveness check

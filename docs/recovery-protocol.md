@@ -222,8 +222,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > replay a WAL-appended but engine-failed operation at runtime. A force-merge
 > writer-replacement failure leaves a typed unavailable-writer state. The next
 > write tries once to rebuild the writer with the normal heap budget and
-> automatic merge policy before adding a new WAL entry; transient failure can
-> heal there, while persistent rebuild I/O consumes the Apply retry budget.
+> automatic merge policy, then replays the retained WAL suffix before adding a
+> new WAL entry. Transient failure can heal there, while persistent rebuild or
+> replay I/O consumes the Apply retry budget.
 > Status-only `MarkPrimaryAvailable` reporting runs in the background so leader
 > discovery or forwarding cannot delay an already-successful write response.
 > This status introduces an intentional health-semantics difference from
@@ -238,9 +239,11 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > observations and uses an unranked live in-sync member. Every in-sync member
 > has acknowledged every write required by the current synchronous write set.
 >
-> Background Tantivy commit failures remain log-only. With a fault confined to
-> the index directory, acknowledged WAL-backed writes can remain invisible to
-> search on that copy until a later successful commit or restart replay.
+> A failed Tantivy commit is logged and also invalidates the writer. It does not
+> advance `translog.committed` or authorize WAL truncation. Before accepting the
+> next write, FerrisSearch rebuilds the writer and replays the retained suffix
+> with the same idempotent path used at startup; persistent rebuild/replay I/O
+> enters the Apply retry budget.
 > Allocation can also return a replacement to the same faulty node; a
 > MaxRetryAllocationDecider-style exclusion policy and
 > `index.allocation.max_retries` setting (OpenSearch defaults to five retries)
@@ -256,11 +259,13 @@ frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
 
 **Known write-failure limit:** synchronous WAL/fsync/engine failures now fail
 the request and enter bounded escalation, but a WAL entry whose later engine
-apply fails remains absent from the live reader and is replayed only during
-restart recovery. If a partial append is followed by later writes, the torn
-frame can become middle corruption; restart then fails closed rather than
-skipping acknowledged history. Startup tail truncation repairs only a trailing
-incomplete frame with no later data.
+apply fails remains absent from the live reader. A later successful commit can
+advance the committed checkpoint past that entry, so restart can skip it;
+while retained, peer-recovery suffix transfer can still apply it on another
+copy. If a partial append is followed by later writes, the torn frame can become
+middle corruption; restart then fails closed rather than skipping acknowledged
+history. Startup tail truncation repairs only a trailing incomplete frame with
+no later data.
 
 ## 3. Reference Protocols And Intentional Differences
 

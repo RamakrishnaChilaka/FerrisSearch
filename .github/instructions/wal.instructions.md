@@ -103,6 +103,15 @@ pub trait WriteAheadLog: Send + Sync {
 - `initialize_empty_at()` creates the empty target WAL/high-water state at a
   file snapshot's exclusive boundary.
 - `next_seq_no()` returns the exclusive next seq_no; this is what gets persisted on commit paths
+- `translog.committed` may advance only from a successful Tantivy commit
+  boundary. Flush and checkpoint-aware truncation validate that the persisted
+  boundary equals the current WAL head before deleting history; a failed commit
+  must leave both the checkpoint and WAL intact.
+- Any failed Tantivy commit invalidates its writer. Before a later write appends
+  a new operation, writer reconstruction replays
+  `[translog.committed, next_seq_no)` with the same idempotent replay logic used
+  at startup. Persistent rebuild/replay I/O is reported through the Apply
+  retry budget.
 - Async durability: background task fsyncs every `sync_interval_ms` via Tokio's blocking pool — never call `File::sync_data()` inline on an async worker
 - Reopen requires `translog.manifest`; it trusts persisted metadata for old generations, removes stray generation files not listed in the manifest, ignores unrelated non-generation side files, and scans only the active generation file to recover the allocator high-water mark
 - On open, an incomplete trailing frame in the active generation is truncated

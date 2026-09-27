@@ -727,13 +727,17 @@ well below the CI budget.
   numeric policy is not verified here.
 - Apply-I/O failure is modeled as a failed logical mutation with no
   acknowledged operation effect. Rust keeps an Apply-failed copy open; an
-  operation that reached the WAL but failed engine apply is not replayed into
-  the live engine and is reconstructed only by restart recovery. Partial or
-  torn WAL-frame persistence and that restart ordering remain acceptance-test
-  work rather than a claim of this model.
-- Background Tantivy commit failures are only logged. With a fault confined to
-  the index directory, acknowledged WAL-backed writes may remain invisible to
-  search on that copy until a later successful commit or restart replay.
+  operation that reached the WAL but failed engine apply is not restored to the
+  live reader. A later successful commit can advance past that entry, while a
+  retained peer-recovery suffix can still transfer it to another copy. Partial
+  or torn WAL-frame persistence and those cross-copy effects remain outside the
+  model.
+- The Rust implementation assumes `translog.committed` never advances beyond
+  operations made durable by a successful Tantivy commit. Any commit failure
+  invalidates the writer; before accepting the next write, writer reconstruction
+  replays and commits the retained WAL suffix from the persisted checkpoint.
+  The model represents those operations as durable atomically and does not
+  model Tantivy worker/channel reconstruction.
 - The allocator may assign a replacement back to the same faulty node. Retry is
   bounded per attempt by recovery backoff and the storage escalation window;
   excluding a node after a configured number of failed allocations is deferred.

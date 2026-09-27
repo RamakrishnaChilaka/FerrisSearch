@@ -215,6 +215,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   spawns throttled best-effort `MarkPrimaryAvailable` reporting without a term
   bump. The already-successful write response must not wait for Raft leadership
   discovery, forwarding, or the transport timeout of that status-only report.
+  Check `primary_unavailable` through the shared applied-state read lock before
+  cloning the service or spawning the task, so ordinary writes allocate no
+  status-report work.
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.

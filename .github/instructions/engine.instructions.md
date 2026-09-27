@@ -134,8 +134,12 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - **Dynamic fields**: creates Tantivy fields on first encounter
 - **`body` field**: catch-all for unmapped textual content
 - `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
-- `replay_translog()` — crash recovery from WAL, streaming entries via `for_each_from()` and replaying only entries at or above the persisted committed checkpoint
-- Replay must stay idempotent across repeated crash recovery: delete-before-add on `_id`, commit in batches, and persist `translog.committed` after each intermediate batch commit
+- `replay_translog()` and failed-writer reconstruction share the same WAL-suffix
+  replay helper. They stream entries via `for_each_from()` starting at the
+  persisted committed checkpoint.
+- Replay must stay idempotent across repeated restart or write-path recovery:
+  delete-before-add on `_id`, commit in bounded batches, and persist
+  `translog.committed` only after each successful intermediate commit.
 - `translog_size_bytes()` exposes the current WAL size for the auto-flush loop
 - The Tantivy `IndexWriter` heap budget is intentionally capped at 64 MiB per shard. Multi-shard restart/open paths must not reserve the old 512 MiB-per-shard budget or nodes with many local shards can OOM before recovery completes.
 - Force merge is serialized only within one `HotEngine`. It temporarily installs
@@ -150,10 +154,14 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   failure can therefore heal on that write. Rebuild I/O failures retain typed
   causes, and primary/replica handlers account persistent failures under the
   shard Apply retry key.
-- Background refresh/commit failures are currently logged only. A fault
-  confined to the Tantivy index directory can leave acknowledged WAL-backed
-  writes invisible to search on that copy until a later successful commit or
-  restart replay; automatic background-failure escalation is deferred.
+- Every production Tantivy commit boundary—refresh, flush, checkpoint-aware
+  flush, recovery snapshot, replay batches, and pre-force-merge commit—must
+  fail the `WriterState` on error. No later write may reuse that writer.
+- Before the next write appends a new WAL entry, a failed writer is rebuilt and
+  the retained suffix `[translog.committed, WAL next_seq)` is replayed and
+  committed with the normal automatic merge policy. Persistent rebuild or
+  replay I/O remains an Apply failure. The original background task logs its
+  commit error; the next write or restart performs recovery.
 - `force_merge(0)` is invalid. Successful force merge must verify the final
   searchable segment count is at most the requested positive bound while
   preserving document values, deletes, and the committed WAL watermark.
@@ -166,6 +174,9 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   lock, and hard-links the existing committed segment components plus
   `meta.json`/`.managed.json`. Tantivy's `SegmentMeta::list_files()` can name
   optional absent components; transfer only files that actually exist.
+- A persisted committed checkpoint and any WAL truncation must be derived from
+  a successful Tantivy commit boundary. Never advance or prune past operations
+  that the corresponding commit did not make durable.
 - Snapshot hashes run after lock release. Unlocked byte-copy fallback is
   forbidden when hard links are unavailable.
 - `StartPeerRecovery` snapshot preparation runs in a detached, cancellation-safe
