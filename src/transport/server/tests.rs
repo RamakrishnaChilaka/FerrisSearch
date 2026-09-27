@@ -2052,6 +2052,64 @@ async fn transient_fence_persist_failure_does_not_fail_the_shard_copy() {
 }
 
 #[tokio::test]
+async fn uninitialized_copy_failure_is_not_queued_for_reporting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = DomainClusterState::new("uninitialized-failure".into());
+    state.add_index(DomainIndexMetadata {
+        name: "idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("uuid-1"),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 1,
+                replicas: Vec::new(),
+                in_sync_replicas: Vec::new(),
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+    let shard_dir = dir.path().join("uuid-1/shard_0");
+    std::fs::create_dir_all(&shard_dir).unwrap();
+    std::fs::write(shard_dir.join("legacy-data"), b"not an empty initial copy").unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    cluster_manager.update_state(state);
+    let service = TransportService {
+        cluster_manager,
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    assert!(
+        service.ensure_primary_activated("idx", 0).await.is_err(),
+        "invalid initial storage must still fail closed"
+    );
+    assert!(
+        service
+            .primary_activation_state
+            .failed_copy_reports
+            .lock()
+            .await
+            .is_empty(),
+        "uninitialized copies must not enqueue FailShardCopy reports"
+    );
+}
+
+#[tokio::test]
 async fn search_remote_store_splits_requires_local_index_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let service = TransportService {

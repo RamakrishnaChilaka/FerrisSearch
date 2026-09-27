@@ -201,6 +201,24 @@ async fn report_failed_shard_copies(
 ) {
     let now = Instant::now();
     for failure in failures {
+        let current = cluster_manager.get_state();
+        let report_is_current = current
+            .indices
+            .get(&failure.index_name)
+            .is_some_and(|metadata| metadata.uuid.as_str() == failure.index_uuid)
+            && current.primary_initialized(&failure.index_name, failure.shard_id)
+            && current.shard_allocation_id(&failure.index_name, failure.shard_id, &failure.node_id)
+                == Some(failure.allocation_id);
+        if !report_is_current {
+            tracing::debug!(
+                index = failure.index_name,
+                shard_id = failure.shard_id,
+                node = failure.node_id,
+                allocation_id = failure.allocation_id,
+                "Skipping stale or uninitialized lifecycle shard-copy failure report"
+            );
+            continue;
+        }
         let report_key = (
             failure.index_uuid.clone(),
             failure.shard_id,

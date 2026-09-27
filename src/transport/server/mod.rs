@@ -2997,6 +2997,35 @@ impl TransportService {
             );
             return;
         }
+        if let Err(quarantine_error) = self
+            .shard_manager
+            .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
+            .await
+        {
+            tracing::warn!(
+                index = index_name,
+                shard_id,
+                error = %quarantine_error,
+                "Failed to quarantine invalid local shard copy"
+            );
+        }
+        let current = self.cluster_manager.get_state();
+        let report_is_current = current
+            .indices
+            .get(index_name)
+            .is_some_and(|metadata| metadata.uuid.as_str() == index_uuid)
+            && current.primary_initialized(index_name, shard_id)
+            && current.shard_allocation_id(index_name, shard_id, &self.local_node_id)
+                == Some(allocation_id);
+        if !report_is_current {
+            tracing::debug!(
+                index = index_name,
+                shard_id,
+                allocation_id,
+                "Skipping stale or uninitialized local shard-copy failure report"
+            );
+            return;
+        }
         const REPORT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let report_key = (index_uuid.to_string(), shard_id, allocation_id);
         let now = std::time::Instant::now();
@@ -3021,18 +3050,6 @@ impl TransportService {
             reports.insert(report_key, now);
         }
         let reason = error.to_string();
-        if let Err(error) = self
-            .shard_manager
-            .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
-            .await
-        {
-            tracing::warn!(
-                index = index_name,
-                shard_id,
-                error = %error,
-                "Failed to quarantine invalid local shard copy"
-            );
-        }
         let Some(raft) = self.raft.as_ref() else {
             return;
         };

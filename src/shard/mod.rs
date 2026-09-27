@@ -570,11 +570,19 @@ impl ShardManager {
         let Some(marker) = Self::load_peer_recovery_install_marker(shard_dir)? else {
             return Ok(());
         };
-        if assignment.is_some_and(|assignment| {
-            marker.index_uuid == index_uuid && marker.allocation_id == assignment.allocation_id
-        }) {
+        if let Some(assignment) = assignment {
+            let reason = if marker.index_uuid == index_uuid
+                && marker.allocation_id == assignment.allocation_id
+            {
+                "its current allocation".to_string()
+            } else {
+                format!(
+                    "a different allocation (marker UUID {}, allocation {})",
+                    marker.index_uuid, marker.allocation_id
+                )
+            };
             return Err(definitive_shard_copy_failure(format!(
-                "shard {index}/{shard_id} has an incomplete peer recovery installation for its current allocation"
+                "shard {index}/{shard_id} has an incomplete peer recovery installation for {reason}"
             )));
         }
         anyhow::bail!(
@@ -3806,6 +3814,42 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn authoritative_open_classifies_a_stale_install_marker_as_definitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let shard_dir = dir.path().join("uuid-1/shard_0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::write(
+            shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "index_uuid": "old-uuid",
+                "allocation_id": 3,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = match manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 3,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("an authoritative copy with a stale install marker must fail closed"),
+            Err(error) => error,
+        };
+        assert!(ShardManager::is_definitive_copy_failure(&error));
+        assert!(error.to_string().contains("a different allocation"));
     }
 
     #[tokio::test]
