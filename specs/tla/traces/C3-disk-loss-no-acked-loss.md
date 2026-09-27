@@ -8,7 +8,7 @@
 
 **Raw trace:** [`C3-disk-loss-no-acked-loss.log`](C3-disk-loss-no-acked-loss.log)
 
-**Raw trace SHA-256:** `6ee7d53c0be1a1d646a3f2bd8b4b8e54565ddbffc2926e790e109dc1fff0c6b7`
+**Raw trace SHA-256:** `e53e77c57e9eb14c5deae56f6ff0cf4b44f2d6ad21c66d874c9165516599c6fb`
 
 | State range | Model action | Rust behavior represented |
 | --- | --- | --- |

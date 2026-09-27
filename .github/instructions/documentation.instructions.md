@@ -74,6 +74,11 @@ benchmark artifacts.
 - Pending-target evidence must distinguish admission, definitive rejection,
   and later retry convergence. State whether durable marker restoration,
   deadline bumps, primary reactivation, or promotion is included.
+- Storage-failure evidence must distinguish immediate corruption from
+  retry-budget escalation, replica removal from promote-only primary handling,
+  and permanent failure from transient recovery.
+- Activation liveness claims must name the proactive lifecycle trigger and
+  preserve the no-trigger stutter trace as bounded counterevidence.
 - Record the monotonic applied-Raft-view assumption. Loss of `raft.db` followed
   by same-name rejoin is outside the current model.
 - Label model-only fixes, including allocation-ID fencing, as proposed until

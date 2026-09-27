@@ -134,7 +134,9 @@ otherwise race while extracting standard modules. Expected-violation
 configurations are successful only when they reproduce the documented
 invariant failure. Keep the bounded G1 empty-store and G2 copy-failure/liveness
 checks, pending-marker restart regression, term-change liveness checks, and
-minimal two-shard isolation check in the fast matrix.
+minimal two-shard isolation check in the fast matrix. Keep corruption,
+persistent-I/O escalation, promote-only primary reporting, and the
+no-lifecycle-activation temporal regression in that fast set.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with

@@ -35,8 +35,9 @@ cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
 ./scripts/tla/check.sh c1-aba-fixed c2-fixed l2  # Selected fixed-design checks
 ./scripts/tla/check.sh g1-empty-store g2-replica g2-primary g2-liveness
-./scripts/tla/check.sh l1-bump l2-primary-restart l2-promotion
+./scripts/tla/check.sh l1-bump l2-primary-idle l2-promotion
 ./scripts/tla/check.sh pending-restart-legacy pending-restart-fixed two-shard
+./scripts/tla/check.sh storage-replica storage-primary storage-primary-no-replica
 ./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
 ./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
 ```
@@ -49,13 +50,14 @@ cargo test -- test_name                         # Single test by name
   and uses isolated Java/TLC temporary directories.
 - Historical counterexamples are living model regressions. The runner must fail if
   `c1-aba`, `c2`, `c2-allocation-ids`, `fence-volatile`, `c3`, `c4`, or
-  `pending-restart-legacy` stops violating its named invariant; those
-  configurations intentionally retain historical protocol behavior.
+  `pending-restart-legacy` stops violating its named invariant, or if
+  `l2-primary-no-trigger` stops producing its temporal liveness violation;
+  those configurations intentionally retain historical protocol behavior.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
-  `g2-primary-red`, `g2-liveness`, `pending-restart-fixed`, `l1-bump`,
-  `l2-primary-restart`, `l2-promotion`, `two-shard`, `fixed-crash`, and
-  `fixed-partition` are expected-pass configurations for the allocation-ID,
-  durable-fencing, empty-store, copy-failure, and pending-marker design.
+  `g2-primary-no-replica`, `g2-liveness`, `pending-restart-fixed`, `l1-bump`,
+  `l2-primary-idle`, `l2-promotion`, `storage-replica`, `storage-primary`,
+  `storage-primary-no-replica`, `two-shard`, `fixed-crash`, and
+  `fixed-partition` are expected-pass configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
@@ -70,12 +72,19 @@ cargo test -- test_name                         # Single test by name
   why that assertion is too strong.
 - G1/G2 checks must cover CreateIndex before first activation, disk loss of
   primary and in-sync replica copies, exact-allocation `FailShardCopy`,
-  no-survivor red state, stale-report rejection, and fair replacement recovery.
+  no-survivor primary-report rejection, stale-report rejection, and fair
+  replacement recovery.
+- Storage-failure checks must exercise both immediate corruption and
+  persistent-I/O escalation. Replica removal and candidate promotion must
+  preserve acknowledged history; a primary report without an in-sync
+  candidate must be rejected without clearing its allocation.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt
   reaches admission, promotion, or definitive rejection; retry convergence is
   a separate configuration.
+- Idle-primary liveness must attach weak fairness to the proactive node
+  lifecycle activation action, not assume a future client or recovery request.
 - The minimal `two-shard` check covers index-level routing isolation only; do
   not cite it as a two-shard WAL, replication, or recovery proof.
 

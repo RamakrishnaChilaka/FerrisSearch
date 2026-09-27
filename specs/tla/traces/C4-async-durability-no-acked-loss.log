@@ -1,15 +1,15 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 37 and seed 8844054268363456502 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 87044] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 39 and seed 5564284786817133722 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 40847] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_C4.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.uM8qZl/c4/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.uM8qZl/c4/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.uM8qZl/c4/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.uM8qZl/c4/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/c4/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/c4/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/c4/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/c4/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -20,9 +20,9 @@ Semantic processing of module PeerRecovery
 Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_C4
-Starting... (2026-09-27 06:28:36)
+Starting... (2026-09-27 07:31:50)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-27 06:28:37.
+Finished computing initial states: 1 distinct state generated at 2026-09-27 07:31:50.
 Error: Invariant NoAckedLoss is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -51,9 +51,9 @@ State 1: <Initial predicate>
   allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
   inSync |-> {n2, n3},
   replicas |-> {n2, n3},
+  term |-> 1,
   unassigned |-> 0,
-  members |-> {n1, n2, n3},
-  term |-> 1 ]
+  members |-> {n1, n2, n3} ]
 /\ faultsStopped = FALSE
 /\ replicaFence = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
@@ -106,27 +106,27 @@ State 1: <Initial predicate>
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2, n3},
-        term |-> 1 ] @@
+        members |-> {n1, n2, n3} ] @@
   n2 :>
       [ primary |-> n1,
         initialized |-> TRUE,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2, n3},
-        term |-> 1 ] @@
+        members |-> {n1, n2, n3} ] @@
   n3 :>
       [ primary |-> n1,
         initialized |-> TRUE,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2, n3},
-        term |-> 1 ] )
+        members |-> {n1, n2, n3} ] )
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ diskLost = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Idle")
@@ -256,9 +256,9 @@ State 9: <C4Next line 35, col 8 to line 37, col 35 of module MC_C4>
   allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
   inSync |-> {n2, n3},
   replicas |-> {n2, n3},
+  term |-> 1,
   unassigned |-> 0,
-  members |-> {n1, n2, n3},
-  term |-> 1 ]
+  members |-> {n1, n2, n3} ]
 /\ faultsStopped = FALSE
 /\ replicaFence = (n1 :> 0 @@ n2 :> 0 @@ n3 :> 0)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE" @@ n3 :> "NO_NODE")
@@ -311,27 +311,27 @@ State 9: <C4Next line 35, col 8 to line 37, col 35 of module MC_C4>
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2, n3},
-        term |-> 1 ] @@
+        members |-> {n1, n2, n3} ] @@
   n2 :>
       [ primary |-> n1,
         initialized |-> TRUE,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2, n3},
-        term |-> 1 ] @@
+        members |-> {n1, n2, n3} ] @@
   n3 :>
       [ primary |-> n1,
         initialized |-> TRUE,
         allocations |-> (n1 :> 1 @@ n2 :> 1 @@ n3 :> 1),
         inSync |-> {n2, n3},
         replicas |-> {n2, n3},
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2, n3},
-        term |-> 1 ] )
+        members |-> {n1, n2, n3} ] )
 /\ alive = (n1 :> FALSE @@ n2 :> TRUE @@ n3 :> TRUE)
 /\ diskLost = (n1 :> FALSE @@ n2 :> FALSE @@ n3 :> FALSE)
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle" @@ n3 :> "Idle")
@@ -340,4 +340,4 @@ State 9: <C4Next line 35, col 8 to line 37, col 35 of module MC_C4>
 32 states generated, 21 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 9.
 The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 3 and the 95th percentile is 3).
-Finished in 01s at (2026-09-27 06:28:37)
+Finished in 01s at (2026-09-27 07:31:51)

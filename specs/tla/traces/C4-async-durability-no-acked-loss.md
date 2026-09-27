@@ -8,7 +8,7 @@
 
 **Raw trace:** [`C4-async-durability-no-acked-loss.log`](C4-async-durability-no-acked-loss.log)
 
-**Raw trace SHA-256:** `23ada25fc653306ebd543751c6e213aa72c99ac50bcff912c9f75fdf4b71e579`
+**Raw trace SHA-256:** `93d36449522ab0486464d428acb0439f2f8d60631725fcf5bbd9104083db47a7`
 
 | State range | Model action | Rust behavior represented |
 | --- | --- | --- |

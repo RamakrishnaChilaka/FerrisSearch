@@ -1,5 +1,5 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 18 and seed 1509799901620089974 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 87747] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 92 and seed -6086012429787461022 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 41273] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_PendingRestart.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_L1.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
@@ -7,10 +7,10 @@ Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
 Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
-Parsing file /tmp/ferrissearch-tla.uM8qZl/pending-restart-legacy/java-tmp/Naturals.tla
-Parsing file /tmp/ferrissearch-tla.uM8qZl/pending-restart-legacy/java-tmp/Sequences.tla
-Parsing file /tmp/ferrissearch-tla.uM8qZl/pending-restart-legacy/java-tmp/FiniteSets.tla
-Parsing file /tmp/ferrissearch-tla.uM8qZl/pending-restart-legacy/java-tmp/TLC.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/pending-restart-legacy/java-tmp/Naturals.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/pending-restart-legacy/java-tmp/Sequences.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/pending-restart-legacy/java-tmp/FiniteSets.tla
+Parsing file /tmp/ferrissearch-tla.CLlrai/pending-restart-legacy/java-tmp/TLC.tla
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -22,9 +22,9 @@ Semantic processing of module Faults
 Semantic processing of module Invariants
 Semantic processing of module MC_L1
 Semantic processing of module MC_PendingRestart
-Starting... (2026-09-27 06:28:59)
+Starting... (2026-09-27 07:32:11)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-09-27 06:29:00.
+Finished computing initial states: 1 distinct state generated at 2026-09-27 07:32:12.
 Error: Invariant NoPartialServe is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -53,9 +53,9 @@ State 1: <Initial predicate>
   inSync |-> {},
   initialized |-> TRUE,
   allocations |-> (n1 :> 1 @@ n2 :> 1),
+  term |-> 1,
   unassigned |-> 0,
-  members |-> {n1, n2},
-  term |-> 1 ]
+  members |-> {n1, n2} ]
 /\ faultsStopped = FALSE
 /\ replicaFence = (n1 :> 1 @@ n2 :> 1)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> "NO_NODE")
@@ -108,18 +108,18 @@ State 1: <Initial predicate>
         inSync |-> {},
         initialized |-> TRUE,
         allocations |-> (n1 :> 1 @@ n2 :> 1),
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2},
-        term |-> 1 ] @@
+        members |-> {n1, n2} ] @@
   n2 :>
       [ primary |-> n1,
         replicas |-> {n2},
         inSync |-> {},
         initialized |-> TRUE,
         allocations |-> (n1 :> 1 @@ n2 :> 1),
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2},
-        term |-> 1 ] )
+        members |-> {n1, n2} ] )
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE)
 /\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle")
@@ -223,10 +223,7 @@ State 16: <PRRestartTarget line 49, col 5 to line 50, col 32 of module MC_Pendin
 /\ raftConnected = (n1 :> TRUE @@ n2 :> TRUE)
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE)
 
-State 17: <PRStopFaults line 53, col 5 to line 59, col 54 of module MC_PendingRestart>
-/\ faultsStopped = TRUE
-
-State 18: <PRLegacyWipeAndDelayedAdmission line 76, col 5 to line 105, col 56 of module MC_PendingRestart>
+State 17: <PRLegacyWipeAndDelayedAdmission line 73, col 5 to line 102, col 56 of module MC_PendingRestart>
 /\ pendingRaft = {}
 /\ raftVoters = {n1, n2}
 /\ docValue = (n1 :> (d1 :> 1) @@ n2 :> (d1 :> 0))
@@ -252,10 +249,10 @@ State 18: <PRLegacyWipeAndDelayedAdmission line 76, col 5 to line 105, col 56 of
   inSync |-> {n2},
   initialized |-> TRUE,
   allocations |-> (n1 :> 1 @@ n2 :> 1),
+  term |-> 1,
   unassigned |-> 0,
-  members |-> {n1, n2},
-  term |-> 1 ]
-/\ faultsStopped = TRUE
+  members |-> {n1, n2} ]
+/\ faultsStopped = FALSE
 /\ replicaFence = (n1 :> 1 @@ n2 :> 1)
 /\ pendingPrimary = (n1 :> "NO_NODE" @@ n2 :> n1)
 /\ writePrimary = <<n1>>
@@ -307,18 +304,18 @@ State 18: <PRLegacyWipeAndDelayedAdmission line 76, col 5 to line 105, col 56 of
         inSync |-> {n2},
         initialized |-> TRUE,
         allocations |-> (n1 :> 1 @@ n2 :> 1),
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2},
-        term |-> 1 ] @@
+        members |-> {n1, n2} ] @@
   n2 :>
       [ primary |-> n1,
         replicas |-> {n2},
         inSync |-> {},
         initialized |-> TRUE,
         allocations |-> (n1 :> 1 @@ n2 :> 1),
+        term |-> 1,
         unassigned |-> 0,
-        members |-> {n1, n2},
-        term |-> 1 ] )
+        members |-> {n1, n2} ] )
 /\ alive = (n1 :> TRUE @@ n2 :> TRUE)
 /\ diskLost = (n1 :> FALSE @@ n2 :> FALSE)
 /\ lifecyclePhase = (n1 :> "Idle" @@ n2 :> "Idle")
@@ -327,4 +324,4 @@ State 18: <PRLegacyWipeAndDelayedAdmission line 76, col 5 to line 105, col 56 of
 20 states generated, 19 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 18.
 The average outdegree of the complete state graph is 1 (minimum is 1, the maximum 1 and the 95th percentile is 1).
-Finished in 01s at (2026-09-27 06:29:00)
+Finished in 01s at (2026-09-27 07:32:12)

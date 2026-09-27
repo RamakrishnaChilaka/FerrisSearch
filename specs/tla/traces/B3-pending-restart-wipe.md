@@ -8,7 +8,7 @@
 
 **Raw trace:** [`B3-pending-restart-wipe.log`](B3-pending-restart-wipe.log)
 
-**Raw trace SHA-256:** `41d753ebbd6a3f4833ca9669e252a691edd91d838caba5232f1b03abeae5f49b`
+**Raw trace SHA-256:** `848631eb1a132b854545cc9815b35ef6c40d4b37648bb8a646e759e61822190e`
 
 TLC generated 20 states, found 19 distinct states, and reached the violation
 at depth 18.
