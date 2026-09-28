@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import importlib.util
 import json
 import sys
@@ -18,10 +17,6 @@ sys.modules[SPEC.name] = trace_to_tla
 SPEC.loader.exec_module(trace_to_tla)
 
 
-def checkpoints() -> dict[str, None]:
-    return {"processed": None, "persisted": None, "max_seq_no": None}
-
-
 def start_record() -> dict[str, object]:
     return {
         "schema": trace_to_tla.SCHEMA,
@@ -29,25 +24,23 @@ def start_record() -> dict[str, object]:
         "step": 0,
         "event": "trace_start",
         "test": "unit",
+        "profile": "d1-core",
         "durability": "request",
-        "initial_prefix_through": None,
-        "nodes": [{"node": "n1", "incarnation": 0}],
+        "max_hidden_steps": 2,
+        "nodes": [
+            {"node": "p", "incarnation": 0},
+            {"node": "r", "incarnation": 0},
+        ],
         "shard_state": {
             "index_uuid": "idx",
             "shard": 0,
-            "primary": "n1",
+            "primary": "p",
             "term": 1,
             "activated": True,
-            "in_sync": [],
+            "in_sync": ["r"],
             "copies": [
-                {
-                    "node": "n1",
-                    "allocation": 1,
-                    "exists": True,
-                    "fence_term": 1,
-                    "fence_max_seq_no": None,
-                    "checkpoints": checkpoints(),
-                }
+                {"node": "p", "allocation": 1, "exists": True, "fence_term": 1},
+                {"node": "r", "allocation": 2, "exists": True, "fence_term": 1},
             ],
         },
     }
@@ -60,34 +53,25 @@ def end_record(step: int, count: int) -> dict[str, object]:
         "step": step,
         "event": "trace_end",
         "outcome": "completed",
-        "quiescent": True,
+        "quiescent": False,
         "records_before_end": count,
     }
 
 
-def route_record() -> dict[str, object]:
+def route_record(step: int = 1) -> dict[str, object]:
     return {
         "schema": trace_to_tla.SCHEMA,
         "run_id": "unit",
-        "step": 1,
+        "step": step,
         "event": "client_write_routed",
-        "node": "n1",
-        "incarnation": 0,
+        "node": "p",
         "index_uuid": "idx",
         "shard": 0,
-        "allocation": 1,
-        "peer": "n1",
-        "peer_incarnation": 0,
-        "peer_allocation": 1,
         "request_id": "w0",
-        "term": 1,
-        "seq_no": None,
+        "target_node": "p",
         "doc": "d",
         "op": "index",
         "content_hash": "a" * 64,
-        "origin": None,
-        "outcome": "routed",
-        "checkpoints": checkpoints(),
     }
 
 
@@ -96,68 +80,70 @@ class TraceConverterTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "trace.jsonl"
-        with path.open("w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        path.write_text(
+            "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+            encoding="utf-8",
+        )
         return path
 
-    def test_empty_trace_generates_module(self) -> None:
-        path = self.write_trace([start_record(), end_record(1, 1)])
+    def test_minimal_prefix_generates_module_and_config(self) -> None:
+        path = self.write_trace([start_record(), route_record(), end_record(2, 2)])
         trace = trace_to_tla.load_trace(path)
-        rendered = trace_to_tla.render_trace_input(trace)
-        self.assertIn("MODULE TraceInput", rendered)
-        self.assertIn("Trace == <<>>", rendered)
+        module, config = trace_to_tla.render(trace)
+        self.assertIn("MODULE TraceInput", module)
+        self.assertIn("Trace == <<", module)
+        self.assertIn("SPECIFICATION TraceSpec", config)
 
-    def test_unknown_schema_version_fails_loudly(self) -> None:
+    def test_v1_is_rejected(self) -> None:
         start = start_record()
-        start["schema"] = "ferrissearch.d1.trace/v2"
+        start["schema"] = "ferrissearch.d1.trace/v1"
         path = self.write_trace([start, end_record(1, 1)])
-        with self.assertRaisesRegex(
-            trace_to_tla.TraceSchemaError, "unsupported schema"
-        ):
+        with self.assertRaisesRegex(trace_to_tla.TraceSchemaError, "unsupported schema"):
             trace_to_tla.load_trace(path)
 
-    def test_unknown_event_fails_loudly(self) -> None:
+    def test_unknown_event_is_rejected(self) -> None:
         event = route_record()
         event["event"] = "future_event"
         path = self.write_trace([start_record(), event, end_record(2, 2)])
         with self.assertRaisesRegex(trace_to_tla.TraceSchemaError, "unknown event"):
             trace_to_tla.load_trace(path)
 
-    def test_unknown_field_fails_loudly(self) -> None:
+    def test_unknown_field_is_rejected(self) -> None:
         event = route_record()
         event["future_field"] = 1
         path = self.write_trace([start_record(), event, end_record(2, 2)])
         with self.assertRaisesRegex(trace_to_tla.TraceSchemaError, "unknown field"):
             trace_to_tla.load_trace(path)
 
-    def test_unknown_outcome_fails_loudly(self) -> None:
-        event = route_record()
-        event["outcome"] = "maybe"
-        path = self.write_trace([start_record(), event, end_record(2, 2)])
-        with self.assertRaisesRegex(trace_to_tla.TraceSchemaError, "unknown .* outcome"):
+    def test_steps_must_be_consecutive(self) -> None:
+        event = route_record(step=2)
+        path = self.write_trace([start_record(), event, end_record(3, 2)])
+        with self.assertRaisesRegex(trace_to_tla.TraceSchemaError, "step must be consecutive"):
             trace_to_tla.load_trace(path)
 
-    def test_operation_identity_cannot_change_content(self) -> None:
-        first = {
-            **route_record(),
-            "event": "wal_appended",
-            "request_id": "w0",
-            "term": 1,
-            "seq_no": 0,
-            "origin": "primary",
-            "outcome": "appended",
-            "durable": True,
+    def test_copy_state_cannot_invent_an_operation(self) -> None:
+        copy_state = {
+            "schema": trace_to_tla.SCHEMA,
+            "run_id": "unit",
+            "step": 1,
+            "event": "copy_state",
+            "node": "p",
+            "index_uuid": "idx",
+            "shard": 0,
+            "allocation": 1,
+            "reason": "quiescent",
+            "documents": [
+                {
+                    "doc": "d",
+                    "state": "live",
+                    "seq_no": 0,
+                    "term": 1,
+                    "content_hash": "a" * 64,
+                }
+            ],
         }
-        second = copy.deepcopy(first)
-        second["step"] = 2
-        second["content_hash"] = "b" * 64
-        path = self.write_trace(
-            [start_record(), first, second, end_record(3, 3)]
-        )
-        with self.assertRaisesRegex(
-            trace_to_tla.TraceSchemaError, "changed content"
-        ):
+        path = self.write_trace([start_record(), copy_state, end_record(2, 2)])
+        with self.assertRaisesRegex(trace_to_tla.TraceSchemaError, "unknown operation identity"):
             trace_to_tla.load_trace(path)
 
 

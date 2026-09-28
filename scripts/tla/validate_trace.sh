@@ -3,8 +3,6 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SPEC_DIR="$ROOT_DIR/specs/tla"
-TRACE_MODEL="$SPEC_DIR/TraceD1.tla"
-TRACE_CONFIG="$SPEC_DIR/TraceD1.cfg"
 CONVERTER="$ROOT_DIR/scripts/tla/trace_to_tla.py"
 TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
@@ -26,6 +24,42 @@ if [[ ! -f "$TRACE_PATH" ]]; then
     echo "Trace file does not exist: $TRACE_PATH" >&2
     exit 2
 fi
+
+PROFILE=$(
+    python3 - "$TRACE_PATH" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.loads(handle.readline()).get("profile", ""))
+PY
+)
+case "$PROFILE" in
+    d1-core)
+        TRACE_MODULE="TraceD1"
+        ACCEPT_INVARIANT="TraceNotAccepted"
+        TYPE_INVARIANT="TraceTypeOK"
+        ;;
+    d1-authority)
+        TRACE_MODULE="TraceD1Authority"
+        ACCEPT_INVARIANT="TraceAuthorityNotAccepted"
+        TYPE_INVARIANT="TraceAuthorityTypeOK"
+        ;;
+    d1-collision)
+        TRACE_MODULE="TraceD1Collision"
+        ACCEPT_INVARIANT="TraceCollisionNotAccepted"
+        TYPE_INVARIANT="TraceCollisionTypeOK"
+        ;;
+    d1-recovery)
+        TRACE_MODULE="TraceD1Recovery"
+        ACCEPT_INVARIANT="TraceRecoveryNotAccepted"
+        TYPE_INVARIANT="TraceRecoveryTypeOK"
+        ;;
+    *)
+        TRACE_MODULE="TraceD1"
+        ACCEPT_INVARIANT="TraceNotAccepted"
+        TYPE_INVARIANT="TraceTypeOK"
+        ;;
+esac
 
 verify_jar() {
     local jar=$1
@@ -68,8 +102,47 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 "$CONVERTER" "$TRACE_PATH" --output "$RUN_DIR/TraceInput.tla"
-cp "$TRACE_MODEL" "$TRACE_CONFIG" "$RUN_DIR/"
+set +e
+conversion_output=$(
+    python3 "$CONVERTER" "$TRACE_PATH" \
+        --output "$RUN_DIR/TraceInput.tla" \
+        --config-output "$RUN_DIR/TraceD1.cfg" 2>&1
+)
+conversion_status=$?
+set -e
+if [[ $conversion_status -ne 0 ]]; then
+    echo "$conversion_output" >&2
+    line=$(sed -n 's/.*line \([0-9][0-9]*\):.*/\1/p' <<<"$conversion_output" | tail -n 1)
+    if [[ -n "$line" && "$line" -gt 1 ]]; then
+        step=$((line - 1))
+        event=$(
+            python3 - "$TRACE_PATH" "$step" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        record = json.loads(line)
+        if record.get("step") == int(sys.argv[2]):
+            print(record.get("event", "schema"))
+            break
+PY
+        )
+        echo "Trace rejected at schema step $step (event ${event:-schema})" >&2
+    fi
+    exit 1
+fi
+echo "$conversion_output"
+cp \
+    "$SPEC_DIR/$TRACE_MODULE.tla" \
+    "$SPEC_DIR/MC_D1_SeqNoApply.tla" \
+    "$SPEC_DIR/MC_D1_TermCollision.tla" \
+    "$SPEC_DIR/Invariants.tla" \
+    "$SPEC_DIR/Faults.tla" \
+    "$SPEC_DIR/PeerRecovery.tla" \
+    "$SPEC_DIR/ShardReplication.tla" \
+    "$SPEC_DIR/RaftLog.tla" \
+    "$RUN_DIR/"
 mkdir -p "$RUN_DIR/java-tmp" "$RUN_DIR/states"
 
 set +e
@@ -84,9 +157,10 @@ set +e
         -deadlock \
         -difftrace \
         -workers 1 \
+        -dump "$RUN_DIR/states.dump" \
         -metadir "$RUN_DIR/states" \
         -config TraceD1.cfg \
-        TraceD1.tla
+        "$TRACE_MODULE.tla"
 ) >"$RUN_DIR/tlc.log" 2>&1
 status=$?
 set -e
@@ -97,46 +171,54 @@ if [[ $status -eq 124 ]]; then
     exit 1
 fi
 
-if [[ $status -eq 0 ]] &&
-    ! grep -Fq "Error:" "$RUN_DIR/tlc.log" &&
-    grep -Fq "Model checking completed. No error has been found." "$RUN_DIR/tlc.log"; then
-    echo "Trace accepted by TraceD1: $TRACE_PATH"
+if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
+    ! grep -Fq "Invariant $TYPE_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
+    echo "Trace accepted by $TRACE_MODULE: $TRACE_PATH"
     exit 0
 fi
 
-if grep -Fq "Invariant TraceFailureFree is violated." "$RUN_DIR/tlc.log"; then
-    failed_step=$(
-        sed -n 's/.*failedStep |-> \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/tlc.log" |
+if [[ $status -eq 0 ]] &&
+    ! grep -Fq "Error:" "$RUN_DIR/tlc.log" &&
+    grep -Fq "Model checking completed. No error has been found." "$RUN_DIR/tlc.log"; then
+    max_position=$(
+        sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
+            sort -n |
             tail -n 1
     )
-    if [[ -z "$failed_step" ]]; then
-        failed_step=$(
-            sed -n 's/.*failedStep = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/tlc.log" |
-                tail -n 1
-        )
+    if [[ -z "$max_position" ]]; then
+        max_position=1
     fi
-    if [[ -n "$failed_step" ]]; then
-        failed_event=$(
-            python3 - "$TRACE_PATH" "$failed_step" <<'PY'
+    failed_step=$(
+        python3 - "$TRACE_PATH" "$max_position" <<'PY'
 import json
 import sys
 
-path, step = sys.argv[1], int(sys.argv[2])
+path, position = sys.argv[1], int(sys.argv[2])
+events = []
 with open(path, encoding="utf-8") as handle:
     for line in handle:
         record = json.loads(line)
-        if record.get("step") == step:
-            print(record.get("event", "unknown"))
+        if record.get("event") not in {"trace_start", "trace_end"}:
+            events.append(record)
+if position <= len(events):
+    print(events[position - 1]["step"])
+else:
+    print(len(events) + 1)
+PY
+    )
+    failed_event=$(
+        python3 - "$TRACE_PATH" "$failed_step" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        record = json.loads(line)
+        if record.get("step") == int(sys.argv[2]):
+            print(record.get("event", "trace_end"))
             break
 PY
-        )
-        echo "Trace rejected at schema step $failed_step (event ${failed_event:-unknown}): $TRACE_PATH" >&2
-    else
-        echo "Trace rejected, but TLC did not expose failedStep: $TRACE_PATH" >&2
-    fi
-    if [[ "${TLA_TRACE_VERBOSE:-0}" == "1" ]]; then
-        cat "$RUN_DIR/tlc.log" >&2
-    fi
+    )
+    echo "Trace rejected at schema step $failed_step (event ${failed_event:-trace_end}): $TRACE_PATH" >&2
     exit 1
 fi
 
