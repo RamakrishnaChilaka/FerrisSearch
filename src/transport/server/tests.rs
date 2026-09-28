@@ -3019,12 +3019,20 @@ async fn primary_apply_escalation_keeps_reads_open_without_immediate_wal_replay(
     }
     assert!(engine.get_document("baseline").unwrap().is_some());
     for attempt in 0..3 {
-        assert!(
-            engine
-                .get_document(&format!("failed-after-wal-{attempt}"))
-                .unwrap()
-                .is_none()
-        );
+        let document = engine
+            .get_document(&format!("failed-after-wal-{attempt}"))
+            .unwrap();
+        if attempt < 2 {
+            assert!(
+                document.is_some(),
+                "the next write must rebuild and replay the prior post-WAL gap"
+            );
+        } else {
+            assert!(
+                document.is_none(),
+                "the currently failing post-WAL operation must remain invisible"
+            );
+        }
     }
     let wal_operations = engine
         .peer_recovery_ops(0, usize::MAX, usize::MAX)
@@ -3041,12 +3049,13 @@ async fn primary_apply_escalation_keeps_reads_open_without_immediate_wal_replay(
     assert!(Arc::ptr_eq(&same_engine, &engine));
     assert!(same_engine.get_document("baseline").unwrap().is_some());
     for attempt in 0..3 {
-        assert!(
-            same_engine
-                .get_document(&format!("failed-after-wal-{attempt}"))
-                .unwrap()
-                .is_none(),
-            "failed post-WAL mutation must remain absent before writer rebuild or replay"
+        let document = same_engine
+            .get_document(&format!("failed-after-wal-{attempt}"))
+            .unwrap();
+        assert_eq!(
+            document.is_some(),
+            attempt < 2,
+            "only operations replayed by a later writer rebuild may be visible"
         );
     }
 }

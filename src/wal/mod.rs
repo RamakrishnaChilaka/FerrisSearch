@@ -74,6 +74,12 @@ pub(crate) struct UnsupportedWalFormatError {
     expected: u32,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("legacy WAL migration failed: {message}")]
+pub(crate) struct LegacyWalMigrationError {
+    message: String,
+}
+
 fn wal_corruption(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(WalCorruptionError {
         message: message.into(),
@@ -161,15 +167,6 @@ pub(crate) enum WalDocumentOperation<'a> {
     NoOp {
         reason: &'a str,
     },
-}
-
-impl<'a> WalDocumentOperation<'a> {
-    pub(crate) fn doc_id(self) -> Option<&'a str> {
-        match self {
-            Self::Index { doc_id, .. } | Self::Delete { doc_id } => Some(doc_id),
-            Self::NoOp { .. } => None,
-        }
-    }
 }
 
 pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOperation<'_>> {
@@ -772,6 +769,24 @@ struct ManifestVersionHeader {
     version: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTranslogManifestV1 {
+    version: u32,
+    active_generation_id: u64,
+    next_generation_id: u64,
+    generations: Vec<LegacyManifestGenerationV1>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyManifestGenerationV1 {
+    id: u64,
+    first_seq_no: Option<u64>,
+    last_seq_no: Option<u64>,
+    size_bytes: u64,
+}
+
 impl TranslogManifest {
     fn from_state(state: &TranslogState) -> Self {
         Self {
@@ -1257,6 +1272,7 @@ impl HotTranslog {
                     active_scan.trailing_bytes,
                 )?;
             }
+
             active_generation.min_seq_no = active_scan.generation.min_seq_no;
             active_generation.max_seq_no = active_scan.generation.max_seq_no;
             active_generation.size_bytes = active_scan.valid_bytes;
@@ -1338,6 +1354,107 @@ impl HotTranslog {
             #[cfg(test)]
             write_io_failure: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub(crate) fn migrate_empty_v1<P: AsRef<Path>>(data_dir: P) -> Result<Option<u64>> {
+        let data_dir = data_dir.as_ref();
+        let path = manifest_path(data_dir);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let header: ManifestVersionHeader = serde_json::from_slice(&bytes).map_err(|error| {
+            wal_corruption(format!("decode translog manifest {path:?}: {error}"))
+        })?;
+        if header.version == TRANSLOG_MANIFEST_VERSION {
+            return Ok(None);
+        }
+        if header.version != 1 {
+            return Err(unsupported_wal_format(
+                "translog manifest",
+                header.version,
+                TRANSLOG_MANIFEST_VERSION,
+            ));
+        }
+        let legacy: LegacyTranslogManifestV1 = serde_json::from_slice(&bytes).map_err(|error| {
+            wal_corruption(format!("decode legacy translog manifest {path:?}: {error}"))
+        })?;
+        if legacy.version != 1 || legacy.generations.is_empty() {
+            return Err(LegacyWalMigrationError {
+                message: "legacy translog manifest is malformed".to_string(),
+            }
+            .into());
+        }
+        let mut generations = Vec::with_capacity(legacy.generations.len());
+        for generation in legacy.generations {
+            let path = generation_path(data_dir, generation.id);
+            let actual_size = fs::metadata(&path)?.len();
+            if generation.size_bytes != 0
+                || actual_size != 0
+                || generation.first_seq_no.is_some()
+                || generation.last_seq_no.is_some()
+            {
+                return Err(LegacyWalMigrationError {
+                    message: format!("legacy translog generation {} is not empty", generation.id),
+                }
+                .into());
+            }
+            generations.push(ManifestGenerationInfo {
+                id: generation.id,
+                min_seq_no: None,
+                max_seq_no: None,
+                size_bytes: 0,
+            });
+        }
+        if !generations
+            .iter()
+            .any(|generation| generation.id == legacy.active_generation_id)
+        {
+            return Err(LegacyWalMigrationError {
+                message: "legacy translog active generation is missing".to_string(),
+            }
+            .into());
+        }
+        let persisted_next_seq_no = match fs::read_to_string(data_dir.join(TRANSLOG_SEQNO_FILE)) {
+            Ok(value) => value.trim().parse::<u64>().map_err(|error| {
+                wal_corruption(format!(
+                    "invalid legacy translog sequence watermark: {error}"
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        let committed_next_seq_no = fs::read_to_string(data_dir.join("translog.committed"))
+            .map_err(|error| LegacyWalMigrationError {
+                message: format!("read legacy committed boundary: {error}"),
+            })?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| LegacyWalMigrationError {
+                message: format!("parse legacy committed boundary: {error}"),
+            })?;
+        if committed_next_seq_no != persisted_next_seq_no {
+            return Err(LegacyWalMigrationError {
+                message: format!(
+                    "legacy committed boundary {committed_next_seq_no} does not match sequence watermark {persisted_next_seq_no}"
+                ),
+            }
+            .into());
+        }
+
+        persist_translog_manifest(
+            &path,
+            &TranslogManifest {
+                version: TRANSLOG_MANIFEST_VERSION,
+                entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
+                active_generation_id: legacy.active_generation_id,
+                next_generation_id: legacy.next_generation_id,
+                generations,
+            },
+        )?;
+        File::open(data_dir)?.sync_all()?;
+        Ok(Some(committed_next_seq_no))
     }
 
     #[cfg(test)]

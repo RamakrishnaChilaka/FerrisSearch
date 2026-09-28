@@ -5,6 +5,7 @@ pub mod routing;
 pub(crate) mod sequence;
 pub mod tantivy;
 pub mod vector;
+pub(crate) mod version_map;
 
 use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -16,6 +17,60 @@ use std::sync::{Arc, Mutex};
 pub use self::composite::CompositeEngine;
 pub use self::sequence::SequenceStats;
 pub use self::tantivy::HotEngine;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocumentMutation {
+    Index {
+        doc_id: String,
+        source: serde_json::Value,
+    },
+    Delete {
+        doc_id: String,
+    },
+    NoOp {
+        reason: String,
+    },
+}
+
+impl DocumentMutation {
+    pub fn doc_id(&self) -> Option<&str> {
+        match self {
+            Self::Index { doc_id, .. } | Self::Delete { doc_id } => Some(doc_id),
+            Self::NoOp { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequencedOperation {
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub mutation: DocumentMutation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    Stale,
+    Redelivery,
+    NoOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaApplyReceipt {
+    pub outcome: ApplyOutcome,
+    pub operation_processed: bool,
+    pub operation_persisted: bool,
+    pub sequence: SequenceStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaBulkApplyReceipt {
+    pub outcomes: Vec<ApplyOutcome>,
+    pub all_operations_processed: bool,
+    pub all_operations_persisted: bool,
+    pub sequence: SequenceStats,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]

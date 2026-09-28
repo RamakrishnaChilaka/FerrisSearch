@@ -127,12 +127,35 @@ pub(crate) struct ShardReopenAborted {
 enum CompositeOpenMode {
     CreateOrOpen { allow_schema_reset: bool },
     ExistingOnly,
+    ExistingPrimary { primary_term: u64 },
+    RecoveryTarget,
 }
 
 #[derive(Clone, Copy)]
 enum ShardOpenAuthority {
-    Local { allow_schema_reset: bool },
-    Assigned(AssignedShardOpen),
+    Local {
+        allow_schema_reset: bool,
+    },
+    Assigned {
+        assignment: AssignedShardOpen,
+        role: AssignedOpenRole,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum AssignedOpenRole {
+    Primary,
+    Replica,
+}
+
+struct AssignedOpenRequest<'a> {
+    index: &'a str,
+    shard_id: u32,
+    mappings: &'a HashMap<String, crate::cluster::state::FieldMapping>,
+    settings: &'a IndexSettings,
+    index_uuid: &'a str,
+    assignment: AssignedShardOpen,
+    role: AssignedOpenRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1552,6 +1575,25 @@ impl ShardManager {
                     self.durability,
                     self.column_cache.clone(),
                 ),
+                CompositeOpenMode::ExistingPrimary { primary_term } => {
+                    CompositeEngine::open_existing_primary_with_mappings(
+                        shard_dir,
+                        refresh_interval,
+                        mappings,
+                        self.durability,
+                        self.column_cache.clone(),
+                        primary_term,
+                    )
+                }
+                CompositeOpenMode::RecoveryTarget => {
+                    CompositeEngine::open_recovery_target_with_mappings(
+                        shard_dir,
+                        refresh_interval,
+                        mappings,
+                        self.durability,
+                        self.column_cache.clone(),
+                    )
+                }
                 CompositeOpenMode::CreateOrOpen { .. } => CompositeEngine::new_with_mappings(
                     shard_dir,
                     refresh_interval,
@@ -1652,6 +1694,50 @@ impl ShardManager {
         index_uuid: &str,
         assignment: AssignedShardOpen,
     ) -> Result<Arc<dyn SearchEngine>> {
+        self.open_assigned_shard_with_role(AssignedOpenRequest {
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            assignment,
+            role: AssignedOpenRole::Replica,
+        })
+    }
+
+    pub fn open_primary_assigned_shard_with_settings(
+        &self,
+        index: &str,
+        shard_id: u32,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: &IndexSettings,
+        index_uuid: &str,
+        assignment: AssignedShardOpen,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        self.open_assigned_shard_with_role(AssignedOpenRequest {
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            assignment,
+            role: AssignedOpenRole::Primary,
+        })
+    }
+
+    fn open_assigned_shard_with_role(
+        &self,
+        request: AssignedOpenRequest<'_>,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let AssignedOpenRequest {
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            assignment,
+            role,
+        } = request;
         let retry_key = Self::copy_io_key(
             index_uuid,
             shard_id,
@@ -1673,7 +1759,7 @@ impl ShardManager {
             mappings,
             settings,
             index_uuid,
-            ShardOpenAuthority::Assigned(assignment),
+            ShardOpenAuthority::Assigned { assignment, role },
         ) {
             Ok(engine) => {
                 self.clear_copy_io_failure(&retry_key);
@@ -1692,20 +1778,27 @@ impl ShardManager {
         index_uuid: &str,
         authority: ShardOpenAuthority,
     ) -> Result<Arc<dyn SearchEngine>> {
-        let (assignment, open_mode) = match authority {
-            ShardOpenAuthority::Local { allow_schema_reset } => {
-                (None, CompositeOpenMode::CreateOrOpen { allow_schema_reset })
-            }
-            ShardOpenAuthority::Assigned(assignment) => (
-                Some(assignment),
-                if assignment.allow_empty_creation {
+        let (assignment, open_mode, assigned_role) = match authority {
+            ShardOpenAuthority::Local { allow_schema_reset } => (
+                None,
+                CompositeOpenMode::CreateOrOpen { allow_schema_reset },
+                None,
+            ),
+            ShardOpenAuthority::Assigned { assignment, role } => {
+                let open_mode = if assignment.allow_empty_creation {
                     CompositeOpenMode::CreateOrOpen {
                         allow_schema_reset: false,
                     }
                 } else {
-                    CompositeOpenMode::ExistingOnly
-                },
-            ),
+                    match role {
+                        AssignedOpenRole::Primary => CompositeOpenMode::ExistingPrimary {
+                            primary_term: assignment.primary_term,
+                        },
+                        AssignedOpenRole::Replica => CompositeOpenMode::ExistingOnly,
+                    }
+                };
+                (Some(assignment), open_mode, Some(role))
+            }
         };
         let key = ShardKey::new(index, shard_id);
         let shard_dir = self
@@ -1831,7 +1924,15 @@ impl ShardManager {
             mappings,
             open_mode,
         )?;
-        if let Some(identity) = prepared_identity {
+        if let Some(mut identity) = prepared_identity {
+            if matches!(assigned_role, Some(AssignedOpenRole::Primary))
+                && let Some(migration_checkpoint) = engine.legacy_migration_checkpoint()
+                && identity.fence_max_seq_no != Some(migration_checkpoint)
+            {
+                identity.fence_max_seq_no = Some(migration_checkpoint);
+                Self::persist_copy_identity(&shard_dir, &identity)?;
+                self.cache_copy_identity(&key, identity.clone());
+            }
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
         }
@@ -1920,6 +2021,26 @@ impl ShardManager {
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking assigned shard open task failed: {e}"))?
+    }
+
+    pub async fn open_primary_assigned_shard_with_settings_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: IndexSettings,
+        index_uuid: impl Into<String> + Send + 'static,
+        assignment: AssignedShardOpen,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let shard_manager = self.clone();
+        let uuid_str = index_uuid.into();
+        tokio::task::spawn_blocking(move || {
+            shard_manager.open_primary_assigned_shard_with_settings(
+                &index, shard_id, &mappings, &settings, &uuid_str, assignment,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking primary shard open task failed: {e}"))?
     }
 
     pub async fn open_shard_with_settings_strict_blocking(
@@ -2583,9 +2704,7 @@ impl ShardManager {
                 &shard_dir,
                 refresh_interval,
                 &mappings,
-                CompositeOpenMode::CreateOrOpen {
-                    allow_schema_reset: false,
-                },
+                CompositeOpenMode::RecoveryTarget,
             )?;
             let mut actual_files = engine.peer_recovery_commit_files()?;
             expected_files.sort();

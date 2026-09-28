@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 use tantivy::query::QueryParser;
@@ -18,6 +18,7 @@ use super::sequence::{
     CommittedBoundaryRecord, LocalCheckpointTracker, PrimaryTermSequenceState, SequenceStats,
     initialize_term_sequence_state,
 };
+use super::version_map::{DEFAULT_VERSION_MAP_MAX_BYTES, LiveVersionMap, PrunedTombstone};
 use crate::wal::{
     HotTranslog, TranslogDurability, WalDocumentOperation, WriteAheadLog, document_operation,
 };
@@ -49,11 +50,38 @@ pub(crate) struct TantivyCommitFailureError {
     source: tantivy::TantivyError,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "sequence operation collision at ({primary_term}, {seq_no}): existing operation differs from the incoming operation"
+)]
+pub(crate) struct SequenceOperationCollisionError {
+    primary_term: u64,
+    seq_no: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("internal sequence field validation failed: {message}")]
+pub(crate) struct InternalSequenceFieldError {
+    message: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("legacy replica is awaiting primary D1 migration")]
+pub(crate) struct LegacyReplicaAwaitingPrimaryMigration;
+
 struct ApplyState {
     checkpoints: LocalCheckpointTracker,
     term_sequences: PrimaryTermSequenceState,
+    versions: LiveVersionMap,
     max_seq_no_of_updates_or_deletes: Option<u64>,
     legacy_migration_checkpoint: Option<u64>,
+}
+
+#[derive(Clone)]
+struct SequencePlanningSnapshot {
+    checkpoints: LocalCheckpointTracker,
+    term_sequences: PrimaryTermSequenceState,
+    max_seq_no_of_updates_or_deletes: Option<u64>,
 }
 
 impl ApplyState {
@@ -66,6 +94,7 @@ impl ApplyState {
         Ok(Self {
             checkpoints: LocalCheckpointTracker::new(committed.clone())?,
             term_sequences,
+            versions: LiveVersionMap::new(DEFAULT_VERSION_MAP_MAX_BYTES),
             max_seq_no_of_updates_or_deletes: committed.max_seq_no_of_updates_or_deletes,
             legacy_migration_checkpoint: committed.legacy_migration_checkpoint,
         })
@@ -78,33 +107,9 @@ impl ApplyState {
             committed.term_sequence_state.max_seq_no_at_term_start,
             &committed,
         )?;
+        self.versions.reset();
         self.max_seq_no_of_updates_or_deletes = committed.max_seq_no_of_updates_or_deletes;
         self.legacy_migration_checkpoint = committed.legacy_migration_checkpoint;
-        Ok(())
-    }
-
-    fn prepare_operation(
-        &mut self,
-        primary_term: u64,
-        seq_no: u64,
-        updates_or_deletes: bool,
-    ) -> Result<()> {
-        if primary_term > self.term_sequences.current_term() {
-            self.term_sequences
-                .raise_term(primary_term, self.checkpoints.max_seq_no())?;
-        }
-        self.term_sequences.check_before_redelivery(
-            primary_term,
-            seq_no,
-            self.checkpoints.has_processed(seq_no),
-        )?;
-        self.checkpoints.advance_max_seq_no(seq_no);
-        if updates_or_deletes {
-            self.max_seq_no_of_updates_or_deletes = Some(
-                self.max_seq_no_of_updates_or_deletes
-                    .map_or(seq_no, |current| current.max(seq_no)),
-            );
-        }
         Ok(())
     }
 
@@ -133,6 +138,38 @@ impl ApplyState {
             term_sequence_state: self.term_sequences.to_record(),
         }
     }
+
+    fn planning_snapshot(&self) -> SequencePlanningSnapshot {
+        SequencePlanningSnapshot {
+            checkpoints: self.checkpoints.clone(),
+            term_sequences: self.term_sequences.clone(),
+            max_seq_no_of_updates_or_deletes: self.max_seq_no_of_updates_or_deletes,
+        }
+    }
+
+    fn restore_planning_snapshot(&mut self, snapshot: SequencePlanningSnapshot) {
+        self.checkpoints = snapshot.checkpoints;
+        self.term_sequences = snapshot.term_sequences;
+        self.max_seq_no_of_updates_or_deletes = snapshot.max_seq_no_of_updates_or_deletes;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalDisposition {
+    Append,
+    AlreadyInLocalWal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentVersion {
+    Native(super::version_map::VersionValue),
+    LegacyAtOrBelow { migration_checkpoint: u64 },
+}
+
+struct PlannedOperation {
+    operation: super::SequencedOperation,
+    outcome: super::ApplyOutcome,
+    complete: bool,
 }
 
 /// Dynamic field registry — maps user-facing field names to Tantivy Field handles.
@@ -142,6 +179,8 @@ struct FieldRegistry {
     id_field: Field,
     /// _source: stores the raw JSON document (STORED only, not indexed)
     source_field: Field,
+    seq_no_field: Option<Field>,
+    primary_term_field: Option<Field>,
     /// Named text fields created dynamically from document keys
     fields: HashMap<String, Field>,
     /// Logical field mappings so Date remains distinct from Integer even
@@ -150,6 +189,28 @@ struct FieldRegistry {
     /// Mapped Date field names for targeted source normalization on ingest/read.
     date_fields: Vec<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HotEnginePurpose {
+    LocalShard(LegacyOpenRole),
+    RemoteSplit,
+}
+
+impl HotEnginePurpose {
+    fn requires_sequence_fields(self) -> bool {
+        matches!(self, Self::LocalShard(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyOpenRole {
+    Primary { primary_term: u64 },
+    Replica,
+    RecoveryTarget,
+}
+
+const SEQ_NO_FIELD_NAME: &str = "_seq_no";
+const PRIMARY_TERM_FIELD_NAME: &str = "_primary_term";
 
 struct WriterState {
     writer: Option<IndexWriter>,
@@ -234,7 +295,15 @@ pub struct HotEngine {
     #[cfg(test)]
     engine_apply_failure: Mutex<Option<(i32, usize)>>,
     #[cfg(test)]
+    refresh_commit_failures: Mutex<usize>,
+    #[cfg(test)]
+    post_apply_refresh_failures: Mutex<usize>,
+    #[cfg(test)]
     refresh_before_writer_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    refresh_after_commit_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    refresh_after_commit_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     #[cfg(test)]
     peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
     #[cfg(test)]
@@ -249,6 +318,7 @@ pub struct HotEngine {
     apply_state: Mutex<ApplyState>,
     committed_boundary_path: PathBuf,
     durability: TranslogDurability,
+    delete_tombstone_retention: Duration,
     /// Shared column cache for fast-field Arrow arrays and grouped-partials
     /// full-segment decoded columns.
     column_cache: Arc<super::column_cache::ColumnCache>,
@@ -435,6 +505,230 @@ fn evolve_meta_json_schema(
     Ok(())
 }
 
+fn evolve_meta_json_internal_sequence_fields(meta_json_path: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(meta_json_path)?;
+    let mut meta: serde_json::Value = serde_json::from_str(&raw)?;
+    let schema_arr = meta
+        .get_mut("schema")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| authoritative_schema_error("meta.json missing 'schema' array"))?;
+    let existing_names: std::collections::HashSet<&str> = schema_arr
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+    let has_seq_no = existing_names.contains(SEQ_NO_FIELD_NAME);
+    let has_primary_term = existing_names.contains(PRIMARY_TERM_FIELD_NAME);
+    match (has_seq_no, has_primary_term) {
+        (true, true) => return Ok(()),
+        (true, false) | (false, true) => {
+            return Err(authoritative_schema_error(
+                "local shard schema contains only one D1 sequence field",
+            ));
+        }
+        (false, false) => {}
+    }
+
+    for name in [SEQ_NO_FIELD_NAME, PRIMARY_TERM_FIELD_NAME] {
+        let mut builder = Schema::builder();
+        builder.add_u64_field(name, FAST | STORED);
+        let serialized = serde_json::to_value(builder.build())?;
+        let entry = serialized
+            .as_array()
+            .and_then(|entries| entries.first())
+            .cloned()
+            .ok_or_else(|| authoritative_schema_error("serialize internal u64 schema field"))?;
+        schema_arr.push(entry);
+    }
+
+    let tmp_path = meta_json_path.with_extension("json.tmp");
+    let mut bytes = serde_json::to_vec_pretty(&meta)?;
+    bytes.push(b'\n');
+    std::fs::write(&tmp_path, bytes)?;
+    std::fs::rename(&tmp_path, meta_json_path)?;
+    Ok(())
+}
+
+fn internal_sequence_field_presence(meta_json_path: &Path) -> Result<(bool, bool)> {
+    let raw = std::fs::read_to_string(meta_json_path)?;
+    let meta: serde_json::Value = serde_json::from_str(&raw)?;
+    let schema = meta
+        .get("schema")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| authoritative_schema_error("meta.json missing 'schema' array"))?;
+    let names = schema
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+    Ok((
+        names.contains(SEQ_NO_FIELD_NAME),
+        names.contains(PRIMARY_TERM_FIELD_NAME),
+    ))
+}
+
+fn prepare_internal_sequence_schema(
+    data_dir: &Path,
+    meta_json_path: &Path,
+    purpose: HotEnginePurpose,
+) -> Result<()> {
+    let HotEnginePurpose::LocalShard(role) = purpose else {
+        return Ok(());
+    };
+    match internal_sequence_field_presence(meta_json_path)? {
+        (true, true) => return Ok(()),
+        (true, false) | (false, true) => {
+            return Err(authoritative_schema_error(
+                "local shard schema contains only one D1 sequence field",
+            ));
+        }
+        (false, false) => {}
+    }
+
+    match role {
+        LegacyOpenRole::Replica => Err(LegacyReplicaAwaitingPrimaryMigration.into()),
+        LegacyOpenRole::RecoveryTarget => {
+            let boundary = CommittedBoundaryRecord::load(&data_dir.join("translog.committed"))?
+                .ok_or_else(|| {
+                    authoritative_schema_error(
+                        "legacy recovery target is missing its committed boundary",
+                    )
+                })?;
+            if boundary.legacy_migration_checkpoint.is_none() {
+                return Err(authoritative_schema_error(
+                    "native recovery target is missing D1 sequence fields",
+                ));
+            }
+            evolve_meta_json_internal_sequence_fields(meta_json_path)
+        }
+        LegacyOpenRole::Primary { primary_term } => {
+            migrate_flushed_legacy_primary(data_dir, meta_json_path, primary_term)
+        }
+    }
+}
+
+fn migrate_flushed_legacy_primary(
+    data_dir: &Path,
+    meta_json_path: &Path,
+    primary_term: u64,
+) -> Result<()> {
+    let committed_path = data_dir.join("translog.committed");
+    let committed_bytes = std::fs::read(&committed_path)?;
+    if committed_bytes.first() == Some(&b'{') {
+        let committed = CommittedBoundaryRecord::load(&committed_path)?.ok_or_else(|| {
+            authoritative_schema_error("legacy primary committed boundary disappeared")
+        })?;
+        if committed.legacy_migration_checkpoint.is_none() && committed.max_seq_no.is_some() {
+            return Err(authoritative_schema_error(
+                "native local shard is missing D1 sequence fields",
+            ));
+        }
+        return evolve_meta_json_internal_sequence_fields(meta_json_path);
+    }
+
+    let migrated_next_seq_no = HotTranslog::migrate_empty_v1(data_dir)?;
+    let legacy_next_seq_no = std::str::from_utf8(&committed_bytes)?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| {
+            authoritative_schema_error(format!("parse legacy committed boundary: {error}"))
+        })?;
+    if migrated_next_seq_no.is_some_and(|migrated| migrated != legacy_next_seq_no) {
+        return Err(authoritative_schema_error(
+            "legacy WAL migration returned an inconsistent boundary",
+        ));
+    }
+    let persisted_next_seq_no = std::fs::read_to_string(data_dir.join("translog.seqno"))
+        .unwrap_or_else(|_| "0".to_string())
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| {
+            authoritative_schema_error(format!("parse legacy sequence watermark: {error}"))
+        })?;
+    if persisted_next_seq_no != legacy_next_seq_no {
+        return Err(authoritative_schema_error(
+            "legacy committed boundary does not match sequence watermark",
+        ));
+    }
+
+    let committed = legacy_committed_boundary(legacy_next_seq_no, primary_term);
+    committed.persist(&committed_path)?;
+    evolve_meta_json_internal_sequence_fields(meta_json_path)
+}
+
+fn legacy_committed_boundary(
+    legacy_next_seq_no: u64,
+    primary_term: u64,
+) -> CommittedBoundaryRecord {
+    let checkpoint = legacy_next_seq_no.checked_sub(1);
+    CommittedBoundaryRecord {
+        version: super::sequence::COMMITTED_BOUNDARY_FORMAT_VERSION,
+        processed_checkpoint: checkpoint,
+        persisted_checkpoint: checkpoint,
+        max_seq_no: checkpoint,
+        max_seq_no_of_updates_or_deletes: checkpoint,
+        legacy_migration_checkpoint: checkpoint,
+        term_sequence_state: super::sequence::PrimaryTermSequenceRecord {
+            current_term: primary_term,
+            max_seq_no_at_term_start: checkpoint,
+            processed_in_current_term_below_start_max: checkpoint
+                .map(|end| vec![super::sequence::SeqNoRange { start: 0, end }])
+                .unwrap_or_default(),
+        },
+    }
+}
+
+fn prepare_remote_split_sequence_state(data_dir: &Path) -> Result<()> {
+    let committed_path = data_dir.join("translog.committed");
+    let bytes = match std::fs::read(&committed_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.first() == Some(&b'{') {
+        return Ok(());
+    }
+    let migrated_next_seq_no = HotTranslog::migrate_empty_v1(data_dir)?;
+    let legacy_next_seq_no =
+        std::str::from_utf8(&bytes)?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| {
+                authoritative_schema_error(format!(
+                    "parse remote split committed boundary: {error}"
+                ))
+            })?;
+    if migrated_next_seq_no.is_some_and(|migrated| migrated != legacy_next_seq_no) {
+        return Err(authoritative_schema_error(
+            "remote split WAL migration returned an inconsistent boundary",
+        ));
+    }
+    legacy_committed_boundary(legacy_next_seq_no, 1).persist(&committed_path)
+}
+
+fn validate_internal_sequence_fields(schema: &Schema, purpose: HotEnginePurpose) -> Result<()> {
+    if !purpose.requires_sequence_fields() {
+        return Ok(());
+    }
+    for name in [SEQ_NO_FIELD_NAME, PRIMARY_TERM_FIELD_NAME] {
+        let field = schema.get_field(name).map_err(|_| {
+            authoritative_schema_error(format!(
+                "local shard schema is missing internal field {name}"
+            ))
+        })?;
+        let entry = schema.get_field_entry(field);
+        let valid = matches!(
+            entry.field_type(),
+            tantivy::schema::FieldType::U64(options)
+                if options.is_fast() && options.is_stored()
+        );
+        if !valid {
+            return Err(authoritative_schema_error(format!(
+                "local shard internal field {name} must be a stored u64 fast field"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_existing_schema_mappings(
     meta_json_path: &Path,
     mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
@@ -497,6 +791,82 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+fn sequenced_wal_entry(
+    operation: &super::SequencedOperation,
+) -> Result<crate::wal::SequencedWalEntry> {
+    let (op, payload) = match &operation.mutation {
+        super::DocumentMutation::Index { doc_id, source } => (
+            crate::wal::WalOperation::Index,
+            serde_json::json!({ "_doc_id": doc_id, "_source": source }),
+        ),
+        super::DocumentMutation::Delete { doc_id } => (
+            crate::wal::WalOperation::Delete,
+            serde_json::json!({ "_doc_id": doc_id }),
+        ),
+        super::DocumentMutation::NoOp { reason } => (
+            crate::wal::WalOperation::NoOp,
+            serde_json::json!({ "_reason": reason }),
+        ),
+    };
+    Ok(crate::wal::SequencedWalEntry {
+        seq_no: operation.seq_no,
+        primary_term: operation.primary_term,
+        op,
+        payload,
+    })
+}
+
+fn wal_entry_matches_operation(
+    entry: &crate::wal::TranslogEntry,
+    operation: &super::SequencedOperation,
+) -> Result<bool> {
+    let decoded = document_operation(entry)?;
+    Ok(match (decoded, &operation.mutation) {
+        (
+            WalDocumentOperation::Index { doc_id, source },
+            super::DocumentMutation::Index {
+                doc_id: incoming_id,
+                source: incoming_source,
+            },
+        ) => doc_id == incoming_id && source == incoming_source,
+        (
+            WalDocumentOperation::Delete { doc_id },
+            super::DocumentMutation::Delete {
+                doc_id: incoming_id,
+            },
+        ) => doc_id == incoming_id,
+        (
+            WalDocumentOperation::NoOp { reason },
+            super::DocumentMutation::NoOp {
+                reason: incoming_reason,
+            },
+        ) => reason == incoming_reason,
+        _ => false,
+    })
+}
+
+fn sequenced_operation_from_entry(
+    entry: &crate::wal::TranslogEntry,
+) -> Result<super::SequencedOperation> {
+    let mutation = match document_operation(entry)? {
+        WalDocumentOperation::Index { doc_id, source } => super::DocumentMutation::Index {
+            doc_id: doc_id.to_string(),
+            source: source.clone(),
+        },
+        WalDocumentOperation::Delete { doc_id } => super::DocumentMutation::Delete {
+            doc_id: doc_id.to_string(),
+        },
+        WalDocumentOperation::NoOp { reason } => super::DocumentMutation::NoOp {
+            reason: reason.to_string(),
+        },
+    };
+    Ok(super::SequencedOperation {
+        seq_no: entry.seq_no,
+        primary_term: entry.primary_term,
+        mutation,
+    })
+}
+
 fn join_scoped_handles<'scope, T>(
     handles: Vec<std::thread::ScopedJoinHandle<'scope, T>>,
     context: &'static str,
@@ -545,6 +915,24 @@ impl HotEngine {
             durability,
             column_cache,
             false,
+            HotEnginePurpose::LocalShard(LegacyOpenRole::Primary { primary_term: 1 }),
+        )
+    }
+
+    pub(crate) fn new_remote_split_with_mappings<P: AsRef<Path>>(
+        data_dir: P,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+    ) -> Result<Self> {
+        Self::new_with_mappings_mode(
+            data_dir,
+            refresh_interval,
+            mappings,
+            TranslogDurability::Request,
+            column_cache,
+            false,
+            HotEnginePurpose::RemoteSplit,
         )
     }
 
@@ -562,6 +950,44 @@ impl HotEngine {
             durability,
             column_cache,
             true,
+            HotEnginePurpose::LocalShard(LegacyOpenRole::Replica),
+        )
+    }
+
+    pub(crate) fn open_existing_primary_with_mappings<P: AsRef<Path>>(
+        data_dir: P,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+        primary_term: u64,
+    ) -> Result<Self> {
+        Self::new_with_mappings_mode(
+            data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache,
+            true,
+            HotEnginePurpose::LocalShard(LegacyOpenRole::Primary { primary_term }),
+        )
+    }
+
+    pub(crate) fn open_recovery_target_with_mappings<P: AsRef<Path>>(
+        data_dir: P,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+    ) -> Result<Self> {
+        Self::new_with_mappings_mode(
+            data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache,
+            true,
+            HotEnginePurpose::LocalShard(LegacyOpenRole::RecoveryTarget),
         )
     }
 
@@ -572,6 +998,7 @@ impl HotEngine {
         durability: TranslogDurability,
         column_cache: Arc<super::column_cache::ColumnCache>,
         existing_only: bool,
+        purpose: HotEnginePurpose,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         let index_path = data_dir.join("index");
@@ -589,6 +1016,10 @@ impl HotEngine {
         // order (and thus Field handle IDs) and only appends.
         if index_exists {
             validate_existing_schema_mappings(&meta_json_path, mappings)?;
+            if purpose == HotEnginePurpose::RemoteSplit {
+                prepare_remote_split_sequence_state(data_dir)?;
+            }
+            prepare_internal_sequence_schema(data_dir, &meta_json_path, purpose)?;
             evolve_meta_json_schema(&meta_json_path, mappings)?;
         }
 
@@ -601,6 +1032,10 @@ impl HotEngine {
             let mut schema_builder = Schema::builder();
             schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
             schema_builder.add_text_field("_source", STORED);
+            if purpose.requires_sequence_fields() {
+                schema_builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
+                schema_builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
+            }
             schema_builder.add_text_field("body", TEXT | STORED);
 
             let mut mapping_names: Vec<_> = mappings.keys().cloned().collect();
@@ -616,12 +1051,15 @@ impl HotEngine {
         };
 
         let schema = index.schema();
+        validate_internal_sequence_fields(&schema, purpose)?;
 
         // Build the FieldRegistry from the opened schema (authoritative).
         let id_field = schema.get_field("_id").expect("_id must exist in schema");
         let source_field = schema
             .get_field("_source")
             .expect("_source must exist in schema");
+        let seq_no_field = schema.get_field(SEQ_NO_FIELD_NAME).ok();
+        let primary_term_field = schema.get_field(PRIMARY_TERM_FIELD_NAME).ok();
 
         let mut fields = HashMap::new();
         let mut field_types = HashMap::new();
@@ -671,6 +1109,8 @@ impl HotEngine {
         let field_registry = FieldRegistry {
             id_field,
             source_field,
+            seq_no_field,
+            primary_term_field,
             fields,
             field_types,
             date_fields,
@@ -691,7 +1131,15 @@ impl HotEngine {
             #[cfg(test)]
             engine_apply_failure: Mutex::new(None),
             #[cfg(test)]
+            refresh_commit_failures: Mutex::new(0),
+            #[cfg(test)]
+            post_apply_refresh_failures: Mutex::new(0),
+            #[cfg(test)]
             refresh_before_writer_sender: Mutex::new(None),
+            #[cfg(test)]
+            refresh_after_commit_sender: Mutex::new(None),
+            #[cfg(test)]
+            refresh_after_commit_release_receiver: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             #[cfg(test)]
@@ -704,6 +1152,7 @@ impl HotEngine {
             apply_state: Mutex::new(apply_state),
             committed_boundary_path,
             durability,
+            delete_tombstone_retention: Duration::from_secs(60),
             column_cache,
         };
 
@@ -772,6 +1221,18 @@ impl HotEngine {
         context: &str,
         boundary: CommittedBoundaryRecord,
     ) -> Result<CommittedBoundaryRecord> {
+        #[cfg(test)]
+        if context == "refresh" {
+            let mut remaining = self
+                .refresh_commit_failures
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if *remaining > 0 {
+                *remaining -= 1;
+                writer_state.fail("injected refresh commit failure");
+                anyhow::bail!("injected refresh commit failure");
+            }
+        }
         let commit_result = {
             let writer = writer_state.writer_mut(context)?;
             writer.commit()
@@ -836,23 +1297,774 @@ impl HotEngine {
             .reset_to_commit(committed)
     }
 
-    fn prepare_sequence_operation(
-        &self,
-        primary_term: u64,
-        seq_no: u64,
-        updates_or_deletes: bool,
-    ) -> Result<()> {
-        self.apply_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .prepare_operation(primary_term, seq_no, updates_or_deletes)
+    fn current_version(&self, state: &ApplyState, doc_id: &str) -> Result<Option<CurrentVersion>> {
+        if let Some(version) = state.versions.lookup(doc_id)? {
+            return Ok(Some(CurrentVersion::Native(version)));
+        }
+
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let searcher = self.reader.searcher();
+        let query = tantivy::query::TermQuery::new(
+            Term::from_field_text(registry.id_field, doc_id),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let Some((_, address)) = searcher
+            .search(&query, &TopDocs::with_limit(1))?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let segment = &searcher.segment_readers()[address.segment_ord as usize];
+        let seq_column = segment.fast_fields().u64(SEQ_NO_FIELD_NAME);
+        let term_column = segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME);
+        let (seq_column, term_column) = match (seq_column, term_column) {
+            (Ok(seq_column), Ok(term_column)) => (seq_column, term_column),
+            _ => {
+                return state
+                    .legacy_migration_checkpoint
+                    .map(|migration_checkpoint| {
+                        Some(CurrentVersion::LegacyAtOrBelow {
+                            migration_checkpoint,
+                        })
+                    })
+                    .ok_or_else(|| {
+                        anyhow::Error::new(InternalSequenceFieldError {
+                            message: format!(
+                                "native document [{doc_id}] is missing _seq_no or _primary_term"
+                            ),
+                        })
+                    });
+            }
+        };
+        let mut seq_values = seq_column.values_for_doc(address.doc_id);
+        let seq_no = seq_values.next().ok_or_else(|| {
+            anyhow::Error::new(InternalSequenceFieldError {
+                message: format!("document [{doc_id}] has no {SEQ_NO_FIELD_NAME} value"),
+            })
+        })?;
+        if seq_values.next().is_some() {
+            return Err(InternalSequenceFieldError {
+                message: format!("document [{doc_id}] has multiple {SEQ_NO_FIELD_NAME} values"),
+            }
+            .into());
+        }
+        let mut term_values = term_column.values_for_doc(address.doc_id);
+        let primary_term = term_values.next().ok_or_else(|| {
+            anyhow::Error::new(InternalSequenceFieldError {
+                message: format!("document [{doc_id}] has no {PRIMARY_TERM_FIELD_NAME} value"),
+            })
+        })?;
+        if term_values.next().is_some() {
+            return Err(InternalSequenceFieldError {
+                message: format!(
+                    "document [{doc_id}] has multiple {PRIMARY_TERM_FIELD_NAME} values"
+                ),
+            }
+            .into());
+        }
+        if primary_term == 0 {
+            return Err(InternalSequenceFieldError {
+                message: format!("document [{doc_id}] has a zero _primary_term"),
+            }
+            .into());
+        }
+        Ok(Some(CurrentVersion::Native(
+            super::version_map::VersionValue::Index(super::version_map::IndexVersionValue {
+                seq_no,
+                primary_term,
+            }),
+        )))
     }
 
-    fn complete_sequence_operation(&self, primary_term: u64, seq_no: u64) -> Result<()> {
+    fn validate_redelivery(
+        &self,
+        translog: &dyn WriteAheadLog,
+        operation: &super::SequencedOperation,
+    ) -> Result<bool> {
+        let mut matched = false;
+        for entry in translog.read_all()? {
+            if entry.seq_no != operation.seq_no || entry.primary_term != operation.primary_term {
+                continue;
+            }
+            if !wal_entry_matches_operation(&entry, operation)? {
+                return Err(SequenceOperationCollisionError {
+                    primary_term: operation.primary_term,
+                    seq_no: operation.seq_no,
+                }
+                .into());
+            }
+            matched = true;
+        }
+        Ok(matched)
+    }
+
+    fn apply_sequenced_batch_locked<F>(
+        &self,
+        translog: &dyn WriteAheadLog,
+        operations: Vec<super::SequencedOperation>,
+        wal_disposition: WalDisposition,
+        mut writer_override: Option<&mut WriterState>,
+        inject_apply_failure: bool,
+        mut side_effect: F,
+    ) -> Result<super::ReplicaBulkApplyReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        #[cfg(not(test))]
+        let _ = inject_apply_failure;
+        if operations.is_empty() {
+            return Ok(super::ReplicaBulkApplyReceipt {
+                outcomes: Vec::new(),
+                all_operations_processed: true,
+                all_operations_persisted: true,
+                sequence: self.sequence_stats(),
+            });
+        }
+
+        if writer_override.is_none() {
+            drop(self.writer_state_with_replay(translog, "sequenced operation apply")?);
+        }
+        let mut state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let planning_snapshot = state.planning_snapshot();
+        let mut planned = Vec::with_capacity(operations.len());
+        let mut shadow_versions = HashMap::<String, CurrentVersion>::new();
+
+        let planning_result = (|| {
+            for operation in operations {
+                if operation.primary_term > state.term_sequences.current_term() {
+                    let max_seq_no = state.checkpoints.max_seq_no();
+                    state
+                        .term_sequences
+                        .raise_term(operation.primary_term, max_seq_no)?;
+                }
+                let already_processed = state.checkpoints.has_processed(operation.seq_no);
+                state.term_sequences.check_before_redelivery(
+                    operation.primary_term,
+                    operation.seq_no,
+                    already_processed,
+                )?;
+                if already_processed {
+                    self.validate_redelivery(translog, &operation)?;
+                    planned.push(PlannedOperation {
+                        operation,
+                        outcome: super::ApplyOutcome::Redelivery,
+                        complete: false,
+                    });
+                    continue;
+                }
+
+                state.checkpoints.advance_max_seq_no(operation.seq_no);
+                if !matches!(operation.mutation, super::DocumentMutation::NoOp { .. }) {
+                    state.max_seq_no_of_updates_or_deletes = Some(
+                        state
+                            .max_seq_no_of_updates_or_deletes
+                            .map_or(operation.seq_no, |current| current.max(operation.seq_no)),
+                    );
+                }
+
+                let outcome = match &operation.mutation {
+                    super::DocumentMutation::NoOp { .. } => super::ApplyOutcome::NoOp,
+                    super::DocumentMutation::Index { doc_id, .. }
+                    | super::DocumentMutation::Delete { doc_id } => {
+                        let current = if let Some(current) = shadow_versions.get(doc_id).copied() {
+                            Some(current)
+                        } else {
+                            self.current_version(&state, doc_id)?
+                        };
+                        let outcome = match current {
+                            Some(CurrentVersion::Native(version))
+                                if version.seq_no() > operation.seq_no =>
+                            {
+                                super::ApplyOutcome::Stale
+                            }
+                            Some(CurrentVersion::Native(version))
+                                if version.seq_no() == operation.seq_no =>
+                            {
+                                let kind_matches = matches!(
+                                    (&operation.mutation, version),
+                                    (
+                                        super::DocumentMutation::Index { .. },
+                                        super::version_map::VersionValue::Index(_)
+                                    ) | (
+                                        super::DocumentMutation::Delete { .. },
+                                        super::version_map::VersionValue::Delete(_)
+                                    )
+                                );
+                                if version.primary_term() != operation.primary_term || !kind_matches
+                                {
+                                    return Err(SequenceOperationCollisionError {
+                                        primary_term: operation.primary_term,
+                                        seq_no: operation.seq_no,
+                                    }
+                                    .into());
+                                }
+                                self.validate_redelivery(translog, &operation)?;
+                                super::ApplyOutcome::Redelivery
+                            }
+                            Some(CurrentVersion::LegacyAtOrBelow {
+                                migration_checkpoint,
+                            }) if operation.seq_no <= migration_checkpoint => {
+                                super::ApplyOutcome::Stale
+                            }
+                            _ => super::ApplyOutcome::Applied,
+                        };
+                        if outcome == super::ApplyOutcome::Applied {
+                            let version = match &operation.mutation {
+                                super::DocumentMutation::Index { .. } => {
+                                    CurrentVersion::Native(super::version_map::VersionValue::Index(
+                                        super::version_map::IndexVersionValue {
+                                            seq_no: operation.seq_no,
+                                            primary_term: operation.primary_term,
+                                        },
+                                    ))
+                                }
+                                super::DocumentMutation::Delete { .. } => CurrentVersion::Native(
+                                    super::version_map::VersionValue::Delete(
+                                        super::version_map::DeleteVersionValue {
+                                            seq_no: operation.seq_no,
+                                            primary_term: operation.primary_term,
+                                            deleted_at: Instant::now(),
+                                        },
+                                    ),
+                                ),
+                                super::DocumentMutation::NoOp { .. } => unreachable!(),
+                            };
+                            shadow_versions.insert(doc_id.clone(), version);
+                        }
+                        outcome
+                    }
+                };
+                planned.push(PlannedOperation {
+                    operation,
+                    outcome,
+                    complete: true,
+                });
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = planning_result {
+            state.restore_planning_snapshot(planning_snapshot);
+            if wal_disposition == WalDisposition::AlreadyInLocalWal {
+                if let Some(writer_state) = writer_override.as_deref_mut() {
+                    writer_state.fail(format!(
+                        "sequenced operation failed after WAL persistence: {error:#}"
+                    ));
+                } else {
+                    self.fail_writer_after_wal(&error);
+                }
+            }
+            return Err(error);
+        }
+
+        let wal_entries = match planned
+            .iter()
+            .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
+            .map(|planned| sequenced_wal_entry(&planned.operation))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                state.restore_planning_snapshot(planning_snapshot);
+                if wal_disposition == WalDisposition::AlreadyInLocalWal {
+                    if let Some(writer_state) = writer_override.as_deref_mut() {
+                        writer_state.fail(format!(
+                            "sequenced operation failed after WAL persistence: {error:#}"
+                        ));
+                    } else {
+                        self.fail_writer_after_wal(&error);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let appended = wal_disposition == WalDisposition::Append && !wal_entries.is_empty();
+        if appended && let Err(error) = translog.append_batch_with_seq(&wal_entries) {
+            state.restore_planning_snapshot(planning_snapshot);
+            return Err(error);
+        }
+
+        let has_applied = planned
+            .iter()
+            .any(|planned| planned.outcome == super::ApplyOutcome::Applied);
+        let mut owned_writer_state = if has_applied && writer_override.is_none() {
+            Some(
+                self.writer
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()),
+            )
+        } else {
+            None
+        };
+        let mut writer_state = if has_applied {
+            if let Some(writer_state) = &mut writer_override {
+                Some(&mut **writer_state)
+            } else {
+                owned_writer_state.as_deref_mut()
+            }
+        } else {
+            None
+        };
+        let execution_result = (|| {
+            #[cfg(test)]
+            if inject_apply_failure {
+                self.maybe_fail_engine_apply_for_test()?;
+            }
+            for planned_operation in &planned {
+                match (
+                    &planned_operation.operation.mutation,
+                    planned_operation.outcome,
+                ) {
+                    (
+                        super::DocumentMutation::Index { doc_id, source },
+                        super::ApplyOutcome::Applied,
+                    ) => {
+                        let writer = writer_state
+                            .as_mut()
+                            .expect("applied operation requires a writer")
+                            .writer_mut("sequenced index apply")?;
+                        let id_field = self
+                            .field_registry
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .id_field;
+                        writer.delete_term(Term::from_field_text(id_field, doc_id));
+                        let doc = self.build_tantivy_doc(
+                            doc_id,
+                            source,
+                            planned_operation.operation.seq_no,
+                            planned_operation.operation.primary_term,
+                        )?;
+                        writer.add_document(doc)?;
+                        side_effect(&planned_operation.operation)?;
+                        state.versions.apply_index(
+                            doc_id,
+                            planned_operation.operation.seq_no,
+                            planned_operation.operation.primary_term,
+                        );
+                    }
+                    (super::DocumentMutation::Delete { doc_id }, super::ApplyOutcome::Applied) => {
+                        let writer = writer_state
+                            .as_mut()
+                            .expect("applied operation requires a writer")
+                            .writer_mut("sequenced delete apply")?;
+                        let id_field = self
+                            .field_registry
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .id_field;
+                        writer.delete_term(Term::from_field_text(id_field, doc_id));
+                        side_effect(&planned_operation.operation)?;
+                        state.versions.apply_delete(
+                            doc_id,
+                            planned_operation.operation.seq_no,
+                            planned_operation.operation.primary_term,
+                        );
+                    }
+                    (_, super::ApplyOutcome::Applied) => unreachable!(),
+                    _ => {}
+                }
+
+                if planned_operation.complete {
+                    state.complete_operation(
+                        planned_operation.operation.primary_term,
+                        planned_operation.operation.seq_no,
+                        self.durability,
+                    )?;
+                    if wal_disposition == WalDisposition::AlreadyInLocalWal {
+                        state
+                            .checkpoints
+                            .mark_persisted(planned_operation.operation.seq_no);
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = execution_result {
+            if appended || wal_disposition == WalDisposition::AlreadyInLocalWal {
+                if let Some(writer_state) = writer_state.as_mut() {
+                    (*writer_state).fail(format!(
+                        "sequenced operation failed after WAL persistence: {error:#}"
+                    ));
+                } else {
+                    self.fail_writer_after_wal(&error);
+                }
+            }
+            return Err(error);
+        }
+
+        let outcomes = planned
+            .iter()
+            .map(|planned| planned.outcome)
+            .collect::<Vec<_>>();
+        let all_operations_processed = planned
+            .iter()
+            .all(|planned| state.checkpoints.has_processed(planned.operation.seq_no));
+        let all_operations_persisted = planned
+            .iter()
+            .all(|planned| state.checkpoints.has_persisted(planned.operation.seq_no));
+        Ok(super::ReplicaBulkApplyReceipt {
+            outcomes,
+            all_operations_processed,
+            all_operations_persisted,
+            sequence: state.checkpoints.stats(),
+        })
+    }
+
+    pub(crate) fn apply_sequenced_operation_with_side_effect<F>(
+        &self,
+        operation: super::SequencedOperation,
+        side_effect: F,
+    ) -> Result<super::ReplicaApplyReceipt>
+    where
+        F: FnOnce(&super::SequencedOperation) -> Result<()>,
+    {
+        let mut side_effect = Some(side_effect);
+        let bulk =
+            self.apply_sequenced_batch_with_side_effect(vec![operation], false, |operation| {
+                side_effect
+                    .take()
+                    .expect("single operation side effect runs at most once")(
+                    operation
+                )
+            })?;
+        Ok(super::ReplicaApplyReceipt {
+            outcome: bulk.outcomes[0],
+            operation_processed: bulk.all_operations_processed,
+            operation_persisted: bulk.all_operations_persisted,
+            sequence: bulk.sequence,
+        })
+    }
+
+    pub(crate) fn apply_sequenced_batch_with_side_effect<F>(
+        &self,
+        operations: Vec<super::SequencedOperation>,
+        allow_oversized_bulk: bool,
+        mut side_effect: F,
+    ) -> Result<super::ReplicaBulkApplyReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        let doc_ids = operations
+            .iter()
+            .filter_map(|operation| operation.mutation.doc_id())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        self.with_version_map_capacity(
+            "sequenced operation apply",
+            doc_ids.iter().map(String::as_str),
+            allow_oversized_bulk,
+            |translog| {
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    operations.clone(),
+                    WalDisposition::Append,
+                    None,
+                    true,
+                    &mut side_effect,
+                )
+            },
+        )
+    }
+
+    pub(crate) fn add_primary_index_with_side_effect<F>(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        mut side_effect: F,
+    ) -> Result<super::IndexWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.validate_keyword_documents(std::iter::once(&payload))?;
+        let doc_id_owned = doc_id.to_string();
+        let seq_no =
+            self.with_version_map_capacity("document indexing", [doc_id], false, |translog| {
+                drop(self.writer_state_with_replay(translog, "document indexing")?);
+                let receipt = translog.append(
+                    primary_term,
+                    crate::wal::WalOperation::Index,
+                    serde_json::json!({ "_doc_id": doc_id, "_source": payload }),
+                )?;
+                let operation = super::SequencedOperation {
+                    seq_no: receipt.seq_no,
+                    primary_term,
+                    mutation: super::DocumentMutation::Index {
+                        doc_id: doc_id_owned.clone(),
+                        source: payload.clone(),
+                    },
+                };
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    vec![operation],
+                    WalDisposition::AlreadyInLocalWal,
+                    None,
+                    true,
+                    &mut side_effect,
+                )?;
+                Ok(receipt.seq_no)
+            })?;
+        Ok(super::IndexWriteReceipt {
+            doc_id: doc_id.to_string(),
+            seq_no,
+        })
+    }
+
+    pub(crate) fn add_primary_bulk_with_side_effect<F>(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+        primary_term: u64,
+        mut side_effect: F,
+    ) -> Result<super::BulkWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
+        let wal_ops = docs
+            .iter()
+            .map(|(doc_id, payload)| {
+                (
+                    crate::wal::WalOperation::Index,
+                    serde_json::json!({ "_doc_id": doc_id, "_source": payload }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let doc_ids = docs
+            .iter()
+            .map(|(doc_id, _)| doc_id.clone())
+            .collect::<Vec<_>>();
+        let start_seq_no = self.with_version_map_capacity(
+            "bulk indexing",
+            doc_ids.iter().map(String::as_str),
+            true,
+            |translog| {
+                drop(self.writer_state_with_replay(translog, "bulk indexing")?);
+                let Some(start_seq_no) =
+                    translog.write_bulk_with_receipt(primary_term, &wal_ops)?
+                else {
+                    return Ok(None);
+                };
+                let operations = docs
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (doc_id, payload))| {
+                        Ok(super::SequencedOperation {
+                            seq_no: start_seq_no.checked_add(offset as u64).ok_or_else(|| {
+                                anyhow::anyhow!("bulk write sequence range overflows")
+                            })?,
+                            primary_term,
+                            mutation: super::DocumentMutation::Index {
+                                doc_id: doc_id.clone(),
+                                source: payload.clone(),
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    operations,
+                    WalDisposition::AlreadyInLocalWal,
+                    None,
+                    true,
+                    &mut side_effect,
+                )?;
+                Ok(Some(start_seq_no))
+            },
+        )?;
+        Ok(super::BulkWriteReceipt {
+            doc_ids,
+            start_seq_no,
+        })
+    }
+
+    pub(crate) fn delete_primary_with_side_effect<F>(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        mut side_effect: F,
+    ) -> Result<super::DeleteWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        let doc_id_owned = doc_id.to_string();
+        let seq_no =
+            self.with_version_map_capacity("document delete", [doc_id], false, |translog| {
+                drop(self.writer_state_with_replay(translog, "document delete")?);
+                let receipt = translog.append(
+                    primary_term,
+                    crate::wal::WalOperation::Delete,
+                    serde_json::json!({ "_doc_id": doc_id }),
+                )?;
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    vec![super::SequencedOperation {
+                        seq_no: receipt.seq_no,
+                        primary_term,
+                        mutation: super::DocumentMutation::Delete {
+                            doc_id: doc_id_owned.clone(),
+                        },
+                    }],
+                    WalDisposition::AlreadyInLocalWal,
+                    None,
+                    true,
+                    &mut side_effect,
+                )?;
+                Ok(receipt.seq_no)
+            })?;
+        Ok(super::DeleteWriteReceipt { deleted: 1, seq_no })
+    }
+
+    fn fail_writer_after_wal(&self, error: &anyhow::Error) {
+        self.writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fail(format!(
+                "sequenced operation failed after WAL persistence: {error:#}"
+            ));
+    }
+
+    fn with_version_map_capacity<'a, T, I, F>(
+        &self,
+        context: &'static str,
+        doc_ids: I,
+        allow_oversized_bulk: bool,
+        mut operation: F,
+    ) -> Result<T>
+    where
+        I: IntoIterator<Item = &'a str>,
+        F: FnMut(&dyn WriteAheadLog) -> Result<T>,
+    {
+        let reservation_bytes = LiveVersionMap::estimate_reservation(doc_ids);
+        let mut refreshed = false;
+        loop {
+            let translog = self
+                .translog
+                .lock()
+                .map_err(|_| anyhow::anyhow!("translog lock poisoned during {context}"))?;
+            let (can_reserve, current_old_empty, estimated_bytes, max_bytes) = {
+                let state = self
+                    .apply_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                (
+                    state.versions.can_reserve(reservation_bytes),
+                    state.versions.current_and_old_are_empty(),
+                    state.versions.estimated_bytes(),
+                    state.versions.max_bytes(),
+                )
+            };
+            let oversized_bulk = reservation_bytes > max_bytes;
+            if can_reserve
+                || (allow_oversized_bulk && oversized_bulk && refreshed && current_old_empty)
+            {
+                let result = operation(&*translog);
+                drop(translog);
+                if result.is_ok()
+                    && allow_oversized_bulk
+                    && oversized_bulk
+                    && let Err(error) = self.post_apply_refresh()
+                {
+                    tracing::warn!(
+                        "post-apply refresh failed after an oversized version-map bulk: {error:#}"
+                    );
+                }
+                return result;
+            }
+            drop(translog);
+
+            if refreshed {
+                return Err(super::version_map::VersionMapCapacityError {
+                    estimated_bytes,
+                    reservation_bytes,
+                    max_bytes,
+                }
+                .into());
+            }
+            self.refresh()?;
+            refreshed = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_version_map_max_bytes_for_test(&self, max_bytes: usize) {
         self.apply_state
             .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .versions
+            .set_max_bytes_for_test(max_bytes);
+    }
+
+    pub(crate) fn refresh_with_pruned_tombstones(&self) -> Result<Vec<PrunedTombstone>> {
+        let _maintenance = self.maintenance_guard("refresh")?;
+        let committed_boundary = self.with_translog("refresh", |translog| {
+            #[cfg(test)]
+            if let Some(sender) = self
+                .refresh_before_writer_sender
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            let mut writer_state = self.writer_state_with_replay(translog, "refresh")?;
+            {
+                let mut state = self
+                    .apply_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                state.versions.rotate_current_into_old()?;
+            }
+            let boundary = self.current_committed_boundary()?;
+            match self.commit_writer_at_boundary(&mut writer_state, "refresh", boundary) {
+                Ok(boundary) => Ok(boundary),
+                Err(error) => {
+                    self.apply_state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+                        .versions
+                        .rollback_refresh()?;
+                    Err(error)
+                }
+            }
+        })?;
+        self.persist_committed_boundary(&committed_boundary)?;
+
+        #[cfg(test)]
+        if let Some(sender) = self
+            .refresh_after_commit_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+            if let Some(release) = self
+                .refresh_after_commit_release_receiver
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = release.recv();
+            }
+        }
+
+        self.reader.reload()?;
+        let pruned = self
+            .apply_state
+            .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .complete_operation(primary_term, seq_no, self.durability)
+            .versions
+            .complete_reader_reload(
+                committed_boundary.processed_checkpoint,
+                self.delete_tombstone_retention,
+            );
+        Ok(pruned)
     }
 
     fn replay_translog_suffix_locked(
@@ -878,48 +2090,40 @@ impl HotEngine {
         }
 
         let mut replayed: u64 = 0;
-        let mut last_seq: u64 = committed_next_seq;
-        let mut batch_count: u64 = 0;
         let mut last_committed_boundary = None;
-        let id_field = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .id_field;
-        let replay_result = translog.for_each_from(committed_next_seq, &mut |entry| {
-            if replayed == 0 {
-                tracing::warn!(
-                    "Replaying translog entries from seq_no {} during {}...",
-                    committed_next_seq,
-                    context
-                );
+        let mut batch = Vec::with_capacity(TRANSLOG_REPLAY_BATCH_SIZE as usize);
+        let mut flush_batch = |batch: &mut Vec<super::SequencedOperation>| -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
             }
-
-            let operation = document_operation(&entry)?;
-            self.prepare_sequence_operation(
-                entry.primary_term,
-                entry.seq_no,
-                !matches!(operation, WalDocumentOperation::NoOp { .. }),
+            self.apply_sequenced_batch_locked(
+                translog,
+                std::mem::take(batch),
+                WalDisposition::AlreadyInLocalWal,
+                Some(writer_state),
+                false,
+                |_| Ok(()),
             )?;
-            if let Some(doc_id) = operation.doc_id() {
-                let writer = writer_state.writer_mut(context)?;
-                writer.delete_term(Term::from_field_text(id_field, doc_id));
-                if let WalDocumentOperation::Index { source, .. } = operation {
-                    let doc = self.build_tantivy_doc(doc_id, source)?;
-                    writer.add_document(doc)?;
-                }
+            let boundary = self.current_committed_boundary()?;
+            let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
+            self.persist_committed_boundary(&boundary)?;
+            last_committed_boundary = Some(boundary);
+            Ok(())
+        };
+        let replay_result = translog.for_each_from(0, &mut |entry| {
+            if committed
+                .processed_checkpoint
+                .is_some_and(|checkpoint| entry.seq_no <= checkpoint)
+            {
+                return Ok(());
             }
-            self.complete_sequence_operation(entry.primary_term, entry.seq_no)?;
-
-            last_seq = entry.seq_no;
+            if replayed == 0 {
+                tracing::warn!("Replaying translog entries during {context}...");
+            }
+            batch.push(sequenced_operation_from_entry(&entry)?);
             replayed += 1;
-            batch_count += 1;
-            if batch_count >= TRANSLOG_REPLAY_BATCH_SIZE {
-                let boundary = self.current_committed_boundary()?;
-                let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
-                self.persist_committed_boundary(&boundary)?;
-                last_committed_boundary = Some(boundary);
-                batch_count = 0;
+            if batch.len() >= TRANSLOG_REPLAY_BATCH_SIZE as usize {
+                flush_batch(&mut batch)?;
             }
             Ok(())
         });
@@ -928,18 +2132,10 @@ impl HotEngine {
             writer_state.fail(format!("{message}: {error:#}"));
             return Err(error).context(message);
         }
-        if replayed == 0 || last_seq.checked_add(1) != Some(wal_next_seq) {
-            let message = format!(
-                "translog replay during {context} did not reach WAL head {wal_next_seq} from committed checkpoint {committed_next_seq}"
-            );
-            writer_state.fail(message.clone());
-            anyhow::bail!(message);
+        if replayed == 0 {
+            return Ok(0);
         }
-        if batch_count > 0 {
-            let boundary = self.current_committed_boundary()?;
-            last_committed_boundary =
-                Some(self.commit_writer_at_boundary(writer_state, context, boundary)?);
-        }
+        flush_batch(&mut batch)?;
         if let Err(error) = self.reader.reload() {
             writer_state.fail(format!("reader reload failed after {context}: {error}"));
             return Err(error).with_context(|| format!("reader reload failed after {context}"));
@@ -954,6 +2150,14 @@ impl HotEngine {
                 format!("committed checkpoint persistence failed after {context}")
             });
         }
+        self.apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .versions
+            .complete_reader_reload(
+                committed_boundary.processed_checkpoint,
+                self.delete_tombstone_retention,
+            );
         tracing::info!(
             "Translog replay during {} recovered {} operations.",
             context,
@@ -1781,12 +2985,21 @@ impl HotEngine {
         &self,
         doc_id: &str,
         payload: &serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
     ) -> Result<TantivyDocument> {
         let registry = self
             .field_registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload)
+        Self::build_tantivy_doc_inner(
+            &registry,
+            &self.index.schema(),
+            doc_id,
+            payload,
+            seq_no,
+            primary_term,
+        )
     }
 
     /// Build a Tantivy document using an already-acquired registry reference.
@@ -1796,11 +3009,19 @@ impl HotEngine {
         schema: &Schema,
         doc_id: &str,
         payload: &serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
     ) -> Result<TantivyDocument> {
         let mut doc = TantivyDocument::new();
 
         // Store the document ID
         doc.add_text(registry.id_field, doc_id);
+        if let Some(field) = registry.seq_no_field {
+            doc.add_u64(field, seq_no);
+        }
+        if let Some(field) = registry.primary_term_field {
+            doc.add_u64(field, primary_term);
+        }
 
         // Canonicalize mapped Date fields before persisting _source so every read path
         // sees the same UTC ISO 8601 representation.
@@ -2054,6 +3275,22 @@ impl HotEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn pause_after_refresh_commit_for_test(
+        &self,
+        sender: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .refresh_after_commit_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
+        *self
+            .refresh_after_commit_release_receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(release);
+    }
+
+    #[cfg(test)]
     fn set_peer_recovery_scan_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
         self.with_translog("set recovery scan barrier", |translog| {
             translog.set_recovery_scan_barrier(Some(barrier));
@@ -2098,6 +3335,37 @@ impl HotEngine {
             .engine_apply_failure
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_refresh_commit_failures_for_test(&self, attempts: usize) {
+        *self
+            .refresh_commit_failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = attempts;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_post_apply_refresh_failures_for_test(&self, attempts: usize) {
+        *self
+            .post_apply_refresh_failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = attempts;
+    }
+
+    fn post_apply_refresh(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .post_apply_refresh_failures
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if *remaining > 0 {
+                *remaining -= 1;
+                anyhow::bail!("injected post-apply refresh failure");
+            }
+        }
+        self.refresh()
     }
 
     #[cfg(test)]
@@ -2406,6 +3674,77 @@ impl HotEngine {
             .term_sequences
             .current_term()
             .max(1)
+    }
+
+    pub(crate) fn legacy_migration_checkpoint(&self) -> Option<u64> {
+        self.apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .legacy_migration_checkpoint
+    }
+
+    pub(crate) fn vector_rebuild_documents(
+        &self,
+    ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        let searcher = self.reader.searcher();
+        let top_docs = searcher.search(&tantivy::query::AllQuery, &TopDocs::with_limit(100_000))?;
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let mut documents = Vec::with_capacity(top_docs.len());
+        for (_, address) in top_docs {
+            let stored = searcher.doc::<TantivyDocument>(address)?;
+            let doc_id = stored
+                .get_all(registry.id_field)
+                .next()
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("vector rebuild document has no _id"))?
+                .to_string();
+            let source = stored
+                .get_all(registry.source_field)
+                .next()
+                .and_then(|value| value.as_str())
+                .and_then(|source| Self::decode_stored_source_with_registry(&registry, source))
+                .ok_or_else(|| anyhow::anyhow!("vector rebuild document has no valid _source"))?;
+            let segment = &searcher.segment_readers()[address.segment_ord as usize];
+            let sequence = match (
+                segment.fast_fields().u64(SEQ_NO_FIELD_NAME),
+                segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME),
+            ) {
+                (Ok(seq_column), Ok(term_column)) => {
+                    let seq_no = seq_column.first(address.doc_id).ok_or_else(|| {
+                        anyhow::Error::new(InternalSequenceFieldError {
+                            message: format!("document [{doc_id}] has no {SEQ_NO_FIELD_NAME}"),
+                        })
+                    })?;
+                    let primary_term = term_column.first(address.doc_id).ok_or_else(|| {
+                        anyhow::Error::new(InternalSequenceFieldError {
+                            message: format!(
+                                "document [{doc_id}] has no {PRIMARY_TERM_FIELD_NAME}"
+                            ),
+                        })
+                    })?;
+                    (seq_no, primary_term)
+                }
+                _ => {
+                    let checkpoint = state.legacy_migration_checkpoint.ok_or_else(|| {
+                        anyhow::Error::new(InternalSequenceFieldError {
+                            message: format!(
+                                "native document [{doc_id}] is missing vector version fields"
+                            ),
+                        })
+                    })?;
+                    (checkpoint, state.term_sequences.current_term().max(1))
+                }
+            };
+            documents.push((doc_id, source, sequence.0, sequence.1));
+        }
+        Ok(documents)
     }
 
     pub fn missing_sequence_intervals_through(
@@ -5909,41 +7248,7 @@ impl super::SearchEngine for HotEngine {
         payload: serde_json::Value,
         primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
-        self.validate_keyword_documents(std::iter::once(&payload))?;
-        // Keep WAL append and the corresponding writer mutation in one critical
-        // section so refresh/flush cannot commit past a translog entry that has
-        // not yet been applied to the Tantivy writer.
-        let seq_no = self.with_translog("document indexing", |tl| {
-            let mut writer_state = self.writer_state_with_replay(tl, "document indexing")?;
-            let writer = writer_state.writer_mut("document indexing")?;
-            let wal_entry = serde_json::json!({
-                "_doc_id": doc_id,
-                "_source": payload
-            });
-            let receipt = tl.append(primary_term, crate::wal::WalOperation::Index, wal_entry)?;
-            self.prepare_sequence_operation(primary_term, receipt.seq_no, true)?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-
-            // 2. Delete any existing doc with same _id (upsert semantics)
-            let id_field = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .id_field;
-            writer.delete_term(Term::from_field_text(id_field, doc_id));
-
-            // 3. Write to Tantivy in-memory buffer
-            let doc = self.build_tantivy_doc(doc_id, &payload)?;
-            writer.add_document(doc)?;
-            self.complete_sequence_operation(primary_term, receipt.seq_no)?;
-            Ok(receipt.seq_no)
-        })?;
-
-        Ok(super::IndexWriteReceipt {
-            doc_id: doc_id.to_string(),
-            seq_no,
-        })
+        self.add_primary_index_with_side_effect(doc_id, payload, primary_term, |_| Ok(()))
     }
 
     fn add_document_with_seq_at_term(
@@ -5954,37 +7259,17 @@ impl super::SearchEngine for HotEngine {
         primary_term: u64,
     ) -> Result<String> {
         self.validate_keyword_documents(std::iter::once(&payload))?;
-        self.with_translog("replica document indexing", |tl| {
-            let mut writer_state =
-                self.writer_state_with_replay(tl, "replica document indexing")?;
-            self.prepare_sequence_operation(primary_term, seq_no, true)?;
-            let writer = writer_state.writer_mut("replica document indexing")?;
-            let wal_entry = serde_json::json!({
-                "_doc_id": doc_id,
-                "_source": payload
-            });
-            tl.append_with_seq(
+        self.apply_sequenced_operation_with_side_effect(
+            super::SequencedOperation {
                 seq_no,
                 primary_term,
-                crate::wal::WalOperation::Index,
-                wal_entry,
-            )?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-
-            let id_field = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .id_field;
-            writer.delete_term(Term::from_field_text(id_field, doc_id));
-
-            let doc = self.build_tantivy_doc(doc_id, &payload)?;
-            writer.add_document(doc)?;
-            self.complete_sequence_operation(primary_term, seq_no)?;
-            Ok(())
-        })?;
-
+                mutation: super::DocumentMutation::Index {
+                    doc_id: doc_id.to_string(),
+                    source: payload,
+                },
+            },
+            |_| Ok(()),
+        )?;
         Ok(doc_id.to_string())
     }
 
@@ -5993,61 +7278,7 @@ impl super::SearchEngine for HotEngine {
         docs: Vec<(String, serde_json::Value)>,
         primary_term: u64,
     ) -> Result<super::BulkWriteReceipt> {
-        self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
-        // Keep WAL persistence and writer mutation serialized with refresh/flush.
-        let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
-            .iter()
-            .map(|(id, p)| {
-                (
-                    crate::wal::WalOperation::Index,
-                    serde_json::json!({ "_doc_id": id, "_source": p }),
-                )
-            })
-            .collect();
-        let mut doc_ids = Vec::with_capacity(docs.len());
-        let start_seq_no = self.with_translog("bulk indexing", |tl| {
-            // 2. Write all docs to Tantivy in-memory buffer under one lock
-            // Acquire registry once for the entire batch (not per-doc)
-            let registry = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer_state_with_replay(tl, "bulk indexing")?;
-            let writer = writer_state.writer_mut("bulk indexing")?;
-            let start_seq_no = tl.write_bulk_with_receipt(primary_term, &ops)?;
-            if let Some(start_seq_no) = start_seq_no {
-                for offset in 0..docs.len() {
-                    self.prepare_sequence_operation(
-                        primary_term,
-                        start_seq_no + offset as u64,
-                        true,
-                    )?;
-                }
-            }
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-            for (offset, (doc_id, payload)) in docs.iter().enumerate() {
-                writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-                let doc = Self::build_tantivy_doc_inner(
-                    &registry,
-                    &self.index.schema(),
-                    doc_id,
-                    payload,
-                )?;
-                writer.add_document(doc)?;
-                self.complete_sequence_operation(
-                    primary_term,
-                    start_seq_no.expect("non-empty bulk has a start sequence") + offset as u64,
-                )?;
-                doc_ids.push(doc_id.clone());
-            }
-            Ok(start_seq_no)
-        })?;
-
-        Ok(super::BulkWriteReceipt {
-            doc_ids,
-            start_seq_no,
-        })
+        self.add_primary_bulk_with_side_effect(docs, primary_term, |_| Ok(()))
     }
 
     fn bulk_add_documents_with_start_seq_at_term(
@@ -6057,44 +7288,24 @@ impl super::SearchEngine for HotEngine {
         primary_term: u64,
     ) -> Result<Vec<String>> {
         self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
-        let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
+        let operations = docs
             .iter()
-            .map(|(id, p)| {
-                (
-                    crate::wal::WalOperation::Index,
-                    serde_json::json!({ "_doc_id": id, "_source": p }),
-                )
+            .enumerate()
+            .map(|(offset, (doc_id, payload))| {
+                Ok(super::SequencedOperation {
+                    seq_no: start_seq_no
+                        .checked_add(offset as u64)
+                        .ok_or_else(|| anyhow::anyhow!("replica WAL sequence range overflows"))?,
+                    primary_term,
+                    mutation: super::DocumentMutation::Index {
+                        doc_id: doc_id.clone(),
+                        source: payload.clone(),
+                    },
+                })
             })
-            .collect();
-        let mut doc_ids = Vec::with_capacity(docs.len());
-        self.with_translog("replica bulk indexing", |tl| {
-            let registry = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer_state_with_replay(tl, "replica bulk indexing")?;
-            for offset in 0..docs.len() {
-                self.prepare_sequence_operation(primary_term, start_seq_no + offset as u64, true)?;
-            }
-            let writer = writer_state.writer_mut("replica bulk indexing")?;
-            tl.write_bulk_with_start_seq(start_seq_no, primary_term, &ops)?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-            for (offset, (doc_id, payload)) in docs.iter().enumerate() {
-                writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-                let doc = Self::build_tantivy_doc_inner(
-                    &registry,
-                    &self.index.schema(),
-                    doc_id,
-                    payload,
-                )?;
-                writer.add_document(doc)?;
-                self.complete_sequence_operation(primary_term, start_seq_no + offset as u64)?;
-                doc_ids.push(doc_id.clone());
-            }
-            Ok(())
-        })?;
-
+            .collect::<Result<Vec<_>>>()?;
+        self.apply_sequenced_batch_with_side_effect(operations, true, |_| Ok(()))?;
+        let doc_ids = docs.into_iter().map(|(doc_id, _)| doc_id).collect();
         Ok(doc_ids)
     }
 
@@ -6103,31 +7314,7 @@ impl super::SearchEngine for HotEngine {
         doc_id: &str,
         primary_term: u64,
     ) -> Result<super::DeleteWriteReceipt> {
-        let seq_no = self.with_translog("document delete", |tl| {
-            let mut writer_state = self.writer_state_with_replay(tl, "document delete")?;
-            let writer = writer_state.writer_mut("document delete")?;
-            let receipt = tl.append(
-                primary_term,
-                crate::wal::WalOperation::Delete,
-                serde_json::json!({ "_doc_id": doc_id }),
-            )?;
-            self.prepare_sequence_operation(primary_term, receipt.seq_no, true)?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-
-            // 2. Delete from Tantivy
-            let id_field = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .id_field;
-            let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
-            // delete_term returns an OpStamp, not a count — we report 1 optimistically
-            let _ = opstamp;
-            self.complete_sequence_operation(primary_term, receipt.seq_no)?;
-            Ok(receipt.seq_no)
-        })?;
-        Ok(super::DeleteWriteReceipt { deleted: 1, seq_no })
+        self.delete_primary_with_side_effect(doc_id, primary_term, |_| Ok(()))
     }
 
     fn delete_document_with_seq_at_term(
@@ -6136,45 +7323,31 @@ impl super::SearchEngine for HotEngine {
         seq_no: u64,
         primary_term: u64,
     ) -> Result<u64> {
-        self.with_translog("replica document delete", |tl| {
-            let mut writer_state = self.writer_state_with_replay(tl, "replica document delete")?;
-            self.prepare_sequence_operation(primary_term, seq_no, true)?;
-            let writer = writer_state.writer_mut("replica document delete")?;
-            tl.append_with_seq(
+        self.apply_sequenced_operation_with_side_effect(
+            super::SequencedOperation {
                 seq_no,
                 primary_term,
-                crate::wal::WalOperation::Delete,
-                serde_json::json!({ "_doc_id": doc_id }),
-            )?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-
-            let id_field = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .id_field;
-            let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
-            let _ = opstamp;
-            self.complete_sequence_operation(primary_term, seq_no)?;
-            Ok(())
-        })?;
+                mutation: super::DocumentMutation::Delete {
+                    doc_id: doc_id.to_string(),
+                },
+            },
+            |_| Ok(()),
+        )?;
         Ok(1)
     }
 
     fn apply_noop_with_seq(&self, reason: &str, seq_no: u64, primary_term: u64) -> Result<()> {
-        self.with_translog("replica no-op apply", |tl| {
-            let _writer_state = self.writer_state_with_replay(tl, "replica no-op apply")?;
-            self.prepare_sequence_operation(primary_term, seq_no, false)?;
-            tl.append_with_seq(
+        self.apply_sequenced_operation_with_side_effect(
+            super::SequencedOperation {
                 seq_no,
                 primary_term,
-                crate::wal::WalOperation::NoOp,
-                serde_json::json!({ "_reason": reason }),
-            )?;
-            self.complete_sequence_operation(primary_term, seq_no)?;
-            Ok(())
-        })
+                mutation: super::DocumentMutation::NoOp {
+                    reason: reason.to_string(),
+                },
+            },
+            |_| Ok(()),
+        )?;
+        Ok(())
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -6201,24 +7374,7 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn refresh(&self) -> Result<()> {
-        let _maintenance = self.maintenance_guard("refresh")?;
-        let committed_boundary = self.with_translog("refresh", |tl| {
-            #[cfg(test)]
-            if let Some(sender) = self
-                .refresh_before_writer_sender
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-            {
-                let _ = sender.send(());
-            }
-            let mut writer_state = self.writer_state_with_replay(tl, "refresh")?;
-            let boundary = self.current_committed_boundary()?;
-            self.commit_writer_at_boundary(&mut writer_state, "refresh", boundary)
-        })?;
-        self.persist_committed_boundary(&committed_boundary)?;
-        self.reader.reload()?;
-        Ok(())
+        self.refresh_with_pruned_tombstones().map(|_| ())
     }
 
     fn flush(&self) -> Result<()> {
@@ -7376,6 +8532,54 @@ mod tests {
             .unwrap();
     }
 
+    fn create_flushed_legacy_fixture(path: &Path, nonempty_wal: bool) {
+        let index_path = path.join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let mut schema = Schema::builder();
+        let id = schema.add_text_field("_id", (STRING | STORED).set_fast(None));
+        let source = schema.add_text_field("_source", STORED);
+        let body = schema.add_text_field("body", TEXT | STORED);
+        let index = Index::open_or_create(
+            tantivy::directory::MmapDirectory::open(&index_path).unwrap(),
+            schema.build(),
+        )
+        .unwrap();
+        let mut writer = index.writer(TANTIVY_WRITER_HEAP_BYTES).unwrap();
+        let mut document = TantivyDocument::new();
+        document.add_text(id, "legacy");
+        document.add_text(source, r#"{"value":"legacy"}"#);
+        document.add_text(body, "legacy");
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(index);
+
+        let generation_bytes = if nonempty_wal { vec![1u8] } else { Vec::new() };
+        std::fs::write(
+            path.join("translog-00000000000000000000.bin"),
+            &generation_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("translog.manifest"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "active_generation_id": 0,
+                "next_generation_id": 1,
+                "generations": [{
+                    "id": 0,
+                    "first_seq_no": if nonempty_wal { Some(0) } else { None },
+                    "last_seq_no": if nonempty_wal { Some(0) } else { None },
+                    "size_bytes": generation_bytes.len(),
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(path.join("translog.seqno"), "1").unwrap();
+        std::fs::write(path.join("translog.committed"), "1").unwrap();
+    }
+
     struct MergeWriteGate {
         armed: AtomicBool,
         entered_sender: Sender<()>,
@@ -7490,11 +8694,15 @@ mod tests {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
         schema_builder.add_text_field("_source", STORED);
+        schema_builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
+        schema_builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
         schema_builder.add_text_field("body", TEXT | STORED);
         let index = Index::open_or_create(directory, schema_builder.build()).unwrap();
         let schema = index.schema();
         let id_field = schema.get_field("_id").unwrap();
         let source_field = schema.get_field("_source").unwrap();
+        let seq_no_field = schema.get_field(SEQ_NO_FIELD_NAME).unwrap();
+        let primary_term_field = schema.get_field(PRIMARY_TERM_FIELD_NAME).unwrap();
         let body_field = schema.get_field("body").unwrap();
         let writer = index.writer(TANTIVY_WRITER_HEAP_BYTES).unwrap();
         let automatic_merge_policy = writer.get_merge_policy();
@@ -7521,13 +8729,19 @@ mod tests {
             force_merge_before_wait_sender: Mutex::new(None),
             writer_replacement_failure: Mutex::new(None),
             engine_apply_failure: Mutex::new(None),
+            refresh_commit_failures: Mutex::new(0),
+            post_apply_refresh_failures: Mutex::new(0),
             refresh_before_writer_sender: Mutex::new(None),
+            refresh_after_commit_sender: Mutex::new(None),
+            refresh_after_commit_release_receiver: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
             peer_recovery_read_started_sender: Mutex::new(None),
             field_registry: RwLock::new(FieldRegistry {
                 id_field,
                 source_field,
+                seq_no_field: Some(seq_no_field),
+                primary_term_field: Some(primary_term_field),
                 fields: HashMap::from([("body".to_string(), body_field)]),
                 field_types: HashMap::new(),
                 date_fields: Vec::new(),
@@ -7537,6 +8751,7 @@ mod tests {
             apply_state: Mutex::new(ApplyState::new(committed_boundary).unwrap()),
             committed_boundary_path,
             durability: TranslogDurability::Request,
+            delete_tombstone_retention: Duration::from_secs(60),
             column_cache: Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
         };
 
@@ -7637,6 +8852,196 @@ mod tests {
 
         // File should be unchanged — no rewrite needed.
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn flushed_legacy_primary_migrates_in_place_and_bounds_old_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        create_flushed_legacy_fixture(dir.path(), false);
+        let engine = HotEngine::open_existing_primary_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &HashMap::new(),
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            engine.get_document("legacy").unwrap().unwrap()["value"],
+            "legacy"
+        );
+        assert_eq!(engine.legacy_migration_checkpoint(), Some(0));
+
+        engine
+            .add_document_with_seq_at_term("legacy", json!({"value": "stale"}), 0, 2)
+            .unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("legacy").unwrap().unwrap()["value"],
+            "legacy"
+        );
+
+        engine
+            .add_document_with_seq_at_term("legacy", json!({"value": "native"}), 1, 2)
+            .unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("legacy").unwrap().unwrap()["value"],
+            "native"
+        );
+        let boundary = CommittedBoundaryRecord::load(&dir.path().join("translog.committed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(boundary.legacy_migration_checkpoint, Some(0));
+    }
+
+    #[test]
+    fn flushed_legacy_replica_waits_for_primary_migration() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        create_flushed_legacy_fixture(dir.path(), false);
+        let meta_path = dir.path().join("index/meta.json");
+        let before = std::fs::read(&meta_path).unwrap();
+        let mappings = HashMap::from([(
+            "new_field".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]);
+        let error = match HotEngine::open_existing_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        ) {
+            Ok(_) => panic!("legacy replica unexpectedly migrated in place"),
+            Err(error) => error,
+        };
+        assert!(error.is::<LegacyReplicaAwaitingPrimaryMigration>());
+        assert_eq!(std::fs::read(meta_path).unwrap(), before);
+    }
+
+    #[test]
+    fn nonempty_legacy_wal_fails_closed_during_primary_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        create_flushed_legacy_fixture(dir.path(), true);
+        let error = match HotEngine::open_existing_primary_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &HashMap::new(),
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+            2,
+        ) {
+            Ok(_) => panic!("non-empty legacy WAL unexpectedly migrated"),
+            Err(error) => error,
+        };
+        assert!(error.is::<crate::wal::LegacyWalMigrationError>());
+    }
+
+    #[test]
+    fn indexed_document_stores_exact_sequence_identity_fast_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine
+            .add_document_with_seq_at_term("doc", json!({"value": 1}), 7, 3)
+            .unwrap();
+        engine.refresh().unwrap();
+        let registry = engine.field_registry.read().unwrap();
+        let searcher = engine.reader.searcher();
+        let query = tantivy::query::TermQuery::new(
+            Term::from_field_text(registry.id_field, "doc"),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let (_, address) = searcher
+            .search(&query, &TopDocs::with_limit(1))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let segment = &searcher.segment_readers()[address.segment_ord as usize];
+        assert_eq!(
+            segment
+                .fast_fields()
+                .u64(SEQ_NO_FIELD_NAME)
+                .unwrap()
+                .first(address.doc_id),
+            Some(7)
+        );
+        assert_eq!(
+            segment
+                .fast_fields()
+                .u64(PRIMARY_TERM_FIELD_NAME)
+                .unwrap()
+                .first(address.doc_id),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn malformed_internal_sequence_field_options_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let mut schema = Schema::builder();
+        schema.add_text_field("_id", (STRING | STORED).set_fast(None));
+        schema.add_text_field("_source", STORED);
+        schema.add_u64_field(SEQ_NO_FIELD_NAME, STORED);
+        schema.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
+        schema.add_text_field("body", TEXT | STORED);
+        Index::open_or_create(
+            tantivy::directory::MmapDirectory::open(&index_path).unwrap(),
+            schema.build(),
+        )
+        .unwrap();
+        HotTranslog::open(dir.path()).unwrap();
+        persist_empty_committed_boundary(dir.path());
+
+        let error = match HotEngine::new(dir.path(), Duration::from_secs(60)) {
+            Ok(_) => panic!("malformed internal field unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.is::<AuthoritativeSchemaError>());
+    }
+
+    #[test]
+    fn remote_split_purpose_does_not_require_sequence_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new_remote_split_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &HashMap::new(),
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        engine.add_document("doc", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.get_document("doc").unwrap().unwrap()["value"], 1);
+        let schema = engine.index.schema();
+        assert!(schema.get_field(SEQ_NO_FIELD_NAME).is_err());
+        assert!(schema.get_field(PRIMARY_TERM_FIELD_NAME).is_err());
+    }
+
+    #[test]
+    fn legacy_remote_split_with_empty_v1_wal_remains_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        create_flushed_legacy_fixture(dir.path(), false);
+        let engine = HotEngine::new_remote_split_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &HashMap::new(),
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.get_document("legacy").unwrap().unwrap()["value"],
+            "legacy"
+        );
+        assert!(engine.index.schema().get_field(SEQ_NO_FIELD_NAME).is_err());
     }
 
     #[test]
@@ -8475,6 +9880,90 @@ mod tests {
         };
         let (_hits, total, _) = engine2.search_query(&req).unwrap();
         assert_eq!(total, 1, "refresh-committed docs must not replay twice");
+    }
+
+    #[test]
+    fn stale_apply_during_commit_to_reload_window_uses_old_version_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap());
+        engine
+            .add_document_with_seq_at_term("doc", json!({"value": 2}), 1, 1)
+            .unwrap();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine.pause_after_refresh_commit_for_test(committed_tx, release_rx);
+
+        let refresh_engine = engine.clone();
+        let refresh = std::thread::spawn(move || refresh_engine.refresh());
+        committed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        engine
+            .add_document_with_seq_at_term("doc", json!({"value": 1}), 0, 1)
+            .unwrap();
+        release_tx.send(()).unwrap();
+        refresh.join().unwrap().unwrap();
+
+        assert_eq!(engine.get_document("doc").unwrap().unwrap()["value"], 2);
+    }
+
+    #[test]
+    fn map_cap_refresh_failure_rejects_before_sequence_or_wal_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.set_version_map_max_bytes_for_test(LiveVersionMap::estimate_reservation(["a"]));
+        let first = engine
+            .add_document_with_receipt("a", json!({"value": 1}))
+            .unwrap();
+        assert_eq!(first.seq_no, 0);
+        let before_next = engine
+            .with_translog("map cap test", |translog| Ok(translog.next_seq_no()))
+            .unwrap();
+        let before_size = engine.translog_size_bytes();
+        let before_stats = engine.sequence_stats();
+
+        engine.inject_refresh_commit_failures_for_test(1);
+        let error = engine
+            .add_document_with_receipt("b", json!({"value": 2}))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected refresh commit failure")
+        );
+        assert_eq!(
+            engine
+                .with_translog("map cap test", |translog| Ok(translog.next_seq_no()))
+                .unwrap(),
+            before_next
+        );
+        assert_eq!(engine.translog_size_bytes(), before_size);
+        assert_eq!(engine.sequence_stats(), before_stats);
+        assert!(engine.get_document("b").unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_bulk_success_is_independent_of_post_apply_refresh_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.set_version_map_max_bytes_for_test(1);
+        engine.inject_post_apply_refresh_failures_for_test(1);
+
+        let receipt = engine
+            .bulk_add_documents_with_receipt(vec![("oversized".to_string(), json!({"value": 1}))])
+            .unwrap();
+        assert_eq!(receipt.start_seq_no, Some(0));
+        assert_eq!(
+            engine
+                .peer_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .len(),
+            1
+        );
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("oversized").unwrap().unwrap()["value"],
+            1
+        );
     }
 
     #[test]

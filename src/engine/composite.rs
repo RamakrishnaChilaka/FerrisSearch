@@ -29,6 +29,20 @@ pub struct CompositeEngine {
     column_cache: Arc<super::column_cache::ColumnCache>,
 }
 
+#[derive(Clone)]
+enum PreparedVectorMutation {
+    None,
+    SkipShapeMismatch {
+        field: String,
+        expected: usize,
+        actual: usize,
+    },
+    Index {
+        vector: Vec<f32>,
+    },
+    Delete,
+}
+
 impl CompositeEngine {
     /// Create a new composite engine at the given data directory.
     pub fn new(data_dir: impl AsRef<Path>, refresh_interval: Duration) -> Result<Self> {
@@ -102,9 +116,63 @@ impl CompositeEngine {
         })
     }
 
+    pub(crate) fn open_existing_primary_with_mappings(
+        data_dir: impl AsRef<Path>,
+        refresh_interval: Duration,
+        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+        primary_term: u64,
+    ) -> Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let text = HotEngine::open_existing_primary_with_mappings(
+            &data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache.clone(),
+            primary_term,
+        )?;
+        Ok(Self {
+            text,
+            vector: RwLock::new(None),
+            data_dir,
+            global_cp: std::sync::atomic::AtomicU64::new(0),
+            column_cache,
+        })
+    }
+
+    pub(crate) fn open_recovery_target_with_mappings(
+        data_dir: impl AsRef<Path>,
+        refresh_interval: Duration,
+        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+    ) -> Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let text = HotEngine::open_recovery_target_with_mappings(
+            &data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache.clone(),
+        )?;
+        Ok(Self {
+            text,
+            vector: RwLock::new(None),
+            data_dir,
+            global_cp: std::sync::atomic::AtomicU64::new(0),
+            column_cache,
+        })
+    }
+
     /// Get a reference to the underlying HotEngine (for refresh loop).
     pub fn text_engine(&self) -> &HotEngine {
         &self.text
+    }
+
+    pub(crate) fn legacy_migration_checkpoint(&self) -> Option<u64> {
+        self.text.legacy_migration_checkpoint()
     }
 
     #[cfg(test)]
@@ -298,8 +366,10 @@ impl CompositeEngine {
         Ok(())
     }
 
-    /// Extract and index vector fields from a document payload.
-    fn index_vectors(&self, doc_id: &str, payload: &serde_json::Value) {
+    fn prepare_vector_mutation(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<PreparedVectorMutation> {
         if let Some(obj) = payload.as_object() {
             for (field, value) in obj {
                 if let Some(arr) = value.as_array()
@@ -307,20 +377,82 @@ impl CompositeEngine {
                 {
                     let floats: Option<Vec<f32>> =
                         arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
-                    if let Some(vec) = floats
-                        && !vec.is_empty()
-                        && self.ensure_vector_index(vec.len()).is_ok()
+                    if let Some(vector) = floats
+                        && !vector.is_empty()
                     {
-                        let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
-                        if let Some(ref vi) = *guard
-                            && let Err(e) = vi.add_with_doc_id(doc_id, &vec)
+                        if let Some(expected) = self
+                            .vector
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .as_ref()
+                            .map(VectorIndex::dimensions)
+                            && expected != vector.len()
                         {
-                            tracing::warn!("Failed to index vector for doc '{}': {}", doc_id, e);
+                            return Ok(PreparedVectorMutation::SkipShapeMismatch {
+                                field: field.clone(),
+                                expected,
+                                actual: vector.len(),
+                            });
                         }
+                        self.ensure_vector_index(vector.len())?;
+                        return Ok(PreparedVectorMutation::Index { vector });
                     }
                 }
             }
         }
+        Ok(PreparedVectorMutation::None)
+    }
+
+    fn apply_prepared_vector_mutation(
+        &self,
+        operation: &super::SequencedOperation,
+        prepared: &PreparedVectorMutation,
+    ) -> Result<()> {
+        match (prepared, &operation.mutation) {
+            (
+                PreparedVectorMutation::Index { vector },
+                super::DocumentMutation::Index { doc_id, .. },
+            ) => {
+                let guard = self
+                    .vector
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                let index = guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("prepared vector index disappeared"))?;
+                index.apply_index(doc_id, vector, operation.seq_no, operation.primary_term)?;
+            }
+            (PreparedVectorMutation::Delete, super::DocumentMutation::Delete { doc_id }) => {
+                let guard = self
+                    .vector
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(index) = guard.as_ref() {
+                    index.apply_delete(doc_id, operation.seq_no, operation.primary_term)?;
+                }
+            }
+            (
+                PreparedVectorMutation::SkipShapeMismatch {
+                    field,
+                    expected,
+                    actual,
+                },
+                super::DocumentMutation::Index { doc_id, .. },
+            ) => {
+                tracing::warn!(
+                    document_id = doc_id,
+                    field,
+                    expected,
+                    actual,
+                    "Skipping vector mutation because the numeric array dimension does not match"
+                );
+            }
+            (PreparedVectorMutation::None, _)
+            | (PreparedVectorMutation::Delete, _)
+            | (PreparedVectorMutation::Index { .. }, _)
+            | (PreparedVectorMutation::SkipShapeMismatch { .. }, _) => {}
+        }
+        Ok(())
     }
 
     /// Save the vector index to disk (called during flush).
@@ -350,31 +482,28 @@ impl CompositeEngine {
     /// knn_vector fields exist in the index mappings). This method does
     /// its own early-return if the MatchAll scan finds no documents.
     pub fn rebuild_vectors(&self) -> Result<()> {
-        let req = crate::search::SearchRequest {
-            query: crate::search::QueryClause::MatchAll(serde_json::Value::Object(
-                Default::default(),
-            )),
-            size: 100_000,
-            from: 0,
-            knn: None,
-            sort: vec![],
-            search_after: None,
-            aggs: std::collections::HashMap::new(),
-        };
-        let (docs, _, _) = self.text.search_query(&req).unwrap_or_default();
+        let docs = self.text.vector_rebuild_documents()?;
         if docs.is_empty() {
             return Ok(());
         }
 
+        if let Some(index) = self
+            .vector
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            index.reset_versions();
+        }
         let mut vector_count = 0;
-        for doc in &docs {
-            let doc_id = doc.get("_id").and_then(|v| v.as_str()).unwrap_or("");
-            if doc_id.is_empty() {
-                continue;
-            }
-            if let Some(source) = doc.get("_source") {
-                self.index_vectors(doc_id, source);
-            }
+        for (doc_id, source, seq_no, primary_term) in docs {
+            let prepared = self.prepare_vector_mutation(&source)?;
+            let operation = super::SequencedOperation {
+                seq_no,
+                primary_term,
+                mutation: super::DocumentMutation::Index { doc_id, source },
+            };
+            self.apply_prepared_vector_mutation(&operation, &prepared)?;
         }
 
         // Check if any vectors were actually indexed
@@ -419,10 +548,13 @@ impl SearchEngine for CompositeEngine {
         payload: serde_json::Value,
         primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
-        let receipt =
-            self.text
-                .add_document_with_receipt_at_term(doc_id, payload.clone(), primary_term)?;
-        self.index_vectors(&receipt.doc_id, &payload);
+        let prepared = self.prepare_vector_mutation(&payload)?;
+        let receipt = self.text.add_primary_index_with_side_effect(
+            doc_id,
+            payload,
+            primary_term,
+            |operation| self.apply_prepared_vector_mutation(operation, &prepared),
+        )?;
         self.update_local_checkpoint(receipt.seq_no);
         Ok(receipt)
     }
@@ -434,15 +566,21 @@ impl SearchEngine for CompositeEngine {
         seq_no: u64,
         primary_term: u64,
     ) -> Result<String> {
-        let id = self.text.add_document_with_seq_at_term(
-            doc_id,
-            payload.clone(),
+        let prepared = self.prepare_vector_mutation(&payload)?;
+        let operation = super::SequencedOperation {
             seq_no,
             primary_term,
-        )?;
-        self.index_vectors(&id, &payload);
+            mutation: super::DocumentMutation::Index {
+                doc_id: doc_id.to_string(),
+                source: payload,
+            },
+        };
+        self.text
+            .apply_sequenced_operation_with_side_effect(operation.clone(), |operation| {
+                self.apply_prepared_vector_mutation(operation, &prepared)
+            })?;
         self.update_local_checkpoint(seq_no);
-        Ok(id)
+        Ok(doc_id.to_string())
     }
 
     fn bulk_add_documents_with_receipt_at_term(
@@ -450,54 +588,20 @@ impl SearchEngine for CompositeEngine {
         docs: Vec<(String, serde_json::Value)>,
         primary_term: u64,
     ) -> Result<super::BulkWriteReceipt> {
-        // Extract vector fields before passing docs to text engine (avoids cloning)
-        let mut vec_fields: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
-        for (_, payload) in &docs {
-            let mut found = None;
-            if let Some(obj) = payload.as_object() {
-                for (field, value) in obj {
-                    if let Some(arr) = value.as_array()
-                        && !self.text.is_keyword_field(field)
-                    {
-                        let floats: Option<Vec<f32>> =
-                            arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
-                        if let Some(ref vec) = floats
-                            && !vec.is_empty()
-                        {
-                            found = floats;
-                            break;
-                        }
-                    }
-                }
-            }
-            vec_fields.push(found);
-        }
+        let prepared = docs
+            .iter()
+            .map(|(_, payload)| self.prepare_vector_mutation(payload))
+            .collect::<Result<Vec<_>>>()?;
 
-        let receipt = self
-            .text
-            .bulk_add_documents_with_receipt_at_term(docs, primary_term)?;
-
-        // Collect (doc_id, vector) pairs and bulk-add to vector index
-        let mut vec_batch: Vec<(String, Vec<f32>)> = Vec::new();
-        for (i, vec_opt) in vec_fields.into_iter().enumerate() {
-            if let (Some(id), Some(vec)) = (receipt.doc_ids.get(i), vec_opt)
-                && self.ensure_vector_index(vec.len()).is_ok()
-            {
-                vec_batch.push((id.clone(), vec));
-            }
-        }
-        if !vec_batch.is_empty() {
-            let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref vi) = *guard {
-                let refs: Vec<(&str, &[f32])> = vec_batch
-                    .iter()
-                    .map(|(id, v)| (id.as_str(), v.as_slice()))
-                    .collect();
-                if let Err(e) = vi.bulk_add_with_doc_ids(&refs) {
-                    tracing::warn!("Failed to bulk-add vectors: {}", e);
-                }
-            }
-        }
+        let mut prepared = prepared.into_iter();
+        let receipt =
+            self.text
+                .add_primary_bulk_with_side_effect(docs, primary_term, |operation| {
+                    let prepared = prepared
+                        .next()
+                        .expect("primary bulk vector preparation matches operation order");
+                    self.apply_prepared_vector_mutation(operation, &prepared)
+                })?;
         if let Some(last_seq_no) = receipt.last_seq_no()? {
             self.update_local_checkpoint(last_seq_no);
         }
@@ -510,54 +614,38 @@ impl SearchEngine for CompositeEngine {
         start_seq_no: u64,
         primary_term: u64,
     ) -> Result<Vec<String>> {
-        let mut vec_fields: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
-        for (_, payload) in &docs {
-            let mut found = None;
-            if let Some(obj) = payload.as_object() {
-                for (field, value) in obj {
-                    if let Some(arr) = value.as_array()
-                        && !self.text.is_keyword_field(field)
-                    {
-                        let floats: Option<Vec<f32>> =
-                            arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
-                        if let Some(ref vec) = floats
-                            && !vec.is_empty()
-                        {
-                            found = floats;
-                            break;
-                        }
-                    }
-                }
-            }
-            vec_fields.push(found);
-        }
-
-        let ids = self.text.bulk_add_documents_with_start_seq_at_term(
-            docs,
-            start_seq_no,
-            primary_term,
-        )?;
-
-        let mut vec_batch: Vec<(String, Vec<f32>)> = Vec::new();
-        for (i, vec_opt) in vec_fields.into_iter().enumerate() {
-            if let (Some(id), Some(vec)) = (ids.get(i), vec_opt)
-                && self.ensure_vector_index(vec.len()).is_ok()
-            {
-                vec_batch.push((id.clone(), vec));
-            }
-        }
-        if !vec_batch.is_empty() {
-            let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref vi) = *guard {
-                let refs: Vec<(&str, &[f32])> = vec_batch
-                    .iter()
-                    .map(|(id, v)| (id.as_str(), v.as_slice()))
-                    .collect();
-                if let Err(e) = vi.bulk_add_with_doc_ids(&refs) {
-                    tracing::warn!("Failed to bulk-add vectors: {}", e);
-                }
-            }
-        }
+        let prepared = docs
+            .iter()
+            .map(|(_, payload)| self.prepare_vector_mutation(payload))
+            .collect::<Result<Vec<_>>>()?;
+        let operations = docs
+            .iter()
+            .enumerate()
+            .map(|(offset, (doc_id, source))| super::SequencedOperation {
+                seq_no: start_seq_no + offset as u64,
+                primary_term,
+                mutation: super::DocumentMutation::Index {
+                    doc_id: doc_id.clone(),
+                    source: source.clone(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut prepared_by_seq = operations
+            .iter()
+            .zip(prepared.iter())
+            .map(|(operation, prepared)| (operation.seq_no, prepared))
+            .collect::<std::collections::HashMap<_, _>>();
+        self.text
+            .apply_sequenced_batch_with_side_effect(operations, true, |operation| {
+                let prepared = prepared_by_seq
+                    .remove(&operation.seq_no)
+                    .expect("prepared vector mutation must match the operation");
+                self.apply_prepared_vector_mutation(operation, prepared)
+            })?;
+        let ids = docs
+            .into_iter()
+            .map(|(doc_id, _)| doc_id)
+            .collect::<Vec<_>>();
 
         if !ids.is_empty() {
             self.update_local_checkpoint(start_seq_no + (ids.len() - 1) as u64);
@@ -570,16 +658,11 @@ impl SearchEngine for CompositeEngine {
         doc_id: &str,
         primary_term: u64,
     ) -> Result<super::DeleteWriteReceipt> {
-        // Remove from vector index if present
-        let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref vi) = *guard {
-            let key = crate::engine::routing::hash_string(doc_id);
-            let _ = vi.remove(key); // ignore errors on missing keys
-        }
-        drop(guard);
-        let receipt = self
-            .text
-            .delete_document_with_receipt_at_term(doc_id, primary_term)?;
+        let receipt =
+            self.text
+                .delete_primary_with_side_effect(doc_id, primary_term, |operation| {
+                    self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
+                })?;
         self.update_local_checkpoint(receipt.seq_no);
         Ok(receipt)
     }
@@ -590,18 +673,20 @@ impl SearchEngine for CompositeEngine {
         seq_no: u64,
         primary_term: u64,
     ) -> Result<u64> {
-        let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref vi) = *guard {
-            let key = crate::engine::routing::hash_string(doc_id);
-            let _ = vi.remove(key);
-        }
-        drop(guard);
-
-        let result = self
-            .text
-            .delete_document_with_seq_at_term(doc_id, seq_no, primary_term)?;
+        self.text.apply_sequenced_operation_with_side_effect(
+            super::SequencedOperation {
+                seq_no,
+                primary_term,
+                mutation: super::DocumentMutation::Delete {
+                    doc_id: doc_id.to_string(),
+                },
+            },
+            |operation| {
+                self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
+            },
+        )?;
         self.update_local_checkpoint(seq_no);
-        Ok(result)
+        Ok(1)
     }
 
     fn apply_noop_with_seq(&self, reason: &str, seq_no: u64, primary_term: u64) -> Result<()> {
@@ -616,7 +701,18 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn refresh(&self) -> Result<()> {
-        self.text.refresh()
+        let pruned = self.text.refresh_with_pruned_tombstones()?;
+        if let Some(index) = self
+            .vector
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            for tombstone in pruned {
+                index.prune_tombstone(tombstone.key, tombstone.seq_no, tombstone.primary_term);
+            }
+        }
+        Ok(())
     }
 
     fn flush(&self) -> Result<()> {

@@ -812,6 +812,49 @@ async fn replicate_doc_index_via_grpc() {
 }
 
 #[tokio::test]
+async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new("d1-ordering".into()));
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cluster_manager, "d1-ordering");
+
+    let address = start_grpc_server(cluster_manager, shard_manager.clone()).await;
+    let mut client = connect_client(address).await;
+    for (seq_no, value) in [(1, 2), (0, 1)] {
+        let response = client
+            .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                index_name: "d1-ordering".into(),
+                shard_id: 0,
+                doc_id: "shared".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": value})).unwrap(),
+                op: "index".into(),
+                seq_no,
+                index_uuid: "d1-ordering-uuid".into(),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+    }
+
+    refresh_all(&shard_manager);
+    let response = client
+        .get_doc(tonic::Request::new(ShardGetRequest {
+            index_name: "d1-ordering".into(),
+            shard_id: 0,
+            doc_id: "shared".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.found);
+    let source: serde_json::Value = serde_json::from_slice(&response.source_json).unwrap();
+    assert_eq!(source["value"], 2);
+}
+
+#[tokio::test]
 async fn replicate_doc_delete_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
@@ -846,7 +889,7 @@ async fn replicate_doc_delete_via_grpc() {
             doc_id: "to-delete".into(),
             payload_json: vec![],
             op: "delete".into(),
-            seq_no: 0,
+            seq_no: 1,
             index_uuid: "rep-del-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
@@ -855,7 +898,7 @@ async fn replicate_doc_delete_via_grpc() {
         .unwrap()
         .into_inner();
 
-    assert!(resp.success);
+    assert!(resp.success, "{}", resp.error);
 
     // Verify deleted
     refresh_all(&sm);

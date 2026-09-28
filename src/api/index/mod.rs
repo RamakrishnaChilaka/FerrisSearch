@@ -154,22 +154,37 @@ pub(crate) async fn ensure_local_index_shards_open(
             continue;
         }
 
-        if let Err(e) = state
-            .shard_manager
-            .open_assigned_shard_with_settings_blocking(
-                index_name.to_string(),
-                *shard_id,
-                metadata.mappings.clone(),
-                metadata.settings.clone(),
-                metadata.uuid.clone(),
-                crate::shard::AssignedShardOpen {
-                    allocation_id,
-                    primary_term: routing.primary_term,
-                    allow_empty_creation: false,
-                },
-            )
-            .await
-        {
+        let assignment = crate::shard::AssignedShardOpen {
+            allocation_id,
+            primary_term: routing.primary_term,
+            allow_empty_creation: false,
+        };
+        let open_result = if routing.primary == state.local_node_id {
+            state
+                .shard_manager
+                .open_primary_assigned_shard_with_settings_blocking(
+                    index_name.to_string(),
+                    *shard_id,
+                    metadata.mappings.clone(),
+                    metadata.settings.clone(),
+                    metadata.uuid.clone(),
+                    assignment,
+                )
+                .await
+        } else {
+            state
+                .shard_manager
+                .open_assigned_shard_with_settings_blocking(
+                    index_name.to_string(),
+                    *shard_id,
+                    metadata.mappings.clone(),
+                    metadata.settings.clone(),
+                    metadata.uuid.clone(),
+                    assignment,
+                )
+                .await
+        };
+        if let Err(e) = open_result {
             tracing::error!(
                 "{}: failed to open shard {}/{}: {}",
                 context,
@@ -312,7 +327,7 @@ async fn auto_create_index(
             committed_state.shard_allocation_id(index_name, 0, &state.local_node_id)
         && let Err(e) = state
             .shard_manager
-            .open_assigned_shard_with_settings_blocking(
+            .open_primary_assigned_shard_with_settings_blocking(
                 created_metadata.name.clone(),
                 0,
                 created_metadata.mappings.clone(),
@@ -516,7 +531,7 @@ pub async fn create_index(
             )
             && let Err(e) = state
                 .shard_manager
-                .open_assigned_shard_with_settings_blocking(
+                .open_primary_assigned_shard_with_settings_blocking(
                     index_name.to_string(),
                     *shard_id,
                     committed_metadata.mappings.clone(),

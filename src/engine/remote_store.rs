@@ -687,11 +687,10 @@ impl RemoteSplitReaderCache {
                 move || -> anyhow::Result<Arc<crate::engine::tantivy::HotEngine>> {
                     let column_cache =
                         Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-                    let engine = crate::engine::tantivy::HotEngine::new_with_mappings(
+                    let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
                         &split_dir,
                         Duration::from_secs(60),
                         &mappings,
-                        crate::wal::TranslogDurability::Request,
                         column_cache,
                     )?;
                     Ok(Arc::new(engine))
@@ -1386,11 +1385,10 @@ pub(crate) async fn publish_docs(
             }
             std::fs::create_dir_all(&staging_for_build)?;
             let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-            let engine = crate::engine::tantivy::HotEngine::new_with_mappings(
+            let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
                 &staging_for_build,
                 Duration::from_secs(60),
                 mappings_for_build.as_ref(),
-                crate::wal::TranslogDurability::Request,
                 column_cache,
             )?;
             use crate::engine::SearchEngine;
@@ -1700,7 +1698,6 @@ mod tests {
     };
     use crate::engine::tantivy::HotEngine;
     use crate::storage::{RemoteSplitManifest, RemoteSplitState, StorageManager};
-    use crate::wal::TranslogDurability;
     use std::collections::BTreeMap;
     use std::sync::mpsc;
     use tempfile::TempDir;
@@ -1778,11 +1775,10 @@ mod tests {
         let stage = manager.staging_dir(metadata.uuid.as_str(), "split-a");
         std::fs::create_dir_all(&stage).unwrap();
         let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-        let engine = HotEngine::new_with_mappings(
+        let engine = HotEngine::new_remote_split_with_mappings(
             &stage,
             Duration::from_secs(60),
             &mappings,
-            TranslogDurability::Request,
             column_cache,
         )
         .unwrap();

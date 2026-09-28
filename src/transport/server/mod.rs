@@ -101,6 +101,7 @@ struct AssignedLocalShard {
     settings: crate::cluster::state::IndexSettings,
     allocation_id: u64,
     primary_term: u64,
+    is_primary: bool,
     allow_empty_creation: bool,
     authoritative: bool,
     primary_unavailable: bool,
@@ -217,21 +218,35 @@ async fn get_or_open_read_shard(
         )));
     }
 
-    Arc::clone(shard_manager)
-        .open_assigned_shard_with_settings_blocking(
-            index_name.to_string(),
-            shard_id,
-            metadata.mappings.clone(),
-            metadata.settings.clone(),
-            metadata.uuid.clone(),
-            crate::shard::AssignedShardOpen {
-                allocation_id,
-                primary_term: routing.primary_term,
-                allow_empty_creation: false,
-            },
-        )
-        .await
-        .map_err(|e| Status::internal(format!("Failed to open shard: {e}")))
+    let assignment = crate::shard::AssignedShardOpen {
+        allocation_id,
+        primary_term: routing.primary_term,
+        allow_empty_creation: false,
+    };
+    let result = if routing.primary == local_node_id {
+        Arc::clone(shard_manager)
+            .open_primary_assigned_shard_with_settings_blocking(
+                index_name.to_string(),
+                shard_id,
+                metadata.mappings.clone(),
+                metadata.settings.clone(),
+                metadata.uuid.clone(),
+                assignment,
+            )
+            .await
+    } else {
+        Arc::clone(shard_manager)
+            .open_assigned_shard_with_settings_blocking(
+                index_name.to_string(),
+                shard_id,
+                metadata.mappings.clone(),
+                metadata.settings.clone(),
+                metadata.uuid.clone(),
+                assignment,
+            )
+            .await
+    };
+    result.map_err(|e| Status::internal(format!("Failed to open shard: {e}")))
 }
 
 pub(crate) async fn run_maintenance_on_assigned_shards_async(
@@ -3237,6 +3252,7 @@ impl TransportService {
             settings: metadata.settings.clone(),
             allocation_id,
             primary_term: routing.primary_term,
+            is_primary: routing.primary == self.local_node_id,
             allow_empty_creation: ordinary_authoritative
                 && cluster_state.may_create_initial_empty_copy(
                     index_name,
@@ -3283,6 +3299,7 @@ impl TransportService {
             settings: metadata.settings.clone(),
             allocation_id,
             primary_term: routing.primary_term,
+            is_primary: routing.primary == self.local_node_id,
             allow_empty_creation: cluster_state.may_create_initial_empty_copy(
                 index_name,
                 shard_id,
@@ -3665,6 +3682,7 @@ impl TransportService {
             settings: metadata.settings.clone(),
             allocation_id,
             primary_term: routing.primary_term,
+            is_primary: true,
             allow_empty_creation: cluster_state.may_create_initial_empty_copy(
                 index_name,
                 shard_id,
@@ -3703,7 +3721,7 @@ impl TransportService {
         }
         if let Err(error) = self
             .shard_manager
-            .open_assigned_shard_with_settings_blocking(
+            .open_primary_assigned_shard_with_settings_blocking(
                 index_name.to_string(),
                 shard_id,
                 current.mappings.clone(),
@@ -3776,7 +3794,7 @@ impl TransportService {
         let current = self.primary_routing(index_name, shard_id)?;
         if let Err(error) = self
             .shard_manager
-            .open_assigned_shard_with_settings_blocking(
+            .open_primary_assigned_shard_with_settings_blocking(
                 index_name.to_string(),
                 shard_id,
                 current.mappings.clone(),
@@ -4081,21 +4099,34 @@ impl TransportService {
                     "index UUID changed for [{index_name}] before shard open"
                 )));
             }
-            let result = self
-                .shard_manager
-                .open_assigned_shard_with_settings_blocking(
-                    index_name.to_string(),
-                    shard_id,
-                    open_override.mappings,
-                    open_override.settings,
-                    open_override.index_uuid,
-                    crate::shard::AssignedShardOpen {
-                        allocation_id: assigned.allocation_id,
-                        primary_term: assigned.primary_term,
-                        allow_empty_creation: assigned.allow_empty_creation,
-                    },
-                )
-                .await;
+            let assignment = crate::shard::AssignedShardOpen {
+                allocation_id: assigned.allocation_id,
+                primary_term: assigned.primary_term,
+                allow_empty_creation: assigned.allow_empty_creation,
+            };
+            let result = if assigned.is_primary {
+                self.shard_manager
+                    .open_primary_assigned_shard_with_settings_blocking(
+                        index_name.to_string(),
+                        shard_id,
+                        open_override.mappings,
+                        open_override.settings,
+                        open_override.index_uuid,
+                        assignment,
+                    )
+                    .await
+            } else {
+                self.shard_manager
+                    .open_assigned_shard_with_settings_blocking(
+                        index_name.to_string(),
+                        shard_id,
+                        open_override.mappings,
+                        open_override.settings,
+                        open_override.index_uuid,
+                        assignment,
+                    )
+                    .await
+            };
             return match result {
                 Ok(engine) => Ok(engine),
                 Err(error) => {
@@ -4112,21 +4143,34 @@ impl TransportService {
             };
         }
 
-        let result = self
-            .shard_manager
-            .open_assigned_shard_with_settings_blocking(
-                index_name.to_string(),
-                shard_id,
-                assigned.mappings,
-                assigned.settings,
-                assigned.index_uuid.clone(),
-                crate::shard::AssignedShardOpen {
-                    allocation_id: assigned.allocation_id,
-                    primary_term: assigned.primary_term,
-                    allow_empty_creation: assigned.allow_empty_creation,
-                },
-            )
-            .await;
+        let assignment = crate::shard::AssignedShardOpen {
+            allocation_id: assigned.allocation_id,
+            primary_term: assigned.primary_term,
+            allow_empty_creation: assigned.allow_empty_creation,
+        };
+        let result = if assigned.is_primary {
+            self.shard_manager
+                .open_primary_assigned_shard_with_settings_blocking(
+                    index_name.to_string(),
+                    shard_id,
+                    assigned.mappings,
+                    assigned.settings,
+                    assigned.index_uuid.clone(),
+                    assignment,
+                )
+                .await
+        } else {
+            self.shard_manager
+                .open_assigned_shard_with_settings_blocking(
+                    index_name.to_string(),
+                    shard_id,
+                    assigned.mappings,
+                    assigned.settings,
+                    assigned.index_uuid.clone(),
+                    assignment,
+                )
+                .await
+        };
         match result {
             Ok(engine) => Ok(engine),
             Err(error) => {

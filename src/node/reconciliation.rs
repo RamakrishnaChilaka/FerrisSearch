@@ -438,18 +438,31 @@ pub(super) fn open_local_assigned_shards(
                 continue;
             }
 
-            if let Err(error) = shard_manager.open_assigned_shard_with_settings(
-                index_name,
-                *shard_id,
-                &metadata.mappings,
-                &metadata.settings,
-                &metadata.uuid,
-                crate::shard::AssignedShardOpen {
-                    allocation_id,
-                    primary_term: routing.primary_term,
-                    allow_empty_creation,
-                },
-            ) {
+            let assignment = crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: routing.primary_term,
+                allow_empty_creation,
+            };
+            let open_result = if routing.primary == local_node_id {
+                shard_manager.open_primary_assigned_shard_with_settings(
+                    index_name,
+                    *shard_id,
+                    &metadata.mappings,
+                    &metadata.settings,
+                    &metadata.uuid,
+                    assignment,
+                )
+            } else {
+                shard_manager.open_assigned_shard_with_settings(
+                    index_name,
+                    *shard_id,
+                    &metadata.mappings,
+                    &metadata.settings,
+                    &metadata.uuid,
+                    assignment,
+                )
+            };
+            if let Err(error) = open_result {
                 tracing::warn!(
                     "Failed to reopen local shard {}/{} during lifecycle reconciliation: {}",
                     index_name,

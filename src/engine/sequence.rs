@@ -52,6 +52,12 @@ impl LocalCheckpointTracker {
             || self.processed_above.contains(seq_no)
     }
 
+    pub(crate) fn has_persisted(&self, seq_no: u64) -> bool {
+        self.persisted_checkpoint
+            .is_some_and(|checkpoint| seq_no <= checkpoint)
+            || self.persisted_above.contains(seq_no)
+    }
+
     pub(crate) fn mark_processed(&mut self, seq_no: u64) {
         if self
             .processed_checkpoint

@@ -17,6 +17,14 @@ pub struct VectorIndex {
     dimensions: usize,
     /// Maps numeric USearch key → string doc_id for reverse lookup.
     key_to_doc_id: RwLock<HashMap<u64, String>>,
+    versions: RwLock<HashMap<u64, VectorVersionValue>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VectorVersionValue {
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub deleted: bool,
 }
 
 impl VectorIndex {
@@ -41,6 +49,7 @@ impl VectorIndex {
             index,
             dimensions,
             key_to_doc_id: RwLock::new(HashMap::new()),
+            versions: RwLock::new(HashMap::new()),
         })
     }
 
@@ -111,12 +120,7 @@ impl VectorIndex {
     /// and stores the mapping for reverse lookup.
     pub fn add_with_doc_id(&self, doc_id: &str, vector: &[f32]) -> Result<u64> {
         let key = crate::engine::routing::hash_string(doc_id);
-        self.add(key, vector)?;
-        let mut map = self
-            .key_to_doc_id
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        map.insert(key, doc_id.to_string());
+        self.apply_index(doc_id, vector, 0, 1)?;
         Ok(key)
     }
 
@@ -141,10 +145,9 @@ impl VectorIndex {
                 continue; // skip mismatched dimensions
             }
             let key = crate::engine::routing::hash_string(doc_id);
-            self.index
-                .add(key, vector)
-                .map_err(|e| anyhow::anyhow!("Failed to add vector: {e}"))?;
-            pairs.push((key, doc_id));
+            if self.apply_index(doc_id, vector, 0, 1)? {
+                pairs.push((key, doc_id));
+            }
         }
         // Single write lock for all doc_id mappings
         let mut map = self
@@ -168,7 +171,124 @@ impl VectorIndex {
         self.index
             .remove(key)
             .map_err(|e| anyhow::anyhow!("Failed to remove vector: {e}"))?;
+        self.versions
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
         Ok(())
+    }
+
+    pub(crate) fn apply_index(
+        &self,
+        doc_id: &str,
+        vector: &[f32],
+        seq_no: u64,
+        primary_term: u64,
+    ) -> Result<bool> {
+        if vector.len() != self.dimensions {
+            return Err(anyhow::anyhow!(
+                "Vector dimension mismatch: expected {}, got {}",
+                self.dimensions,
+                vector.len()
+            ));
+        }
+        let key = crate::engine::routing::hash_string(doc_id);
+        let mut versions = self
+            .versions
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if versions
+            .get(&key)
+            .is_some_and(|current| current.seq_no >= seq_no)
+        {
+            return Ok(false);
+        }
+        let existing_vector = versions.get(&key).is_some_and(|current| !current.deleted)
+            || self
+                .key_to_doc_id
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&key);
+        if existing_vector {
+            let _ = self.index.remove(key);
+        }
+        self.add(key, vector)?;
+        self.key_to_doc_id
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, doc_id.to_string());
+        versions.insert(
+            key,
+            VectorVersionValue {
+                seq_no,
+                primary_term,
+                deleted: false,
+            },
+        );
+        Ok(true)
+    }
+
+    pub(crate) fn apply_delete(
+        &self,
+        doc_id: &str,
+        seq_no: u64,
+        primary_term: u64,
+    ) -> Result<bool> {
+        let key = crate::engine::routing::hash_string(doc_id);
+        let mut versions = self
+            .versions
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if versions
+            .get(&key)
+            .is_some_and(|current| current.seq_no >= seq_no)
+        {
+            return Ok(false);
+        }
+        if versions.get(&key).is_some_and(|current| !current.deleted) {
+            let _ = self.index.remove(key);
+        }
+        versions.insert(
+            key,
+            VectorVersionValue {
+                seq_no,
+                primary_term,
+                deleted: true,
+            },
+        );
+        Ok(true)
+    }
+
+    pub(crate) fn prune_tombstone(&self, key: u64, seq_no: u64, primary_term: u64) {
+        let mut versions = self
+            .versions
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if versions.get(&key).is_some_and(|current| {
+            current.seq_no == seq_no && current.primary_term == primary_term && current.deleted
+        }) {
+            versions.remove(&key);
+            self.key_to_doc_id
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+        }
+    }
+
+    pub(crate) fn reset_versions(&self) {
+        self.versions
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn version_for_test(&self, doc_id: &str) -> Option<VectorVersionValue> {
+        self.versions
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&crate::engine::routing::hash_string(doc_id))
+            .copied()
     }
 
     /// Search for the k nearest neighbors to the given query vector.
@@ -488,5 +608,42 @@ mod tests {
         vi.bulk_add_with_doc_ids(&docs).unwrap();
         assert_eq!(vi.len(), initial_cap + 500);
         assert!(vi.capacity() > initial_cap);
+    }
+
+    #[test]
+    fn stale_vector_updates_and_indexes_after_delete_are_ignored() {
+        let vi = VectorIndex::new(2, MetricKind::L2sq).unwrap();
+        assert!(vi.apply_index("doc", &[2.0, 0.0], 2, 1).unwrap());
+        assert!(!vi.apply_index("doc", &[1.0, 0.0], 1, 1).unwrap());
+        assert_eq!(
+            vi.version_for_test("doc"),
+            Some(VectorVersionValue {
+                seq_no: 2,
+                primary_term: 1,
+                deleted: false,
+            })
+        );
+
+        assert!(vi.apply_delete("doc", 3, 1).unwrap());
+        assert!(!vi.apply_index("doc", &[9.0, 0.0], 2, 1).unwrap());
+        assert_eq!(
+            vi.version_for_test("doc"),
+            Some(VectorVersionValue {
+                seq_no: 3,
+                primary_term: 1,
+                deleted: true,
+            })
+        );
+        let (keys, _) = vi.search(&[2.0, 0.0], 1).unwrap();
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn tombstone_prune_does_not_remove_a_newer_vector_version() {
+        let vi = VectorIndex::new(2, MetricKind::L2sq).unwrap();
+        vi.apply_delete("doc", 3, 1).unwrap();
+        vi.apply_index("doc", &[4.0, 0.0], 4, 1).unwrap();
+        vi.prune_tombstone(crate::engine::routing::hash_string("doc"), 3, 1);
+        assert_eq!(vi.version_for_test("doc").unwrap().seq_no, 4);
     }
 }
