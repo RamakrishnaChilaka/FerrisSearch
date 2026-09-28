@@ -6,7 +6,9 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-07-10.
+> **Last source audit:** 2026-09-27 for FS-001, FS-007, FS-012, FS-013,
+> FS-014, FS-019, and FS-022 through FS-026, after PRs #142-#144. Other tasks
+> were last audited on 2026-07-10.
 
 This is a dependency-aware sequence, not a feature wish list. Rank expresses
 current strategic importance; a task still waits for every listed dependency.
@@ -29,11 +31,51 @@ No task is considered complete merely because a partial code path exists.
 - **Scale blocker:** required before the architecture can grow safely.
 - **Research opportunity:** validates or differentiates the core systems thesis.
 
+## Re-Ranking And Status Changes (2026-09-27)
+
+PRs #142-#144 added Raft-owned in-sync replica sets, primary terms, allocation
+IDs, durable replica fences, file-based peer recovery, bounded storage-failure
+escalation, and a bounded TLA+ model of replication and recovery
+(`specs/tla/`). The status notes on FS-012 and FS-022 through FS-026 record
+what those PRs completed, measured against each task's done criteria.
+
+**Raised: replica apply order (under FS-012).** Replicas apply replicated
+writes in arrival order. The primary replicates after leaving its WAL critical
+section, so concurrent writes can arrive out of sequence order. A review probe
+with a 3,000-document bulk plus 50 concurrent single writes left the replica
+WAL out of order in 4 of 10 runs; in one run, 26 of 50 acknowledged documents
+differed between primary and replica. Promoting that replica rolls back
+acknowledged writes. This is a release blocker, and its interim ordering fix
+lands before the rest of Wave 1, as the FS-014 mitigation does. The TLA+ model
+allows one client write at a time, so it could not find this.
+
+**Raised: FS-007** now ranks immediately after FS-001, ahead of FS-002 through
+FS-006; its section has moved to match. Ad hoc fault injection in PR #144 found
+two acknowledged-data bugs that were present at 8f17172: a transient Tantivy
+commit failure lost acknowledged writes, and WAL replay after restart
+resurrected acknowledged deletes. The operation-ignoring replay dates to the
+first CRUD commit (e95b3ba, #1). The TLA+ model could not see either bug,
+because both sat below its durable-operation abstraction. A named failpoint
+framework that also emits protocol traces for checking against the model is
+the direct defense, and FS-012 and FS-023 depend on it to close their done
+criteria.
+
+**Raised: the FS-014 interim mitigation** should land before the rest of Wave
+1. The bulk parser turns `delete`, `create`, and `update` actions into
+full-document index operations, and a misread can shift every later item. The
+full streaming parser keeps its rank.
+
+The rest of the order is unchanged.
+
 ## Wave 1 — Freeze Contracts And Write Identity
 
 ### FS-001 — Decide The Write Consistency And Retry Contract
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** none
+
+**Status (2026-09-27):** Proposed decision record drafted in
+[`adr/0001-write-consistency-and-retry-contract.md`](adr/0001-write-consistency-and-retry-contract.md);
+not yet accepted.
 
 **Evidence:** `src/transport/server/mod.rs`, `src/replication/mod.rs`, and
 `src/api/index/` can return failure after a primary mutation; client-visible
@@ -46,6 +88,31 @@ partial replication, and conflict semantics for single and bulk writes.
 **Done when:** The decision covers timeout-after-commit, primary failover,
 replica failure, duplicate retry, update/delete races, and explicitly maps each
 supported API response to durable internal state.
+
+### FS-007 — Build Deterministic Distributed Failure Injection
+
+**Class:** Release blocker | **Gate:** 0 | **Depends on:** none
+
+**Status (2026-09-27):** Not started as a framework. PRs #141 and #143 added
+in-process pause hooks: force-merge and refresh barriers, snapshot and setup
+release channels, and WAL-append and scan barriers. PR #144 added test-only
+failure hooks for WAL writes, engine apply, writer replacement, and
+assigned-open I/O, plus a bounded TLA+ model in `specs/tla/`. The hooks are ad
+hoc and in-process only. None of them is a named failpoint, can crash a
+process at a boundary, or records a protocol trace.
+
+**Evidence:** current suites cover many integration paths but cannot
+systematically stop at every write, publication, recovery, hydration, and
+compaction boundary.
+
+**Outcome:** A test-only failpoint framework can pause, fail, crash, or delay
+named boundaries with deterministic orchestration across in-process and
+process-backed tests. Failpoints also record protocol events that can be
+checked against the `specs/tla` model.
+
+**Done when:** Tests can reproduce timeout-after-commit, replica failure,
+manifest crash points, partial hydration, stale leader/writer, and restart
+without sleeps as the correctness mechanism.
 
 ### FS-002 — Decide The Fenced Manifest Publication Protocol
 
@@ -122,22 +189,6 @@ unsupported, with a test reference.
 SQL, cluster, security, and maintenance semantics are covered and README claims
 link to the matrix rather than using broad compatibility language.
 
-### FS-007 — Build Deterministic Distributed Failure Injection
-
-**Class:** Release blocker | **Gate:** 0 | **Depends on:** none
-
-**Evidence:** current suites cover many integration paths but cannot
-systematically stop at every write, publication, recovery, hydration, and
-compaction boundary.
-
-**Outcome:** A test-only failpoint framework can pause, fail, crash, or delay
-named boundaries with deterministic orchestration across in-process and
-process-backed tests.
-
-**Done when:** Tests can reproduce timeout-after-commit, replica failure,
-manifest crash points, partial hydration, stale leader/writer, and restart
-without sleeps as the correctness mechanism.
-
 ### FS-008 — Establish Reproducible Correctness And Performance Baselines
 
 **Class:** Research opportunity | **Gate:** 0 | **Depends on:** none
@@ -200,7 +251,33 @@ new sequence/version state, including timeout-after-commit and failover cases.
 
 ### FS-012 — Fence Stale Primaries And Replica Applies
 
-**Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-009, FS-010
+**Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-007, FS-009, FS-010
+
+**Status (2026-09-27):** Partial.
+- **Fencing is implemented** (PRs #143-#144), ahead of the listed dependencies:
+  - Primary writes require an activated primary at the exact allocation and
+    term.
+  - Replica RPCs require the index UUID, the target allocation, and a term at
+    least as high as both the applied view and the durable replica fence. The
+    fence is persisted before WAL mutation.
+  - Recovery fetch rejects stale terms, and promotion is a Raft conditional
+    command.
+  - Evidence: `stale_primary_replication_is_rejected_by_promoted_target`,
+    `replica_fence_is_persisted_before_ack_and_restored_on_restart`,
+    `conditional_membership_rejects_stale_promotion_and_old_primary_term`,
+    `stale_primary_term_rejects_recovery_fetch`, and the TLA+ C2 and fence
+    configurations.
+- **The stale-primary criterion is unmet:** no test pauses a live old primary,
+  promotes a replica, and releases the delayed writes. That test needs FS-007.
+- **New release-blocking evidence:** replicas apply operations in arrival
+  order, not sequence order. Concurrent writes can therefore leave an in-sync
+  replica with older values for acknowledged documents. Its WAL can also end up
+  in an order that replay rejects or misapplies. The fix is to apply by
+  per-document `seq_no`, with stale-operation skipping, delete tombstones,
+  ignored redelivery, and gap-aware checkpoints
+  ([ADR 0001](adr/0001-write-consistency-and-retry-contract.md), D1). The fix
+  does not depend on FS-007, FS-009, or FS-010. An interim fix that orders
+  replica apply can land first.
 
 **Evidence:** routing and sequence preservation exist, but the data plane lacks
 a complete primary-epoch check at every mutation and replication boundary.
@@ -210,11 +287,27 @@ recovery, and promotion; stale epochs cannot mutate data after leadership or
 routing changes.
 
 **Done when:** deterministic tests pause an old primary, promote a replica, and
-prove every delayed old-primary write/apply is rejected.
+prove every delayed old-primary write/apply is rejected. Under the review probe
+(a large bulk plus concurrent single writes, repeated), primary and replica end
+with identical documents, and the replica WAL replays correctly across a
+restart.
 
 ### FS-013 — Make Write Acknowledgement Policy Explicit
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-001, FS-011, FS-012
+
+**Status (2026-09-27):** Evidence changed.
+- Writes now wait only for the Raft-owned in-sync replica set.
+- Any replica failure fails the request, even though the primary already
+  mutated.
+- The storage escalation budget removes a copy only when its own storage fails.
+  An unreachable replica that is still a cluster member is never removed
+  (`unreachable_in_sync_replica_still_fails_live_write`), and neither is one
+  failing with an unclassified error.
+- Until such a node leaves the cluster or an operator intervenes, every write
+  to its shards fails, and each attempt can wait out the 30 s transport
+  timeout. The failure detector removes only nodes that stop pinging the Raft
+  leader.
 
 **Evidence:** writes wait for all configured replicas, global checkpoint
 progress is tied to the slowest replica, and failure after local mutation is
@@ -231,6 +324,23 @@ replicas without false success.
 ### FS-014 — Replace Bulk Materialization With A Strict Streaming Pipeline
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-001, FS-009
+
+**Status (2026-09-27):** New correctness evidence. `parse_bulk_ndjson`
+(`src/api/index/bulk.rs`) treats every action as `index` and consumes lines in
+fixed pairs:
+- A `delete` consumes the next action line and overwrites its target with it.
+- An `update` stores its whole `{"doc": ...}` wrapper as the document.
+- An unparsable source line drops the item with no response entry, so later
+  positions shift.
+- An unparsable action line goes undetected.
+- A trailing action without a source line is dropped.
+- `/{index}/_bulk` ignores `_index` on action lines.
+
+An interim mitigation does not depend on FS-001 or FS-009:
+- Parse action types strictly.
+- Reject the whole request on a malformed or unknown action line, as OpenSearch
+  does.
+- Reject well-formed but unsupported actions per item.
 
 **Evidence:** bulk parsing/routing materializes request text, action pairs, and
 per-shard collections before execution.
@@ -306,6 +416,9 @@ inspectable audit record and metrics.
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-007, FS-018
 
 **Evidence:** in-process publication tests cannot prove cross-process fencing.
+The bounded TLA+ model in `specs/tla/` found an allocation ABA and a stale-primary
+gap in the pre-#144 design, before the Rust fixes. Model the FS-002
+sequencer protocol the same way before implementing FS-018.
 
 **Outcome:** Process-backed filesystem and S3-compatible tests run independent
 producers and sequencer failover at every publication boundary.
@@ -350,6 +463,12 @@ covered before destructive mode can be enabled.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-001, FS-005
 
+**Status (2026-09-27):** Partial. PR #143 recovery snapshots are hard-linked
+Tantivy file sets taken at a WAL boundary under the translog lock, with a
+SHA-256 file manifest. They are scoped to a recovery session, not a persisted
+and versioned snapshot format. Vector state is rebuilt rather than captured, and
+no format compatibility is declared.
+
 **Evidence:** replica bootstrap is WAL-oriented and cannot efficiently recover
 a new or far-behind copy.
 
@@ -365,6 +484,20 @@ control-plane progress.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-007, FS-022
 
+**Status (2026-09-27):** Partial.
+- **Implemented** (PRs #143-#144):
+  - The source serves files in chunks of at most 1 MiB.
+  - The target verifies each file's SHA-256
+    (`corrupted_recovery_file_checksum_is_rejected`).
+  - Pending markers are restored on restart.
+  - A source term change settles or rejects the pending target.
+  - Persistent local I/O escalates through the storage retry budget.
+- **Not a staged install:** preparation deletes the shard directory and writes
+  files directly into `index/` under a `PEER_RECOVERY_IN_PROGRESS` marker.
+- **Unmet done criteria:** "either the previous valid shard or the new valid
+  snapshot" is unmet by design, and disk exhaustion during install is not
+  covered.
+
 **Evidence:** no complete snapshot bootstrap exists for replica recovery.
 
 **Outcome:** Primary/source streams a bounded snapshot to a staging directory;
@@ -377,6 +510,18 @@ snapshot, never a mixed state.
 ### FS-024 — Stream The WAL Suffix During Recovery
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-022, FS-023
+
+**Status (2026-09-27):** Partial.
+- **Implemented:** catch-up pulls bounded batches through `FetchRecoveryOps`,
+  each at most `MAX_RECOVERY_OPS` (1,024) operations under a byte limit. It
+  starts at the snapshot boundary and preserves primary sequence numbers.
+- **Conflicts with the done criteria:**
+  - Validation rejects reordering but allows sequence gaps
+    (`recovery_operation_validation_allows_gaps_but_rejects_reordering`).
+  - The source reads the WAL in file order, not sequence order.
+  - Duplicate operations are rejected rather than treated as idempotent.
+- **Missing:** measured-memory evidence for large suffixes, and a cancellation
+  test covering both ends.
 
 **Evidence:** WAL scanning can stream internally, but recovery responses
 materialize operation collections.
@@ -392,6 +537,13 @@ and the final checkpoint is contiguous.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-012, FS-013, FS-024
 
+**Status (2026-09-27):** Partial. In-sync membership, allocation IDs, primary
+terms, and conditional admission and promotion are Raft-owned (PRs #143-#144).
+Pending-recovery markers are durable and restored on restart, and the TLA+
+model checks these transitions within bounds. The per-copy lifecycle is still
+spread across node, shard, and transport code rather than one explicit state
+machine with named states and metrics.
+
 **Evidence:** ISR tracking is checkpoint/lag based and lifecycle recovery is
 spread across node, shard, transport, and replication code.
 
@@ -406,6 +558,11 @@ state transitions rather than incidental open-shard status.
 ### FS-026 — Make Replica Policy Settings Reactive And Operable
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-013, FS-025
+
+**Status (2026-09-27):** Not started. PRs #143-#144 added node-level settings,
+not reactive cluster settings: `max_concurrent_peer_recoveries`,
+`shard_io_failure_escalation_attempts`, and
+`shard_io_failure_escalation_window_ms`.
 
 **Evidence:** ISR max lag and slowest-replica checkpoint behavior are fixed
 implementation choices. Raft commits settings metadata on every node, but
