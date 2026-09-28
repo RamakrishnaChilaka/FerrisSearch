@@ -454,8 +454,29 @@ struct CompletionSettlementContext<'a> {
     transport_client: &'a TransportClient,
     session_id: &'a str,
     pending: &'a PeerRecoveryAwaitingMembership,
-    applied_next_seq_no: u64,
+    applied_cursor: crate::wal::WalCursor,
+    processed_checkpoint: Option<u64>,
     retry_timeout: Duration,
+}
+
+fn require_recovery_cursor(
+    cursor: Option<crate::transport::proto::RecoveryWalCursor>,
+    label: &'static str,
+) -> Result<crate::wal::WalCursor> {
+    let cursor = cursor.ok_or_else(|| anyhow::anyhow!("{label} is missing"))?;
+    Ok(crate::wal::WalCursor {
+        generation_id: cursor.generation_id,
+        byte_offset: cursor.byte_offset,
+    })
+}
+
+fn recovery_cursor_proto(
+    cursor: crate::wal::WalCursor,
+) -> crate::transport::proto::RecoveryWalCursor {
+    crate::transport::proto::RecoveryWalCursor {
+        generation_id: cursor.generation_id,
+        byte_offset: cursor.byte_offset,
+    }
 }
 
 async fn run_peer_recovery(
@@ -488,6 +509,20 @@ async fn run_peer_recovery(
     }
     if start.target_allocation_id != Some(candidate.allocation_id) {
         anyhow::bail!("peer recovery source returned a different target allocation ID");
+    }
+    let snapshot_cursor = require_recovery_cursor(start.snapshot_cursor, "snapshot WAL cursor")?;
+    let committed_boundary: crate::engine::sequence::CommittedBoundaryRecord =
+        serde_json::from_slice(&start.committed_boundary_json)
+            .context("decode peer recovery committed boundary")?;
+    committed_boundary.validate()?;
+    if committed_boundary.processed_checkpoint != start.snapshot_processed_checkpoint
+        || committed_boundary.persisted_checkpoint != start.snapshot_persisted_checkpoint
+        || committed_boundary.max_seq_no != start.snapshot_max_seq_no
+    {
+        anyhow::bail!("peer recovery committed boundary summary mismatch");
+    }
+    if committed_boundary.term_sequence_state.current_term != start.primary_term {
+        anyhow::bail!("peer recovery committed boundary term mismatch");
     }
     validate_file_manifest(&start.files)?;
 
@@ -544,14 +579,12 @@ async fn run_peer_recovery(
             allocation_id: candidate.allocation_id,
             primary_term: start.primary_term,
             shard_dir,
-            snapshot_next_seq_no: start.snapshot_next_seq_no,
+            committed_boundary: committed_boundary.clone(),
             expected_files: start.files.iter().map(|file| file.name.clone()).collect(),
         })
         .await
         .map_err(ShardManager::local_storage_failure)?;
-    set_checkpoint_from_next(&engine, start.snapshot_next_seq_no);
-
-    let mut next_seq_no = start.snapshot_next_seq_no;
+    let mut cursor = snapshot_cursor;
     let mut operations = 0u64;
     loop {
         let response = transport_client
@@ -559,23 +592,28 @@ async fn run_peer_recovery(
                 &candidate.primary,
                 FetchRecoveryOpsRequest {
                     session_id: start.session_id.clone(),
-                    from_seq_no: next_seq_no,
+                    cursor: Some(recovery_cursor_proto(cursor)),
                     max_ops: crate::transport::server::MAX_RECOVERY_OPS as u32,
+                    snapshot_processed_checkpoint: committed_boundary.processed_checkpoint,
                 },
             )
             .await
             .context("fetch peer recovery operations")?;
-        let (new_next, applied) = apply_recovery_operations(
+        let next_cursor =
+            require_recovery_cursor(response.next_cursor, "peer recovery next cursor")?;
+        let (new_cursor, applied) = apply_recovery_operations_cursor(
             engine.clone(),
-            next_seq_no,
-            response.primary_next_seq_no,
+            cursor,
+            next_cursor,
+            committed_boundary.processed_checkpoint,
+            response.source_max_seq_no,
             response.complete,
             response.operations,
         )
         .await?;
         operations += applied;
-        next_seq_no = new_next;
-        if response.complete && next_seq_no == response.primary_next_seq_no {
+        cursor = new_cursor;
+        if response.complete {
             break;
         }
     }
@@ -586,7 +624,8 @@ async fn run_peer_recovery(
                 &candidate.primary,
                 PrepareFinalizeRecoveryRequest {
                     session_id: start.session_id.clone(),
-                    applied_next_seq_no: next_seq_no,
+                    cursor: Some(recovery_cursor_proto(cursor)),
+                    processed_checkpoint: engine.sequence_stats().processed_checkpoint,
                 },
             )
             .await
@@ -597,38 +636,53 @@ async fn run_peer_recovery(
                     &candidate.primary,
                     FetchRecoveryOpsRequest {
                         session_id: start.session_id.clone(),
-                        from_seq_no: next_seq_no,
+                        cursor: Some(recovery_cursor_proto(cursor)),
                         max_ops: crate::transport::server::MAX_RECOVERY_OPS as u32,
+                        snapshot_processed_checkpoint: committed_boundary.processed_checkpoint,
                     },
                 )
                 .await?;
-            let (new_next, applied) = apply_recovery_operations(
+            let next_cursor =
+                require_recovery_cursor(response.next_cursor, "peer recovery next cursor")?;
+            let (new_cursor, applied) = apply_recovery_operations_cursor(
                 engine.clone(),
-                next_seq_no,
-                response.primary_next_seq_no,
+                cursor,
+                next_cursor,
+                committed_boundary.processed_checkpoint,
+                response.source_max_seq_no,
                 response.complete,
                 response.operations,
             )
             .await?;
-            next_seq_no = new_next;
+            cursor = new_cursor;
             operations += applied;
             continue;
         }
         if !prepared.complete {
             anyhow::bail!("peer recovery finalize response was incomplete");
         }
-        let (new_next, applied) = apply_recovery_operations(
+        let next_cursor = require_recovery_cursor(prepared.next_cursor, "finalize next cursor")?;
+        let barrier_wal_end =
+            require_recovery_cursor(prepared.barrier_wal_end, "finalize barrier WAL end")?;
+        let (new_cursor, applied) = apply_recovery_operations_cursor(
             engine.clone(),
-            next_seq_no,
-            prepared.barrier_next_seq_no,
+            cursor,
+            next_cursor,
+            committed_boundary.processed_checkpoint,
+            prepared.barrier_max_seq_no,
             true,
             prepared.operations,
         )
         .await?;
-        next_seq_no = new_next;
+        cursor = new_cursor;
         operations += applied;
-        if next_seq_no != prepared.barrier_next_seq_no {
-            anyhow::bail!("peer recovery target did not reach the barrier head");
+        if cursor != barrier_wal_end {
+            anyhow::bail!("peer recovery target did not reach the physical barrier");
+        }
+        if engine.sequence_stats().processed_checkpoint != prepared.barrier_processed_checkpoint {
+            anyhow::bail!(
+                "peer recovery target processed checkpoint does not match the source barrier"
+            );
         }
         break;
     }
@@ -660,7 +714,8 @@ async fn run_peer_recovery(
         transport_client: &transport_client,
         session_id: &start.session_id,
         pending: &pending,
-        applied_next_seq_no: next_seq_no,
+        applied_cursor: cursor,
+        processed_checkpoint: engine.sequence_stats().processed_checkpoint,
         retry_timeout: COMPLETE_RETRY_TIMEOUT,
     })
     .await;
@@ -813,58 +868,41 @@ async fn download_recovery_file(
     Ok(offset)
 }
 
-enum TargetOperation {
-    Index {
-        seq_no: u64,
-        primary_term: u64,
-        doc_id: String,
-        payload: serde_json::Value,
-    },
-    Delete {
-        seq_no: u64,
-        primary_term: u64,
-        doc_id: String,
-    },
-    NoOp {
-        seq_no: u64,
-        primary_term: u64,
-        reason: String,
-    },
-}
-
-async fn apply_recovery_operations(
+async fn apply_recovery_operations_cursor(
     engine: Arc<dyn SearchEngine>,
-    from_seq_no: u64,
-    primary_next_seq_no: u64,
+    cursor: crate::wal::WalCursor,
+    next_cursor: crate::wal::WalCursor,
+    snapshot_processed_checkpoint: Option<u64>,
+    source_max_seq_no: Option<u64>,
     complete: bool,
     operations: Vec<RecoverReplicaOp>,
-) -> Result<(u64, u64)> {
+) -> Result<(crate::wal::WalCursor, u64)> {
+    if next_cursor.position() < cursor.position() {
+        anyhow::bail!("peer recovery physical cursor regressed");
+    }
+    if !complete && next_cursor == cursor {
+        anyhow::bail!("bounded peer recovery response made no physical progress");
+    }
     let mut decoded = Vec::with_capacity(operations.len());
-    let mut previous = None;
     for operation in operations {
-        if operation.seq_no < from_seq_no || operation.seq_no >= primary_next_seq_no {
-            anyhow::bail!("peer recovery operation is outside the requested range");
-        }
         if operation.primary_term == 0 {
             anyhow::bail!("peer recovery operation has a zero primary term");
         }
-        if previous.is_some_and(|previous| operation.seq_no <= previous) {
-            anyhow::bail!("peer recovery operations are not strictly increasing");
+        if source_max_seq_no.is_none_or(|maximum| operation.seq_no > maximum) {
+            anyhow::bail!("peer recovery operation exceeds the captured source maximum");
         }
-        previous = Some(operation.seq_no);
-        match operation.op.as_str() {
-            "index" => decoded.push(TargetOperation::Index {
-                seq_no: operation.seq_no,
-                primary_term: operation.primary_term,
+        if snapshot_processed_checkpoint.is_some_and(|checkpoint| operation.seq_no <= checkpoint) {
+            continue;
+        }
+        let mutation = match operation.op.as_str() {
+            "index" => crate::engine::DocumentMutation::Index {
                 doc_id: operation.doc_id,
-                payload: serde_json::from_slice(&operation.payload_json)
+                source: serde_json::from_slice(&operation.payload_json)
                     .context("decode peer recovery index payload")?,
-            }),
-            "delete" => decoded.push(TargetOperation::Delete {
-                seq_no: operation.seq_no,
-                primary_term: operation.primary_term,
+            },
+            "delete" => crate::engine::DocumentMutation::Delete {
                 doc_id: operation.doc_id,
-            }),
+            },
             "noop" => {
                 let payload: serde_json::Value = serde_json::from_slice(&operation.payload_json)
                     .context("decode peer recovery no-op payload")?;
@@ -873,84 +911,55 @@ async fn apply_recovery_operations(
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("peer recovery no-op has no _reason"))?
                     .to_string();
-                decoded.push(TargetOperation::NoOp {
-                    seq_no: operation.seq_no,
-                    primary_term: operation.primary_term,
-                    reason,
-                });
+                crate::engine::DocumentMutation::NoOp { reason }
             }
             other => anyhow::bail!("unknown peer recovery operation '{other}'"),
-        }
-    }
-    if !complete && decoded.is_empty() {
-        anyhow::bail!("bounded peer recovery response made no progress");
-    }
-    let applied = decoded.len() as u64;
-    let last_next = previous
-        .and_then(|seq_no| seq_no.checked_add(1))
-        .unwrap_or(from_seq_no);
-    let new_next = if complete {
-        primary_next_seq_no
-    } else {
-        last_next
-    };
-    if new_next < from_seq_no {
-        anyhow::bail!("peer recovery cursor regressed");
+        };
+        decoded.push(crate::engine::SequencedOperation {
+            seq_no: operation.seq_no,
+            primary_term: operation.primary_term,
+            mutation,
+        });
     }
 
+    let applied = decoded.len() as u64;
     let engine_for_apply = engine.clone();
     tokio::task::spawn_blocking(move || {
-        let operations = decoded
-            .into_iter()
-            .map(|operation| match operation {
-                TargetOperation::Index {
-                    seq_no,
-                    primary_term,
-                    doc_id,
-                    payload,
-                } => crate::engine::SequencedOperation {
-                    seq_no,
-                    primary_term,
-                    mutation: crate::engine::DocumentMutation::Index {
-                        doc_id,
-                        source: payload,
-                    },
-                },
-                TargetOperation::Delete {
-                    seq_no,
-                    primary_term,
-                    doc_id,
-                } => crate::engine::SequencedOperation {
-                    seq_no,
-                    primary_term,
-                    mutation: crate::engine::DocumentMutation::Delete { doc_id },
-                },
-                TargetOperation::NoOp {
-                    seq_no,
-                    primary_term,
-                    reason,
-                } => crate::engine::SequencedOperation {
-                    seq_no,
-                    primary_term,
-                    mutation: crate::engine::DocumentMutation::NoOp { reason },
-                },
-            })
-            .collect();
         engine_for_apply
-            .apply_replica_batch(operations)
+            .apply_replica_batch(decoded)
             .map_err(ShardManager::local_storage_failure)?;
         Ok::<(), anyhow::Error>(())
     })
     .await
     .map_err(|error| anyhow::anyhow!("peer recovery apply task failed: {error}"))??;
-    set_checkpoint_from_next(&engine, new_next);
-    Ok((new_next, applied))
+    Ok((next_cursor, applied))
 }
 
-fn set_checkpoint_from_next(engine: &Arc<dyn SearchEngine>, next_seq_no: u64) {
-    if let Some(last_seq_no) = next_seq_no.checked_sub(1) {
-        engine.update_local_checkpoint(last_seq_no);
-    }
+#[cfg(test)]
+async fn apply_recovery_operations(
+    engine: Arc<dyn SearchEngine>,
+    from_seq_no: u64,
+    primary_next_seq_no: u64,
+    complete: bool,
+    operations: Vec<RecoverReplicaOp>,
+) -> Result<(u64, u64)> {
+    let (_, applied) = apply_recovery_operations_cursor(
+        engine,
+        crate::wal::WalCursor {
+            generation_id: 0,
+            byte_offset: from_seq_no,
+        },
+        crate::wal::WalCursor {
+            generation_id: 0,
+            byte_offset: primary_next_seq_no,
+        },
+        None,
+        primary_next_seq_no.checked_sub(1),
+        complete,
+        operations,
+    )
+    .await?;
+    Ok((primary_next_seq_no, applied))
 }
 
 async fn complete_with_observed_settlement(
@@ -965,7 +974,8 @@ async fn complete_with_observed_settlement(
                 &context.candidate.primary,
                 CompleteFinalizeRecoveryRequest {
                     session_id: context.session_id.to_string(),
-                    applied_next_seq_no: context.applied_next_seq_no,
+                    applied_cursor: Some(recovery_cursor_proto(context.applied_cursor)),
+                    processed_checkpoint: context.processed_checkpoint,
                 },
             )
             .await
@@ -1097,7 +1107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_operation_validation_allows_gaps_but_rejects_reordering() {
+    async fn recovery_operation_validation_allows_gaps_and_reordering() {
         let dir = tempfile::tempdir().unwrap();
         let engine: Arc<dyn SearchEngine> = Arc::new(
             crate::engine::CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap(),
@@ -1129,7 +1139,7 @@ mod tests {
         assert_eq!(next, 9);
         assert_eq!(applied, 2);
 
-        let error = apply_recovery_operations(
+        let (next, applied) = apply_recovery_operations(
             engine,
             9,
             12,
@@ -1152,8 +1162,9 @@ mod tests {
             ],
         )
         .await
-        .unwrap_err();
-        assert!(error.to_string().contains("strictly increasing"));
+        .unwrap();
+        assert_eq!(next, 12);
+        assert_eq!(applied, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1303,8 +1314,9 @@ mod tests {
         let stale_fetch = client
             .fetch_recovery_ops(tonic::Request::new(FetchRecoveryOpsRequest {
                 session_id: session.session_id,
-                from_seq_no: session.snapshot_next_seq_no,
+                cursor: session.snapshot_cursor,
                 max_ops: 1,
+                snapshot_processed_checkpoint: session.snapshot_processed_checkpoint,
             }))
             .await
             .unwrap_err();
@@ -2051,7 +2063,11 @@ mod tests {
             transport_client: &transport_client,
             session_id: "lost-response",
             pending: &pending,
-            applied_next_seq_no: 1,
+            applied_cursor: crate::wal::WalCursor {
+                generation_id: 0,
+                byte_offset: 1,
+            },
+            processed_checkpoint: Some(0),
             retry_timeout: Duration::from_millis(50),
         })
         .await;
@@ -2619,8 +2635,12 @@ mod tests {
         let stale_session = source_client
             .fetch_recovery_ops(tonic::Request::new(FetchRecoveryOpsRequest {
                 session_id: stats.session_id,
-                from_seq_no: 0,
+                cursor: Some(crate::transport::proto::RecoveryWalCursor {
+                    generation_id: 0,
+                    byte_offset: 0,
+                }),
                 max_ops: 1,
+                snapshot_processed_checkpoint: None,
             }))
             .await
             .unwrap_err();

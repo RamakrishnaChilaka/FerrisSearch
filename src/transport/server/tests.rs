@@ -137,7 +137,7 @@ async fn recover_replica_does_not_open_or_mutate_live_wal() {
             .recover_replica(Request::new(RecoverReplicaRequest {
                 index_name: index_name.into(),
                 shard_id: 0,
-                local_checkpoint: 0,
+                processed_checkpoint: Some(0),
             }))
             .await
     });
@@ -925,7 +925,7 @@ async fn version_map_capacity_rejection_is_resource_exhausted_before_wal_append(
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert!(
         engine
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .is_empty()
@@ -3335,14 +3335,20 @@ async fn primary_apply_escalation_keeps_reads_open_without_immediate_wal_replay(
         }
     }
     let wal_operations = engine
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .legacy_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
-    for attempt in 0..3 {
+    for attempt in 0..2 {
         assert!(wal_operations.iter().any(|operation| {
             operation.payload["_doc_id"] == format!("failed-after-wal-{attempt}")
         }));
     }
+    assert!(
+        wal_operations
+            .iter()
+            .all(|operation| operation.payload["_doc_id"] != "failed-after-wal-2"),
+        "legacy recovery must not serve an operation the source has not processed"
+    );
     let current = shard_manager.get_shard("idx", 0).unwrap();
     assert!(Arc::ptr_eq(&current, &engine));
     let same_engine = service.get_or_open_shard("idx", 0).await.unwrap();

@@ -74,6 +74,12 @@ pub(crate) struct UnsupportedWalFormatError {
     expected: u32,
 }
 
+impl UnsupportedWalFormatError {
+    pub(crate) fn is_legacy_manifest(&self) -> bool {
+        self.component == "translog manifest" && self.found == 1
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("legacy WAL migration failed: {message}")]
 pub(crate) struct LegacyWalMigrationError {
@@ -231,6 +237,24 @@ pub struct TranslogReadSnapshot {
     scan_barrier: Option<Arc<std::sync::Barrier>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalCursor {
+    pub generation_id: u64,
+    pub byte_offset: u64,
+}
+
+impl WalCursor {
+    pub(crate) fn position(self) -> (u64, u64) {
+        (self.generation_id, self.byte_offset)
+    }
+}
+
+pub struct CursorReadBatch {
+    pub entries: Vec<TranslogEntry>,
+    pub next_cursor: WalCursor,
+    pub complete: bool,
+}
+
 impl TranslogReadSnapshot {
     pub fn next_seq_no(&self) -> u64 {
         self.next_seq_no
@@ -238,6 +262,35 @@ impl TranslogReadSnapshot {
 
     pub fn max_seq_no(&self) -> Option<u64> {
         self.max_seq_no
+    }
+
+    pub fn end_cursor(&self) -> WalCursor {
+        self.generations
+            .last()
+            .map(|generation| WalCursor {
+                generation_id: generation.id,
+                byte_offset: generation.size_bytes,
+            })
+            .unwrap_or(WalCursor {
+                generation_id: 0,
+                byte_offset: 0,
+            })
+    }
+
+    pub fn read_bounded_cursor(
+        &self,
+        cursor: WalCursor,
+        end_cursor: WalCursor,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<CursorReadBatch> {
+        HotTranslog::read_bounded_cursor_from_generations(
+            &self.generations,
+            cursor,
+            end_cursor,
+            max_ops,
+            max_bytes,
+        )
     }
 
     pub fn read_bounded_range(
@@ -437,6 +490,9 @@ pub trait WriteAheadLog: Send + Sync {
     /// Used by the auto-flush mechanism to trigger flush when the translog
     /// exceeds a configurable threshold.
     fn size_bytes(&self) -> Result<u64>;
+
+    /// Force all currently appended WAL bytes to stable storage.
+    fn sync(&self) -> Result<()>;
 
     /// Stream entries with seq_no >= `min_seq_no` through `callback` without
     /// accumulating them in memory. Returns the number of entries processed.
@@ -1642,6 +1698,162 @@ impl HotTranslog {
         Ok((entries, read_through_head))
     }
 
+    fn read_bounded_cursor_from_generations(
+        generations: &[GenerationInfo],
+        cursor: WalCursor,
+        end_cursor: WalCursor,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<CursorReadBatch> {
+        if max_ops == 0 || max_bytes == 0 {
+            anyhow::bail!("bounded cursor read requires non-zero limits");
+        }
+        if cursor.position() > end_cursor.position() {
+            anyhow::bail!("translog cursor is past the captured end");
+        }
+        if cursor == end_cursor {
+            return Ok(CursorReadBatch {
+                entries: Vec::new(),
+                next_cursor: cursor,
+                complete: true,
+            });
+        }
+
+        let mut entries = Vec::new();
+        let mut bytes = 0usize;
+        let mut next_cursor = cursor;
+        let mut saw_generation = false;
+
+        for generation in generations.iter().filter(|generation| {
+            generation.id >= cursor.generation_id && generation.id <= end_cursor.generation_id
+        }) {
+            let start_offset = if generation.id == cursor.generation_id {
+                cursor.byte_offset
+            } else {
+                0
+            };
+            let end_offset = if generation.id == end_cursor.generation_id {
+                end_cursor.byte_offset
+            } else {
+                generation.size_bytes
+            };
+            if start_offset > end_offset || end_offset > generation.size_bytes {
+                anyhow::bail!(
+                    "translog cursor range {}:{}..{} exceeds captured generation size {}",
+                    generation.id,
+                    start_offset,
+                    end_offset,
+                    generation.size_bytes
+                );
+            }
+            saw_generation = true;
+            let file = File::open(&generation.path).with_context(|| {
+                format!(
+                    "live translog generation {:?} is missing or unreadable",
+                    generation.path
+                )
+            })?;
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(start_offset))?;
+            next_cursor = WalCursor {
+                generation_id: generation.id,
+                byte_offset: start_offset,
+            };
+
+            while next_cursor.byte_offset < end_offset {
+                let frame_start = reader.stream_position()?;
+                let mut len_buf = [0u8; 4];
+                reader.read_exact(&mut len_buf).with_context(|| {
+                    format!(
+                        "read translog frame length at {}:{}",
+                        generation.id, frame_start
+                    )
+                })?;
+                let payload_len = u32::from_le_bytes(len_buf) as usize;
+                let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+                let frame_end = frame_start
+                    .checked_add(frame_bytes as u64)
+                    .ok_or_else(|| anyhow::anyhow!("translog frame cursor overflow"))?;
+                if frame_end > end_offset {
+                    anyhow::bail!(
+                        "translog frame at {}:{} crosses captured end {}",
+                        generation.id,
+                        frame_start,
+                        end_offset
+                    );
+                }
+                if entries.len() >= max_ops
+                    || bytes
+                        .checked_add(frame_bytes)
+                        .is_none_or(|total| total > max_bytes)
+                {
+                    if entries.is_empty() {
+                        anyhow::bail!(
+                            "translog operation at {}:{} exceeds the recovery byte limit",
+                            generation.id,
+                            frame_start
+                        );
+                    }
+                    return Ok(CursorReadBatch {
+                        entries,
+                        next_cursor,
+                        complete: false,
+                    });
+                }
+                if frame_bytes > MAX_WAL_FRAME_BYTES {
+                    anyhow::bail!(
+                        "translog operation at {}:{} has frame length {}, exceeding recovery transfer maximum {}",
+                        generation.id,
+                        frame_start,
+                        frame_bytes,
+                        MAX_WAL_FRAME_BYTES
+                    );
+                }
+                let mut payload = vec![0u8; payload_len];
+                reader.read_exact(&mut payload)?;
+                entries.push(decode_wire_entry(&payload)?.into_translog()?);
+                bytes += frame_bytes;
+                next_cursor.byte_offset = frame_end;
+            }
+
+            if generation.id < end_cursor.generation_id
+                && let Some(next_generation) = generations
+                    .iter()
+                    .find(|candidate| candidate.id > generation.id)
+            {
+                next_cursor = WalCursor {
+                    generation_id: next_generation.id,
+                    byte_offset: 0,
+                };
+            }
+        }
+
+        if !saw_generation {
+            let Some(next_generation) = generations
+                .iter()
+                .find(|generation| generation.id > cursor.generation_id)
+            else {
+                anyhow::bail!("translog cursor generation is no longer retained");
+            };
+            return Self::read_bounded_cursor_from_generations(
+                generations,
+                WalCursor {
+                    generation_id: next_generation.id,
+                    byte_offset: 0,
+                },
+                end_cursor,
+                max_ops,
+                max_bytes,
+            );
+        }
+
+        Ok(CursorReadBatch {
+            entries,
+            next_cursor,
+            complete: next_cursor == end_cursor,
+        })
+    }
+
     /// Start a background task that periodically fsyncs the translog file.
     /// Only useful in `Async` durability mode. Returns a join handle.
     pub fn start_sync_task(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -1837,6 +2049,7 @@ impl WriteAheadLog for HotTranslog {
         } else {
             state.active_file.write_all(&frame)?;
         }
+
         #[cfg(not(test))]
         state.active_file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
@@ -1855,6 +2068,10 @@ impl WriteAheadLog for HotTranslog {
         };
 
         Ok(entry)
+    }
+
+    fn sync(&self) -> Result<()> {
+        HotTranslog::sync(self)
     }
 
     fn append_with_seq(

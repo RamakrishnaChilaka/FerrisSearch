@@ -122,7 +122,11 @@ pub struct PeerRecoveryFileMetadata {
 }
 
 pub struct PeerRecoverySnapshot {
+    pub snapshot_cursor: crate::wal::WalCursor,
+    #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    #[allow(dead_code)]
+    pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin_id: u64,
     pub files: Vec<PeerRecoveryFileMetadata>,
 }
@@ -177,13 +181,19 @@ impl Drop for PeerRecoveryRetentionPin {
 }
 
 pub struct PeerRecoverySnapshotPreparation {
+    pub snapshot_cursor: crate::wal::WalCursor,
+    #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin: PeerRecoveryRetentionPin,
     pub file_names: Vec<String>,
 }
 
 pub struct PreparedPeerRecoverySnapshot {
+    pub snapshot_cursor: crate::wal::WalCursor,
+    #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin: PeerRecoveryRetentionPin,
     pub files: Vec<PeerRecoveryFileMetadata>,
 }
@@ -191,7 +201,10 @@ pub struct PreparedPeerRecoverySnapshot {
 impl PeerRecoverySnapshotPreparation {
     pub fn hash_files(self, snapshot_dir: &Path) -> Result<PreparedPeerRecoverySnapshot> {
         let Self {
+            snapshot_cursor,
+            #[cfg(test)]
             snapshot_next_seq_no,
+            committed_boundary,
             retention_pin,
             file_names,
         } = self;
@@ -221,7 +234,10 @@ impl PeerRecoverySnapshotPreparation {
             });
         }
         Ok(PreparedPeerRecoverySnapshot {
+            snapshot_cursor,
+            #[cfg(test)]
             snapshot_next_seq_no,
+            committed_boundary,
             retention_pin,
             files,
         })
@@ -230,8 +246,15 @@ impl PeerRecoverySnapshotPreparation {
 
 pub struct PeerRecoveryOpsBatch {
     pub operations: Vec<crate::wal::TranslogEntry>,
-    pub primary_next_seq_no: u64,
+    pub next_cursor: crate::wal::WalCursor,
+    pub source_max_seq_no: Option<u64>,
     pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerRecoveryBarrier {
+    pub wal_end: crate::wal::WalCursor,
+    pub sequence: SequenceStats,
 }
 
 /// Per-segment metadata for diagnostics and monitoring.
@@ -562,11 +585,29 @@ pub trait SearchEngine: Send + Sync {
 
     fn peer_recovery_ops(
         &self,
-        _min_seq_no: u64,
+        _cursor: crate::wal::WalCursor,
+        _end_cursor: Option<crate::wal::WalCursor>,
         _max_ops: usize,
         _max_bytes: usize,
     ) -> Result<PeerRecoveryOpsBatch> {
         anyhow::bail!("peer recovery operation streaming is not supported by this engine")
+    }
+
+    fn legacy_recovery_ops(
+        &self,
+        _min_seq_no: u64,
+        _max_ops: usize,
+        _max_bytes: usize,
+    ) -> Result<PeerRecoveryOpsBatch> {
+        anyhow::bail!("legacy recovery operation streaming is not supported by this engine")
+    }
+
+    fn peer_recovery_barrier(&self) -> Result<PeerRecoveryBarrier> {
+        anyhow::bail!("peer recovery barriers are not supported by this engine")
+    }
+
+    fn prepare_primary_activation(&self, _primary_term: u64) -> Result<Vec<SequencedOperation>> {
+        anyhow::bail!("primary activation gap filling is not supported by this engine")
     }
 
     fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {

@@ -102,7 +102,7 @@ fn duplicate_delivery_does_not_append_twice_and_reopens() {
         apply_index(&engine, "x", json!({"value": 1}), 0, 1);
         assert_eq!(
             engine
-                .peer_recovery_ops(0, usize::MAX, usize::MAX)
+                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .len(),
@@ -135,7 +135,7 @@ fn incompatible_same_term_redelivery_fails_without_another_wal_entry() {
     );
     assert_eq!(
         engine
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .len(),

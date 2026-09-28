@@ -858,11 +858,34 @@ impl SearchEngine for CompositeEngine {
 
     fn peer_recovery_ops(
         &self,
+        cursor: crate::wal::WalCursor,
+        end_cursor: Option<crate::wal::WalCursor>,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<super::PeerRecoveryOpsBatch> {
+        self.text
+            .peer_recovery_ops(cursor, end_cursor, max_ops, max_bytes)
+    }
+
+    fn legacy_recovery_ops(
+        &self,
         min_seq_no: u64,
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
-        self.text.peer_recovery_ops(min_seq_no, max_ops, max_bytes)
+        self.text
+            .legacy_recovery_ops(min_seq_no, max_ops, max_bytes)
+    }
+
+    fn peer_recovery_barrier(&self) -> Result<super::PeerRecoveryBarrier> {
+        self.text.peer_recovery_barrier()
+    }
+
+    fn prepare_primary_activation(
+        &self,
+        primary_term: u64,
+    ) -> Result<Vec<super::SequencedOperation>> {
+        self.text.prepare_primary_activation(primary_term)
     }
 
     fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
@@ -1877,7 +1900,7 @@ mod tests {
         assert_eq!(delete.primary_term, 7);
 
         let operations = engine
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations;
         assert_eq!(

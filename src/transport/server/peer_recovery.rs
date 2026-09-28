@@ -9,7 +9,7 @@ use crate::transport::proto::{
     CompleteFinalizeRecoveryRequest, CompleteFinalizeRecoveryResponse,
     FetchRecoveryFileChunkRequest, FetchRecoveryFileChunkResponse, FetchRecoveryOpsRequest,
     FetchRecoveryOpsResponse, MarkReplicaInSyncRequest, PrepareFinalizeRecoveryRequest,
-    PrepareFinalizeRecoveryResponse, RecoverReplicaOp, RecoveryFileMetadata,
+    PrepareFinalizeRecoveryResponse, RecoverReplicaOp, RecoveryFileMetadata, RecoveryWalCursor,
     StartPeerRecoveryRequest, StartPeerRecoveryResponse,
 };
 use std::collections::HashMap;
@@ -396,12 +396,13 @@ struct SourceSession {
     target_allocation_id: u64,
     primary_node_id: String,
     primary_term: u64,
-    snapshot_next_seq_no: u64,
+    snapshot_cursor: crate::wal::WalCursor,
+    snapshot_boundary: crate::engine::sequence::CommittedBoundaryRecord,
     snapshot_dir: PathBuf,
     files: HashMap<String, PeerRecoveryFileMetadata>,
     retention_pin: Option<PeerRecoveryRetentionPin>,
     last_activity: Instant,
-    barrier_next_seq_no: Option<u64>,
+    barrier: Option<crate::engine::PeerRecoveryBarrier>,
     barrier_guard: Option<OwnedRwLockWriteGuard<()>>,
     finalize_deadline: Option<Instant>,
     finalize_preparing: Arc<AtomicBool>,
@@ -567,8 +568,10 @@ pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverRep
     })
 }
 
-fn recovery_ops(batch: PeerRecoveryOpsBatch) -> Result<Vec<RecoverReplicaOp>, Status> {
-    batch.operations.into_iter().map(recovery_op).collect()
+fn recovery_ops(
+    operations: Vec<crate::wal::TranslogEntry>,
+) -> Result<Vec<RecoverReplicaOp>, Status> {
+    operations.into_iter().map(recovery_op).collect()
 }
 
 fn source_session_start_response(
@@ -578,7 +581,7 @@ fn source_session_start_response(
     StartPeerRecoveryResponse {
         session_id: session_id.to_string(),
         primary_term: session.primary_term,
-        snapshot_next_seq_no: session.snapshot_next_seq_no,
+        snapshot_cursor: Some(proto_cursor(session.snapshot_cursor)),
         files: session
             .files
             .values()
@@ -591,7 +594,30 @@ fn source_session_start_response(
         error: String::new(),
         preparing: false,
         target_allocation_id: Some(session.target_allocation_id),
+        snapshot_processed_checkpoint: session.snapshot_boundary.processed_checkpoint,
+        snapshot_persisted_checkpoint: session.snapshot_boundary.persisted_checkpoint,
+        snapshot_max_seq_no: session.snapshot_boundary.max_seq_no,
+        committed_boundary_json: serde_json::to_vec(&session.snapshot_boundary)
+            .expect("validated committed boundary must serialize"),
     }
+}
+
+fn proto_cursor(cursor: crate::wal::WalCursor) -> RecoveryWalCursor {
+    RecoveryWalCursor {
+        generation_id: cursor.generation_id,
+        byte_offset: cursor.byte_offset,
+    }
+}
+
+fn require_cursor(
+    cursor: Option<RecoveryWalCursor>,
+    label: &'static str,
+) -> Result<crate::wal::WalCursor, Status> {
+    let cursor = cursor.ok_or_else(|| Status::invalid_argument(format!("{label} is required")))?;
+    Ok(crate::wal::WalCursor {
+        generation_id: cursor.generation_id,
+        byte_offset: cursor.byte_offset,
+    })
 }
 
 enum MembershipObservation {
@@ -810,11 +836,15 @@ impl TransportService {
         Ok(Some(StartPeerRecoveryResponse {
             session_id: active_id,
             primary_term: setup.primary_term,
-            snapshot_next_seq_no: 0,
+            snapshot_cursor: None,
             files: Vec::new(),
             error: String::new(),
             preparing: true,
             target_allocation_id: Some(setup.target_allocation_id),
+            snapshot_processed_checkpoint: None,
+            snapshot_persisted_checkpoint: None,
+            snapshot_max_seq_no: None,
+            committed_boundary_json: Vec::new(),
         }))
     }
 
@@ -943,12 +973,13 @@ impl TransportService {
                 target_allocation_id,
                 primary_node_id: local_node_id,
                 primary_term,
-                snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+                snapshot_cursor: snapshot.snapshot_cursor,
+                snapshot_boundary: snapshot.committed_boundary,
                 snapshot_dir,
                 files,
                 retention_pin: Some(snapshot.retention_pin),
                 last_activity: Instant::now(),
-                barrier_next_seq_no: None,
+                barrier: None,
                 barrier_guard: None,
                 finalize_deadline: None,
                 finalize_preparing: Arc::new(AtomicBool::new(false)),
@@ -959,7 +990,8 @@ impl TransportService {
             registry.sessions.insert(task_session_id.clone(), session);
             tracing::info!(
                 session_id = task_session_id,
-                snapshot_next_seq_no = snapshot.snapshot_next_seq_no,
+                snapshot_generation = snapshot.snapshot_cursor.generation_id,
+                snapshot_offset = snapshot.snapshot_cursor.byte_offset,
                 "Peer recovery snapshot is ready"
             );
         });
@@ -1021,6 +1053,18 @@ impl TransportService {
             let _ = sender.send(());
         }
         Ok(barrier.read_owned().await)
+    }
+
+    pub(super) async fn peer_recovery_exclusive_guard(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+    ) -> OwnedRwLockWriteGuard<()> {
+        self.peer_recovery_state
+            .barrier((index_uuid.to_string(), shard_id))
+            .await
+            .write_owned()
+            .await
     }
 
     async fn source_session(&self, session_id: &str) -> Result<Arc<Mutex<SourceSession>>, Status> {
@@ -1329,11 +1373,15 @@ impl TransportService {
         Ok(StartPeerRecoveryResponse {
             session_id,
             primary_term,
-            snapshot_next_seq_no: 0,
+            snapshot_cursor: None,
             files: Vec::new(),
             error: String::new(),
             preparing: true,
             target_allocation_id: Some(target_allocation_id),
+            snapshot_processed_checkpoint: None,
+            snapshot_persisted_checkpoint: None,
+            snapshot_max_seq_no: None,
+            committed_boundary_json: Vec::new(),
         })
     }
 
@@ -1400,6 +1448,7 @@ impl TransportService {
                 "peer recovery operation batch exceeds the configured limit",
             ));
         }
+        let cursor = require_cursor(request.cursor, "peer recovery WAL cursor")?;
         let session = self.source_session(&request.session_id).await?;
         let (index_name, shard_id) = {
             let mut session = session.lock().await;
@@ -1410,9 +1459,16 @@ impl TransportService {
                     "peer recovery source authority is stale",
                 ));
             }
-            if request.from_seq_no < session.snapshot_next_seq_no {
+            if cursor.position() < session.snapshot_cursor.position() {
                 return Err(Status::invalid_argument(
                     "peer recovery operation cursor precedes the snapshot boundary",
+                ));
+            }
+            if request.snapshot_processed_checkpoint
+                != session.snapshot_boundary.processed_checkpoint
+            {
+                return Err(Status::invalid_argument(
+                    "peer recovery snapshot processed checkpoint mismatch",
                 ));
             }
             session.last_activity = Instant::now();
@@ -1425,18 +1481,22 @@ impl TransportService {
                 Status::unavailable("peer recovery source engine is not currently open")
             })?;
 
-        let from_seq_no = request.from_seq_no;
         let batch = tokio::task::spawn_blocking(move || {
-            engine.peer_recovery_ops(from_seq_no, max_ops, MAX_RECOVERY_OP_BYTES)
+            engine.peer_recovery_ops(cursor, None, max_ops, MAX_RECOVERY_OP_BYTES)
         })
         .await
         .map_err(|error| Status::internal(format!("recovery ops task failed: {error}")))?
         .map_err(|error| Status::internal(format!("read recovery operations: {error}")))?;
-        let primary_next_seq_no = batch.primary_next_seq_no;
-        let complete = batch.complete;
+        let PeerRecoveryOpsBatch {
+            operations,
+            next_cursor,
+            source_max_seq_no,
+            complete,
+        } = batch;
         Ok(FetchRecoveryOpsResponse {
-            operations: recovery_ops(batch)?,
-            primary_next_seq_no,
+            operations: recovery_ops(operations)?,
+            next_cursor: Some(proto_cursor(next_cursor)),
+            source_max_seq_no,
             complete,
             error: String::new(),
         })
@@ -1446,6 +1506,7 @@ impl TransportService {
         &self,
         request: PrepareFinalizeRecoveryRequest,
     ) -> Result<PrepareFinalizeRecoveryResponse, Status> {
+        let cursor = require_cursor(request.cursor, "peer recovery finalize cursor")?;
         let session = self.source_session(&request.session_id).await?;
         let (key, index_name, _preparing_guard) = {
             let mut session = session.lock().await;
@@ -1507,13 +1568,19 @@ impl TransportService {
             }
         }
 
-        let applied_next_seq_no = request.applied_next_seq_no;
-        let batch = tokio::task::spawn_blocking(move || {
-            engine.peer_recovery_ops(applied_next_seq_no, MAX_RECOVERY_OPS, MAX_RECOVERY_OP_BYTES)
+        let barrier_read = tokio::task::spawn_blocking(move || {
+            let barrier = engine.peer_recovery_barrier()?;
+            let batch = engine.peer_recovery_ops(
+                cursor,
+                Some(barrier.wal_end),
+                MAX_RECOVERY_OPS,
+                MAX_RECOVERY_OP_BYTES,
+            )?;
+            Ok::<_, anyhow::Error>((barrier, batch))
         })
         .await;
-        let batch = match batch {
-            Ok(Ok(batch)) => batch,
+        let (barrier, batch) = match barrier_read {
+            Ok(Ok(result)) => result,
             Ok(Err(error)) => {
                 return Err(Status::internal(format!(
                     "read finalize operations: {error}"
@@ -1525,34 +1592,40 @@ impl TransportService {
                 )));
             }
         };
-        let barrier_next_seq_no = batch.primary_next_seq_no;
         if !batch.complete {
             drop(guard);
             return Ok(PrepareFinalizeRecoveryResponse {
                 operations: Vec::new(),
-                barrier_next_seq_no,
+                next_cursor: Some(proto_cursor(batch.next_cursor)),
+                barrier_wal_end: Some(proto_cursor(barrier.wal_end)),
+                barrier_processed_checkpoint: barrier.sequence.processed_checkpoint,
                 retry_catch_up: true,
                 complete: false,
                 error: String::new(),
+                barrier_max_seq_no: barrier.sequence.max_seq_no,
             });
         }
-        let operations = match recovery_ops(batch) {
+        let next_cursor = batch.next_cursor;
+        let operations = match recovery_ops(batch.operations) {
             Ok(operations) => operations,
             Err(error) => return Err(error),
         };
         {
             let mut session = session.lock().await;
-            session.barrier_next_seq_no = Some(barrier_next_seq_no);
+            session.barrier = Some(barrier);
             session.barrier_guard = Some(guard);
             session.finalize_deadline = Some(Instant::now() + FINALIZE_BARRIER_TIMEOUT);
             session.last_activity = Instant::now();
         }
         Ok(PrepareFinalizeRecoveryResponse {
             operations,
-            barrier_next_seq_no,
+            next_cursor: Some(proto_cursor(next_cursor)),
+            barrier_wal_end: Some(proto_cursor(barrier.wal_end)),
+            barrier_processed_checkpoint: barrier.sequence.processed_checkpoint,
             retry_catch_up: false,
             complete: true,
             error: String::new(),
+            barrier_max_seq_no: barrier.sequence.max_seq_no,
         })
     }
 
@@ -1560,14 +1633,25 @@ impl TransportService {
         &self,
         request: CompleteFinalizeRecoveryRequest,
     ) -> Result<CompleteFinalizeRecoveryResponse, Status> {
+        let applied_cursor =
+            require_cursor(request.applied_cursor, "peer recovery applied cursor")?;
         let session = self.source_session(&request.session_id).await?;
         {
             let mut session = session.lock().await;
-            if session.barrier_next_seq_no != Some(request.applied_next_seq_no)
+            if session
+                .barrier
+                .is_none_or(|barrier| barrier.wal_end != applied_cursor)
                 || session.barrier_guard.is_none()
             {
                 return Err(Status::failed_precondition(
                     "peer recovery target has not applied the finalize barrier head",
+                ));
+            }
+            if session.barrier.is_none_or(|barrier| {
+                barrier.sequence.processed_checkpoint != request.processed_checkpoint
+            }) {
+                return Err(Status::failed_precondition(
+                    "peer recovery target processed checkpoint does not match the source barrier",
                 ));
             }
             if session.settlement_running {
@@ -1805,6 +1889,20 @@ mod tests {
             .unwrap()
     }
 
+    fn test_barrier(
+        cursor: crate::wal::WalCursor,
+        boundary: &crate::engine::sequence::CommittedBoundaryRecord,
+    ) -> crate::engine::PeerRecoveryBarrier {
+        crate::engine::PeerRecoveryBarrier {
+            wal_end: cursor,
+            sequence: crate::engine::SequenceStats {
+                processed_checkpoint: boundary.processed_checkpoint,
+                persisted_checkpoint: boundary.persisted_checkpoint,
+                max_seq_no: boundary.max_seq_no,
+            },
+        }
+    }
+
     async fn wait_for_ready_source_session(service: &TransportService) -> String {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -1815,10 +1913,18 @@ mod tests {
             if let Some(session_id) = ready {
                 return session_id;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "peer recovery source session did not become ready"
-            );
+            if tokio::time::Instant::now() >= deadline {
+                let failures = service
+                    .peer_recovery_state
+                    .registry
+                    .lock()
+                    .await
+                    .setups
+                    .values()
+                    .filter_map(|setup| setup.failure.clone())
+                    .collect::<Vec<_>>();
+                panic!("peer recovery source session did not become ready: {failures:?}");
+            }
             tokio::task::yield_now().await;
         }
     }
@@ -1839,6 +1945,7 @@ mod tests {
         engine
             .add_document("base", serde_json::json!({"value": 0}))
             .unwrap();
+        service.ensure_primary_activated("idx", 0).await.unwrap();
 
         let (gate_tx, gate_rx) = oneshot::channel();
         *service.peer_recovery_state.start_response_gate.lock().await = Some(gate_rx);
@@ -1886,7 +1993,7 @@ mod tests {
         reopened.flush().unwrap();
         assert!(
             reopened
-                .peer_recovery_ops(1, 16, 1024 * 1024)
+                .legacy_recovery_ops(1, 16, 1024 * 1024)
                 .unwrap()
                 .operations
                 .is_empty(),
@@ -2276,12 +2383,26 @@ mod tests {
             target_allocation_id: 1,
             primary_node_id: "primary".into(),
             primary_term: 1,
-            snapshot_next_seq_no: 0,
+            snapshot_cursor: crate::wal::WalCursor {
+                generation_id: 0,
+                byte_offset: 0,
+            },
+            snapshot_boundary: crate::engine::sequence::CommittedBoundaryRecord::empty(1),
             snapshot_dir: dir.path().join("settlement-session"),
             files: HashMap::new(),
             retention_pin: None,
             last_activity: Instant::now(),
-            barrier_next_seq_no: Some(0),
+            barrier: Some(crate::engine::PeerRecoveryBarrier {
+                wal_end: crate::wal::WalCursor {
+                    generation_id: 0,
+                    byte_offset: 0,
+                },
+                sequence: crate::engine::SequenceStats {
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
+                    max_seq_no: None,
+                },
+            }),
             barrier_guard: Some(settlement_guard),
             finalize_deadline: Some(Instant::now() - Duration::from_secs(1)),
             finalize_preparing: Arc::new(AtomicBool::new(false)),
@@ -2352,14 +2473,18 @@ mod tests {
                 target_allocation_id: 1,
                 primary_node_id: "primary".into(),
                 primary_term: 1,
-                snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+                snapshot_cursor: snapshot.snapshot_cursor,
+                snapshot_boundary: snapshot.committed_boundary.clone(),
                 snapshot_dir,
                 files: HashMap::new(),
                 retention_pin: Some(snapshot.retention_pin),
                 last_activity: Instant::now()
                     - RECOVERY_SESSION_IDLE_TIMEOUT
                     - Duration::from_secs(1),
-                barrier_next_seq_no: Some(snapshot.snapshot_next_seq_no),
+                barrier: Some(test_barrier(
+                    snapshot.snapshot_cursor,
+                    &snapshot.committed_boundary,
+                )),
                 barrier_guard: Some(guard),
                 finalize_deadline: Some(Instant::now() - Duration::from_secs(60)),
                 finalize_preparing: Arc::new(AtomicBool::new(false)),
@@ -2395,12 +2520,26 @@ mod tests {
             target_allocation_id: allocation_id,
             primary_node_id: "primary".into(),
             primary_term: 1,
-            snapshot_next_seq_no: 0,
+            snapshot_cursor: crate::wal::WalCursor {
+                generation_id: 0,
+                byte_offset: 0,
+            },
+            snapshot_boundary: crate::engine::sequence::CommittedBoundaryRecord::empty(1),
             snapshot_dir: dir.path().join("finalizing-session"),
             files: HashMap::new(),
             retention_pin: None,
             last_activity: Instant::now(),
-            barrier_next_seq_no: Some(0),
+            barrier: Some(crate::engine::PeerRecoveryBarrier {
+                wal_end: crate::wal::WalCursor {
+                    generation_id: 0,
+                    byte_offset: 0,
+                },
+                sequence: crate::engine::SequenceStats {
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
+                    max_seq_no: None,
+                },
+            }),
             barrier_guard: Some(barrier_guard),
             finalize_deadline: Some(Instant::now() + Duration::from_secs(30)),
             finalize_preparing: Arc::new(AtomicBool::new(false)),
@@ -2453,6 +2592,7 @@ mod tests {
                 "uuid-1",
             )
             .unwrap();
+        service.ensure_primary_activated("idx", 0).await.unwrap();
 
         let barrier = service
             .peer_recovery_state
@@ -2476,7 +2616,15 @@ mod tests {
                 }))
                 .await
         });
-        waiting_rx.await.unwrap();
+        if tokio::time::timeout(Duration::from_secs(5), waiting_rx)
+            .await
+            .is_err()
+        {
+            panic!(
+                "queued index write did not reach the recovery barrier; finished={}",
+                index.is_finished()
+            );
+        }
         move_primary(&cluster);
         drop(guard);
         assert!(!index.await.unwrap().unwrap().into_inner().success);
@@ -2506,7 +2654,10 @@ mod tests {
                 }))
                 .await
         });
-        waiting_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiting_rx)
+            .await
+            .expect("queued bulk write did not reach the recovery barrier")
+            .unwrap();
         move_primary(&cluster);
         drop(guard);
         assert!(!bulk.await.unwrap().unwrap().into_inner().success);
@@ -2534,7 +2685,10 @@ mod tests {
                 }))
                 .await
         });
-        waiting_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiting_rx)
+            .await
+            .expect("queued delete did not reach the recovery barrier")
+            .unwrap();
         move_primary(&cluster);
         drop(guard);
         assert!(!delete.await.unwrap().unwrap().into_inner().success);
@@ -3021,7 +3175,8 @@ mod tests {
             target_allocation_id: 1,
             primary_node_id: "primary".into(),
             primary_term: 1,
-            snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+            snapshot_cursor: snapshot.snapshot_cursor,
+            snapshot_boundary: snapshot.committed_boundary.clone(),
             snapshot_dir,
             files: snapshot
                 .files
@@ -3030,7 +3185,7 @@ mod tests {
                 .collect(),
             retention_pin: Some(snapshot.retention_pin),
             last_activity: Instant::now(),
-            barrier_next_seq_no: None,
+            barrier: None,
             barrier_guard: None,
             finalize_deadline: None,
             finalize_preparing: Arc::new(AtomicBool::new(false)),
@@ -3055,7 +3210,8 @@ mod tests {
             prepare_service
                 .prepare_finalize_recovery_inner(PrepareFinalizeRecoveryRequest {
                     session_id: "session".into(),
-                    applied_next_seq_no: 1,
+                    cursor: Some(proto_cursor(snapshot.snapshot_cursor)),
+                    processed_checkpoint: snapshot.committed_boundary.processed_checkpoint,
                 })
                 .await
         });
@@ -3186,12 +3342,16 @@ mod tests {
             target_allocation_id,
             primary_node_id: "primary".into(),
             primary_term: 1,
-            snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+            snapshot_cursor: snapshot.snapshot_cursor,
+            snapshot_boundary: snapshot.committed_boundary.clone(),
             snapshot_dir,
             files: HashMap::new(),
             retention_pin: Some(snapshot.retention_pin),
             last_activity: Instant::now(),
-            barrier_next_seq_no: Some(snapshot.snapshot_next_seq_no),
+            barrier: Some(test_barrier(
+                snapshot.snapshot_cursor,
+                &snapshot.committed_boundary,
+            )),
             barrier_guard: Some(guard),
             finalize_deadline: Some(Instant::now() - Duration::from_secs(1)),
             finalize_preparing: Arc::new(AtomicBool::new(false)),
@@ -3262,7 +3422,8 @@ mod tests {
                 target_allocation_id: 1,
                 primary_node_id: "primary".into(),
                 primary_term: 1,
-                snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+                snapshot_cursor: snapshot.snapshot_cursor,
+                snapshot_boundary: snapshot.committed_boundary.clone(),
                 snapshot_dir: snapshot_dir.clone(),
                 files: snapshot
                     .files
@@ -3273,7 +3434,7 @@ mod tests {
                 last_activity: Instant::now()
                     - RECOVERY_SESSION_IDLE_TIMEOUT
                     - Duration::from_secs(1),
-                barrier_next_seq_no: None,
+                barrier: None,
                 barrier_guard: None,
                 finalize_deadline: None,
                 finalize_preparing: Arc::new(AtomicBool::new(false)),
@@ -3290,7 +3451,7 @@ mod tests {
         engine.flush().unwrap();
         assert!(
             engine
-                .peer_recovery_ops(snapshot.snapshot_next_seq_no, 16, 1024 * 1024)
+                .legacy_recovery_ops(snapshot.snapshot_next_seq_no, 16, 1024 * 1024)
                 .unwrap()
                 .operations
                 .is_empty(),
@@ -3360,7 +3521,8 @@ mod tests {
                     .unwrap(),
                 primary_node_id: "primary".into(),
                 primary_term: 1,
-                snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+                snapshot_cursor: snapshot.snapshot_cursor,
+                snapshot_boundary: snapshot.committed_boundary.clone(),
                 snapshot_dir,
                 files: snapshot
                     .files
@@ -3369,7 +3531,7 @@ mod tests {
                     .collect(),
                 retention_pin: Some(snapshot.retention_pin),
                 last_activity: Instant::now(),
-                barrier_next_seq_no: None,
+                barrier: None,
                 barrier_guard: None,
                 finalize_deadline: None,
                 finalize_preparing: Arc::new(AtomicBool::new(false)),
@@ -3456,8 +3618,9 @@ mod tests {
         let error = service
             .fetch_recovery_ops_inner(FetchRecoveryOpsRequest {
                 session_id: "session".into(),
-                from_seq_no: snapshot.snapshot_next_seq_no,
+                cursor: Some(proto_cursor(snapshot.snapshot_cursor)),
                 max_ops: 1,
+                snapshot_processed_checkpoint: snapshot.committed_boundary.processed_checkpoint,
             })
             .await
             .unwrap_err();

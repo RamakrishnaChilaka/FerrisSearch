@@ -804,7 +804,7 @@ async fn replicate_doc_index_via_grpc() {
     let entries = sm
         .get_shard("replica-idx", 0)
         .unwrap()
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .legacy_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(entries.len(), 1);
@@ -974,7 +974,7 @@ async fn replicate_bulk_via_grpc() {
     let entries = sm
         .get_shard("bulk-rep-idx", 0)
         .unwrap()
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .legacy_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(entries.len(), 3);
@@ -1263,7 +1263,7 @@ async fn replica_apply_rejects_uuid_allocation_term_and_missing_identity_fields(
     assert_eq!(engine.doc_count(), 0);
     assert!(
         engine
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .is_empty()
@@ -1415,7 +1415,7 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
     assert!(engine.get_document("first").unwrap().is_none());
     assert!(
         engine
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .is_empty()
@@ -1531,7 +1531,7 @@ async fn primary_write_replicates_to_replica_node() {
     let entries = replica_sm
         .get_shard("replicated-idx", 0)
         .unwrap()
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .legacy_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(entries.len(), 1);
@@ -1789,7 +1789,7 @@ async fn primary_bulk_replicates_to_replica_node() {
     let entries = replica_sm
         .get_shard("bulk-repl-idx", 0)
         .unwrap()
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .legacy_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(entries.len(), 5);
@@ -3581,7 +3581,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         let entries = shard_manager
             .get_shard(index, 0)
             .unwrap()
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations;
         assert_eq!(entries.len(), receipts.len());
@@ -3652,7 +3652,7 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
         shards
             .get_shard(index, 0)
             .unwrap()
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .is_empty()
@@ -3691,7 +3691,7 @@ async fn recover_replica_returns_translog_entries() {
         .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
             index_name: "recover-idx".into(),
             shard_id: 0,
-            local_checkpoint: 2,
+            processed_checkpoint: Some(2),
         }))
         .await
         .unwrap()
@@ -3739,7 +3739,7 @@ async fn recover_replica_returns_empty_when_caught_up() {
         .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
             index_name: "caught-up-idx".into(),
             shard_id: 0,
-            local_checkpoint: 100,
+            processed_checkpoint: Some(100),
         }))
         .await
         .unwrap()
@@ -3968,7 +3968,7 @@ async fn recover_replica_ops_have_correct_fields() {
         .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
             index_name: "opf-idx".into(),
             shard_id: 0,
-            local_checkpoint: 0,
+            processed_checkpoint: Some(0),
         }))
         .await
         .unwrap()

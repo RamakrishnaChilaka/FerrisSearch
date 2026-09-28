@@ -1780,6 +1780,17 @@ impl InternalTransport for TransportService {
             "delete" => crate::engine::DocumentMutation::Delete {
                 doc_id: req.doc_id.clone(),
             },
+            "noop" => {
+                let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
+                    .map_err(|e| Status::invalid_argument(format!("invalid no-op JSON: {e}")))?;
+                let reason = payload
+                    .get("_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Status::invalid_argument("replication no-op has no _reason"))?;
+                crate::engine::DocumentMutation::NoOp {
+                    reason: reason.to_string(),
+                }
+            }
             other => {
                 return Err(Status::invalid_argument(format!(
                     "unknown replication op: {other}"
@@ -2161,50 +2172,61 @@ impl InternalTransport for TransportService {
             .await?;
 
         info!(
-            "gRPC: recover_replica for {}/shard_{} from checkpoint {}",
-            req.index_name, req.shard_id, req.local_checkpoint
+            "gRPC: recover_replica for {}/shard_{} from checkpoint {:?}",
+            req.index_name, req.shard_id, req.processed_checkpoint
         );
 
-        let entries = if let Some(from_seq_no) = req.local_checkpoint.checked_add(1) {
+        let from_seq_no = req
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0);
+        let entries = {
             let recovery_engine = engine.clone();
             match self
                 .worker_pools
                 .spawn_search(move || {
-                    recovery_engine.peer_recovery_ops(from_seq_no, usize::MAX, usize::MAX)
+                    recovery_engine.legacy_recovery_ops(from_seq_no, usize::MAX, usize::MAX)
                 })
                 .await
             {
                 Ok(Ok(batch)) if batch.complete => batch.operations,
                 Ok(Ok(_)) => {
+                    let sequence = engine.sequence_stats();
                     return Ok(Response::new(RecoverReplicaResponse {
                         success: false,
                         error: "Live recovery read did not reach the captured WAL head".to_string(),
                         ops_replayed: 0,
-                        primary_checkpoint: engine.local_checkpoint(),
+                        processed_checkpoint: sequence.processed_checkpoint,
                         operations: vec![],
+                        persisted_checkpoint: sequence.persisted_checkpoint,
+                        max_seq_no: sequence.max_seq_no,
                     }));
                 }
                 Ok(Err(e)) => {
+                    let sequence = engine.sequence_stats();
                     return Ok(Response::new(RecoverReplicaResponse {
                         success: false,
                         error: format!("Failed to read live recovery operations: {e}"),
                         ops_replayed: 0,
-                        primary_checkpoint: engine.local_checkpoint(),
+                        processed_checkpoint: sequence.processed_checkpoint,
                         operations: vec![],
+                        persisted_checkpoint: sequence.persisted_checkpoint,
+                        max_seq_no: sequence.max_seq_no,
                     }));
                 }
                 Err(e) => {
+                    let sequence = engine.sequence_stats();
                     return Ok(Response::new(RecoverReplicaResponse {
                         success: false,
                         error: format!("Live recovery read task failed: {e}"),
                         ops_replayed: 0,
-                        primary_checkpoint: engine.local_checkpoint(),
+                        processed_checkpoint: sequence.processed_checkpoint,
                         operations: vec![],
+                        persisted_checkpoint: sequence.persisted_checkpoint,
+                        max_seq_no: sequence.max_seq_no,
                     }));
                 }
             }
-        } else {
-            Vec::new()
         };
 
         let ops_count = entries.len() as u64;
@@ -2215,12 +2237,15 @@ impl InternalTransport for TransportService {
             .map(peer_recovery::recovery_op)
             .collect::<Result<Vec<_>, _>>()?;
 
+        let sequence = engine.sequence_stats();
         Ok(Response::new(RecoverReplicaResponse {
             success: true,
             error: String::new(),
             ops_replayed: ops_count,
-            primary_checkpoint: engine.local_checkpoint(),
+            processed_checkpoint: sequence.processed_checkpoint,
             operations,
+            persisted_checkpoint: sequence.persisted_checkpoint,
+            max_seq_no: sequence.max_seq_no,
         }))
     }
 
@@ -4138,17 +4163,29 @@ impl TransportService {
             .await;
             return Err(format!("failed to persist primary fence: {error}"));
         }
-        if self.raft.is_none() {
-            self.primary_activation_state
-                .activated_terms
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(initial_key, current.primary_term);
+        if self
+            .primary_activation_state
+            .activated_terms
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&initial_key)
+            .is_some_and(|term| *term == current.primary_term)
+        {
             return Ok(ActivatedPrimary {
                 index_uuid: current.index_uuid,
                 allocation_id: current.allocation_id,
                 primary_term: current.primary_term,
             });
+        }
+        if self.raft.is_none() {
+            let activated = ActivatedPrimary {
+                index_uuid: current.index_uuid,
+                allocation_id: current.allocation_id,
+                primary_term: current.primary_term,
+            };
+            self.prepare_local_primary_activation(index_name, shard_id, &activated)
+                .await?;
+            return Ok(activated);
         }
 
         let key = initial_key;
@@ -4355,16 +4392,121 @@ impl TransportService {
                 "failed to persist activated primary fence: {error}"
             ));
         }
+        let activated = ActivatedPrimary {
+            index_uuid,
+            allocation_id,
+            primary_term: activated_term,
+        };
+        self.prepare_local_primary_activation(index_name, shard_id, &activated)
+            .await?;
+        Ok(activated)
+    }
+
+    async fn prepare_local_primary_activation(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        activated_primary: &ActivatedPrimary,
+    ) -> Result<(), String> {
+        let guard = self
+            .peer_recovery_exclusive_guard(&activated_primary.index_uuid, shard_id)
+            .await;
+        let engine = self
+            .shard_manager
+            .get_shard(index_name, shard_id)
+            .ok_or_else(|| {
+                format!("primary shard [{index_name}][{shard_id}] is not open during activation")
+            })?;
+        let activation_engine = engine.clone();
+        let primary_term = activated_primary.primary_term;
+        let noops = self
+            .worker_pools
+            .spawn_write(move || activation_engine.prepare_primary_activation(primary_term))
+            .await
+            .map_err(|error| format!("primary activation task failed: {error}"))?
+            .map_err(|error| format!("primary activation replay/gap fill failed: {error}"))?;
         self.primary_activation_state
             .activated_terms
             .write()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(key, activated_term);
-        Ok(ActivatedPrimary {
-            index_uuid,
-            allocation_id,
-            primary_term: activated_term,
-        })
+            .insert(
+                (
+                    activated_primary.index_uuid.clone(),
+                    shard_id,
+                    activated_primary.allocation_id,
+                ),
+                activated_primary.primary_term,
+            );
+        drop(guard);
+
+        if noops.is_empty() {
+            return Ok(());
+        }
+        let write_state =
+            self.validated_primary_write_state(index_name, shard_id, activated_primary)?;
+        for operation in noops {
+            let crate::engine::DocumentMutation::NoOp { reason } = operation.mutation else {
+                continue;
+            };
+            match crate::replication::replicate_write(
+                &self.transport_client,
+                &write_state,
+                index_name,
+                shard_id,
+                "",
+                &serde_json::json!({ "_reason": reason }),
+                "noop",
+                operation.seq_no,
+                operation.primary_term,
+            )
+            .await
+            {
+                Ok(replica_checkpoints) => {
+                    self.record_replica_checkpoints(
+                        &engine,
+                        index_name,
+                        shard_id,
+                        activated_primary,
+                        engine.sequence_stats(),
+                        &replica_checkpoints,
+                    );
+                }
+                Err(errors) => {
+                    let primary_sequence = engine.sequence_stats();
+                    if let Some(metadata) = write_state.indices.get(index_name) {
+                        for replica_node_id in metadata.in_sync_replica_nodes(shard_id) {
+                            if let Some(allocation_id) = write_state.shard_allocation_id(
+                                index_name,
+                                shard_id,
+                                replica_node_id,
+                            ) {
+                                self.shard_manager.isr_tracker.update_replica_checkpoint(
+                                    index_name,
+                                    &activated_primary.index_uuid,
+                                    shard_id,
+                                    activated_primary.primary_term,
+                                    primary_sequence.processed_checkpoint,
+                                    crate::shard::ReplicaCheckpointUpdate {
+                                        node_id: replica_node_id.clone(),
+                                        allocation_id,
+                                        processed_checkpoint: None,
+                                        persisted_checkpoint: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    tracing::warn!(
+                        index = index_name,
+                        shard_id,
+                        seq_no = operation.seq_no,
+                        errors = ?errors,
+                        "Promotion NoOp replication failed; retaining replica gap observation"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validated_primary_write_state(

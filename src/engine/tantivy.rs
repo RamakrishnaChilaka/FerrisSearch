@@ -7710,7 +7710,12 @@ impl super::SearchEngine for HotEngine {
             .unwrap_or_else(|error| error.into_inner())
             .take()
         {
-            let _ = sender.send(prepared.snapshot_next_seq_no);
+            let snapshot_next_seq_no = prepared
+                .committed_boundary
+                .max_seq_no
+                .and_then(|seq_no| seq_no.checked_add(1))
+                .unwrap_or(0);
+            let _ = sender.send(snapshot_next_seq_no);
         }
         #[cfg(test)]
         if let Some(receiver) = self
@@ -7730,7 +7735,10 @@ impl super::SearchEngine for HotEngine {
             }
         };
         Ok(super::PeerRecoverySnapshot {
+            snapshot_cursor: prepared.snapshot_cursor,
+            #[cfg(test)]
             snapshot_next_seq_no: prepared.snapshot_next_seq_no,
+            committed_boundary: prepared.committed_boundary,
             retention_pin_id: prepared.retention_pin.into_pin_id(),
             files: prepared.files,
         })
@@ -7747,7 +7755,6 @@ impl super::SearchEngine for HotEngine {
 
         let _maintenance = self.maintenance_guard("peer recovery snapshot")?;
         let preparation = self.with_translog("peer recovery snapshot", |translog| {
-            let snapshot_next_seq_no = translog.next_seq_no();
             let mut writer_state =
                 self.writer_state_with_replay(translog, "peer recovery snapshot")?;
             let boundary = self.current_committed_boundary()?;
@@ -7758,7 +7765,12 @@ impl super::SearchEngine for HotEngine {
             )?;
             drop(writer_state);
             self.persist_committed_boundary_durable(&committed_boundary)?;
-            let retention_pin_id = translog.register_retention_pin(snapshot_next_seq_no)?;
+            let snapshot_cursor = translog.recovery_read_snapshot()?.end_cursor();
+            let retention_floor = committed_boundary
+                .processed_checkpoint
+                .and_then(|checkpoint| checkpoint.checked_add(1))
+                .unwrap_or(0);
+            let retention_pin_id = translog.register_retention_pin(retention_floor)?;
 
             let result = (|| {
                 let file_names = self.peer_recovery_file_names()?;
@@ -7781,7 +7793,12 @@ impl super::SearchEngine for HotEngine {
             })();
 
             match result {
-                Ok(file_names) => Ok((snapshot_next_seq_no, retention_pin_id, file_names)),
+                Ok(file_names) => Ok((
+                    snapshot_cursor,
+                    committed_boundary,
+                    retention_pin_id,
+                    file_names,
+                )),
                 Err(error) => {
                     let _ = translog.release_retention_pin(retention_pin_id);
                     let _ = std::fs::remove_dir_all(snapshot_dir);
@@ -7789,7 +7806,8 @@ impl super::SearchEngine for HotEngine {
                 }
             }
         });
-        let (snapshot_next_seq_no, retention_pin_id, file_names) = match preparation {
+        let (snapshot_cursor, committed_boundary, retention_pin_id, file_names) = match preparation
+        {
             Ok(preparation) => preparation,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(snapshot_dir);
@@ -7798,7 +7816,13 @@ impl super::SearchEngine for HotEngine {
         };
         drop(_maintenance);
         Ok(super::PeerRecoverySnapshotPreparation {
-            snapshot_next_seq_no,
+            snapshot_cursor,
+            #[cfg(test)]
+            snapshot_next_seq_no: committed_boundary
+                .max_seq_no
+                .and_then(|seq_no| seq_no.checked_add(1))
+                .unwrap_or(0),
+            committed_boundary,
             retention_pin: super::PeerRecoveryRetentionPin::new(
                 self.translog.clone(),
                 retention_pin_id,
@@ -7815,7 +7839,8 @@ impl super::SearchEngine for HotEngine {
 
     fn peer_recovery_ops(
         &self,
-        min_seq_no: u64,
+        cursor: crate::wal::WalCursor,
+        end_cursor: Option<crate::wal::WalCursor>,
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
@@ -7831,12 +7856,136 @@ impl super::SearchEngine for HotEngine {
         let snapshot = self.with_translog("peer recovery operation snapshot", |translog| {
             translog.recovery_read_snapshot()
         })?;
-        let primary_next_seq_no = snapshot.next_seq_no();
-        let (operations, complete) = snapshot.read_bounded_range(min_seq_no, max_ops, max_bytes)?;
+        let end_cursor = end_cursor.unwrap_or_else(|| snapshot.end_cursor());
+        if end_cursor.position() > snapshot.end_cursor().position() {
+            anyhow::bail!("peer recovery end cursor exceeds the captured WAL end");
+        }
+        let batch = snapshot.read_bounded_cursor(cursor, end_cursor, max_ops, max_bytes)?;
+        let checkpoints = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .checkpoints
+            .clone();
+        let operations = batch
+            .entries
+            .into_iter()
+            .filter(|entry| checkpoints.has_processed(entry.seq_no))
+            .collect();
         Ok(super::PeerRecoveryOpsBatch {
             operations,
-            primary_next_seq_no,
+            next_cursor: batch.next_cursor,
+            source_max_seq_no: checkpoints.stats().max_seq_no,
+            complete: batch.complete,
+        })
+    }
+
+    fn legacy_recovery_ops(
+        &self,
+        min_seq_no: u64,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<super::PeerRecoveryOpsBatch> {
+        #[cfg(test)]
+        if let Some(sender) = self
+            .peer_recovery_read_started_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+        }
+        let snapshot = self.with_translog("legacy recovery operation snapshot", |translog| {
+            translog.recovery_read_snapshot()
+        })?;
+        let (operations, complete) = snapshot.read_bounded_range(min_seq_no, max_ops, max_bytes)?;
+        let checkpoints = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .checkpoints
+            .clone();
+        Ok(super::PeerRecoveryOpsBatch {
+            operations: operations
+                .into_iter()
+                .filter(|entry| checkpoints.has_processed(entry.seq_no))
+                .collect(),
+            next_cursor: snapshot.end_cursor(),
+            source_max_seq_no: checkpoints.stats().max_seq_no,
             complete,
+        })
+    }
+
+    fn peer_recovery_barrier(&self) -> Result<super::PeerRecoveryBarrier> {
+        self.with_translog("peer recovery barrier", |translog| {
+            drop(self.writer_state_with_replay(translog, "peer recovery barrier")?);
+            let wal_end = translog.recovery_read_snapshot()?.end_cursor();
+            let sequence = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+                .checkpoints
+                .stats();
+            Ok(super::PeerRecoveryBarrier { wal_end, sequence })
+        })
+    }
+
+    fn prepare_primary_activation(
+        &self,
+        primary_term: u64,
+    ) -> Result<Vec<super::SequencedOperation>> {
+        let _maintenance = self.maintenance_guard("primary activation")?;
+        self.with_translog("primary activation", |translog| {
+            {
+                let mut writer_state = self
+                    .writer
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner());
+                writer_state.fail("primary activation requires full local WAL replay");
+            }
+            drop(self.writer_state_with_replay(translog, "primary activation")?);
+
+            let max_seq_no = self
+                .sequence_stats()
+                .max_seq_no
+                .into_iter()
+                .chain(translog.max_seq_no())
+                .max();
+            let Some(max_seq_no) = max_seq_no else {
+                return Ok(Vec::new());
+            };
+            let missing = self.missing_sequence_intervals_through(max_seq_no);
+            let operations = missing
+                .into_iter()
+                .flat_map(|range| range.map(|seq_no| (seq_no, primary_term)))
+                .map(|(seq_no, primary_term)| super::SequencedOperation {
+                    seq_no,
+                    primary_term,
+                    mutation: super::DocumentMutation::NoOp {
+                        reason: "promotion gap".to_string(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            if operations.is_empty() {
+                return Ok(operations);
+            }
+            self.apply_sequenced_batch_locked(
+                translog,
+                operations.clone(),
+                WalDisposition::Append,
+                None,
+                false,
+                |_| Ok(()),
+            )?;
+            translog.sync()?;
+            let mut state = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+            for operation in &operations {
+                state.checkpoints.mark_persisted(operation.seq_no);
+            }
+            Ok(operations)
         })
     }
 
@@ -9992,7 +10141,7 @@ mod tests {
         assert_eq!(receipt.start_seq_no, Some(0));
         assert_eq!(
             engine
-                .peer_recovery_ops(0, usize::MAX, usize::MAX)
+                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .len(),
@@ -12680,9 +12829,9 @@ mod tests {
         let snapshot_reader = snapshot_index.reader().unwrap();
         assert_eq!(snapshot_reader.searcher().num_docs(), 2);
 
-        let suffix = engine.peer_recovery_ops(2, 16, 1024 * 1024).unwrap();
+        let suffix = engine.legacy_recovery_ops(2, 16, 1024 * 1024).unwrap();
         assert!(suffix.complete);
-        assert_eq!(suffix.primary_next_seq_no, 3);
+        assert_eq!(suffix.source_max_seq_no, Some(2));
         assert_eq!(
             suffix
                 .operations
@@ -12707,7 +12856,7 @@ mod tests {
 
         let assert_retained = |expected: &[u64]| {
             let batch = engine
-                .peer_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
+                .legacy_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
                 .unwrap();
             assert_eq!(
                 batch
@@ -12743,7 +12892,7 @@ mod tests {
         engine.flush().unwrap();
         assert!(
             engine
-                .peer_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
+                .legacy_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
                 .unwrap()
                 .operations
                 .is_empty()
@@ -12771,7 +12920,7 @@ mod tests {
 
         let scan_engine = engine.clone();
         let scan = std::thread::spawn(move || {
-            scan_engine.peer_recovery_ops(suffix.seq_no, 16, 4 * 1024 * 1024)
+            scan_engine.legacy_recovery_ops(suffix.seq_no, 16, 4 * 1024 * 1024)
         });
         barrier.wait();
 

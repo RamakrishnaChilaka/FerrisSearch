@@ -380,6 +380,13 @@ pub(super) fn open_local_assigned_shards(
                 }
                 continue;
             }
+            if shard_manager.has_legacy_replica_migration(index_name, *shard_id) {
+                if routing.primary == local_node_id {
+                    shard_manager.remove_legacy_replica_migration(index_name, *shard_id);
+                } else {
+                    continue;
+                }
+            }
             if shard_manager.get_shard(index_name, *shard_id).is_some() {
                 if let Err(error) = shard_manager.validate_open_copy_identity(
                     index_name,
@@ -475,7 +482,20 @@ pub(super) fn open_local_assigned_shards(
                     shard_id,
                     error
                 );
-                if ShardManager::should_report_copy_failure(&error) {
+                if routing.primary != local_node_id
+                    && ShardManager::is_legacy_replica_migration_error(&error)
+                {
+                    shard_manager.register_legacy_replica_migration(
+                        index_name,
+                        crate::shard::LegacyReplicaPendingMigration {
+                            index_uuid: metadata.uuid.to_string(),
+                            shard_id: *shard_id,
+                            allocation_id,
+                            primary_node_id: routing.primary.clone(),
+                            observed_primary_term: routing.primary_term,
+                        },
+                    );
+                } else if ShardManager::should_report_copy_failure(&error) {
                     failures.push(ShardCopyFailure {
                         index_name: index_name.clone(),
                         index_uuid: metadata.uuid.to_string(),

@@ -174,6 +174,15 @@ pub struct PeerRecoveryAwaitingMembership {
     pub primary_term: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyReplicaPendingMigration {
+    pub index_uuid: String,
+    pub shard_id: u32,
+    pub allocation_id: AllocationId,
+    pub primary_node_id: String,
+    pub observed_primary_term: u64,
+}
+
 impl PeerRecoveryAwaitingMembership {
     fn validate(&self) -> Result<()> {
         if self.index_uuid.is_empty() {
@@ -222,7 +231,7 @@ pub(crate) trait SourceRecoverySessionCleanup: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>>;
 }
 
-pub struct PeerRecoveryTargetInstall {
+pub(crate) struct PeerRecoveryTargetInstall {
     pub index: String,
     pub shard_id: u32,
     pub mappings: HashMap<String, crate::cluster::state::FieldMapping>,
@@ -231,7 +240,7 @@ pub struct PeerRecoveryTargetInstall {
     pub allocation_id: AllocationId,
     pub primary_term: u64,
     pub shard_dir: PathBuf,
-    pub snapshot_next_seq_no: u64,
+    pub committed_boundary: crate::engine::sequence::CommittedBoundaryRecord,
     pub expected_files: Vec<String>,
 }
 
@@ -258,6 +267,15 @@ pub struct ShardCopyIdentity {
     pub replica_fence: u64,
     #[serde(default)]
     pub fence_max_seq_no: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyShardCopyIdentityV1 {
+    version: u32,
+    index_uuid: String,
+    allocation_id: AllocationId,
+    replica_fence: u64,
 }
 
 impl ShardCopyIdentity {
@@ -802,6 +820,7 @@ pub struct ShardManager {
     #[cfg(test)]
     assigned_open_attempts: AtomicUsize,
     peer_recovery_targets: RwLock<HashMap<ShardKey, PeerRecoveryTargetState>>,
+    legacy_replica_migrations: RwLock<HashMap<ShardKey, LegacyReplicaPendingMigration>>,
     source_recovery_cleanup: RwLock<Option<Arc<dyn SourceRecoverySessionCleanup>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
     pub isr_tracker: IsrTracker,
@@ -866,6 +885,7 @@ impl ShardManager {
             #[cfg(test)]
             assigned_open_attempts: AtomicUsize::new(0),
             peer_recovery_targets: RwLock::new(HashMap::new()),
+            legacy_replica_migrations: RwLock::new(HashMap::new()),
             source_recovery_cleanup: RwLock::new(None),
             isr_tracker: IsrTracker::new(1000),
             durability,
@@ -1306,16 +1326,18 @@ impl ShardManager {
         Ok(identity.clone())
     }
 
-    fn prepare_assigned_copy_identity(
+    fn prepare_assigned_copy_identity_for_role(
         &self,
         key: &ShardKey,
         shard_dir: &std::path::Path,
         index_uuid: &str,
         assignment: AssignedShardOpen,
+        role: AssignedOpenRole,
     ) -> Result<ShardCopyIdentity> {
         if assignment.allocation_id == 0 {
             anyhow::bail!("assigned shard copy has a zero allocation ID");
         }
+
         if assignment.primary_term == 0 {
             anyhow::bail!("assigned shard copy has a zero primary term");
         }
@@ -1339,7 +1361,34 @@ impl ShardManager {
         }
         let identity_path = Self::copy_identity_path(shard_dir);
         let identity = if identity_path.try_exists()? {
-            let identity = Self::load_copy_identity(shard_dir)?;
+            let identity = match Self::load_copy_identity(shard_dir) {
+                Ok(identity) => identity,
+                Err(error)
+                    if matches!(role, AssignedOpenRole::Primary)
+                        && error.is::<LegacyShardCopyIdentityError>() =>
+                {
+                    let legacy: LegacyShardCopyIdentityV1 =
+                        serde_json::from_slice(&std::fs::read(&identity_path)?)?;
+                    if legacy.version != 1
+                        || legacy.index_uuid != index_uuid
+                        || legacy.allocation_id != assignment.allocation_id
+                        || legacy.replica_fence == 0
+                    {
+                        return Err(definitive_shard_copy_failure(
+                            "legacy shard copy identity does not match the primary assignment",
+                        ));
+                    }
+                    let identity = ShardCopyIdentity::new(
+                        index_uuid,
+                        assignment.allocation_id,
+                        assignment.primary_term,
+                        None,
+                    )?;
+                    Self::persist_copy_identity(shard_dir, &identity)?;
+                    identity
+                }
+                Err(error) => return Err(error),
+            };
             identity.validate_expected(index_uuid, assignment.allocation_id)?;
             identity
         } else {
@@ -1386,6 +1435,23 @@ impl ShardManager {
         }
         self.cache_copy_identity(key, identity.clone());
         Ok(identity)
+    }
+
+    #[cfg(test)]
+    fn prepare_assigned_copy_identity(
+        &self,
+        key: &ShardKey,
+        shard_dir: &std::path::Path,
+        index_uuid: &str,
+        assignment: AssignedShardOpen,
+    ) -> Result<ShardCopyIdentity> {
+        self.prepare_assigned_copy_identity_for_role(
+            key,
+            shard_dir,
+            index_uuid,
+            assignment,
+            AssignedOpenRole::Primary,
+        )
     }
 
     fn ensure_local_test_identity(
@@ -1498,6 +1564,59 @@ impl ShardManager {
                 .downcast_ref::<PersistentShardCopyIoFailure>()
                 .is_some_and(|failure| failure.operation != ShardCopyIoOperation::Apply)
         })
+    }
+
+    pub(crate) fn is_legacy_replica_migration_error(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::engine::tantivy::LegacyReplicaAwaitingPrimaryMigration>()
+                .is_some()
+                || cause
+                    .downcast_ref::<LegacyShardCopyIdentityError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::sequence::LegacyCommittedBoundaryFormatError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::wal::UnsupportedWalFormatError>()
+                    .is_some_and(crate::wal::UnsupportedWalFormatError::is_legacy_manifest)
+        })
+    }
+
+    pub(crate) fn register_legacy_replica_migration(
+        &self,
+        index: &str,
+        pending: LegacyReplicaPendingMigration,
+    ) {
+        self.legacy_replica_migrations
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(ShardKey::new(index, pending.shard_id), pending);
+    }
+
+    pub(crate) fn legacy_replica_migrations(
+        &self,
+    ) -> Vec<(ShardKey, LegacyReplicaPendingMigration)> {
+        self.legacy_replica_migrations
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(key, pending)| (key.clone(), pending.clone()))
+            .collect()
+    }
+
+    pub(crate) fn remove_legacy_replica_migration(&self, index: &str, shard_id: u32) {
+        self.legacy_replica_migrations
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&ShardKey::new(index, shard_id));
+    }
+
+    pub(crate) fn has_legacy_replica_migration(&self, index: &str, shard_id: u32) -> bool {
+        self.legacy_replica_migrations
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&ShardKey::new(index, shard_id))
     }
 
     pub(crate) fn ensure_local_apply_allowed(
@@ -2179,7 +2298,13 @@ impl ShardManager {
         };
 
         let mut prepared_identity = if let Some(assignment) = assignment {
-            Some(self.prepare_assigned_copy_identity(&key, &shard_dir, index_uuid, assignment)?)
+            Some(self.prepare_assigned_copy_identity_for_role(
+                &key,
+                &shard_dir,
+                index_uuid,
+                assignment,
+                assigned_role.expect("assigned role is present with assignment"),
+            )?)
         } else {
             None
         };
@@ -2918,7 +3043,7 @@ impl ShardManager {
         .map_err(|e| anyhow::anyhow!("blocking peer recovery target preparation failed: {e}"))?
     }
 
-    pub async fn finalize_peer_recovery_target_blocking(
+    pub(crate) async fn finalize_peer_recovery_target_blocking(
         self: &Arc<Self>,
         install: PeerRecoveryTargetInstall,
     ) -> Result<Arc<dyn SearchEngine>> {
@@ -2933,7 +3058,7 @@ impl ShardManager {
                 allocation_id,
                 primary_term,
                 shard_dir,
-                snapshot_next_seq_no,
+                committed_boundary,
                 mut expected_files,
             } = install;
             let key = ShardKey::new(&index, shard_id);
@@ -2962,21 +3087,26 @@ impl ShardManager {
                 ));
             }
 
-            HotTranslog::initialize_empty_at(
-                &shard_dir,
-                shard_manager.durability,
-                snapshot_next_seq_no,
-            )?;
-            let committed_path = shard_dir.join("translog.committed");
-            let mut committed =
-                crate::engine::sequence::CommittedBoundaryRecord::empty(primary_term);
-            if let Some(last_seq_no) = snapshot_next_seq_no.checked_sub(1) {
-                committed.processed_checkpoint = Some(last_seq_no);
-                committed.persisted_checkpoint = Some(last_seq_no);
-                committed.max_seq_no = Some(last_seq_no);
-                committed.max_seq_no_of_updates_or_deletes = Some(last_seq_no);
+            committed_boundary.validate()?;
+            if committed_boundary.term_sequence_state.current_term != primary_term {
+                return Err(definitive_shard_copy_failure(
+                    "peer recovery committed boundary term does not match the source term",
+                ));
             }
-            committed.persist(&committed_path)?;
+            let allocator_next = committed_boundary
+                .max_seq_no
+                .map(|max_seq_no| {
+                    max_seq_no.checked_add(1).ok_or_else(|| {
+                        definitive_shard_copy_failure(
+                            "peer recovery maximum sequence exhausts the allocator",
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            HotTranslog::initialize_empty_at(&shard_dir, shard_manager.durability, allocator_next)?;
+            let committed_path = shard_dir.join("translog.committed");
+            committed_boundary.persist(&committed_path)?;
             std::fs::File::open(shard_dir.join("index"))?.sync_all()?;
 
             shard_manager.register_index_uuid(&index, &index_uuid);
@@ -3011,7 +3141,9 @@ impl ShardManager {
                 engine.rebuild_vectors()?;
             }
 
-            let fence_max_seq_no = committed.term_sequence_state.max_seq_no_at_term_start;
+            let fence_max_seq_no = committed_boundary
+                .term_sequence_state
+                .max_seq_no_at_term_start;
             let identity =
                 ShardCopyIdentity::new(&index_uuid, allocation_id, primary_term, fence_max_seq_no)?;
             Self::persist_copy_identity(&shard_dir, &identity)?;
@@ -3523,6 +3655,10 @@ impl ShardManager {
         }
         drop(shards);
         self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|key, _| key.index != index);
+        self.legacy_replica_migrations
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .retain(|key, _| key.index != index);
@@ -4741,10 +4877,13 @@ mod tests {
     async fn finalized_peer_recovery_install_opens_exact_snapshot() {
         let source_dir = tempfile::tempdir().unwrap();
         let source = CompositeEngine::new(source_dir.path(), Duration::from_secs(60)).unwrap();
-        source.add_document("doc-1", json!({"value": 1})).unwrap();
-        source.add_document("doc-2", json!({"value": 2})).unwrap();
+        let source: Arc<dyn SearchEngine> = Arc::new(source);
+        apply_index(&source, "doc-1", json!({"value": 1}), 0, 1).unwrap();
+        apply_index(&source, "doc-2", json!({"value": 2}), 2, 1).unwrap();
         let snapshot_dir = source_dir.path().join("peer-recovery/session");
         let snapshot = source.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+        assert_eq!(snapshot.committed_boundary.processed_checkpoint, Some(0));
+        assert_eq!(snapshot.committed_boundary.max_seq_no, Some(2));
 
         let target_dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(ShardManager::new(
@@ -4774,7 +4913,7 @@ mod tests {
                 allocation_id: 1,
                 primary_term: 1,
                 shard_dir: shard_dir.clone(),
-                snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+                committed_boundary: snapshot.committed_boundary.clone(),
                 expected_files: snapshot
                     .files
                     .iter()
@@ -4784,6 +4923,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.doc_count(), 2);
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
         assert!(!shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists());
         source
             .release_peer_recovery_pin(snapshot.retention_pin_id)
@@ -4954,6 +5095,78 @@ mod tests {
         assert!(!ShardManager::should_quarantine_copy_failure(
             &manifest_error
         ));
+    }
+
+    #[test]
+    fn legacy_identity_migrates_only_for_primary_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let shard_dir = dir.path().join("uuid-1/shard_0");
+        std::fs::create_dir_all(shard_dir.join("index")).unwrap();
+        std::fs::write(shard_dir.join("index/meta.json"), b"{}").unwrap();
+        std::fs::write(
+            shard_dir.join(SHARD_COPY_IDENTITY_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "index_uuid": "uuid-1",
+                "allocation_id": 7,
+                "replica_fence": 2,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let assignment = AssignedShardOpen {
+            allocation_id: 7,
+            primary_term: 3,
+            allow_empty_creation: false,
+        };
+
+        let replica_error = manager
+            .prepare_assigned_copy_identity_for_role(
+                &ShardKey::new("idx", 0),
+                &shard_dir,
+                "uuid-1",
+                assignment,
+                AssignedOpenRole::Replica,
+            )
+            .unwrap_err();
+        assert!(ShardManager::is_legacy_replica_migration_error(
+            &replica_error
+        ));
+
+        let identity = manager
+            .prepare_assigned_copy_identity_for_role(
+                &ShardKey::new("idx", 0),
+                &shard_dir,
+                "uuid-1",
+                assignment,
+                AssignedOpenRole::Primary,
+            )
+            .unwrap();
+        assert_eq!(identity.version, SHARD_COPY_IDENTITY_VERSION);
+        assert_eq!(identity.replica_fence, 3);
+        assert_eq!(identity.fence_max_seq_no, None);
+    }
+
+    #[test]
+    fn legacy_replica_pending_state_is_allocation_bound() {
+        let (_dir, manager) = create_shard_manager();
+        manager.register_legacy_replica_migration(
+            "idx",
+            LegacyReplicaPendingMigration {
+                index_uuid: "uuid-1".into(),
+                shard_id: 0,
+                allocation_id: 7,
+                primary_node_id: "node-1".into(),
+                observed_primary_term: 3,
+            },
+        );
+        let pending = manager.legacy_replica_migrations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.allocation_id, 7);
+        assert!(manager.has_legacy_replica_migration("idx", 0));
+        manager.remove_legacy_replica_migration("idx", 0);
+        assert!(!manager.has_legacy_replica_migration("idx", 0));
     }
 
     #[test]
@@ -5564,7 +5777,7 @@ mod tests {
         first.inject_writer_replacement_failures_for_test(28, 1);
         assert!(first.force_merge(1).is_err());
         let wal_before = first
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .len();
@@ -5583,7 +5796,7 @@ mod tests {
         assert!(!ShardManager::should_report_copy_failure(&blocked));
         assert_eq!(
             first
-                .peer_recovery_ops(0, usize::MAX, usize::MAX)
+                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .len(),
