@@ -112,6 +112,7 @@ default_configs=(
     d1-primary-gap-max
     d1-primary-gap-processed
     d1-promotion-replay-noop
+    trace-validator
     two-shard
 )
 
@@ -174,6 +175,7 @@ d1-term-collision-restart-identity pass: identity restores fence collision max
 d1-primary-gap-max      expected B3NoRecoveryLoop: max-based detector loops
 d1-primary-gap-processed pass: compare replica and primary processed checkpoints
 d1-promotion-replay-noop pass: replay, fill NoOp, activate despite replica gap
+trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -201,6 +203,12 @@ run_config() {
     local expected
     local mode="check"
     local timeout_seconds=$TIMEOUT_SECONDS
+
+    if [[ "$name" == "trace-validator" ]]; then
+        echo "=== TLA+ trace-validator (pass) ==="
+        TLA2TOOLS_JAR="$JAR" "$ROOT_DIR/scripts/tla/test_trace_validator.sh"
+        return
+    fi
 
     case "$name" in
         c1-fast|MC_C1_fast)
