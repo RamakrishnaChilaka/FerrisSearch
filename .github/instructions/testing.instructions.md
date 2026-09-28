@@ -142,17 +142,28 @@ cargo test -- test_name                         # Single test by name
   local WAL entries before NoOp fill; failed NoOp replication may leave a
   replica gap but cannot block local activation.
 - D1 implementation traces follow `specs/tla/trace/SCHEMA.md`. The converter
-  must reject unknown schema versions, events, outcomes, and fields before
-  invoking TLC. The checked-in valid traces must remain accepted; the
-  arrival-order, sequence-only redelivery, and highest-commit replay traces
-  must remain rejected at their documented schema steps.
-- A trace-validation pass means only that the finite observed execution can be
-  embedded in `TraceD1` while unobserved state is existentially completed. It
-  is not an implementation proof, and hand-written fixtures are not evidence
-  that a Rust execution emitted the same behavior.
+  must accept only schema v2 and reject unknown versions, events, outcomes,
+  fields, non-consecutive steps, invalid durability, required-replica/view
+  mismatch, or invented copy state before invoking TLC.
+- Trace profiles compose observations with the owning actions:
+  `TraceD1` with `MC_D1_SeqNoApply`, `TraceD1Authority` with Raft/activation,
+  `TraceD1Collision` with the B1 slice, and `TraceD1Recovery` with
+  `PeerRecovery`. Do not replace these with a deterministic replay machine or
+  duplicate planner/routing rules in the trace module.
+- TLC trace acceptance is existential witness search with a trace-declared
+  hidden-action bound. A pass means only that the finite observation can be
+  embedded in the selected bounded model; it is not an implementation proof.
+- The review mutation matrix must retain rejection for m1, m2, m3, m4, m5,
+  m6, m6b, m7, m8, m8b, m9, m9b, m15, m18, and m19, while m13 and m14 remain
+  accepted. Also retain the replay-stage invalid trace whose commit boundary is
+  valid but replay behavior is not.
+- `copy_state` is mandatory for every available copy at quiescence and after
+  replay/admission. Outcome labels alone are not semantic evidence.
 - Protocol trace events must be synchronously ordered by the process-global
   trace sink and emitted after the named effect but before releasing its
-  linearizing lock. Do not validate normal asynchronous tracing output.
+  linearizing lock. Every mutable field in one event comes from that same lock;
+  split commit capture/persistence and other cross-lock effects. Do not
+  validate normal asynchronous tracing output.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt
