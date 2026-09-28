@@ -446,6 +446,12 @@ impl CommittedBoundaryRecord {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        if let Some(next_seq_no) = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            return Err(LegacyCommittedBoundaryFormatError { next_seq_no }.into());
+        }
         let header =
             serde_json::from_slice::<CommittedBoundaryVersionHeader>(&bytes).map_err(|error| {
                 committed_boundary_corruption(format!(
@@ -581,6 +587,9 @@ impl PrimaryTermSequenceState {
         seq_no: u64,
         already_processed: bool,
     ) -> Result<()> {
+        if primary_term < self.current_term {
+            return Ok(());
+        }
         self.validate_term(primary_term)?;
         if already_processed
             && self
@@ -601,6 +610,9 @@ impl PrimaryTermSequenceState {
     }
 
     pub(crate) fn mark_processed(&mut self, primary_term: u64, seq_no: u64) -> Result<()> {
+        if primary_term < self.current_term {
+            return Ok(());
+        }
         self.validate_term(primary_term)?;
         if self
             .max_seq_no_at_term_start
@@ -608,6 +620,17 @@ impl PrimaryTermSequenceState {
         {
             self.processed_in_current_term_below_start_max
                 .insert(seq_no);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_not_stale(&self, primary_term: u64) -> Result<()> {
+        if primary_term < self.current_term {
+            return Err(PrimaryTermSequenceStateTermError {
+                expected: self.current_term,
+                found: primary_term,
+            }
+            .into());
         }
         Ok(())
     }
@@ -679,6 +702,12 @@ pub(crate) struct PrimaryTermSequenceStateTermError {
 pub(crate) struct UnsupportedCommittedBoundaryVersionError {
     found: u32,
     expected: u32,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("legacy integer committed boundary {next_seq_no} requires migration")]
+pub(crate) struct LegacyCommittedBoundaryFormatError {
+    next_seq_no: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -945,6 +974,17 @@ mod tests {
         record.version += 1;
         let error = record.validate().unwrap_err();
         assert!(error.is::<UnsupportedCommittedBoundaryVersionError>());
+    }
+
+    #[test]
+    fn legacy_integer_committed_boundary_has_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("translog.committed");
+        std::fs::write(&path, "17\n").unwrap();
+
+        let error = CommittedBoundaryRecord::load(&path).unwrap_err();
+
+        assert!(error.is::<LegacyCommittedBoundaryFormatError>());
     }
 
     #[test]

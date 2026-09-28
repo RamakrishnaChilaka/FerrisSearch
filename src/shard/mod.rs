@@ -35,6 +35,13 @@ pub(crate) struct DefinitiveShardCopyFailure {
     message: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("legacy shard copy identity version {found} requires migration to version {expected}")]
+pub(crate) struct LegacyShardCopyIdentityError {
+    found: u32,
+    expected: u32,
+}
+
 fn definitive_shard_copy_failure(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(DefinitiveShardCopyFailure {
         message: message.into(),
@@ -249,6 +256,7 @@ pub struct ShardCopyIdentity {
     pub index_uuid: String,
     pub allocation_id: AllocationId,
     pub replica_fence: u64,
+    #[serde(default)]
     pub fence_max_seq_no: Option<u64>,
 }
 
@@ -271,6 +279,13 @@ impl ShardCopyIdentity {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.version == 1 {
+            return Err(LegacyShardCopyIdentityError {
+                found: self.version,
+                expected: SHARD_COPY_IDENTITY_VERSION,
+            }
+            .into());
+        }
         if self.version != SHARD_COPY_IDENTITY_VERSION {
             return Err(definitive_shard_copy_failure(format!(
                 "unsupported shard copy identity version {}",
@@ -4483,6 +4498,68 @@ mod tests {
         };
         assert!(error.to_string().contains("decode shard copy identity"));
         assert!(manager.get_shard("idx", 0).is_none());
+    }
+
+    #[test]
+    fn legacy_storage_formats_are_typed_and_not_quarantined() {
+        let identity_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            identity_dir.path().join(SHARD_COPY_IDENTITY_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "index_uuid": "uuid-1",
+                "allocation_id": 7,
+                "replica_fence": 2,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let identity_error = ShardManager::load_copy_identity(identity_dir.path()).unwrap_err();
+        assert!(identity_error.is::<LegacyShardCopyIdentityError>());
+        assert!(!ShardManager::should_report_copy_failure(&identity_error));
+        assert!(!ShardManager::should_quarantine_copy_failure(
+            &identity_error
+        ));
+
+        let committed_dir = tempfile::tempdir().unwrap();
+        let committed_path = committed_dir.path().join("translog.committed");
+        std::fs::write(&committed_path, "1").unwrap();
+        let committed_error =
+            crate::engine::sequence::CommittedBoundaryRecord::load(&committed_path).unwrap_err();
+        assert!(
+            committed_error.is::<crate::engine::sequence::LegacyCommittedBoundaryFormatError>()
+        );
+        assert!(!ShardManager::should_report_copy_failure(&committed_error));
+        assert!(!ShardManager::should_quarantine_copy_failure(
+            &committed_error
+        ));
+
+        let manifest_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            manifest_dir.path().join("translog.manifest"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "active_generation_id": 0,
+                "next_generation_id": 1,
+                "generations": [{
+                    "id": 0,
+                    "first_seq_no": null,
+                    "last_seq_no": null,
+                    "size_bytes": 0,
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest_error = match HotTranslog::open(manifest_dir.path()) {
+            Ok(_) => panic!("legacy translog manifest unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(manifest_error.is::<crate::wal::UnsupportedWalFormatError>());
+        assert!(!ShardManager::should_report_copy_failure(&manifest_error));
+        assert!(!ShardManager::should_quarantine_copy_failure(
+            &manifest_error
+        ));
     }
 
     #[test]

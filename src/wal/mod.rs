@@ -540,21 +540,26 @@ fn decode_wire_entry(payload: &[u8]) -> Result<WireEntryV2> {
             }
             Ok(wire)
         }
-        Err(v2_error) if declared_version == Some(TRANSLOG_ENTRY_FORMAT_VERSION) => Err(
-            wal_corruption(format!("decode translog v2 frame: {v2_error}")),
-        ),
         Err(v2_error) => {
-            if bincode_next::serde::decode_from_slice::<LegacyWireEntryV1, _>(
+            let legacy_v1 = bincode_next::serde::decode_from_slice::<LegacyWireEntryV1, _>(
                 payload,
                 BINCODE_CONFIG,
-            )
-            .is_ok()
-            {
+            );
+            if legacy_v1.is_ok_and(|(legacy, consumed)| {
+                consumed == payload.len()
+                    && WalOperation::parse(&legacy.op).is_ok()
+                    && serde_json::from_str::<serde_json::Value>(&legacy.payload_json).is_ok()
+            }) {
                 return Err(unsupported_wal_format(
                     "translog entry",
                     1,
                     TRANSLOG_ENTRY_FORMAT_VERSION,
                 ));
+            }
+            if declared_version == Some(TRANSLOG_ENTRY_FORMAT_VERSION) {
+                return Err(wal_corruption(format!(
+                    "decode translog v2 frame: {v2_error}"
+                )));
             }
             Err(wal_corruption(format!("decode translog frame: {v2_error}")))
         }
@@ -3001,18 +3006,27 @@ mod tests {
 
     #[test]
     fn legacy_v1_entry_fails_with_typed_error() {
-        let wire = LegacyWireEntryV1 {
-            seq_no: 0,
-            op: "index".to_string(),
-            payload_json: serde_json::to_string(&json!({"_doc_id": "doc", "_source": {}})).unwrap(),
-        };
-        let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
-        let mut frame = Vec::with_capacity(encoded.len() + 4);
-        frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&encoded);
+        for seq_no in [0u64, 1, 2, 3, 7, 300, 1 << 33] {
+            let wire = LegacyWireEntryV1 {
+                seq_no,
+                op: "index".to_string(),
+                payload_json: serde_json::to_string(&json!({
+                    "_doc_id": "doc",
+                    "_source": {}
+                }))
+                .unwrap(),
+            };
+            let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
+            let mut frame = Vec::with_capacity(encoded.len() + 4);
+            frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&encoded);
 
-        let error = decode_entries(&mut std::io::Cursor::new(frame)).unwrap_err();
-        assert!(error.is::<UnsupportedWalFormatError>());
+            let error = decode_entries(&mut std::io::Cursor::new(frame)).unwrap_err();
+            assert!(
+                error.is::<UnsupportedWalFormatError>(),
+                "legacy seq_no {seq_no} was misclassified: {error:#}"
+            );
+        }
     }
 
     #[test]

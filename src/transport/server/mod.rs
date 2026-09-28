@@ -667,7 +667,11 @@ impl InternalTransport for TransportService {
                 .await
                 {
                     Ok(replica_checkpoints) => {
-                        Self::advance_global_checkpoint(&engine, seq_no, &replica_checkpoints);
+                        Self::advance_global_checkpoint(
+                            &engine,
+                            engine.local_checkpoint(),
+                            &replica_checkpoints,
+                        );
                         self.shard_manager.isr_tracker.update_replica_checkpoints(
                             &req.index_name,
                             req.shard_id,
@@ -854,7 +858,7 @@ impl InternalTransport for TransportService {
                         start_seq_no: None,
                     }));
                 };
-                let seq_no = last_seq_no.ok_or_else(|| {
+                last_seq_no.ok_or_else(|| {
                     Status::internal("non-empty bulk receipt has no last sequence")
                 })?;
                 self.spawn_primary_available_report_after_write(
@@ -875,7 +879,11 @@ impl InternalTransport for TransportService {
                 .await
                 {
                     Ok(replica_checkpoints) => {
-                        Self::advance_global_checkpoint(&engine, seq_no, &replica_checkpoints);
+                        Self::advance_global_checkpoint(
+                            &engine,
+                            engine.local_checkpoint(),
+                            &replica_checkpoints,
+                        );
                         self.shard_manager.isr_tracker.update_replica_checkpoints(
                             &req.index_name,
                             req.shard_id,
@@ -1034,7 +1042,11 @@ impl InternalTransport for TransportService {
                 .await
                 {
                     Ok(replica_checkpoints) => {
-                        Self::advance_global_checkpoint(&engine, seq_no, &replica_checkpoints);
+                        Self::advance_global_checkpoint(
+                            &engine,
+                            engine.local_checkpoint(),
+                            &replica_checkpoints,
+                        );
                         self.shard_manager.isr_tracker.update_replica_checkpoints(
                             &req.index_name,
                             req.shard_id,

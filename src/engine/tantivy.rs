@@ -157,7 +157,17 @@ impl ApplyState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalDisposition {
     Append,
-    AlreadyInLocalWal,
+    AlreadyInLocalWal { persisted: bool },
+}
+
+impl WalDisposition {
+    fn is_already_in_local_wal(self) -> bool {
+        matches!(self, Self::AlreadyInLocalWal { .. })
+    }
+
+    fn is_persisted(self) -> bool {
+        matches!(self, Self::AlreadyInLocalWal { persisted: true })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +326,7 @@ pub struct HotEngine {
     /// Write-ahead log for crash durability
     translog: Arc<Mutex<dyn WriteAheadLog>>,
     apply_state: Mutex<ApplyState>,
+    identity_term_state: Mutex<Option<(u64, Option<u64>)>>,
     committed_boundary_path: PathBuf,
     durability: TranslogDurability,
     delete_tombstone_retention: Duration,
@@ -1150,6 +1161,7 @@ impl HotEngine {
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(apply_state),
+            identity_term_state: Mutex::new(None),
             committed_boundary_path,
             durability,
             delete_tombstone_retention: Duration::from_secs(60),
@@ -1219,7 +1231,7 @@ impl HotEngine {
         &self,
         writer_state: &mut WriterState,
         context: &str,
-        boundary: CommittedBoundaryRecord,
+        _boundary: CommittedBoundaryRecord,
     ) -> Result<CommittedBoundaryRecord> {
         #[cfg(test)]
         if context == "refresh" {
@@ -1238,7 +1250,19 @@ impl HotEngine {
             writer.commit()
         };
         match commit_result {
-            Ok(_) => Ok(boundary),
+            Ok(_) => {
+                let mut state = self
+                    .apply_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                let processed_checkpoint = state.checkpoints.processed_checkpoint();
+                state
+                    .checkpoints
+                    .mark_persisted_through(processed_checkpoint);
+                let boundary = state.committed_boundary();
+                boundary.validate()?;
+                Ok(boundary)
+            }
             Err(source) => {
                 let failure = TantivyCommitFailureError {
                     context: context.to_string(),
@@ -1291,10 +1315,36 @@ impl HotEngine {
     }
 
     fn reset_apply_state_to_commit(&self, committed: CommittedBoundaryRecord) -> Result<()> {
-        self.apply_state
+        let identity_term_state = *self
+            .identity_term_state
             .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .reset_to_commit(committed)
+            .map_err(|_| anyhow::anyhow!("identity term state lock poisoned"))?;
+        let mut state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        state.reset_to_commit(committed.clone())?;
+        if let Some((identity_fence, identity_fence_max_seq_no)) = identity_term_state {
+            state.term_sequences = initialize_term_sequence_state(
+                identity_fence,
+                identity_fence_max_seq_no,
+                &committed,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn prepare_primary_term_before_wal(&self, primary_term: u64) -> Result<()> {
+        let mut state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        state.term_sequences.ensure_not_stale(primary_term)?;
+        if primary_term > state.term_sequences.current_term() {
+            let max_seq_no = state.checkpoints.max_seq_no();
+            state.term_sequences.raise_term(primary_term, max_seq_no)?;
+        }
+        Ok(())
     }
 
     fn current_version(&self, state: &ApplyState, doc_id: &str) -> Result<Option<CurrentVersion>> {
@@ -1551,7 +1601,7 @@ impl HotEngine {
         })();
         if let Err(error) = planning_result {
             state.restore_planning_snapshot(planning_snapshot);
-            if wal_disposition == WalDisposition::AlreadyInLocalWal {
+            if wal_disposition.is_already_in_local_wal() {
                 if let Some(writer_state) = writer_override.as_deref_mut() {
                     writer_state.fail(format!(
                         "sequenced operation failed after WAL persistence: {error:#}"
@@ -1572,7 +1622,7 @@ impl HotEngine {
             Ok(entries) => entries,
             Err(error) => {
                 state.restore_planning_snapshot(planning_snapshot);
-                if wal_disposition == WalDisposition::AlreadyInLocalWal {
+                if wal_disposition.is_already_in_local_wal() {
                     if let Some(writer_state) = writer_override.as_deref_mut() {
                         writer_state.fail(format!(
                             "sequenced operation failed after WAL persistence: {error:#}"
@@ -1677,7 +1727,7 @@ impl HotEngine {
                         planned_operation.operation.seq_no,
                         self.durability,
                     )?;
-                    if wal_disposition == WalDisposition::AlreadyInLocalWal {
+                    if wal_disposition.is_persisted() {
                         state
                             .checkpoints
                             .mark_persisted(planned_operation.operation.seq_no);
@@ -1687,7 +1737,7 @@ impl HotEngine {
             Ok::<(), anyhow::Error>(())
         })();
         if let Err(error) = execution_result {
-            if appended || wal_disposition == WalDisposition::AlreadyInLocalWal {
+            if appended || wal_disposition.is_already_in_local_wal() {
                 if let Some(writer_state) = writer_state.as_mut() {
                     (*writer_state).fail(format!(
                         "sequenced operation failed after WAL persistence: {error:#}"
@@ -1784,10 +1834,12 @@ impl HotEngine {
         F: FnMut(&super::SequencedOperation) -> Result<()>,
     {
         self.validate_keyword_documents(std::iter::once(&payload))?;
+        self.prepare_primary_term_before_wal(primary_term)?;
         let doc_id_owned = doc_id.to_string();
         let seq_no =
             self.with_version_map_capacity("document indexing", [doc_id], false, |translog| {
                 drop(self.writer_state_with_replay(translog, "document indexing")?);
+                self.prepare_primary_term_before_wal(primary_term)?;
                 let receipt = translog.append(
                     primary_term,
                     crate::wal::WalOperation::Index,
@@ -1804,7 +1856,9 @@ impl HotEngine {
                 self.apply_sequenced_batch_locked(
                     translog,
                     vec![operation],
-                    WalDisposition::AlreadyInLocalWal,
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: matches!(self.durability, TranslogDurability::Request),
+                    },
                     None,
                     true,
                     &mut side_effect,
@@ -1827,6 +1881,7 @@ impl HotEngine {
         F: FnMut(&super::SequencedOperation) -> Result<()>,
     {
         self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
+        self.prepare_primary_term_before_wal(primary_term)?;
         let wal_ops = docs
             .iter()
             .map(|(doc_id, payload)| {
@@ -1846,6 +1901,7 @@ impl HotEngine {
             true,
             |translog| {
                 drop(self.writer_state_with_replay(translog, "bulk indexing")?);
+                self.prepare_primary_term_before_wal(primary_term)?;
                 let Some(start_seq_no) =
                     translog.write_bulk_with_receipt(primary_term, &wal_ops)?
                 else {
@@ -1870,7 +1926,9 @@ impl HotEngine {
                 self.apply_sequenced_batch_locked(
                     translog,
                     operations,
-                    WalDisposition::AlreadyInLocalWal,
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: matches!(self.durability, TranslogDurability::Request),
+                    },
                     None,
                     true,
                     &mut side_effect,
@@ -1893,10 +1951,12 @@ impl HotEngine {
     where
         F: FnMut(&super::SequencedOperation) -> Result<()>,
     {
+        self.prepare_primary_term_before_wal(primary_term)?;
         let doc_id_owned = doc_id.to_string();
         let seq_no =
             self.with_version_map_capacity("document delete", [doc_id], false, |translog| {
                 drop(self.writer_state_with_replay(translog, "document delete")?);
+                self.prepare_primary_term_before_wal(primary_term)?;
                 let receipt = translog.append(
                     primary_term,
                     crate::wal::WalOperation::Delete,
@@ -1911,7 +1971,9 @@ impl HotEngine {
                             doc_id: doc_id_owned.clone(),
                         },
                     }],
-                    WalDisposition::AlreadyInLocalWal,
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: matches!(self.durability, TranslogDurability::Request),
+                    },
                     None,
                     true,
                     &mut side_effect,
@@ -2099,7 +2161,7 @@ impl HotEngine {
             self.apply_sequenced_batch_locked(
                 translog,
                 std::mem::take(batch),
-                WalDisposition::AlreadyInLocalWal,
+                WalDisposition::AlreadyInLocalWal { persisted: true },
                 Some(writer_state),
                 false,
                 |_| Ok(()),
@@ -3765,7 +3827,6 @@ impl HotEngine {
             .unwrap_or_else(|error| error.into_inner());
         state.checkpoints.advance_max_seq_no(seq_no);
         state.checkpoints.mark_processed(seq_no);
-        state.checkpoints.mark_persisted(seq_no);
     }
 
     pub fn wal_max_seq_no(&self) -> Option<u64> {
@@ -3777,32 +3838,27 @@ impl HotEngine {
         identity_fence: u64,
         identity_fence_max_seq_no: Option<u64>,
     ) -> Result<()> {
-        self.with_translog("term-sequence reconciliation", |translog| {
-            let committed = self.load_committed_boundary()?;
-            let mut state = self
-                .apply_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let committed = self.load_committed_boundary()?;
+        let mut state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let current = state.term_sequences.to_record();
+        if current.current_term != identity_fence
+            || current.max_seq_no_at_term_start != identity_fence_max_seq_no
+        {
             state.term_sequences = initialize_term_sequence_state(
                 identity_fence,
                 identity_fence_max_seq_no,
                 &committed,
             )?;
-            if identity_fence > committed.term_sequence_state.current_term {
-                translog.for_each_from(0, &mut |entry| {
-                    if entry.primary_term == identity_fence
-                        && identity_fence_max_seq_no.is_some_and(|maximum| entry.seq_no <= maximum)
-                        && state.checkpoints.has_processed(entry.seq_no)
-                    {
-                        state
-                            .term_sequences
-                            .mark_processed(identity_fence, entry.seq_no)?;
-                    }
-                    Ok(())
-                })?;
-            }
-            Ok(())
-        })
+        }
+        *self
+            .identity_term_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("identity term state lock poisoned"))? =
+            Some((identity_fence, identity_fence_max_seq_no));
+        Ok(())
     }
 
     pub fn last_seq_no(&self) -> u64 {
@@ -3850,8 +3906,8 @@ impl HotEngine {
         self.reader.reload()?;
         self.persist_committed_boundary(&committed_boundary)?;
         self.validate_truncation_boundary(&*tl, &committed_boundary)?;
-        if global_checkpoint > 0 {
-            tl.truncate_below(global_checkpoint)?;
+        if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
+            tl.truncate_below(global_checkpoint.min(processed_checkpoint))?;
         }
         Ok(true)
     }
@@ -3870,8 +3926,8 @@ impl HotEngine {
             self.reader.reload()?;
             self.persist_committed_boundary(&committed_boundary)?;
             self.validate_truncation_boundary(tl, &committed_boundary)?;
-            if global_checkpoint > 0 {
-                tl.truncate_below(global_checkpoint)?;
+            if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
+                tl.truncate_below(global_checkpoint.min(processed_checkpoint))?;
             }
             Ok(())
         })
@@ -7388,7 +7444,9 @@ impl super::SearchEngine for HotEngine {
             self.reader.reload()?;
             self.persist_committed_boundary(&committed_boundary)?;
             self.validate_truncation_boundary(tl, &committed_boundary)?;
-            tl.truncate()?;
+            if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
+                tl.truncate_below(processed_checkpoint)?;
+            }
             Ok(())
         })
     }
@@ -8749,6 +8807,7 @@ mod tests {
             refresh_interval: Duration::from_secs(60),
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(ApplyState::new(committed_boundary).unwrap()),
+            identity_term_state: Mutex::new(None),
             committed_boundary_path,
             durability: TranslogDurability::Request,
             delete_tombstone_retention: Duration::from_secs(60),
