@@ -1,0 +1,1050 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 117 and seed 7237530309378308593 with 8 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 61411] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_D1_SeqNoApply.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Invariants.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/Faults.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/PeerRecovery.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/ShardReplication.tla
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/RaftLog.tla
+Parsing file /tmp/d1-order-f/Naturals.tla
+Parsing file /tmp/d1-order-f/Sequences.tla
+Parsing file /tmp/d1-order-f/FiniteSets.tla
+Parsing file /tmp/d1-order-f/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RaftLog
+Semantic processing of module ShardReplication
+Semantic processing of module PeerRecovery
+Semantic processing of module Faults
+Semantic processing of module Invariants
+Semantic processing of module MC_D1_SeqNoApply
+Starting... (2026-09-28 03:50:42)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-28 03:50:43.
+Error: Invariant D1AcknowledgedCopiesConverge is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ pendingRaft = {}
+/\ storageFaultInjected = FALSE
+/\ raftVoters = {p, r}
+/\ docValue = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ docSeqNext = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ sessionBumpSubmitted = (p :> FALSE @@ r :> FALSE)
+/\ copyAllocation = (p :> 1 @@ r :> 1)
+/\ sessionHead = (p :> 0 @@ r :> 0)
+/\ crashDone = FALSE
+/\ admissionSafe = TRUE
+/\ nextSeq = (p :> 0 @@ r :> 0)
+/\ writeKind = <<"Put", "Put", "Put">>
+/\ writeEpoch = <<0, 0, 0>>
+/\ staleApplySafe = TRUE
+/\ raftLeader = p
+/\ sessionSourceEpoch = (p :> 0 @@ r :> 0)
+/\ applied = (p :> 0 @@ r :> 0)
+/\ installMarker = (p :> FALSE @@ r :> FALSE)
+/\ persistedDocSeqNext = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ pendingTerm = (p :> 0 @@ r :> 0)
+/\ duplicateSent = FALSE
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {}
+/\ durableOps = (p :> {} @@ r :> {})
+/\ replayComplete = (p :> FALSE @@ r :> FALSE)
+/\ truncBelow = (p :> 0 @@ r :> 0)
+/\ routing = [ term |-> 1,
+  primary |-> p,
+  inSync |-> {r},
+  initialized |-> TRUE,
+  allocations |-> (p :> 1 @@ r :> 1),
+  replicas |-> {r},
+  unassigned |-> 0,
+  members |-> {p, r} ]
+/\ faultsStopped = FALSE
+/\ replicaFence = (p :> 1 @@ r :> 1)
+/\ commitDone = FALSE
+/\ persistedTombstoneSeqNext = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ pendingPrimary = (p :> "NO_NODE" @@ r :> "NO_NODE")
+/\ writePrimary = <<"NO_NODE", "NO_NODE", "NO_NODE">>
+/\ writeSeq = <<0, 0, 0>>
+/\ pendingAllocation = (p :> 0 @@ r :> 0)
+/\ pins = (p :> {} @@ r :> {})
+/\ maxSeqNext = (p :> 0 @@ r :> 0)
+/\ tombstoneOld = (p :> {} @@ r :> {})
+/\ epoch = (p :> 0 @@ r :> 0)
+/\ copyUuid = (p :> "INDEX_UUID" @@ r :> "INDEX_UUID")
+/\ exclusiveHolder = (p :> "NO_NODE" @@ r :> "NO_NODE")
+/\ copyExists = (p :> TRUE @@ r :> TRUE)
+/\ tombstonePruneSafe = TRUE
+/\ persistedDocValue = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (p :> FALSE @@ r :> FALSE)
+/\ persistedMaxSeqNext = (p :> 0 @@ r :> 0)
+/\ pruneDone = FALSE
+/\ replayBoundary = (p :> 0 @@ r :> 0)
+/\ writeStatus = <<"Unused", "Unused", "Unused">>
+/\ sessionSource = (p :> "NO_NODE" @@ r :> "NO_NODE")
+/\ sessionBoundary = (p :> 0 @@ r :> 0)
+/\ replayPos = (p :> 1 @@ r :> 1)
+/\ termMonotonic = TRUE
+/\ activated = (p :> 1 @@ r :> 0)
+/\ sessionSettlementRunning = (p :> FALSE @@ r :> FALSE)
+/\ writeRequired = <<{}, {}, {}>>
+/\ processedSeqs = (p :> {} @@ r :> {})
+/\ sessionFetched = (p :> 0 @@ r :> 0)
+/\ raftConnected = (p :> TRUE @@ r :> TRUE)
+/\ activationPending = (p :> 0 @@ r :> 0)
+/\ nextWrite = 1
+/\ sessionAllocation = (p :> 0 @@ r :> 0)
+/\ walOrder = (p :> <<>> @@ r :> <<>>)
+/\ replaySafe = TRUE
+/\ sessionPhase = (p :> "None" @@ r :> "None")
+/\ recoveryAttempts = 0
+/\ writeTarget = <<"NO_NODE", "NO_NODE", "NO_NODE">>
+/\ processedNext = (p :> 0 @@ r :> 0)
+/\ committed = (p :> 0 @@ r :> 0)
+/\ failed = {}
+/\ durableReplicaFence = (p :> 1 @@ r :> 1)
+/\ ops = (p :> {} @@ r :> {})
+/\ sessionSnapshot = (p :> {} @@ r :> {})
+/\ persistedOps = (p :> {} @@ r :> {})
+/\ replaying = (p :> FALSE @@ r :> FALSE)
+/\ writeTerm = <<0, 0, 0>>
+/\ sessionTerm = (p :> 0 @@ r :> 0)
+/\ activePrimaryApplySafe = TRUE
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (p :> FALSE @@ r :> FALSE)
+/\ tombstoneSeqNext = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ sessionCursor = (p :> 0 @@ r :> 0)
+/\ writeDoc = <<x, x, x>>
+/\ sharedHolders = (p :> {} @@ r :> {})
+/\ raftLog = <<>>
+/\ copyMode = (p :> "Active" @@ r :> "Active")
+/\ messages = {}
+/\ ackMembershipSafe = TRUE
+/\ views = ( p :>
+      [ term |-> 1,
+        primary |-> p,
+        inSync |-> {r},
+        initialized |-> TRUE,
+        allocations |-> (p :> 1 @@ r :> 1),
+        replicas |-> {r},
+        unassigned |-> 0,
+        members |-> {p, r} ] @@
+  r :>
+      [ term |-> 1,
+        primary |-> p,
+        inSync |-> {r},
+        initialized |-> TRUE,
+        allocations |-> (p :> 1 @@ r :> 1),
+        replicas |-> {r},
+        unassigned |-> 0,
+        members |-> {p, r} ] )
+/\ persistedProcessedNext = (p :> 0 @@ r :> 0)
+/\ alive = (p :> TRUE @@ r :> TRUE)
+/\ diskLost = (p :> FALSE @@ r :> FALSE)
+/\ lifecyclePhase = (p :> "Idle" @@ r :> "Idle")
+/\ writeWait = <<{}, {}, {}>>
+
+State 2: <D1ClientWrite line 134, col 5 to line 137, col 66 of module MC_D1_SeqNoApply>
+/\ writeStatus = <<"Routed", "Unused", "Unused">>
+/\ nextWrite = 2
+/\ writeTarget = <<p, "NO_NODE", "NO_NODE">>
+
+State 3: <D1ClientWrite line 134, col 5 to line 137, col 66 of module MC_D1_SeqNoApply>
+/\ writeStatus = <<"Routed", "Routed", "Unused">>
+/\ nextWrite = 3
+/\ writeTarget = <<p, p, "NO_NODE">>
+
+State 4: <D1ClientWrite line 134, col 5 to line 137, col 66 of module MC_D1_SeqNoApply>
+/\ writeStatus = <<"Routed", "Routed", "Routed">>
+/\ nextWrite = 4
+/\ writeTarget = <<p, p, p>>
+
+State 5: <D1PrimaryAccept line 144, col 5 to line 171, col 41 of module MC_D1_SeqNoApply>
+/\ docValue = (p :> (x :> 1 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ docSeqNext = (p :> (x :> 1 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ nextSeq = (p :> 1 @@ r :> 0)
+/\ durableOps = (p :> {1} @@ r :> {})
+/\ writePrimary = <<p, "NO_NODE", "NO_NODE">>
+/\ maxSeqNext = (p :> 1 @@ r :> 0)
+/\ writeStatus = <<"Replicating", "Routed", "Routed">>
+/\ writeRequired = <<{r}, {}, {}>>
+/\ processedSeqs = (p :> {0} @@ r :> {})
+/\ walOrder = (p :> <<1>> @@ r :> <<>>)
+/\ processedNext = (p :> 1 @@ r :> 0)
+/\ ops = (p :> {1} @@ r :> {})
+/\ writeTerm = <<1, 0, 0>>
+/\ sharedHolders = (p :> {1} @@ r :> {})
+/\ messages = { [ seq |-> 0,
+    write |-> 1,
+    to |-> r,
+    from |-> p,
+    fromEpoch |-> 0,
+    term |-> 1,
+    indexUuid |-> "INDEX_UUID",
+    targetAllocation |-> 1,
+    kind |-> "Replicate",
+    toEpoch |-> 0 ] }
+/\ writeWait = <<{r}, {}, {}>>
+
+State 6: <D1PrimaryAccept line 144, col 5 to line 171, col 41 of module MC_D1_SeqNoApply>
+/\ docValue = (p :> (x :> 2 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ docSeqNext = (p :> (x :> 2 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ nextSeq = (p :> 2 @@ r :> 0)
+/\ durableOps = (p :> {1, 2} @@ r :> {})
+/\ writePrimary = <<p, p, "NO_NODE">>
+/\ writeSeq = <<0, 1, 0>>
+/\ maxSeqNext = (p :> 2 @@ r :> 0)
+/\ writeStatus = <<"Replicating", "Replicating", "Routed">>
+/\ writeRequired = <<{r}, {r}, {}>>
+/\ processedSeqs = (p :> {0, 1} @@ r :> {})
+/\ walOrder = (p :> <<1, 2>> @@ r :> <<>>)
+/\ processedNext = (p :> 2 @@ r :> 0)
+/\ ops = (p :> {1, 2} @@ r :> {})
+/\ writeTerm = <<1, 1, 0>>
+/\ sharedHolders = (p :> {1, 2} @@ r :> {})
+/\ messages = { [ seq |-> 0,
+    write |-> 1,
+    to |-> r,
+    from |-> p,
+    fromEpoch |-> 0,
+    term |-> 1,
+    indexUuid |-> "INDEX_UUID",
+    targetAllocation |-> 1,
+    kind |-> "Replicate",
+    toEpoch |-> 0 ],
+  [ seq |-> 1,
+    write |-> 2,
+    to |-> r,
+    from |-> p,
+    fromEpoch |-> 0,
+    term |-> 1,
+    indexUuid |-> "INDEX_UUID",
+    targetAllocation |-> 1,
+    kind |-> "Replicate",
+    toEpoch |-> 0 ] }
+/\ writeWait = <<{r}, {r}, {}>>
+
+State 7: <D1OrderNext line 772, col 8 to line 775, col 47 of module MC_D1_SeqNoApply>
+/\ docValue = (p :> (x :> 2 @@ y :> 0) @@ r :> (x :> 1 @@ y :> 0))
+/\ docSeqNext = (p :> (x :> 2 @@ y :> 0) @@ r :> (x :> 1 @@ y :> 0))
+/\ nextSeq = (p :> 2 @@ r :> 1)
+/\ durableOps = (p :> {1, 2} @@ r :> {1})
+/\ maxSeqNext = (p :> 2 @@ r :> 1)
+/\ processedSeqs = (p :> {0, 1} @@ r :> {0})
+/\ walOrder = (p :> <<1, 2>> @@ r :> <<1>>)
+/\ processedNext = (p :> 2 @@ r :> 1)
+/\ ops = (p :> {1, 2} @@ r :> {1})
+/\ messages = { [ seq |-> 0,
+    write |-> 1,
+    to |-> p,
+    from |-> r,
+    fromEpoch |-> 0,
+    term |-> 1,
+    indexUuid |-> "INDEX_UUID",
+    targetAllocation |-> 1,
+    kind |-> "ReplicaAck",
+    toEpoch |-> 0 ],
+  [ seq |-> 1,
+    write |-> 2,
+    to |-> r,
+    from |-> p,
+    fromEpoch |-> 0,
+    term |-> 1,
+    indexUuid |-> "INDEX_UUID",
+    targetAllocation |-> 1,
+    kind |-> "Replicate",
+    toEpoch |-> 0 ] }
+
+State 8: <D1OrderNext line 776, col 8 to line 776, col 54 of module MC_D1_SeqNoApply>
+/\ messages = { [ seq |-> 1,
+    write |-> 2,
+    to |-> r,
+    from |-> p,
+    fromEpoch |-> 0,
+    term |-> 1,
+    indexUuid |-> "INDEX_UUID",
+    targetAllocation |-> 1,
+    kind |-> "Replicate",
+    toEpoch |-> 0 ] }
+/\ writeWait = <<{}, {r}, {}>>
+
+State 9: <D1PrimaryAck line 374, col 5 to line 377, col 66 of module MC_D1_SeqNoApply>
+/\ pendingRaft = {}
+/\ storageFaultInjected = FALSE
+/\ raftVoters = {p, r}
+/\ docValue = (p :> (x :> 2 @@ y :> 0) @@ r :> (x :> 1 @@ y :> 0))
+/\ docSeqNext = (p :> (x :> 2 @@ y :> 0) @@ r :> (x :> 1 @@ y :> 0))
+/\ sessionBumpSubmitted = (p :> FALSE @@ r :> FALSE)
+/\ copyAllocation = (p :> 1 @@ r :> 1)
+/\ sessionHead = (p :> 0 @@ r :> 0)
+/\ crashDone = FALSE
+/\ admissionSafe = TRUE
+/\ nextSeq = (p :> 2 @@ r :> 1)
+/\ writeKind = <<"Put", "Put", "Put">>
+/\ writeEpoch = <<0, 0, 0>>
+/\ staleApplySafe = TRUE
+/\ raftLeader = p
+/\ sessionSourceEpoch = (p :> 0 @@ r :> 0)
+/\ applied = (p :> 0 @@ r :> 0)
+/\ installMarker = (p :> FALSE @@ r :> FALSE)
+/\ persistedDocSeqNext = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ pendingTerm = (p :> 0 @@ r :> 0)
+/\ duplicateSent = FALSE
+/\ authoritativeWipeSafe = TRUE
+/\ acked = {1}
+/\ durableOps = (p :> {1, 2} @@ r :> {1})
+/\ replayComplete = (p :> FALSE @@ r :> FALSE)
+/\ truncBelow = (p :> 0 @@ r :> 0)
+/\ routing = [ term |-> 1,
+  primary |-> p,
+  inSync |-> {r},
+  initialized |-> TRUE,
+  allocations |-> (p :> 1 @@ r :> 1),
+  replicas |-> {r},
+  unassigned |-> 0,
+  members |-> {p, r} ]
+/\ faultsStopped = FALSE
+/\ replicaFence = (p :> 1 @@ r :> 1)
+/\ commitDone = FALSE
+/\ persistedTombstoneSeqNext = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ pendingPrimary = (p :> "NO_NODE" @@ r :> "NO_NODE")
+/\ writePrimary = <<p, p, "NO_NODE">>
+/\ writeSeq = <<0, 1, 0>>
+/\ pendingAllocation = (p :> 0 @@ r :> 0)
+/\ pins = (p :> {} @@ r :> {})
+/\ maxSeqNext = (p :> 2 @@ r :> 1)
+/\ tombstoneOld = (p :> {} @@ r :> {})
+/\ epoch = (p :> 0 @@ r :> 0)
+/\ copyUuid = (p :> "INDEX_UUID" @@ r :> "INDEX_UUID")
+/\ exclusiveHolder = (p :> "NO_NODE" @@ r :> "NO_NODE")
+/\ copyExists = (p :> TRUE @@ r :> TRUE)
+/\ tombstonePruneSafe = TRUE
+/\ persistedDocValue = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ crashCount = 0
+/\ partitionCount = 0
+/\ sessionMarkSubmitted = (p :> FALSE @@ r :> FALSE)
+/\ persistedMaxSeqNext = (p :> 0 @@ r :> 0)
+/\ pruneDone = FALSE
+/\ replayBoundary = (p :> 0 @@ r :> 0)
+/\ writeStatus = <<"Acked", "Replicating", "Routed">>
+/\ sessionSource = (p :> "NO_NODE" @@ r :> "NO_NODE")
+/\ sessionBoundary = (p :> 0 @@ r :> 0)
+/\ replayPos = (p :> 1 @@ r :> 1)
+/\ termMonotonic = TRUE
+/\ activated = (p :> 1 @@ r :> 0)
+/\ sessionSettlementRunning = (p :> FALSE @@ r :> FALSE)
+/\ writeRequired = <<{r}, {r}, {}>>
+/\ processedSeqs = (p :> {0, 1} @@ r :> {0})
+/\ sessionFetched = (p :> 0 @@ r :> 0)
+/\ raftConnected = (p :> TRUE @@ r :> TRUE)
+/\ activationPending = (p :> 0 @@ r :> 0)
+/\ nextWrite = 4
+/\ sessionAllocation = (p :> 0 @@ r :> 0)
+/\ walOrder = (p :> <<1, 2>> @@ r :> <<1>>)
+/\ replaySafe = TRUE
+/\ sessionPhase = (p :> "None" @@ r :> "None")
+/\ recoveryAttempts = 0
+/\ writeTarget = <<p, p, p>>
+/\ processedNext = (p :> 2 @@ r :> 1)
+/\ committed = (p :> 0 @@ r :> 0)
+/\ failed = {}
+/\ durableReplicaFence = (p :> 1 @@ r :> 1)
+/\ ops = (p :> {1, 2} @@ r :> {1})
+/\ sessionSnapshot = (p :> {} @@ r :> {})
+/\ persistedOps = (p :> {} @@ r :> {})
+/\ replaying = (p :> FALSE @@ r :> FALSE)
+/\ writeTerm = <<1, 1, 0>>
+/\ sessionTerm = (p :> 0 @@ r :> 0)
+/\ activePrimaryApplySafe = TRUE
+/\ promotionSafe = TRUE
+/\ sessionFinalizePreparing = (p :> FALSE @@ r :> FALSE)
+/\ tombstoneSeqNext = (p :> (x :> 0 @@ y :> 0) @@ r :> (x :> 0 @@ y :> 0))
+/\ sessionCursor = (p :> 0 @@ r :> 0)
+/\ writeDoc = <<x, x, x>>
+/\ sharedHolders = (p :> {2} @@ r :> {})
+/\ raftLog = <<>>
+/\ copyMode = (p :> "Active" @@ r :> "Active")
+/\ messages = { [ seq |-> 1,
+    write |-> 2,
+    to |-> r,
+    from |-> p,
+    fromEpoch |-> 0,
+    term |-> 1,
+    indexUuid |-> "INDEX_UUID",
+    targetAllocation |-> 1,
+    kind |-> "Replicate",
+    toEpoch |-> 0 ] }
+/\ ackMembershipSafe = TRUE
+/\ views = ( p :>
+      [ term |-> 1,
+        primary |-> p,
+        inSync |-> {r},
+        initialized |-> TRUE,
+        allocations |-> (p :> 1 @@ r :> 1),
+        replicas |-> {r},
+        unassigned |-> 0,
+        members |-> {p, r} ] @@
+  r :>
+      [ term |-> 1,
+        primary |-> p,
+        inSync |-> {r},
+        initialized |-> TRUE,
+        allocations |-> (p :> 1 @@ r :> 1),
+        replicas |-> {r},
+        unassigned |-> 0,
+        members |-> {p, r} ] )
+/\ persistedProcessedNext = (p :> 0 @@ r :> 0)
+/\ alive = (p :> TRUE @@ r :> TRUE)
+/\ diskLost = (p :> FALSE @@ r :> FALSE)
+/\ lifecyclePhase = (p :> "Idle" @@ r :> "Idle")
+/\ writeWait = <<{}, {r}, {}>>
+
+The coverage statistics at 2026-09-28 03:50:44
+<D1Init line 68, col 1 to line 68, col 6 of module MC_D1_SeqNoApply>: 2:2
+  line 247, col 14 to line 252, col 39 of module ShardReplication: 16
+  line 253, col 14 to line 253, col 37 of module ShardReplication: 8
+  line 254, col 14 to line 254, col 52 of module ShardReplication: 8
+  line 255, col 14 to line 255, col 43 of module ShardReplication: 8
+  line 256, col 14 to line 256, col 40 of module ShardReplication: 8
+  line 257, col 14 to line 257, col 51 of module ShardReplication: 8
+  line 258, col 14 to line 262, col 32 of module ShardReplication: 8
+  line 263, col 14 to line 263, col 57 of module ShardReplication: 8
+  line 265, col 14 to line 265, col 56 of module ShardReplication: 8
+  line 266, col 14 to line 266, col 55 of module ShardReplication: 8
+  line 267, col 14 to line 267, col 51 of module ShardReplication: 8
+  line 268, col 14 to line 268, col 54 of module ShardReplication: 8
+  line 269, col 14 to line 269, col 55 of module ShardReplication: 8
+  line 270, col 14 to line 270, col 48 of module ShardReplication: 8
+  line 271, col 14 to line 271, col 46 of module ShardReplication: 8
+  line 272, col 14 to line 272, col 52 of module ShardReplication: 8
+  line 273, col 14 to line 273, col 52 of module ShardReplication: 8
+  line 274, col 14 to line 274, col 48 of module ShardReplication: 8
+  line 275, col 14 to line 275, col 39 of module ShardReplication: 8
+  line 276, col 14 to line 276, col 46 of module ShardReplication: 8
+  line 277, col 14 to line 277, col 66 of module ShardReplication: 8
+  line 278, col 14 to line 278, col 42 of module ShardReplication: 8
+  line 279, col 14 to line 279, col 44 of module ShardReplication: 8
+  line 280, col 14 to line 280, col 45 of module ShardReplication: 8
+  line 281, col 14 to line 281, col 40 of module ShardReplication: 8
+  line 282, col 14 to line 282, col 62 of module ShardReplication: 8
+  line 283, col 14 to line 287, col 27 of module ShardReplication: 8
+  line 288, col 14 to line 290, col 74 of module ShardReplication: 8
+  line 291, col 14 to line 293, col 74 of module ShardReplication: 8
+  line 294, col 14 to line 300, col 27 of module ShardReplication: 8
+  line 301, col 14 to line 301, col 50 of module ShardReplication: 8
+  line 302, col 14 to line 302, col 52 of module ShardReplication: 8
+  line 303, col 14 to line 303, col 26 of module ShardReplication: 8
+  line 304, col 14 to line 304, col 49 of module ShardReplication: 8
+  line 305, col 14 to line 305, col 55 of module ShardReplication: 8
+  line 306, col 14 to line 306, col 23 of module ShardReplication: 8
+  line 307, col 14 to line 307, col 24 of module ShardReplication: 8
+  line 308, col 14 to line 308, col 33 of module ShardReplication: 8
+  line 309, col 14 to line 309, col 33 of module ShardReplication: 8
+  line 310, col 14 to line 310, col 37 of module ShardReplication: 8
+  line 311, col 14 to line 311, col 34 of module ShardReplication: 8
+  line 312, col 14 to line 312, col 42 of module ShardReplication: 8
+  line 313, col 14 to line 313, col 33 of module ShardReplication: 8
+  line 239, col 30 to line 239, col 34 of module ShardReplication: 8
+  line 238, col 28 to line 238, col 60 of module ShardReplication: 4:21795
+  line 237, col 27 to line 237, col 31 of module ShardReplication: 2
+  line 8, col 8 to line 8, col 23 of module Invariants: 8
+  line 9, col 8 to line 9, col 16 of module Invariants: 8
+  line 70, col 8 to line 70, col 32 of module MC_D1_SeqNoApply: 8
+  line 71, col 8 to line 71, col 20 of module MC_D1_SeqNoApply: 8
+  line 72, col 8 to line 72, col 20 of module MC_D1_SeqNoApply: 8
+  line 73, col 8 to line 73, col 18 of module MC_D1_SeqNoApply: 8
+  line 74, col 8 to line 74, col 36 of module MC_D1_SeqNoApply: 8
+  line 75, col 8 to line 75, col 31 of module MC_D1_SeqNoApply: 4
+  line 76, col 8 to line 76, col 37 of module MC_D1_SeqNoApply: 2
+  line 77, col 8 to line 77, col 41 of module MC_D1_SeqNoApply: 2
+  line 78, col 8 to line 78, col 20 of module MC_D1_SeqNoApply: 2
+  line 79, col 8 to line 79, col 43 of module MC_D1_SeqNoApply: 2
+  line 80, col 8 to line 80, col 46 of module MC_D1_SeqNoApply: 2
+  line 81, col 8 to line 81, col 45 of module MC_D1_SeqNoApply: 2
+  line 82, col 8 to line 82, col 42 of module MC_D1_SeqNoApply: 2
+  line 83, col 8 to line 83, col 54 of module MC_D1_SeqNoApply: 2
+  line 84, col 8 to line 84, col 51 of module MC_D1_SeqNoApply: 2
+  line 85, col 8 to line 85, col 61 of module MC_D1_SeqNoApply: 2
+  line 86, col 8 to line 86, col 67 of module MC_D1_SeqNoApply: 2
+  line 87, col 8 to line 87, col 45 of module MC_D1_SeqNoApply: 2
+  line 88, col 8 to line 88, col 45 of module MC_D1_SeqNoApply: 2
+  line 89, col 8 to line 90, col 57 of module MC_D1_SeqNoApply: 2
+  line 91, col 8 to line 92, col 51 of module MC_D1_SeqNoApply: 2
+  line 93, col 8 to line 94, col 51 of module MC_D1_SeqNoApply: 2
+  line 95, col 8 to line 95, col 45 of module MC_D1_SeqNoApply: 2
+  line 96, col 8 to line 96, col 41 of module MC_D1_SeqNoApply: 2
+  line 97, col 8 to line 97, col 46 of module MC_D1_SeqNoApply: 2
+  line 98, col 8 to line 98, col 50 of module MC_D1_SeqNoApply: 2
+  line 99, col 8 to line 99, col 24 of module MC_D1_SeqNoApply: 2
+  line 100, col 8 to line 100, col 25 of module MC_D1_SeqNoApply: 2
+  line 101, col 8 to line 101, col 24 of module MC_D1_SeqNoApply: 2
+  line 102, col 8 to line 102, col 28 of module MC_D1_SeqNoApply: 2
+  line 103, col 8 to line 103, col 32 of module MC_D1_SeqNoApply: 2
+  line 104, col 8 to line 104, col 24 of module MC_D1_SeqNoApply: 2
+<D1ClientWrite line 133, col 1 to line 133, col 24 of module MC_D1_SeqNoApply>: 93:451
+  line 321, col 8 to line 321, col 27 of module ShardReplication: 2490
+  |line 321, col 8 to line 321, col 14 of module ShardReplication: 2039
+  |line 321, col 20 to line 321, col 27 of module ShardReplication: 2039
+  line 322, col 8 to line 322, col 28 of module ShardReplication: 902
+  |line 322, col 8 to line 322, col 18 of module ShardReplication: 451
+  |line 322, col 24 to line 322, col 28 of module ShardReplication: 451
+  line 323, col 8 to line 323, col 25 of module ShardReplication: 451
+  line 324, col 8 to line 324, col 19 of module ShardReplication: 902
+  |line 324, col 8 to line 324, col 10 of module ShardReplication: 451
+  |line 324, col 16 to line 324, col 19 of module ShardReplication: 451
+  line 325, col 8 to line 325, col 26 of module ShardReplication: 902
+  |line 325, col 8 to line 325, col 11 of module ShardReplication: 451
+  |line 325, col 17 to line 325, col 26 of module ShardReplication: 451
+  line 329, col 8 to line 329, col 60 of module ShardReplication: 451
+  |line 329, col 8 to line 329, col 32 of module ShardReplication: 451
+  ||line 329, col 20 to line 329, col 31 of module ShardReplication: 451
+  |||line 176, col 5 to line 177, col 53 of module ShardReplication: 451
+  ||||line 177, col 9 to line 177, col 52 of module ShardReplication: 1353
+  ||||line 176, col 12 to line 176, col 19 of module ShardReplication: 451
+  |line 329, col 36 to line 329, col 60 of module ShardReplication: 451
+  line 330, col 8 to line 330, col 64 of module ShardReplication: 451
+  line 331, col 8 to line 331, col 53 of module ShardReplication: 451
+  line 332, col 8 to line 332, col 56 of module ShardReplication: 451
+  line 333, col 8 to line 333, col 62 of module ShardReplication: 451
+  line 334, col 8 to line 334, col 33 of module ShardReplication: 451
+  line 335, col 8 to line 341, col 76 of module ShardReplication: 451
+  line 134, col 20 to line 134, col 30 of module MC_D1_SeqNoApply: 451
+  line 134, col 33 to line 134, col 35 of module MC_D1_SeqNoApply: 451
+  line 134, col 38 to line 134, col 41 of module MC_D1_SeqNoApply: 451
+  line 135, col 8 to line 137, col 66 of module MC_D1_SeqNoApply: 451
+<D1PrimaryAccept line 139, col 1 to line 139, col 24 of module MC_D1_SeqNoApply (144 5 171 41)>: 547:742
+  line 346, col 8 to line 346, col 38 of module ShardReplication: 2266
+  |line 346, col 8 to line 346, col 27 of module ShardReplication: 1524
+  line 347, col 8 to line 347, col 28 of module ShardReplication: 1484
+  |line 347, col 8 to line 347, col 18 of module ShardReplication: 742
+  |line 347, col 24 to line 347, col 28 of module ShardReplication: 742
+  line 348, col 8 to line 348, col 25 of module ShardReplication: 742
+  line 349, col 8 to line 349, col 30 of module ShardReplication: 742
+  line 350, col 8 to line 350, col 40 of module ShardReplication: 1484
+  |line 350, col 8 to line 350, col 28 of module ShardReplication: 742
+  |line 350, col 32 to line 350, col 40 of module ShardReplication: 742
+  line 193, col 8 to line 193, col 21 of module ShardReplication: 742
+  line 194, col 11 to line 194, col 34 of module ShardReplication: 742
+  line 195, col 11 to line 195, col 62 of module ShardReplication: 1484
+  |line 195, col 11 to line 195, col 30 of module ShardReplication: 742
+  |line 195, col 34 to line 195, col 62 of module ShardReplication: 742
+  line 351, col 28 to line 351, col 38 of module ShardReplication: 742
+  line 352, col 8 to line 352, col 37 of module ShardReplication: 1484
+  |line 352, col 8 to line 352, col 25 of module ShardReplication: 742
+  line 353, col 8 to line 353, col 54 of module ShardReplication: 742
+  line 354, col 8 to line 356, col 19 of module ShardReplication: 742
+  line 357, col 8 to line 357, col 47 of module ShardReplication: 1484
+  |line 357, col 8 to line 357, col 33 of module ShardReplication: 742
+  |line 357, col 37 to line 357, col 47 of module ShardReplication: 742
+  line 358, col 8 to line 358, col 55 of module ShardReplication: 1484
+  |line 358, col 8 to line 358, col 29 of module ShardReplication: 742
+  |line 358, col 33 to line 358, col 55 of module ShardReplication: 742
+  line 359, col 8 to line 359, col 44 of module ShardReplication: 1484
+  |line 359, col 8 to line 359, col 35 of module ShardReplication: 742
+  |line 359, col 39 to line 359, col 44 of module ShardReplication: 742
+  line 360, col 8 to line 360, col 39 of module ShardReplication: 742
+  line 366, col 8 to line 366, col 39 of module ShardReplication: 1484
+  |line 366, col 9 to line 366, col 39 of module ShardReplication: 742
+  line 383, col 8 to line 383, col 69 of module ShardReplication: 742
+  line 384, col 8 to line 384, col 69 of module ShardReplication: 742
+  line 385, col 8 to line 385, col 72 of module ShardReplication: 742
+  line 386, col 8 to line 386, col 64 of module ShardReplication: 742
+  line 387, col 8 to line 388, col 65 of module ShardReplication: 742
+  line 389, col 8 to line 390, col 62 of module ShardReplication: 742
+  line 391, col 8 to line 391, col 68 of module ShardReplication: 742
+  line 392, col 8 to line 392, col 60 of module ShardReplication: 742
+  line 393, col 8 to line 396, col 68 of module ShardReplication: 742
+  line 397, col 8 to line 398, col 71 of module ShardReplication: 742
+  line 399, col 8 to line 399, col 57 of module ShardReplication: 742
+  line 400, col 8 to line 400, col 41 of module ShardReplication: 742
+  line 401, col 8 to line 402, col 66 of module ShardReplication: 742
+  line 403, col 8 to line 408, col 46 of module ShardReplication: 742
+  line 144, col 22 to line 144, col 28 of module MC_D1_SeqNoApply: 1524
+  line 145, col 8 to line 146, col 63 of module MC_D1_SeqNoApply: 742
+  line 147, col 8 to line 148, col 63 of module MC_D1_SeqNoApply: 742
+  line 149, col 8 to line 151, col 61 of module MC_D1_SeqNoApply: 742
+  |line 150, col 11 to line 151, col 61 of module MC_D1_SeqNoApply: 742
+  ||line 150, col 12 to line 150, col 24 of module MC_D1_SeqNoApply: 742
+  ||line 151, col 15 to line 151, col 60 of module MC_D1_SeqNoApply: 742
+  ||line 151, col 32 to line 151, col 60 of module MC_D1_SeqNoApply: 742
+  |||line 53, col 5 to line 55, col 62 of module MC_D1_SeqNoApply: 742
+  ||||line 54, col 9 to line 55, col 62 of module MC_D1_SeqNoApply: 2142
+  |||||line 54, col 12 to line 54, col 64 of module MC_D1_SeqNoApply: 2142
+  ||||||line 54, col 12 to line 54, col 44 of module MC_D1_SeqNoApply: 2142:4345
+  |||||||line 54, col 30 to line 54, col 43 of module MC_D1_SeqNoApply: 6426
+  |||||||line 54, col 21 to line 54, col 26 of module MC_D1_SeqNoApply: 2142
+  ||||||line 54, col 56 to line 54, col 64 of module MC_D1_SeqNoApply: 2142
+  |||||line 55, col 13 to line 55, col 61 of module MC_D1_SeqNoApply: 2142
+  ||||||line 55, col 13 to line 55, col 32 of module MC_D1_SeqNoApply: 2142
+  ||||||line 55, col 37 to line 55, col 61 of module MC_D1_SeqNoApply: 1997
+  ||||line 53, col 25 to line 53, col 36 of module MC_D1_SeqNoApply: 742
+  |||line 151, col 47 to line 151, col 59 of module MC_D1_SeqNoApply: 742
+  line 152, col 8 to line 153, col 65 of module MC_D1_SeqNoApply: 742
+  line 154, col 8 to line 155, col 70 of module MC_D1_SeqNoApply: 742
+  line 156, col 8 to line 161, col 25 of module MC_D1_SeqNoApply: 742
+  |line 157, col 11 to line 161, col 25 of module MC_D1_SeqNoApply: 742
+  ||line 157, col 12 to line 157, col 27 of module MC_D1_SeqNoApply: 742
+  ||line 158, col 15 to line 161, col 24 of module MC_D1_SeqNoApply: 742
+  ||line 159, col 19 to line 161, col 24 of module MC_D1_SeqNoApply: 742
+  |||line 159, col 22 to line 159, col 50 of module MC_D1_SeqNoApply: 742
+  |||line 160, col 24 to line 160, col 41 of module MC_D1_SeqNoApply: 233
+  line 162, col 8 to line 163, col 58 of module MC_D1_SeqNoApply: 742
+  line 164, col 8 to line 171, col 41 of module MC_D1_SeqNoApply: 742
+<D1PrimaryAck line 373, col 1 to line 373, col 21 of module MC_D1_SeqNoApply>: 20:21
+  line 627, col 8 to line 627, col 27 of module ShardReplication: 1528
+  |line 627, col 8 to line 627, col 14 of module ShardReplication: 1509
+  |line 627, col 20 to line 627, col 27 of module ShardReplication: 1509
+  line 628, col 8 to line 628, col 43 of module ShardReplication: 1528
+  |line 628, col 8 to line 628, col 27 of module ShardReplication: 1509
+  line 629, col 8 to line 629, col 30 of module ShardReplication: 662
+  |line 629, col 8 to line 629, col 25 of module ShardReplication: 643
+  |line 629, col 29 to line 629, col 30 of module ShardReplication: 643
+  line 630, col 8 to line 630, col 25 of module ShardReplication: 19
+  |line 630, col 8 to line 630, col 12 of module ShardReplication: 21
+  |line 630, col 14 to line 630, col 24 of module ShardReplication: 21
+  line 631, col 8 to line 631, col 47 of module ShardReplication: 40
+  |line 631, col 8 to line 631, col 25 of module ShardReplication: 21
+  |line 631, col 29 to line 631, col 47 of module ShardReplication: 21
+  line 632, col 8 to line 632, col 63 of module ShardReplication: 19
+  |line 632, col 23 to line 632, col 63 of module ShardReplication: 21
+  line 633, col 8 to line 633, col 36 of module ShardReplication: 19
+  |line 633, col 17 to line 633, col 36 of module ShardReplication: 21
+  line 634, col 8 to line 635, col 63 of module ShardReplication: 19
+  |line 635, col 11 to line 635, col 63 of module ShardReplication: 21
+  line 636, col 8 to line 637, col 27 of module ShardReplication: 19
+  |line 637, col 11 to line 637, col 27 of module ShardReplication: 21
+  line 638, col 14 to line 638, col 60 of module ShardReplication: 40
+  |line 638, col 14 to line 638, col 27 of module ShardReplication: 21
+  |line 638, col 39 to line 638, col 60 of module ShardReplication: 21
+  line 639, col 46 to line 639, col 69 of module ShardReplication: 40
+  |line 639, col 46 to line 639, col 52 of module ShardReplication: 21
+  |line 639, col 58 to line 639, col 69 of module ShardReplication: 21
+  line 639, col 29 to line 639, col 42 of module ShardReplication: 21
+  line 640, col 8 to line 647, col 27 of module ShardReplication: 19
+  line 374, col 19 to line 374, col 25 of module MC_D1_SeqNoApply: 1509
+  line 375, col 8 to line 377, col 66 of module MC_D1_SeqNoApply: 19
+<D1Redeliver line 379, col 1 to line 379, col 20 of module MC_D1_SeqNoApply (386 5 408 23)>: 143:147
+  line 386, col 8 to line 386, col 21 of module MC_D1_SeqNoApply: 1653
+  |line 386, col 9 to line 386, col 21 of module MC_D1_SeqNoApply: 1506
+  line 387, col 8 to line 387, col 27 of module MC_D1_SeqNoApply: 1596
+  |line 387, col 8 to line 387, col 14 of module MC_D1_SeqNoApply: 1449
+  |line 387, col 20 to line 387, col 27 of module MC_D1_SeqNoApply: 1449
+  line 388, col 8 to line 388, col 43 of module MC_D1_SeqNoApply: 1596
+  |line 388, col 8 to line 388, col 27 of module MC_D1_SeqNoApply: 1449
+  line 389, col 8 to line 389, col 55 of module MC_D1_SeqNoApply: 764
+  |line 389, col 8 to line 389, col 24 of module MC_D1_SeqNoApply: 617
+  |line 389, col 30 to line 389, col 55 of module MC_D1_SeqNoApply: 617
+  line 390, col 8 to line 390, col 30 of module MC_D1_SeqNoApply: 294
+  |line 390, col 8 to line 390, col 14 of module MC_D1_SeqNoApply: 147
+  |line 390, col 23 to line 390, col 30 of module MC_D1_SeqNoApply: 147
+  line 391, col 8 to line 391, col 42 of module MC_D1_SeqNoApply: 147
+  line 392, col 8 to line 392, col 28 of module MC_D1_SeqNoApply: 147
+  line 393, col 8 to line 408, col 23 of module MC_D1_SeqNoApply: 147
+<D1OrderNext line 769, col 1 to line 769, col 11 of module MC_D1_SeqNoApply (772 8 775 47)>: 471:499
+  line 199, col 8 to line 199, col 57 of module MC_D1_SeqNoApply: 0
+  line 200, col 8 to line 200, col 56 of module MC_D1_SeqNoApply: 0
+  line 201, col 8 to line 201, col 70 of module MC_D1_SeqNoApply: 0
+  line 202, col 8 to line 202, col 62 of module MC_D1_SeqNoApply: 0
+  line 203, col 8 to line 206, col 75 of module MC_D1_SeqNoApply: 0
+  line 207, col 8 to line 212, col 25 of module MC_D1_SeqNoApply: 0
+  line 213, col 8 to line 219, col 25 of module MC_D1_SeqNoApply: 0
+  line 220, col 8 to line 220, col 68 of module MC_D1_SeqNoApply: 0
+  line 221, col 8 to line 222, col 59 of module MC_D1_SeqNoApply: 0
+  line 223, col 8 to line 225, col 57 of module MC_D1_SeqNoApply: 0
+  line 226, col 8 to line 229, col 75 of module MC_D1_SeqNoApply: 0
+  line 230, col 8 to line 231, col 66 of module MC_D1_SeqNoApply: 0
+  line 232, col 8 to line 237, col 25 of module MC_D1_SeqNoApply: 0
+  line 238, col 8 to line 239, col 54 of module MC_D1_SeqNoApply: 0
+  line 240, col 8 to line 252, col 72 of module MC_D1_SeqNoApply: 0
+  line 266, col 8 to line 266, col 14 of module MC_D1_SeqNoApply: 480
+  line 176, col 8 to line 176, col 27 of module MC_D1_SeqNoApply: 1128
+  |line 176, col 8 to line 176, col 14 of module MC_D1_SeqNoApply: 648
+  |line 176, col 20 to line 176, col 27 of module MC_D1_SeqNoApply: 648
+  line 177, col 8 to line 177, col 33 of module MC_D1_SeqNoApply: 1128
+  |line 177, col 8 to line 177, col 19 of module MC_D1_SeqNoApply: 648
+  line 178, col 8 to line 178, col 28 of module MC_D1_SeqNoApply: 979
+  |line 178, col 8 to line 178, col 14 of module MC_D1_SeqNoApply: 499
+  |line 178, col 18 to line 178, col 28 of module MC_D1_SeqNoApply: 499
+  line 179, col 8 to line 179, col 21 of module MC_D1_SeqNoApply: 480
+  |line 179, col 8 to line 179, col 12 of module MC_D1_SeqNoApply: 499
+  |line 179, col 14 to line 179, col 20 of module MC_D1_SeqNoApply: 499
+  line 180, col 8 to line 180, col 26 of module MC_D1_SeqNoApply: 979
+  |line 180, col 9 to line 180, col 26 of module MC_D1_SeqNoApply: 499
+  line 181, col 8 to line 181, col 26 of module MC_D1_SeqNoApply: 480
+  |line 181, col 8 to line 181, col 17 of module MC_D1_SeqNoApply: 499
+  |line 181, col 19 to line 181, col 25 of module MC_D1_SeqNoApply: 499
+  line 193, col 8 to line 193, col 21 of module ShardReplication: 499
+  line 194, col 11 to line 194, col 34 of module ShardReplication: 480
+  |line 194, col 11 to line 194, col 30 of module ShardReplication: 499
+  line 195, col 11 to line 195, col 62 of module ShardReplication: 979
+  |line 195, col 11 to line 195, col 30 of module ShardReplication: 499
+  |line 195, col 34 to line 195, col 62 of module ShardReplication: 499
+  line 182, col 28 to line 182, col 34 of module MC_D1_SeqNoApply: 499
+  line 183, col 8 to line 183, col 39 of module MC_D1_SeqNoApply: 979
+  |line 183, col 8 to line 183, col 21 of module MC_D1_SeqNoApply: 499
+  |line 183, col 25 to line 183, col 39 of module MC_D1_SeqNoApply: 499
+  line 184, col 8 to line 184, col 46 of module MC_D1_SeqNoApply: 979
+  |line 184, col 8 to line 184, col 26 of module MC_D1_SeqNoApply: 499
+  |line 184, col 30 to line 184, col 46 of module MC_D1_SeqNoApply: 499
+  line 185, col 8 to line 185, col 38 of module MC_D1_SeqNoApply: 979
+  |line 185, col 9 to line 185, col 38 of module MC_D1_SeqNoApply: 499
+  line 204, col 8 to line 204, col 44 of module ShardReplication: 979
+  |line 204, col 8 to line 204, col 24 of module ShardReplication: 499
+  |line 204, col 28 to line 204, col 44 of module ShardReplication: 499
+  line 205, col 8 to line 205, col 36 of module ShardReplication: 979
+  |line 205, col 8 to line 205, col 24 of module ShardReplication: 499
+  |line 205, col 28 to line 205, col 36 of module ShardReplication: 499
+  line 206, col 8 to line 206, col 33 of module ShardReplication: 979
+  |line 206, col 8 to line 206, col 21 of module ShardReplication: 499
+  line 207, col 11 to line 207, col 23 of module ShardReplication: 499
+  line 208, col 19 to line 208, col 46 of module ShardReplication: 480
+  |line 208, col 19 to line 208, col 42 of module ShardReplication: 499
+  line 209, col 19 to line 209, col 68 of module ShardReplication: 979
+  |line 209, col 19 to line 209, col 42 of module ShardReplication: 499
+  |line 209, col 46 to line 209, col 68 of module ShardReplication: 499
+  line 210, col 19 to line 211, col 53 of module ShardReplication: 979
+  |line 210, col 19 to line 210, col 42 of module ShardReplication: 499
+  |line 211, col 19 to line 211, col 53 of module ShardReplication: 499
+  line 213, col 11 to line 213, col 24 of module ShardReplication: 499
+  line 214, col 16 to line 214, col 43 of module ShardReplication: 480
+  |line 214, col 16 to line 214, col 27 of module ShardReplication: 499
+  |line 214, col 32 to line 214, col 43 of module ShardReplication: 499
+  line 268, col 8 to line 268, col 51 of module MC_D1_SeqNoApply: 979
+  |line 268, col 8 to line 268, col 21 of module MC_D1_SeqNoApply: 499
+  |line 268, col 30 to line 268, col 51 of module MC_D1_SeqNoApply: 499
+  line 269, col 8 to line 269, col 57 of module MC_D1_SeqNoApply: 480
+  line 270, col 8 to line 270, col 56 of module MC_D1_SeqNoApply: 480
+  line 271, col 8 to line 271, col 70 of module MC_D1_SeqNoApply: 480
+  line 272, col 8 to line 275, col 23 of module MC_D1_SeqNoApply: 480
+  |line 273, col 11 to line 275, col 23 of module MC_D1_SeqNoApply: 480
+  ||line 273, col 14 to line 273, col 18 of module MC_D1_SeqNoApply: 480
+  ||line 274, col 16 to line 274, col 58 of module MC_D1_SeqNoApply: 451
+  ||line 275, col 16 to line 275, col 23 of module MC_D1_SeqNoApply: 29
+  line 276, col 8 to line 279, col 75 of module MC_D1_SeqNoApply: 480
+  |line 277, col 11 to line 279, col 75 of module MC_D1_SeqNoApply: 480
+  ||line 277, col 12 to line 277, col 18 of module MC_D1_SeqNoApply: 480
+  ||line 278, col 15 to line 279, col 74 of module MC_D1_SeqNoApply: 480
+  ||line 279, col 19 to line 279, col 74 of module MC_D1_SeqNoApply: 480
+  |||line 279, col 22 to line 279, col 43 of module MC_D1_SeqNoApply: 480
+  |||line 279, col 50 to line 279, col 67 of module MC_D1_SeqNoApply: 442
+  line 280, col 8 to line 285, col 25 of module MC_D1_SeqNoApply: 480
+  line 286, col 8 to line 292, col 25 of module MC_D1_SeqNoApply: 480
+  line 293, col 8 to line 293, col 68 of module MC_D1_SeqNoApply: 480
+  line 294, col 8 to line 295, col 59 of module MC_D1_SeqNoApply: 480
+  line 296, col 8 to line 298, col 57 of module MC_D1_SeqNoApply: 480
+  |line 297, col 11 to line 298, col 57 of module MC_D1_SeqNoApply: 480
+  ||line 297, col 12 to line 297, col 24 of module MC_D1_SeqNoApply: 480
+  ||line 298, col 15 to line 298, col 56 of module MC_D1_SeqNoApply: 480
+  ||line 298, col 28 to line 298, col 56 of module MC_D1_SeqNoApply: 480
+  |||line 53, col 5 to line 55, col 62 of module MC_D1_SeqNoApply: 480
+  ||||line 54, col 9 to line 55, col 62 of module MC_D1_SeqNoApply: 879
+  |||||line 54, col 12 to line 54, col 64 of module MC_D1_SeqNoApply: 879
+  ||||||line 54, col 12 to line 54, col 44 of module MC_D1_SeqNoApply: 879:1348
+  |||||||line 54, col 30 to line 54, col 43 of module MC_D1_SeqNoApply: 2637
+  |||||||line 54, col 21 to line 54, col 26 of module MC_D1_SeqNoApply: 879
+  ||||||line 54, col 56 to line 54, col 64 of module MC_D1_SeqNoApply: 879
+  |||||line 55, col 13 to line 55, col 61 of module MC_D1_SeqNoApply: 879
+  ||||line 53, col 25 to line 53, col 36 of module MC_D1_SeqNoApply: 480
+  |||line 298, col 43 to line 298, col 55 of module MC_D1_SeqNoApply: 480
+  line 299, col 8 to line 302, col 75 of module MC_D1_SeqNoApply: 480
+  |line 300, col 11 to line 302, col 75 of module MC_D1_SeqNoApply: 480
+  ||line 300, col 12 to line 300, col 21 of module MC_D1_SeqNoApply: 480
+  ||line 301, col 15 to line 302, col 74 of module MC_D1_SeqNoApply: 480
+  ||line 302, col 19 to line 302, col 74 of module MC_D1_SeqNoApply: 480
+  |||line 302, col 22 to line 302, col 43 of module MC_D1_SeqNoApply: 480
+  |||line 302, col 50 to line 302, col 67 of module MC_D1_SeqNoApply: 442
+  line 303, col 8 to line 307, col 25 of module MC_D1_SeqNoApply: 480
+  |line 304, col 11 to line 307, col 25 of module MC_D1_SeqNoApply: 480
+  ||line 304, col 14 to line 304, col 18 of module MC_D1_SeqNoApply: 480
+  ||line 305, col 16 to line 306, col 57 of module MC_D1_SeqNoApply: 451
+  ||line 307, col 16 to line 307, col 25 of module MC_D1_SeqNoApply: 29
+  line 308, col 8 to line 315, col 31 of module MC_D1_SeqNoApply: 480
+  |line 309, col 11 to line 315, col 31 of module MC_D1_SeqNoApply: 480
+  ||line 309, col 14 to line 309, col 18 of module MC_D1_SeqNoApply: 480
+  ||line 310, col 16 to line 314, col 31 of module MC_D1_SeqNoApply: 451
+  |||line 310, col 17 to line 310, col 32 of module MC_D1_SeqNoApply: 451
+  |||line 311, col 21 to line 314, col 30 of module MC_D1_SeqNoApply: 451
+  |||line 312, col 25 to line 314, col 30 of module MC_D1_SeqNoApply: 451
+  ||||line 312, col 28 to line 312, col 56 of module MC_D1_SeqNoApply: 451
+  ||||line 313, col 30 to line 313, col 47 of module MC_D1_SeqNoApply: 94
+  ||line 315, col 16 to line 315, col 31 of module MC_D1_SeqNoApply: 29
+  line 316, col 8 to line 319, col 27 of module MC_D1_SeqNoApply: 480
+  |line 317, col 11 to line 319, col 27 of module MC_D1_SeqNoApply: 480
+  ||line 317, col 14 to line 317, col 18 of module MC_D1_SeqNoApply: 480
+  ||line 318, col 16 to line 318, col 59 of module MC_D1_SeqNoApply: 451
+  ||line 319, col 16 to line 319, col 27 of module MC_D1_SeqNoApply: 29
+  line 320, col 8 to line 332, col 72 of module MC_D1_SeqNoApply: 480
+  line 774, col 37 to line 774, col 43 of module MC_D1_SeqNoApply: 648
+  line 339, col 8 to line 339, col 14 of module MC_D1_SeqNoApply: 19
+  line 176, col 8 to line 176, col 27 of module MC_D1_SeqNoApply: 667
+  |line 176, col 8 to line 176, col 14 of module MC_D1_SeqNoApply: 648
+  |line 176, col 20 to line 176, col 27 of module MC_D1_SeqNoApply: 648
+  line 177, col 8 to line 177, col 33 of module MC_D1_SeqNoApply: 667
+  |line 177, col 8 to line 177, col 19 of module MC_D1_SeqNoApply: 648
+  line 178, col 8 to line 178, col 28 of module MC_D1_SeqNoApply: 518
+  |line 178, col 8 to line 178, col 14 of module MC_D1_SeqNoApply: 499
+  |line 178, col 18 to line 178, col 28 of module MC_D1_SeqNoApply: 499
+  line 179, col 8 to line 179, col 21 of module MC_D1_SeqNoApply: 19
+  |line 179, col 8 to line 179, col 12 of module MC_D1_SeqNoApply: 499
+  |line 179, col 14 to line 179, col 20 of module MC_D1_SeqNoApply: 499
+  line 180, col 8 to line 180, col 26 of module MC_D1_SeqNoApply: 518
+  |line 180, col 9 to line 180, col 26 of module MC_D1_SeqNoApply: 499
+  line 181, col 8 to line 181, col 26 of module MC_D1_SeqNoApply: 19
+  |line 181, col 8 to line 181, col 17 of module MC_D1_SeqNoApply: 499
+  |line 181, col 19 to line 181, col 25 of module MC_D1_SeqNoApply: 499
+  line 193, col 8 to line 193, col 21 of module ShardReplication: 499
+  line 194, col 11 to line 194, col 34 of module ShardReplication: 19
+  |line 194, col 11 to line 194, col 30 of module ShardReplication: 499
+  line 195, col 11 to line 195, col 62 of module ShardReplication: 518
+  |line 195, col 11 to line 195, col 30 of module ShardReplication: 499
+  |line 195, col 34 to line 195, col 62 of module ShardReplication: 499
+  line 182, col 28 to line 182, col 34 of module MC_D1_SeqNoApply: 499
+  line 183, col 8 to line 183, col 39 of module MC_D1_SeqNoApply: 518
+  |line 183, col 8 to line 183, col 21 of module MC_D1_SeqNoApply: 499
+  |line 183, col 25 to line 183, col 39 of module MC_D1_SeqNoApply: 499
+  line 184, col 8 to line 184, col 46 of module MC_D1_SeqNoApply: 518
+  |line 184, col 8 to line 184, col 26 of module MC_D1_SeqNoApply: 499
+  |line 184, col 30 to line 184, col 46 of module MC_D1_SeqNoApply: 499
+  line 185, col 8 to line 185, col 38 of module MC_D1_SeqNoApply: 518
+  |line 185, col 9 to line 185, col 38 of module MC_D1_SeqNoApply: 499
+  line 204, col 8 to line 204, col 44 of module ShardReplication: 518
+  |line 204, col 8 to line 204, col 24 of module ShardReplication: 499
+  |line 204, col 28 to line 204, col 44 of module ShardReplication: 499
+  line 205, col 8 to line 205, col 36 of module ShardReplication: 518
+  |line 205, col 8 to line 205, col 24 of module ShardReplication: 499
+  |line 205, col 28 to line 205, col 36 of module ShardReplication: 499
+  line 206, col 8 to line 206, col 33 of module ShardReplication: 518
+  |line 206, col 8 to line 206, col 21 of module ShardReplication: 499
+  line 207, col 11 to line 207, col 23 of module ShardReplication: 499
+  line 208, col 19 to line 208, col 46 of module ShardReplication: 19
+  |line 208, col 19 to line 208, col 42 of module ShardReplication: 499
+  line 209, col 19 to line 209, col 68 of module ShardReplication: 518
+  |line 209, col 19 to line 209, col 42 of module ShardReplication: 499
+  |line 209, col 46 to line 209, col 68 of module ShardReplication: 499
+  line 210, col 19 to line 211, col 53 of module ShardReplication: 518
+  |line 210, col 19 to line 210, col 42 of module ShardReplication: 499
+  |line 211, col 19 to line 211, col 53 of module ShardReplication: 499
+  line 213, col 11 to line 213, col 24 of module ShardReplication: 499
+  line 214, col 16 to line 214, col 43 of module ShardReplication: 19
+  |line 214, col 16 to line 214, col 27 of module ShardReplication: 499
+  |line 214, col 32 to line 214, col 43 of module ShardReplication: 499
+  line 341, col 8 to line 341, col 45 of module MC_D1_SeqNoApply: 518
+  |line 341, col 8 to line 341, col 18 of module MC_D1_SeqNoApply: 499
+  |line 341, col 24 to line 341, col 45 of module MC_D1_SeqNoApply: 499
+  line 342, col 8 to line 342, col 57 of module MC_D1_SeqNoApply: 19
+  line 343, col 8 to line 348, col 25 of module MC_D1_SeqNoApply: 19
+  line 349, col 8 to line 355, col 25 of module MC_D1_SeqNoApply: 19
+  line 356, col 8 to line 365, col 23 of module MC_D1_SeqNoApply: 19
+  line 775, col 40 to line 775, col 46 of module MC_D1_SeqNoApply: 648
+  line 772, col 23 to line 772, col 30 of module MC_D1_SeqNoApply: 507
+<D1OrderNext line 769, col 1 to line 769, col 11 of module MC_D1_SeqNoApply (776 8 776 54)>: 129:149
+  line 604, col 8 to line 604, col 27 of module ShardReplication: 795
+  |line 604, col 8 to line 604, col 14 of module ShardReplication: 646
+  |line 604, col 20 to line 604, col 27 of module ShardReplication: 646
+  line 605, col 8 to line 605, col 34 of module ShardReplication: 795
+  |line 605, col 8 to line 605, col 19 of module ShardReplication: 646
+  line 606, col 8 to line 606, col 43 of module ShardReplication: 298
+  |line 606, col 8 to line 606, col 27 of module ShardReplication: 149
+  line 607, col 8 to line 607, col 25 of module ShardReplication: 149
+  line 608, col 8 to line 608, col 43 of module ShardReplication: 298
+  |line 608, col 8 to line 608, col 25 of module ShardReplication: 149
+  |line 608, col 29 to line 608, col 43 of module ShardReplication: 149
+  line 609, col 8 to line 609, col 46 of module ShardReplication: 298
+  |line 609, col 8 to line 609, col 26 of module ShardReplication: 149
+  |line 609, col 30 to line 609, col 46 of module ShardReplication: 149
+  line 610, col 8 to line 610, col 39 of module ShardReplication: 149
+  line 611, col 8 to line 612, col 60 of module ShardReplication: 149
+  line 613, col 8 to line 620, col 61 of module ShardReplication: 149
+  line 369, col 8 to line 371, col 66 of module MC_D1_SeqNoApply: 149
+  line 776, col 47 to line 776, col 53 of module MC_D1_SeqNoApply: 646
+  line 776, col 23 to line 776, col 30 of module MC_D1_SeqNoApply: 506
+<D1TypeOK line 106, col 1 to line 106, col 8 of module MC_D1_SeqNoApply>
+  line 107, col 5 to line 131, col 28 of module MC_D1_SeqNoApply: 1404
+  |line 107, col 8 to line 107, col 13 of module MC_D1_SeqNoApply: 1404
+  ||line 19, col 5 to line 22, col 18 of module Invariants: 1404
+  |||line 19, col 8 to line 19, col 17 of module Invariants: 1404
+  ||||line 101, col 5 to line 130, col 50 of module RaftLog: 1404
+  |||||line 101, col 8 to line 113, col 36 of module RaftLog: 1404
+  |||||line 114, col 8 to line 124, col 45 of module RaftLog: 1404
+  |||||line 125, col 8 to line 125, col 33 of module RaftLog: 1404
+  |||||line 126, col 8 to line 126, col 39 of module RaftLog: 1404
+  |||||line 127, col 8 to line 127, col 41 of module RaftLog: 1404
+  |||||line 128, col 8 to line 128, col 33 of module RaftLog: 1404
+  |||||line 129, col 8 to line 129, col 22 of module RaftLog: 1404
+  |||||line 130, col 8 to line 130, col 50 of module RaftLog: 1404
+  ||||||line 130, col 25 to line 130, col 50 of module RaftLog: 2808
+  ||||||line 130, col 17 to line 130, col 21 of module RaftLog: 1404
+  |||line 20, col 8 to line 20, col 24 of module Invariants: 1404
+  ||||line 1036, col 5 to line 1091, col 32 of module ShardReplication: 1404
+  |||||line 1036, col 8 to line 1036, col 22 of module ShardReplication: 1404
+  |||||line 1037, col 8 to line 1037, col 41 of module ShardReplication: 1404
+  |||||line 1038, col 8 to line 1038, col 37 of module ShardReplication: 1404
+  |||||line 1039, col 8 to line 1039, col 30 of module ShardReplication: 1404
+  |||||line 1040, col 8 to line 1040, col 38 of module ShardReplication: 1404
+  ||||||line 133, col 5 to line 148, col 65 of module ShardReplication: 1404
+  |||||||line 133, col 8 to line 133, col 26 of module ShardReplication: 1404
+  |||||||line 134, col 8 to line 134, col 28 of module ShardReplication: 1404
+  |||||||line 135, col 8 to line 135, col 47 of module ShardReplication: 1404
+  |||||||line 136, col 8 to line 136, col 36 of module ShardReplication: 1404
+  |||||||line 137, col 8 to line 137, col 45 of module ShardReplication: 1404
+  |||||||line 138, col 8 to line 138, col 32 of module ShardReplication: 1404
+  |||||||line 139, col 8 to line 139, col 54 of module ShardReplication: 1404
+  |||||||line 140, col 8 to line 140, col 32 of module ShardReplication: 1404
+  |||||||line 141, col 8 to line 141, col 38 of module ShardReplication: 1404
+  |||||||line 144, col 8 to line 144, col 52 of module ShardReplication: 1404
+  |||||||line 145, col 8 to line 148, col 65 of module ShardReplication: 1404
+  ||||||||line 146, col 12 to line 148, col 65 of module ShardReplication: 2808
+  |||||||||line 146, col 15 to line 146, col 30 of module ShardReplication: 2808
+  |||||||||line 147, col 17 to line 147, col 38 of module ShardReplication: 1404
+  |||||||||line 148, col 17 to line 148, col 65 of module ShardReplication: 1404
+  ||||||||line 145, col 20 to line 145, col 24 of module ShardReplication: 1404
+  ||||||line 1040, col 31 to line 1040, col 37 of module ShardReplication: 1404
+  |||||line 1041, col 8 to line 1041, col 35 of module ShardReplication: 1404
+  |||||line 1042, col 8 to line 1042, col 31 of module ShardReplication: 1404
+  |||||line 1043, col 8 to line 1043, col 43 of module ShardReplication: 1404
+  |||||line 1044, col 8 to line 1044, col 42 of module ShardReplication: 1404
+  |||||line 1045, col 8 to line 1045, col 50 of module ShardReplication: 1404
+  |||||line 1046, col 8 to line 1046, col 39 of module ShardReplication: 1404
+  |||||line 1047, col 8 to line 1047, col 50 of module ShardReplication: 1404
+  |||||line 1048, col 8 to line 1048, col 38 of module ShardReplication: 1404
+  |||||line 1049, col 8 to line 1049, col 45 of module ShardReplication: 1404
+  |||||line 1050, col 8 to line 1050, col 56 of module ShardReplication: 1404
+  |||||line 1051, col 8 to line 1051, col 57 of module ShardReplication: 1404
+  |||||line 1052, col 8 to line 1052, col 39 of module ShardReplication: 1404
+  |||||line 1053, col 8 to line 1053, col 46 of module ShardReplication: 1404
+  |||||line 1054, col 8 to line 1054, col 45 of module ShardReplication: 1404
+  |||||line 1055, col 8 to line 1055, col 51 of module ShardReplication: 1404
+  |||||line 1056, col 8 to line 1056, col 47 of module ShardReplication: 1404
+  |||||line 1057, col 8 to line 1057, col 41 of module ShardReplication: 1404
+  |||||line 1058, col 8 to line 1058, col 48 of module ShardReplication: 1404
+  |||||line 1059, col 8 to line 1059, col 53 of module ShardReplication: 1404
+  |||||line 1060, col 8 to line 1060, col 42 of module ShardReplication: 1404
+  |||||line 1061, col 8 to line 1061, col 44 of module ShardReplication: 1404
+  |||||line 1062, col 8 to line 1062, col 45 of module ShardReplication: 1404
+  |||||line 1063, col 8 to line 1063, col 48 of module ShardReplication: 1404
+  |||||line 1064, col 8 to line 1064, col 40 of module ShardReplication: 1404
+  |||||line 1065, col 8 to line 1065, col 55 of module ShardReplication: 1404
+  |||||line 1066, col 8 to line 1066, col 55 of module ShardReplication: 1404
+  |||||line 1067, col 8 to line 1067, col 45 of module ShardReplication: 1404
+  |||||line 1068, col 8 to line 1068, col 52 of module ShardReplication: 1404
+  |||||line 1069, col 8 to line 1069, col 40 of module ShardReplication: 1404
+  |||||line 1070, col 8 to line 1070, col 43 of module ShardReplication: 1404
+  |||||line 1071, col 8 to line 1081, col 49 of module ShardReplication: 1404
+  |||||line 1082, col 8 to line 1082, col 51 of module ShardReplication: 1404
+  |||||line 1083, col 8 to line 1083, col 57 of module ShardReplication: 1404
+  |||||line 1084, col 8 to line 1084, col 31 of module ShardReplication: 1404
+  |||||line 1085, col 8 to line 1085, col 32 of module ShardReplication: 1404
+  |||||line 1086, col 8 to line 1086, col 32 of module ShardReplication: 1404
+  |||||line 1087, col 8 to line 1087, col 32 of module ShardReplication: 1404
+  |||||line 1088, col 8 to line 1088, col 36 of module ShardReplication: 1404
+  |||||line 1089, col 8 to line 1089, col 33 of module ShardReplication: 1404
+  |||||line 1090, col 8 to line 1090, col 41 of module ShardReplication: 1404
+  |||||line 1091, col 8 to line 1091, col 32 of module ShardReplication: 1404
+  |||line 21, col 8 to line 21, col 25 of module Invariants: 1404
+  ||||line 923, col 5 to line 943, col 46 of module PeerRecovery: 1404
+  |||||line 923, col 8 to line 923, col 44 of module PeerRecovery: 1404
+  |||||line 924, col 8 to line 924, col 42 of module PeerRecovery: 1404
+  |||||line 925, col 8 to line 925, col 48 of module PeerRecovery: 1404
+  |||||line 926, col 8 to line 926, col 55 of module PeerRecovery: 1404
+  |||||line 927, col 8 to line 927, col 44 of module PeerRecovery: 1404
+  |||||line 928, col 8 to line 928, col 44 of module PeerRecovery: 1404
+  |||||line 929, col 8 to line 929, col 58 of module PeerRecovery: 1404
+  |||||line 930, col 8 to line 930, col 50 of module PeerRecovery: 1404
+  |||||line 931, col 8 to line 931, col 48 of module PeerRecovery: 1404
+  |||||line 932, col 8 to line 932, col 46 of module PeerRecovery: 1404
+  |||||line 933, col 8 to line 933, col 53 of module PeerRecovery: 1404
+  |||||line 934, col 8 to line 934, col 49 of module PeerRecovery: 1404
+  |||||line 935, col 8 to line 935, col 54 of module PeerRecovery: 1404
+  |||||line 936, col 8 to line 936, col 50 of module PeerRecovery: 1404
+  |||||line 937, col 8 to line 937, col 54 of module PeerRecovery: 1404
+  |||||line 938, col 8 to line 938, col 50 of module PeerRecovery: 1404
+  |||||line 939, col 8 to line 939, col 56 of module PeerRecovery: 1404
+  |||||line 940, col 8 to line 940, col 44 of module PeerRecovery: 1404
+  |||||line 941, col 8 to line 941, col 58 of module PeerRecovery: 1404
+  |||||line 942, col 8 to line 942, col 40 of module PeerRecovery: 1404
+  |||||line 943, col 8 to line 943, col 46 of module PeerRecovery: 1404
+  ||||||line 943, col 8 to line 943, col 41 of module PeerRecovery: 1404
+  |||||||line 943, col 20 to line 943, col 40 of module PeerRecovery: 1404
+  ||||||||line 87, col 5 to line 87, col 54 of module PeerRecovery: 1404
+  |||||||||line 87, col 25 to line 87, col 53 of module PeerRecovery: 2808
+  |||||||||line 87, col 17 to line 87, col 21 of module PeerRecovery: 1404
+  |||line 22, col 8 to line 22, col 18 of module Invariants: 1404
+  |line 108, col 8 to line 108, col 44 of module MC_D1_SeqNoApply: 1404
+  |line 109, col 8 to line 109, col 49 of module MC_D1_SeqNoApply: 1404
+  |line 110, col 8 to line 110, col 48 of module MC_D1_SeqNoApply: 1404
+  |line 111, col 8 to line 111, col 45 of module MC_D1_SeqNoApply: 1404
+  |line 112, col 8 to line 112, col 57 of module MC_D1_SeqNoApply: 1404
+  |line 113, col 8 to line 113, col 54 of module MC_D1_SeqNoApply: 1404
+  |line 114, col 8 to line 114, col 55 of module MC_D1_SeqNoApply: 1404
+  |line 115, col 8 to line 115, col 61 of module MC_D1_SeqNoApply: 1404
+  |line 116, col 8 to line 116, col 46 of module MC_D1_SeqNoApply: 1404
+  |line 117, col 8 to line 117, col 50 of module MC_D1_SeqNoApply: 1404
+  |line 118, col 8 to line 118, col 62 of module MC_D1_SeqNoApply: 1404
+  |line 119, col 8 to line 119, col 64 of module MC_D1_SeqNoApply: 1404
+  |line 120, col 8 to line 121, col 43 of module MC_D1_SeqNoApply: 1404
+  |line 122, col 8 to line 122, col 39 of module MC_D1_SeqNoApply: 1404
+  |line 123, col 8 to line 123, col 35 of module MC_D1_SeqNoApply: 1404
+  |line 124, col 8 to line 124, col 49 of module MC_D1_SeqNoApply: 1404
+  |line 125, col 8 to line 125, col 44 of module MC_D1_SeqNoApply: 1404
+  |line 126, col 8 to line 126, col 29 of module MC_D1_SeqNoApply: 1404
+  |line 127, col 8 to line 127, col 29 of module MC_D1_SeqNoApply: 1404
+  |line 128, col 8 to line 128, col 28 of module MC_D1_SeqNoApply: 1404
+  |line 129, col 8 to line 129, col 32 of module MC_D1_SeqNoApply: 1404
+  |line 130, col 8 to line 130, col 37 of module MC_D1_SeqNoApply: 1404
+  |line 131, col 8 to line 131, col 28 of module MC_D1_SeqNoApply: 1404
+<D1ProcessedCheckpointGapAware line 736, col 1 to line 736, col 29 of module MC_D1_SeqNoApply>
+  line 737, col 5 to line 738, col 65 of module MC_D1_SeqNoApply: 1404
+  |line 738, col 9 to line 738, col 65 of module MC_D1_SeqNoApply: 2808
+  ||line 738, col 9 to line 738, col 27 of module MC_D1_SeqNoApply: 2808
+  ||line 738, col 31 to line 738, col 65 of module MC_D1_SeqNoApply: 2808
+  |||line 53, col 5 to line 55, col 62 of module MC_D1_SeqNoApply: 2808
+  ||||line 54, col 9 to line 55, col 62 of module MC_D1_SeqNoApply: 5740
+  |||||line 54, col 12 to line 54, col 64 of module MC_D1_SeqNoApply: 5740
+  ||||||line 54, col 12 to line 54, col 44 of module MC_D1_SeqNoApply: 5740:9898
+  |||||||line 54, col 30 to line 54, col 43 of module MC_D1_SeqNoApply: 17220
+  |||||||line 54, col 21 to line 54, col 26 of module MC_D1_SeqNoApply: 5740
+  ||||||line 54, col 56 to line 54, col 64 of module MC_D1_SeqNoApply: 5740
+  |||||line 55, col 13 to line 55, col 61 of module MC_D1_SeqNoApply: 5740
+  ||||||line 55, col 13 to line 55, col 32 of module MC_D1_SeqNoApply: 5740
+  ||||||line 55, col 37 to line 55, col 61 of module MC_D1_SeqNoApply: 5562
+  ||||line 53, col 25 to line 53, col 36 of module MC_D1_SeqNoApply: 2808
+  |||line 738, col 46 to line 738, col 64 of module MC_D1_SeqNoApply: 2808
+  |line 737, col 17 to line 737, col 21 of module MC_D1_SeqNoApply: 1404
+<D1WalHasNoDuplicateSeq line 740, col 1 to line 740, col 22 of module MC_D1_SeqNoApply>
+  line 741, col 5 to line 746, col 29 of module MC_D1_SeqNoApply: 1404
+  |line 742, col 7 to line 746, col 29 of module MC_D1_SeqNoApply: 2808
+  ||line 743, col 9 to line 746, col 29 of module MC_D1_SeqNoApply: 3160
+  |||line 744, col 13 to line 746, col 29 of module MC_D1_SeqNoApply: 5628
+  ||||line 744, col 13 to line 745, col 46 of module MC_D1_SeqNoApply: 5628
+  ||||line 746, col 16 to line 746, col 29 of module MC_D1_SeqNoApply: 3160
+  |||line 743, col 23 to line 743, col 44 of module MC_D1_SeqNoApply: 3160
+  ||line 742, col 20 to line 742, col 41 of module MC_D1_SeqNoApply: 2808
+  |line 741, col 17 to line 741, col 21 of module MC_D1_SeqNoApply: 1404
+<D1AcknowledgedCopiesConverge line 748, col 1 to line 748, col 28 of module MC_D1_SeqNoApply>
+  line 749, col 5 to line 756, col 31 of module MC_D1_SeqNoApply: 1404
+  |line 750, col 25 to line 750, col 51 of module MC_D1_SeqNoApply: 2806
+  ||line 66, col 5 to line 66, col 33 of module MC_D1_SeqNoApply: 2806
+  |||line 151, col 23 to line 151, col 58 of module ShardReplication: 2806:60
+  ||||line 151, col 41 to line 151, col 57 of module ShardReplication: 38
+  ||||line 151, col 30 to line 151, col 37 of module ShardReplication: 2806
+  |||line 152, col 8 to line 158, col 36 of module ShardReplication: 2806
+  ||||line 152, col 11 to line 152, col 25 of module ShardReplication: 2806
+  ||||line 153, col 13 to line 153, col 19 of module ShardReplication: 2786
+  ||||line 154, col 13 to line 158, col 36 of module ShardReplication: 20
+  |||line 66, col 23 to line 66, col 27 of module MC_D1_SeqNoApply: 2806
+  ||line 750, col 48 to line 750, col 50 of module MC_D1_SeqNoApply: 38
+  |line 751, col 12 to line 756, col 31 of module MC_D1_SeqNoApply: 2806
+  ||line 751, col 15 to line 751, col 32 of module MC_D1_SeqNoApply: 2806
+  ||line 752, col 17 to line 752, col 20 of module MC_D1_SeqNoApply: 2786
+  ||line 753, col 17 to line 756, col 31 of module MC_D1_SeqNoApply: 20
+  |||line 753, col 20 to line 753, col 56 of module MC_D1_SeqNoApply: 20
+  |||line 754, col 20 to line 756, col 31 of module MC_D1_SeqNoApply: 18
+  |line 749, col 16 to line 749, col 19 of module MC_D1_SeqNoApply: 1404
+End of statistics.
+1996 states generated, 1404 distinct states found, 898 states left on queue.
+The depth of the complete state graph search is 9.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 6 and the 95th percentile is 4).
+Finished in 04s at (2026-09-28 03:50:44)

@@ -176,6 +176,9 @@ ActiveWrites ==
     {w \in WriteIds :
         writeStatus[w] \in {"Routed", "Replicating"}}
 
+MaxConcurrentClientWrites ==
+    IF FaultMode \in {"D1Historical", "D1Fixed"} THEN 3 ELSE 1
+
 WriteMessages(writeId) ==
     {m \in messages : m.write = writeId}
 
@@ -320,9 +323,10 @@ ClientWrite(coordinator, doc, kind) ==
     /\ alive[coordinator]
     /\ doc \in Docs
     /\ kind \in WriteKinds
-    \* One client operation may be in flight.  Writes still interleave with
-    \* every Raft, recovery, network, and fault action.
-    /\ ActiveWrites = {}
+    \* D1 configurations allow three writes to overlap so messages for the
+    \* same shard may reach a replica in any order. Other configurations retain
+    \* their historical one-write state-space bound.
+    /\ Cardinality(ActiveWrites) < MaxConcurrentClientWrites
     /\ writeStatus' = [writeStatus EXCEPT ![writeId] = "Routed"]
     /\ writeDoc' = [writeDoc EXCEPT ![writeId] = doc]
     /\ writeKind' = [writeKind EXCEPT ![writeId] = kind]

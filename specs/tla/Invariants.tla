@@ -143,7 +143,7 @@ SafetyConstraint ==
     /\ Len(raftLog) <= MaxRaftEntries
     /\ Cardinality(pendingRaft) <= MaxPendingRaft
     /\ Cardinality(messages) <= MaxMessages
-    /\ Cardinality(ActiveWrites) <= 1
+    /\ Cardinality(ActiveWrites) <= MaxConcurrentClientWrites
     /\ \A node \in Nodes :
            \/ ~raftConnected[node]
            \/ Len(raftLog) - applied[node] <= MaxViewLag

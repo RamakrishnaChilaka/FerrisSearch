@@ -7,7 +7,7 @@ TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 DEFAULT_JAR="${XDG_CACHE_HOME:-$HOME/.cache}/ferrissearch-tla/v${TLA_VERSION}/tla2tools.jar"
-WORKERS="${TLA_WORKERS:-8}"
+WORKERS="${TLA_WORKERS:-12}"
 TIMEOUT_SECONDS="${TLA_TIMEOUT_SECONDS:-300}"
 LONG_TIMEOUT_SECONDS="${TLA_LONG_TIMEOUT_SECONDS:-1800}"
 SIMULATION_TRACES="${TLA_SIMULATION_TRACES:-10000}"
@@ -99,6 +99,11 @@ default_configs=(
     s1-combined-primary
     s1-combined-liveness
     s1-combined-liveness-no-timeout
+    d1-order-historical
+    d1-order-fixed
+    d1-replay-historical
+    d1-replay-fixed
+    d1-no-durable-tombstone
     two-shard
 )
 
@@ -148,6 +153,11 @@ s1-combined-replica     pass: storage fault, crash/reset, repair, and recovery
 s1-combined-primary     pass: promote-only report across primary/leader crash
 s1-combined-liveness    pass: timeout, redetection, recovery, and resumed write
 s1-combined-liveness-no-timeout expected temporal failure: timeout assumption
+d1-order-historical     expected NoCopyBehindAcked: arrival-order replica apply
+d1-order-fixed          pass: concurrent writes converge under seq-aware apply
+d1-replay-historical    expected replay loss from highest committed sequence
+d1-replay-fixed         pass: processed-checkpoint replay through D1 planner
+d1-no-durable-tombstone pass: replayed delete fences a late older index
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -361,6 +371,31 @@ run_config() {
             module="MC_S1_Combined.tla"
             cfg="MC_S1_CombinedLivenessNoTimeout.cfg"
             expected="temporal"
+            ;;
+        d1-order-historical|MC_D1_OrderHistorical)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_OrderHistorical.cfg"
+            expected="NoCopyBehindAcked"
+            ;;
+        d1-order-fixed|MC_D1_OrderFixed)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_OrderFixed.cfg"
+            expected="pass"
+            ;;
+        d1-replay-historical|MC_D1_ReplayHistorical)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_ReplayHistorical.cfg"
+            expected="D1ReplayPreservesAcknowledged"
+            ;;
+        d1-replay-fixed|MC_D1_ReplayFixed)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_ReplayFixed.cfg"
+            expected="pass"
+            ;;
+        d1-no-durable-tombstone|MC_D1_NoDurableTombstone)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_NoDurableTombstone.cfg"
+            expected="pass"
             ;;
         two-shard|MC_TwoShardIsolation)
             module="MC_TwoShardIsolation.tla"
