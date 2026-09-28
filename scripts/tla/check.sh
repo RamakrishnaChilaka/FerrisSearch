@@ -107,6 +107,11 @@ default_configs=(
     d1-term-collision-seq-only
     d1-term-collision-fixed
     d1-gaps
+    d1-term-collision-restart-committed
+    d1-term-collision-restart-identity
+    d1-primary-gap-max
+    d1-primary-gap-processed
+    d1-promotion-replay-noop
     two-shard
 )
 
@@ -164,6 +169,11 @@ d1-no-durable-tombstone pass: replayed delete fences a late older index
 d1-term-collision-seq-only expected B1NoCopyBehindAcked: term/seq collision
 d1-term-collision-fixed pass: newer-term collision fails and re-recovers copy
 d1-gaps                 pass: pull, recovery, and promotion NoOp close gaps
+d1-term-collision-restart-committed expected B1RNoCopyBehindAcked
+d1-term-collision-restart-identity pass: identity restores fence collision max
+d1-primary-gap-max      expected B3NoRecoveryLoop: max-based detector loops
+d1-primary-gap-processed pass: compare replica and primary processed checkpoints
+d1-promotion-replay-noop pass: replay, fill NoOp, activate despite replica gap
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -416,6 +426,31 @@ run_config() {
         d1-gaps|MC_D1_Gaps)
             module="MC_D1_Gaps.tla"
             cfg="MC_D1_Gaps.cfg"
+            expected="pass"
+            ;;
+        d1-term-collision-restart-committed|MC_D1_TermCollisionRestartCommitted)
+            module="MC_D1_TermCollisionRestart.tla"
+            cfg="MC_D1_TermCollisionRestartCommitted.cfg"
+            expected="B1RNoCopyBehindAcked"
+            ;;
+        d1-term-collision-restart-identity|MC_D1_TermCollisionRestartIdentity)
+            module="MC_D1_TermCollisionRestart.tla"
+            cfg="MC_D1_TermCollisionRestartIdentity.cfg"
+            expected="pass"
+            ;;
+        d1-primary-gap-max|MC_D1_PrimaryGapMaxBased)
+            module="MC_D1_PrimaryGap.tla"
+            cfg="MC_D1_PrimaryGapMaxBased.cfg"
+            expected="B3NoRecoveryLoop"
+            ;;
+        d1-primary-gap-processed|MC_D1_PrimaryGapProcessed)
+            module="MC_D1_PrimaryGap.tla"
+            cfg="MC_D1_PrimaryGapProcessed.cfg"
+            expected="pass"
+            ;;
+        d1-promotion-replay-noop|MC_D1_PromotionReplayNoOp)
+            module="MC_D1_PromotionReplayNoOp.tla"
+            cfg="MC_D1_PromotionReplayNoOp.cfg"
             expected="pass"
             ;;
         two-shard|MC_TwoShardIsolation)

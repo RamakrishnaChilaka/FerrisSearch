@@ -105,6 +105,11 @@ B2Next ==
 B2NoCopyBehindAcked ==
     acknowledged \subseteq processed
 
+B2GapDoesNotBlockLaterAcknowledgement ==
+    phase >= 1 =>
+        /\ 2 \in acknowledged
+        /\ 2 \in processed
+
 B2CheckpointGapAware ==
     processedNext = ContiguousNext(processed)
 

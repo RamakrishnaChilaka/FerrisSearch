@@ -1,0 +1,54 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 42 and seed -7177517238583100771 with 12 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 80279] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_D1_PrimaryGap.tla
+Parsing file /tmp/d1-b3-h/Naturals.tla
+Parsing file /tmp/d1-b3-h/FiniteSets.tla
+Parsing file /tmp/d1-b3-h/TLC.tla
+Parsing file /tmp/d1-b3-h/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module MC_D1_PrimaryGap
+Starting... (2026-09-28 05:48:24)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-28 05:48:25.
+Error: Invariant B3NoRecoveryLoop is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ replicaProcessed = {}
+/\ primaryCheckpoint = 0
+/\ phase = 0
+/\ primaryMaxNext = 0
+/\ recoveryCount = 0
+/\ acknowledged = {}
+/\ replicaCheckpoint = 0
+/\ primaryProcessed = {}
+
+State 2: <B3CreatePrimaryAndReplicaGap line 46, col 5 to line 54, col 30 of module MC_D1_PrimaryGap>
+/\ replicaProcessed = {0, 2}
+/\ primaryCheckpoint = 1
+/\ phase = 1
+/\ primaryMaxNext = 3
+/\ acknowledged = {0, 2}
+/\ replicaCheckpoint = 1
+/\ primaryProcessed = {0, 2}
+
+State 3: <B3MaxBasedRecover line 59, col 5 to line 68, col 26 of module MC_D1_PrimaryGap>
+/\ phase = 2
+/\ recoveryCount = 1
+
+State 4: <B3MaxBasedRecover line 59, col 5 to line 68, col 26 of module MC_D1_PrimaryGap>
+/\ replicaProcessed = {0, 2}
+/\ primaryCheckpoint = 1
+/\ phase = 3
+/\ primaryMaxNext = 3
+/\ recoveryCount = 2
+/\ acknowledged = {0, 2}
+/\ replicaCheckpoint = 1
+/\ primaryProcessed = {0, 2}
+
+4 states generated, 4 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 4.
+The average outdegree of the complete state graph is 1 (minimum is 1, the maximum 1 and the 95th percentile is 1).
+Finished in 00s at (2026-09-28 05:48:25)

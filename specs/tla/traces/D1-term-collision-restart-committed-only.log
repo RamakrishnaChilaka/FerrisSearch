@@ -1,0 +1,72 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 115 and seed 4490574683837899336 with 12 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 80125] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_D1_TermCollisionRestart.tla
+Parsing file /tmp/d1-b1r-h/Naturals.tla
+Parsing file /tmp/d1-b1r-h/FiniteSets.tla
+Parsing file /tmp/d1-b1r-h/TLC.tla
+Parsing file /tmp/d1-b1r-h/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module MC_D1_TermCollisionRestart
+Starting... (2026-09-28 05:48:00)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-28 05:48:01.
+Error: Invariant B1RNoCopyBehindAcked is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ processed = {}
+/\ fenceTerm = 1
+/\ activeFenceMax = 10
+/\ identityFenceTerm = 1
+/\ docOp = "NONE"
+/\ identityFenceMax = 10
+/\ phase = 0
+/\ committedMax = 10
+/\ newAcknowledged = FALSE
+/\ recovered = FALSE
+/\ failed = FALSE
+/\ promoted = FALSE
+
+State 2: <B1RApplyOldTermWrite line 63, col 5 to line 69, col 72 of module MC_D1_TermCollisionRestart>
+/\ processed = {11}
+/\ docOp = "OLD_TERM_1_SEQ_11"
+/\ phase = 1
+
+State 3: <B1RRaiseFence line 73, col 5 to line 81, col 33 of module MC_D1_TermCollisionRestart>
+/\ fenceTerm = 2
+/\ activeFenceMax = 11
+/\ identityFenceTerm = 2
+/\ identityFenceMax = 11
+/\ phase = 2
+
+State 4: <B1RRestart line 87, col 5 to line 96, col 65 of module MC_D1_TermCollisionRestart>
+/\ activeFenceMax = 10
+/\ phase = 3
+
+State 5: <B1RCommittedOnlyNewWrite line 99, col 5 to line 107, col 73 of module MC_D1_TermCollisionRestart>
+/\ phase = 4
+/\ newAcknowledged = TRUE
+
+State 6: <B1RCommittedReady line 122, col 5 to line 128, col 33 of module MC_D1_TermCollisionRestart>
+/\ phase = 5
+
+State 7: <B1RPromote line 144, col 5 to line 150, col 23 of module MC_D1_TermCollisionRestart>
+/\ processed = {11}
+/\ fenceTerm = 2
+/\ activeFenceMax = 10
+/\ identityFenceTerm = 2
+/\ docOp = "OLD_TERM_1_SEQ_11"
+/\ identityFenceMax = 11
+/\ phase = 6
+/\ committedMax = 10
+/\ newAcknowledged = TRUE
+/\ recovered = FALSE
+/\ failed = FALSE
+/\ promoted = TRUE
+
+7 states generated, 7 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 1 (minimum is 1, the maximum 1 and the 95th percentile is 1).
+Finished in 01s at (2026-09-28 05:48:01)
