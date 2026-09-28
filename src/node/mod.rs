@@ -209,7 +209,9 @@ async fn report_failed_shard_copies(
             .is_some_and(|metadata| metadata.uuid.as_str() == failure.index_uuid)
             && current.primary_initialized(&failure.index_name, failure.shard_id)
             && current.shard_allocation_id(&failure.index_name, failure.shard_id, &failure.node_id)
-                == Some(failure.allocation_id);
+                == Some(failure.allocation_id)
+            && current.indices[&failure.index_name].shard_routing[&failure.shard_id].primary_term
+                == failure.primary_term;
         if !report_is_current {
             tracing::debug!(
                 index = failure.index_name,
@@ -249,6 +251,7 @@ async fn report_failed_shard_copies(
         } else {
             None
         };
+        let expected_primary_term = failure.primary_term;
         if raft.is_leader()
             && failure.promote_only
             && promotion_candidate.is_none()
@@ -291,6 +294,7 @@ async fn report_failed_shard_copies(
                 shard_id: failure.shard_id,
                 node: failure.node_id.clone(),
                 allocation_id: failure.allocation_id,
+                expected_primary_term,
                 promote_only: failure.promote_only,
                 promotion_candidate,
             }
@@ -328,6 +332,7 @@ async fn report_failed_shard_copies(
                         node_id: failure.node_id.clone(),
                         allocation_id: Some(failure.allocation_id),
                         promote_only: failure.promote_only,
+                        expected_primary_term,
                     },
                 )
                 .await
@@ -770,6 +775,7 @@ impl Node {
                     manager_clone.clone(),
                     client.clone(),
                 );
+                primary_activation_service.reconcile_replica_gaps().await;
 
                 if !orphan_cleanup_done {
                     orphan_cleanup_done = cleanup_orphaned_data_if_authoritative_blocking(

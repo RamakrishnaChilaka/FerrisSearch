@@ -381,11 +381,39 @@ impl ShardKey {
 /// Per-replica checkpoint info for ISR tracking.
 #[derive(Debug, Clone)]
 pub struct ReplicaCheckpoint {
-    /// The replica's last known applied sequence high-water mark.
-    /// This tracker does not prove contiguous application below the watermark.
-    pub checkpoint: u64,
+    pub allocation_id: AllocationId,
+    /// Highest contiguous processed checkpoint observed for this allocation.
+    pub processed_checkpoint: Option<u64>,
+    /// Highest contiguous persisted checkpoint observed for this allocation.
+    pub persisted_checkpoint: Option<u64>,
     /// When we last heard from this replica.
-    pub last_updated: std::time::Instant,
+    pub last_updated: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaCheckpointUpdate {
+    pub node_id: String,
+    pub allocation_id: AllocationId,
+    pub processed_checkpoint: Option<u64>,
+    pub persisted_checkpoint: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicaCheckpointContext<'a> {
+    pub index_uuid: &'a str,
+    pub primary_term: u64,
+    pub primary_processed_checkpoint: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplicaGapObservation {
+    pub index_uuid: String,
+    pub replica_node_id: String,
+    pub allocation_id: AllocationId,
+    pub primary_term: u64,
+    pub first_seen: Instant,
+    pub target_checkpoint: u64,
+    pub max_reported_checkpoint: Option<u64>,
 }
 
 /// Tracks replica checkpoint observations for primary shards on this node.
@@ -397,6 +425,7 @@ pub struct IsrTracker {
     /// Per-shard, per-replica checkpoint tracking.
     /// Key: ShardKey, Value: HashMap<replica_node_id, ReplicaCheckpoint>
     replicas: RwLock<HashMap<ShardKey, HashMap<String, ReplicaCheckpoint>>>,
+    gap_observations: RwLock<HashMap<ShardKey, HashMap<String, ReplicaGapObservation>>>,
     /// Maximum allowed seq_no lag for the diagnostic lag-eligible view.
     max_lag: u64,
 }
@@ -405,27 +434,39 @@ impl IsrTracker {
     pub fn new(max_lag: u64) -> Self {
         Self {
             replicas: RwLock::new(HashMap::new()),
+            gap_observations: RwLock::new(HashMap::new()),
             max_lag,
         }
     }
 
-    /// Update a replica's checkpoint for a given shard.
+    fn max_checkpoint(current: Option<u64>, reported: Option<u64>) -> Option<u64> {
+        match (current, reported) {
+            (Some(current), Some(reported)) => Some(current.max(reported)),
+            (Some(current), None) => Some(current),
+            (None, Some(reported)) => Some(reported),
+            (None, None) => None,
+        }
+    }
+
     pub fn update_replica_checkpoint(
         &self,
         index: &str,
+        index_uuid: &str,
         shard_id: u32,
-        replica_node_id: &str,
-        checkpoint: u64,
+        primary_term: u64,
+        primary_processed_checkpoint: Option<u64>,
+        checkpoint: ReplicaCheckpointUpdate,
     ) {
-        let key = ShardKey::new(index, shard_id);
-        let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
-        let shard_replicas = replicas.entry(key).or_default();
-        shard_replicas.insert(
-            replica_node_id.to_string(),
-            ReplicaCheckpoint {
-                checkpoint,
-                last_updated: std::time::Instant::now(),
+        self.update_replica_checkpoints_at(
+            index,
+            shard_id,
+            ReplicaCheckpointContext {
+                index_uuid,
+                primary_term,
+                primary_processed_checkpoint,
             },
+            std::slice::from_ref(&checkpoint),
+            Instant::now(),
         );
     }
 
@@ -433,21 +474,101 @@ impl IsrTracker {
     pub fn update_replica_checkpoints(
         &self,
         index: &str,
+        index_uuid: &str,
         shard_id: u32,
-        checkpoints: &[(String, u64)],
+        primary_term: u64,
+        primary_processed_checkpoint: Option<u64>,
+        checkpoints: &[ReplicaCheckpointUpdate],
+    ) {
+        self.update_replica_checkpoints_at(
+            index,
+            shard_id,
+            ReplicaCheckpointContext {
+                index_uuid,
+                primary_term,
+                primary_processed_checkpoint,
+            },
+            checkpoints,
+            Instant::now(),
+        );
+    }
+
+    pub(crate) fn update_replica_checkpoints_at(
+        &self,
+        index: &str,
+        shard_id: u32,
+        context: ReplicaCheckpointContext<'_>,
+        checkpoints: &[ReplicaCheckpointUpdate],
+        now: Instant,
     ) {
         let key = ShardKey::new(index, shard_id);
         let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
-        let shard_replicas = replicas.entry(key).or_default();
-        let now = std::time::Instant::now();
-        for (node_id, cp) in checkpoints {
-            shard_replicas.insert(
-                node_id.clone(),
-                ReplicaCheckpoint {
-                    checkpoint: *cp,
+        let mut gaps = self
+            .gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let shard_replicas = replicas.entry(key.clone()).or_default();
+        let shard_gaps = gaps.entry(key).or_default();
+        for checkpoint in checkpoints {
+            let stored = shard_replicas
+                .entry(checkpoint.node_id.clone())
+                .or_insert_with(|| ReplicaCheckpoint {
+                    allocation_id: checkpoint.allocation_id,
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
                     last_updated: now,
-                },
-            );
+                });
+            if stored.allocation_id != checkpoint.allocation_id {
+                *stored = ReplicaCheckpoint {
+                    allocation_id: checkpoint.allocation_id,
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
+                    last_updated: now,
+                };
+                shard_gaps.remove(&checkpoint.node_id);
+            }
+            stored.processed_checkpoint =
+                Self::max_checkpoint(stored.processed_checkpoint, checkpoint.processed_checkpoint);
+            stored.persisted_checkpoint =
+                Self::max_checkpoint(stored.persisted_checkpoint, checkpoint.persisted_checkpoint);
+            stored.last_updated = now;
+
+            if let Some(observation) = shard_gaps.get_mut(&checkpoint.node_id) {
+                if observation.index_uuid != context.index_uuid
+                    || observation.allocation_id != checkpoint.allocation_id
+                    || observation.primary_term != context.primary_term
+                {
+                    shard_gaps.remove(&checkpoint.node_id);
+                } else {
+                    observation.max_reported_checkpoint = stored.processed_checkpoint;
+                    if stored
+                        .processed_checkpoint
+                        .is_some_and(|reported| reported >= observation.target_checkpoint)
+                    {
+                        shard_gaps.remove(&checkpoint.node_id);
+                    }
+                }
+            }
+
+            if !shard_gaps.contains_key(&checkpoint.node_id)
+                && let Some(target_checkpoint) = context.primary_processed_checkpoint
+                && stored
+                    .processed_checkpoint
+                    .is_none_or(|reported| reported < target_checkpoint)
+            {
+                shard_gaps.insert(
+                    checkpoint.node_id.clone(),
+                    ReplicaGapObservation {
+                        index_uuid: context.index_uuid.to_string(),
+                        replica_node_id: checkpoint.node_id.clone(),
+                        allocation_id: checkpoint.allocation_id,
+                        primary_term: context.primary_term,
+                        first_seen: now,
+                        target_checkpoint,
+                        max_reported_checkpoint: stored.processed_checkpoint,
+                    },
+                );
+            }
         }
     }
 
@@ -464,7 +585,11 @@ impl IsrTracker {
         match replicas.get(&key) {
             Some(shard_replicas) => shard_replicas
                 .iter()
-                .filter(|(_, rc)| primary_checkpoint.saturating_sub(rc.checkpoint) <= self.max_lag)
+                .filter(|(_, rc)| {
+                    rc.processed_checkpoint.is_some_and(|checkpoint| {
+                        primary_checkpoint.saturating_sub(checkpoint) <= self.max_lag
+                    })
+                })
                 .map(|(node_id, _)| node_id.clone())
                 .collect(),
             None => vec![],
@@ -478,10 +603,142 @@ impl IsrTracker {
         match replicas.get(&key) {
             Some(shard_replicas) => shard_replicas
                 .iter()
-                .map(|(node_id, rc)| (node_id.clone(), rc.checkpoint))
+                .filter_map(|(node_id, rc)| {
+                    rc.processed_checkpoint
+                        .map(|checkpoint| (node_id.clone(), checkpoint))
+                })
                 .collect(),
             None => vec![],
         }
+    }
+
+    pub fn expired_gap_observations(
+        &self,
+        timeout: Duration,
+    ) -> Vec<(ShardKey, ReplicaGapObservation)> {
+        self.expired_gap_observations_at(timeout, Instant::now())
+    }
+
+    fn expired_gap_observations_at(
+        &self,
+        timeout: Duration,
+        now: Instant,
+    ) -> Vec<(ShardKey, ReplicaGapObservation)> {
+        self.gap_observations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|(key, observations)| {
+                observations
+                    .values()
+                    .filter(|observation| now.duration_since(observation.first_seen) >= timeout)
+                    .map(|observation| (key.clone(), observation.clone()))
+            })
+            .collect()
+    }
+
+    pub fn record_gap_probe_checkpoint(
+        &self,
+        index: &str,
+        shard_id: u32,
+        replica_node_id: &str,
+        allocation_id: AllocationId,
+        processed_checkpoint: Option<u64>,
+    ) -> bool {
+        let key = ShardKey::new(index, shard_id);
+        let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
+        let mut gaps = self
+            .gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(observation) = gaps
+            .get_mut(&key)
+            .and_then(|observations| observations.get_mut(replica_node_id))
+        else {
+            return false;
+        };
+        if observation.allocation_id != allocation_id {
+            return false;
+        }
+        let max_reported =
+            Self::max_checkpoint(observation.max_reported_checkpoint, processed_checkpoint);
+        observation.max_reported_checkpoint = max_reported;
+        if let Some(stored) = replicas
+            .get_mut(&key)
+            .and_then(|replicas| replicas.get_mut(replica_node_id))
+            .filter(|stored| stored.allocation_id == allocation_id)
+        {
+            stored.processed_checkpoint =
+                Self::max_checkpoint(stored.processed_checkpoint, processed_checkpoint);
+            stored.last_updated = Instant::now();
+        }
+        if max_reported.is_some_and(|reported| reported >= observation.target_checkpoint) {
+            if let Some(observations) = gaps.get_mut(&key) {
+                observations.remove(replica_node_id);
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn remove_gap_observation(
+        &self,
+        index: &str,
+        shard_id: u32,
+        replica_node_id: &str,
+        allocation_id: AllocationId,
+        primary_term: u64,
+    ) {
+        let key = ShardKey::new(index, shard_id);
+        let mut gaps = self
+            .gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(observations) = gaps.get_mut(&key) else {
+            return;
+        };
+        if observations
+            .get(replica_node_id)
+            .is_some_and(|observation| {
+                observation.allocation_id == allocation_id
+                    && observation.primary_term == primary_term
+            })
+        {
+            observations.remove(replica_node_id);
+        }
+    }
+
+    pub fn has_gap_observation(
+        &self,
+        index: &str,
+        shard_id: u32,
+        replica_node_id: &str,
+        allocation_id: AllocationId,
+        primary_term: u64,
+    ) -> bool {
+        self.gap_observations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ShardKey::new(index, shard_id))
+            .and_then(|observations| observations.get(replica_node_id))
+            .is_some_and(|observation| {
+                observation.allocation_id == allocation_id
+                    && observation.primary_term == primary_term
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gap_observations(
+        &self,
+        index: &str,
+        shard_id: u32,
+    ) -> Vec<ReplicaGapObservation> {
+        self.gap_observations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ShardKey::new(index, shard_id))
+            .map(|observations| observations.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Remove tracking data for a shard (e.g., when index is deleted).
@@ -489,12 +746,20 @@ impl IsrTracker {
         let key = ShardKey::new(index, shard_id);
         let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
         replicas.remove(&key);
+        self.gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
     }
 
     /// Remove tracking for all shards of an index.
     pub fn remove_index(&self, index: &str) {
         let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
         replicas.retain(|k, _| k.index != index);
+        self.gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| k.index != index);
     }
 }
 
@@ -1203,6 +1468,12 @@ impl ShardManager {
                 || cause.downcast_ref::<std::num::ParseIntError>().is_some()
                 || cause
                     .downcast_ref::<crate::engine::tantivy::AuthoritativeSchemaError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::sequence::PrimaryTermSequenceCollisionError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::tantivy::SequenceOperationCollisionError>()
                     .is_some()
                 || cause
                     .downcast_ref::<tantivy::TantivyError>()
@@ -3511,6 +3782,23 @@ mod tests {
         (dir, mgr)
     }
 
+    fn apply_index(
+        engine: &Arc<dyn SearchEngine>,
+        doc_id: &str,
+        source: serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
+    ) -> Result<crate::engine::ReplicaApplyReceipt> {
+        engine.apply_replica_operation(crate::engine::SequencedOperation {
+            seq_no,
+            primary_term,
+            mutation: crate::engine::DocumentMutation::Index {
+                doc_id: doc_id.to_string(),
+                source,
+            },
+        })
+    }
+
     // ── ShardKey ─────────────────────────────────────────────────────────
 
     #[test]
@@ -3853,6 +4141,37 @@ mod tests {
 
     // ── ISR Tracker ─────────────────────────────────────────────────────
 
+    fn replica_checkpoint(
+        node_id: &str,
+        allocation_id: u64,
+        processed_checkpoint: Option<u64>,
+        persisted_checkpoint: Option<u64>,
+    ) -> ReplicaCheckpointUpdate {
+        ReplicaCheckpointUpdate {
+            node_id: node_id.to_string(),
+            allocation_id,
+            processed_checkpoint,
+            persisted_checkpoint,
+        }
+    }
+
+    fn update_replica_checkpoint(
+        tracker: &IsrTracker,
+        index: &str,
+        shard_id: u32,
+        node_id: &str,
+        checkpoint: u64,
+    ) {
+        tracker.update_replica_checkpoint(
+            index,
+            &format!("{index}-uuid"),
+            shard_id,
+            1,
+            Some(checkpoint),
+            replica_checkpoint(node_id, 1, Some(checkpoint), Some(checkpoint)),
+        );
+    }
+
     #[test]
     fn isr_tracker_empty_returns_no_replicas() {
         let tracker = IsrTracker::new(100);
@@ -3863,8 +4182,8 @@ mod tests {
     #[test]
     fn isr_tracker_update_and_query_checkpoint() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx", 0, "replica-1", 50);
-        tracker.update_replica_checkpoint("idx", 0, "replica-2", 90);
+        update_replica_checkpoint(&tracker, "idx", 0, "replica-1", 50);
+        update_replica_checkpoint(&tracker, "idx", 0, "replica-2", 90);
 
         let cps = tracker.replica_checkpoints("idx", 0);
         assert_eq!(cps.len(), 2);
@@ -3877,8 +4196,8 @@ mod tests {
     #[test]
     fn isr_tracker_lagging_replica_excluded() {
         let tracker = IsrTracker::new(10); // tight lag threshold
-        tracker.update_replica_checkpoint("idx", 0, "replica-1", 95);
-        tracker.update_replica_checkpoint("idx", 0, "replica-2", 50); // way behind
+        update_replica_checkpoint(&tracker, "idx", 0, "replica-1", 95);
+        update_replica_checkpoint(&tracker, "idx", 0, "replica-2", 50);
 
         let isr = tracker.in_sync_replicas("idx", 0, 100);
         assert_eq!(isr.len(), 1);
@@ -3888,29 +4207,108 @@ mod tests {
     #[test]
     fn isr_tracker_update_batch() {
         let tracker = IsrTracker::new(100);
-        let checkpoints = vec![("r1".to_string(), 10), ("r2".to_string(), 20)];
-        tracker.update_replica_checkpoints("idx", 0, &checkpoints);
+        let checkpoints = vec![
+            replica_checkpoint("r1", 1, Some(10), Some(10)),
+            replica_checkpoint("r2", 2, Some(20), Some(20)),
+        ];
+        tracker.update_replica_checkpoints("idx", "idx-uuid", 0, 1, Some(20), &checkpoints);
 
         let cps = tracker.replica_checkpoints("idx", 0);
         assert_eq!(cps.len(), 2);
     }
 
     #[test]
-    fn isr_tracker_update_overwrites_checkpoint() {
+    fn d1_commit3_replica_checkpoint_observation_never_regresses() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx", 0, "r1", 10);
-        tracker.update_replica_checkpoint("idx", 0, "r1", 50);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 3);
 
         let cps = tracker.replica_checkpoints("idx", 0);
         assert_eq!(cps.len(), 1);
-        assert_eq!(cps[0].1, 50);
+        assert_eq!(cps[0].1, 10);
+    }
+
+    #[test]
+    fn replica_gap_target_stays_fixed_until_progress_reaches_it() {
+        let tracker = IsrTracker::new(100);
+        let first_seen = Instant::now();
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(5),
+            },
+            &[replica_checkpoint("r1", 7, Some(0), Some(0))],
+            first_seen,
+        );
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(10),
+            },
+            &[replica_checkpoint("r1", 7, Some(2), Some(2))],
+            first_seen + Duration::from_secs(30),
+        );
+
+        let observations = tracker.gap_observations("idx", 0);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].target_checkpoint, 5);
+        assert_eq!(observations[0].first_seen, first_seen);
+        assert_eq!(observations[0].max_reported_checkpoint, Some(2));
+    }
+
+    #[test]
+    fn reordered_lower_checkpoint_cannot_reopen_a_closed_gap() {
+        let tracker = IsrTracker::new(100);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 3);
+
+        assert!(tracker.gap_observations("idx", 0).is_empty());
+        assert_eq!(
+            tracker.replica_checkpoints("idx", 0),
+            vec![("r1".to_string(), 10)]
+        );
+    }
+
+    #[test]
+    fn deadline_probe_clears_an_idle_gap_at_the_fixed_target() {
+        let tracker = IsrTracker::new(100);
+        let first_seen = Instant::now();
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(5),
+            },
+            &[replica_checkpoint("r1", 7, Some(0), Some(0))],
+            first_seen,
+        );
+        assert_eq!(
+            tracker
+                .expired_gap_observations_at(
+                    Duration::from_secs(60),
+                    first_seen + Duration::from_secs(61)
+                )
+                .len(),
+            1
+        );
+
+        assert!(tracker.record_gap_probe_checkpoint("idx", 0, "r1", 7, Some(5)));
+        assert!(tracker.gap_observations("idx", 0).is_empty());
     }
 
     #[test]
     fn isr_tracker_remove_shard() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx", 0, "r1", 10);
-        tracker.update_replica_checkpoint("idx", 1, "r1", 20);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx", 1, "r1", 20);
 
         tracker.remove_shard("idx", 0);
 
@@ -3921,9 +4319,9 @@ mod tests {
     #[test]
     fn isr_tracker_remove_index() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx-a", 0, "r1", 10);
-        tracker.update_replica_checkpoint("idx-a", 1, "r1", 20);
-        tracker.update_replica_checkpoint("idx-b", 0, "r1", 30);
+        update_replica_checkpoint(&tracker, "idx-a", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx-a", 1, "r1", 20);
+        update_replica_checkpoint(&tracker, "idx-b", 0, "r1", 30);
 
         tracker.remove_index("idx-a");
 
@@ -3935,8 +4333,8 @@ mod tests {
     #[test]
     fn isr_tracker_different_shards_independent() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx", 0, "r1", 10);
-        tracker.update_replica_checkpoint("idx", 1, "r2", 20);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx", 1, "r2", 20);
 
         let cps0 = tracker.replica_checkpoints("idx", 0);
         let cps1 = tracker.replica_checkpoints("idx", 1);
@@ -3949,10 +4347,8 @@ mod tests {
     #[test]
     fn close_index_cleans_isr_tracker() {
         let (_dir, mgr) = create_shard_manager();
-        mgr.isr_tracker
-            .update_replica_checkpoint("my-idx", 0, "r1", 10);
-        mgr.isr_tracker
-            .update_replica_checkpoint("other-idx", 0, "r1", 20);
+        update_replica_checkpoint(&mgr.isr_tracker, "my-idx", 0, "r1", 10);
+        update_replica_checkpoint(&mgr.isr_tracker, "other-idx", 0, "r1", 20);
 
         mgr.close_index_shards("my-idx").unwrap();
 
@@ -4422,9 +4818,7 @@ mod tests {
                 fence_max_seq_no: None,
             })
         );
-        engine
-            .add_document_with_seq_at_term("before-raise", json!({"value": 0}), 0, 2)
-            .unwrap();
+        apply_index(&engine, "before-raise", json!({"value": 0}), 0, 2).unwrap();
         manager
             .raise_copy_fence_blocking("idx".into(), 0, "uuid-1".into(), 7, 5)
             .await
@@ -4674,9 +5068,7 @@ mod tests {
                 },
             )
             .unwrap();
-        engine
-            .add_document_with_seq("preserved", serde_json::json!({"value": 1}), 0)
-            .unwrap();
+        apply_index(&engine, "preserved", serde_json::json!({"value": 1}), 0, 3).unwrap();
         engine.refresh().unwrap();
         assert!(manager.begin_peer_recovery_target("idx", 0));
         manager
@@ -5093,13 +5485,14 @@ mod tests {
                         message_term: 2,
                     },
                     |engine| {
-                        engine
-                            .add_document_with_seq(
-                                "doc",
-                                serde_json::json!({"value": seq_no}),
-                                seq_no,
-                            )
-                            .map(|_| ())
+                        apply_index(
+                            &engine,
+                            "doc",
+                            serde_json::json!({"value": seq_no}),
+                            seq_no,
+                            2,
+                        )
+                        .map(|_| ())
                     },
                 )
                 .unwrap_err();
@@ -5494,9 +5887,7 @@ mod tests {
                     message_term: 2,
                 },
                 |engine| {
-                    engine
-                        .add_document_with_seq("doc", serde_json::json!({"value": 0}), 0)
-                        .map(|_| ())
+                    apply_index(&engine, "doc", serde_json::json!({"value": 0}), 0, 2).map(|_| ())
                 },
             )
             .unwrap_err();
@@ -5513,9 +5904,7 @@ mod tests {
                     message_term: 2,
                 },
                 |engine| {
-                    engine
-                        .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
-                        .map(|_| ())
+                    apply_index(&engine, "doc", serde_json::json!({"value": 1}), 0, 2).map(|_| ())
                 },
             )
             .unwrap();
@@ -5532,9 +5921,7 @@ mod tests {
                     message_term: 2,
                 },
                 |engine| {
-                    engine
-                        .add_document_with_seq("doc", serde_json::json!({"value": 2}), 1)
-                        .map(|_| ())
+                    apply_index(&engine, "doc", serde_json::json!({"value": 2}), 1, 2).map(|_| ())
                 },
             )
             .unwrap_err();
@@ -5552,15 +5939,67 @@ mod tests {
                     message_term: 2,
                 },
                 |engine| {
-                    engine
-                        .add_document_with_seq("doc", serde_json::json!({"value": 3}), 1)
-                        .map(|_| ())
+                    apply_index(&engine, "doc", serde_json::json!({"value": 3}), 1, 2).map(|_| ())
                 },
             )
             .unwrap_err();
         assert!(ShardManager::should_report_copy_failure(
             &persistent_after_reset
         ));
+    }
+
+    #[tokio::test]
+    async fn primary_term_sequence_collision_is_definitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 1,
+                    message_term: 1,
+                },
+                |engine| apply_index(&engine, "doc", json!({"value": 1}), 0, 1).map(|_| ()),
+            )
+            .unwrap();
+        manager
+            .raise_copy_fence_blocking("idx".into(), 0, "uuid-1".into(), 7, 2)
+            .await
+            .unwrap();
+
+        let error = manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| apply_index(&engine, "doc", json!({"value": 2}), 0, 2).map(|_| ()),
+            )
+            .unwrap_err();
+
+        assert!(ShardManager::is_definitive_copy_failure(&error));
+        assert!(ShardManager::should_report_copy_failure(&error));
     }
 
     #[tokio::test]

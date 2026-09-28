@@ -1104,6 +1104,7 @@ async fn stale_primary_replication_is_rejected_by_promoted_target() {
         &serde_json::json!({"value": "old-primary"}),
         "index",
         0,
+        1,
     )
     .await;
 
@@ -3147,7 +3148,7 @@ async fn update_nonexistent_document_returns_not_found() {
 // ─── Recovery & Checkpoint integration tests ────────────────────────────────
 
 #[tokio::test]
-async fn replicate_doc_returns_local_checkpoint() {
+async fn replicate_doc_returns_sequence_proof() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
@@ -3175,10 +3176,13 @@ async fn replicate_doc_returns_local_checkpoint() {
         .into_inner();
 
     assert!(resp.success);
-    assert_eq!(resp.local_checkpoint, 0);
+    assert_eq!(resp.processed_checkpoint, None);
+    assert_eq!(resp.persisted_checkpoint, None);
+    assert!(resp.operation_processed);
+    assert!(resp.operation_persisted);
 
     // Filling the missing prefix closes the gap through sequence 5.
-    let mut checkpoint = 0;
+    let mut checkpoint = None;
     for seq_no in 0..5 {
         let response = client
             .replicate_doc(tonic::Request::new(ReplicateDocRequest {
@@ -3196,9 +3200,11 @@ async fn replicate_doc_returns_local_checkpoint() {
             .unwrap()
             .into_inner();
         assert!(response.success);
-        checkpoint = response.local_checkpoint;
+        assert!(response.operation_processed);
+        assert!(response.operation_persisted);
+        checkpoint = response.processed_checkpoint;
     }
-    assert_eq!(checkpoint, 5);
+    assert_eq!(checkpoint, Some(5));
 
     // A second gap holds the checkpoint at 5 until 6..9 arrive.
     let payload2 = serde_json::json!({"title": "checkpoint test 2"});
@@ -3219,7 +3225,9 @@ async fn replicate_doc_returns_local_checkpoint() {
         .into_inner();
 
     assert!(resp2.success);
-    assert_eq!(resp2.local_checkpoint, 5);
+    assert_eq!(resp2.processed_checkpoint, Some(5));
+    assert!(resp2.operation_processed);
+    assert!(resp2.operation_persisted);
     for seq_no in 6..10 {
         let response = client
             .replicate_doc(tonic::Request::new(ReplicateDocRequest {
@@ -3237,13 +3245,13 @@ async fn replicate_doc_returns_local_checkpoint() {
             .unwrap()
             .into_inner();
         assert!(response.success);
-        checkpoint = response.local_checkpoint;
+        checkpoint = response.processed_checkpoint;
     }
-    assert_eq!(checkpoint, 10);
+    assert_eq!(checkpoint, Some(10));
 }
 
 #[tokio::test]
-async fn replicate_bulk_returns_local_checkpoint() {
+async fn replicate_bulk_returns_sequence_proof() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
@@ -3281,9 +3289,106 @@ async fn replicate_bulk_returns_local_checkpoint() {
 
     assert!(resp.success);
     assert_eq!(
-        resp.local_checkpoint, 2,
+        resp.processed_checkpoint,
+        Some(2),
         "checkpoint should equal the batch's contiguous final sequence"
     );
+    assert_eq!(resp.persisted_checkpoint, Some(2));
+    assert!(resp.all_operations_processed);
+    assert!(resp.all_operations_persisted);
+}
+
+#[tokio::test]
+async fn async_replica_response_separates_processed_from_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("async-sequence-proof".into()));
+    let sm = Arc::new(ShardManager::new_with_durability(
+        dir.path(),
+        Duration::from_secs(60),
+        ferrissearch::wal::TranslogDurability::Async {
+            sync_interval_ms: 3_600_000,
+        },
+    ));
+    setup_single_node_cluster_state(&cm, "async-proof-idx");
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let response = client
+        .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+            index_name: "async-proof-idx".into(),
+            shard_id: 0,
+            doc_id: "doc".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            op: "index".into(),
+            seq_no: 0,
+            index_uuid: "async-proof-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.success, "{}", response.error);
+    assert_eq!(response.processed_checkpoint, Some(0));
+    assert_eq!(response.persisted_checkpoint, None);
+    assert!(response.operation_processed);
+    assert!(!response.operation_persisted);
+}
+
+#[tokio::test]
+async fn sequence_state_probe_reports_exact_open_copy_and_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("sequence-probe".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "probe-idx");
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    let write = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "probe-idx".into(),
+            shard_id: 0,
+            doc_id: "doc".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(write.success, "{}", write.error);
+
+    let response = client
+        .get_shard_sequence_state(tonic::Request::new(proto::GetShardSequenceStateRequest {
+            index_name: "probe-idx".into(),
+            index_uuid: "probe-idx-uuid".into(),
+            shard_id: 0,
+            allocation_id: Some(1),
+            expected_primary_term: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.processed_checkpoint, Some(0));
+    assert_eq!(response.persisted_checkpoint, Some(0));
+    assert_eq!(response.max_seq_no, Some(0));
+    assert_eq!(
+        response.sequence_format_version,
+        ferrissearch::engine::SEQUENCE_FORMAT_VERSION
+    );
+    assert!(response.active_primary);
+
+    let error = client
+        .get_shard_sequence_state(tonic::Request::new(proto::GetShardSequenceStateRequest {
+            index_name: "probe-idx".into(),
+            index_uuid: "probe-idx-uuid".into(),
+            shard_id: 0,
+            allocation_id: Some(2),
+            expected_primary_term: 1,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(sm.get_shard("probe-idx", 0).is_some());
 }
 
 #[tokio::test]
@@ -3329,8 +3434,8 @@ async fn primary_write_advances_global_checkpoint() {
     let primary_engine = primary_sm.get_shard("gc-idx", 0).unwrap();
     let global_cp = primary_engine.global_checkpoint();
     assert!(
-        global_cp > 0,
-        "global checkpoint should advance after successful replication, got {global_cp}"
+        global_cp.is_some_and(|checkpoint| checkpoint > 0),
+        "global checkpoint should advance after successful replication, got {global_cp:?}"
     );
 
     // And the ISR tracker should know about the replica
@@ -3501,7 +3606,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
     }
     assert_eq!(
         primary_sm.get_shard(index, 0).unwrap().global_checkpoint(),
-        40
+        Some(40)
     );
 }
 
@@ -3691,8 +3796,10 @@ async fn bulk_replication_advances_global_checkpoint() {
 
     let engine = primary_sm.get_shard("bgc-idx", 0).unwrap();
     assert!(
-        engine.global_checkpoint() > 0,
-        "global checkpoint should advance after bulk replication, got {}",
+        engine
+            .global_checkpoint()
+            .is_some_and(|checkpoint| checkpoint > 0),
+        "global checkpoint should advance after bulk replication, got {:?}",
         engine.global_checkpoint()
     );
     assert!(
@@ -3758,7 +3865,7 @@ async fn delete_replication_advances_global_checkpoint() {
         .global_checkpoint();
     assert!(
         cp_after_delete > cp_after_index,
-        "global checkpoint should advance after delete replication: {cp_after_delete} > {cp_after_index}"
+        "global checkpoint should advance after delete replication: {cp_after_delete:?} > {cp_after_index:?}"
     );
 }
 

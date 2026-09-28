@@ -46,9 +46,10 @@ impl BulkTargetFailure {
     }
 }
 
-type BulkTargetResults = HashMap<BulkTargetKey, Result<u64, BulkTargetFailure>>;
+type BulkTargetResults =
+    HashMap<BulkTargetKey, Result<crate::engine::BulkWriteReceipt, BulkTargetFailure>>;
 
-fn bulk_success_item(index_name: &str, doc_id: &str, seq_no: u64) -> Value {
+fn bulk_success_item(index_name: &str, doc_id: &str, seq_no: u64, primary_term: u64) -> Value {
     serde_json::json!({
         "index": {
             "_index": index_name,
@@ -58,7 +59,7 @@ fn bulk_success_item(index_name: &str, doc_id: &str, seq_no: u64) -> Value {
             "status": 201,
             "_shards": { "total": 1, "successful": 1, "failed": 0 },
             "_seq_no": seq_no,
-            "_primary_term": 1
+            "_primary_term": primary_term
         }
     })
 }
@@ -162,7 +163,8 @@ async fn forward_bulk_batches(
                     .await?;
                 receipt.start_seq_no.ok_or_else(|| {
                     anyhow::anyhow!("non-empty bulk batch has no assigned starting sequence")
-                })
+                })?;
+                Ok::<_, anyhow::Error>(receipt)
             }));
             shard_keys.push((index_name, node_id, shard_id));
         } else {
@@ -178,8 +180,8 @@ async fn forward_bulk_batches(
     let results = join_all(futures).await;
     for (key, result) in shard_keys.into_iter().zip(results) {
         match result {
-            Ok(Ok(start_seq_no)) => {
-                outcomes.insert(key, Ok(start_seq_no));
+            Ok(Ok(receipt)) => {
+                outcomes.insert(key, Ok(receipt));
             }
             Ok(Err(e)) => {
                 outcomes.insert(key, Err(BulkTargetFailure::from_forward_error(e)));
@@ -218,12 +220,19 @@ pub(super) fn finalize_bulk_items(
                 failure.error_type,
                 &failure.reason,
             ),
-            Some(Ok(start_seq_no)) => {
+            Some(Ok(receipt)) => {
                 let offset = offsets.entry(target).or_default();
-                let seq_no = start_seq_no.checked_add(*offset);
+                let seq_no = receipt
+                    .start_seq_no
+                    .and_then(|start_seq_no| start_seq_no.checked_add(*offset));
                 *offset += 1;
                 match seq_no {
-                    Some(seq_no) => bulk_success_item(&doc.index_name, &doc.doc_id, seq_no),
+                    Some(seq_no) => bulk_success_item(
+                        &doc.index_name,
+                        &doc.doc_id,
+                        seq_no,
+                        receipt.primary_term,
+                    ),
                     None => bulk_error_item(
                         Some(&doc.index_name),
                         &doc.doc_id,

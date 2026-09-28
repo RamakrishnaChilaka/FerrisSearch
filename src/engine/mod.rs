@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub use self::composite::CompositeEngine;
-pub use self::sequence::SequenceStats;
+pub use self::sequence::{SEQUENCE_FORMAT_VERSION, SequenceStats};
 pub use self::tantivy::HotEngine;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,12 +84,14 @@ pub(crate) fn is_write_validation_error(error: &anyhow::Error) -> bool {
 pub struct IndexWriteReceipt {
     pub doc_id: String,
     pub seq_no: u64,
+    pub primary_term: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkWriteReceipt {
     pub doc_ids: Vec<String>,
     pub start_seq_no: Option<u64>,
+    pub primary_term: u64,
 }
 
 impl BulkWriteReceipt {
@@ -109,6 +111,7 @@ impl BulkWriteReceipt {
 pub struct DeleteWriteReceipt {
     pub deleted: u64,
     pub seq_no: u64,
+    pub primary_term: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,25 +322,6 @@ pub trait SearchEngine: Send + Sync {
         primary_term: u64,
     ) -> Result<IndexWriteReceipt>;
 
-    /// Index a single document using a caller-supplied sequence number.
-    /// Replica/recovery paths use this so WAL entries preserve primary-assigned seq_nos.
-    fn add_document_with_seq(
-        &self,
-        doc_id: &str,
-        payload: serde_json::Value,
-        seq_no: u64,
-    ) -> Result<String> {
-        self.add_document_with_seq_at_term(doc_id, payload, seq_no, self.current_primary_term())
-    }
-
-    fn add_document_with_seq_at_term(
-        &self,
-        doc_id: &str,
-        payload: serde_json::Value,
-        seq_no: u64,
-        primary_term: u64,
-    ) -> Result<String>;
-
     /// Bulk-index documents. Each tuple is (doc_id, payload). Returns document IDs.
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
         Ok(self.bulk_add_documents_with_receipt(docs)?.doc_ids)
@@ -356,26 +340,6 @@ pub trait SearchEngine: Send + Sync {
         primary_term: u64,
     ) -> Result<BulkWriteReceipt>;
 
-    /// Bulk-index documents using caller-supplied contiguous sequence numbers.
-    fn bulk_add_documents_with_start_seq(
-        &self,
-        docs: Vec<(String, serde_json::Value)>,
-        start_seq_no: u64,
-    ) -> Result<Vec<String>> {
-        self.bulk_add_documents_with_start_seq_at_term(
-            docs,
-            start_seq_no,
-            self.current_primary_term(),
-        )
-    }
-
-    fn bulk_add_documents_with_start_seq_at_term(
-        &self,
-        docs: Vec<(String, serde_json::Value)>,
-        start_seq_no: u64,
-        primary_term: u64,
-    ) -> Result<Vec<String>>;
-
     /// Delete a document by its `_id`. Returns the number of deleted documents.
     fn delete_document(&self, doc_id: &str) -> Result<u64> {
         Ok(self.delete_document_with_receipt(doc_id)?.deleted)
@@ -391,21 +355,24 @@ pub trait SearchEngine: Send + Sync {
         primary_term: u64,
     ) -> Result<DeleteWriteReceipt>;
 
-    /// Delete a document using a caller-supplied sequence number.
-    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
-        self.delete_document_with_seq_at_term(doc_id, seq_no, self.current_primary_term())
-    }
+    fn apply_replica_operation(&self, operation: SequencedOperation)
+    -> Result<ReplicaApplyReceipt>;
 
-    fn delete_document_with_seq_at_term(
+    fn apply_replica_batch(
         &self,
-        doc_id: &str,
-        seq_no: u64,
-        primary_term: u64,
-    ) -> Result<u64>;
+        operations: Vec<SequencedOperation>,
+    ) -> Result<ReplicaBulkApplyReceipt>;
 
     /// Persist a sequence-numbered no-op without mutating document state.
-    fn apply_noop_with_seq(&self, _reason: &str, _seq_no: u64, _primary_term: u64) -> Result<()> {
-        anyhow::bail!("sequence-numbered no-ops are not supported by this engine")
+    fn apply_noop_with_seq(&self, reason: &str, seq_no: u64, primary_term: u64) -> Result<()> {
+        self.apply_replica_operation(SequencedOperation {
+            seq_no,
+            primary_term,
+            mutation: DocumentMutation::NoOp {
+                reason: reason.to_string(),
+            },
+        })?;
+        Ok(())
     }
 
     /// Retrieve a document by its `_id`. Returns the `_source` JSON if found.
@@ -568,8 +535,8 @@ pub trait SearchEngine: Send + Sync {
 
     /// Get the global checkpoint: min of all in-sync replica checkpoints.
     /// Only meaningful on the primary shard.
-    fn global_checkpoint(&self) -> u64 {
-        0
+    fn global_checkpoint(&self) -> Option<u64> {
+        None
     }
 
     /// Update the global checkpoint (called by primary after collecting replica checkpoints).
@@ -616,12 +583,14 @@ mod tests {
         let receipt = BulkWriteReceipt {
             doc_ids: vec!["a".into(), "b".into()],
             start_seq_no: Some(0),
+            primary_term: 1,
         };
         assert_eq!(receipt.last_seq_no().unwrap(), Some(1));
         assert!(
             BulkWriteReceipt {
                 doc_ids: vec!["a".into()],
                 start_seq_no: None,
+                primary_term: 1,
             }
             .last_seq_no()
             .is_err()
@@ -630,6 +599,7 @@ mod tests {
             BulkWriteReceipt {
                 doc_ids: vec!["a".into(), "b".into()],
                 start_seq_no: Some(u64::MAX),
+                primary_term: 1,
             }
             .last_seq_no()
             .is_err()
@@ -638,6 +608,7 @@ mod tests {
             BulkWriteReceipt {
                 doc_ids: vec![],
                 start_seq_no: None,
+                primary_term: 1,
             }
             .last_seq_no()
             .unwrap(),

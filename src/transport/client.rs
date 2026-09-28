@@ -13,6 +13,14 @@ use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaApplyResponse {
+    pub processed_checkpoint: Option<u64>,
+    pub persisted_checkpoint: Option<u64>,
+    pub operation_processed: bool,
+    pub operation_persisted: bool,
+}
+
 #[derive(Clone)]
 pub struct TransportClient {
     timeout: Duration,
@@ -595,17 +603,21 @@ impl TransportClient {
         &self,
         node: &NodeInfo,
         request: ReplicateDocRequest,
-    ) -> Result<u64, anyhow::Error> {
+    ) -> Result<ReplicaApplyResponse, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let response = client
             .replicate_doc(tonic::Request::new(request))
             .await?
             .into_inner();
-        if response.success {
-            Ok(response.local_checkpoint)
-        } else {
-            Err(anyhow::anyhow!("Replication failed: {}", response.error))
-        }
+        decode_replica_apply_response(
+            response.success,
+            &response.error,
+            response.processed_checkpoint,
+            response.persisted_checkpoint,
+            response.operation_processed,
+            response.operation_persisted,
+            "replication",
+        )
     }
 
     /// Replicate a bulk set of document operations to a replica shard on a remote node.
@@ -613,20 +625,33 @@ impl TransportClient {
         &self,
         node: &NodeInfo,
         request: ReplicateBulkRequest,
-    ) -> Result<u64, anyhow::Error> {
+    ) -> Result<ReplicaApplyResponse, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let response = client
             .replicate_bulk(tonic::Request::new(request))
             .await?
             .into_inner();
-        if response.success {
-            Ok(response.local_checkpoint)
-        } else {
-            Err(anyhow::anyhow!(
-                "Bulk replication failed: {}",
-                response.error
-            ))
-        }
+        decode_replica_apply_response(
+            response.success,
+            &response.error,
+            response.processed_checkpoint,
+            response.persisted_checkpoint,
+            response.all_operations_processed,
+            response.all_operations_persisted,
+            "bulk replication",
+        )
+    }
+
+    pub async fn get_shard_sequence_state(
+        &self,
+        node: &NodeInfo,
+        request: GetShardSequenceStateRequest,
+    ) -> Result<GetShardSequenceStateResponse, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        Ok(client
+            .get_shard_sequence_state(tonic::Request::new(request))
+            .await?
+            .into_inner())
     }
 
     /// Request a retained WAL suffix from the primary.
@@ -1295,11 +1320,18 @@ fn decode_shard_doc_response(
     let seq_no = response.seq_no.ok_or_else(|| {
         anyhow::anyhow!("successful shard index response is missing its assigned sequence")
     })?;
+    let primary_term = response
+        .primary_term
+        .filter(|term| *term > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("successful shard index response is missing its primary term")
+        })?;
     Ok(serde_json::json!({
         "_index": index_name,
         "_id": response.doc_id,
         "_shard": shard_id,
         "_seq_no": seq_no,
+        "_primary_term": primary_term,
         "result": "created"
     }))
 }
@@ -1323,6 +1355,12 @@ fn decode_shard_bulk_response(
     let receipt = crate::engine::BulkWriteReceipt {
         doc_ids: response.doc_ids,
         start_seq_no: response.start_seq_no,
+        primary_term: response
+            .primary_term
+            .filter(|term| *term > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("successful shard bulk response is missing its primary term")
+            })?,
     };
     receipt.last_seq_no()?;
     Ok(receipt)
@@ -1340,13 +1378,56 @@ fn decode_shard_delete_response(
     let seq_no = response.seq_no.ok_or_else(|| {
         anyhow::anyhow!("successful shard delete response is missing its assigned sequence")
     })?;
+    let primary_term = response
+        .primary_term
+        .filter(|term| *term > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("successful shard delete response is missing its primary term")
+        })?;
     Ok(serde_json::json!({
         "_index": index_name,
         "_id": doc_id,
         "_shard": shard_id,
         "_seq_no": seq_no,
+        "_primary_term": primary_term,
         "result": "deleted"
     }))
+}
+
+fn decode_replica_apply_response(
+    success: bool,
+    error: &str,
+    processed_checkpoint: Option<u64>,
+    persisted_checkpoint: Option<u64>,
+    operation_processed: bool,
+    operation_persisted: bool,
+    label: &str,
+) -> Result<ReplicaApplyResponse, anyhow::Error> {
+    if !success {
+        anyhow::bail!("{label} failed: {error}");
+    }
+    if !operation_processed {
+        anyhow::bail!("successful {label} response did not prove the operation was processed");
+    }
+    if persisted_checkpoint.is_some() && processed_checkpoint.is_none() {
+        anyhow::bail!("{label} response has a persisted checkpoint without a processed checkpoint");
+    }
+    if let (Some(persisted), Some(processed)) = (persisted_checkpoint, processed_checkpoint)
+        && persisted > processed
+    {
+        anyhow::bail!(
+            "{label} response persisted checkpoint {persisted} exceeds processed checkpoint {processed}"
+        );
+    }
+    if operation_persisted && !operation_processed {
+        anyhow::bail!("{label} response persisted an unprocessed operation");
+    }
+    Ok(ReplicaApplyResponse {
+        processed_checkpoint,
+        persisted_checkpoint,
+        operation_processed,
+        operation_persisted,
+    })
 }
 
 #[derive(Debug)]
@@ -1520,12 +1601,14 @@ mod tests {
                 doc_id: "generated".into(),
                 error: String::new(),
                 seq_no: Some(0),
+                primary_term: Some(7),
             },
         )
         .unwrap();
 
         assert_eq!(index["_id"], "generated");
         assert_eq!(index["_seq_no"], 0);
+        assert_eq!(index["_primary_term"], 7);
     }
 
     #[test]
@@ -1541,6 +1624,7 @@ mod tests {
                         doc_id: String::new(),
                         error: String::new(),
                         seq_no: Some(0),
+                        primary_term: Some(7),
                     },
                 )
                 .is_err()
@@ -1559,10 +1643,12 @@ mod tests {
                 doc_id: "doc".into(),
                 error: String::new(),
                 seq_no: Some(0),
+                primary_term: Some(7),
             },
         )
         .unwrap();
         assert_eq!(index["_seq_no"], 0);
+        assert_eq!(index["_primary_term"], 7);
         assert!(
             decode_shard_doc_response(
                 "idx",
@@ -1573,6 +1659,7 @@ mod tests {
                     doc_id: "doc".into(),
                     error: String::new(),
                     seq_no: None,
+                    primary_term: Some(7),
                 },
             )
             .is_err()
@@ -1587,6 +1674,7 @@ mod tests {
                     doc_id: "other".into(),
                     error: String::new(),
                     seq_no: Some(0),
+                    primary_term: Some(7),
                 },
             )
             .is_err()
@@ -1603,22 +1691,26 @@ mod tests {
                 doc_ids: vec!["a".into(), "b".into()],
                 error: String::new(),
                 start_seq_no: Some(0),
+                primary_term: Some(7),
             },
         )
         .unwrap();
         assert_eq!(bulk.last_seq_no().unwrap(), Some(1));
+        assert_eq!(bulk.primary_term, 7);
         for response in [
             ShardBulkResponse {
                 success: true,
                 doc_ids: vec!["a".into(), "b".into()],
                 error: String::new(),
                 start_seq_no: None,
+                primary_term: Some(7),
             },
             ShardBulkResponse {
                 success: true,
                 doc_ids: vec!["b".into(), "a".into()],
                 error: String::new(),
                 start_seq_no: Some(0),
+                primary_term: Some(7),
             },
         ] {
             assert!(decode_shard_bulk_response(&docs, response).is_err());
@@ -1631,6 +1723,7 @@ mod tests {
                     doc_ids: vec![],
                     error: String::new(),
                     start_seq_no: Some(0),
+                    primary_term: Some(7),
                 },
             )
             .is_err()
@@ -1645,10 +1738,12 @@ mod tests {
                 deleted: 1,
                 error: String::new(),
                 seq_no: Some(0),
+                primary_term: Some(7),
             },
         )
         .unwrap();
         assert_eq!(delete["_seq_no"], 0);
+        assert_eq!(delete["_primary_term"], 7);
         assert!(
             decode_shard_delete_response(
                 "idx",
@@ -1659,9 +1754,37 @@ mod tests {
                     deleted: 1,
                     error: String::new(),
                     seq_no: None,
+                    primary_term: Some(7),
                 },
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn replica_response_decoder_requires_exact_operation_proof() {
+        let response =
+            decode_replica_apply_response(true, "", None, None, true, false, "replication")
+                .unwrap();
+        assert!(response.operation_processed);
+        assert!(!response.operation_persisted);
+        assert_eq!(response.processed_checkpoint, None);
+
+        assert!(
+            decode_replica_apply_response(
+                true,
+                "",
+                Some(10),
+                Some(10),
+                false,
+                false,
+                "replication",
+            )
+            .is_err()
+        );
+        assert!(
+            decode_replica_apply_response(true, "", Some(5), Some(6), true, true, "replication",)
+                .is_err()
         );
     }
 

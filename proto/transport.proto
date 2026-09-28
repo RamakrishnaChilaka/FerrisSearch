@@ -115,6 +115,7 @@ message ShardDocResponse {
     string doc_id = 2;
     string error = 3;         // empty on success
     optional uint64 seq_no = 4;
+    optional uint64 primary_term = 5;
 }
 
 message ShardDeleteRequest {
@@ -128,6 +129,7 @@ message ShardDeleteResponse {
     uint64 deleted = 2;
     string error = 3;
     optional uint64 seq_no = 4;
+    optional uint64 primary_term = 5;
 }
 
 message ShardGetRequest {
@@ -153,6 +155,7 @@ message ShardBulkResponse {
     repeated string doc_ids = 2;
     string error = 3;
     optional uint64 start_seq_no = 4; // absent for an empty batch
+    optional uint64 primary_term = 5;
 }
 
 message ShardSearchRequest {
@@ -244,7 +247,10 @@ message ReplicateDocRequest {
 message ReplicateDocResponse {
     bool success = 1;
     string error = 2;
-    uint64 local_checkpoint = 3;  // replica's highest contiguous seq_no after apply
+    optional uint64 processed_checkpoint = 3;
+    optional uint64 persisted_checkpoint = 4;
+    bool operation_processed = 5;
+    bool operation_persisted = 6;
 }
 
 message ReplicateBulkRequest {
@@ -259,7 +265,26 @@ message ReplicateBulkRequest {
 message ReplicateBulkResponse {
     bool success = 1;
     string error = 2;
-    uint64 local_checkpoint = 3;  // replica's highest contiguous seq_no after bulk apply
+    optional uint64 processed_checkpoint = 3;
+    optional uint64 persisted_checkpoint = 4;
+    bool all_operations_processed = 5;
+    bool all_operations_persisted = 6;
+}
+
+message GetShardSequenceStateRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    optional uint64 allocation_id = 4;
+    uint64 expected_primary_term = 5;
+}
+
+message GetShardSequenceStateResponse {
+    optional uint64 processed_checkpoint = 1;
+    optional uint64 persisted_checkpoint = 2;
+    optional uint64 max_seq_no = 3;
+    uint32 sequence_format_version = 4;
+    bool active_primary = 5;
 }
 
 // ─── Replica Recovery ───────────────────────────────────────────────────────
@@ -422,6 +447,7 @@ message FailShardCopyRequest {
     string node_id = 4;
     optional uint64 allocation_id = 5;
     bool promote_only = 6;  // required for primary-copy failure reports
+    uint64 expected_primary_term = 7;
 }
 
 message FailShardCopyResponse {
@@ -657,6 +683,7 @@ service InternalTransport {
     // Primary-to-replica replication
     rpc ReplicateDoc(ReplicateDocRequest) returns (ReplicateDocResponse);
     rpc ReplicateBulk(ReplicateBulkRequest) returns (ReplicateBulkResponse);
+    rpc GetShardSequenceState(GetShardSequenceStateRequest) returns (GetShardSequenceStateResponse);
 
     // Replica recovery: replica sends its checkpoint, primary replays translog
     rpc RecoverReplica(RecoverReplicaRequest) returns (RecoverReplicaResponse);

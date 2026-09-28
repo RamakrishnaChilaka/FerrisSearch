@@ -10,21 +10,34 @@ fn open_engine(path: &std::path::Path) -> CompositeEngine {
     CompositeEngine::new(path, Duration::from_secs(3600)).unwrap()
 }
 
+fn apply_index(
+    engine: &dyn SearchEngine,
+    doc_id: &str,
+    source: serde_json::Value,
+    seq_no: u64,
+    primary_term: u64,
+) -> ferrissearch::engine::ReplicaApplyReceipt {
+    engine
+        .apply_replica_operation(ferrissearch::engine::SequencedOperation {
+            seq_no,
+            primary_term,
+            mutation: ferrissearch::engine::DocumentMutation::Index {
+                doc_id: doc_id.to_string(),
+                source,
+            },
+        })
+        .unwrap()
+}
+
 #[test]
 fn restart_replays_historical_older_term_entries_after_a_fence_raise() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = open_engine(dir.path());
-        engine
-            .add_document_with_seq_at_term("a", json!({"v": 0}), 0, 1)
-            .unwrap();
-        engine
-            .add_document_with_seq_at_term("b", json!({"v": 2}), 2, 1)
-            .unwrap();
+        apply_index(&engine, "a", json!({"v": 0}), 0, 1);
+        apply_index(&engine, "b", json!({"v": 2}), 2, 1);
         engine.reconcile_term_sequence_state(2, Some(2)).unwrap();
-        engine
-            .add_document_with_seq_at_term("c", json!({"v": 3}), 3, 2)
-            .unwrap();
+        apply_index(&engine, "c", json!({"v": 3}), 3, 2);
         engine.refresh().unwrap();
     }
 
@@ -68,12 +81,8 @@ fn full_flush_retains_history_above_a_processed_gap() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = open_engine(dir.path());
-        engine
-            .add_document_with_seq_at_term("a", json!({"v": 0}), 0, 1)
-            .unwrap();
-        engine
-            .add_document_with_seq_at_term("b", json!({"v": 2}), 2, 1)
-            .unwrap();
+        apply_index(&engine, "a", json!({"v": 0}), 0, 1);
+        apply_index(&engine, "b", json!({"v": 2}), 2, 1);
         engine.flush().unwrap();
         let retained = engine
             .peer_recovery_ops(0, usize::MAX, usize::MAX)
@@ -83,9 +92,7 @@ fn full_flush_retains_history_above_a_processed_gap() {
     }
 
     let reopened = open_engine(dir.path());
-    reopened
-        .add_document_with_seq_at_term("gap", json!({"v": 1}), 1, 1)
-        .unwrap();
+    apply_index(&reopened, "gap", json!({"v": 1}), 1, 1);
     assert_eq!(reopened.sequence_stats().processed_checkpoint, Some(2));
 }
 
@@ -94,12 +101,8 @@ fn checkpoint_flush_caps_pruning_at_the_processed_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = open_engine(dir.path());
-        engine
-            .add_document_with_seq_at_term("a", json!({"v": 0}), 0, 1)
-            .unwrap();
-        engine
-            .add_document_with_seq_at_term("b", json!({"v": 2}), 2, 1)
-            .unwrap();
+        apply_index(&engine, "a", json!({"v": 0}), 0, 1);
+        apply_index(&engine, "b", json!({"v": 2}), 2, 1);
         engine.reconcile_term_sequence_state(2, Some(2)).unwrap();
         let receipt = engine
             .add_document_with_receipt_at_term("c", json!({"v": 3}), 2)
@@ -117,9 +120,7 @@ fn checkpoint_flush_caps_pruning_at_the_processed_checkpoint() {
     }
 
     let reopened = open_engine(dir.path());
-    reopened
-        .add_document_with_seq_at_term("gap", json!({"v": 1}), 1, 2)
-        .unwrap();
+    apply_index(&reopened, "gap", json!({"v": 1}), 1, 2);
     assert_eq!(reopened.sequence_stats().processed_checkpoint, Some(3));
 }
 

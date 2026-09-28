@@ -483,6 +483,7 @@ impl ClusterStateMachine {
                 shard_id,
                 node,
                 allocation_id,
+                expected_primary_term,
                 promote_only,
                 promotion_candidate,
             } => {
@@ -512,6 +513,17 @@ impl ClusterStateMachine {
                         "index '{index_name}' has no shard {shard_id}"
                     ));
                 };
+                if *expected_primary_term == 0 {
+                    return ClusterResponse::Error(format!(
+                        "failed-copy primary term must be greater than zero for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if current_routing.primary_term != *expected_primary_term {
+                    return ClusterResponse::Error(format!(
+                        "primary term mismatch for failed copy of index '{index_name}' shard {shard_id}: expected {}, got {}",
+                        current_routing.primary_term, expected_primary_term
+                    ));
+                }
                 if !current_allocations.primary_initialized {
                     return ClusterResponse::Error(format!(
                         "cannot fail shard copy for uninitialized index '{index_name}' shard {shard_id}"
@@ -1437,6 +1449,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 9,
+                    expected_primary_term: 2,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1452,6 +1465,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1494,6 +1508,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1508,6 +1523,73 @@ mod tests {
                 .shard_allocation_id("idx", 0, "node-2"),
             Some(14)
         );
+    }
+
+    #[test]
+    fn delayed_old_term_failure_cannot_remove_replica() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("idx");
+        metadata.number_of_replicas = 1;
+        {
+            let routing = metadata.shard_routing.get_mut(&0).unwrap();
+            routing.replicas = vec!["node-2".into()];
+            routing.in_sync_replicas = vec!["node-2".into()];
+        }
+        let index_uuid = metadata.uuid.to_string();
+        assert_eq!(
+            sm.apply_command_at(&ClusterCommand::CreateIndex { metadata }, 10),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::ActivatePrimary {
+                    index_name: "idx".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                    expected_term: 1,
+                },
+                11,
+            ),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::ActivatePrimary {
+                    index_name: "idx".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                    expected_term: 2,
+                },
+                12,
+            ),
+            ClusterResponse::Ok
+        );
+        let version_before = sm.state_handle().read().unwrap().version;
+
+        assert!(matches!(
+            sm.apply_command_at(
+                &ClusterCommand::FailShardCopy {
+                    index_name: "idx".into(),
+                    index_uuid,
+                    shard_id: 0,
+                    node: "node-2".into(),
+                    allocation_id: 10,
+                    expected_primary_term: 2,
+                    promote_only: false,
+                    promotion_candidate: None,
+                },
+                13,
+            ),
+            ClusterResponse::Error(error) if error.contains("primary term mismatch")
+        ));
+        let state = sm.state_handle();
+        let state = state.read().unwrap();
+        assert_eq!(state.version, version_before);
+        assert_eq!(state.shard_allocation_id("idx", 0, "node-2"), Some(10));
     }
 
     #[test]
@@ -1529,6 +1611,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 1,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1580,6 +1663,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: true,
                     promotion_candidate: Some("node-2".into()),
                 },
@@ -1631,6 +1715,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1646,6 +1731,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: true,
                     promotion_candidate: None,
                 },
@@ -1885,6 +1971,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: true,
                     promotion_candidate: Some("node-3".into()),
                 },
@@ -1900,6 +1987,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: true,
                     promotion_candidate: Some("node-2".into()),
                 },

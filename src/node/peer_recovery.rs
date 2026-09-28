@@ -900,38 +900,45 @@ async fn apply_recovery_operations(
 
     let engine_for_apply = engine.clone();
     tokio::task::spawn_blocking(move || {
-        for operation in decoded {
-            match operation {
+        let operations = decoded
+            .into_iter()
+            .map(|operation| match operation {
                 TargetOperation::Index {
                     seq_no,
                     primary_term,
                     doc_id,
                     payload,
-                } => {
-                    engine_for_apply
-                        .add_document_with_seq_at_term(&doc_id, payload, seq_no, primary_term)
-                        .map_err(ShardManager::local_storage_failure)?;
-                }
+                } => crate::engine::SequencedOperation {
+                    seq_no,
+                    primary_term,
+                    mutation: crate::engine::DocumentMutation::Index {
+                        doc_id,
+                        source: payload,
+                    },
+                },
                 TargetOperation::Delete {
                     seq_no,
                     primary_term,
                     doc_id,
-                } => {
-                    engine_for_apply
-                        .delete_document_with_seq_at_term(&doc_id, seq_no, primary_term)
-                        .map_err(ShardManager::local_storage_failure)?;
-                }
+                } => crate::engine::SequencedOperation {
+                    seq_no,
+                    primary_term,
+                    mutation: crate::engine::DocumentMutation::Delete { doc_id },
+                },
                 TargetOperation::NoOp {
                     seq_no,
                     primary_term,
                     reason,
-                } => {
-                    engine_for_apply
-                        .apply_noop_with_seq(&reason, seq_no, primary_term)
-                        .map_err(ShardManager::local_storage_failure)?;
-                }
-            }
-        }
+                } => crate::engine::SequencedOperation {
+                    seq_no,
+                    primary_term,
+                    mutation: crate::engine::DocumentMutation::NoOp { reason },
+                },
+            })
+            .collect();
+        engine_for_apply
+            .apply_replica_batch(operations)
+            .map_err(ShardManager::local_storage_failure)?;
         Ok::<(), anyhow::Error>(())
     })
     .await
@@ -1003,6 +1010,25 @@ mod tests {
         create_transport_service_for_test, create_transport_service_with_raft,
     };
     use std::collections::HashMap;
+
+    fn apply_index(
+        engine: &Arc<dyn SearchEngine>,
+        doc_id: &str,
+        source: serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
+    ) {
+        engine
+            .apply_replica_operation(crate::engine::SequencedOperation {
+                seq_no,
+                primary_term,
+                mutation: crate::engine::DocumentMutation::Index {
+                    doc_id: doc_id.to_string(),
+                    source,
+                },
+            })
+            .unwrap();
+    }
 
     async fn wait_for_leader(raft: &crate::consensus::types::RaftInstance) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1393,9 +1419,13 @@ mod tests {
                 "lagged-uuid",
             )
             .unwrap();
-        target_engine
-            .add_document_with_seq("acked", serde_json::json!({"value": 1}), 0)
-            .unwrap();
+        apply_index(
+            &target_engine,
+            "acked",
+            serde_json::json!({"value": 1}),
+            0,
+            1,
+        );
         target_engine.refresh().unwrap();
 
         let driver = PeerRecoveryDriver::new(2);
@@ -1642,9 +1672,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            engine
-                .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
-                .unwrap();
+            apply_index(&engine, "doc", serde_json::json!({"value": 1}), 0, 1);
             engine.refresh().unwrap();
             engine.flush().unwrap();
             assert!(first.begin_peer_recovery_target("docs", 0));
@@ -1764,9 +1792,13 @@ mod tests {
                 },
             )
             .unwrap();
-        source_engine
-            .add_document_with_seq("source-copy", serde_json::json!({"value": "source"}), 0)
-            .unwrap();
+        apply_index(
+            &source_engine,
+            "source-copy",
+            serde_json::json!({"value": "source"}),
+            0,
+            7,
+        );
         source_engine.refresh().unwrap();
         source_engine.flush().unwrap();
         let source_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
@@ -1801,9 +1833,13 @@ mod tests {
                     },
                 )
                 .unwrap();
-            target_engine
-                .add_document_with_seq("pending-copy", serde_json::json!({"value": "pending"}), 0)
-                .unwrap();
+            apply_index(
+                &target_engine,
+                "pending-copy",
+                serde_json::json!({"value": "pending"}),
+                0,
+                7,
+            );
             target_engine.refresh().unwrap();
             target_engine.flush().unwrap();
             assert!(first_target.begin_peer_recovery_target("docs", 0));
@@ -1969,9 +2005,13 @@ mod tests {
                 },
             )
             .unwrap();
-        target_engine
-            .add_document_with_seq("base", serde_json::json!({"value": 0}), 0)
-            .unwrap();
+        apply_index(
+            &target_engine,
+            "base",
+            serde_json::json!({"value": 0}),
+            0,
+            2,
+        );
         target_engine.refresh().unwrap();
         assert!(target_shards.begin_peer_recovery_target("pending", 0));
         let pending = PeerRecoveryAwaitingMembership {
@@ -2101,9 +2141,7 @@ mod tests {
                 "promoted-uuid",
             )
             .unwrap();
-        engine
-            .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
-            .unwrap();
+        apply_index(&engine, "doc", serde_json::json!({"value": 1}), 0, 1);
         engine.refresh().unwrap();
         assert!(first_manager.begin_peer_recovery_target("promoted", 0));
         first_manager

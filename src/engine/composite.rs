@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use super::SearchEngine;
@@ -22,8 +22,8 @@ pub struct CompositeEngine {
     text: HotEngine,
     vector: RwLock<Option<VectorIndex>>,
     data_dir: std::path::PathBuf,
-    /// Monotonic replicated high-water mark (primary only).
-    global_cp: std::sync::atomic::AtomicU64,
+    /// Monotonic replicated persisted checkpoint (primary only).
+    global_cp: Mutex<Option<u64>>,
     /// Shared column cache for fast-field Arrow arrays.
     #[allow(dead_code)]
     column_cache: Arc<super::column_cache::ColumnCache>,
@@ -86,7 +86,7 @@ impl CompositeEngine {
             text,
             vector: RwLock::new(vector),
             data_dir,
-            global_cp: std::sync::atomic::AtomicU64::new(0),
+            global_cp: Mutex::new(None),
             column_cache,
         })
     }
@@ -111,7 +111,7 @@ impl CompositeEngine {
             text,
             vector: RwLock::new(None),
             data_dir,
-            global_cp: std::sync::atomic::AtomicU64::new(0),
+            global_cp: Mutex::new(None),
             column_cache,
         })
     }
@@ -137,7 +137,7 @@ impl CompositeEngine {
             text,
             vector: RwLock::new(None),
             data_dir,
-            global_cp: std::sync::atomic::AtomicU64::new(0),
+            global_cp: Mutex::new(None),
             column_cache,
         })
     }
@@ -161,7 +161,7 @@ impl CompositeEngine {
             text,
             vector: RwLock::new(None),
             data_dir,
-            global_cp: std::sync::atomic::AtomicU64::new(0),
+            global_cp: Mutex::new(None),
             column_cache,
         })
     }
@@ -311,17 +311,13 @@ impl CompositeEngine {
             return Ok(false);
         }
 
-        // `flush_with_global_checkpoint(0)` falls back to full truncation.
-        // A zero checkpoint is ambiguous in this codebase, so skip auto-flush
-        // until it advances past zero instead of risking loss of replica
-        // recovery history.
-        if self.global_checkpoint() == 0 {
+        let Some(global_checkpoint) = self.global_checkpoint() else {
             tracing::debug!(
-                "Skipping auto-flush with translog size {} bytes because global checkpoint is 0",
+                "Skipping auto-flush with translog size {} bytes because no global checkpoint is available",
                 tl_size
             );
             return Ok(false);
-        }
+        };
 
         tracing::info!(
             "Translog size ({} bytes) exceeds threshold ({} bytes), auto-flushing",
@@ -330,7 +326,7 @@ impl CompositeEngine {
         );
         if !self
             .text
-            .try_flush_with_global_checkpoint(self.global_checkpoint())?
+            .try_flush_with_global_checkpoint(global_checkpoint)?
         {
             tracing::debug!(
                 "Skipping auto-flush with translog size {} bytes because the shard is busy ingesting or committing",
@@ -559,30 +555,6 @@ impl SearchEngine for CompositeEngine {
         Ok(receipt)
     }
 
-    fn add_document_with_seq_at_term(
-        &self,
-        doc_id: &str,
-        payload: serde_json::Value,
-        seq_no: u64,
-        primary_term: u64,
-    ) -> Result<String> {
-        let prepared = self.prepare_vector_mutation(&payload)?;
-        let operation = super::SequencedOperation {
-            seq_no,
-            primary_term,
-            mutation: super::DocumentMutation::Index {
-                doc_id: doc_id.to_string(),
-                source: payload,
-            },
-        };
-        self.text
-            .apply_sequenced_operation_with_side_effect(operation.clone(), |operation| {
-                self.apply_prepared_vector_mutation(operation, &prepared)
-            })?;
-        self.update_local_checkpoint(seq_no);
-        Ok(doc_id.to_string())
-    }
-
     fn bulk_add_documents_with_receipt_at_term(
         &self,
         docs: Vec<(String, serde_json::Value)>,
@@ -608,51 +580,6 @@ impl SearchEngine for CompositeEngine {
         Ok(receipt)
     }
 
-    fn bulk_add_documents_with_start_seq_at_term(
-        &self,
-        docs: Vec<(String, serde_json::Value)>,
-        start_seq_no: u64,
-        primary_term: u64,
-    ) -> Result<Vec<String>> {
-        let prepared = docs
-            .iter()
-            .map(|(_, payload)| self.prepare_vector_mutation(payload))
-            .collect::<Result<Vec<_>>>()?;
-        let operations = docs
-            .iter()
-            .enumerate()
-            .map(|(offset, (doc_id, source))| super::SequencedOperation {
-                seq_no: start_seq_no + offset as u64,
-                primary_term,
-                mutation: super::DocumentMutation::Index {
-                    doc_id: doc_id.clone(),
-                    source: source.clone(),
-                },
-            })
-            .collect::<Vec<_>>();
-        let mut prepared_by_seq = operations
-            .iter()
-            .zip(prepared.iter())
-            .map(|(operation, prepared)| (operation.seq_no, prepared))
-            .collect::<std::collections::HashMap<_, _>>();
-        self.text
-            .apply_sequenced_batch_with_side_effect(operations, true, |operation| {
-                let prepared = prepared_by_seq
-                    .remove(&operation.seq_no)
-                    .expect("prepared vector mutation must match the operation");
-                self.apply_prepared_vector_mutation(operation, prepared)
-            })?;
-        let ids = docs
-            .into_iter()
-            .map(|(doc_id, _)| doc_id)
-            .collect::<Vec<_>>();
-
-        if !ids.is_empty() {
-            self.update_local_checkpoint(start_seq_no + (ids.len() - 1) as u64);
-        }
-        Ok(ids)
-    }
-
     fn delete_document_with_receipt_at_term(
         &self,
         doc_id: &str,
@@ -667,33 +594,47 @@ impl SearchEngine for CompositeEngine {
         Ok(receipt)
     }
 
-    fn delete_document_with_seq_at_term(
+    fn apply_replica_operation(
         &self,
-        doc_id: &str,
-        seq_no: u64,
-        primary_term: u64,
-    ) -> Result<u64> {
-        self.text.apply_sequenced_operation_with_side_effect(
-            super::SequencedOperation {
-                seq_no,
-                primary_term,
-                mutation: super::DocumentMutation::Delete {
-                    doc_id: doc_id.to_string(),
-                },
-            },
-            |operation| {
-                self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
-            },
-        )?;
-        self.update_local_checkpoint(seq_no);
-        Ok(1)
+        operation: super::SequencedOperation,
+    ) -> Result<super::ReplicaApplyReceipt> {
+        let prepared = match &operation.mutation {
+            super::DocumentMutation::Index { source, .. } => {
+                self.prepare_vector_mutation(source)?
+            }
+            super::DocumentMutation::Delete { .. } => PreparedVectorMutation::Delete,
+            super::DocumentMutation::NoOp { .. } => PreparedVectorMutation::None,
+        };
+        self.text
+            .apply_sequenced_operation_with_side_effect(operation, |operation| {
+                self.apply_prepared_vector_mutation(operation, &prepared)
+            })
     }
 
-    fn apply_noop_with_seq(&self, reason: &str, seq_no: u64, primary_term: u64) -> Result<()> {
+    fn apply_replica_batch(
+        &self,
+        operations: Vec<super::SequencedOperation>,
+    ) -> Result<super::ReplicaBulkApplyReceipt> {
+        let mut prepared_by_identity = operations
+            .iter()
+            .map(|operation| {
+                let prepared = match &operation.mutation {
+                    super::DocumentMutation::Index { source, .. } => {
+                        self.prepare_vector_mutation(source)?
+                    }
+                    super::DocumentMutation::Delete { .. } => PreparedVectorMutation::Delete,
+                    super::DocumentMutation::NoOp { .. } => PreparedVectorMutation::None,
+                };
+                Ok(((operation.primary_term, operation.seq_no), prepared))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
         self.text
-            .apply_noop_with_seq(reason, seq_no, primary_term)?;
-        self.update_local_checkpoint(seq_no);
-        Ok(())
+            .apply_sequenced_batch_with_side_effect(operations, true, |operation| {
+                let prepared = prepared_by_identity
+                    .remove(&(operation.primary_term, operation.seq_no))
+                    .expect("prepared vector mutation must match the operation");
+                self.apply_prepared_vector_mutation(operation, &prepared)
+            })
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -722,8 +663,11 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn flush_with_global_checkpoint(&self) -> Result<()> {
-        self.text
-            .flush_with_global_checkpoint(self.global_checkpoint())?;
+        if let Some(global_checkpoint) = self.global_checkpoint() {
+            self.text.flush_with_global_checkpoint(global_checkpoint)?;
+        } else {
+            self.text.flush_without_truncation()?;
+        }
         self.save_vectors()?;
         Ok(())
     }
@@ -879,13 +823,19 @@ impl SearchEngine for CompositeEngine {
         self.text.current_primary_term()
     }
 
-    fn global_checkpoint(&self) -> u64 {
-        self.global_cp.load(std::sync::atomic::Ordering::Relaxed)
+    fn global_checkpoint(&self) -> Option<u64> {
+        *self
+            .global_cp
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn update_global_checkpoint(&self, checkpoint: u64) {
-        self.global_cp
-            .fetch_max(checkpoint, std::sync::atomic::Ordering::Relaxed);
+        let mut global = self
+            .global_cp
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *global = Some(global.map_or(checkpoint, |current| current.max(checkpoint)));
     }
 
     fn create_peer_recovery_snapshot(
@@ -1601,16 +1551,16 @@ mod tests {
     }
 
     #[test]
-    fn global_checkpoint_starts_at_zero() {
+    fn global_checkpoint_starts_unavailable() {
         let (_dir, engine) = create_engine();
-        assert_eq!(engine.global_checkpoint(), 0);
+        assert_eq!(engine.global_checkpoint(), None);
     }
 
     #[test]
     fn update_global_checkpoint_stores_value() {
         let (_dir, engine) = create_engine();
         engine.update_global_checkpoint(42);
-        assert_eq!(engine.global_checkpoint(), 42);
+        assert_eq!(engine.global_checkpoint(), Some(42));
     }
 
     #[test]
@@ -1650,14 +1600,14 @@ mod tests {
     }
 
     #[test]
-    fn maybe_auto_flush_skips_when_global_checkpoint_is_zero() {
+    fn maybe_auto_flush_skips_when_global_checkpoint_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
         engine.add_document("d1", json!({"x": 1})).unwrap();
 
         let before = engine.text.translog_size_bytes();
         assert!(before > 0);
-        assert_eq!(engine.global_checkpoint(), 0);
+        assert_eq!(engine.global_checkpoint(), None);
 
         let flushed = engine.maybe_auto_flush(1).unwrap();
 
@@ -1820,7 +1770,14 @@ mod tests {
         let (_dir, engine) = create_engine();
 
         engine
-            .add_document_with_seq("replica-doc", json!({"x": 1}), 7)
+            .apply_replica_operation(super::super::SequencedOperation {
+                seq_no: 7,
+                primary_term: 1,
+                mutation: super::super::DocumentMutation::Index {
+                    doc_id: "replica-doc".into(),
+                    source: json!({"x": 1}),
+                },
+            })
             .unwrap();
 
         assert_eq!(engine.sequence_stats().processed_checkpoint, None);
@@ -1832,13 +1789,19 @@ mod tests {
         let (_dir, engine) = create_engine();
 
         engine
-            .bulk_add_documents_with_start_seq(
-                vec![
-                    ("b1".into(), json!({"x": 1})),
-                    ("b2".into(), json!({"x": 2})),
-                    ("b3".into(), json!({"x": 3})),
-                ],
-                10,
+            .apply_replica_batch(
+                ["b1", "b2", "b3"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, doc_id)| super::super::SequencedOperation {
+                        seq_no: 10 + offset as u64,
+                        primary_term: 1,
+                        mutation: super::super::DocumentMutation::Index {
+                            doc_id: doc_id.into(),
+                            source: json!({"x": offset + 1}),
+                        },
+                    })
+                    .collect(),
             )
             .unwrap();
 
@@ -1850,10 +1813,10 @@ mod tests {
     fn update_global_checkpoint_never_regresses() {
         let (_dir, engine) = create_engine();
         engine.update_global_checkpoint(10);
-        assert_eq!(engine.global_checkpoint(), 10);
+        assert_eq!(engine.global_checkpoint(), Some(10));
 
         engine.update_global_checkpoint(5);
-        assert_eq!(engine.global_checkpoint(), 10);
+        assert_eq!(engine.global_checkpoint(), Some(10));
     }
 
     #[test]
@@ -1900,15 +1863,18 @@ mod tests {
     #[test]
     fn primary_terms_are_preserved_in_receipts_and_wal_entries() {
         let (_dir, engine) = create_engine();
-        engine
+        let index = engine
             .add_document_with_receipt_at_term("one", json!({"value": 1}), 7)
             .unwrap();
-        engine
+        let bulk = engine
             .bulk_add_documents_with_receipt_at_term(vec![("two".into(), json!({"value": 2}))], 7)
             .unwrap();
-        engine
+        let delete = engine
             .delete_document_with_receipt_at_term("one", 7)
             .unwrap();
+        assert_eq!(index.primary_term, 7);
+        assert_eq!(bulk.primary_term, 7);
+        assert_eq!(delete.primary_term, 7);
 
         let operations = engine
             .peer_recovery_ops(0, usize::MAX, usize::MAX)
@@ -1946,10 +1912,14 @@ mod tests {
             .bulk_add_documents(vec![("two".into(), json!({"tags": [3, 4]}))])
             .unwrap();
         engine
-            .bulk_add_documents_with_start_seq(
-                vec![("replica".into(), json!({"tags": [5, 6]}))],
-                10,
-            )
+            .apply_replica_batch(vec![super::super::SequencedOperation {
+                seq_no: 10,
+                primary_term: 1,
+                mutation: super::super::DocumentMutation::Index {
+                    doc_id: "replica".into(),
+                    source: json!({"tags": [5, 6]}),
+                },
+            }])
             .unwrap();
         assert!(engine.vector.read().unwrap().is_none());
     }

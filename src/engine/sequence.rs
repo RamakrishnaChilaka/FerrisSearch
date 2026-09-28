@@ -7,6 +7,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 pub(crate) const COMMITTED_BOUNDARY_FORMAT_VERSION: u32 = 1;
+pub const SEQUENCE_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SequenceStats {

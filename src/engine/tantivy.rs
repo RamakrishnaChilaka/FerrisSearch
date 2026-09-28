@@ -1868,6 +1868,7 @@ impl HotEngine {
         Ok(super::IndexWriteReceipt {
             doc_id: doc_id.to_string(),
             seq_no,
+            primary_term,
         })
     }
 
@@ -1939,6 +1940,7 @@ impl HotEngine {
         Ok(super::BulkWriteReceipt {
             doc_ids,
             start_seq_no,
+            primary_term,
         })
     }
 
@@ -1980,7 +1982,11 @@ impl HotEngine {
                 )?;
                 Ok(receipt.seq_no)
             })?;
-        Ok(super::DeleteWriteReceipt { deleted: 1, seq_no })
+        Ok(super::DeleteWriteReceipt {
+            deleted: 1,
+            seq_no,
+            primary_term,
+        })
     }
 
     fn fail_writer_after_wal(&self, error: &anyhow::Error) {
@@ -3930,6 +3936,23 @@ impl HotEngine {
                 tl.truncate_below(global_checkpoint.min(processed_checkpoint))?;
             }
             Ok(())
+        })
+    }
+
+    pub fn flush_without_truncation(&self) -> Result<()> {
+        let _maintenance = self.maintenance_guard("flush without truncation")?;
+        self.with_translog("flush without truncation", |tl| {
+            let mut writer_state = self.writer_state_with_replay(tl, "flush without truncation")?;
+            let boundary = self.current_committed_boundary()?;
+            let committed_boundary = self.commit_writer_at_boundary(
+                &mut writer_state,
+                "flush without truncation",
+                boundary,
+            )?;
+            drop(writer_state);
+            self.reader.reload()?;
+            self.persist_committed_boundary(&committed_boundary)?;
+            self.validate_truncation_boundary(tl, &committed_boundary)
         })
     }
 
@@ -7307,62 +7330,12 @@ impl super::SearchEngine for HotEngine {
         self.add_primary_index_with_side_effect(doc_id, payload, primary_term, |_| Ok(()))
     }
 
-    fn add_document_with_seq_at_term(
-        &self,
-        doc_id: &str,
-        payload: serde_json::Value,
-        seq_no: u64,
-        primary_term: u64,
-    ) -> Result<String> {
-        self.validate_keyword_documents(std::iter::once(&payload))?;
-        self.apply_sequenced_operation_with_side_effect(
-            super::SequencedOperation {
-                seq_no,
-                primary_term,
-                mutation: super::DocumentMutation::Index {
-                    doc_id: doc_id.to_string(),
-                    source: payload,
-                },
-            },
-            |_| Ok(()),
-        )?;
-        Ok(doc_id.to_string())
-    }
-
     fn bulk_add_documents_with_receipt_at_term(
         &self,
         docs: Vec<(String, serde_json::Value)>,
         primary_term: u64,
     ) -> Result<super::BulkWriteReceipt> {
         self.add_primary_bulk_with_side_effect(docs, primary_term, |_| Ok(()))
-    }
-
-    fn bulk_add_documents_with_start_seq_at_term(
-        &self,
-        docs: Vec<(String, serde_json::Value)>,
-        start_seq_no: u64,
-        primary_term: u64,
-    ) -> Result<Vec<String>> {
-        self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
-        let operations = docs
-            .iter()
-            .enumerate()
-            .map(|(offset, (doc_id, payload))| {
-                Ok(super::SequencedOperation {
-                    seq_no: start_seq_no
-                        .checked_add(offset as u64)
-                        .ok_or_else(|| anyhow::anyhow!("replica WAL sequence range overflows"))?,
-                    primary_term,
-                    mutation: super::DocumentMutation::Index {
-                        doc_id: doc_id.clone(),
-                        source: payload.clone(),
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.apply_sequenced_batch_with_side_effect(operations, true, |_| Ok(()))?;
-        let doc_ids = docs.into_iter().map(|(doc_id, _)| doc_id).collect();
-        Ok(doc_ids)
     }
 
     fn delete_document_with_receipt_at_term(
@@ -7373,37 +7346,28 @@ impl super::SearchEngine for HotEngine {
         self.delete_primary_with_side_effect(doc_id, primary_term, |_| Ok(()))
     }
 
-    fn delete_document_with_seq_at_term(
+    fn apply_replica_operation(
         &self,
-        doc_id: &str,
-        seq_no: u64,
-        primary_term: u64,
-    ) -> Result<u64> {
-        self.apply_sequenced_operation_with_side_effect(
-            super::SequencedOperation {
-                seq_no,
-                primary_term,
-                mutation: super::DocumentMutation::Delete {
-                    doc_id: doc_id.to_string(),
-                },
-            },
-            |_| Ok(()),
-        )?;
-        Ok(1)
+        operation: super::SequencedOperation,
+    ) -> Result<super::ReplicaApplyReceipt> {
+        if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
+            self.validate_keyword_documents(std::iter::once(source))?;
+        }
+        self.apply_sequenced_operation_with_side_effect(operation, |_| Ok(()))
     }
 
-    fn apply_noop_with_seq(&self, reason: &str, seq_no: u64, primary_term: u64) -> Result<()> {
-        self.apply_sequenced_operation_with_side_effect(
-            super::SequencedOperation {
-                seq_no,
-                primary_term,
-                mutation: super::DocumentMutation::NoOp {
-                    reason: reason.to_string(),
-                },
-            },
-            |_| Ok(()),
-        )?;
-        Ok(())
+    fn apply_replica_batch(
+        &self,
+        operations: Vec<super::SequencedOperation>,
+    ) -> Result<super::ReplicaBulkApplyReceipt> {
+        self.validate_keyword_documents(operations.iter().filter_map(|operation| {
+            if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
+                Some(source)
+            } else {
+                None
+            }
+        }))?;
+        self.apply_sequenced_batch_with_side_effect(operations, true, |_| Ok(()))
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -8584,6 +8548,25 @@ mod tests {
         (dir, engine)
     }
 
+    fn apply_index(
+        engine: &dyn SearchEngine,
+        doc_id: &str,
+        source: serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
+    ) -> super::super::ReplicaApplyReceipt {
+        engine
+            .apply_replica_operation(super::super::SequencedOperation {
+                seq_no,
+                primary_term,
+                mutation: super::super::DocumentMutation::Index {
+                    doc_id: doc_id.to_string(),
+                    source,
+                },
+            })
+            .unwrap()
+    }
+
     fn persist_empty_committed_boundary(path: &Path) {
         CommittedBoundaryRecord::empty(0)
             .persist(&path.join("translog.committed"))
@@ -8932,18 +8915,14 @@ mod tests {
         );
         assert_eq!(engine.legacy_migration_checkpoint(), Some(0));
 
-        engine
-            .add_document_with_seq_at_term("legacy", json!({"value": "stale"}), 0, 2)
-            .unwrap();
+        apply_index(&engine, "legacy", json!({"value": "stale"}), 0, 2);
         engine.refresh().unwrap();
         assert_eq!(
             engine.get_document("legacy").unwrap().unwrap()["value"],
             "legacy"
         );
 
-        engine
-            .add_document_with_seq_at_term("legacy", json!({"value": "native"}), 1, 2)
-            .unwrap();
+        apply_index(&engine, "legacy", json!({"value": "native"}), 1, 2);
         engine.refresh().unwrap();
         assert_eq!(
             engine.get_document("legacy").unwrap().unwrap()["value"],
@@ -9006,9 +8985,7 @@ mod tests {
     fn indexed_document_stores_exact_sequence_identity_fast_fields() {
         let dir = tempfile::tempdir().unwrap();
         let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
-        engine
-            .add_document_with_seq_at_term("doc", json!({"value": 1}), 7, 3)
-            .unwrap();
+        apply_index(&engine, "doc", json!({"value": 1}), 7, 3);
         engine.refresh().unwrap();
         let registry = engine.field_registry.read().unwrap();
         let searcher = engine.reader.searcher();
@@ -9516,7 +9493,14 @@ mod tests {
         );
         assert!(
             engine
-                .add_document_with_seq("replica", invalid, 42)
+                .apply_replica_operation(super::super::SequencedOperation {
+                    seq_no: 42,
+                    primary_term: 1,
+                    mutation: super::super::DocumentMutation::Index {
+                        doc_id: "replica".into(),
+                        source: invalid,
+                    },
+                })
                 .is_err()
         );
         assert_eq!(
@@ -9945,9 +9929,7 @@ mod tests {
     fn stale_apply_during_commit_to_reload_window_uses_old_version_map() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap());
-        engine
-            .add_document_with_seq_at_term("doc", json!({"value": 2}), 1, 1)
-            .unwrap();
+        apply_index(engine.as_ref(), "doc", json!({"value": 2}), 1, 1);
         let (committed_tx, committed_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         engine.pause_after_refresh_commit_for_test(committed_tx, release_rx);
@@ -9955,9 +9937,7 @@ mod tests {
         let refresh_engine = engine.clone();
         let refresh = std::thread::spawn(move || refresh_engine.refresh());
         committed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        engine
-            .add_document_with_seq_at_term("doc", json!({"value": 1}), 0, 1)
-            .unwrap();
+        apply_index(engine.as_ref(), "doc", json!({"value": 1}), 0, 1);
         release_tx.send(()).unwrap();
         refresh.join().unwrap().unwrap();
 

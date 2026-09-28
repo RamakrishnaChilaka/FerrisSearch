@@ -5,6 +5,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+fn apply_index(
+    engine: &Arc<dyn crate::engine::SearchEngine>,
+    doc_id: &str,
+    source: serde_json::Value,
+    seq_no: u64,
+    primary_term: u64,
+) {
+    engine
+        .apply_replica_operation(crate::engine::SequencedOperation {
+            seq_no,
+            primary_term,
+            mutation: crate::engine::DocumentMutation::Index {
+                doc_id: doc_id.to_string(),
+                source,
+            },
+        })
+        .unwrap();
+}
+
 #[tokio::test]
 async fn node_rejects_excessive_peer_recovery_concurrency() {
     let config = crate::config::AppConfig {
@@ -1184,9 +1203,7 @@ async fn corrupt_in_sync_replica_copy_is_reported_as_definitive() {
                 },
             )
             .unwrap();
-        engine
-            .add_document_with_seq("acked", serde_json::json!({"value": 1}), 0)
-            .unwrap();
+        apply_index(&engine, "acked", serde_json::json!({"value": 1}), 0, 1);
     }
     let manifest = dir.path().join("idx-uuid/shard_0/translog.manifest");
     assert!(manifest.exists());
@@ -1368,6 +1385,7 @@ async fn corrupt_in_sync_replica_is_failed_and_replication_resumes() {
             &serde_json::json!({"value": 2}),
             "index",
             1,
+            2,
         )
         .await
         .is_ok(),
@@ -1542,9 +1560,7 @@ async fn published_pending_marker_recovers_in_memory_state_without_restart() {
             },
         )
         .unwrap();
-    engine
-        .add_document_with_seq("preserved", serde_json::json!({"value": 1}), 0)
-        .unwrap();
+    apply_index(&engine, "preserved", serde_json::json!({"value": 1}), 0, 1);
     engine.refresh().unwrap();
     assert!(
         manager

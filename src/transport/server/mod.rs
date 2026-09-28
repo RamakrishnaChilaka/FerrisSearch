@@ -544,6 +544,7 @@ impl InternalTransport for TransportService {
                     doc_id: req.doc_id,
                     error,
                     seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -558,6 +559,7 @@ impl InternalTransport for TransportService {
                     doc_id: req.doc_id,
                     error,
                     seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -573,6 +575,7 @@ impl InternalTransport for TransportService {
                     doc_id: req.doc_id,
                     error,
                     seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -603,6 +606,7 @@ impl InternalTransport for TransportService {
                     doc_id,
                     error,
                     seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -645,7 +649,8 @@ impl InternalTransport for TransportService {
             Ok(receipt) => {
                 let id = receipt.doc_id;
                 let seq_no = receipt.seq_no;
-                let primary_term = activated_primary.primary_term;
+                let primary_term = receipt.primary_term;
+                let primary_sequence = engine.sequence_stats();
                 self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
@@ -653,7 +658,7 @@ impl InternalTransport for TransportService {
                 );
 
                 // Replicate to replica shards with seq_no
-                match crate::replication::replicate_write_with_term(
+                match crate::replication::replicate_write(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -667,14 +672,12 @@ impl InternalTransport for TransportService {
                 .await
                 {
                     Ok(replica_checkpoints) => {
-                        Self::advance_global_checkpoint(
+                        self.record_replica_checkpoints(
                             &engine,
-                            engine.local_checkpoint(),
-                            &replica_checkpoints,
-                        );
-                        self.shard_manager.isr_tracker.update_replica_checkpoints(
                             &req.index_name,
                             req.shard_id,
+                            &activated_primary,
+                            primary_sequence,
                             &replica_checkpoints,
                         );
                     }
@@ -690,6 +693,7 @@ impl InternalTransport for TransportService {
                             doc_id: id,
                             error: format!("Replication failed: {}", errors.join("; ")),
                             seq_no: Some(seq_no),
+                            primary_term: Some(primary_term),
                         }));
                     }
                 }
@@ -699,10 +703,14 @@ impl InternalTransport for TransportService {
                     doc_id: id,
                     error: String::new(),
                     seq_no: Some(seq_no),
+                    primary_term: Some(primary_term),
                 }))
             }
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
+            }
+            Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
+                Err(Status::resource_exhausted(e.to_string()))
             }
             Err(e) => {
                 self.report_local_copy_failure(
@@ -710,6 +718,7 @@ impl InternalTransport for TransportService {
                     &activated_primary.index_uuid,
                     req.shard_id,
                     activated_primary.allocation_id,
+                    activated_primary.primary_term,
                     &e,
                 )
                 .await;
@@ -718,6 +727,7 @@ impl InternalTransport for TransportService {
                     doc_id: String::new(),
                     error: e.to_string(),
                     seq_no: None,
+                    primary_term: None,
                 }))
             }
         }
@@ -740,6 +750,7 @@ impl InternalTransport for TransportService {
                     doc_ids: Vec::new(),
                     error,
                     start_seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -754,6 +765,7 @@ impl InternalTransport for TransportService {
                     doc_ids: Vec::new(),
                     error,
                     start_seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -769,6 +781,7 @@ impl InternalTransport for TransportService {
                     doc_ids: Vec::new(),
                     error,
                     start_seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -804,6 +817,7 @@ impl InternalTransport for TransportService {
                     doc_ids: Vec::new(),
                     error,
                     start_seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -849,13 +863,15 @@ impl InternalTransport for TransportService {
                     .last_seq_no()
                     .map_err(|e| Status::internal(e.to_string()))?;
                 let ids = receipt.doc_ids;
-                let primary_term = activated_primary.primary_term;
+                let primary_term = receipt.primary_term;
+                let primary_sequence = engine.sequence_stats();
                 let Some(start_seq_no) = receipt.start_seq_no else {
                     return Ok(Response::new(ShardBulkResponse {
                         success: true,
                         doc_ids: ids,
                         error: String::new(),
                         start_seq_no: None,
+                        primary_term: Some(primary_term),
                     }));
                 };
                 last_seq_no.ok_or_else(|| {
@@ -867,7 +883,7 @@ impl InternalTransport for TransportService {
                     &activated_primary,
                 );
                 // Replicate to replica shards
-                match crate::replication::replicate_bulk_with_term(
+                match crate::replication::replicate_bulk(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -879,14 +895,12 @@ impl InternalTransport for TransportService {
                 .await
                 {
                     Ok(replica_checkpoints) => {
-                        Self::advance_global_checkpoint(
+                        self.record_replica_checkpoints(
                             &engine,
-                            engine.local_checkpoint(),
-                            &replica_checkpoints,
-                        );
-                        self.shard_manager.isr_tracker.update_replica_checkpoints(
                             &req.index_name,
                             req.shard_id,
+                            &activated_primary,
+                            primary_sequence,
                             &replica_checkpoints,
                         );
                     }
@@ -902,6 +916,7 @@ impl InternalTransport for TransportService {
                             doc_ids: ids,
                             error: format!("Replication failed: {}", errors.join("; ")),
                             start_seq_no: Some(start_seq_no),
+                            primary_term: Some(primary_term),
                         }));
                     }
                 }
@@ -912,10 +927,14 @@ impl InternalTransport for TransportService {
                     doc_ids: ids,
                     error: String::new(),
                     start_seq_no: Some(start_seq_no),
+                    primary_term: Some(primary_term),
                 }))
             }
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
+            }
+            Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
+                Err(Status::resource_exhausted(e.to_string()))
             }
             Err(e) => {
                 self.report_local_copy_failure(
@@ -923,6 +942,7 @@ impl InternalTransport for TransportService {
                     &activated_primary.index_uuid,
                     req.shard_id,
                     activated_primary.allocation_id,
+                    activated_primary.primary_term,
                     &e,
                 )
                 .await;
@@ -931,6 +951,7 @@ impl InternalTransport for TransportService {
                     doc_ids: vec![],
                     error: e.to_string(),
                     start_seq_no: None,
+                    primary_term: None,
                 }))
             }
         }
@@ -952,6 +973,7 @@ impl InternalTransport for TransportService {
                     deleted: 0,
                     error,
                     seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -966,6 +988,7 @@ impl InternalTransport for TransportService {
                     deleted: 0,
                     error,
                     seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -981,6 +1004,7 @@ impl InternalTransport for TransportService {
                     deleted: 0,
                     error,
                     seq_no: None,
+                    primary_term: None,
                 }));
             }
         };
@@ -1021,14 +1045,15 @@ impl InternalTransport for TransportService {
             Ok(receipt) => {
                 let deleted = receipt.deleted;
                 let seq_no = receipt.seq_no;
-                let primary_term = activated_primary.primary_term;
+                let primary_term = receipt.primary_term;
+                let primary_sequence = engine.sequence_stats();
                 self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
                     &activated_primary,
                 );
                 // Replicate delete to replica shards
-                match crate::replication::replicate_write_with_term(
+                match crate::replication::replicate_write(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -1042,14 +1067,12 @@ impl InternalTransport for TransportService {
                 .await
                 {
                     Ok(replica_checkpoints) => {
-                        Self::advance_global_checkpoint(
+                        self.record_replica_checkpoints(
                             &engine,
-                            engine.local_checkpoint(),
-                            &replica_checkpoints,
-                        );
-                        self.shard_manager.isr_tracker.update_replica_checkpoints(
                             &req.index_name,
                             req.shard_id,
+                            &activated_primary,
+                            primary_sequence,
                             &replica_checkpoints,
                         );
                     }
@@ -1065,6 +1088,7 @@ impl InternalTransport for TransportService {
                             deleted,
                             error: format!("Replication failed: {}", errors.join("; ")),
                             seq_no: Some(seq_no),
+                            primary_term: Some(primary_term),
                         }));
                     }
                 }
@@ -1073,10 +1097,14 @@ impl InternalTransport for TransportService {
                     deleted,
                     error: String::new(),
                     seq_no: Some(seq_no),
+                    primary_term: Some(primary_term),
                 }))
             }
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
+            }
+            Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
+                Err(Status::resource_exhausted(e.to_string()))
             }
             Err(e) => {
                 self.report_local_copy_failure(
@@ -1084,6 +1112,7 @@ impl InternalTransport for TransportService {
                     &activated_primary.index_uuid,
                     req.shard_id,
                     activated_primary.allocation_id,
+                    activated_primary.primary_term,
                     &e,
                 )
                 .await;
@@ -1092,6 +1121,7 @@ impl InternalTransport for TransportService {
                     deleted: 0,
                     error: e.to_string(),
                     seq_no: None,
+                    primary_term: None,
                 }))
             }
         }
@@ -1677,7 +1707,10 @@ impl InternalTransport for TransportService {
                 return Ok(Response::new(ReplicateDocResponse {
                     success: false,
                     error,
-                    local_checkpoint: 0,
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
+                    operation_processed: false,
+                    operation_persisted: false,
                 }));
             }
         };
@@ -1688,7 +1721,10 @@ impl InternalTransport for TransportService {
             return Ok(Response::new(ReplicateDocResponse {
                 success: false,
                 error: "replica is installing a peer recovery snapshot".to_string(),
-                local_checkpoint: 0,
+                processed_checkpoint: None,
+                persisted_checkpoint: None,
+                operation_processed: false,
+                operation_persisted: false,
             }));
         }
         let assigned_uuid = assigned.index_uuid.clone();
@@ -1715,6 +1751,7 @@ impl InternalTransport for TransportService {
                     &assigned_uuid,
                     req.shard_id,
                     allocation_id,
+                    primary_term,
                     &error,
                 )
                 .await;
@@ -1722,7 +1759,10 @@ impl InternalTransport for TransportService {
             return Ok(Response::new(ReplicateDocResponse {
                 success: false,
                 error: format!("failed to open replica copy: {error}"),
-                local_checkpoint: 0,
+                processed_checkpoint: None,
+                persisted_checkpoint: None,
+                operation_processed: false,
+                operation_persisted: false,
             }));
         }
 
@@ -1731,16 +1771,15 @@ impl InternalTransport for TransportService {
             req.op, req.doc_id, req.seq_no, req.index_name, req.shard_id
         );
 
-        enum ReplicaOperation {
-            Index(serde_json::Value),
-            Delete,
-        }
         let operation = match req.op.as_str() {
-            "index" => ReplicaOperation::Index(
-                serde_json::from_slice(&req.payload_json)
+            "index" => crate::engine::DocumentMutation::Index {
+                doc_id: req.doc_id.clone(),
+                source: serde_json::from_slice(&req.payload_json)
                     .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?,
-            ),
-            "delete" => ReplicaOperation::Delete,
+            },
+            "delete" => crate::engine::DocumentMutation::Delete {
+                doc_id: req.doc_id.clone(),
+            },
             other => {
                 return Err(Status::invalid_argument(format!(
                     "unknown replication op: {other}"
@@ -1751,7 +1790,6 @@ impl InternalTransport for TransportService {
         let index_name = req.index_name.clone();
         let index_uuid = req.index_uuid.clone();
         let shard_id = req.shard_id;
-        let doc_id = req.doc_id.clone();
         let seq_no = req.seq_no;
         let result = self
             .worker_pools
@@ -1769,24 +1807,11 @@ impl InternalTransport for TransportService {
                         message_term: primary_term,
                     },
                     |engine| {
-                        match operation {
-                            ReplicaOperation::Index(payload) => {
-                                engine.add_document_with_seq_at_term(
-                                    &doc_id,
-                                    payload,
-                                    seq_no,
-                                    primary_term,
-                                )?;
-                            }
-                            ReplicaOperation::Delete => {
-                                engine.delete_document_with_seq_at_term(
-                                    &doc_id,
-                                    seq_no,
-                                    primary_term,
-                                )?;
-                            }
-                        }
-                        Ok(engine.local_checkpoint())
+                        engine.apply_replica_operation(crate::engine::SequencedOperation {
+                            seq_no,
+                            primary_term,
+                            mutation: operation,
+                        })
                     },
                 )
             })
@@ -1794,10 +1819,13 @@ impl InternalTransport for TransportService {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
-            Ok(local_checkpoint) => Ok(Response::new(ReplicateDocResponse {
+            Ok(receipt) => Ok(Response::new(ReplicateDocResponse {
                 success: true,
                 error: String::new(),
-                local_checkpoint,
+                processed_checkpoint: receipt.sequence.processed_checkpoint,
+                persisted_checkpoint: receipt.sequence.persisted_checkpoint,
+                operation_processed: receipt.operation_processed,
+                operation_persisted: receipt.operation_persisted,
             })),
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
@@ -1809,17 +1837,26 @@ impl InternalTransport for TransportService {
                         &assigned_uuid,
                         req.shard_id,
                         allocation_id,
+                        primary_term,
                         &e,
                     )
                     .await;
                 }
+                let sequence = self
+                    .shard_manager
+                    .get_shard(&req.index_name, req.shard_id)
+                    .map(|engine| engine.sequence_stats());
                 Ok(Response::new(ReplicateDocResponse {
                     success: false,
                     error: e.to_string(),
-                    local_checkpoint: self
-                        .shard_manager
-                        .get_shard(&req.index_name, req.shard_id)
-                        .map_or(0, |engine| engine.local_checkpoint()),
+                    processed_checkpoint: sequence
+                        .as_ref()
+                        .and_then(|stats| stats.processed_checkpoint),
+                    persisted_checkpoint: sequence
+                        .as_ref()
+                        .and_then(|stats| stats.persisted_checkpoint),
+                    operation_processed: false,
+                    operation_persisted: false,
                 }))
             }
         }
@@ -1856,7 +1893,10 @@ impl InternalTransport for TransportService {
                 return Ok(Response::new(ReplicateBulkResponse {
                     success: false,
                     error,
-                    local_checkpoint: 0,
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
+                    all_operations_processed: false,
+                    all_operations_persisted: false,
                 }));
             }
         };
@@ -1867,7 +1907,10 @@ impl InternalTransport for TransportService {
             return Ok(Response::new(ReplicateBulkResponse {
                 success: false,
                 error: "replica is installing a peer recovery snapshot".to_string(),
-                local_checkpoint: 0,
+                processed_checkpoint: None,
+                persisted_checkpoint: None,
+                all_operations_processed: false,
+                all_operations_persisted: false,
             }));
         }
         let assigned_uuid = assigned.index_uuid.clone();
@@ -1894,6 +1937,7 @@ impl InternalTransport for TransportService {
                     &assigned_uuid,
                     req.shard_id,
                     allocation_id,
+                    primary_term,
                     &error,
                 )
                 .await;
@@ -1901,7 +1945,10 @@ impl InternalTransport for TransportService {
             return Ok(Response::new(ReplicateBulkResponse {
                 success: false,
                 error: format!("failed to open replica copy: {error}"),
-                local_checkpoint: 0,
+                processed_checkpoint: None,
+                persisted_checkpoint: None,
+                all_operations_processed: false,
+                all_operations_persisted: false,
             }));
         }
 
@@ -1913,7 +1960,7 @@ impl InternalTransport for TransportService {
         );
 
         let start_seq_no = req.ops.first().map_or(0, |first| first.seq_no);
-        let mut docs = Vec::with_capacity(req.ops.len());
+        let mut operations = Vec::with_capacity(req.ops.len());
         for (offset, op) in req.ops.iter().enumerate() {
             if op.index_name != req.index_name
                 || op.shard_id != req.shard_id
@@ -1942,7 +1989,14 @@ impl InternalTransport for TransportService {
                 serde_json::from_slice(&op.payload_json).map_err(|e| {
                     Status::invalid_argument(format!("invalid JSON in bulk replicate: {e}"))
                 })?;
-            docs.push((op.doc_id.clone(), payload));
+            operations.push(crate::engine::SequencedOperation {
+                seq_no: op.seq_no,
+                primary_term,
+                mutation: crate::engine::DocumentMutation::Index {
+                    doc_id: op.doc_id.clone(),
+                    source: payload,
+                },
+            });
         }
 
         let service = self.clone();
@@ -1964,26 +2018,20 @@ impl InternalTransport for TransportService {
                         applied_view_term: current.primary_term,
                         message_term: primary_term,
                     },
-                    |engine| {
-                        if !docs.is_empty() {
-                            engine.bulk_add_documents_with_start_seq_at_term(
-                                docs,
-                                start_seq_no,
-                                primary_term,
-                            )?;
-                        }
-                        Ok(engine.local_checkpoint())
-                    },
+                    |engine| engine.apply_replica_batch(operations),
                 )
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         match write_result {
-            Ok(local_checkpoint) => Ok(Response::new(ReplicateBulkResponse {
+            Ok(receipt) => Ok(Response::new(ReplicateBulkResponse {
                 success: true,
                 error: String::new(),
-                local_checkpoint,
+                processed_checkpoint: receipt.sequence.processed_checkpoint,
+                persisted_checkpoint: receipt.sequence.persisted_checkpoint,
+                all_operations_processed: receipt.all_operations_processed,
+                all_operations_persisted: receipt.all_operations_persisted,
             })),
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
@@ -1995,20 +2043,112 @@ impl InternalTransport for TransportService {
                         &assigned_uuid,
                         req.shard_id,
                         allocation_id,
+                        primary_term,
                         &e,
                     )
                     .await;
                 }
+                let sequence = self
+                    .shard_manager
+                    .get_shard(&req.index_name, req.shard_id)
+                    .map(|engine| engine.sequence_stats());
                 Ok(Response::new(ReplicateBulkResponse {
                     success: false,
                     error: e.to_string(),
-                    local_checkpoint: self
-                        .shard_manager
-                        .get_shard(&req.index_name, req.shard_id)
-                        .map_or(0, |engine| engine.local_checkpoint()),
+                    processed_checkpoint: sequence
+                        .as_ref()
+                        .and_then(|stats| stats.processed_checkpoint),
+                    persisted_checkpoint: sequence
+                        .as_ref()
+                        .and_then(|stats| stats.persisted_checkpoint),
+                    all_operations_processed: false,
+                    all_operations_persisted: false,
                 }))
             }
         }
+    }
+
+    async fn get_shard_sequence_state(
+        &self,
+        request: Request<GetShardSequenceStateRequest>,
+    ) -> Result<Response<GetShardSequenceStateResponse>, Status> {
+        let req = request.into_inner();
+        if req.index_name.is_empty() || req.index_uuid.is_empty() {
+            return Err(Status::invalid_argument(
+                "sequence-state probe requires index name and UUID",
+            ));
+        }
+        let allocation_id = req
+            .allocation_id
+            .filter(|allocation_id| *allocation_id > 0)
+            .ok_or_else(|| {
+                Status::invalid_argument("sequence-state probe requires an allocation ID")
+            })?;
+        if req.expected_primary_term == 0 {
+            return Err(Status::invalid_argument(
+                "sequence-state probe requires an expected primary term",
+            ));
+        }
+
+        let state = self.cluster_manager.get_state();
+        let metadata = state
+            .indices
+            .get(&req.index_name)
+            .ok_or_else(|| Status::not_found("sequence-state probe index is unavailable"))?;
+        if metadata.uuid.as_str() != req.index_uuid {
+            return Err(Status::failed_precondition(
+                "sequence-state probe index UUID mismatch",
+            ));
+        }
+        let routing = metadata
+            .shard_routing
+            .get(&req.shard_id)
+            .ok_or_else(|| Status::not_found("sequence-state probe shard is unavailable"))?;
+        if state.shard_allocation_id(&req.index_name, req.shard_id, &self.local_node_id)
+            != Some(allocation_id)
+        {
+            return Err(Status::failed_precondition(
+                "sequence-state probe allocation mismatch",
+            ));
+        }
+        let identity = self
+            .shard_manager
+            .copy_identity(&req.index_name, req.shard_id)
+            .ok_or_else(|| Status::not_found("sequence-state probe copy is not open"))?;
+        if identity.index_uuid != req.index_uuid || identity.allocation_id != allocation_id {
+            return Err(Status::failed_precondition(
+                "sequence-state probe durable identity mismatch",
+            ));
+        }
+        if req.expected_primary_term < identity.replica_fence {
+            return Err(Status::failed_precondition(format!(
+                "sequence-state probe term {} is below durable fence {}",
+                req.expected_primary_term, identity.replica_fence
+            )));
+        }
+        let engine = self
+            .shard_manager
+            .get_shard(&req.index_name, req.shard_id)
+            .ok_or_else(|| Status::not_found("sequence-state probe copy is not open"))?;
+        let sequence = engine.sequence_stats();
+        let active_primary = routing.primary == self.local_node_id
+            && routing.primary_term == req.expected_primary_term
+            && identity.replica_fence == routing.primary_term
+            && self
+                .primary_activation_state
+                .activated_terms
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&(req.index_uuid.clone(), req.shard_id, allocation_id))
+                .is_some_and(|term| *term == routing.primary_term);
+
+        Ok(Response::new(GetShardSequenceStateResponse {
+            processed_checkpoint: sequence.processed_checkpoint,
+            persisted_checkpoint: sequence.persisted_checkpoint,
+            max_seq_no: sequence.max_seq_no,
+            sequence_format_version: crate::engine::SEQUENCE_FORMAT_VERSION,
+            active_primary,
+        }))
     }
 
     async fn recover_replica(
@@ -2493,9 +2633,25 @@ impl InternalTransport for TransportService {
                 "FailShardCopy allocation ID must be greater than zero",
             ));
         }
+        if req.expected_primary_term == 0 {
+            return Err(Status::invalid_argument(
+                "FailShardCopy requires an expected primary term",
+            ));
+        }
 
         let promotion_candidate = if req.promote_only {
             let state = self.cluster_manager.get_state();
+            if state
+                .indices
+                .get(&req.index_name)
+                .and_then(|metadata| metadata.shard_routing.get(&req.shard_id))
+                .is_none_or(|routing| routing.primary_term != req.expected_primary_term)
+            {
+                return Ok(Response::new(FailShardCopyResponse {
+                    acknowledged: false,
+                    error: "FailShardCopy primary term does not match current routing".to_string(),
+                }));
+            }
             let promotion_candidate =
                 self.select_live_promotion_candidate(&state, &req.index_name, req.shard_id);
             if promotion_candidate.is_none()
@@ -2539,6 +2695,7 @@ impl InternalTransport for TransportService {
                 shard_id: req.shard_id,
                 node: req.node_id,
                 allocation_id,
+                expected_primary_term: req.expected_primary_term,
                 promote_only: req.promote_only,
                 promotion_candidate,
             }
@@ -3322,12 +3479,210 @@ impl TransportService {
         })
     }
 
+    pub(crate) async fn reconcile_replica_gaps(&self) {
+        const GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        let observations = self
+            .shard_manager
+            .isr_tracker
+            .expired_gap_observations(GAP_TIMEOUT);
+        for (key, observation) in observations {
+            let state = self.cluster_manager.get_state();
+            let current = state
+                .indices
+                .get(&key.index)
+                .and_then(|metadata| {
+                    metadata
+                        .shard_routing
+                        .get(&key.shard_id)
+                        .map(|routing| (metadata, routing))
+                })
+                .filter(|(metadata, routing)| {
+                    metadata.uuid.as_str() == observation.index_uuid
+                        && routing.primary == self.local_node_id
+                        && routing.primary_term == observation.primary_term
+                        && state.shard_allocation_id(
+                            &key.index,
+                            key.shard_id,
+                            &observation.replica_node_id,
+                        ) == Some(observation.allocation_id)
+                });
+            let Some((_, _)) = current else {
+                self.shard_manager.isr_tracker.remove_gap_observation(
+                    &key.index,
+                    key.shard_id,
+                    &observation.replica_node_id,
+                    observation.allocation_id,
+                    observation.primary_term,
+                );
+                continue;
+            };
+
+            let should_fail = match state.nodes.get(&observation.replica_node_id) {
+                Some(replica) => match self
+                    .transport_client
+                    .get_shard_sequence_state(
+                        replica,
+                        GetShardSequenceStateRequest {
+                            index_name: key.index.clone(),
+                            index_uuid: observation.index_uuid.clone(),
+                            shard_id: key.shard_id,
+                            allocation_id: Some(observation.allocation_id),
+                            expected_primary_term: observation.primary_term,
+                        },
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        if response.sequence_format_version
+                            != crate::engine::SEQUENCE_FORMAT_VERSION
+                        {
+                            self.shard_manager.isr_tracker.has_gap_observation(
+                                &key.index,
+                                key.shard_id,
+                                &observation.replica_node_id,
+                                observation.allocation_id,
+                                observation.primary_term,
+                            )
+                        } else if self.shard_manager.isr_tracker.record_gap_probe_checkpoint(
+                            &key.index,
+                            key.shard_id,
+                            &observation.replica_node_id,
+                            observation.allocation_id,
+                            response.processed_checkpoint,
+                        ) {
+                            false
+                        } else {
+                            self.shard_manager.isr_tracker.has_gap_observation(
+                                &key.index,
+                                key.shard_id,
+                                &observation.replica_node_id,
+                                observation.allocation_id,
+                                observation.primary_term,
+                            )
+                        }
+                    }
+                    Err(error) => {
+                        let definitive =
+                            error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+                                matches!(
+                                    status.code(),
+                                    tonic::Code::InvalidArgument
+                                        | tonic::Code::NotFound
+                                        | tonic::Code::FailedPrecondition
+                                        | tonic::Code::DataLoss
+                                )
+                            });
+                        if !definitive {
+                            tracing::warn!(
+                                index = key.index,
+                                shard_id = key.shard_id,
+                                replica = observation.replica_node_id,
+                                allocation_id = observation.allocation_id,
+                                error = %error,
+                                "Replica gap probe failed transiently; retaining the fixed target"
+                            );
+                        }
+                        definitive
+                            && self.shard_manager.isr_tracker.has_gap_observation(
+                                &key.index,
+                                key.shard_id,
+                                &observation.replica_node_id,
+                                observation.allocation_id,
+                                observation.primary_term,
+                            )
+                    }
+                },
+                None => self.shard_manager.isr_tracker.has_gap_observation(
+                    &key.index,
+                    key.shard_id,
+                    &observation.replica_node_id,
+                    observation.allocation_id,
+                    observation.primary_term,
+                ),
+            };
+            if !should_fail {
+                continue;
+            }
+
+            let command = crate::consensus::types::ClusterCommand::FailShardCopy {
+                index_name: key.index.clone(),
+                index_uuid: observation.index_uuid.clone(),
+                shard_id: key.shard_id,
+                node: observation.replica_node_id.clone(),
+                allocation_id: observation.allocation_id,
+                expected_primary_term: observation.primary_term,
+                promote_only: false,
+                promotion_candidate: None,
+            };
+            let result = if self.raft.as_ref().is_some_and(|raft| raft.is_leader()) {
+                crate::consensus::client_write_checked(
+                    self.raft
+                        .as_ref()
+                        .expect("Raft presence checked for leader gap report"),
+                    command,
+                )
+                .await
+                .map_err(anyhow::Error::msg)
+            } else {
+                let Some(master_id) = state.master_node.as_ref() else {
+                    tracing::warn!(
+                        index = key.index,
+                        shard_id = key.shard_id,
+                        "Cannot report replica gap because no Raft leader is known"
+                    );
+                    continue;
+                };
+                let Some(master) = state.nodes.get(master_id) else {
+                    tracing::warn!(
+                        index = key.index,
+                        shard_id = key.shard_id,
+                        master = master_id,
+                        "Cannot report replica gap because the Raft leader is absent"
+                    );
+                    continue;
+                };
+                self.transport_client
+                    .forward_fail_shard_copy(
+                        master,
+                        FailShardCopyRequest {
+                            index_name: key.index.clone(),
+                            index_uuid: observation.index_uuid.clone(),
+                            shard_id: key.shard_id,
+                            node_id: observation.replica_node_id.clone(),
+                            allocation_id: Some(observation.allocation_id),
+                            promote_only: false,
+                            expected_primary_term: observation.primary_term,
+                        },
+                    )
+                    .await
+            };
+            match result {
+                Ok(()) => self.shard_manager.isr_tracker.remove_gap_observation(
+                    &key.index,
+                    key.shard_id,
+                    &observation.replica_node_id,
+                    observation.allocation_id,
+                    observation.primary_term,
+                ),
+                Err(error) => tracing::warn!(
+                    index = key.index,
+                    shard_id = key.shard_id,
+                    replica = observation.replica_node_id,
+                    allocation_id = observation.allocation_id,
+                    error = %error,
+                    "Failed to remove replica after the fixed gap target remained unmet"
+                ),
+            }
+        }
+    }
+
     async fn report_local_copy_failure(
         &self,
         index_name: &str,
         index_uuid: &str,
         shard_id: u32,
         allocation_id: u64,
+        expected_primary_term: u64,
         error: &anyhow::Error,
     ) {
         if !ShardManager::should_report_copy_failure(error) {
@@ -3349,6 +3704,7 @@ impl TransportService {
         };
         if metadata.uuid.as_str() != index_uuid
             || !current.primary_initialized(index_name, shard_id)
+            || routing.primary_term != expected_primary_term
             || current.shard_allocation_id(index_name, shard_id, &self.local_node_id)
                 != Some(allocation_id)
         {
@@ -3460,6 +3816,7 @@ impl TransportService {
                     shard_id,
                     node: self.local_node_id.clone(),
                     allocation_id,
+                    expected_primary_term,
                     promote_only,
                     promotion_candidate,
                 }
@@ -3498,6 +3855,7 @@ impl TransportService {
                         node_id: self.local_node_id.clone(),
                         allocation_id: Some(allocation_id),
                         promote_only,
+                        expected_primary_term,
                     },
                 )
                 .await
@@ -3752,6 +4110,7 @@ impl TransportService {
                 &current.index_uuid,
                 shard_id,
                 current.allocation_id,
+                current.primary_term,
                 &error,
             )
             .await;
@@ -3773,12 +4132,18 @@ impl TransportService {
                 &current.index_uuid,
                 shard_id,
                 current.allocation_id,
+                current.primary_term,
                 &error,
             )
             .await;
             return Err(format!("failed to persist primary fence: {error}"));
         }
         if self.raft.is_none() {
+            self.primary_activation_state
+                .activated_terms
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(initial_key, current.primary_term);
             return Ok(ActivatedPrimary {
                 index_uuid: current.index_uuid,
                 allocation_id: current.allocation_id,
@@ -3825,6 +4190,7 @@ impl TransportService {
                 &current.index_uuid,
                 shard_id,
                 current.allocation_id,
+                current.primary_term,
                 &error,
             )
             .await;
@@ -3846,6 +4212,7 @@ impl TransportService {
                 &current.index_uuid,
                 shard_id,
                 current.allocation_id,
+                current.primary_term,
                 &error,
             )
             .await;
@@ -3980,6 +4347,7 @@ impl TransportService {
                 &index_uuid,
                 shard_id,
                 allocation_id,
+                activated_term,
                 &error,
             )
             .await;
@@ -4097,6 +4465,7 @@ impl TransportService {
                     &assigned.index_uuid,
                     shard_id,
                     assigned.allocation_id,
+                    assigned.primary_term,
                     &error,
                 )
                 .await;
@@ -4147,6 +4516,7 @@ impl TransportService {
                         &assigned.index_uuid,
                         shard_id,
                         assigned.allocation_id,
+                        assigned.primary_term,
                         &error,
                     )
                     .await;
@@ -4191,6 +4561,7 @@ impl TransportService {
                     &assigned.index_uuid,
                     shard_id,
                     assigned.allocation_id,
+                    assigned.primary_term,
                     &error,
                 )
                 .await;
@@ -4215,29 +4586,59 @@ impl TransportService {
         .await
     }
 
-    /// Compute and advance the current replicated high-water mark for a shard.
-    /// This uses the minimum observed primary/replica watermark and is monotonic,
-    /// but it does not prove that every lower sequence has been applied.
+    /// Advance the replicated checkpoint only when every in-sync copy reports
+    /// a contiguous persisted prefix.
     fn advance_global_checkpoint(
         engine: &Arc<dyn crate::engine::SearchEngine>,
-        primary_checkpoint: u64,
-        replica_checkpoints: &[(String, u64)],
+        primary_checkpoint: Option<u64>,
+        replica_checkpoints: &[crate::shard::ReplicaCheckpointUpdate],
     ) {
+        let Some(primary_checkpoint) = primary_checkpoint else {
+            return;
+        };
         if replica_checkpoints.is_empty() {
-            // No replicas → global checkpoint = primary checkpoint
             engine.update_global_checkpoint(primary_checkpoint);
             return;
         }
-        let min_replica = replica_checkpoints
+        let Some(min_replica) = replica_checkpoints
             .iter()
-            .map(|(_, cp)| *cp)
-            .min()
-            .unwrap_or(0);
+            .map(|checkpoint| checkpoint.persisted_checkpoint)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|checkpoints| checkpoints.into_iter().min())
+        else {
+            return;
+        };
         let global = std::cmp::min(primary_checkpoint, min_replica);
-        let current = engine.global_checkpoint();
-        if global > current {
+        if engine
+            .global_checkpoint()
+            .is_none_or(|current| global > current)
+        {
             engine.update_global_checkpoint(global);
         }
+    }
+
+    fn record_replica_checkpoints(
+        &self,
+        engine: &Arc<dyn crate::engine::SearchEngine>,
+        index_name: &str,
+        shard_id: u32,
+        activated_primary: &ActivatedPrimary,
+        primary_sequence: crate::engine::SequenceStats,
+        replica_checkpoints: &[crate::shard::ReplicaCheckpointUpdate],
+    ) {
+        Self::advance_global_checkpoint(
+            engine,
+            primary_sequence.persisted_checkpoint,
+            replica_checkpoints,
+        );
+        self.shard_manager.isr_tracker.update_replica_checkpoints(
+            index_name,
+            &activated_primary.index_uuid,
+            shard_id,
+            activated_primary.primary_term,
+            primary_sequence.processed_checkpoint,
+            replica_checkpoints,
+        );
     }
 
     /// Run a maintenance operation (refresh or flush) only on shards assigned

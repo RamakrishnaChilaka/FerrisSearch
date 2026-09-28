@@ -80,7 +80,14 @@ async fn fence_raise_persists_the_pre_raise_maximum_sequence() {
         )
         .unwrap();
     engine
-        .add_document_with_seq("before-raise", json!({"value": 0}), 0)
+        .apply_replica_operation(ferrissearch::engine::SequencedOperation {
+            seq_no: 0,
+            primary_term: 2,
+            mutation: ferrissearch::engine::DocumentMutation::Index {
+                doc_id: "before-raise".into(),
+                source: json!({"value": 0}),
+            },
+        })
         .unwrap();
 
     manager

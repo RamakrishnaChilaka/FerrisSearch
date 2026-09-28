@@ -7,6 +7,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
+fn d1_commit3_version_map_capacity_is_retryable_429() {
+    let error = anyhow::Error::new(tonic::Status::resource_exhausted(
+        "version map capacity exceeded",
+    ));
+
+    assert_eq!(
+        forwarded_write_error_classification(&error),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "version_map_capacity_exceeded"
+        )
+    );
+}
+
+#[test]
 fn remote_store_search_stats_response_json_contains_pruning_counters() {
     let stats = RemoteStoreSearchStats {
         published_splits: 5,
@@ -513,8 +528,22 @@ fn finalize_bulk_items_preserves_receipts_across_targets_and_duplicate_ids() {
         })
         .collect();
     let outcomes = HashMap::from([
-        (("a".to_string(), "node-1".to_string(), 0), Ok(10)),
-        (("b".to_string(), "node-1".to_string(), 1), Ok(20)),
+        (
+            ("a".to_string(), "node-1".to_string(), 0),
+            Ok(crate::engine::BulkWriteReceipt {
+                doc_ids: vec!["same".into(), "same".into()],
+                start_seq_no: Some(10),
+                primary_term: 7,
+            }),
+        ),
+        (
+            ("b".to_string(), "node-1".to_string(), 1),
+            Ok(crate::engine::BulkWriteReceipt {
+                doc_ids: vec!["other".into()],
+                start_seq_no: Some(20),
+                primary_term: 8,
+            }),
+        ),
     ]);
     let items = finalize_bulk_items(vec![None, None, None], routed, &outcomes);
     assert_eq!(
@@ -524,6 +553,8 @@ fn finalize_bulk_items_preserves_receipts_across_targets_and_duplicate_ids() {
             .collect::<Vec<_>>(),
         vec![10, 20, 11]
     );
+    assert_eq!(items[0]["index"]["_primary_term"], 7);
+    assert_eq!(items[1]["index"]["_primary_term"], 8);
     assert!(items.iter().all(|item| item["index"]["status"] == 201));
 }
 
