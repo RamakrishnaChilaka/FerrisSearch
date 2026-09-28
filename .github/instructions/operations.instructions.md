@@ -138,7 +138,7 @@ local-only unless their bounds are reduced and re-recorded. Each invocation
 needs isolated Java and TLC temporary directories; parallel TLC processes
 otherwise race while extracting standard modules. Expected-violation
 configurations are successful only when they reproduce the documented
-invariant failure. The runner defaults to eight TLC workers and permits a
+invariant failure. The runner defaults to twelve TLC workers and permits a
 `TLA_WORKERS` override. Keep the bounded G1 empty-store and G2
 copy-failure/liveness checks, pending-marker restart regression, term-change
 liveness checks, and minimal two-shard isolation check in the fast matrix.
@@ -147,7 +147,9 @@ open/fence/marker/apply persistent-I/O escalation, promote-only primary
 reporting, the apply-I/O no-escalation temporal regression, and the
 no-lifecycle-activation temporal regression in that fast set. Also keep the
 combined S1 crash/restart/recovery safety and liveness checks plus the
-no-timeout modeling-assumption regression in the fast matrix.
+no-timeout modeling-assumption regression in the fast matrix. Keep the D1
+historical order/replay counterexamples, fixed concurrent/replay variants, and
+no-durable-tombstone check in that matrix.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with

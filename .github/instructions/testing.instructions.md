@@ -55,14 +55,17 @@ cargo test -- test_name                         # Single test by name
   `pending-restart-legacy` stops violating its named invariant, or if
   `l2-primary-no-trigger`, `storage-apply-no-escalation`, or
   `s1-combined-liveness-no-timeout` stops producing its temporal liveness
-  violation. The S1 no-timeout case is a modeling-assumption regression, not a
-  historical Rust defect.
+  violation. `d1-order-historical` must retain `NoCopyBehindAcked`, and
+  `d1-replay-historical` must retain its acknowledged replay-loss violation.
+  The S1 no-timeout case is a modeling-assumption regression, not a historical
+  Rust defect.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
   `g2-primary-no-replica`, `g2-liveness`, `pending-restart-fixed`, `l1-bump`,
   `l2-primary-idle`, `l2-promotion`, `storage-replica`, `storage-primary`,
   `storage-primary-no-replica`, `storage-apply-replica`,
   `storage-apply-primary`, `storage-apply-primary-no-replica`,
   `s1-combined-replica`, `s1-combined-primary`, `s1-combined-liveness`,
+  `d1-order-fixed`, `d1-replay-fixed`, `d1-no-durable-tombstone`,
   `two-shard`, `fixed-crash`, and `fixed-partition` are expected-pass
   configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
@@ -72,6 +75,9 @@ cargo test -- test_name                         # Single test by name
   exhausted Raft/message/term/allocation/recovery bound, preserve the trace,
   and record the old and new values. Safety failures and non-bound liveness
   failures still stop immediately.
+- A property comparing non-semantic internal retention/cache/bookkeeping state
+  may be refined when logical state and every safety property already agree.
+  Preserve and document the over-strong-property trace before continuing.
 - Safety runs may use a documented state constraint and valid node symmetry.
   Liveness runs use neither; declare the exact fairness assumptions instead.
 - When you add a model variable, add it to every action's `UNCHANGED` tuple,
@@ -108,6 +114,12 @@ cargo test -- test_name                         # Single test by name
   acknowledged write. Timeout fairness is permitted only when a required
   target is down, has restarted past the request epoch, or its transport
   message was dropped.
+- ADR D1 configurations must allow at least two same-shard client writes in
+  flight and arbitrary replica delivery order. Check `NoCopyBehindAcked`
+  during concurrency and logical-only convergence at quiescence when every
+  primary-WAL operation was acknowledged. Replay checks cover gap-aware
+  processed checkpoints, redelivery, tombstone pruning, crash/restart, and a
+  late older index after delete.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt

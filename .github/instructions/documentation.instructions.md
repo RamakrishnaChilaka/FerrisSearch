@@ -88,6 +88,11 @@ benchmark artifacts.
   reset, persistent-fault redetection, repair eligibility, the guarded
   transport-timeout assumption, and any numeric bound raised after a retained
   bound-exhaustion trace.
+- D1 evidence must state the concurrent-write bound, distinguish
+  `NoCopyBehindAcked` from quiescent logical convergence, and exclude
+  unacknowledged primary-WAL histories from exact convergence until D10.
+  Tombstone-retention metadata is not logical state; retain traces for
+  over-strong properties that compare it.
 - Activation liveness claims must name the proactive lifecycle trigger and
   preserve the no-trigger stutter trace as bounded counterevidence.
 - Record the monotonic applied-Raft-view assumption. Loss of `raft.db` followed

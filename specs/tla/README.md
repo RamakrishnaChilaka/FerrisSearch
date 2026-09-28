@@ -48,7 +48,7 @@ TLA_LOG_DIR=/path/to/logs \
 runner gives every invocation isolated TLC and Java temporary directories. It
 fails when an expected-pass configuration reports an error, or when an
 expected counterexample no longer violates its named invariant. Safety checks
-default to eight TLC workers; set `TLA_WORKERS` to override that count.
+default to twelve TLC workers; set `TLA_WORKERS` to override that count.
 
 Deadlock checking is disabled because the finite write/fault/recovery bounds
 create intentional terminal states. Safety configurations use a state
@@ -78,6 +78,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_StorageFailure.tla` | Corruption and persistent open/fence/marker-I/O escalation, promote-only copy failure, and post-failure write liveness. |
 | `MC_ApplyStorageFailure.tla` | Persistent WAL/fsync/engine apply failure on an open copy, bounded escalation, post-removal/promotion write liveness, and the historical no-escalation lasso. |
 | `MC_S1_Combined.tla` | Persistent open/apply failure combined with crash/restart, leader change, delayed conditional reports, repair, fresh allocation, peer recovery, transport timeout, and resumed writes. |
+| `MC_D1_SeqNoApply.tla` | Concurrent same-shard writes, arbitrary replica delivery order, historical arrival-order/replay failures, and proposed D1 seq-aware apply, checkpoints, tombstones, redelivery, truncation, and restart replay. |
 | `MC_TwoShardIsolation.tla` | Minimal index-level check that one red shard does not block failover and allocation on a sibling shard. |
 | `MC_FenceDurability.tla` | Bounded check that a learned replica fence must survive restart. |
 | `MC_G1_EmptyStore.tla` | CreateIndex, permitted initial empty-copy creation, pre-activation disk loss, first activation, and first acknowledged write. |
@@ -94,8 +95,10 @@ liveness configurations use neither symmetry nor a state constraint.
 - Documents are represented by bounded document keys and unique write IDs.
   Deletes are distinct write kinds; value/rollback checks use operation
   identity and exact sequence numbers.
-- At most one client write is active at once. That write still interleaves with
-  Raft, replication, recovery, crashes, view delivery, and message loss.
+- Existing fault/recovery configurations retain a one-active-write state-space
+  bound. D1 configurations allow three same-shard client writes to overlap,
+  satisfying ADR 0001 section 8 and allowing their replica messages to arrive
+  in any order.
 - `InitialInitialized = TRUE` starts at normalized term 1 after initial
   activation, as the original configurations did. `FALSE` starts at the
   committed CreateIndex routing record with no open copies or in-sync
@@ -170,6 +173,10 @@ liveness configurations use neither symmetry nor a state constraint.
 | `BeginPersistentApplyFailure`, `PrimaryApplyFailure`, `ReplicaApplyFailure`, `EscalatePersistentApplyFailure` | `ShardManager::{ensure_local_apply_allowed,record_local_apply_result,apply_replica_operation}` around primary and replica WAL/fsync/engine mutation; failed operations do not acknowledge or mutate the modeled logical history. |
 | `RepairPersistentStorageFault` | Operator/storage repair after an accepted exact-allocation failure; repair remains possible if fresh allocation races ahead of the repair action. |
 | `S1TimedOutReplicationFails` | `TransportClient` request timeout plus `replication::replicate_write` error propagation for a required replica that is down, has restarted past the request epoch, or whose request/response was dropped. |
+| `D1HistoricalReplicaApply` | Current `ShardManager::apply_replica_operation`, `append_with_seq`, and `write_bulk_with_start_seq`: WAL and engine mutation follow replica arrival order. |
+| `D1FixedReplicaProcess`, `D1FixedReplicaRedelivery` | Proposed D1 apply planner shared by replica apply, recovery, and replay: retain history, skip stale document mutations, and acknowledge processed sequence redelivery without another WAL append. |
+| `D1CommitReplica`, `D1RestartReplica`, `D1FixedReplayApply` | Persisted processed-checkpoint boundary, crash/restart, and replay above that boundary through the same D1 planner. |
+| `D1PruneTombstone`, `D1TruncateToProcessedCheckpoint` | Tombstone pruning only at/below the processed checkpoint and WAL truncation no farther than the persisted processed/global boundary abstraction. |
 | `LifecycleProposeActivation` | Proactive local-primary activation from the node lifecycle after startup or promotion. |
 | `StartRecovery`, `SourceSetupFailure`, `PollSetupFailure` | `run_peer_recovery`, `start_peer_recovery_inner`, `launch_source_setup`, and `source_start_status`. |
 | `SourceSnapshot` | `HotEngine::prepare_peer_recovery_snapshot`, including commit, durable checkpoint, hard-linked files, and `register_retention_pin`. |
@@ -243,6 +250,67 @@ The retained
 shows why durability is required: a replica can learn term 3 from replication,
 restart while its Raft view still says term 1, and otherwise accept a term-1
 retry. The durable variant rejects the same probe.
+
+## D1 sequence-aware replica apply
+
+`FaultMode = "D1Historical"` models the current pre-D1 behavior:
+
+- up to three same-shard client writes overlap;
+- primary sequence assignment remains serialized, but replication messages may
+  reach the replica in any order;
+- the replica WAL and document state follow arrival order; and
+- commit/restart replay begins at the highest committed sequence plus one,
+  ignoring gaps.
+
+That variant violates `NoCopyBehindAcked`: after a newer operation is
+acknowledged, a late older operation can leave an in-sync replica behind. It
+also loses an acknowledged lower-sequence document when a higher sequence is
+committed first and restart skips every WAL entry below that high-water
+boundary.
+
+`FaultMode = "D1Fixed"` models the proposed ADR 0001 D1 planner:
+
+- a per-document applied sequence decides whether an operation mutates logical
+  document state;
+- stale-or-equal document operations remain in WAL history but do not replace
+  a newer value or delete;
+- a processed sequence is acknowledged as idempotent redelivery without
+  another WAL append;
+- the processed checkpoint is the highest contiguous processed prefix, with a
+  processed set above gaps and a separate maximum observed sequence;
+- successful commit persists the processed checkpoint and maximum sequence;
+- restart replays retained WAL entries above the persisted processed
+  checkpoint in file order through the same planner; and
+- tombstones are pruned only after becoming old and at or below the processed
+  checkpoint.
+
+`NoCopyBehindAcked` requires every available primary/in-sync copy's
+per-document applied sequence to be at least the highest acknowledged sequence
+for that document. A copy may safely be ahead of acknowledgements.
+`D1QuiescentConvergence` requires identical **logical** document state only
+when no write or replication message remains active and every operation that
+reached the primary WAL was acknowledged. It compares absence, deletion, and
+live value/applied sequence, but not tombstone-retention or cache metadata.
+
+Histories containing failed or otherwise unacknowledged primary-WAL operations
+are intentionally excluded from exact quiescent convergence. Such operations
+may leave copies divergent until ADR D10 adds resync, trimming, and no-op gap
+closure.
+
+Two property formulations were retired:
+
+- exact equality at every acknowledgement rejected a safely ahead primary;
+  and
+- equality of retained tombstone metadata rejected copies with identical
+  logical deletion state after one copy safely pruned its tombstone.
+
+The no-durable-tombstone configuration processes sequence 0, then sequence 2
+delete with a gap at sequence 1. It commits processed checkpoint 1, truncates
+sequence 0, restarts with no durable tombstone metadata, replays retained
+sequence 2 to reconstruct the tombstone, and then receives the older sequence
+1 index. The older index remains stale and the document stays deleted.
+Within these bounds, durable tombstone metadata is therefore unnecessary when
+replay and WAL truncation follow the D1 checkpoint rules.
 
 ## Empty-store and copy-failure rules
 
@@ -496,10 +564,19 @@ The targeted fence-durability model also checks
 `FenceRejectsStaleProbe`, and the C2 model checks
 `C2RejectsStaleMessage`. The apply-storage configurations additionally check
 `ApplyFailureCopyRemainsOpen` and `FailedApplyNeverMutatesFailedCopy`.
+The D1 configurations check `NoCopyBehindAcked`,
+`D1QuiescentConvergence`, `D1ProcessedCheckpointGapAware`,
+`D1WalHasNoDuplicateSeq`, `D1ReplayCovered`,
+`D1DeleteNotResurrected`, and `D1TombstonePruningSafe`.
 
 The retired `NoStaleReplicaApply` assertion and its counterexample remain in
 the trace directory. It compared against unseen global state rather than the
 replica's applied view and durable fence.
+
+The retired D1 exact-acknowledgement property and tombstone-retention
+convergence property also remain with their traces. The first rejected a
+safely ahead copy; the second compared non-semantic retention metadata after
+logical state had converged.
 
 Liveness properties:
 
@@ -608,6 +685,7 @@ implicitly enable every fault class.
 | Focused S1 storage checks | No | No | Scenario delay only | No | Yes | Yes in apply variants | No |
 | Combined S1 safety | One crash/restart; leader may change | No | Delay and crash-dropped requests | No | Yes | Yes | No |
 | Combined S1 liveness | Forced target crash/restart | No | Delay plus guarded timeout/drop failure | No | No | Yes | No |
+| D1 ordering/replay | Replica restart in replay variants | No | Arbitrary replica order and redelivery | No | No | No | No |
 | L1/L2 recovery checks | L2 only | No | Scenario delay only | No | No | No | No |
 
 No bounded configuration combines metadata partition with storage failure,
@@ -617,7 +695,7 @@ failure. The combined S1 checks do not enable `DiskLoss` or
 
 ## Configurations and results
 
-Results below were produced on September 27, 2026 with Java 25 and the pinned
+Results below were produced on September 28, 2026 with Java 25 and the pinned
 TLA+ tools jar. Times are TLC wall times on one development host, not
 performance benchmarks.
 
@@ -659,13 +737,18 @@ performance benchmarks.
 | `s1-combined-primary` | 3 / 1 / 3 | Failed primary; promote-only report; primary/leader crash; 1 recovery; log 4 | Retry reset + carried candidate | Safety pass | 643,048 / 162,852 | 53 | 11s |
 | `s1-combined-liveness` | 3 / 1 / 5 | Apply fault; timeout; 1 crash; 1 recovery; term 3; messages 2; log 5 | Guarded timeout fairness | Safety and liveness pass | 138,367 / 43,844 | 66 | 33s |
 | `s1-combined-liveness-no-timeout` | Same as combined liveness | Guarded timeout action omitted | Modeling-assumption regression | Expected temporal violation | 49 / 41 | 21-state lasso | 2s |
+| `d1-order-historical` | 2 / 2 / 3 | Three concurrent writes; arbitrary replica arrival order | Arrival-order apply | Expected `NoCopyBehindAcked` violation | 384 / 207 | 16 | 2s |
+| `d1-order-fixed` | Same as historical ordering | Same concurrent/message bounds | Seq-aware D1 planner | Pass | 542 / 259 | 16 | 2s |
+| `d1-replay-historical` | 2 / 2 / 3 | Delete committed above gaps; duplicate; crash/restart | Highest-sequence replay boundary | Expected acknowledged replay-loss violation | 457 / 201 | 26 | 2s |
+| `d1-replay-fixed` | Same replay schedule | Processed checkpoint; planner replay; tombstone pruning | Proposed D1 | Pass | 1,583 / 531 | 29 | 2s |
+| `d1-no-durable-tombstone` | 2 / 2 / 3 | Checkpoint 1; truncate seq 0; restart without tombstone; late seq 1 | Proposed D1 | Pass | 132 / 70 | 21 | 2s |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
 | `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 87,012,150 / 12,495,758 | 42 | 42m55s |
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
-The complete default eight-worker fast matrix ran from 11:54:55 to
-11:58:59 UTC (4m04s), and every expected pass or expected counterexample
-matched. The two large exhaustive runs also used eight workers.
+The complete default twelve-worker fast matrix ran from 04:33:15 to
+04:37:46 UTC (4m31s), and every expected pass or expected counterexample
+matched. The two large exhaustive runs used eight workers.
 
 The two long fixed-design configurations use the top-level `Next` relation,
 not a scenario wrapper, but `FaultMode` still limits enabled fault classes.
@@ -707,6 +790,10 @@ well below the CI budget.
 - [R2 idle primary without lifecycle activation](traces/R2-idle-primary-no-activation.md)
 - [R3 open replica apply I/O without escalation](traces/R3-apply-io-no-escalation.md)
 - [S1 liveness without transport timeout](traces/S1-combined-liveness-no-timeout.md)
+- [D1 arrival-order acknowledged rollback](traces/D1-arrival-order-no-copy-behind.md)
+- [D1 highest-committed replay loss](traces/D1-highest-commit-replay-loss.md)
+- [Retired D1 exact-acknowledgement property](traces/D1-retired-exact-acked-convergence.md)
+- [Retired D1 tombstone-retention property](traces/D1-retired-tombstone-retention-convergence.md)
 
 ## Not covered
 
@@ -759,6 +846,9 @@ well below the CI budget.
   and tie-breaking order are not modeled as distinct implementation states.
 - The Raft-recorded `primary_unavailable` health flag is omitted because it
   changes status and repair signaling, not copy authority or routing.
+- D1 exact quiescent convergence excludes histories with failed or otherwise
+  unacknowledged primary-WAL operations. Cross-copy cleanup of those histories
+  requires ADR D10 resync, trimming, and no-op gap closure.
 - Applied Raft views are monotonic. Loss of a node's durable `raft.db` followed
   by same-name rejoin is outside the model and requires separate identity and
   bootstrap handling.
