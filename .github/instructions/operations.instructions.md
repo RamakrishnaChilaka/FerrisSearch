@@ -149,7 +149,8 @@ no-lifecycle-activation temporal regression in that fast set. Also keep the
 combined S1 crash/restart/recovery safety and liveness checks plus the
 no-timeout modeling-assumption regression in the fast matrix. Keep the D1
 historical order/replay counterexamples, fixed concurrent/replay variants, and
-no-durable-tombstone check in that matrix.
+no-durable-tombstone check in that matrix. Also retain the D1 term-collision
+historical/fixed pair and bounded gap-resolution check.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with

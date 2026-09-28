@@ -57,6 +57,7 @@ cargo test -- test_name                         # Single test by name
   `s1-combined-liveness-no-timeout` stops producing its temporal liveness
   violation. `d1-order-historical` must retain `NoCopyBehindAcked`, and
   `d1-replay-historical` must retain its acknowledged replay-loss violation.
+  `d1-term-collision-seq-only` must retain `B1NoCopyBehindAcked`.
   The S1 no-timeout case is a modeling-assumption regression, not a historical
   Rust defect.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
@@ -66,8 +67,8 @@ cargo test -- test_name                         # Single test by name
   `storage-apply-primary`, `storage-apply-primary-no-replica`,
   `s1-combined-replica`, `s1-combined-primary`, `s1-combined-liveness`,
   `d1-order-fixed`, `d1-replay-fixed`, `d1-no-durable-tombstone`,
-  `two-shard`, `fixed-crash`, and `fixed-partition` are expected-pass
-  configurations.
+  `d1-term-collision-fixed`, `d1-gaps`, `two-shard`, `fixed-crash`, and
+  `fixed-partition` are expected-pass configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
@@ -120,6 +121,10 @@ cargo test -- test_name                         # Single test by name
   primary-WAL operation was acknowledged. Replay checks cover gap-aware
   processed checkpoints, redelivery, tombstone pruning, crash/restart, and a
   late older index after delete.
+- D1 term-collision checks distinguish operation identity by primary term and
+  sequence. A newer-term collision at an already processed sequence must fail
+  the copy and require recovery. Gap checks cover missing-operation pull,
+  timeout/re-recovery, and promotion-time NoOp fill before checkpoint advance.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt

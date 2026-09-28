@@ -93,6 +93,10 @@ benchmark artifacts.
   unacknowledged primary-WAL histories from exact convergence until D10.
   Tombstone-retention metadata is not logical state; retain traces for
   over-strong properties that compare it.
+- D1 identity evidence must include the primary term when one sequence number
+  can be reused after promotion. Gap evidence must state whether the missing
+  operation is pulled, recovered, or filled with a NoOp before checkpoint
+  advancement.
 - Activation liveness claims must name the proactive lifecycle trigger and
   preserve the no-trigger stutter trace as bounded counterevidence.
 - Record the monotonic applied-Raft-view assumption. Loss of `raft.db` followed

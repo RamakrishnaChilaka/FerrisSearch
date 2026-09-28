@@ -79,6 +79,8 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_ApplyStorageFailure.tla` | Persistent WAL/fsync/engine apply failure on an open copy, bounded escalation, post-removal/promotion write liveness, and the historical no-escalation lasso. |
 | `MC_S1_Combined.tla` | Persistent open/apply failure combined with crash/restart, leader change, delayed conditional reports, repair, fresh allocation, peer recovery, transport timeout, and resumed writes. |
 | `MC_D1_SeqNoApply.tla` | Concurrent same-shard writes, arbitrary replica delivery order, historical arrival-order/replay failures, and proposed D1 seq-aware apply, checkpoints, tombstones, redelivery, truncation, and restart replay. |
+| `MC_D1_TermCollision.tla` | B1 reuse of one sequence across primary terms, seq-only redelivery failure, durable max-sequence collision detection, copy failure, and re-recovery. |
+| `MC_D1_Gaps.tla` | B2 bounded permanent-gap outcomes: pull the missing operation, timeout and re-recover, or promotion-time NoOp fill. |
 | `MC_TwoShardIsolation.tla` | Minimal index-level check that one red shard does not block failover and allocation on a sibling shard. |
 | `MC_FenceDurability.tla` | Bounded check that a learned replica fence must survive restart. |
 | `MC_G1_EmptyStore.tla` | CreateIndex, permitted initial empty-copy creation, pre-activation disk loss, first activation, and first acknowledged write. |
@@ -177,6 +179,8 @@ liveness configurations use neither symmetry nor a state constraint.
 | `D1FixedReplicaProcess`, `D1FixedReplicaRedelivery` | Proposed D1 apply planner shared by replica apply, recovery, and replay: retain history, skip stale document mutations, and acknowledge processed sequence redelivery without another WAL append. |
 | `D1CommitReplica`, `D1RestartReplica`, `D1FixedReplayApply` | Persisted processed-checkpoint boundary, crash/restart, and replay above that boundary through the same D1 planner. |
 | `D1PruneTombstone`, `D1TruncateToProcessedCheckpoint` | Tombstone pruning only at/below the processed checkpoint and WAL truncation no farther than the persisted processed/global boundary abstraction. |
+| `B1SeqOnlyNewWrite`, `B1TermAwareNewWrite`, `B1RecoverR2` | Seq-only redelivery collision versus newer-term collision fail-out and exact recovery before promotion. |
+| `B2PullMissing`, `B2TimeoutAndRecover`, `B2PromoteAndFillNoOp` | Missing-operation pull, timeout-triggered full recovery, and promotion-time NoOp closure for an unacknowledged gap. |
 | `LifecycleProposeActivation` | Proactive local-primary activation from the node lifecycle after startup or promotion. |
 | `StartRecovery`, `SourceSetupFailure`, `PollSetupFailure` | `run_peer_recovery`, `start_peer_recovery_inner`, `launch_source_setup`, and `source_start_status`. |
 | `SourceSnapshot` | `HotEngine::prepare_peer_recovery_snapshot`, including commit, durable checkpoint, hard-linked files, and `register_retention_pin`. |
@@ -311,6 +315,36 @@ sequence 2 to reconstruct the tombstone, and then receives the older sequence
 1 index. The older index remains stale and the document stays deleted.
 Within these bounds, durable tombstone metadata is therefore unnecessary when
 replay and WAL truncation follow the D1 checkpoint rules.
+
+### B1: term/sequence collision
+
+The B1 model starts with an unacknowledged term-1 sequence-11 operation applied
+only on R2. R1 is promoted to term 2 with WAL maximum 10 and therefore assigns
+sequence 11 to a different operation.
+
+The historical variant keys redelivery by sequence alone. R2 skips the new
+term-2 operation, returns success, and later rolls back the acknowledged value
+when promoted. The fixed variant durably records local `max_seq_no` when it
+raises its fence to a newer term. Receiving an already-processed sequence at
+or below that maximum under the newer term is a definitive identity collision,
+not redelivery. R2 fails, leaves the in-sync set, and is recovered from R1
+before it may be promoted.
+
+### B2: processed gaps
+
+The B2 model gives a copy processed sequences `{0, 2}` and a permanent missing
+sequence 1. Only sequences 0 and 2 are acknowledged, so promotion can safely
+resolve the unacknowledged gap.
+
+All bounded outcomes advance the processed checkpoint from 1 to 3:
+
+- pull sequence 1 from retained history;
+- timeout, remove the copy, and install a complete peer-recovery image; or
+- promote the copy and write a term-local NoOp for sequence 1.
+
+`B2NoCopyBehindAcked` remains true in every branch, and the promotion branch
+requires the missing sequence to appear in the NoOp set before the checkpoint
+advances.
 
 ## Empty-store and copy-failure rules
 
@@ -568,6 +602,10 @@ The D1 configurations check `NoCopyBehindAcked`,
 `D1QuiescentConvergence`, `D1ProcessedCheckpointGapAware`,
 `D1WalHasNoDuplicateSeq`, `D1ReplayCovered`,
 `D1DeleteNotResurrected`, and `D1TombstonePruningSafe`.
+The B1/B2 slices additionally check `B1NoCopyBehindAcked`,
+`B1CollisionFailsClosed`, `B1RecoveredBeforePromotion`,
+`B2CheckpointGapAware`, `B2ResolvedCheckpointAdvances`, and
+`B2PromotionFillsNoOp`.
 
 The retired `NoStaleReplicaApply` assertion and its counterexample remain in
 the trace directory. It compared against unseen global state rather than the
@@ -685,7 +723,7 @@ implicitly enable every fault class.
 | Focused S1 storage checks | No | No | Scenario delay only | No | Yes | Yes in apply variants | No |
 | Combined S1 safety | One crash/restart; leader may change | No | Delay and crash-dropped requests | No | Yes | Yes | No |
 | Combined S1 liveness | Forced target crash/restart | No | Delay plus guarded timeout/drop failure | No | No | Yes | No |
-| D1 ordering/replay | Replica restart in replay variants | No | Arbitrary replica order and redelivery | No | No | No | No |
+| D1 ordering/replay/term/gaps | Replica restart in replay variants; promotion in B1/B2 | No | Arbitrary replica order and redelivery | No | No | No | No |
 | L1/L2 recovery checks | L2 only | No | Scenario delay only | No | No | No | No |
 
 No bounded configuration combines metadata partition with storage failure,
@@ -742,12 +780,15 @@ performance benchmarks.
 | `d1-replay-historical` | 2 / 2 / 3 | Delete committed above gaps; duplicate; crash/restart | Highest-sequence replay boundary | Expected acknowledged replay-loss violation | 457 / 201 | 26 | 2s |
 | `d1-replay-fixed` | Same replay schedule | Processed checkpoint; planner replay; tombstone pruning | Proposed D1 | Pass | 1,583 / 531 | 29 | 2s |
 | `d1-no-durable-tombstone` | 2 / 2 / 3 | Checkpoint 1; truncate seq 0; restart without tombstone; late seq 1 | Proposed D1 | Pass | 132 / 70 | 21 | 2s |
+| `d1-term-collision-seq-only` | 3 copies / seq 11 | Term-1 partial apply; R1 term-2 reuse; later R2 promotion | Seq-only redelivery | Expected `B1NoCopyBehindAcked` violation | 6 / 6 | 6 | 1s |
+| `d1-term-collision-fixed` | Same collision schedule | Durable max on fence raise; fail and recover R2 | Term-aware identity | Pass | 6 / 6 | 6 | <1s |
+| `d1-gaps` | 2 copies / seq 0..2 | Permanent gap 1; pull, recovery, or promotion NoOp | Gap-aware checkpoint | Pass | 5 / 5 | 3 | <1s |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
 | `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 87,012,150 / 12,495,758 | 42 | 42m55s |
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
-The complete default twelve-worker fast matrix ran from 04:33:15 to
-04:37:46 UTC (4m31s), and every expected pass or expected counterexample
+The complete default twelve-worker fast matrix ran from 05:24:10 to
+05:27:50 UTC (3m40s), and every expected pass or expected counterexample
 matched. The two large exhaustive runs used eight workers.
 
 The two long fixed-design configurations use the top-level `Next` relation,
@@ -794,6 +835,7 @@ well below the CI budget.
 - [D1 highest-committed replay loss](traces/D1-highest-commit-replay-loss.md)
 - [Retired D1 exact-acknowledgement property](traces/D1-retired-exact-acked-convergence.md)
 - [Retired D1 tombstone-retention property](traces/D1-retired-tombstone-retention-convergence.md)
+- [D1 term/sequence collision with seq-only redelivery](traces/D1-term-seq-collision.md)
 
 ## Not covered
 
