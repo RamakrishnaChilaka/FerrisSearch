@@ -81,6 +81,9 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_D1_SeqNoApply.tla` | Concurrent same-shard writes, arbitrary replica delivery order, historical arrival-order/replay failures, and proposed D1 seq-aware apply, checkpoints, tombstones, redelivery, truncation, and restart replay. |
 | `MC_D1_TermCollision.tla` | B1 reuse of one sequence across primary terms, seq-only redelivery failure, durable max-sequence collision detection, copy failure, and re-recovery. |
 | `MC_D1_Gaps.tla` | B2 bounded permanent-gap outcomes: pull the missing operation, timeout and re-recover, or promotion-time NoOp fill. |
+| `MC_D1_TermCollisionRestart.tla` | B1 crash/rebuild after fence raise, committed-record-only versus identity-based restoration of collision state. |
+| `MC_D1_PrimaryGap.tla` | Primary engine-apply gap, max-based recovery loop, and processed-checkpoint comparison. |
+| `MC_D1_PromotionReplayNoOp.tla` | Promotion ordering: replay local WAL, fill gaps with NoOps, tolerate failed NoOp replication, then activate. |
 | `MC_TwoShardIsolation.tla` | Minimal index-level check that one red shard does not block failover and allocation on a sibling shard. |
 | `MC_FenceDurability.tla` | Bounded check that a learned replica fence must survive restart. |
 | `MC_G1_EmptyStore.tla` | CreateIndex, permitted initial empty-copy creation, pre-activation disk loss, first activation, and first acknowledged write. |
@@ -181,6 +184,9 @@ liveness configurations use neither symmetry nor a state constraint.
 | `D1PruneTombstone`, `D1TruncateToProcessedCheckpoint` | Tombstone pruning only at/below the processed checkpoint and WAL truncation no farther than the persisted processed/global boundary abstraction. |
 | `B1SeqOnlyNewWrite`, `B1TermAwareNewWrite`, `B1RecoverR2` | Seq-only redelivery collision versus newer-term collision fail-out and exact recovery before promotion. |
 | `B2PullMissing`, `B2TimeoutAndRecover`, `B2PromoteAndFillNoOp` | Missing-operation pull, timeout-triggered full recovery, and promotion-time NoOp closure for an unacknowledged gap. |
+| `B1RRaiseFence`, `B1RRestart`, `B1RIdentityCollision` | Persist fence/max identity before a new-term operation, restore collision state after restart, and fail a newer-term sequence collision. |
+| `B3MaxBasedRecover`, `B3ProcessedBasedStable` | Historical max-versus-checkpoint gap detection and fixed processed-checkpoint comparison. |
+| `B4ReplayWalEntry`, `B4FillNoOpAfterReplay`, `B4ActivatePrimary` | Promotion replays all local WAL entries, fills remaining gaps, and activates without waiting for failed NoOp replication. |
 | `LifecycleProposeActivation` | Proactive local-primary activation from the node lifecycle after startup or promotion. |
 | `StartRecovery`, `SourceSetupFailure`, `PollSetupFailure` | `run_peer_recovery`, `start_peer_recovery_inner`, `launch_source_setup`, and `source_start_status`. |
 | `SourceSnapshot` | `HotEngine::prepare_peer_recovery_snapshot`, including commit, durable checkpoint, hard-linked files, and `register_retention_pin`. |
@@ -330,6 +336,13 @@ or below that maximum under the newer term is a definitive identity collision,
 not redelivery. R2 fails, leaves the in-sync set, and is recovered from R1
 before it may be promoted.
 
+The restart variant raises R2's fence to term 2 and durably stores
+`fence_max_seq_no = 11` before any term-2 operation arrives. Startup replay
+restores the old term-1 sequence 11. Restoring collision maximum 10 from only
+the last committed record reproduces false redelivery and acknowledged
+rollback. Restoring fence term and fence maximum from durable copy identity
+detects the collision, fails R2, and requires recovery before promotion.
+
 ### B2: processed gaps
 
 The B2 model gives a copy processed sequences `{0, 2}` and a permanent missing
@@ -345,6 +358,36 @@ All bounded outcomes advance the processed checkpoint from 1 to 3:
 `B2NoCopyBehindAcked` remains true in every branch, and the promotion branch
 requires the missing sequence to appear in the NoOp set before the checkpoint
 advances.
+
+Acknowledgement is operation/document based, not checkpoint based. In the
+bounded B2 state, the replica checkpoint remains 1 while acknowledged sequence
+2 is already processed. That gap does not block acknowledging sequence 2
+because every acknowledged operation is present on every in-sync copy.
+
+### Primary-side gaps
+
+A primary can have sequence 1 in its WAL while engine apply failed, leaving
+processed set `{0, 2}`, processed checkpoint 1, and exclusive maximum 3.
+Re-recovery copies the same legitimate gap to the replica. Comparing the
+replica checkpoint to primary maximum therefore loops recovery forever.
+Comparing replica processed checkpoint 1 to primary processed checkpoint 1
+recognizes equivalent progress and performs no recovery. `NoCopyBehindAcked`
+continues to hold because acknowledged operations 0 and 2 are processed on
+both copies.
+
+### Promotion replay and NoOp fill
+
+A promotion candidate is not an available primary while replaying its local
+WAL. The model replays every retained entry before filling missing sequence 1
+with a term-local NoOp. NoOp replication may fail, leaving another replica
+with processed set `{0, 2}` and checkpoint 1; that replica-local gap does not
+block activation. The promoted primary activates only after local replay and
+NoOp fill advance its checkpoint to 3.
+
+The first B4 property incorrectly required the replaying, unactivated
+candidate to cover acknowledged operations. Its retained trace documents the
+availability-scope correction: existing available in-sync copies are always
+checked, while the promotion candidate is checked only after activation.
 
 ## Empty-store and copy-failure rules
 
@@ -605,7 +648,11 @@ The D1 configurations check `NoCopyBehindAcked`,
 The B1/B2 slices additionally check `B1NoCopyBehindAcked`,
 `B1CollisionFailsClosed`, `B1RecoveredBeforePromotion`,
 `B2CheckpointGapAware`, `B2ResolvedCheckpointAdvances`, and
-`B2PromotionFillsNoOp`.
+`B2PromotionFillsNoOp`. Round-2 slices add
+`B1RRestoresIdentityCollisionState`, `B1RRecoveredBeforePromotion`,
+`B3NoRecoveryLoop`, `B3ProcessedComparisonAvoidsRecovery`,
+`B4NoOpOnlyAfterReplay`, and
+`B4FailedNoOpReplicationDoesNotBlockActivation`.
 
 The retired `NoStaleReplicaApply` assertion and its counterexample remain in
 the trace directory. It compared against unseen global state rather than the
@@ -782,13 +829,18 @@ performance benchmarks.
 | `d1-no-durable-tombstone` | 2 / 2 / 3 | Checkpoint 1; truncate seq 0; restart without tombstone; late seq 1 | Proposed D1 | Pass | 132 / 70 | 21 | 2s |
 | `d1-term-collision-seq-only` | 3 copies / seq 11 | Term-1 partial apply; R1 term-2 reuse; later R2 promotion | Seq-only redelivery | Expected `B1NoCopyBehindAcked` violation | 6 / 6 | 6 | 1s |
 | `d1-term-collision-fixed` | Same collision schedule | Durable max on fence raise; fail and recover R2 | Term-aware identity | Pass | 6 / 6 | 6 | <1s |
-| `d1-gaps` | 2 copies / seq 0..2 | Permanent gap 1; pull, recovery, or promotion NoOp | Gap-aware checkpoint | Pass | 5 / 5 | 3 | <1s |
+| `d1-gaps` | 2 copies / seq 0..2 | Permanent gap 1; pull, recovery, or promotion NoOp | Gap-aware checkpoint | Pass | 5 / 5 | 3 | 1s |
+| `d1-term-collision-restart-committed` | 1 replica / seq 11 | Fence raised, crash/rebuild, restore committed max 10 | Committed-only restore | Expected `B1RNoCopyBehindAcked` violation | 7 / 7 | 7 | 1s |
+| `d1-term-collision-restart-identity` | Same restart schedule | Restore fence term/max 11 from copy identity | Identity restore | Pass | 7 / 7 | 7 | 1s |
+| `d1-primary-gap-max` | 2 copies / seq 0..2 | Both checkpoints 1; primary max next 3 | Max-based detector | Expected `B3NoRecoveryLoop` violation | 4 / 4 | 4 | <1s |
+| `d1-primary-gap-processed` | Same primary gap | Compare processed checkpoint 1 to 1 | Processed detector | Pass | 3 / 3 | 3 | 1s |
+| `d1-promotion-replay-noop` | Promoted copy WAL `{0,2}` | Replay, NoOp 1, failed NoOp replication, activate | Promotion ordering | Pass | 8 / 7 | 6 | 1s |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
 | `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 87,012,150 / 12,495,758 | 42 | 42m55s |
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
-The complete default twelve-worker fast matrix ran from 05:24:10 to
-05:27:50 UTC (3m40s), and every expected pass or expected counterexample
+The complete default twelve-worker fast matrix ran from 05:58:02 to
+06:01:36 UTC (3m34s), and every expected pass or expected counterexample
 matched. The two large exhaustive runs used eight workers.
 
 The two long fixed-design configurations use the top-level `Next` relation,
@@ -836,6 +888,9 @@ well below the CI budget.
 - [Retired D1 exact-acknowledgement property](traces/D1-retired-exact-acked-convergence.md)
 - [Retired D1 tombstone-retention property](traces/D1-retired-tombstone-retention-convergence.md)
 - [D1 term/sequence collision with seq-only redelivery](traces/D1-term-seq-collision.md)
+- [D1 restart with committed-only collision state](traces/D1-term-collision-restart-committed-only.md)
+- [D1 primary max-based gap recovery loop](traces/D1-primary-gap-max-recovery-loop.md)
+- [Retired D1 promotion-candidate availability property](traces/D1-retired-promotion-candidate-availability.md)
 
 ## Not covered
 

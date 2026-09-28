@@ -150,7 +150,8 @@ combined S1 crash/restart/recovery safety and liveness checks plus the
 no-timeout modeling-assumption regression in the fast matrix. Keep the D1
 historical order/replay counterexamples, fixed concurrent/replay variants, and
 no-durable-tombstone check in that matrix. Also retain the D1 term-collision
-historical/fixed pair and bounded gap-resolution check.
+historical/fixed pair, restart restoration pair, primary-gap detector pair,
+bounded gap-resolution check, and promotion replay/NoOp check.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with

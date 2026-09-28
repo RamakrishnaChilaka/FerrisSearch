@@ -97,6 +97,9 @@ benchmark artifacts.
   can be reused after promotion. Gap evidence must state whether the missing
   operation is pulled, recovered, or filled with a NoOp before checkpoint
   advancement.
+- D1 restart evidence must distinguish committed metadata from durable copy
+  identity. Promotion evidence must scope safety properties to available
+  copies and state that WAL replay completes before local NoOp gap fill.
 - Activation liveness claims must name the proactive lifecycle trigger and
   preserve the no-trigger stutter trace as bounded counterevidence.
 - Record the monotonic applied-Raft-view assumption. Loss of `raft.db` followed

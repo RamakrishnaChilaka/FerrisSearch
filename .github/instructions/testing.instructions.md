@@ -58,6 +58,9 @@ cargo test -- test_name                         # Single test by name
   violation. `d1-order-historical` must retain `NoCopyBehindAcked`, and
   `d1-replay-historical` must retain its acknowledged replay-loss violation.
   `d1-term-collision-seq-only` must retain `B1NoCopyBehindAcked`.
+  `d1-term-collision-restart-committed` must retain
+  `B1RNoCopyBehindAcked`, and `d1-primary-gap-max` must retain
+  `B3NoRecoveryLoop`.
   The S1 no-timeout case is a modeling-assumption regression, not a historical
   Rust defect.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
@@ -67,7 +70,9 @@ cargo test -- test_name                         # Single test by name
   `storage-apply-primary`, `storage-apply-primary-no-replica`,
   `s1-combined-replica`, `s1-combined-primary`, `s1-combined-liveness`,
   `d1-order-fixed`, `d1-replay-fixed`, `d1-no-durable-tombstone`,
-  `d1-term-collision-fixed`, `d1-gaps`, `two-shard`, `fixed-crash`, and
+  `d1-term-collision-fixed`, `d1-gaps`,
+  `d1-term-collision-restart-identity`, `d1-primary-gap-processed`,
+  `d1-promotion-replay-noop`, `two-shard`, `fixed-crash`, and
   `fixed-partition` are expected-pass configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
@@ -79,6 +84,9 @@ cargo test -- test_name                         # Single test by name
 - A property comparing non-semantic internal retention/cache/bookkeeping state
   may be refined when logical state and every safety property already agree.
   Preserve and document the over-strong-property trace before continuing.
+- A property applied to a copy that is not available under the Rust contract
+  may be availability-scoped. Promotion candidates still replaying and
+  recovery targets not yet admitted are not available copies.
 - Safety runs may use a documented state constraint and valid node symmetry.
   Liveness runs use neither; declare the exact fairness assumptions instead.
 - When you add a model variable, add it to every action's `UNCHANGED` tuple,
@@ -125,6 +133,11 @@ cargo test -- test_name                         # Single test by name
   sequence. A newer-term collision at an already processed sequence must fail
   the copy and require recovery. Gap checks cover missing-operation pull,
   timeout/re-recovery, and promotion-time NoOp fill before checkpoint advance.
+- Restart collision checks restore fence term and fence maximum from durable
+  copy identity rather than commit metadata. Primary-gap detection compares
+  processed checkpoints, not maximum sequence. Promotion checks replay all
+  local WAL entries before NoOp fill; failed NoOp replication may leave a
+  replica gap but cannot block local activation.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt
