@@ -104,6 +104,9 @@ default_configs=(
     d1-replay-historical
     d1-replay-fixed
     d1-no-durable-tombstone
+    d1-term-collision-seq-only
+    d1-term-collision-fixed
+    d1-gaps
     two-shard
 )
 
@@ -158,6 +161,9 @@ d1-order-fixed          pass: concurrent writes converge under seq-aware apply
 d1-replay-historical    expected replay loss from highest committed sequence
 d1-replay-fixed         pass: processed-checkpoint replay through D1 planner
 d1-no-durable-tombstone pass: replayed delete fences a late older index
+d1-term-collision-seq-only expected B1NoCopyBehindAcked: term/seq collision
+d1-term-collision-fixed pass: newer-term collision fails and re-recovers copy
+d1-gaps                 pass: pull, recovery, and promotion NoOp close gaps
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -395,6 +401,21 @@ run_config() {
         d1-no-durable-tombstone|MC_D1_NoDurableTombstone)
             module="MC_D1_SeqNoApply.tla"
             cfg="MC_D1_NoDurableTombstone.cfg"
+            expected="pass"
+            ;;
+        d1-term-collision-seq-only|MC_D1_TermCollisionSeqOnly)
+            module="MC_D1_TermCollision.tla"
+            cfg="MC_D1_TermCollisionSeqOnly.cfg"
+            expected="B1NoCopyBehindAcked"
+            ;;
+        d1-term-collision-fixed|MC_D1_TermCollisionFixed)
+            module="MC_D1_TermCollision.tla"
+            cfg="MC_D1_TermCollisionFixed.cfg"
+            expected="pass"
+            ;;
+        d1-gaps|MC_D1_Gaps)
+            module="MC_D1_Gaps.tla"
+            cfg="MC_D1_Gaps.cfg"
             expected="pass"
             ;;
         two-shard|MC_TwoShardIsolation)
