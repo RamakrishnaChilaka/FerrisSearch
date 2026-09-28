@@ -40,6 +40,9 @@ cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh storage-replica storage-primary storage-primary-no-replica
 ./scripts/tla/check.sh storage-apply-replica storage-apply-primary storage-apply-primary-no-replica
 ./scripts/tla/check.sh s1-combined-replica s1-combined-primary s1-combined-liveness
+./scripts/tla/check.sh trace-validator          # Converter and trace acceptance/rejection
+./scripts/tla/validate_trace.sh path/to/trace.jsonl
+./scripts/tla/test_trace_validator.sh
 ./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
 ./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
 ```
@@ -72,7 +75,7 @@ cargo test -- test_name                         # Single test by name
   `d1-order-fixed`, `d1-replay-fixed`, `d1-no-durable-tombstone`,
   `d1-term-collision-fixed`, `d1-gaps`,
   `d1-term-collision-restart-identity`, `d1-primary-gap-processed`,
-  `d1-promotion-replay-noop`, `two-shard`, `fixed-crash`, and
+  `d1-promotion-replay-noop`, `trace-validator`, `two-shard`, `fixed-crash`, and
   `fixed-partition` are expected-pass configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
@@ -138,6 +141,18 @@ cargo test -- test_name                         # Single test by name
   processed checkpoints, not maximum sequence. Promotion checks replay all
   local WAL entries before NoOp fill; failed NoOp replication may leave a
   replica gap but cannot block local activation.
+- D1 implementation traces follow `specs/tla/trace/SCHEMA.md`. The converter
+  must reject unknown schema versions, events, outcomes, and fields before
+  invoking TLC. The checked-in valid traces must remain accepted; the
+  arrival-order, sequence-only redelivery, and highest-commit replay traces
+  must remain rejected at their documented schema steps.
+- A trace-validation pass means only that the finite observed execution can be
+  embedded in `TraceD1` while unobserved state is existentially completed. It
+  is not an implementation proof, and hand-written fixtures are not evidence
+  that a Rust execution emitted the same behavior.
+- Protocol trace events must be synchronously ordered by the process-global
+  trace sink and emitted after the named effect but before releasing its
+  linearizing lock. Do not validate normal asynchronous tracing output.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt

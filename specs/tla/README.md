@@ -36,6 +36,14 @@ Run selected configurations:
 ./scripts/tla/check.sh c1-aba-fixed c2-fixed g1-empty-store g2-liveness
 ```
 
+Validate one implementation trace or run the trace validator's self-tests:
+
+```bash
+./scripts/tla/validate_trace.sh path/to/d1-trace.jsonl
+./scripts/tla/test_trace_validator.sh
+./scripts/tla/check.sh trace-validator
+```
+
 Use an existing verified jar or retain raw logs:
 
 ```bash
@@ -84,6 +92,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_D1_TermCollisionRestart.tla` | B1 crash/rebuild after fence raise, committed-record-only versus identity-based restoration of collision state. |
 | `MC_D1_PrimaryGap.tla` | Primary engine-apply gap, max-based recovery loop, and processed-checkpoint comparison. |
 | `MC_D1_PromotionReplayNoOp.tla` | Promotion ordering: replay local WAL, fill gaps with NoOps, tolerate failed NoOp replication, then activate. |
+| `TraceD1.tla` | Observable-state projection of the D1 rules for validating schema-v1 JSONL executions, including first-failing-step diagnostics. |
 | `MC_TwoShardIsolation.tla` | Minimal index-level check that one red shard does not block failover and allocation on a sibling shard. |
 | `MC_FenceDurability.tla` | Bounded check that a learned replica fence must survive restart. |
 | `MC_G1_EmptyStore.tla` | CreateIndex, permitted initial empty-copy creation, pre-activation disk loss, first activation, and first acknowledged write. |
@@ -100,6 +109,11 @@ liveness configurations use neither symmetry nor a state constraint.
 - Documents are represented by bounded document keys and unique write IDs.
   Deletes are distinct write kinds; value/rollback checks use operation
   identity and exact sequence numbers.
+- Trace validation represents payloads by a canonical content hash and
+  constrains exact allocation, term, sequence, required-replica, WAL,
+  checkpoint, fence, replay, promotion, activation, and recovery observations.
+  Unlogged scheduling and metadata-view steps remain existentially chosen
+  between recorded events.
 - Existing fault/recovery configurations retain a one-active-write state-space
   bound. D1 configurations allow three same-shard client writes to overlap,
   satisfying ADR 0001 section 8 and allowing their replica messages to arrive
@@ -306,6 +320,44 @@ Histories containing failed or otherwise unacknowledged primary-WAL operations
 are intentionally excluded from exact quiescent convergence. Such operations
 may leave copies divergent until ADR D10 adds resync, trimming, and no-op gap
 closure.
+
+### Implementation trace validation
+
+[`trace/SCHEMA.md`](trace/SCHEMA.md) defines the JSON Lines contract for
+instrumented D1 tests. A process-global ordered event stream records only
+protocol-linearization points. `scripts/tla/trace_to_tla.py` validates the
+schema exactly, rejects unknown versions, events, outcomes, or fields, and
+generates a finite `TraceInput.tla`. `TraceD1.tla` then requires each observed
+event to be enabled by the D1 observable-state projection. Unobserved
+scheduling, message, Raft-view, and bookkeeping state may occur between
+records, but observed records cannot be reordered or discarded.
+
+A successful validation means the finite logged execution can be embedded in
+a behavior accepted by this projection. It does not prove the implementation
+correct, verify the instrumentation, replace the bounded model configurations,
+or establish behavior for executions that were not logged.
+
+The checked-in request-durable fixtures cover concurrent out-of-order replica
+delivery, newer-term sequence collision, crash/restart replay, delete followed
+by a late older index, exact required-replica acknowledgement, and gap-aware
+processed/persisted checkpoints. Results from September 28, 2026, using Java
+25 and TLA+ tools 1.7.4:
+
+| Trace fixture | Expected/result | Generated / distinct | Depth | Time |
+| --- | --- | ---: | ---: | ---: |
+| [`valid-concurrent-order.jsonl`](trace/examples/valid-concurrent-order.jsonl) | Accepted: late sequence 0 index is stale behind acknowledged sequence 1 delete | 29 / 24 | 24 | 2s |
+| [`valid-term-collision.jsonl`](trace/examples/valid-term-collision.jsonl) | Accepted: durable fence maximum makes reused sequence 11 a collision before recovery | 38 / 32 | 32 | 2s |
+| [`valid-processed-checkpoint-replay.jsonl`](trace/examples/valid-processed-checkpoint-replay.jsonl) | Accepted: restart replays physical WAL order above the persisted processed checkpoint | 58 / 47 | 47 | 2s |
+| [`invalid-arrival-order.jsonl`](trace/examples/invalid-arrival-order.jsonl) | Rejected at schema step 19, `operation_applied`: older index claims `applied_newer` instead of `stale` | 24 / 20 | 20 | 2s |
+| [`invalid-seq-only-redelivery.jsonl`](trace/examples/invalid-seq-only-redelivery.jsonl) | Rejected at schema step 25, `operation_applied`: newer-term collision claims `redelivery` | 32 / 26 | 26 | 2s |
+| [`invalid-highest-commit-replay.jsonl`](trace/examples/invalid-highest-commit-replay.jsonl) | Rejected at schema step 20, `commit_persisted`: boundary advances to maximum sequence 2 across gaps | 27 / 21 | 21 | 3s |
+
+`scripts/tla/test_trace_validator.sh` also checks converter rejection of
+unknown schema versions, event names, fields, outcomes, and changed content for
+one `(term, seq_no)` identity. It is the `trace-validator` entry in the default
+fast matrix. The Rust instrumentation is not yet connected, so these results
+validate the trace checker and hand-written D1 scenarios, not a captured Rust
+execution.
 
 Two property formulations were retired:
 
@@ -835,13 +887,14 @@ performance benchmarks.
 | `d1-primary-gap-max` | 2 copies / seq 0..2 | Both checkpoints 1; primary max next 3 | Max-based detector | Expected `B3NoRecoveryLoop` violation | 4 / 4 | 4 | <1s |
 | `d1-primary-gap-processed` | Same primary gap | Compare processed checkpoint 1 to 1 | Processed detector | Pass | 3 / 3 | 3 | 1s |
 | `d1-promotion-replay-noop` | Promoted copy WAL `{0,2}` | Replay, NoOp 1, failed NoOp replication, activate | Promotion ordering | Pass | 8 / 7 | 6 | 1s |
+| `trace-validator` | Schema-v1 one-shard traces | Strict conversion; fixed and historical D1 scenarios | Exact allocation/term/sequence observations | Validator self-tests pass; expected invalid traces rejected at named steps | See trace table above | See trace table above | 16s total |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
 | `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 87,012,150 / 12,495,758 | 42 | 42m55s |
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
-The complete default twelve-worker fast matrix ran from 05:58:02 to
-06:01:36 UTC (3m34s), and every expected pass or expected counterexample
-matched. The two large exhaustive runs used eight workers.
+The complete default twelve-worker fast matrix, including trace validation,
+ran from 13:45:27 to 13:50:32 UTC (5m05s), and every expected pass or expected
+counterexample matched. The two large exhaustive runs used eight workers.
 
 The two long fixed-design configurations use the top-level `Next` relation,
 not a scenario wrapper, but `FaultMode` still limits enabled fault classes.
@@ -897,7 +950,9 @@ well below the CI budget.
 - This is not a proof for unbounded nodes, writes, terms, crashes, or queues.
 - No Apalache inductive check has been run.
 - No TLAPS proof has been written.
-- Process-test protocol traces are not yet emitted or validated against TLA+.
+- The trace validator currently checks hand-written schema-v1 fixtures. Rust
+  process/integration tests do not yet emit those events, so no captured Rust
+  execution is claimed as validated evidence yet.
 - Index delete/recreate identity is abstracted as pre-finalize abort rather
   than modeled end to end.
 - File/chunk/frame-size limits, SHA-256 implementation details, torn-frame

@@ -1,8 +1,8 @@
 # D1 implementation trace schema
 
-**Status:** schema contract for the first trace-validation implementation.
-`TraceD1.tla`, the JSONL converter, and the runner are intentionally deferred to
-the next step.
+**Status:** version 1 is implemented by `TraceD1.tla`,
+`scripts/tla/trace_to_tla.py`, and `scripts/tla/validate_trace.sh`. Rust
+instrumentation will emit this schema in a later implementation commit.
 
 This schema defines the events that instrumented Rust tests must emit so TLC can
 check whether the observed execution is a behavior permitted by the D1 model.
