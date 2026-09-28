@@ -3110,10 +3110,10 @@ async fn replicate_doc_returns_local_checkpoint() {
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     setup_single_node_cluster_state(&cm, "cp-idx");
 
-    let addr = start_grpc_server(cm, sm).await;
+    let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
 
-    // First replicate — checkpoint should be 0 (or whatever the first seq_no is)
+    // A higher sequence can be processed without advancing the contiguous checkpoint.
     let payload = serde_json::json!({"title": "checkpoint test 1"});
     let resp = client
         .replicate_doc(tonic::Request::new(ReplicateDocRequest {
@@ -3132,12 +3132,32 @@ async fn replicate_doc_returns_local_checkpoint() {
         .into_inner();
 
     assert!(resp.success);
-    assert_eq!(
-        resp.local_checkpoint, 5,
-        "local checkpoint should match the seq_no we sent"
-    );
+    assert_eq!(resp.local_checkpoint, 0);
 
-    // Second replicate with higher seq_no
+    // Filling the missing prefix closes the gap through sequence 5.
+    let mut checkpoint = 0;
+    for seq_no in 0..5 {
+        let response = client
+            .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                index_name: "cp-idx".into(),
+                shard_id: 0,
+                doc_id: format!("cp-prefix-{seq_no}"),
+                payload_json: serde_json::to_vec(&serde_json::json!({"seq": seq_no})).unwrap(),
+                op: "index".into(),
+                seq_no,
+                index_uuid: "cp-idx-uuid".into(),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        checkpoint = response.local_checkpoint;
+    }
+    assert_eq!(checkpoint, 5);
+
+    // A second gap holds the checkpoint at 5 until 6..9 arrive.
     let payload2 = serde_json::json!({"title": "checkpoint test 2"});
     let resp2 = client
         .replicate_doc(tonic::Request::new(ReplicateDocRequest {
@@ -3156,10 +3176,27 @@ async fn replicate_doc_returns_local_checkpoint() {
         .into_inner();
 
     assert!(resp2.success);
-    assert_eq!(
-        resp2.local_checkpoint, 10,
-        "checkpoint should advance to 10"
-    );
+    assert_eq!(resp2.local_checkpoint, 5);
+    for seq_no in 6..10 {
+        let response = client
+            .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                index_name: "cp-idx".into(),
+                shard_id: 0,
+                doc_id: format!("cp-gap-{seq_no}"),
+                payload_json: serde_json::to_vec(&serde_json::json!({"seq": seq_no})).unwrap(),
+                op: "index".into(),
+                seq_no,
+                index_uuid: "cp-idx-uuid".into(),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        checkpoint = response.local_checkpoint;
+    }
+    assert_eq!(checkpoint, 10);
 }
 
 #[tokio::test]
@@ -3179,7 +3216,7 @@ async fn replicate_bulk_returns_local_checkpoint() {
             doc_id: format!("bulk-cp-{i}"),
             payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
             op: "index".into(),
-            seq_no: 100 + i as u64,
+            seq_no: i as u64,
             index_uuid: "bulk-cp-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
@@ -3201,8 +3238,8 @@ async fn replicate_bulk_returns_local_checkpoint() {
 
     assert!(resp.success);
     assert_eq!(
-        resp.local_checkpoint, 102,
-        "checkpoint should equal highest seq_no in batch"
+        resp.local_checkpoint, 2,
+        "checkpoint should equal the batch's contiguous final sequence"
     );
 }
 
@@ -3791,6 +3828,7 @@ async fn recover_replica_ops_have_correct_fields() {
     assert_eq!(resp.operations.len(), 2);
     let index = &resp.operations[0];
     assert_eq!(index.seq_no, 1);
+    assert_eq!(index.primary_term, 1);
     assert_eq!(index.op, "index");
     assert_eq!(index.doc_id, "opf-1");
     assert_eq!(
@@ -3799,6 +3837,7 @@ async fn recover_replica_ops_have_correct_fields() {
     );
     let delete = &resp.operations[1];
     assert_eq!(delete.seq_no, 2);
+    assert_eq!(delete.primary_term, 1);
     assert_eq!(delete.op, "delete");
     assert_eq!(delete.doc_id, "opf-1");
     assert_eq!(

@@ -816,12 +816,19 @@ async fn download_recovery_file(
 enum TargetOperation {
     Index {
         seq_no: u64,
+        primary_term: u64,
         doc_id: String,
         payload: serde_json::Value,
     },
     Delete {
         seq_no: u64,
+        primary_term: u64,
         doc_id: String,
+    },
+    NoOp {
+        seq_no: u64,
+        primary_term: u64,
+        reason: String,
     },
 }
 
@@ -838,6 +845,9 @@ async fn apply_recovery_operations(
         if operation.seq_no < from_seq_no || operation.seq_no >= primary_next_seq_no {
             anyhow::bail!("peer recovery operation is outside the requested range");
         }
+        if operation.primary_term == 0 {
+            anyhow::bail!("peer recovery operation has a zero primary term");
+        }
         if previous.is_some_and(|previous| operation.seq_no <= previous) {
             anyhow::bail!("peer recovery operations are not strictly increasing");
         }
@@ -845,14 +855,30 @@ async fn apply_recovery_operations(
         match operation.op.as_str() {
             "index" => decoded.push(TargetOperation::Index {
                 seq_no: operation.seq_no,
+                primary_term: operation.primary_term,
                 doc_id: operation.doc_id,
                 payload: serde_json::from_slice(&operation.payload_json)
                     .context("decode peer recovery index payload")?,
             }),
             "delete" => decoded.push(TargetOperation::Delete {
                 seq_no: operation.seq_no,
+                primary_term: operation.primary_term,
                 doc_id: operation.doc_id,
             }),
+            "noop" => {
+                let payload: serde_json::Value = serde_json::from_slice(&operation.payload_json)
+                    .context("decode peer recovery no-op payload")?;
+                let reason = payload
+                    .get("_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("peer recovery no-op has no _reason"))?
+                    .to_string();
+                decoded.push(TargetOperation::NoOp {
+                    seq_no: operation.seq_no,
+                    primary_term: operation.primary_term,
+                    reason,
+                });
+            }
             other => anyhow::bail!("unknown peer recovery operation '{other}'"),
         }
     }
@@ -878,16 +904,30 @@ async fn apply_recovery_operations(
             match operation {
                 TargetOperation::Index {
                     seq_no,
+                    primary_term,
                     doc_id,
                     payload,
                 } => {
                     engine_for_apply
-                        .add_document_with_seq(&doc_id, payload, seq_no)
+                        .add_document_with_seq_at_term(&doc_id, payload, seq_no, primary_term)
                         .map_err(ShardManager::local_storage_failure)?;
                 }
-                TargetOperation::Delete { seq_no, doc_id } => {
+                TargetOperation::Delete {
+                    seq_no,
+                    primary_term,
+                    doc_id,
+                } => {
                     engine_for_apply
-                        .delete_document_with_seq(&doc_id, seq_no)
+                        .delete_document_with_seq_at_term(&doc_id, seq_no, primary_term)
+                        .map_err(ShardManager::local_storage_failure)?;
+                }
+                TargetOperation::NoOp {
+                    seq_no,
+                    primary_term,
+                    reason,
+                } => {
+                    engine_for_apply
+                        .apply_noop_with_seq(&reason, seq_no, primary_term)
                         .map_err(ShardManager::local_storage_failure)?;
                 }
             }
@@ -1044,12 +1084,14 @@ mod tests {
             vec![
                 RecoverReplicaOp {
                     seq_no: 5,
+                    primary_term: 2,
                     op: "index".into(),
                     doc_id: "a".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
                 },
                 RecoverReplicaOp {
                     seq_no: 8,
+                    primary_term: 2,
                     op: "delete".into(),
                     doc_id: "b".into(),
                     payload_json: Vec::new(),
@@ -1069,12 +1111,14 @@ mod tests {
             vec![
                 RecoverReplicaOp {
                     seq_no: 11,
+                    primary_term: 2,
                     op: "delete".into(),
                     doc_id: "a".into(),
                     payload_json: Vec::new(),
                 },
                 RecoverReplicaOp {
                     seq_no: 10,
+                    primary_term: 2,
                     op: "delete".into(),
                     doc_id: "b".into(),
                     payload_json: Vec::new(),

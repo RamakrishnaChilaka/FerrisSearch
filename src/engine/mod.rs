@@ -2,6 +2,7 @@ pub mod column_cache;
 pub mod composite;
 pub mod remote_store;
 pub mod routing;
+pub(crate) mod sequence;
 pub mod tantivy;
 pub mod vector;
 
@@ -13,6 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub use self::composite::CompositeEngine;
+pub use self::sequence::SequenceStats;
 pub use self::tantivy::HotEngine;
 
 #[derive(Debug, thiserror::Error)]
@@ -251,6 +253,15 @@ pub trait SearchEngine: Send + Sync {
         &self,
         doc_id: &str,
         payload: serde_json::Value,
+    ) -> Result<IndexWriteReceipt> {
+        self.add_document_with_receipt_at_term(doc_id, payload, self.current_primary_term())
+    }
+
+    fn add_document_with_receipt_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
     ) -> Result<IndexWriteReceipt>;
 
     /// Index a single document using a caller-supplied sequence number.
@@ -260,6 +271,16 @@ pub trait SearchEngine: Send + Sync {
         doc_id: &str,
         payload: serde_json::Value,
         seq_no: u64,
+    ) -> Result<String> {
+        self.add_document_with_seq_at_term(doc_id, payload, seq_no, self.current_primary_term())
+    }
+
+    fn add_document_with_seq_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
     ) -> Result<String>;
 
     /// Bulk-index documents. Each tuple is (doc_id, payload). Returns document IDs.
@@ -270,6 +291,14 @@ pub trait SearchEngine: Send + Sync {
     fn bulk_add_documents_with_receipt(
         &self,
         docs: Vec<(String, serde_json::Value)>,
+    ) -> Result<BulkWriteReceipt> {
+        self.bulk_add_documents_with_receipt_at_term(docs, self.current_primary_term())
+    }
+
+    fn bulk_add_documents_with_receipt_at_term(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+        primary_term: u64,
     ) -> Result<BulkWriteReceipt>;
 
     /// Bulk-index documents using caller-supplied contiguous sequence numbers.
@@ -277,6 +306,19 @@ pub trait SearchEngine: Send + Sync {
         &self,
         docs: Vec<(String, serde_json::Value)>,
         start_seq_no: u64,
+    ) -> Result<Vec<String>> {
+        self.bulk_add_documents_with_start_seq_at_term(
+            docs,
+            start_seq_no,
+            self.current_primary_term(),
+        )
+    }
+
+    fn bulk_add_documents_with_start_seq_at_term(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+        start_seq_no: u64,
+        primary_term: u64,
     ) -> Result<Vec<String>>;
 
     /// Delete a document by its `_id`. Returns the number of deleted documents.
@@ -284,10 +326,32 @@ pub trait SearchEngine: Send + Sync {
         Ok(self.delete_document_with_receipt(doc_id)?.deleted)
     }
 
-    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<DeleteWriteReceipt>;
+    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<DeleteWriteReceipt> {
+        self.delete_document_with_receipt_at_term(doc_id, self.current_primary_term())
+    }
+
+    fn delete_document_with_receipt_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+    ) -> Result<DeleteWriteReceipt>;
 
     /// Delete a document using a caller-supplied sequence number.
-    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64>;
+    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
+        self.delete_document_with_seq_at_term(doc_id, seq_no, self.current_primary_term())
+    }
+
+    fn delete_document_with_seq_at_term(
+        &self,
+        doc_id: &str,
+        seq_no: u64,
+        primary_term: u64,
+    ) -> Result<u64>;
+
+    /// Persist a sequence-numbered no-op without mutating document state.
+    fn apply_noop_with_seq(&self, _reason: &str, _seq_no: u64, _primary_term: u64) -> Result<()> {
+        anyhow::bail!("sequence-numbered no-ops are not supported by this engine")
+    }
 
     /// Retrieve a document by its `_id`. Returns the `_source` JSON if found.
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>>;
@@ -417,11 +481,35 @@ pub trait SearchEngine: Send + Sync {
     /// This is currently a high-water mark, not a contiguous-prefix proof.
     /// Returns 0 if no seq_no tracking is configured (backward compat).
     fn local_checkpoint(&self) -> u64 {
-        0
+        self.sequence_stats().processed_checkpoint.unwrap_or(0)
     }
 
     /// Update the local checkpoint after applying a replicated operation.
     fn update_local_checkpoint(&self, _seq_no: u64) {}
+
+    fn sequence_stats(&self) -> SequenceStats {
+        SequenceStats {
+            processed_checkpoint: None,
+            persisted_checkpoint: None,
+            max_seq_no: None,
+        }
+    }
+
+    fn wal_max_seq_no(&self) -> Option<u64> {
+        None
+    }
+
+    fn reconcile_term_sequence_state(
+        &self,
+        _identity_fence: u64,
+        _identity_fence_max_seq_no: Option<u64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn current_primary_term(&self) -> u64 {
+        1
+    }
 
     /// Get the global checkpoint: min of all in-sync replica checkpoints.
     /// Only meaningful on the primary shard.

@@ -24,6 +24,37 @@ pub async fn replicate_write(
     op: &str,
     seq_no: u64,
 ) -> Result<Vec<(String, u64)>, Vec<String>> {
+    let primary_term = cluster_state
+        .indices
+        .get(index_name)
+        .and_then(|metadata| metadata.shard_routing.get(&shard_id))
+        .map_or(1, |routing| routing.primary_term);
+    replicate_write_with_term(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        doc_id,
+        payload,
+        op,
+        seq_no,
+        primary_term,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn replicate_write_with_term(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    doc_id: &str,
+    payload: &serde_json::Value,
+    op: &str,
+    seq_no: u64,
+    primary_term: u64,
+) -> Result<Vec<(String, u64)>, Vec<String>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
         None => return Ok(vec![]), // no index metadata, nothing to replicate
@@ -32,7 +63,12 @@ pub async fn replicate_write(
         return Ok(vec![]);
     };
     let index_uuid = metadata.uuid.to_string();
-    let primary_term = routing.primary_term;
+    if routing.primary_term != primary_term {
+        return Err(vec![format!(
+            "replication term {primary_term} does not match captured routing term {}",
+            routing.primary_term
+        )]);
+    }
 
     let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
     if replica_node_ids.is_empty() {
@@ -151,6 +187,32 @@ pub async fn replicate_bulk(
     docs: &[(String, serde_json::Value)],
     start_seq_no: u64,
 ) -> Result<Vec<(String, u64)>, Vec<String>> {
+    let primary_term = cluster_state
+        .indices
+        .get(index_name)
+        .and_then(|metadata| metadata.shard_routing.get(&shard_id))
+        .map_or(1, |routing| routing.primary_term);
+    replicate_bulk_with_term(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        docs,
+        start_seq_no,
+        primary_term,
+    )
+    .await
+}
+
+pub async fn replicate_bulk_with_term(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    docs: &[(String, serde_json::Value)],
+    start_seq_no: u64,
+    primary_term: u64,
+) -> Result<Vec<(String, u64)>, Vec<String>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
         None => return Ok(vec![]),
@@ -159,7 +221,12 @@ pub async fn replicate_bulk(
         return Ok(vec![]);
     };
     let index_uuid = metadata.uuid.to_string();
-    let primary_term = routing.primary_term;
+    if routing.primary_term != primary_term {
+        return Err(vec![format!(
+            "bulk replication term {primary_term} does not match captured routing term {}",
+            routing.primary_term
+        )]);
+    }
 
     let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
     if replica_node_ids.is_empty() {

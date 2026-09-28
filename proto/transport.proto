@@ -281,9 +281,10 @@ message RecoverReplicaResponse {
 // A single operation in a recovery response (matches translog entry).
 message RecoverReplicaOp {
     uint64 seq_no = 1;
-    string op = 2;           // "index" or "delete"
+    string op = 2;           // "index", "delete", or "noop"
     string doc_id = 3;
-    bytes payload_json = 4;  // document body
+    bytes payload_json = 4;  // document body or no-op metadata
+    uint64 primary_term = 5;
 }
 
 message RecoveryFileMetadata {

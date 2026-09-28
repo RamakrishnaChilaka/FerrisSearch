@@ -4,7 +4,6 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -15,6 +14,10 @@ use tantivy::schema::{FAST, Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, SegmentMeta, TantivyDocument, Term};
 
 use super::SearchEngine;
+use super::sequence::{
+    CommittedBoundaryRecord, LocalCheckpointTracker, PrimaryTermSequenceState, SequenceStats,
+    initialize_term_sequence_state,
+};
 use crate::wal::{
     HotTranslog, TranslogDurability, WalDocumentOperation, WriteAheadLog, document_operation,
 };
@@ -46,9 +49,90 @@ pub(crate) struct TantivyCommitFailureError {
     source: tantivy::TantivyError,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CommittedTantivyBoundary {
-    next_seq_no: u64,
+struct ApplyState {
+    checkpoints: LocalCheckpointTracker,
+    term_sequences: PrimaryTermSequenceState,
+    max_seq_no_of_updates_or_deletes: Option<u64>,
+    legacy_migration_checkpoint: Option<u64>,
+}
+
+impl ApplyState {
+    fn new(committed: CommittedBoundaryRecord) -> Result<Self> {
+        let term_sequences = initialize_term_sequence_state(
+            committed.term_sequence_state.current_term,
+            committed.term_sequence_state.max_seq_no_at_term_start,
+            &committed,
+        )?;
+        Ok(Self {
+            checkpoints: LocalCheckpointTracker::new(committed.clone())?,
+            term_sequences,
+            max_seq_no_of_updates_or_deletes: committed.max_seq_no_of_updates_or_deletes,
+            legacy_migration_checkpoint: committed.legacy_migration_checkpoint,
+        })
+    }
+
+    fn reset_to_commit(&mut self, committed: CommittedBoundaryRecord) -> Result<()> {
+        self.checkpoints.reset_to_commit(committed.clone())?;
+        self.term_sequences = initialize_term_sequence_state(
+            committed.term_sequence_state.current_term,
+            committed.term_sequence_state.max_seq_no_at_term_start,
+            &committed,
+        )?;
+        self.max_seq_no_of_updates_or_deletes = committed.max_seq_no_of_updates_or_deletes;
+        self.legacy_migration_checkpoint = committed.legacy_migration_checkpoint;
+        Ok(())
+    }
+
+    fn prepare_operation(
+        &mut self,
+        primary_term: u64,
+        seq_no: u64,
+        updates_or_deletes: bool,
+    ) -> Result<()> {
+        if primary_term > self.term_sequences.current_term() {
+            self.term_sequences
+                .raise_term(primary_term, self.checkpoints.max_seq_no())?;
+        }
+        self.term_sequences.check_before_redelivery(
+            primary_term,
+            seq_no,
+            self.checkpoints.has_processed(seq_no),
+        )?;
+        self.checkpoints.advance_max_seq_no(seq_no);
+        if updates_or_deletes {
+            self.max_seq_no_of_updates_or_deletes = Some(
+                self.max_seq_no_of_updates_or_deletes
+                    .map_or(seq_no, |current| current.max(seq_no)),
+            );
+        }
+        Ok(())
+    }
+
+    fn complete_operation(
+        &mut self,
+        primary_term: u64,
+        seq_no: u64,
+        durability: TranslogDurability,
+    ) -> Result<()> {
+        self.term_sequences.mark_processed(primary_term, seq_no)?;
+        self.checkpoints.mark_processed(seq_no);
+        if matches!(durability, TranslogDurability::Request) {
+            self.checkpoints.mark_persisted(seq_no);
+        }
+        Ok(())
+    }
+
+    fn committed_boundary(&self) -> CommittedBoundaryRecord {
+        CommittedBoundaryRecord {
+            version: super::sequence::COMMITTED_BOUNDARY_FORMAT_VERSION,
+            processed_checkpoint: self.checkpoints.processed_checkpoint(),
+            persisted_checkpoint: self.checkpoints.persisted_checkpoint(),
+            max_seq_no: self.checkpoints.max_seq_no(),
+            max_seq_no_of_updates_or_deletes: self.max_seq_no_of_updates_or_deletes,
+            legacy_migration_checkpoint: self.legacy_migration_checkpoint,
+            term_sequence_state: self.term_sequences.to_record(),
+        }
+    }
 }
 
 /// Dynamic field registry — maps user-facing field names to Tantivy Field handles.
@@ -162,8 +246,9 @@ pub struct HotEngine {
     pub refresh_interval: Duration,
     /// Write-ahead log for crash durability
     translog: Arc<Mutex<dyn WriteAheadLog>>,
-    /// Highest committed translog seq_no, stored as the next seq_no after commit.
-    committed_seq_no_path: PathBuf,
+    apply_state: Mutex<ApplyState>,
+    committed_boundary_path: PathBuf,
+    durability: TranslogDurability,
     /// Shared column cache for fast-field Arrow arrays and grouped-partials
     /// full-segment decoded columns.
     column_cache: Arc<super::column_cache::ColumnCache>,
@@ -575,6 +660,13 @@ impl HotEngine {
         if matches!(durability, TranslogDurability::Async { .. }) {
             translog.start_sync_task();
         }
+        let committed_boundary_path = data_dir.join("translog.committed");
+        let committed_boundary = CommittedBoundaryRecord::load_or_initialize_empty(
+            &committed_boundary_path,
+            0,
+            translog.max_seq_no(),
+        )?;
+        let apply_state = ApplyState::new(committed_boundary)?;
 
         let field_registry = FieldRegistry {
             id_field,
@@ -583,8 +675,6 @@ impl HotEngine {
             field_types,
             date_fields,
         };
-
-        let committed_seq_no_path = data_dir.join("translog.committed");
 
         let engine = Self {
             index,
@@ -611,7 +701,9 @@ impl HotEngine {
             field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
-            committed_seq_no_path,
+            apply_state: Mutex::new(apply_state),
+            committed_boundary_path,
+            durability,
             column_cache,
         };
 
@@ -678,14 +770,14 @@ impl HotEngine {
         &self,
         writer_state: &mut WriterState,
         context: &str,
-        next_seq_no: u64,
-    ) -> Result<CommittedTantivyBoundary> {
+        boundary: CommittedBoundaryRecord,
+    ) -> Result<CommittedBoundaryRecord> {
         let commit_result = {
             let writer = writer_state.writer_mut(context)?;
             writer.commit()
         };
         match commit_result {
-            Ok(_) => Ok(CommittedTantivyBoundary { next_seq_no }),
+            Ok(_) => Ok(boundary),
             Err(source) => {
                 let failure = TantivyCommitFailureError {
                     context: context.to_string(),
@@ -700,23 +792,67 @@ impl HotEngine {
     fn validate_truncation_boundary(
         &self,
         translog: &dyn WriteAheadLog,
-        boundary: CommittedTantivyBoundary,
+        boundary: &CommittedBoundaryRecord,
     ) -> Result<()> {
-        let persisted = self.load_committed_next_seq_no()?;
-        if persisted != boundary.next_seq_no {
+        let persisted = self.load_committed_boundary()?;
+        if persisted != *boundary {
             anyhow::bail!(
-                "refusing WAL truncation: persisted committed checkpoint {persisted} does not match successful Tantivy commit boundary {}",
-                boundary.next_seq_no
+                "refusing WAL truncation: persisted committed boundary does not match the successful Tantivy commit boundary"
             );
         }
-        let wal_next_seq_no = translog.next_seq_no();
-        if boundary.next_seq_no != wal_next_seq_no {
+        if boundary.max_seq_no != translog.max_seq_no() {
             anyhow::bail!(
-                "refusing WAL truncation: successful Tantivy commit boundary {} does not match WAL next sequence {wal_next_seq_no}",
-                boundary.next_seq_no
+                "refusing WAL truncation: successful Tantivy maximum sequence {:?} does not match WAL maximum sequence {:?}",
+                boundary.max_seq_no,
+                translog.max_seq_no()
             );
         }
         Ok(())
+    }
+
+    fn load_committed_boundary(&self) -> Result<CommittedBoundaryRecord> {
+        CommittedBoundaryRecord::load(&self.committed_boundary_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "committed boundary {:?} disappeared after engine initialization",
+                self.committed_boundary_path
+            )
+        })
+    }
+
+    fn current_committed_boundary(&self) -> Result<CommittedBoundaryRecord> {
+        let state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let boundary = state.committed_boundary();
+        boundary.validate()?;
+        Ok(boundary)
+    }
+
+    fn reset_apply_state_to_commit(&self, committed: CommittedBoundaryRecord) -> Result<()> {
+        self.apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .reset_to_commit(committed)
+    }
+
+    fn prepare_sequence_operation(
+        &self,
+        primary_term: u64,
+        seq_no: u64,
+        updates_or_deletes: bool,
+    ) -> Result<()> {
+        self.apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .prepare_operation(primary_term, seq_no, updates_or_deletes)
+    }
+
+    fn complete_sequence_operation(&self, primary_term: u64, seq_no: u64) -> Result<()> {
+        self.apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .complete_operation(primary_term, seq_no, self.durability)
     }
 
     fn replay_translog_suffix_locked(
@@ -725,7 +861,12 @@ impl HotEngine {
         writer_state: &mut WriterState,
         context: &str,
     ) -> Result<u64> {
-        let committed_next_seq = self.load_committed_next_seq_no()?;
+        let committed = self.load_committed_boundary()?;
+        self.reset_apply_state_to_commit(committed.clone())?;
+        let committed_next_seq = committed
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0);
         let wal_next_seq = translog.next_seq_no();
         if committed_next_seq > wal_next_seq {
             anyhow::bail!(
@@ -755,9 +896,12 @@ impl HotEngine {
             }
 
             let operation = document_operation(&entry)?;
-            let doc_id = operation.doc_id();
-
-            {
+            self.prepare_sequence_operation(
+                entry.primary_term,
+                entry.seq_no,
+                !matches!(operation, WalDocumentOperation::NoOp { .. }),
+            )?;
+            if let Some(doc_id) = operation.doc_id() {
                 let writer = writer_state.writer_mut(context)?;
                 writer.delete_term(Term::from_field_text(id_field, doc_id));
                 if let WalDocumentOperation::Index { source, .. } = operation {
@@ -765,14 +909,15 @@ impl HotEngine {
                     writer.add_document(doc)?;
                 }
             }
+            self.complete_sequence_operation(entry.primary_term, entry.seq_no)?;
 
             last_seq = entry.seq_no;
             replayed += 1;
             batch_count += 1;
             if batch_count >= TRANSLOG_REPLAY_BATCH_SIZE {
-                let boundary =
-                    self.commit_writer_at_boundary(writer_state, context, last_seq + 1)?;
-                self.persist_committed_boundary(boundary)?;
+                let boundary = self.current_committed_boundary()?;
+                let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
+                self.persist_committed_boundary(&boundary)?;
                 last_committed_boundary = Some(boundary);
                 batch_count = 0;
             }
@@ -791,8 +936,9 @@ impl HotEngine {
             anyhow::bail!(message);
         }
         if batch_count > 0 {
+            let boundary = self.current_committed_boundary()?;
             last_committed_boundary =
-                Some(self.commit_writer_at_boundary(writer_state, context, last_seq + 1)?);
+                Some(self.commit_writer_at_boundary(writer_state, context, boundary)?);
         }
         if let Err(error) = self.reader.reload() {
             writer_state.fail(format!("reader reload failed after {context}: {error}"));
@@ -800,7 +946,7 @@ impl HotEngine {
         }
         let committed_boundary = last_committed_boundary
             .expect("a non-empty successful replay has a committed boundary");
-        if let Err(error) = self.persist_committed_boundary(committed_boundary) {
+        if let Err(error) = self.persist_committed_boundary(&committed_boundary) {
             writer_state.fail(format!(
                 "committed checkpoint persistence failed after {context}: {error:#}"
             ));
@@ -866,8 +1012,7 @@ impl HotEngine {
     fn pause_and_drain_automatic_merges(
         &self,
         translog: &dyn WriteAheadLog,
-        committed_next_seq: u64,
-    ) -> Result<CommittedTantivyBoundary> {
+    ) -> Result<CommittedBoundaryRecord> {
         let automatic_policy = self
             .automatic_merge_policy
             .read()
@@ -879,11 +1024,9 @@ impl HotEngine {
         writer_state
             .writer_mut("force-merge preparation")?
             .set_merge_policy(Box::new(NoMergePolicy));
-        let committed_boundary = self.commit_writer_at_boundary(
-            &mut writer_state,
-            "force-merge preparation",
-            committed_next_seq,
-        )?;
+        let boundary = self.current_committed_boundary()?;
+        let committed_boundary =
+            self.commit_writer_at_boundary(&mut writer_state, "force-merge preparation", boundary)?;
 
         let writer = writer_state.take("force-merge merge-thread drain")?;
         #[cfg(test)]
@@ -1810,42 +1953,26 @@ impl HotEngine {
         })
     }
 
+    #[cfg(test)]
     fn load_committed_next_seq_no(&self) -> Result<u64> {
-        if !self.committed_seq_no_path.exists() {
-            return Ok(0);
-        }
-        let s = std::fs::read_to_string(&self.committed_seq_no_path)?;
-        s.trim().parse::<u64>().map_err(|error| {
-            anyhow::anyhow!(
-                "invalid committed translog checkpoint {:?}: {}",
-                self.committed_seq_no_path,
-                error
-            )
-        })
+        Ok(self
+            .load_committed_boundary()?
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0))
     }
 
-    fn persist_committed_boundary(&self, boundary: CommittedTantivyBoundary) -> Result<()> {
-        std::fs::write(
-            &self.committed_seq_no_path,
-            boundary.next_seq_no.to_string(),
-        )?;
-        Ok(())
+    fn persist_committed_boundary(&self, boundary: &CommittedBoundaryRecord) -> Result<()> {
+        boundary.persist(&self.committed_boundary_path)
     }
 
-    fn persist_committed_boundary_durable(&self, boundary: CommittedTantivyBoundary) -> Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&self.committed_seq_no_path)?;
-        write!(file, "{}", boundary.next_seq_no)?;
-        file.sync_all()?;
-        Ok(())
+    fn persist_committed_boundary_durable(&self, boundary: &CommittedBoundaryRecord) -> Result<()> {
+        self.persist_committed_boundary(boundary)
     }
 
     fn peer_recovery_file_names(&self) -> Result<Vec<String>> {
         let index_path = self
-            .committed_seq_no_path
+            .committed_boundary_path
             .parent()
             .expect("committed checkpoint path has a parent")
             .join("index");
@@ -2264,6 +2391,81 @@ impl HotEngine {
     /// only up to the given global checkpoint. Entries above the checkpoint
     /// are retained for replica recovery via translog replay.
     /// Returns the highest seq_no written to the WAL.
+    pub fn sequence_stats(&self) -> SequenceStats {
+        self.apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoints
+            .stats()
+    }
+
+    pub fn current_primary_term(&self) -> u64 {
+        self.apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .term_sequences
+            .current_term()
+            .max(1)
+    }
+
+    pub fn missing_sequence_intervals_through(
+        &self,
+        end: u64,
+    ) -> Vec<std::ops::RangeInclusive<u64>> {
+        self.apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoints
+            .missing_intervals_through(end)
+    }
+
+    pub(crate) fn update_local_checkpoint_compat(&self, seq_no: u64) {
+        let mut state = self
+            .apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.checkpoints.advance_max_seq_no(seq_no);
+        state.checkpoints.mark_processed(seq_no);
+        state.checkpoints.mark_persisted(seq_no);
+    }
+
+    pub fn wal_max_seq_no(&self) -> Option<u64> {
+        self.with_translog_recover("wal_max_seq_no", |translog| translog.max_seq_no())
+    }
+
+    pub fn reconcile_term_sequence_state(
+        &self,
+        identity_fence: u64,
+        identity_fence_max_seq_no: Option<u64>,
+    ) -> Result<()> {
+        self.with_translog("term-sequence reconciliation", |translog| {
+            let committed = self.load_committed_boundary()?;
+            let mut state = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+            state.term_sequences = initialize_term_sequence_state(
+                identity_fence,
+                identity_fence_max_seq_no,
+                &committed,
+            )?;
+            if identity_fence > committed.term_sequence_state.current_term {
+                translog.for_each_from(0, &mut |entry| {
+                    if entry.primary_term == identity_fence
+                        && identity_fence_max_seq_no.is_some_and(|maximum| entry.seq_no <= maximum)
+                        && state.checkpoints.has_processed(entry.seq_no)
+                    {
+                        state
+                            .term_sequences
+                            .mark_processed(identity_fence, entry.seq_no)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn last_seq_no(&self) -> u64 {
         self.with_translog_recover("last_seq_no", |tl| tl.last_seq_no())
     }
@@ -2291,7 +2493,6 @@ impl HotEngine {
                 anyhow::bail!("translog lock poisoned during checkpoint-aware flush")
             }
         };
-        let committed_next_seq = tl.next_seq_no();
         // Keep the existing writer-lock recovery policy here. A poisoned
         // translog lock makes the WAL retention boundary ambiguous; a poisoned
         // writer lock does not.
@@ -2303,19 +2504,15 @@ impl HotEngine {
         if writer_state.writer.is_none() {
             return Ok(false);
         }
-        let committed_boundary = self.commit_writer_at_boundary(
-            &mut writer_state,
-            "checkpoint-aware flush",
-            committed_next_seq,
-        )?;
+        let boundary = self.current_committed_boundary()?;
+        let committed_boundary =
+            self.commit_writer_at_boundary(&mut writer_state, "checkpoint-aware flush", boundary)?;
         drop(writer_state);
         self.reader.reload()?;
-        self.persist_committed_boundary(committed_boundary)?;
-        self.validate_truncation_boundary(&*tl, committed_boundary)?;
+        self.persist_committed_boundary(&committed_boundary)?;
+        self.validate_truncation_boundary(&*tl, &committed_boundary)?;
         if global_checkpoint > 0 {
             tl.truncate_below(global_checkpoint)?;
-        } else {
-            tl.truncate()?;
         }
         Ok(true)
     }
@@ -2323,21 +2520,19 @@ impl HotEngine {
     pub fn flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<()> {
         let _maintenance = self.maintenance_guard("checkpoint-aware flush")?;
         self.with_translog("checkpoint-aware flush", |tl| {
-            let committed_next_seq = tl.next_seq_no();
             let mut writer_state = self.writer_state_with_replay(tl, "checkpoint-aware flush")?;
+            let boundary = self.current_committed_boundary()?;
             let committed_boundary = self.commit_writer_at_boundary(
                 &mut writer_state,
                 "checkpoint-aware flush",
-                committed_next_seq,
+                boundary,
             )?;
             drop(writer_state);
             self.reader.reload()?;
-            self.persist_committed_boundary(committed_boundary)?;
-            self.validate_truncation_boundary(tl, committed_boundary)?;
+            self.persist_committed_boundary(&committed_boundary)?;
+            self.validate_truncation_boundary(tl, &committed_boundary)?;
             if global_checkpoint > 0 {
                 tl.truncate_below(global_checkpoint)?;
-            } else {
-                tl.truncate()?;
             }
             Ok(())
         })
@@ -5708,10 +5903,11 @@ impl super::SearchEngine for HotEngine {
         HotEngine::writer_is_failed_for_test(self)
     }
 
-    fn add_document_with_receipt(
+    fn add_document_with_receipt_at_term(
         &self,
         doc_id: &str,
         payload: serde_json::Value,
+        primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
         self.validate_keyword_documents(std::iter::once(&payload))?;
         // Keep WAL append and the corresponding writer mutation in one critical
@@ -5724,7 +5920,8 @@ impl super::SearchEngine for HotEngine {
                 "_doc_id": doc_id,
                 "_source": payload
             });
-            let receipt = tl.append(crate::wal::WalOperation::Index, wal_entry)?;
+            let receipt = tl.append(primary_term, crate::wal::WalOperation::Index, wal_entry)?;
+            self.prepare_sequence_operation(primary_term, receipt.seq_no, true)?;
             #[cfg(test)]
             self.maybe_fail_engine_apply_for_test()?;
 
@@ -5739,6 +5936,7 @@ impl super::SearchEngine for HotEngine {
             // 3. Write to Tantivy in-memory buffer
             let doc = self.build_tantivy_doc(doc_id, &payload)?;
             writer.add_document(doc)?;
+            self.complete_sequence_operation(primary_term, receipt.seq_no)?;
             Ok(receipt.seq_no)
         })?;
 
@@ -5748,22 +5946,29 @@ impl super::SearchEngine for HotEngine {
         })
     }
 
-    fn add_document_with_seq(
+    fn add_document_with_seq_at_term(
         &self,
         doc_id: &str,
         payload: serde_json::Value,
         seq_no: u64,
+        primary_term: u64,
     ) -> Result<String> {
         self.validate_keyword_documents(std::iter::once(&payload))?;
         self.with_translog("replica document indexing", |tl| {
             let mut writer_state =
                 self.writer_state_with_replay(tl, "replica document indexing")?;
+            self.prepare_sequence_operation(primary_term, seq_no, true)?;
             let writer = writer_state.writer_mut("replica document indexing")?;
             let wal_entry = serde_json::json!({
                 "_doc_id": doc_id,
                 "_source": payload
             });
-            tl.append_with_seq(seq_no, crate::wal::WalOperation::Index, wal_entry)?;
+            tl.append_with_seq(
+                seq_no,
+                primary_term,
+                crate::wal::WalOperation::Index,
+                wal_entry,
+            )?;
             #[cfg(test)]
             self.maybe_fail_engine_apply_for_test()?;
 
@@ -5776,15 +5981,17 @@ impl super::SearchEngine for HotEngine {
 
             let doc = self.build_tantivy_doc(doc_id, &payload)?;
             writer.add_document(doc)?;
+            self.complete_sequence_operation(primary_term, seq_no)?;
             Ok(())
         })?;
 
         Ok(doc_id.to_string())
     }
 
-    fn bulk_add_documents_with_receipt(
+    fn bulk_add_documents_with_receipt_at_term(
         &self,
         docs: Vec<(String, serde_json::Value)>,
+        primary_term: u64,
     ) -> Result<super::BulkWriteReceipt> {
         self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
         // Keep WAL persistence and writer mutation serialized with refresh/flush.
@@ -5807,10 +6014,19 @@ impl super::SearchEngine for HotEngine {
                 .unwrap_or_else(|e| e.into_inner());
             let mut writer_state = self.writer_state_with_replay(tl, "bulk indexing")?;
             let writer = writer_state.writer_mut("bulk indexing")?;
-            let start_seq_no = tl.write_bulk_with_receipt(&ops)?;
+            let start_seq_no = tl.write_bulk_with_receipt(primary_term, &ops)?;
+            if let Some(start_seq_no) = start_seq_no {
+                for offset in 0..docs.len() {
+                    self.prepare_sequence_operation(
+                        primary_term,
+                        start_seq_no + offset as u64,
+                        true,
+                    )?;
+                }
+            }
             #[cfg(test)]
             self.maybe_fail_engine_apply_for_test()?;
-            for (doc_id, payload) in &docs {
+            for (offset, (doc_id, payload)) in docs.iter().enumerate() {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
                 let doc = Self::build_tantivy_doc_inner(
                     &registry,
@@ -5819,6 +6035,10 @@ impl super::SearchEngine for HotEngine {
                     payload,
                 )?;
                 writer.add_document(doc)?;
+                self.complete_sequence_operation(
+                    primary_term,
+                    start_seq_no.expect("non-empty bulk has a start sequence") + offset as u64,
+                )?;
                 doc_ids.push(doc_id.clone());
             }
             Ok(start_seq_no)
@@ -5830,10 +6050,11 @@ impl super::SearchEngine for HotEngine {
         })
     }
 
-    fn bulk_add_documents_with_start_seq(
+    fn bulk_add_documents_with_start_seq_at_term(
         &self,
         docs: Vec<(String, serde_json::Value)>,
         start_seq_no: u64,
+        primary_term: u64,
     ) -> Result<Vec<String>> {
         self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
         let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
@@ -5852,11 +6073,14 @@ impl super::SearchEngine for HotEngine {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             let mut writer_state = self.writer_state_with_replay(tl, "replica bulk indexing")?;
+            for offset in 0..docs.len() {
+                self.prepare_sequence_operation(primary_term, start_seq_no + offset as u64, true)?;
+            }
             let writer = writer_state.writer_mut("replica bulk indexing")?;
-            tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
+            tl.write_bulk_with_start_seq(start_seq_no, primary_term, &ops)?;
             #[cfg(test)]
             self.maybe_fail_engine_apply_for_test()?;
-            for (doc_id, payload) in &docs {
+            for (offset, (doc_id, payload)) in docs.iter().enumerate() {
                 writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
                 let doc = Self::build_tantivy_doc_inner(
                     &registry,
@@ -5865,6 +6089,7 @@ impl super::SearchEngine for HotEngine {
                     payload,
                 )?;
                 writer.add_document(doc)?;
+                self.complete_sequence_operation(primary_term, start_seq_no + offset as u64)?;
                 doc_ids.push(doc_id.clone());
             }
             Ok(())
@@ -5873,14 +6098,20 @@ impl super::SearchEngine for HotEngine {
         Ok(doc_ids)
     }
 
-    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<super::DeleteWriteReceipt> {
+    fn delete_document_with_receipt_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+    ) -> Result<super::DeleteWriteReceipt> {
         let seq_no = self.with_translog("document delete", |tl| {
             let mut writer_state = self.writer_state_with_replay(tl, "document delete")?;
             let writer = writer_state.writer_mut("document delete")?;
             let receipt = tl.append(
+                primary_term,
                 crate::wal::WalOperation::Delete,
                 serde_json::json!({ "_doc_id": doc_id }),
             )?;
+            self.prepare_sequence_operation(primary_term, receipt.seq_no, true)?;
             #[cfg(test)]
             self.maybe_fail_engine_apply_for_test()?;
 
@@ -5893,17 +6124,25 @@ impl super::SearchEngine for HotEngine {
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             // delete_term returns an OpStamp, not a count — we report 1 optimistically
             let _ = opstamp;
+            self.complete_sequence_operation(primary_term, receipt.seq_no)?;
             Ok(receipt.seq_no)
         })?;
         Ok(super::DeleteWriteReceipt { deleted: 1, seq_no })
     }
 
-    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
+    fn delete_document_with_seq_at_term(
+        &self,
+        doc_id: &str,
+        seq_no: u64,
+        primary_term: u64,
+    ) -> Result<u64> {
         self.with_translog("replica document delete", |tl| {
             let mut writer_state = self.writer_state_with_replay(tl, "replica document delete")?;
+            self.prepare_sequence_operation(primary_term, seq_no, true)?;
             let writer = writer_state.writer_mut("replica document delete")?;
             tl.append_with_seq(
                 seq_no,
+                primary_term,
                 crate::wal::WalOperation::Delete,
                 serde_json::json!({ "_doc_id": doc_id }),
             )?;
@@ -5917,9 +6156,25 @@ impl super::SearchEngine for HotEngine {
                 .id_field;
             let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
             let _ = opstamp;
+            self.complete_sequence_operation(primary_term, seq_no)?;
             Ok(())
         })?;
         Ok(1)
+    }
+
+    fn apply_noop_with_seq(&self, reason: &str, seq_no: u64, primary_term: u64) -> Result<()> {
+        self.with_translog("replica no-op apply", |tl| {
+            let _writer_state = self.writer_state_with_replay(tl, "replica no-op apply")?;
+            self.prepare_sequence_operation(primary_term, seq_no, false)?;
+            tl.append_with_seq(
+                seq_no,
+                primary_term,
+                crate::wal::WalOperation::NoOp,
+                serde_json::json!({ "_reason": reason }),
+            )?;
+            self.complete_sequence_operation(primary_term, seq_no)?;
+            Ok(())
+        })
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -5948,7 +6203,6 @@ impl super::SearchEngine for HotEngine {
     fn refresh(&self) -> Result<()> {
         let _maintenance = self.maintenance_guard("refresh")?;
         let committed_boundary = self.with_translog("refresh", |tl| {
-            let next_seq = tl.next_seq_no();
             #[cfg(test)]
             if let Some(sender) = self
                 .refresh_before_writer_sender
@@ -5959,9 +6213,10 @@ impl super::SearchEngine for HotEngine {
                 let _ = sender.send(());
             }
             let mut writer_state = self.writer_state_with_replay(tl, "refresh")?;
-            self.commit_writer_at_boundary(&mut writer_state, "refresh", next_seq)
+            let boundary = self.current_committed_boundary()?;
+            self.commit_writer_at_boundary(&mut writer_state, "refresh", boundary)
         })?;
-        self.persist_committed_boundary(committed_boundary)?;
+        self.persist_committed_boundary(&committed_boundary)?;
         self.reader.reload()?;
         Ok(())
     }
@@ -5969,14 +6224,14 @@ impl super::SearchEngine for HotEngine {
     fn flush(&self) -> Result<()> {
         let _maintenance = self.maintenance_guard("flush")?;
         self.with_translog("flush", |tl| {
-            let committed_next_seq = tl.next_seq_no();
             let mut writer_state = self.writer_state_with_replay(tl, "flush")?;
+            let boundary = self.current_committed_boundary()?;
             let committed_boundary =
-                self.commit_writer_at_boundary(&mut writer_state, "flush", committed_next_seq)?;
+                self.commit_writer_at_boundary(&mut writer_state, "flush", boundary)?;
             drop(writer_state); // release lock before reader reload
             self.reader.reload()?;
-            self.persist_committed_boundary(committed_boundary)?;
-            self.validate_truncation_boundary(tl, committed_boundary)?;
+            self.persist_committed_boundary(&committed_boundary)?;
+            self.validate_truncation_boundary(tl, &committed_boundary)?;
             tl.truncate()?;
             Ok(())
         })
@@ -5999,8 +6254,7 @@ impl super::SearchEngine for HotEngine {
 
         let _maintenance = self.maintenance_guard("force merge")?;
         let committed_boundary = self.with_translog("force merge", |translog| {
-            let next_seq = translog.next_seq_no();
-            self.pause_and_drain_automatic_merges(translog, next_seq)
+            self.pause_and_drain_automatic_merges(translog)
         })?;
         let restore_policy = AutomaticMergePolicyRestore {
             engine: self,
@@ -6008,7 +6262,7 @@ impl super::SearchEngine for HotEngine {
         };
 
         let merge_result = (|| {
-            self.persist_committed_boundary(committed_boundary)?;
+            self.persist_committed_boundary(&committed_boundary)?;
             self.reader.reload()?;
 
             loop {
@@ -6318,19 +6572,20 @@ impl super::SearchEngine for HotEngine {
             let snapshot_next_seq_no = translog.next_seq_no();
             let mut writer_state =
                 self.writer_state_with_replay(translog, "peer recovery snapshot")?;
+            let boundary = self.current_committed_boundary()?;
             let committed_boundary = self.commit_writer_at_boundary(
                 &mut writer_state,
                 "peer recovery snapshot",
-                snapshot_next_seq_no,
+                boundary,
             )?;
             drop(writer_state);
-            self.persist_committed_boundary_durable(committed_boundary)?;
+            self.persist_committed_boundary_durable(&committed_boundary)?;
             let retention_pin_id = translog.register_retention_pin(snapshot_next_seq_no)?;
 
             let result = (|| {
                 let file_names = self.peer_recovery_file_names()?;
                 let index_path = self
-                    .committed_seq_no_path
+                    .committed_boundary_path
                     .parent()
                     .expect("committed checkpoint path has a parent")
                     .join("index");
@@ -6413,6 +6668,26 @@ impl super::SearchEngine for HotEngine {
 
     fn doc_count(&self) -> u64 {
         self.reader.searcher().num_docs()
+    }
+
+    fn sequence_stats(&self) -> SequenceStats {
+        HotEngine::sequence_stats(self)
+    }
+
+    fn wal_max_seq_no(&self) -> Option<u64> {
+        HotEngine::wal_max_seq_no(self)
+    }
+
+    fn reconcile_term_sequence_state(
+        &self,
+        identity_fence: u64,
+        identity_fence_max_seq_no: Option<u64>,
+    ) -> Result<()> {
+        HotEngine::reconcile_term_sequence_state(self, identity_fence, identity_fence_max_seq_no)
+    }
+
+    fn current_primary_term(&self) -> u64 {
+        HotEngine::current_primary_term(self)
     }
 }
 
@@ -7095,6 +7370,12 @@ mod tests {
         (dir, engine)
     }
 
+    fn persist_empty_committed_boundary(path: &Path) {
+        CommittedBoundaryRecord::empty(0)
+            .persist(&path.join("translog.committed"))
+            .unwrap();
+    }
+
     struct MergeWriteGate {
         armed: AtomicBool,
         entered_sender: Sender<()>,
@@ -7224,7 +7505,11 @@ mod tests {
             .unwrap();
         let translog =
             HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
-        let committed_seq_no_path = dir.path().join("translog.committed");
+        let committed_boundary_path = dir.path().join("translog.committed");
+        let committed_boundary = CommittedBoundaryRecord::empty(0);
+        committed_boundary
+            .persist(&committed_boundary_path)
+            .unwrap();
 
         let engine = HotEngine {
             index,
@@ -7249,7 +7534,9 @@ mod tests {
             }),
             refresh_interval: Duration::from_secs(60),
             translog: Arc::new(Mutex::new(translog)),
-            committed_seq_no_path,
+            apply_state: Mutex::new(ApplyState::new(committed_boundary).unwrap()),
+            committed_boundary_path,
+            durability: TranslogDurability::Request,
             column_cache: Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
         };
 
@@ -8114,6 +8401,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal = HotTranslog::open(dir.path()).unwrap();
         wal.append(
+            1,
             crate::wal::WalOperation::Index,
             json!({
                 "_doc_id": "invalid",
@@ -8122,6 +8410,7 @@ mod tests {
         )
         .unwrap();
         drop(wal);
+        persist_empty_committed_boundary(dir.path());
 
         let mappings = HashMap::from([(
             "tags".to_string(),
@@ -8369,11 +8658,13 @@ mod tests {
 
         // Simulate a stale checkpoint left behind by an interrupted replay after
         // the first batch checkpoint had already been persisted.
-        std::fs::write(
-            dir.path().join("translog.committed"),
-            TRANSLOG_REPLAY_BATCH_SIZE.to_string(),
-        )
-        .unwrap();
+        let checkpoint_path = dir.path().join("translog.committed");
+        let mut committed = CommittedBoundaryRecord::load(&checkpoint_path)
+            .unwrap()
+            .unwrap();
+        committed.processed_checkpoint = Some(TRANSLOG_REPLAY_BATCH_SIZE - 1);
+        committed.persisted_checkpoint = Some(TRANSLOG_REPLAY_BATCH_SIZE - 1);
+        committed.persist(&checkpoint_path).unwrap();
 
         // Second reopen replays the already-committed suffix again.
         let engine3 = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
@@ -8436,8 +8727,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let translog =
                 HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
-            translog.append(operation, payload).unwrap();
+            translog.append(1, operation, payload).unwrap();
             drop(translog);
+            persist_empty_committed_boundary(dir.path());
 
             let error = match HotEngine::new(dir.path(), Duration::from_secs(3600)) {
                 Ok(_) => panic!("startup replay accepted malformed WAL operation"),
@@ -11551,11 +11843,12 @@ mod tests {
             tl.next_seq_no()
         };
         let checkpoint_path = dir.path().join("translog.committed");
-        let before_force_merge = std::fs::read_to_string(&checkpoint_path)
+        let before_force_merge = CommittedBoundaryRecord::load(&checkpoint_path)
             .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap();
+            .unwrap()
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0);
         assert!(
             before_force_merge < expected_next_seq,
             "expected pending writes before force-merge checkpoint advance"
@@ -11563,11 +11856,12 @@ mod tests {
 
         engine.force_merge(1).unwrap();
 
-        let after_force_merge = std::fs::read_to_string(&checkpoint_path)
+        let after_force_merge = CommittedBoundaryRecord::load(&checkpoint_path)
             .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap();
+            .unwrap()
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0);
         assert_eq!(
             after_force_merge, expected_next_seq,
             "force_merge must advance translog.committed to the committed next seq_no"

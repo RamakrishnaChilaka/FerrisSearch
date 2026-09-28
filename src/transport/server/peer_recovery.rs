@@ -553,6 +553,9 @@ pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverRep
         crate::wal::WalDocumentOperation::Delete { doc_id } => {
             (doc_id.to_string(), serde_json::json!({}))
         }
+        crate::wal::WalDocumentOperation::NoOp { reason } => {
+            (String::new(), serde_json::json!({ "_reason": reason }))
+        }
     };
     Ok(RecoverReplicaOp {
         seq_no: entry.seq_no,
@@ -560,6 +563,7 @@ pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverRep
         doc_id,
         payload_json: serde_json::to_vec(&payload)
             .map_err(|error| Status::internal(format!("serialize recovery operation: {error}")))?,
+        primary_term: entry.primary_term,
     })
 }
 

@@ -71,6 +71,7 @@ name = "ferris-cli"
 path = "src/cli.rs"
 
 [dev-dependencies]
+proptest = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 sqllogictest = "0.29"
 tempfile = "3"

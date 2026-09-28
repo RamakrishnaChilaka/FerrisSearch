@@ -24,7 +24,7 @@ pub const SHARD_DATA_REMOVE_REASON_STALE_UUID_REPLACEMENT: &str = "stale_index_u
 pub const PEER_RECOVERY_IN_PROGRESS_MARKER: &str = "PEER_RECOVERY_IN_PROGRESS";
 pub const PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER: &str = "PEER_RECOVERY_AWAITING_MEMBERSHIP";
 pub const SHARD_COPY_IDENTITY_FILE: &str = "SHARD_COPY_IDENTITY.json";
-const SHARD_COPY_IDENTITY_VERSION: u32 = 1;
+const SHARD_COPY_IDENTITY_VERSION: u32 = 2;
 type SourceRecoveryIdentity = (String, u32);
 type SourceRecoveryLock = Arc<tokio::sync::Mutex<()>>;
 type SourceRecoveryLockMap = HashMap<SourceRecoveryIdentity, SourceRecoveryLock>;
@@ -226,15 +226,22 @@ pub struct ShardCopyIdentity {
     pub index_uuid: String,
     pub allocation_id: AllocationId,
     pub replica_fence: u64,
+    pub fence_max_seq_no: Option<u64>,
 }
 
 impl ShardCopyIdentity {
-    fn new(index_uuid: &str, allocation_id: AllocationId, replica_fence: u64) -> Result<Self> {
+    fn new(
+        index_uuid: &str,
+        allocation_id: AllocationId,
+        replica_fence: u64,
+        fence_max_seq_no: Option<u64>,
+    ) -> Result<Self> {
         let identity = Self {
             version: SHARD_COPY_IDENTITY_VERSION,
             index_uuid: index_uuid.to_string(),
             allocation_id,
             replica_fence,
+            fence_max_seq_no,
         };
         identity.validate()?;
         Ok(identity)
@@ -1050,6 +1057,7 @@ impl ShardManager {
                 index_uuid,
                 assignment.allocation_id,
                 assignment.primary_term,
+                None,
             )?;
             Self::persist_copy_identity(shard_dir, &identity)?;
             identity
@@ -1118,7 +1126,7 @@ impl ShardManager {
                 key.shard_id
             );
         }
-        let identity = ShardCopyIdentity::new(index_uuid, 1, 1)?;
+        let identity = ShardCopyIdentity::new(index_uuid, 1, 1, None)?;
         Self::persist_copy_identity(shard_dir, &identity)?;
         self.cache_copy_identity(key, identity.clone());
         Ok(identity)
@@ -1791,9 +1799,11 @@ impl ShardManager {
             None
         };
 
-        if let Some(assignment) = assignment {
-            self.prepare_assigned_copy_identity(&key, &shard_dir, index_uuid, assignment)?;
-        }
+        let mut prepared_identity = if let Some(assignment) = assignment {
+            Some(self.prepare_assigned_copy_identity(&key, &shard_dir, index_uuid, assignment)?)
+        } else {
+            None
+        };
 
         self.register_index_uuid(index, index_uuid);
 
@@ -1805,7 +1815,8 @@ impl ShardManager {
 
         if assignment.is_none() {
             std::fs::create_dir_all(&shard_dir)?;
-            self.ensure_local_test_identity(&key, &shard_dir, index_uuid)?;
+            prepared_identity =
+                Some(self.ensure_local_test_identity(&key, &shard_dir, index_uuid)?);
         }
         let stale_snapshot_dir = shard_dir.join("peer-recovery");
         if stale_snapshot_dir.exists() {
@@ -1820,6 +1831,10 @@ impl ShardManager {
             mappings,
             open_mode,
         )?;
+        if let Some(identity) = prepared_identity {
+            engine
+                .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
+        }
         CompositeEngine::start_refresh_loop_reactive(
             engine.clone(),
             refresh_rx,
@@ -1952,8 +1967,22 @@ impl ShardManager {
                 context.message_term
             );
         }
+        let engine = self
+            .shards
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("replica shard engine is not open"))?;
         if context.message_term > identity.replica_fence {
+            let fence_max_seq_no = engine
+                .sequence_stats()
+                .max_seq_no
+                .into_iter()
+                .chain(engine.wal_max_seq_no())
+                .max();
             identity.replica_fence = context.message_term;
+            identity.fence_max_seq_no = fence_max_seq_no;
             let shard_dir = self
                 .data_dir
                 .join(context.index_uuid)
@@ -1969,15 +1998,10 @@ impl ShardManager {
                 return Err(self.record_copy_io_failure(retry_key, error));
             }
             self.clear_copy_io_failure(&retry_key);
-            self.cache_copy_identity(&key, identity);
+            self.cache_copy_identity(&key, identity.clone());
+            engine
+                .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
         }
-        let engine = self
-            .shards
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("replica shard engine is not open"))?;
         self.ensure_local_apply_allowed(context.index_uuid, shard_id, context.allocation_id)?;
         let result = operation(engine);
         self.record_local_apply_result(context.index_uuid, shard_id, context.allocation_id, result)
@@ -2004,7 +2028,23 @@ impl ShardManager {
             let mut identity =
                 shard_manager.validated_cached_copy_identity(&key, &index_uuid, allocation_id)?;
             if term > identity.replica_fence {
+                let engine = shard_manager
+                    .shards
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("shard engine is not open during fence raise")
+                    })?;
+                let fence_max_seq_no = engine
+                    .sequence_stats()
+                    .max_seq_no
+                    .into_iter()
+                    .chain(engine.wal_max_seq_no())
+                    .max();
                 identity.replica_fence = term;
+                identity.fence_max_seq_no = fence_max_seq_no;
                 let shard_dir = shard_manager
                     .data_dir
                     .join(&index_uuid)
@@ -2020,7 +2060,11 @@ impl ShardManager {
                     return Err(shard_manager.record_copy_io_failure(retry_key, error));
                 }
                 shard_manager.clear_copy_io_failure(&retry_key);
-                shard_manager.cache_copy_identity(&key, identity);
+                shard_manager.cache_copy_identity(&key, identity.clone());
+                engine.reconcile_term_sequence_state(
+                    identity.replica_fence,
+                    identity.fence_max_seq_no,
+                )?;
             }
             Ok(())
         })
@@ -2517,14 +2561,15 @@ impl ShardManager {
                 snapshot_next_seq_no,
             )?;
             let committed_path = shard_dir.join("translog.committed");
-            let mut committed = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&committed_path)?;
-            use std::io::Write;
-            write!(committed, "{snapshot_next_seq_no}")?;
-            committed.sync_all()?;
+            let mut committed =
+                crate::engine::sequence::CommittedBoundaryRecord::empty(primary_term);
+            if let Some(last_seq_no) = snapshot_next_seq_no.checked_sub(1) {
+                committed.processed_checkpoint = Some(last_seq_no);
+                committed.persisted_checkpoint = Some(last_seq_no);
+                committed.max_seq_no = Some(last_seq_no);
+                committed.max_seq_no_of_updates_or_deletes = Some(last_seq_no);
+            }
+            committed.persist(&committed_path)?;
             std::fs::File::open(shard_dir.join("index"))?.sync_all()?;
 
             shard_manager.register_index_uuid(&index, &index_uuid);
@@ -2561,8 +2606,12 @@ impl ShardManager {
                 engine.rebuild_vectors()?;
             }
 
-            let identity = ShardCopyIdentity::new(&index_uuid, allocation_id, primary_term)?;
+            let fence_max_seq_no = committed.term_sequence_state.max_seq_no_at_term_start;
+            let identity =
+                ShardCopyIdentity::new(&index_uuid, allocation_id, primary_term, fence_max_seq_no)?;
             Self::persist_copy_identity(&shard_dir, &identity)?;
+            engine
+                .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
             std::fs::remove_file(&marker_path)?;
             std::fs::File::open(&shard_dir)?.sync_all()?;
 
@@ -4236,8 +4285,12 @@ mod tests {
                 index_uuid: "uuid-1".into(),
                 allocation_id: 7,
                 replica_fence: 2,
+                fence_max_seq_no: None,
             })
         );
+        engine
+            .add_document_with_seq_at_term("before-raise", json!({"value": 0}), 0, 2)
+            .unwrap();
         manager
             .raise_copy_fence_blocking("idx".into(), 0, "uuid-1".into(), 7, 5)
             .await
@@ -4260,7 +4313,9 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(restarted.copy_identity("idx", 0).unwrap().replica_fence, 5);
+        let identity = restarted.copy_identity("idx", 0).unwrap();
+        assert_eq!(identity.replica_fence, 5);
+        assert_eq!(identity.fence_max_seq_no, Some(0));
     }
 
     #[test]
@@ -5024,7 +5079,11 @@ mod tests {
                 .unwrap();
             engine.refresh().unwrap();
             let committed_path = dir.path().join("uuid-1/shard_0/translog.committed");
-            assert_eq!(std::fs::read_to_string(&committed_path).unwrap(), "1");
+            let committed = crate::engine::sequence::CommittedBoundaryRecord::load(&committed_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(committed.processed_checkpoint, Some(0));
+            assert_eq!(committed.persisted_checkpoint, Some(0));
 
             let index_dir = dir.path().join("uuid-1/shard_0/index");
             std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -5046,8 +5105,10 @@ mod tests {
                 "a failed commit must remove the writer before another write can queue"
             );
             assert_eq!(
-                std::fs::read_to_string(&committed_path).unwrap(),
-                "1",
+                crate::engine::sequence::CommittedBoundaryRecord::load(&committed_path)
+                    .unwrap()
+                    .unwrap(),
+                committed,
                 "a failed commit must not advance the persisted checkpoint"
             );
 
@@ -5082,10 +5143,12 @@ mod tests {
                 assert!(engine.get_document(id).unwrap().is_some(), "{id}");
             }
             engine.flush().unwrap();
-            assert_eq!(
-                std::fs::read_to_string(&committed_path).unwrap(),
-                (during_fault.seq_no + acknowledged.len() as u64 + 1).to_string()
-            );
+            let committed = crate::engine::sequence::CommittedBoundaryRecord::load(&committed_path)
+                .unwrap()
+                .unwrap();
+            let expected_checkpoint = during_fault.seq_no + acknowledged.len() as u64;
+            assert_eq!(committed.processed_checkpoint, Some(expected_checkpoint));
+            assert_eq!(committed.persisted_checkpoint, Some(expected_checkpoint));
         }
 
         let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));

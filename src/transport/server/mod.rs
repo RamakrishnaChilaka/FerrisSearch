@@ -609,8 +609,11 @@ impl InternalTransport for TransportService {
                 let engine = engine.clone();
                 let doc_id = doc_id.clone();
                 let payload = payload.clone();
+                let primary_term = activated_primary.primary_term;
                 self.worker_pools
-                    .spawn_write(move || engine.add_document_with_receipt(&doc_id, payload))
+                    .spawn_write(move || {
+                        engine.add_document_with_receipt_at_term(&doc_id, payload, primary_term)
+                    })
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
             }
@@ -627,6 +630,7 @@ impl InternalTransport for TransportService {
             Ok(receipt) => {
                 let id = receipt.doc_id;
                 let seq_no = receipt.seq_no;
+                let primary_term = activated_primary.primary_term;
                 self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
@@ -634,7 +638,7 @@ impl InternalTransport for TransportService {
                 );
 
                 // Replicate to replica shards with seq_no
-                match crate::replication::replicate_write(
+                match crate::replication::replicate_write_with_term(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -643,6 +647,7 @@ impl InternalTransport for TransportService {
                     &payload,
                     "index",
                     seq_no,
+                    primary_term,
                 )
                 .await
                 {
@@ -802,8 +807,11 @@ impl InternalTransport for TransportService {
             Ok(()) => {
                 let engine = engine.clone();
                 let docs_for_write = docs.clone();
+                let primary_term = activated_primary.primary_term;
                 self.worker_pools
-                    .spawn_write(move || engine.bulk_add_documents_with_receipt(docs_for_write))
+                    .spawn_write(move || {
+                        engine.bulk_add_documents_with_receipt_at_term(docs_for_write, primary_term)
+                    })
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
             }
@@ -822,6 +830,7 @@ impl InternalTransport for TransportService {
                     .last_seq_no()
                     .map_err(|e| Status::internal(e.to_string()))?;
                 let ids = receipt.doc_ids;
+                let primary_term = activated_primary.primary_term;
                 let Some(start_seq_no) = receipt.start_seq_no else {
                     return Ok(Response::new(ShardBulkResponse {
                         success: true,
@@ -839,13 +848,14 @@ impl InternalTransport for TransportService {
                     &activated_primary,
                 );
                 // Replicate to replica shards
-                match crate::replication::replicate_bulk(
+                match crate::replication::replicate_bulk_with_term(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
                     req.shard_id,
                     &docs,
                     start_seq_no,
+                    primary_term,
                 )
                 .await
                 {
@@ -967,8 +977,11 @@ impl InternalTransport for TransportService {
             Ok(()) => {
                 let engine = engine.clone();
                 let doc_id = req.doc_id.clone();
+                let primary_term = activated_primary.primary_term;
                 self.worker_pools
-                    .spawn_write(move || engine.delete_document_with_receipt(&doc_id))
+                    .spawn_write(move || {
+                        engine.delete_document_with_receipt_at_term(&doc_id, primary_term)
+                    })
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
             }
@@ -985,13 +998,14 @@ impl InternalTransport for TransportService {
             Ok(receipt) => {
                 let deleted = receipt.deleted;
                 let seq_no = receipt.seq_no;
+                let primary_term = activated_primary.primary_term;
                 self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
                     &activated_primary,
                 );
                 // Replicate delete to replica shards
-                match crate::replication::replicate_write(
+                match crate::replication::replicate_write_with_term(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -1000,6 +1014,7 @@ impl InternalTransport for TransportService {
                     &serde_json::json!({}),
                     "delete",
                     seq_no,
+                    primary_term,
                 )
                 .await
                 {
@@ -1729,10 +1744,19 @@ impl InternalTransport for TransportService {
                     |engine| {
                         match operation {
                             ReplicaOperation::Index(payload) => {
-                                engine.add_document_with_seq(&doc_id, payload, seq_no)?;
+                                engine.add_document_with_seq_at_term(
+                                    &doc_id,
+                                    payload,
+                                    seq_no,
+                                    primary_term,
+                                )?;
                             }
                             ReplicaOperation::Delete => {
-                                engine.delete_document_with_seq(&doc_id, seq_no)?;
+                                engine.delete_document_with_seq_at_term(
+                                    &doc_id,
+                                    seq_no,
+                                    primary_term,
+                                )?;
                             }
                         }
                         Ok(engine.local_checkpoint())
@@ -1915,7 +1939,11 @@ impl InternalTransport for TransportService {
                     },
                     |engine| {
                         if !docs.is_empty() {
-                            engine.bulk_add_documents_with_start_seq(docs, start_seq_no)?;
+                            engine.bulk_add_documents_with_start_seq_at_term(
+                                docs,
+                                start_seq_no,
+                                primary_term,
+                            )?;
                         }
                         Ok(engine.local_checkpoint())
                     },

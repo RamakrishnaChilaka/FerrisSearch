@@ -10,10 +10,11 @@
 //! Each entry is stored as a length-prefixed bincode frame:
 //!
 //! ```text
-//! [u32 LE: payload_len] [payload_len bytes: bincode-encoded TranslogEntry]
+//! [u32 LE: payload_len] [payload_len bytes: bincode-encoded WireEntryV2]
 //! ```
 //!
-//! This is more compact than JSONL and faster to parse/replay.
+//! Each v2 entry carries its format version, primary term, sequence number,
+//! operation type, and JSON payload.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -40,11 +41,13 @@ pub enum TranslogDurability {
 
 const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
 const TRANSLOG_MANIFEST_FILE: &str = "translog.manifest";
-const TRANSLOG_MANIFEST_VERSION: u32 = 1;
+pub(crate) const TRANSLOG_ENTRY_FORMAT_VERSION: u32 = 2;
+const TRANSLOG_MANIFEST_VERSION: u32 = 2;
 const TRANSLOG_SEQNO_FILE: &str = "translog.seqno";
 const TRANSLOG_FILE_PREFIX: &str = "translog-";
 const TRANSLOG_FILE_SUFFIX: &str = ".bin";
 const TRANSLOG_GENERATION_WIDTH: usize = 20;
+const MAX_NOOP_REASON_BYTES: usize = 1024;
 /// Maximum total frame size accepted for new writes and peer-recovery transfer.
 pub const MAX_WAL_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// Bounded compatibility ceiling for complete frames written before the write cap existed.
@@ -63,22 +66,39 @@ pub(crate) struct WalCorruptionError {
     message: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported {component} format version {found} (expected {expected})")]
+pub(crate) struct UnsupportedWalFormatError {
+    component: &'static str,
+    found: u32,
+    expected: u32,
+}
+
 fn wal_corruption(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(WalCorruptionError {
         message: message.into(),
     })
 }
 
+fn unsupported_wal_format(component: &'static str, found: u32, expected: u32) -> anyhow::Error {
+    anyhow::Error::new(UnsupportedWalFormatError {
+        component,
+        found,
+        expected,
+    })
+}
+
 /// The type of WAL operation.
 ///
-/// This enum replaces the previous stringly-typed `"index"` / `"delete"` convention.
-/// Serialized as a string in the binary wire format for backwards compatibility.
+/// Serialized as a validated string in the versioned binary wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalOperation {
     /// Index (create or update) a document.
     Index,
     /// Delete a document by ID.
     Delete,
+    /// Fill an intentionally empty sequence without mutating document state.
+    NoOp,
 }
 
 impl WalOperation {
@@ -87,6 +107,7 @@ impl WalOperation {
         match s {
             "index" => Ok(Self::Index),
             "delete" => Ok(Self::Delete),
+            "noop" => Ok(Self::NoOp),
             other => anyhow::bail!("unknown WAL operation type: {other}"),
         }
     }
@@ -96,6 +117,7 @@ impl WalOperation {
         match self {
             Self::Index => "index",
             Self::Delete => "delete",
+            Self::NoOp => "noop",
         }
     }
 }
@@ -111,9 +133,19 @@ impl std::fmt::Display for WalOperation {
 pub struct TranslogEntry {
     /// Monotonically increasing sequence number for ordering
     pub seq_no: u64,
+    /// Primary term that assigned this sequence number.
+    pub primary_term: u64,
     /// The operation type.
     pub op: WalOperation,
     /// The full document payload
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct SequencedWalEntry {
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub op: WalOperation,
     pub payload: serde_json::Value,
 }
 
@@ -126,17 +158,48 @@ pub(crate) enum WalDocumentOperation<'a> {
     Delete {
         doc_id: &'a str,
     },
+    NoOp {
+        reason: &'a str,
+    },
 }
 
 impl<'a> WalDocumentOperation<'a> {
-    pub(crate) fn doc_id(self) -> &'a str {
+    pub(crate) fn doc_id(self) -> Option<&'a str> {
         match self {
-            Self::Index { doc_id, .. } | Self::Delete { doc_id } => doc_id,
+            Self::Index { doc_id, .. } | Self::Delete { doc_id } => Some(doc_id),
+            Self::NoOp { .. } => None,
         }
     }
 }
 
 pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOperation<'_>> {
+    if entry.primary_term == 0 {
+        return Err(wal_corruption(format!(
+            "translog operation {} has a zero primary term",
+            entry.seq_no
+        )));
+    }
+    if entry.op == WalOperation::NoOp {
+        let reason = entry
+            .payload
+            .get("_reason")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                wal_corruption(format!(
+                    "no-op translog operation {} has no _reason",
+                    entry.seq_no
+                ))
+            })?;
+        if reason.len() > MAX_NOOP_REASON_BYTES {
+            return Err(wal_corruption(format!(
+                "no-op translog operation {} reason is {} bytes, exceeding maximum {}",
+                entry.seq_no,
+                reason.len(),
+                MAX_NOOP_REASON_BYTES
+            )));
+        }
+        return Ok(WalDocumentOperation::NoOp { reason });
+    }
     let doc_id = entry
         .payload
         .get("_doc_id")
@@ -158,12 +221,14 @@ pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOpe
             Ok(WalDocumentOperation::Index { doc_id, source })
         }
         WalOperation::Delete => Ok(WalDocumentOperation::Delete { doc_id }),
+        WalOperation::NoOp => unreachable!("no-op operations return before document validation"),
     }
 }
 
 #[derive(Clone)]
 pub struct TranslogReadSnapshot {
     next_seq_no: u64,
+    max_seq_no: Option<u64>,
     generations: Vec<GenerationInfo>,
     #[cfg(test)]
     scan_barrier: Option<Arc<std::sync::Barrier>>,
@@ -172,6 +237,10 @@ pub struct TranslogReadSnapshot {
 impl TranslogReadSnapshot {
     pub fn next_seq_no(&self) -> u64 {
         self.next_seq_no
+    }
+
+    pub fn max_seq_no(&self) -> Option<u64> {
+        self.max_seq_no
     }
 
     pub fn read_bounded_range(
@@ -196,24 +265,41 @@ impl TranslogReadSnapshot {
 /// `serde_json::Value` uses `deserialize_any()` which bincode doesn't support,
 /// so we serialize the JSON payload to a string first.
 #[derive(Serialize, Deserialize)]
-struct WireEntry {
+struct WireEntryV2 {
+    format_version: u32,
     seq_no: u64,
+    primary_term: u64,
     op: String,
     payload_json: String,
 }
 
-impl WireEntry {
+impl WireEntryV2 {
     #[cfg(test)]
     fn from_translog(entry: &TranslogEntry) -> Result<Self> {
+        validate_entry_identity(entry.primary_term, entry.op, &entry.payload)?;
         Ok(Self {
+            format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no: entry.seq_no,
+            primary_term: entry.primary_term,
             op: entry.op.as_str().to_string(),
             payload_json: serde_json::to_string(&entry.payload)?,
         })
     }
 
     fn into_translog(self) -> Result<TranslogEntry> {
+        if self.format_version != TRANSLOG_ENTRY_FORMAT_VERSION {
+            return Err(unsupported_wal_format(
+                "translog entry",
+                self.format_version,
+                TRANSLOG_ENTRY_FORMAT_VERSION,
+            ));
+        }
         let seq_no = self.seq_no;
+        if self.primary_term == 0 {
+            return Err(wal_corruption(format!(
+                "translog entry seq_no {seq_no} has a zero primary term"
+            )));
+        }
         let op = WalOperation::parse(&self.op).map_err(|error| {
             wal_corruption(format!(
                 "failed to decode translog entry seq_no {seq_no}: {error}"
@@ -224,12 +310,46 @@ impl WireEntry {
                 "failed to decode translog payload seq_no {seq_no}: {error}"
             ))
         })?;
+        validate_entry_identity(self.primary_term, op, &payload)
+            .map_err(|error| wal_corruption(error.to_string()))?;
         Ok(TranslogEntry {
             seq_no,
+            primary_term: self.primary_term,
             op,
             payload,
         })
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyWireEntryV1 {
+    seq_no: u64,
+    op: String,
+    payload_json: String,
+}
+
+fn validate_entry_identity(
+    primary_term: u64,
+    op: WalOperation,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    if primary_term == 0 {
+        anyhow::bail!("WAL primary term must be greater than zero");
+    }
+    if op == WalOperation::NoOp {
+        let reason = payload
+            .get("_reason")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("WAL no-op requires a _reason string"))?;
+        if reason.len() > MAX_NOOP_REASON_BYTES {
+            anyhow::bail!(
+                "WAL no-op reason is {} bytes, exceeding maximum {}",
+                reason.len(),
+                MAX_NOOP_REASON_BYTES
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Trait abstracting a Write-Ahead Log backend.
@@ -237,29 +357,44 @@ impl WireEntry {
 /// Future implementations could use memory-only WAL, remote WAL, etc.
 pub trait WriteAheadLog: Send + Sync {
     /// Append a single operation and fsync for durability.
-    fn append(&self, op: WalOperation, payload: serde_json::Value) -> Result<TranslogEntry>;
+    fn append(
+        &self,
+        primary_term: u64,
+        op: WalOperation,
+        payload: serde_json::Value,
+    ) -> Result<TranslogEntry>;
 
     /// Append a single operation using a caller-supplied sequence number.
     /// Used for replica/recovery paths so shard copies persist the primary's seq_no.
     fn append_with_seq(
         &self,
         seq_no: u64,
+        primary_term: u64,
         op: WalOperation,
         payload: serde_json::Value,
     ) -> Result<TranslogEntry>;
 
     /// Append multiple operations with a single fsync (bulk optimization).
-    fn append_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<Vec<TranslogEntry>>;
+    fn append_bulk(
+        &self,
+        primary_term: u64,
+        ops: &[(WalOperation, serde_json::Value)],
+    ) -> Result<Vec<TranslogEntry>>;
 
     /// Write multiple operations to WAL with a single fsync, without constructing
     /// return entries. Faster than `append_bulk` when the caller doesn't need the entries.
-    fn write_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<()> {
-        self.write_bulk_with_receipt(ops).map(|_| ())
+    fn write_bulk(
+        &self,
+        primary_term: u64,
+        ops: &[(WalOperation, serde_json::Value)],
+    ) -> Result<()> {
+        self.write_bulk_with_receipt(primary_term, ops).map(|_| ())
     }
 
     /// Return the first sequence allocated under the WAL lock, or None for an empty batch.
     fn write_bulk_with_receipt(
         &self,
+        primary_term: u64,
         ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<Option<u64>>;
 
@@ -267,8 +402,12 @@ pub trait WriteAheadLog: Send + Sync {
     fn write_bulk_with_start_seq(
         &self,
         start_seq_no: u64,
+        primary_term: u64,
         ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<()>;
+
+    /// Append arbitrary caller-assigned operations in physical input order.
+    fn append_batch_with_seq(&self, entries: &[SequencedWalEntry]) -> Result<Vec<TranslogEntry>>;
 
     /// Read all pending entries (used for replay on startup).
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
@@ -283,13 +422,19 @@ pub trait WriteAheadLog: Send + Sync {
     /// Entries above the global checkpoint are retained for replica recovery.
     fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;
 
-    /// Get the last assigned sequence number (highest seq_no written so far).
+    /// Get the last assigned sequence number (highest seq_no accepted so far).
     /// Returns 0 if no writes have occurred.
     fn last_seq_no(&self) -> u64;
 
     /// Get the next sequence number that will be assigned on append.
     /// This is exclusive: if seq_no 0 has been written, this returns 1.
     fn next_seq_no(&self) -> u64;
+
+    /// Return the minimum sequence currently retained in the WAL.
+    fn min_seq_no(&self) -> Option<u64>;
+
+    /// Return the largest assigned or explicitly accepted sequence number.
+    fn max_seq_no(&self) -> Option<u64>;
 
     /// Return the current on-disk size of the translog in bytes.
     /// Used by the auto-flush mechanism to trigger flush when the translog
@@ -329,25 +474,29 @@ pub trait WriteAheadLog: Send + Sync {
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
 #[cfg(test)]
 fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
-    let wire = WireEntry::from_translog(entry)?;
+    let wire = WireEntryV2::from_translog(entry)?;
     encode_wire_entry(&wire)
 }
 
 /// Encode directly from borrowed values — avoids cloning the payload.
 fn encode_entry_borrowed(
     seq_no: u64,
+    primary_term: u64,
     op: WalOperation,
     payload: &serde_json::Value,
 ) -> Result<Vec<u8>> {
-    let wire = WireEntry {
+    validate_entry_identity(primary_term, op, payload)?;
+    let wire = WireEntryV2 {
+        format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
         seq_no,
+        primary_term,
         op: op.as_str().to_string(),
         payload_json: serde_json::to_string(payload)?,
     };
     encode_wire_entry(&wire)
 }
 
-fn encode_wire_entry(wire: &WireEntry) -> Result<Vec<u8>> {
+fn encode_wire_entry(wire: &WireEntryV2) -> Result<Vec<u8>> {
     let encoded = bincode_next::serde::encode_to_vec(wire, BINCODE_CONFIG)?;
     let frame_bytes = checked_frame_bytes(encoded.len(), MAX_WAL_FRAME_BYTES)?;
     let len = u32::try_from(encoded.len())
@@ -372,17 +521,47 @@ fn checked_frame_bytes(payload_len: usize, max_bytes: usize) -> Result<usize> {
     Ok(frame_bytes)
 }
 
-fn decode_wire_entry(payload: &[u8]) -> Result<WireEntry> {
-    let (wire, consumed): (WireEntry, usize) =
-        bincode_next::serde::decode_from_slice(payload, BINCODE_CONFIG)
-            .map_err(|error| wal_corruption(format!("decode translog frame: {error}")))?;
-    if consumed != payload.len() {
-        return Err(wal_corruption(format!(
-            "translog frame has {} trailing payload bytes",
-            payload.len() - consumed
-        )));
+fn decode_wire_entry(payload: &[u8]) -> Result<WireEntryV2> {
+    let declared_version =
+        bincode_next::serde::decode_from_slice::<(u32,), _>(payload, BINCODE_CONFIG)
+            .ok()
+            .map(|((version,), _)| version);
+    match bincode_next::serde::decode_from_slice::<WireEntryV2, _>(payload, BINCODE_CONFIG) {
+        Ok((wire, consumed)) => {
+            if wire.format_version != TRANSLOG_ENTRY_FORMAT_VERSION {
+                return Err(unsupported_wal_format(
+                    "translog entry",
+                    wire.format_version,
+                    TRANSLOG_ENTRY_FORMAT_VERSION,
+                ));
+            }
+            if consumed != payload.len() {
+                return Err(wal_corruption(format!(
+                    "translog frame has {} trailing payload bytes",
+                    payload.len() - consumed
+                )));
+            }
+            Ok(wire)
+        }
+        Err(v2_error) if declared_version == Some(TRANSLOG_ENTRY_FORMAT_VERSION) => Err(
+            wal_corruption(format!("decode translog v2 frame: {v2_error}")),
+        ),
+        Err(v2_error) => {
+            if bincode_next::serde::decode_from_slice::<LegacyWireEntryV1, _>(
+                payload,
+                BINCODE_CONFIG,
+            )
+            .is_ok()
+            {
+                return Err(unsupported_wal_format(
+                    "translog entry",
+                    1,
+                    TRANSLOG_ENTRY_FORMAT_VERSION,
+                ));
+            }
+            Err(wal_corruption(format!("decode translog frame: {v2_error}")))
+        }
     }
-    Ok(wire)
 }
 
 /// Read all complete length-prefixed entries from a reader.
@@ -442,9 +621,16 @@ fn read_next_entry<R: Read>(
 }
 
 fn decode_wire_seq_no(prefix: &[u8]) -> Result<u64> {
-    let ((seq_no,), _): ((u64,), _) =
+    let ((format_version, seq_no), _): ((u32, u64), _) =
         bincode_next::serde::decode_from_slice(prefix, BINCODE_CONFIG)
             .map_err(|error| wal_corruption(format!("decode translog sequence prefix: {error}")))?;
+    if format_version != TRANSLOG_ENTRY_FORMAT_VERSION {
+        return Err(unsupported_wal_format(
+            "translog entry",
+            format_version,
+            TRANSLOG_ENTRY_FORMAT_VERSION,
+        ));
+    }
     Ok(seq_no)
 }
 
@@ -453,7 +639,7 @@ fn decode_wire_entry_with_prefix<R: Read>(
     mut prefix: Vec<u8>,
     payload_len: usize,
     expected_seq_no: u64,
-) -> Result<WireEntry> {
+) -> Result<WireEntryV2> {
     let prefix_len = prefix.len();
     prefix.resize(payload_len, 0);
     reader.read_exact(&mut prefix[prefix_len..])?;
@@ -486,8 +672,8 @@ fn decode_entries_streaming<R: Read>(
 
 #[derive(Debug, Default)]
 struct GenerationScan {
-    first_seq_no: Option<u64>,
-    last_seq_no: Option<u64>,
+    min_seq_no: Option<u64>,
+    max_seq_no: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -499,19 +685,19 @@ struct ActiveGenerationScan {
 
 impl GenerationScan {
     fn observe(&mut self, seq_no: u64) {
-        self.first_seq_no = Some(match self.first_seq_no {
-            Some(first) => first.min(seq_no),
+        self.min_seq_no = Some(match self.min_seq_no {
+            Some(minimum) => minimum.min(seq_no),
             None => seq_no,
         });
-        self.last_seq_no = Some(match self.last_seq_no {
-            Some(last) => last.max(seq_no),
+        self.max_seq_no = Some(match self.max_seq_no {
+            Some(maximum) => maximum.max(seq_no),
             None => seq_no,
         });
     }
 
     #[cfg(test)]
     fn next_seq_no(&self) -> u64 {
-        self.last_seq_no
+        self.max_seq_no
             .map(|last| last.saturating_add(1))
             .unwrap_or(0)
     }
@@ -521,29 +707,30 @@ impl GenerationScan {
 struct GenerationInfo {
     id: u64,
     path: PathBuf,
-    first_seq_no: Option<u64>,
-    last_seq_no: Option<u64>,
+    min_seq_no: Option<u64>,
+    max_seq_no: Option<u64>,
     size_bytes: u64,
 }
 
 impl GenerationInfo {
     fn observe_seq(&mut self, seq_no: u64) {
-        self.first_seq_no = Some(match self.first_seq_no {
-            Some(first) => first.min(seq_no),
+        self.min_seq_no = Some(match self.min_seq_no {
+            Some(minimum) => minimum.min(seq_no),
             None => seq_no,
         });
-        self.last_seq_no = Some(match self.last_seq_no {
-            Some(last) => last.max(seq_no),
+        self.max_seq_no = Some(match self.max_seq_no {
+            Some(maximum) => maximum.max(seq_no),
             None => seq_no,
         });
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct ManifestGenerationInfo {
     id: u64,
-    first_seq_no: Option<u64>,
-    last_seq_no: Option<u64>,
+    min_seq_no: Option<u64>,
+    max_seq_no: Option<u64>,
     size_bytes: u64,
 }
 
@@ -552,8 +739,8 @@ impl ManifestGenerationInfo {
         GenerationInfo {
             id: self.id,
             path: generation_path(data_dir, self.id),
-            first_seq_no: self.first_seq_no,
-            last_seq_no: self.last_seq_no,
+            min_seq_no: self.min_seq_no,
+            max_seq_no: self.max_seq_no,
             size_bytes: self.size_bytes,
         }
     }
@@ -563,25 +750,33 @@ impl From<&GenerationInfo> for ManifestGenerationInfo {
     fn from(generation: &GenerationInfo) -> Self {
         Self {
             id: generation.id,
-            first_seq_no: generation.first_seq_no,
-            last_seq_no: generation.last_seq_no,
+            min_seq_no: generation.min_seq_no,
+            max_seq_no: generation.max_seq_no,
             size_bytes: generation.size_bytes,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct TranslogManifest {
     version: u32,
+    entry_format_version: u32,
     active_generation_id: u64,
     next_generation_id: u64,
     generations: Vec<ManifestGenerationInfo>,
+}
+
+#[derive(Deserialize)]
+struct ManifestVersionHeader {
+    version: u32,
 }
 
 impl TranslogManifest {
     fn from_state(state: &TranslogState) -> Self {
         Self {
             version: TRANSLOG_MANIFEST_VERSION,
+            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             active_generation_id: state.active_generation_id,
             next_generation_id: state.next_generation_id,
             generations: state
@@ -594,11 +789,18 @@ impl TranslogManifest {
 
     fn validate(&self) -> Result<()> {
         if self.version != TRANSLOG_MANIFEST_VERSION {
-            anyhow::bail!(
-                "unsupported translog manifest version {} (expected {})",
+            return Err(unsupported_wal_format(
+                "translog manifest",
                 self.version,
-                TRANSLOG_MANIFEST_VERSION
-            );
+                TRANSLOG_MANIFEST_VERSION,
+            ));
+        }
+        if self.entry_format_version != TRANSLOG_ENTRY_FORMAT_VERSION {
+            return Err(unsupported_wal_format(
+                "translog entry",
+                self.entry_format_version,
+                TRANSLOG_ENTRY_FORMAT_VERSION,
+            ));
         }
         if self.generations.is_empty() {
             anyhow::bail!("translog manifest has no generations");
@@ -619,6 +821,21 @@ impl TranslogManifest {
             previous_id = Some(generation.id);
             if generation.id == self.active_generation_id {
                 saw_active = true;
+            }
+            match (generation.min_seq_no, generation.max_seq_no) {
+                (Some(minimum), Some(maximum)) if minimum > maximum => {
+                    return Err(wal_corruption(format!(
+                        "translog generation {} minimum sequence {} exceeds maximum {}",
+                        generation.id, minimum, maximum
+                    )));
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(wal_corruption(format!(
+                        "translog generation {} has only one sequence bound",
+                        generation.id
+                    )));
+                }
+                _ => {}
             }
         }
 
@@ -664,6 +881,28 @@ impl TranslogState {
 
     fn generations_snapshot(&self) -> Vec<GenerationInfo> {
         self.generations.clone()
+    }
+
+    fn min_seq_no(&self) -> Option<u64> {
+        self.generations
+            .iter()
+            .filter_map(|generation| generation.min_seq_no)
+            .min()
+    }
+
+    fn max_seq_no(&self) -> Option<u64> {
+        let retained_max = self
+            .generations
+            .iter()
+            .filter_map(|generation| generation.max_seq_no)
+            .max();
+        let assigned_max = self.next_seq_no.checked_sub(1);
+        match (retained_max, assigned_max) {
+            (Some(retained), Some(assigned)) => Some(retained.max(assigned)),
+            (Some(retained), None) => Some(retained),
+            (None, Some(assigned)) => Some(assigned),
+            (None, None) => None,
+        }
     }
 }
 
@@ -798,11 +1037,20 @@ fn load_translog_manifest(data_dir: &Path) -> Result<Option<TranslogManifest>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    let header = serde_json::from_slice::<ManifestVersionHeader>(&bytes)
+        .map_err(|error| wal_corruption(format!("decode translog manifest {path:?}: {error}")))?;
+    if header.version != TRANSLOG_MANIFEST_VERSION {
+        return Err(unsupported_wal_format(
+            "translog manifest",
+            header.version,
+            TRANSLOG_MANIFEST_VERSION,
+        ));
+    }
     let manifest = serde_json::from_slice::<TranslogManifest>(&bytes)
         .map_err(|error| wal_corruption(format!("decode translog manifest {path:?}: {error}")))?;
     manifest
         .validate()
-        .map_err(|error| wal_corruption(format!("validate translog manifest {path:?}: {error}")))?;
+        .with_context(|| format!("validate translog manifest {path:?}"))?;
     Ok(Some(manifest))
 }
 
@@ -901,8 +1149,8 @@ fn create_empty_generation(data_dir: &Path, generation_id: u64) -> Result<(Gener
         GenerationInfo {
             id: generation_id,
             path,
-            first_seq_no: None,
-            last_seq_no: None,
+            min_seq_no: None,
+            max_seq_no: None,
             size_bytes,
         },
         file,
@@ -1009,8 +1257,8 @@ impl HotTranslog {
                     active_scan.trailing_bytes,
                 )?;
             }
-            active_generation.first_seq_no = active_scan.generation.first_seq_no;
-            active_generation.last_seq_no = active_scan.generation.last_seq_no;
+            active_generation.min_seq_no = active_scan.generation.min_seq_no;
+            active_generation.max_seq_no = active_scan.generation.max_seq_no;
             active_generation.size_bytes = active_scan.valid_bytes;
             let active_file = open_generation_writer(&active_generation.path)?;
 
@@ -1032,6 +1280,7 @@ impl HotTranslog {
             let generations = vec![generation];
             let manifest = TranslogManifest {
                 version: TRANSLOG_MANIFEST_VERSION,
+                entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
                 active_generation_id: 0,
                 next_generation_id: 1,
                 generations: generations
@@ -1048,7 +1297,7 @@ impl HotTranslog {
             persisted_seq,
             generations
                 .iter()
-                .filter_map(|generation| generation.last_seq_no)
+                .filter_map(|generation| generation.max_seq_no)
                 .max()
                 .map(|last| last.saturating_add(1))
                 .unwrap_or(0),
@@ -1121,8 +1370,8 @@ impl HotTranslog {
         {
             let mut state = recover_lock(&translog.state, "state");
             if state.generations.len() != 1
-                || state.generations[0].first_seq_no.is_some()
-                || state.generations[0].last_seq_no.is_some()
+                || state.generations[0].min_seq_no.is_some()
+                || state.generations[0].max_seq_no.is_some()
             {
                 anyhow::bail!("cannot initialize a non-empty translog at a recovery boundary");
             }
@@ -1158,11 +1407,11 @@ impl HotTranslog {
 
         for generation in generations.iter().filter(|generation| {
             generation
-                .last_seq_no
-                .is_some_and(|last| last >= min_seq_no)
+                .max_seq_no
+                .is_some_and(|maximum| maximum >= min_seq_no)
                 && generation
-                    .first_seq_no
-                    .is_none_or(|first| first < end_seq_no)
+                    .min_seq_no
+                    .is_none_or(|minimum| minimum < end_seq_no)
         }) {
             let is_final_captured_generation = Some(generation.id) == final_generation_id;
             let file = File::open(&generation.path).with_context(|| {
@@ -1345,16 +1594,16 @@ impl HotTranslog {
                 && match (global_checkpoint, min_pin) {
                     (_, Some(0)) => false,
                     (Some(global_checkpoint), Some(min_pin)) => generation
-                        .last_seq_no
-                        .map(|last_seq_no| last_seq_no <= global_checkpoint.min(min_pin - 1))
+                        .max_seq_no
+                        .map(|max_seq_no| max_seq_no <= global_checkpoint.min(min_pin - 1))
                         .unwrap_or(true),
                     (None, Some(min_pin)) => generation
-                        .last_seq_no
-                        .map(|last_seq_no| last_seq_no < min_pin)
+                        .max_seq_no
+                        .map(|max_seq_no| max_seq_no < min_pin)
                         .unwrap_or(true),
                     (Some(global_checkpoint), None) => generation
-                        .last_seq_no
-                        .map(|last_seq_no| last_seq_no <= global_checkpoint)
+                        .max_seq_no
+                        .map(|max_seq_no| max_seq_no <= global_checkpoint)
                         .unwrap_or(true),
                     (None, None) => true,
                 };
@@ -1398,8 +1647,52 @@ impl HotTranslog {
     }
 }
 
-impl WriteAheadLog for HotTranslog {
+#[cfg(test)]
+impl HotTranslog {
     fn append(&self, op: WalOperation, payload: serde_json::Value) -> Result<TranslogEntry> {
+        WriteAheadLog::append(self, 1, op, payload)
+    }
+
+    fn append_with_seq(
+        &self,
+        seq_no: u64,
+        op: WalOperation,
+        payload: serde_json::Value,
+    ) -> Result<TranslogEntry> {
+        WriteAheadLog::append_with_seq(self, seq_no, 1, op, payload)
+    }
+
+    fn append_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
+        WriteAheadLog::append_bulk(self, 1, ops)
+    }
+
+    fn write_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<()> {
+        WriteAheadLog::write_bulk(self, 1, ops)
+    }
+
+    fn write_bulk_with_receipt(
+        &self,
+        ops: &[(WalOperation, serde_json::Value)],
+    ) -> Result<Option<u64>> {
+        WriteAheadLog::write_bulk_with_receipt(self, 1, ops)
+    }
+
+    fn write_bulk_with_start_seq(
+        &self,
+        start_seq_no: u64,
+        ops: &[(WalOperation, serde_json::Value)],
+    ) -> Result<()> {
+        WriteAheadLog::write_bulk_with_start_seq(self, start_seq_no, 1, ops)
+    }
+}
+
+impl WriteAheadLog for HotTranslog {
+    fn append(
+        &self,
+        primary_term: u64,
+        op: WalOperation,
+        payload: serde_json::Value,
+    ) -> Result<TranslogEntry> {
         #[cfg(test)]
         self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
@@ -1408,7 +1701,7 @@ impl WriteAheadLog for HotTranslog {
         let next_seq_no = seq_no
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
-        let frame = encode_entry_borrowed(seq_no, op, &payload)?;
+        let frame = encode_entry_borrowed(seq_no, primary_term, op, &payload)?;
         #[cfg(test)]
         if let Some(barrier) =
             recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier").take()
@@ -1434,6 +1727,7 @@ impl WriteAheadLog for HotTranslog {
 
         let entry = TranslogEntry {
             seq_no,
+            primary_term,
             op,
             payload,
         };
@@ -1444,14 +1738,18 @@ impl WriteAheadLog for HotTranslog {
     fn append_with_seq(
         &self,
         seq_no: u64,
+        primary_term: u64,
         op: WalOperation,
         payload: serde_json::Value,
     ) -> Result<TranslogEntry> {
         #[cfg(test)]
         self.maybe_fail_write_for_test()?;
+        let next_seq_no = seq_no
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
         let mut state = recover_lock(&self.state, "state");
         let generation_index = state.active_generation_index()?;
-        let frame = encode_entry_borrowed(seq_no, op, &payload)?;
+        let frame = encode_entry_borrowed(seq_no, primary_term, op, &payload)?;
         state.active_file.write_all(&frame)?;
         if matches!(self.durability, TranslogDurability::Request) {
             state.active_file.sync_data()?;
@@ -1459,10 +1757,11 @@ impl WriteAheadLog for HotTranslog {
         let generation = &mut state.generations[generation_index];
         generation.observe_seq(seq_no);
         generation.size_bytes += frame.len() as u64;
-        state.next_seq_no = state.next_seq_no.max(seq_no.saturating_add(1));
+        state.next_seq_no = state.next_seq_no.max(next_seq_no);
 
         let entry = TranslogEntry {
             seq_no,
+            primary_term,
             op,
             payload,
         };
@@ -1470,7 +1769,11 @@ impl WriteAheadLog for HotTranslog {
         Ok(entry)
     }
 
-    fn append_bulk(&self, ops: &[(WalOperation, serde_json::Value)]) -> Result<Vec<TranslogEntry>> {
+    fn append_bulk(
+        &self,
+        primary_term: u64,
+        ops: &[(WalOperation, serde_json::Value)],
+    ) -> Result<Vec<TranslogEntry>> {
         #[cfg(test)]
         self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
@@ -1485,9 +1788,10 @@ impl WriteAheadLog for HotTranslog {
 
         for (offset, (op, payload)) in ops.iter().enumerate() {
             let seq_no = start_seq_no + offset as u64;
-            buf.extend_from_slice(&encode_entry_borrowed(seq_no, *op, payload)?);
+            buf.extend_from_slice(&encode_entry_borrowed(seq_no, primary_term, *op, payload)?);
             entries.push(TranslogEntry {
                 seq_no,
+                primary_term,
                 op: *op,
                 payload: payload.clone(),
             });
@@ -1511,6 +1815,7 @@ impl WriteAheadLog for HotTranslog {
 
     fn write_bulk_with_receipt(
         &self,
+        primary_term: u64,
         ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<Option<u64>> {
         if ops.is_empty() {
@@ -1529,7 +1834,7 @@ impl WriteAheadLog for HotTranslog {
 
         for (offset, (op, payload)) in ops.iter().enumerate() {
             let seq_no = start_seq_no + offset as u64;
-            buf.extend_from_slice(&encode_entry_borrowed(seq_no, *op, payload)?);
+            buf.extend_from_slice(&encode_entry_borrowed(seq_no, primary_term, *op, payload)?);
             last_seq_no = Some(seq_no);
         }
 
@@ -1551,13 +1856,12 @@ impl WriteAheadLog for HotTranslog {
     fn write_bulk_with_start_seq(
         &self,
         start_seq_no: u64,
+        primary_term: u64,
         ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<()> {
-        if !ops.is_empty() {
-            start_seq_no
-                .checked_add((ops.len() - 1) as u64)
-                .ok_or_else(|| anyhow::anyhow!("replica WAL sequence range overflows"))?;
-        }
+        let next_seq_no = start_seq_no
+            .checked_add(ops.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("replica WAL sequence range overflows"))?;
         #[cfg(test)]
         self.maybe_fail_write_for_test()?;
         let mut state = recover_lock(&self.state, "state");
@@ -1567,7 +1871,7 @@ impl WriteAheadLog for HotTranslog {
 
         for (offset, (op, payload)) in ops.iter().enumerate() {
             let seq_no = start_seq_no + offset as u64;
-            buf.extend_from_slice(&encode_entry_borrowed(seq_no, *op, payload)?);
+            buf.extend_from_slice(&encode_entry_borrowed(seq_no, primary_term, *op, payload)?);
             last_seq_no = Some(seq_no);
         }
 
@@ -1580,10 +1884,57 @@ impl WriteAheadLog for HotTranslog {
             generation.observe_seq(start_seq_no);
             generation.observe_seq(last_seq_no);
             generation.size_bytes += buf.len() as u64;
-            state.next_seq_no = state.next_seq_no.max(last_seq_no.saturating_add(1));
+            state.next_seq_no = state.next_seq_no.max(next_seq_no);
         }
 
         Ok(())
+    }
+
+    fn append_batch_with_seq(&self, entries: &[SequencedWalEntry]) -> Result<Vec<TranslogEntry>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
+
+        let mut encoded = Vec::with_capacity(entries.len() * 200);
+        let mut max_next_seq_no = 0u64;
+        for entry in entries {
+            let next_seq_no = entry
+                .seq_no
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
+            max_next_seq_no = max_next_seq_no.max(next_seq_no);
+            encoded.extend_from_slice(&encode_entry_borrowed(
+                entry.seq_no,
+                entry.primary_term,
+                entry.op,
+                &entry.payload,
+            )?);
+        }
+
+        let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
+        state.active_file.write_all(&encoded)?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            state.active_file.sync_data()?;
+        }
+        let generation = &mut state.generations[generation_index];
+        for entry in entries {
+            generation.observe_seq(entry.seq_no);
+        }
+        generation.size_bytes += encoded.len() as u64;
+        state.next_seq_no = state.next_seq_no.max(max_next_seq_no);
+
+        Ok(entries
+            .iter()
+            .map(|entry| TranslogEntry {
+                seq_no: entry.seq_no,
+                primary_term: entry.primary_term,
+                op: entry.op,
+                payload: entry.payload.clone(),
+            })
+            .collect())
     }
 
     fn read_all(&self) -> Result<Vec<TranslogEntry>> {
@@ -1611,8 +1962,8 @@ impl WriteAheadLog for HotTranslog {
             .into_iter()
             .filter(|generation| {
                 generation
-                    .last_seq_no
-                    .map(|last_seq_no| last_seq_no > after_seq_no)
+                    .max_seq_no
+                    .map(|max_seq_no| max_seq_no > after_seq_no)
                     .unwrap_or(false)
             })
         {
@@ -1688,6 +2039,14 @@ impl WriteAheadLog for HotTranslog {
         recover_lock(&self.state, "state").next_seq_no
     }
 
+    fn min_seq_no(&self) -> Option<u64> {
+        recover_lock(&self.state, "state").min_seq_no()
+    }
+
+    fn max_seq_no(&self) -> Option<u64> {
+        recover_lock(&self.state, "state").max_seq_no()
+    }
+
     fn size_bytes(&self) -> Result<u64> {
         let state = recover_lock(&self.state, "state");
         Ok(state
@@ -1709,8 +2068,8 @@ impl WriteAheadLog for HotTranslog {
             .into_iter()
             .filter(|generation| {
                 generation
-                    .last_seq_no
-                    .map(|last_seq_no| last_seq_no >= min_seq_no)
+                    .max_seq_no
+                    .map(|max_seq_no| max_seq_no >= min_seq_no)
                     .unwrap_or(false)
             })
         {
@@ -1758,6 +2117,7 @@ impl WriteAheadLog for HotTranslog {
         }
         Ok(TranslogReadSnapshot {
             next_seq_no: state.next_seq_no,
+            max_seq_no: state.max_seq_no(),
             generations: state.generations.clone(),
             #[cfg(test)]
             scan_barrier: recover_lock(
@@ -1834,8 +2194,10 @@ mod tests {
     }
 
     fn encoded_frame_len(seq_no: u64, op: WalOperation, payload: &serde_json::Value) -> usize {
-        let wire = WireEntry {
+        let wire = WireEntryV2 {
+            format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no,
+            primary_term: 1,
             op: op.as_str().to_string(),
             payload_json: serde_json::to_string(payload).unwrap(),
         };
@@ -1861,8 +2223,8 @@ mod tests {
         panic!("could not construct a WAL frame with exact length {target}");
     }
 
-    fn encode_legacy_entry_without_write_limit(entry: &TranslogEntry) -> Vec<u8> {
-        let wire = WireEntry::from_translog(entry).unwrap();
+    fn encode_entry_without_write_limit(entry: &TranslogEntry) -> Vec<u8> {
+        let wire = WireEntryV2::from_translog(entry).unwrap();
         let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
         let mut frame = Vec::with_capacity(4 + encoded.len());
         frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
@@ -2055,34 +2417,36 @@ mod tests {
     }
 
     #[test]
-    fn legacy_large_frame_opens_replays_and_skips_in_recovery() {
+    fn oversized_v2_frame_written_before_limit_opens_replays_and_skips_in_recovery() {
         let _guard = WAL_FRAME_LIMIT_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let legacy = TranslogEntry {
+        let pre_limit = TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"blob": "x".repeat(40 * 1024 * 1024)}),
         };
-        let frame = encode_legacy_entry_without_write_limit(&legacy);
+        let frame = encode_entry_without_write_limit(&pre_limit);
         assert!(frame.len() > MAX_WAL_FRAME_BYTES);
         assert!(frame.len() < 65 * 1024 * 1024);
         fs::write(generation_path(dir.path(), 0), &frame).unwrap();
         let manifest = TranslogManifest {
             version: TRANSLOG_MANIFEST_VERSION,
+            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             active_generation_id: 0,
             next_generation_id: 1,
             generations: vec![ManifestGenerationInfo {
                 id: 0,
-                first_seq_no: Some(0),
-                last_seq_no: Some(0),
+                min_seq_no: Some(0),
+                max_seq_no: Some(0),
                 size_bytes: frame.len() as u64,
             }],
         };
         persist_translog_manifest(&manifest_path(dir.path()), &manifest).unwrap();
         drop(frame);
-        drop(legacy);
+        drop(pre_limit);
 
         let wal = HotTranslog::open(dir.path()).unwrap();
         assert_eq!(wal.next_seq_no(), 1);
@@ -2140,8 +2504,9 @@ mod tests {
         assert_eq!(manifest.next_generation_id, 1);
         assert_eq!(manifest.generations.len(), 1);
         assert_eq!(manifest.generations[0].id, 0);
-        assert_eq!(manifest.generations[0].first_seq_no, None);
-        assert_eq!(manifest.generations[0].last_seq_no, None);
+        assert_eq!(manifest.entry_format_version, TRANSLOG_ENTRY_FORMAT_VERSION);
+        assert_eq!(manifest.generations[0].min_seq_no, None);
+        assert_eq!(manifest.generations[0].max_seq_no, None);
     }
 
     #[test]
@@ -2208,6 +2573,150 @@ mod tests {
         assert_eq!(entries[1].seq_no, 11);
         assert_eq!(entries[2].seq_no, 12);
         assert_eq!(tl.next_seq_no(), 13);
+    }
+
+    #[test]
+    fn arbitrary_explicit_sequence_batch_preserves_physical_order_and_ranges() {
+        let (dir, translog) = open_translog();
+        let entries = vec![
+            SequencedWalEntry {
+                seq_no: 10,
+                primary_term: 2,
+                op: WalOperation::Index,
+                payload: json!({"_doc_id": "late", "_source": {"value": 10}}),
+            },
+            SequencedWalEntry {
+                seq_no: 3,
+                primary_term: 2,
+                op: WalOperation::Delete,
+                payload: json!({"_doc_id": "old"}),
+            },
+            SequencedWalEntry {
+                seq_no: 7,
+                primary_term: 2,
+                op: WalOperation::NoOp,
+                payload: json!({"_reason": "gap"}),
+            },
+        ];
+
+        let appended = translog.append_batch_with_seq(&entries).unwrap();
+        assert_eq!(
+            appended
+                .iter()
+                .map(|entry| (entry.seq_no, entry.primary_term, entry.op))
+                .collect::<Vec<_>>(),
+            [
+                (10, 2, WalOperation::Index),
+                (3, 2, WalOperation::Delete),
+                (7, 2, WalOperation::NoOp),
+            ]
+        );
+        assert_eq!(
+            translog
+                .read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [10, 3, 7]
+        );
+        assert_eq!(translog.min_seq_no(), Some(3));
+        assert_eq!(translog.max_seq_no(), Some(10));
+        assert_eq!(translog.next_seq_no(), 11);
+
+        translog.truncate_below(2).unwrap();
+        let manifest = read_manifest(dir.path());
+        let retained = manifest
+            .generations
+            .iter()
+            .find(|generation| generation.min_seq_no == Some(3))
+            .unwrap();
+        assert_eq!(retained.max_seq_no, Some(10));
+
+        drop(translog);
+        let reopened = HotTranslog::open(dir.path()).unwrap();
+        assert_eq!(reopened.min_seq_no(), Some(3));
+        assert_eq!(reopened.max_seq_no(), Some(10));
+        assert_eq!(
+            reopened
+                .read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [10, 3, 7]
+        );
+    }
+
+    #[test]
+    fn overlapping_generation_ranges_are_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = encode_entry(&TranslogEntry {
+            seq_no: 10,
+            primary_term: 2,
+            op: WalOperation::Index,
+            payload: json!({"_doc_id": "ten", "_source": {}}),
+        })
+        .unwrap();
+        let second = encode_entry(&TranslogEntry {
+            seq_no: 5,
+            primary_term: 2,
+            op: WalOperation::Index,
+            payload: json!({"_doc_id": "five", "_source": {}}),
+        })
+        .unwrap();
+        fs::write(generation_path(dir.path(), 0), &first).unwrap();
+        fs::write(generation_path(dir.path(), 1), &second).unwrap();
+        persist_translog_manifest(
+            &manifest_path(dir.path()),
+            &TranslogManifest {
+                version: TRANSLOG_MANIFEST_VERSION,
+                entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
+                active_generation_id: 1,
+                next_generation_id: 2,
+                generations: vec![
+                    ManifestGenerationInfo {
+                        id: 0,
+                        min_seq_no: Some(10),
+                        max_seq_no: Some(10),
+                        size_bytes: first.len() as u64,
+                    },
+                    ManifestGenerationInfo {
+                        id: 1,
+                        min_seq_no: Some(5),
+                        max_seq_no: Some(5),
+                        size_bytes: second.len() as u64,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let translog = HotTranslog::open(dir.path()).unwrap();
+        assert_eq!(
+            translog
+                .read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [10, 5]
+        );
+        assert_eq!(translog.max_seq_no(), Some(10));
+    }
+
+    #[test]
+    fn recovery_snapshot_exposes_captured_max_sequence() {
+        let (_dir, translog) = open_translog();
+        translog
+            .append_with_seq(8, WalOperation::Index, json!({"value": 8}))
+            .unwrap();
+        translog
+            .append_with_seq(2, WalOperation::Index, json!({"value": 2}))
+            .unwrap();
+
+        let snapshot = translog.recovery_read_snapshot().unwrap();
+        assert_eq!(snapshot.max_seq_no(), Some(8));
     }
 
     #[test]
@@ -2290,6 +2799,7 @@ mod tests {
     fn binary_encode_decode_roundtrip() {
         let entry = TranslogEntry {
             seq_no: 42,
+            primary_term: 7,
             op: WalOperation::Index,
             payload: json!({"field": "value", "num": 123}),
         };
@@ -2302,14 +2812,97 @@ mod tests {
         let decoded = decode_entries(&mut reader).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].seq_no, 42);
+        assert_eq!(decoded[0].primary_term, 7);
         assert_eq!(decoded[0].op, WalOperation::Index);
         assert_eq!(decoded[0].payload["field"], "value");
+    }
+
+    #[test]
+    fn noop_roundtrip_preserves_identity_and_reason() {
+        let entry = TranslogEntry {
+            seq_no: 9,
+            primary_term: 4,
+            op: WalOperation::NoOp,
+            payload: json!({"_reason": "promotion gap"}),
+        };
+        let frame = encode_entry(&entry).unwrap();
+        let mut reader = std::io::Cursor::new(frame);
+        let decoded = decode_entries(&mut reader).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].seq_no, 9);
+        assert_eq!(decoded[0].primary_term, 4);
+        assert_eq!(decoded[0].op, WalOperation::NoOp);
+        assert!(matches!(
+            document_operation(&decoded[0]).unwrap(),
+            WalDocumentOperation::NoOp {
+                reason: "promotion gap"
+            }
+        ));
+    }
+
+    #[test]
+    fn zero_primary_term_and_oversized_noop_reason_fail_before_write() {
+        let (_dir, translog) = open_translog();
+        let zero_term = WriteAheadLog::append(
+            &translog,
+            0,
+            WalOperation::Index,
+            json!({"_doc_id": "doc", "_source": {}}),
+        )
+        .unwrap_err();
+        assert!(zero_term.to_string().contains("greater than zero"));
+
+        let oversized = WriteAheadLog::append(
+            &translog,
+            1,
+            WalOperation::NoOp,
+            json!({"_reason": "x".repeat(MAX_NOOP_REASON_BYTES + 1)}),
+        )
+        .unwrap_err();
+        assert!(oversized.to_string().contains("reason"));
+        assert_eq!(translog.size_bytes().unwrap(), 0);
+        assert_eq!(translog.next_seq_no(), 0);
+    }
+
+    #[test]
+    fn unknown_entry_version_fails_with_typed_error() {
+        let wire = WireEntryV2 {
+            format_version: TRANSLOG_ENTRY_FORMAT_VERSION + 1,
+            seq_no: 0,
+            primary_term: 1,
+            op: "index".to_string(),
+            payload_json: serde_json::to_string(&json!({"_doc_id": "doc", "_source": {}})).unwrap(),
+        };
+        let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
+        let mut frame = Vec::with_capacity(encoded.len() + 4);
+        frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&encoded);
+
+        let error = decode_entries(&mut std::io::Cursor::new(frame)).unwrap_err();
+        assert!(error.is::<UnsupportedWalFormatError>());
+    }
+
+    #[test]
+    fn legacy_v1_entry_fails_with_typed_error() {
+        let wire = LegacyWireEntryV1 {
+            seq_no: 0,
+            op: "index".to_string(),
+            payload_json: serde_json::to_string(&json!({"_doc_id": "doc", "_source": {}})).unwrap(),
+        };
+        let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
+        let mut frame = Vec::with_capacity(encoded.len() + 4);
+        frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&encoded);
+
+        let error = decode_entries(&mut std::io::Cursor::new(frame)).unwrap_err();
+        assert!(error.is::<UnsupportedWalFormatError>());
     }
 
     #[test]
     fn streaming_decode_rejects_partial_frame_at_eof() {
         let entry = TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"ok": true}),
         };
@@ -2454,18 +3047,21 @@ mod tests {
         let path = generation_path(dir.path(), 0);
         let first = encode_entry(&TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": 0}),
         })
         .unwrap();
         let torn = encode_entry(&TranslogEntry {
             seq_no: 1,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": "terminal"}),
         })
         .unwrap();
         let appended = encode_entry(&TranslogEntry {
             seq_no: 2,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": "x".repeat(256)}),
         })
@@ -2481,8 +3077,8 @@ mod tests {
         let generation = GenerationInfo {
             id: 0,
             path,
-            first_seq_no: Some(0),
-            last_seq_no: Some(2),
+            min_seq_no: Some(0),
+            max_seq_no: Some(2),
             size_bytes: bytes.len() as u64,
         };
 
@@ -2511,18 +3107,21 @@ mod tests {
         let path = generation_path(dir.path(), 0);
         let first = encode_entry(&TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": 0}),
         })
         .unwrap();
         let second = encode_entry(&TranslogEntry {
             seq_no: 1,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": 1}),
         })
         .unwrap();
         let post_head = encode_entry(&TranslogEntry {
             seq_no: 2,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": "x".repeat(8192)}),
         })
@@ -2535,8 +3134,8 @@ mod tests {
         let generation = GenerationInfo {
             id: 0,
             path,
-            first_seq_no: Some(0),
-            last_seq_no: Some(1),
+            min_seq_no: Some(0),
+            max_seq_no: Some(1),
             size_bytes: captured_size as u64,
         };
 
@@ -2563,12 +3162,14 @@ mod tests {
         let final_path = generation_path(dir.path(), 1);
         let first = encode_entry(&TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": 0}),
         })
         .unwrap();
         let post_head = encode_entry(&TranslogEntry {
             seq_no: 1,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": "x".repeat(8192)}),
         })
@@ -2582,15 +3183,15 @@ mod tests {
             GenerationInfo {
                 id: 0,
                 path: first_path,
-                first_seq_no: Some(0),
-                last_seq_no: Some(0),
+                min_seq_no: Some(0),
+                max_seq_no: Some(0),
                 size_bytes: captured_size as u64,
             },
             GenerationInfo {
                 id: 1,
                 path: final_path,
-                first_seq_no: None,
-                last_seq_no: None,
+                min_seq_no: None,
+                max_seq_no: None,
                 size_bytes: 0,
             },
         ];
@@ -2613,12 +3214,14 @@ mod tests {
         let path = generation_path(dir.path(), 0);
         let first = encode_entry(&TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": 0}),
         })
         .unwrap();
         let post_head = encode_entry(&TranslogEntry {
             seq_no: 1,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": "x".repeat(8192)}),
         })
@@ -2629,8 +3232,8 @@ mod tests {
         let generation = GenerationInfo {
             id: 0,
             path,
-            first_seq_no: Some(0),
-            last_seq_no: Some(0),
+            min_seq_no: Some(0),
+            max_seq_no: Some(0),
             size_bytes: bytes.len() as u64,
         };
 
@@ -2654,8 +3257,8 @@ mod tests {
         let generation = GenerationInfo {
             id: 0,
             path,
-            first_seq_no: Some(0),
-            last_seq_no: Some(0),
+            min_seq_no: Some(0),
+            max_seq_no: Some(0),
             size_bytes: 4,
         };
 
@@ -2679,8 +3282,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = generation_path(dir.path(), 0);
         let payload = payload_for_frame_len(0, WalOperation::Index, MAX_WAL_FRAME_BYTES + 1);
-        let frame = encode_legacy_entry_without_write_limit(&TranslogEntry {
+        let frame = encode_entry_without_write_limit(&TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload,
         });
@@ -2689,8 +3293,8 @@ mod tests {
         let generation = GenerationInfo {
             id: 0,
             path,
-            first_seq_no: Some(0),
-            last_seq_no: Some(0),
+            min_seq_no: Some(0),
+            max_seq_no: Some(0),
             size_bytes: frame.len() as u64,
         };
 
@@ -2907,6 +3511,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let legacy_entry = TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"legacy": true}),
         };
@@ -2924,6 +3529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entry = TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"doc": 1}),
         };
@@ -2941,6 +3547,7 @@ mod tests {
 
         let active_entry = TranslogEntry {
             seq_no: 7,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"active": true}),
         };
@@ -2949,19 +3556,20 @@ mod tests {
 
         let manifest = TranslogManifest {
             version: TRANSLOG_MANIFEST_VERSION,
+            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             active_generation_id: 1,
             next_generation_id: 2,
             generations: vec![
                 ManifestGenerationInfo {
                     id: 0,
-                    first_seq_no: Some(0),
-                    last_seq_no: Some(6),
+                    min_seq_no: Some(0),
+                    max_seq_no: Some(6),
                     size_bytes: b"corrupt old generation".len() as u64,
                 },
                 ManifestGenerationInfo {
                     id: 1,
-                    first_seq_no: Some(7),
-                    last_seq_no: Some(7),
+                    min_seq_no: Some(7),
+                    max_seq_no: Some(7),
                     size_bytes: active_frame.len() as u64,
                 },
             ],
@@ -2975,8 +3583,10 @@ mod tests {
     #[test]
     fn open_returns_error_for_unknown_active_generation_wal_operation() {
         let dir = tempfile::tempdir().unwrap();
-        let wire = WireEntry {
+        let wire = WireEntryV2 {
+            format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no: 0,
+            primary_term: 1,
             op: "bogus".to_string(),
             payload_json: serde_json::to_string(&json!({"doc": 1})).unwrap(),
         };
@@ -2988,12 +3598,13 @@ mod tests {
 
         let manifest = TranslogManifest {
             version: TRANSLOG_MANIFEST_VERSION,
+            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             active_generation_id: 0,
             next_generation_id: 1,
             generations: vec![ManifestGenerationInfo {
                 id: 0,
-                first_seq_no: Some(0),
-                last_seq_no: Some(0),
+                min_seq_no: Some(0),
+                max_seq_no: Some(0),
                 size_bytes: frame.len() as u64,
             }],
         };
@@ -3055,12 +3666,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = encode_entry(&TranslogEntry {
             seq_no: 0,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": 0}),
         })
         .unwrap();
-        let corrupt_wire = WireEntry {
+        let corrupt_wire = WireEntryV2 {
+            format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no: 1,
+            primary_term: 1,
             op: "bogus".to_string(),
             payload_json: serde_json::to_string(&json!({"value": 1})).unwrap(),
         };
@@ -3071,6 +3685,7 @@ mod tests {
         corrupt.extend_from_slice(&corrupt_payload);
         let last = encode_entry(&TranslogEntry {
             seq_no: 2,
+            primary_term: 1,
             op: WalOperation::Index,
             payload: json!({"value": 2}),
         })
@@ -3081,12 +3696,13 @@ mod tests {
         fs::write(generation_path(dir.path(), 0), &bytes).unwrap();
         let manifest = TranslogManifest {
             version: TRANSLOG_MANIFEST_VERSION,
+            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             active_generation_id: 0,
             next_generation_id: 1,
             generations: vec![ManifestGenerationInfo {
                 id: 0,
-                first_seq_no: Some(0),
-                last_seq_no: Some(2),
+                min_seq_no: Some(0),
+                max_seq_no: Some(2),
                 size_bytes: bytes.len() as u64,
             }],
         };
