@@ -139,7 +139,9 @@ pub async fn replicate_bulk(
 - Failed replication returns typed per-replica failures retaining node,
   allocation, message, and definitive status. A primary receiving a definitive
   `DATA_LOSS` failure conditionally removes that exact allocation at the
-  captured term before returning the write failure.
+  captured term before returning the write failure. The replica persists an
+  allocation-bound collision marker before closing; lifecycle failure reports
+  retry until the exact allocation is removed.
 - Request durability requires every replica response to prove the exact
   operation persisted; async durability requires processed proof and advances
   persisted checkpoints only after fsync or commit.

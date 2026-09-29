@@ -24,7 +24,7 @@ pub const SHARD_DATA_REMOVE_REASON_STALE_UUID_REPLACEMENT: &str = "stale_index_u
 pub const PEER_RECOVERY_IN_PROGRESS_MARKER: &str = "PEER_RECOVERY_IN_PROGRESS";
 pub const PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER: &str = "PEER_RECOVERY_AWAITING_MEMBERSHIP";
 pub const SHARD_COPY_IDENTITY_FILE: &str = "SHARD_COPY_IDENTITY.json";
-const SHARD_COPY_IDENTITY_VERSION: u32 = 2;
+const SHARD_COPY_IDENTITY_VERSION: u32 = 3;
 type SourceRecoveryIdentity = (String, u32);
 type SourceRecoveryLock = Arc<tokio::sync::Mutex<()>>;
 type SourceRecoveryLockMap = HashMap<SourceRecoveryIdentity, SourceRecoveryLock>;
@@ -228,6 +228,15 @@ pub(crate) struct ReplicaApplyContext<'a> {
     pub message_term: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "shard copy collision quarantine is active for index UUID {index_uuid}, allocation {allocation_id}"
+)]
+pub(crate) struct CollisionQuarantinedShardCopy {
+    index_uuid: String,
+    allocation_id: AllocationId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardCopyIdentity {
@@ -236,6 +245,7 @@ pub struct ShardCopyIdentity {
     pub allocation_id: AllocationId,
     pub replica_fence: u64,
     pub fence_max_seq_no: Option<u64>,
+    pub collision_quarantined: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -256,6 +266,7 @@ impl ShardCopyIdentity {
             allocation_id,
             replica_fence,
             fence_max_seq_no,
+            collision_quarantined: false,
         };
         identity.validate()?;
         Ok(identity)
@@ -289,7 +300,7 @@ impl ShardCopyIdentity {
         Ok(())
     }
 
-    fn validate_expected(&self, index_uuid: &str, allocation_id: AllocationId) -> Result<()> {
+    fn validate_binding(&self, index_uuid: &str, allocation_id: AllocationId) -> Result<()> {
         self.validate()?;
         if self.index_uuid != index_uuid {
             return Err(definitive_shard_copy_failure(format!(
@@ -302,6 +313,18 @@ impl ShardCopyIdentity {
                 "local shard copy allocation mismatch: expected {allocation_id}, found {}",
                 self.allocation_id
             )));
+        }
+        Ok(())
+    }
+
+    fn validate_expected(&self, index_uuid: &str, allocation_id: AllocationId) -> Result<()> {
+        self.validate_binding(index_uuid, allocation_id)?;
+        if self.collision_quarantined {
+            return Err(CollisionQuarantinedShardCopy {
+                index_uuid: self.index_uuid.clone(),
+                allocation_id: self.allocation_id,
+            }
+            .into());
         }
         Ok(())
     }
@@ -1482,6 +1505,9 @@ impl ShardManager {
                     .downcast_ref::<crate::engine::sequence::SequenceStateCorruptionError>()
                     .is_some()
                 || cause
+                    .downcast_ref::<CollisionQuarantinedShardCopy>()
+                    .is_some()
+                || cause
                     .downcast_ref::<crate::engine::tantivy::SequenceOperationCollisionError>()
                     .is_some()
                 || cause
@@ -1503,6 +1529,9 @@ impl ShardManager {
                     .is_some()
                 || cause
                     .downcast_ref::<crate::engine::version_map::VersionMapCollisionError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<CollisionQuarantinedShardCopy>()
                     .is_some()
         })
     }
@@ -1627,6 +1656,50 @@ impl ShardManager {
         self.isr_tracker.remove_shard(index, shard_id);
     }
 
+    pub(crate) fn quarantine_sequence_collision(
+        &self,
+        index: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let shard_dir = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"));
+        let mut identity = self
+            .copy_identities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| Self::load_copy_identity(&shard_dir))?;
+        identity.validate_binding(index_uuid, allocation_id)?;
+        let persist_result = if identity.collision_quarantined {
+            Ok(())
+        } else {
+            identity.collision_quarantined = true;
+            Self::persist_copy_identity(&shard_dir, &identity)
+        };
+
+        self.shards
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.isr_tracker.remove_shard(index, shard_id);
+        persist_result
+    }
+
     pub async fn quarantine_shard_copy_blocking(
         self: &Arc<Self>,
         index: String,
@@ -1639,6 +1712,26 @@ impl ShardManager {
         .await
         .map_err(|error| anyhow::anyhow!("blocking shard quarantine failed: {error}"))?;
         Ok(())
+    }
+
+    pub(crate) async fn quarantine_sequence_collision_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            shard_manager.quarantine_sequence_collision(
+                &index,
+                shard_id,
+                &index_uuid,
+                allocation_id,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("blocking collision quarantine failed: {error}"))?
     }
 
     pub(crate) fn register_source_recovery_cleanup(
@@ -4853,6 +4946,7 @@ mod tests {
                 allocation_id: 7,
                 replica_fence: 2,
                 fence_max_seq_no: None,
+                collision_quarantined: false,
             })
         );
         apply_index(&engine, "before-raise", json!({"value": 0}), 0, 2).unwrap();
@@ -4961,6 +5055,29 @@ mod tests {
         .unwrap();
 
         let error = ShardManager::load_copy_identity(shard_dir).unwrap_err();
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
+        assert!(ShardManager::should_report_copy_failure(&error));
+        assert!(ShardManager::should_quarantine_copy_failure(&error));
+    }
+
+    #[test]
+    fn no_compat_v2_identity_requires_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SHARD_COPY_IDENTITY_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "index_uuid": "uuid-1",
+                "allocation_id": 7,
+                "replica_fence": 2,
+                "fence_max_seq_no": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = ShardManager::load_copy_identity(dir.path()).unwrap_err();
         assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
         assert!(error.to_string().contains("recreate the index"));
         assert!(ShardManager::should_report_copy_failure(&error));

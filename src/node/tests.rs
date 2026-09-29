@@ -158,6 +158,208 @@ async fn reconciliation_closes_engine_after_local_allocation_is_removed() {
     assert!(dir.path().join("idx-uuid/shard_0").exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal() {
+    let (raft, state_handle) =
+        crate::consensus::create_raft_instance_mem(1, "collision-quarantine".into())
+            .await
+            .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !raft.is_leader() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex {
+            metadata: IndexMetadata {
+                name: "idx".into(),
+                uuid: IndexUuid::new("idx-uuid"),
+                number_of_shards: 1,
+                number_of_replicas: 1,
+                shard_routing: HashMap::from([(
+                    0,
+                    ShardRoutingEntry {
+                        primary: "node-1".into(),
+                        primary_term: 1,
+                        replicas: vec!["node-2".into()],
+                        in_sync_replicas: Vec::new(),
+                        unassigned_replicas: 0,
+                    },
+                )]),
+                mappings: HashMap::new(),
+                dynamic: Default::default(),
+                settings: IndexSettings::default(),
+            },
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    let primary_allocation = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("idx", 0)
+        .unwrap();
+    let allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("idx", 0, "node-2")
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "idx".into(),
+            index_uuid: "idx-uuid".into(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: primary_allocation,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    assert_eq!(
+        raft.client_write(ClusterCommand::MarkReplicaInSync {
+            index_name: "idx".into(),
+            index_uuid: "idx-uuid".into(),
+            shard_id: 0,
+            replica: "node-2".into(),
+            allocation_id,
+            primary: "node-1".into(),
+            primary_term: 2,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+    shard_manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "idx-uuid",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    let identity_path = dir
+        .path()
+        .join("idx-uuid/shard_0")
+        .join(crate::shard::SHARD_COPY_IDENTITY_FILE);
+    let mut identity: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&identity_path).unwrap()).unwrap();
+    identity["collision_quarantined"] = serde_json::Value::Bool(true);
+    std::fs::write(&identity_path, serde_json::to_vec(&identity).unwrap()).unwrap();
+    std::fs::File::open(identity_path.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    shard_manager.quarantine_shard_copy("idx", 0);
+
+    let mut lagging_state = state_handle.read().unwrap().clone();
+    lagging_state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap()
+        .primary_term = 1;
+    let stale_failure = open_local_assigned_shards(
+        &lagging_state,
+        "node-2",
+        &shard_manager,
+        &std::sync::Mutex::new(std::collections::HashSet::new()),
+    )
+    .into_iter()
+    .next()
+    .expect("collision marker must remain reportable under a lagging routing view");
+    assert_eq!(stale_failure.primary_term, 1);
+    assert!(
+        stale_failure
+            .reason
+            .contains("collision quarantine is active")
+    );
+
+    let cluster_manager = ClusterManager::with_shared_state(state_handle.clone());
+    let mut recent_reports = std::collections::HashMap::new();
+    report_failed_shard_copies(
+        vec![stale_failure],
+        &cluster_manager,
+        &shard_manager,
+        &TransportClient::new(),
+        raft.as_ref(),
+        &mut recent_reports,
+    )
+    .await;
+    assert!(
+        state_handle.read().unwrap().indices["idx"].shard_routing[&0].is_replica_in_sync("node-2"),
+        "the stale first report must not remove the current allocation"
+    );
+
+    let current_state = state_handle.read().unwrap().clone();
+    let current_failure = open_local_assigned_shards(
+        &current_state,
+        "node-2",
+        &shard_manager,
+        &std::sync::Mutex::new(std::collections::HashSet::new()),
+    )
+    .into_iter()
+    .next()
+    .expect("collision marker must be reported again after routing catches up");
+    assert_eq!(current_failure.primary_term, 2);
+    assert!(
+        current_failure
+            .reason
+            .contains("collision quarantine is active")
+    );
+    report_failed_shard_copies(
+        vec![current_failure],
+        &cluster_manager,
+        &shard_manager,
+        &TransportClient::new(),
+        raft.as_ref(),
+        &mut recent_reports,
+    )
+    .await;
+    let removed_state = state_handle.read().unwrap().clone();
+    assert!(
+        !removed_state.indices["idx"].shard_routing[&0]
+            .replicas
+            .iter()
+            .any(|node| node == "node-2")
+    );
+    assert_eq!(removed_state.shard_allocation_id("idx", 0, "node-2"), None);
+
+    assert!(
+        open_local_assigned_shards(
+            &removed_state,
+            "node-2",
+            &shard_manager,
+            &std::sync::Mutex::new(std::collections::HashSet::new()),
+        )
+        .is_empty()
+    );
+    assert!(shard_manager.get_shard("idx", 0).is_none());
+    let identity: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(identity_path).unwrap()).unwrap();
+    assert_eq!(identity["collision_quarantined"], true);
+}
+
 #[tokio::test]
 async fn open_local_assigned_shards_opens_unopened_local_shards() {
     let dir = tempfile::tempdir().unwrap();

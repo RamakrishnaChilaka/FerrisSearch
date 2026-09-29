@@ -1812,6 +1812,9 @@ impl InternalTransport for TransportService {
                 )
                 .await;
             }
+            if error.is::<crate::shard::CollisionQuarantinedShardCopy>() {
+                return Err(Status::data_loss(error.to_string()));
+            }
             return Ok(Response::new(ReplicateDocResponse {
                 success: false,
                 error: format!("failed to open replica copy: {error}"),
@@ -2022,6 +2025,9 @@ impl InternalTransport for TransportService {
                     &error,
                 )
                 .await;
+            }
+            if error.is::<crate::shard::CollisionQuarantinedShardCopy>() {
+                return Err(Status::data_loss(error.to_string()));
             }
             return Ok(Response::new(ReplicateBulkResponse {
                 success: false,
@@ -3803,15 +3809,14 @@ impl TransportService {
         }
         let collision_failure = ShardManager::is_sequence_collision_failure(error);
         if collision_failure
-            && self
-                .shard_manager
-                .copy_identity(index_name, shard_id)
-                .is_some_and(|identity| {
-                    identity.index_uuid == index_uuid && identity.allocation_id == allocation_id
-                })
             && let Err(quarantine_error) = self
                 .shard_manager
-                .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
+                .quarantine_sequence_collision_blocking(
+                    index_name.to_string(),
+                    shard_id,
+                    index_uuid.to_string(),
+                    allocation_id,
+                )
                 .await
         {
             tracing::warn!(

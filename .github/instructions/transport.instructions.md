@@ -168,7 +168,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   when the replica's routing view lags the message term, and retains exact node
   and allocation identity through fan-out. The primary conditionally reports
   that exact copy at the write's captured term; do not depend only on the
-  replica's local routing view to start recovery.
+  replica's local routing view to start recovery. Quarantine is durable in the
+  copy identity; later replication to the marked allocation remains
+  `DATA_LOSS` and cannot reopen it.
 - Gap probes run concurrently under a two-second per-probe timeout. A copy that
   is assigned but still opening/replaying returns `UNAVAILABLE`. Only proven
   UUID/allocation/durable-identity mismatch (`FAILED_PRECONDITION`) or

@@ -52,7 +52,8 @@ pub struct ShardManager {
 ### Durable Copy Identity
 - Every served assigned copy has `<data_dir>/<uuid>/shard_<id>/SHARD_COPY_IDENTITY.json`.
 - The versioned JSON contains index UUID, allocation ID, and durable replica
-  fence. Updates use temp write, file fsync, rename, and directory fsync.
+  fence plus an allocation-bound collision-quarantine flag. Updates use temp
+  write, file fsync, rename, and directory fsync.
 - Assigned opens load and validate the file before publishing an engine.
   Missing, malformed, or mismatched identity fails closed.
 - Identity, marker, WAL, and Tantivy decode/validation failures are definitive.
@@ -82,12 +83,16 @@ pub struct ShardManager {
   repair.
   Definitive and open-level failures may quarantine only after the report
   throttle admits the attempt, except sequence/version collisions, which
-  quarantine immediately and are also reported by the primary.
+  atomically persist collision quarantine before the engine is evicted and are
+  also reported by the primary.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.
 - Pre-1.0 or unknown copy identity versions are never adopted or upgraded.
   They use the shared unsupported-format error and require index recreation.
+- A collision-quarantined identity cannot open or accept replica apply for the
+  same allocation. The marker remains until routing removes that allocation
+  and peer recovery installs a fresh identity for a new allocation.
 - `fence_max_seq_no` is captured and persisted only when a copy fence advances
   (or when peer recovery creates a new identity). Ordinary assigned-copy open
   validates and reconciles that value but never rewrites it.

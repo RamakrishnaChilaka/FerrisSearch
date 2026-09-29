@@ -4408,3 +4408,133 @@ async fn review_c3_gap_probes_run_concurrently_with_short_timeout() {
         2
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collision_quarantine_rejects_reopen_and_follow_up_replication() {
+    let mut state = gap_test_state(0);
+    state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap()
+        .primary_term = 1;
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let allocation_id = state.shard_allocation_id("idx", 0, "replica").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    {
+        let engine = shards
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &crate::cluster::state::IndexSettings::default(),
+                "uuid-1",
+                crate::shard::AssignedShardOpen {
+                    allocation_id,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .apply_replica_batch(
+                (0..=5)
+                    .map(|seq_no| crate::engine::SequencedOperation {
+                        seq_no,
+                        primary_term: 1,
+                        mutation: crate::engine::DocumentMutation::Index {
+                            doc_id: format!("doc-{seq_no}"),
+                            source: json!({"term": 1, "seq": seq_no}),
+                        },
+                    })
+                    .collect(),
+            )
+            .unwrap();
+    }
+    let manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    manager.update_state(state);
+    let service = TransportService {
+        cluster_manager: manager,
+        shard_manager: shards.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "replica".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let request = |seq_no: u64| ReplicateDocRequest {
+        index_name: "idx".into(),
+        shard_id: 0,
+        doc_id: format!("doc-{seq_no}"),
+        payload_json: serde_json::to_vec(&json!({"term": 2, "seq": seq_no})).unwrap(),
+        op: "index".into(),
+        seq_no,
+        index_uuid: "uuid-1".into(),
+        primary_term: Some(2),
+        target_allocation_id: Some(allocation_id),
+    };
+
+    let collision = service
+        .replicate_doc(Request::new(request(5)))
+        .await
+        .unwrap_err();
+    assert_eq!(collision.code(), tonic::Code::DataLoss);
+    assert!(shards.get_shard("idx", 0).is_none());
+
+    let identity_path = dir
+        .path()
+        .join("uuid-1")
+        .join("shard_0")
+        .join(crate::shard::SHARD_COPY_IDENTITY_FILE);
+    let identity: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&identity_path).unwrap()).unwrap();
+    assert_eq!(identity["allocation_id"], allocation_id);
+    assert_eq!(identity["collision_quarantined"], true);
+
+    let follow_up = service
+        .replicate_doc(Request::new(request(6)))
+        .await
+        .unwrap_err();
+    assert_eq!(follow_up.code(), tonic::Code::DataLoss);
+    assert!(
+        follow_up
+            .message()
+            .contains("collision quarantine is active")
+    );
+    assert!(shards.get_shard("idx", 0).is_none());
+
+    drop(service);
+    drop(shards);
+    let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let error = match restarted.open_assigned_shard_with_settings(
+        "idx",
+        0,
+        &HashMap::new(),
+        &crate::cluster::state::IndexSettings::default(),
+        "uuid-1",
+        crate::shard::AssignedShardOpen {
+            allocation_id,
+            primary_term: 1,
+            allow_empty_creation: false,
+        },
+    ) {
+        Ok(_) => panic!("a collision-quarantined copy must not reopen"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("collision quarantine is active"));
+    assert!(restarted.get_shard("idx", 0).is_none());
+}
