@@ -61,7 +61,8 @@ TraceInit ==
     /\ captureDocValue = EmptyCapturedDocValue
     /\ captureDocSeqNext = EmptyCapturedDocSeq
     /\ captureTombstoneSeqNext = EmptyCapturedDocSeq
-    /\ replicaResponsePersisted = [writeId \in WriteIds |-> 0]
+    /\ replicaResponsePersisted =
+          [writeId \in WriteIds |-> [node \in Nodes |-> 0]]
 
 MessageFor(writeId, replica) ==
     CHOOSE message \in messages :
@@ -150,7 +151,7 @@ PrimaryWalObservation(event) ==
     /\ writeStatus[event.writeId] = "Routed"
     /\ CanPrimaryAccept(event.writeId)
     /\ event.term = views[event.node].term
-    /\ event.seq = nextSeq[event.node]
+    /\ event.seq >= nextSeq[event.node]
     /\ IF RequestDurability THEN event.durable ELSE TRUE
     /\ UNCHANGED d1vars
     /\ UNCHANGED AuxVars
@@ -224,7 +225,7 @@ ReplicaProcessEvent(event) ==
     /\ event.writeId \in durableOps'[event.node]
     /\ replicaResponsePersisted' =
           [replicaResponsePersisted EXCEPT
-              ![event.writeId] = event.persistedNext]
+              ![event.writeId][event.node] = event.persistedNext]
     /\ LiveCheckpointMatchesPrime(event.node, event)
     /\ UNCHANGED CaptureVars
 
@@ -239,8 +240,9 @@ ReplicaResultEvent(event) ==
               /\ UNCHANGED D1Vars
        [] OTHER -> FALSE
     /\ IF event.outcome = "acknowledged"
-          THEN replicaResponsePersisted[event.writeId]
-               = event.resultPersistedNext
+          THEN /\ replicaResponsePersisted[event.writeId][event.peer]
+                    <= event.resultPersistedNext
+               /\ event.resultPersistedNext <= persistedNext[event.peer]
           ELSE TRUE
     /\ UNCHANGED AuxVars
 
@@ -471,7 +473,8 @@ TraceTypeOK ==
     /\ captureDocSeqNext \in [Nodes -> [Docs -> 0..MaxWrites]]
     /\ captureTombstoneSeqNext \in
           [Nodes -> [Docs -> 0..MaxWrites]]
-    /\ replicaResponsePersisted \in [WriteIds -> 0..MaxWrites]
+    /\ replicaResponsePersisted \in
+          [WriteIds -> [Nodes -> 0..MaxWrites]]
 
 TraceCoreSafety ==
     /\ RoutingWellFormed

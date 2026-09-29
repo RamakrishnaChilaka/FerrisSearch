@@ -78,8 +78,12 @@ set -e
 if [[ $conversion_status -ne 0 ]]; then
     echo "$conversion_output" >&2
     line=$(sed -n 's/.*line \([0-9][0-9]*\):.*/\1/p' <<<"$conversion_output" | tail -n 1)
-    if [[ -n "$line" && "$line" -gt 1 ]]; then
-        step=$((line - 1))
+    if [[ -n "$line" ]]; then
+        if [[ "$line" -eq 1 ]]; then
+            step=0
+        else
+            step=$((line - 1))
+        fi
         event=$(
             python3 - "$TRACE_PATH" "$step" <<'PY'
 import json

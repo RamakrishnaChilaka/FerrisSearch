@@ -23,7 +23,8 @@ TraceRecoveryInit ==
     /\ tracePos = 1
     /\ hiddenSteps = 0
     /\ finished = FALSE
-    /\ replicaResponsePersisted = [writeId \in WriteIds |-> 0]
+    /\ replicaResponsePersisted =
+          [writeId \in WriteIds |-> [node \in Nodes |-> 0]]
 
 StableReplication(action) ==
     /\ action
@@ -167,14 +168,16 @@ ReplicaApplyEvent(event) ==
     /\ event.writeId \in durableOps'[event.node]
     /\ replicaResponsePersisted' =
           [replicaResponsePersisted EXCEPT
-              ![event.writeId] = event.persistedNext]
+              ![event.writeId][event.node] = event.persistedNext]
     /\ processedNext'[event.node] = event.processedNext
     /\ persistedNext'[event.node] = event.persistedNext
     /\ maxSeqNext'[event.node] = event.maxNext
 
 ReplicaResultEvent(event) ==
     /\ HasAck(event.writeId, event.peer)
-    /\ replicaResponsePersisted[event.writeId] = event.resultPersistedNext
+    /\ replicaResponsePersisted[event.writeId][event.peer]
+          <= event.resultPersistedNext
+    /\ event.resultPersistedNext <= persistedNext[event.peer]
     /\ D1DeliverAck(AckFor(event.writeId, event.peer))
 
 ClientResultEvent(event) ==
@@ -335,7 +338,8 @@ TraceRecoveryTypeOK ==
     /\ tracePos \in 1..(Len(Trace) + 1)
     /\ hiddenSteps \in 0..MaxHiddenSteps
     /\ finished \in BOOLEAN
-    /\ replicaResponsePersisted \in [WriteIds -> 0..MaxWrites]
+    /\ replicaResponsePersisted \in
+          [WriteIds -> [Nodes -> 0..MaxWrites]]
 
 TraceRecoverySafety ==
     /\ RoutingWellFormed

@@ -110,4 +110,20 @@ run_valid n13 n13-primary-restart-replay.jsonl
 run_valid n14 valid-concurrent-order.jsonl
 run_valid n15 n15-core-with-routing-view.jsonl
 
+run_valid a1 a1-per-write-persisted-buffer.jsonl
+run_valid a1c a1c-results-adjacent.jsonl
+run_valid b1 b1-bulk-batch-final-response-checkpoint.jsonl
+run_valid b1c b1c-bulk-item-local-response-checkpoint.jsonl
+run_valid b2 b2-bulk-faithful-order-batch-final.jsonl
+run_valid b2c b2c-bulk-faithful-order-item-local.jsonl
+run_valid b3 b3-bulk-receipts-first-batch-final.jsonl
+run_valid b3c b3c-bulk-receipts-first-item-local.jsonl
+run_invalid a2-overstated-response invalid-replica-response-overstates-persisted.jsonl 15 replica_result
+run_invalid v1 v1-failover-after-replicated-write.jsonl 5 replica_received
+run_invalid v2 v2-recovery-duplicate-catchup-redelivery.jsonl 33 operation_processed
+run_invalid v4 v4-nonquiescent-without-copy-state.jsonl 19 trace_end
+run_invalid v5 v5-collision-then-new-write.jsonl 8 client_write_routed
+run_invalid v6 v6-pruned-tombstone-absent.jsonl 20 copy_state
+run_invalid v9 v9-trace-sets-hidden-budget.jsonl 0 trace_start
+
 echo "D1 schema-v3 trace validator self-tests passed."

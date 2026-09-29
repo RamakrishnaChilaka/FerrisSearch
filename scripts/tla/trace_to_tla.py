@@ -758,6 +758,73 @@ def load_trace(path: Path) -> LoadedTrace:
         profile = "d1-authority"
     else:
         profile = "d1-core"
+
+    profile_events = {
+        "d1-core": {
+            "client_write_routed",
+            "wal_appended",
+            "operation_processed",
+            "primary_replication_started",
+            "replica_received",
+            "replica_result",
+            "client_result",
+            "fence_persisted",
+            "commit_captured",
+            "commit_persisted",
+            "wal_truncated",
+            "node_crashed",
+            "node_restarted",
+            "replay_started",
+            "replay_entry",
+            "replay_finished",
+            "routing_view",
+            "copy_state",
+        },
+        "d1-authority": {
+            "node_crashed",
+            "routing_promoted",
+            "routing_view",
+            "fence_persisted",
+            "primary_activated",
+            "client_write_routed",
+            "wal_appended",
+            "operation_processed",
+            "primary_replication_started",
+            "client_result",
+            "copy_state",
+        },
+        "d1-collision": {
+            "wal_appended",
+            "operation_processed",
+            "routing_promoted",
+            "routing_view",
+            "fence_persisted",
+            "in_sync_removed",
+            "copy_state",
+        },
+        "d1-recovery": {
+            "client_write_routed",
+            "wal_appended",
+            "operation_processed",
+            "primary_replication_started",
+            "replica_received",
+            "replica_result",
+            "client_result",
+            "routing_view",
+            "recovery_snapshot",
+            "recovery_started",
+            "recovery_installed",
+            "recovery_barrier",
+            "recovery_membership",
+            "copy_state",
+        },
+    }
+    for event in events:
+        if event["event"] not in profile_events[profile]:
+            fail(
+                event["step"] + 1,
+                f"event {event['event']!r} is outside inferred composition {profile}",
+            )
     end = records[-1]
     exact_fields(end, END_FIELDS, len(records))
     if end["schema"] != SCHEMA:

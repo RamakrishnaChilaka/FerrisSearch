@@ -18,9 +18,12 @@ The converter checks the JSON Lines contract and generates a finite
 - the trace is accepted only when TLC finds a behavior that consumes every
   observation.
 
-The emitter does not choose a profile. The converter infers the composition
-from the event vocabulary, with recovery taking precedence over collision,
-authority, and core events:
+The emitter does not choose a profile. The converter infers exactly one
+composition from the event vocabulary and then rejects every event outside
+that composition. A single trace cannot mix data-plane replication with a
+later failover, recovery with crash/fence/commit observations, or the bounded
+collision script with later ordinary writes. Tests covering more than one
+concern emit separate traces.
 
 | Inferred composition | TLC module | Exact actions used |
 | --- | --- | --- |
@@ -28,6 +31,19 @@ authority, and core events:
 | `d1-authority` | `TraceD1Authority.tla` | `Invariants`: crash, election, routing promotion, per-node view delivery, activation proposal/commit/observation, and primary write gating. |
 | `d1-collision` | `TraceD1Collision.tla` | `MC_D1_TermCollision`: partial old-term apply, promotion, durable collision fence, definitive collision, and in-sync removal. |
 | `d1-recovery` | `TraceD1Recovery.tla` | `PeerRecovery` control actions plus the same D1 fixed live-replication and recovery-apply state transitions used by `MC_D1_SeqNoApply`. |
+
+Exact vocabularies:
+
+| Composition | Accepted events |
+| --- | --- |
+| Core | `client_write_routed`, `wal_appended`, `operation_processed`, `primary_replication_started`, `replica_received`, `replica_result`, `client_result`, `fence_persisted`, `commit_captured`, `commit_persisted`, `wal_truncated`, `node_crashed`, `node_restarted`, `replay_started`, `replay_entry`, `replay_finished`, `routing_view`, `copy_state` |
+| Authority | `node_crashed`, `routing_promoted`, `routing_view`, `fence_persisted`, `primary_activated`, primary-side client/WAL/process/replication/result events, `copy_state` |
+| Collision | `wal_appended`, `operation_processed`, `routing_promoted`, `routing_view`, `fence_persisted`, `in_sync_removed`, `copy_state` |
+| Recovery | primary and replica write events, `routing_view`, `recovery_snapshot`, `recovery_started`, `recovery_installed`, `recovery_barrier`, `recovery_membership`, `copy_state` |
+
+Recovery actions are used only by `TraceD1Recovery`. They are checked through
+the safety invariants evaluated on each accepted recovery witness; they are not
+part of core, authority, or collision traces.
 
 The trace modules still contain trace-side rules rather than only model
 actions:
@@ -155,6 +171,11 @@ checkpoint.
 must exactly equal the primary node's latest traced routing view, including
 allocation IDs.
 
+A bulk request may emit every per-item `wal_appended` record before any
+`operation_processed` record. One bulk append and its per-item processing occur
+inside the same translog critical section; the trace order follows the physical
+operations within that section.
+
 ### Replica transport
 
 | Event | Fields beyond framing | Linearization |
@@ -167,6 +188,13 @@ A live-replication or recovery `wal_appended` must have the corresponding
 receipt/fetched operation. A live operation below the durable local fence
 cannot reach the planner. Older-term WAL replay may be redelivery when the
 exact operation is already processed.
+
+For an acknowledged result, the item's apply-time persisted checkpoint must be
+less than or equal to the response checkpoint, and the response checkpoint
+must be less than or equal to the replica's persisted checkpoint when the
+primary receives it. This admits concurrent responses and bulk RPCs whose one
+response carries the checkpoint after the complete batch, while rejecting an
+overstated checkpoint.
 
 ### Commit and truncation
 
@@ -227,6 +255,12 @@ The target is unavailable until admitted or promoted; a promoted target still
 requires activation before primary service. Recovery installation uses the
 captured source snapshot, never the source's later current state.
 
+The ordered-cursor premise is that the recovery source is the activated
+primary. It scans the pinned physical WAL in file order and advances one
+exclusive sequence cursor; therefore catch-up entries arrive in increasing
+physical-WAL order without duplicates. Out-of-order or duplicate catch-up is
+outside this composition.
+
 ### `copy_state`
 
 `copy_state` is an observation, not a claimed planner outcome. It contains:
@@ -278,6 +312,10 @@ Before TLC, `trace_to_tla.py` rejects:
 - Removed emitter-selected profiles and `max_hidden_steps`.
 - Added response-time persisted checkpoints to `replica_result`.
 - Required final `copy_state` for non-quiescent traces.
+- Allowed all bulk WAL records before per-item processing.
+- Keyed response lower bounds by `(write, replica)` and allowed batch-final
+  response checkpoints within the model-observed interval.
+- Made compositions exclusive and documented their complete vocabularies.
 
 Recovery snapshot and catch-up remain strictly ordered by the implemented
 peer-recovery cursor. Out-of-order or duplicate catch-up batches are not
