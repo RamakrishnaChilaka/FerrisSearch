@@ -158,6 +158,11 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - `ReplicateBulk` accepts either contiguous ordered index operations or a
   strictly increasing, potentially non-contiguous homogeneous NoOp batch.
   Promotion activation uses bounded NoOp batches rather than one RPC per gap.
+- A failed promotion NoOp batch remains pending in the shared activation state.
+  The next lifecycle or request activation retries it even when the local
+  UUID/shard/allocation/term cache already says the primary is active. Remove
+  pending state only after successful redelivery or when that primary copy is
+  invalidated.
 - Successful replica responses carry optional processed and persisted
   checkpoints and must prove the exact single operation or every bulk item was
   processed. A behind contiguous checkpoint is a gap observation, not failure
@@ -242,11 +247,13 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - Production transport and node lifecycle share one primary-activation state.
   Proactive lifecycle activation and request-triggered activation are
   idempotent for the same UUID/shard/allocation/term. The unavailable flag alone
-  does not bypass that cache. A repaired quarantined open-level failure forces a
-  fresh activation; a successful local write after an Apply-level failure
-  spawns throttled best-effort `MarkPrimaryAvailable` reporting without a term
-  bump. The already-successful write response must not wait for Raft leadership
-  discovery, forwarding, or the transport timeout of that status-only report.
+  does not bypass that cache, but pending promotion NoOps do bypass the fast
+  return so their best-effort fan-out is retried. A repaired quarantined
+  open-level failure forces a fresh activation; a successful local write after
+  an Apply-level failure spawns throttled best-effort `MarkPrimaryAvailable`
+  reporting without a term bump. The already-successful write response must not
+  wait for Raft leadership discovery, forwarding, or the transport timeout of
+  that status-only report.
   Check `primary_unavailable` through the shared applied-state read lock before
   cloning the service or spawning the task, so ordinary writes allocate no
   status-report work.

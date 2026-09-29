@@ -184,9 +184,11 @@ Activation persists the durable fence, replays retained WAL state, fills every
 missing local sequence through the fenced maximum with durable current-term
 NoOps, and only then enables writes. Best-effort NoOp replication may leave a
 bounded replica gap for normal probe/removal handling; it must not weaken local
-activation. These promotion NoOps fill gaps on the promoted copy only; they do
-not repair replicas that missed a real post-WAL primary operation. Such copies
-follow the gap deadline and peer-recovery path until D10 exists.
+activation. Lifecycle ticks retry failed promotion NoOp batches for the same
+active UUID/allocation/term until fan-out succeeds or the copy is invalidated.
+These promotion NoOps fill gaps on the promoted copy only; they do not repair
+replicas that missed a real post-WAL primary operation. Such copies follow the
+gap deadline and peer-recovery path until D10 exists.
 
 Earlier shard schemas, committed boundaries, manifests, WAL entries, and copy
 identities never migrate in place. Every role fails closed through the same

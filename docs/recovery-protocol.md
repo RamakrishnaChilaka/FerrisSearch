@@ -73,7 +73,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > generation/byte cursor without advancing past a source-unapplied frame, and
 > uses the final replaying barrier to resume from that cursor before admission.
 > Promotion persists its fence, fills local gaps with NoOps, and replicates
-> those NoOps in bounded batches. A term/sequence collision durably marks the
+> those NoOps in bounded batches. Failed batches remain best-effort for local
+> activation but are retried by later lifecycle or request activation at the
+> same UUID, allocation, and term. A term/sequence collision durably marks the
 > exact allocation as quarantined before closing it; the copy cannot reopen or
 > accept replication until Raft removes it and fresh peer recovery installs a
 > new allocation identity. Text-only writer replay durably marks vector state

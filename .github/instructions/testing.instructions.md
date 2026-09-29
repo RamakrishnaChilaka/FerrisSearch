@@ -331,6 +331,10 @@ cargo test -- test_name                         # Single test by name
 - D1 vector recovery regressions must cover a failed post-WAL text apply
   followed by refresh or primary activation before the next write, plus
   restart persistence and successful clearing of `vectors.stale`.
+- Promotion NoOp coverage must include a real source activation, an initial
+  failed gRPC fan-out, a later lifecycle activation, and value-level proof that
+  the replica durably received the original term/sequence NoOp and closed its
+  checkpoint gap.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

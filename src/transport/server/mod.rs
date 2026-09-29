@@ -49,10 +49,20 @@ fn new_join_lock() -> Arc<Mutex<()>> {
     Arc::new(Mutex::new(()))
 }
 
+type PrimaryActivationKey = (String, u32, u64);
+
+#[derive(Clone)]
+struct PendingPromotionNoOps {
+    primary_term: u64,
+    operations: Vec<crate::engine::SequencedOperation>,
+}
+
 #[derive(Default)]
 struct PrimaryActivationState {
-    activated_terms: RwLock<HashMap<(String, u32, u64), u64>>,
+    activated_terms: RwLock<HashMap<PrimaryActivationKey, u64>>,
+    pending_noops: RwLock<HashMap<PrimaryActivationKey, PendingPromotionNoOps>>,
     activation_lock: Mutex<()>,
+    noop_replication_lock: Mutex<()>,
     failed_copy_reports: Mutex<HashMap<(String, u32, u64), std::time::Instant>>,
     available_primary_reports: Mutex<HashMap<(String, u32, u64, u64), std::time::Instant>>,
     #[cfg(test)]
@@ -3893,11 +3903,17 @@ impl TransportService {
         }
         if !collision_failure && ShardManager::should_quarantine_copy_failure(error) {
             if promote_only {
+                let activation_key = (index_uuid.to_string(), shard_id, allocation_id);
                 self.primary_activation_state
                     .activated_terms
                     .write()
                     .unwrap_or_else(|lock_error| lock_error.into_inner())
-                    .remove(&(index_uuid.to_string(), shard_id, allocation_id));
+                    .remove(&activation_key);
+                self.primary_activation_state
+                    .pending_noops
+                    .write()
+                    .unwrap_or_else(|lock_error| lock_error.into_inner())
+                    .remove(&activation_key);
             }
             if let Err(quarantine_error) = self
                 .shard_manager
@@ -4219,6 +4235,11 @@ impl TransportService {
                 .write()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&initial_key);
+            self.primary_activation_state
+                .pending_noops
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&initial_key);
         }
         if let Err(error) = self
             .shard_manager
@@ -4277,11 +4298,14 @@ impl TransportService {
             .get(&initial_key)
             .is_some_and(|term| *term == current.primary_term)
         {
-            return Ok(ActivatedPrimary {
+            let activated = ActivatedPrimary {
                 index_uuid: current.index_uuid,
                 allocation_id: current.allocation_id,
                 primary_term: current.primary_term,
-            });
+            };
+            self.retry_pending_promotion_noops(index_name, shard_id, &activated)
+                .await?;
+            return Ok(activated);
         }
         if self.raft.is_none() {
             let activated = ActivatedPrimary {
@@ -4303,11 +4327,14 @@ impl TransportService {
             .get(&key)
             .is_some_and(|term| *term == current.primary_term)
         {
-            return Ok(ActivatedPrimary {
+            let activated = ActivatedPrimary {
                 index_uuid: current.index_uuid,
                 allocation_id: current.allocation_id,
                 primary_term: current.primary_term,
-            });
+            };
+            self.retry_pending_promotion_noops(index_name, shard_id, &activated)
+                .await?;
+            return Ok(activated);
         }
 
         let _activation_guard = self.primary_activation_state.activation_lock.lock().await;
@@ -4373,11 +4400,14 @@ impl TransportService {
             .get(&key)
             .is_some_and(|term| *term == expected_term)
         {
-            return Ok(ActivatedPrimary {
+            let activated = ActivatedPrimary {
                 index_uuid,
                 allocation_id,
                 primary_term: expected_term,
-            });
+            };
+            self.retry_pending_promotion_noops(index_name, shard_id, &activated)
+                .await?;
+            return Ok(activated);
         }
 
         let raft = self
@@ -4531,26 +4561,90 @@ impl TransportService {
             .await
             .map_err(|error| format!("primary activation task failed: {error}"))?
             .map_err(|error| format!("primary activation replay/gap fill failed: {error}"))?;
+        let activation_key = (
+            activated_primary.index_uuid.clone(),
+            shard_id,
+            activated_primary.allocation_id,
+        );
+        if !noops.is_empty() {
+            self.primary_activation_state
+                .pending_noops
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    activation_key.clone(),
+                    PendingPromotionNoOps {
+                        primary_term: activated_primary.primary_term,
+                        operations: noops,
+                    },
+                );
+        }
         self.primary_activation_state
             .activated_terms
             .write()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(
-                (
-                    activated_primary.index_uuid.clone(),
-                    shard_id,
-                    activated_primary.allocation_id,
-                ),
-                activated_primary.primary_term,
-            );
+            .insert(activation_key, activated_primary.primary_term);
         drop(guard);
 
-        if noops.is_empty() {
+        self.retry_pending_promotion_noops(index_name, shard_id, activated_primary)
+            .await
+    }
+
+    async fn retry_pending_promotion_noops(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        activated_primary: &ActivatedPrimary,
+    ) -> Result<(), String> {
+        let activation_key = (
+            activated_primary.index_uuid.clone(),
+            shard_id,
+            activated_primary.allocation_id,
+        );
+        let has_pending = self
+            .primary_activation_state
+            .pending_noops
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&activation_key)
+            .is_some_and(|pending| {
+                pending.primary_term == activated_primary.primary_term
+                    && !pending.operations.is_empty()
+            });
+        if !has_pending {
             return Ok(());
         }
+
+        let _replication_guard = self
+            .primary_activation_state
+            .noop_replication_lock
+            .lock()
+            .await;
+        let operations = self
+            .primary_activation_state
+            .pending_noops
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&activation_key)
+            .filter(|pending| pending.primary_term == activated_primary.primary_term)
+            .map(|pending| pending.operations.clone())
+            .unwrap_or_default();
+        if operations.is_empty() {
+            return Ok(());
+        }
+
+        let engine = self
+            .shard_manager
+            .get_shard(index_name, shard_id)
+            .ok_or_else(|| {
+                format!(
+                    "primary shard [{index_name}][{shard_id}] is not open during promotion NoOp retry"
+                )
+            })?;
         let write_state =
             self.validated_primary_write_state(index_name, shard_id, activated_primary)?;
-        for batch in noops.chunks(MAX_RECOVERY_OPS) {
+        let mut failed_operations = Vec::new();
+        for batch in operations.chunks(MAX_RECOVERY_OPS) {
             let first_seq_no = batch
                 .first()
                 .expect("promotion NoOp batch is non-empty")
@@ -4622,7 +4716,24 @@ impl TransportService {
                         errors = ?errors,
                         "Promotion NoOp batch replication failed; retaining replica gap observation"
                     );
+                    failed_operations.extend_from_slice(batch);
                 }
+            }
+        }
+
+        let mut pending = self
+            .primary_activation_state
+            .pending_noops
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if pending
+            .get(&activation_key)
+            .is_some_and(|current| current.primary_term == activated_primary.primary_term)
+        {
+            if failed_operations.is_empty() {
+                pending.remove(&activation_key);
+            } else if let Some(current) = pending.get_mut(&activation_key) {
+                current.operations = failed_operations;
             }
         }
         Ok(())

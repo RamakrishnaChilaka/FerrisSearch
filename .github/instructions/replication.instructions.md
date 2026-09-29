@@ -163,8 +163,9 @@ pub async fn replicate_bulk(
   still not general D10 rollback/resync or client retry-token support.
 - Promotion NoOps are replicated in bounded homogeneous bulk batches, preserving
   each explicit non-contiguous sequence number. A batch transport failure
-  remains best-effort and creates the same replica gap observation as the
-  former single-operation path.
+  remains best-effort, creates the same replica gap observation as the former
+  single-operation path, and retains that failed batch for redelivery on the
+  next activation attempt at the same UUID/allocation/term.
 - A primary engine failure after WAL append but before replication leaves an
   operation that no replica received. After local rebuild/replay advances the
   primary prefix, later replica responses expose the permanent gap; each
