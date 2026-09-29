@@ -890,7 +890,9 @@ async fn apply_recovery_operations_cursor(
         if operations.is_empty() {
             return Ok((cursor, 0));
         }
-        anyhow::bail!("bounded peer recovery response returned operations without physical progress");
+        anyhow::bail!(
+            "bounded peer recovery response returned operations without physical progress"
+        );
     }
     let mut decoded = Vec::with_capacity(operations.len());
     for operation in operations {
