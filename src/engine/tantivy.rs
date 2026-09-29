@@ -157,7 +157,10 @@ impl ApplyState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalDisposition {
     Append,
-    AlreadyInLocalWal { persisted: bool },
+    AlreadyInLocalWal {
+        persisted: bool,
+        validate_redelivery: bool,
+    },
 }
 
 impl WalDisposition {
@@ -166,7 +169,24 @@ impl WalDisposition {
     }
 
     fn is_persisted(self) -> bool {
-        matches!(self, Self::AlreadyInLocalWal { persisted: true })
+        matches!(
+            self,
+            Self::AlreadyInLocalWal {
+                persisted: true,
+                ..
+            }
+        )
+    }
+
+    fn validates_redelivery(self) -> bool {
+        matches!(
+            self,
+            Self::Append
+                | Self::AlreadyInLocalWal {
+                    validate_redelivery: true,
+                    ..
+                }
+        )
     }
 }
 
@@ -1391,11 +1411,20 @@ impl HotEngine {
             }
         };
         let mut seq_values = seq_column.values_for_doc(address.doc_id);
-        let seq_no = seq_values.next().ok_or_else(|| {
-            anyhow::Error::new(InternalSequenceFieldError {
-                message: format!("document [{doc_id}] has no {SEQ_NO_FIELD_NAME} value"),
-            })
-        })?;
+        let Some(seq_no) = seq_values.next() else {
+            return state
+                .legacy_migration_checkpoint
+                .map(|migration_checkpoint| {
+                    Some(CurrentVersion::LegacyAtOrBelow {
+                        migration_checkpoint,
+                    })
+                })
+                .ok_or_else(|| {
+                    anyhow::Error::new(InternalSequenceFieldError {
+                        message: format!("document [{doc_id}] has no {SEQ_NO_FIELD_NAME} value"),
+                    })
+                });
+        };
         if seq_values.next().is_some() {
             return Err(InternalSequenceFieldError {
                 message: format!("document [{doc_id}] has multiple {SEQ_NO_FIELD_NAME} values"),
@@ -1403,11 +1432,22 @@ impl HotEngine {
             .into());
         }
         let mut term_values = term_column.values_for_doc(address.doc_id);
-        let primary_term = term_values.next().ok_or_else(|| {
-            anyhow::Error::new(InternalSequenceFieldError {
-                message: format!("document [{doc_id}] has no {PRIMARY_TERM_FIELD_NAME} value"),
-            })
-        })?;
+        let Some(primary_term) = term_values.next() else {
+            return state
+                .legacy_migration_checkpoint
+                .map(|migration_checkpoint| {
+                    Some(CurrentVersion::LegacyAtOrBelow {
+                        migration_checkpoint,
+                    })
+                })
+                .ok_or_else(|| {
+                    anyhow::Error::new(InternalSequenceFieldError {
+                        message: format!(
+                            "document [{doc_id}] has no {PRIMARY_TERM_FIELD_NAME} value"
+                        ),
+                    })
+                });
+        };
         if term_values.next().is_some() {
             return Err(InternalSequenceFieldError {
                 message: format!(
@@ -1435,21 +1475,20 @@ impl HotEngine {
         translog: &dyn WriteAheadLog,
         operation: &super::SequencedOperation,
     ) -> Result<bool> {
-        let mut matched = false;
-        for entry in translog.read_all()? {
-            if entry.seq_no != operation.seq_no || entry.primary_term != operation.primary_term {
-                continue;
-            }
-            if !wal_entry_matches_operation(&entry, operation)? {
-                return Err(SequenceOperationCollisionError {
-                    primary_term: operation.primary_term,
-                    seq_no: operation.seq_no,
-                }
-                .into());
-            }
-            matched = true;
+        let Some(entry) = translog.find_entry(operation.seq_no)? else {
+            return Ok(false);
+        };
+        if entry.primary_term != operation.primary_term {
+            return Ok(false);
         }
-        Ok(matched)
+        if !wal_entry_matches_operation(&entry, operation)? {
+            return Err(SequenceOperationCollisionError {
+                primary_term: operation.primary_term,
+                seq_no: operation.seq_no,
+            }
+            .into());
+        }
+        Ok(true)
     }
 
     fn apply_sequenced_batch_locked<F>(
@@ -1501,7 +1540,9 @@ impl HotEngine {
                     already_processed,
                 )?;
                 if already_processed {
-                    self.validate_redelivery(translog, &operation)?;
+                    if wal_disposition.validates_redelivery() {
+                        self.validate_redelivery(translog, &operation)?;
+                    }
                     planned.push(PlannedOperation {
                         operation,
                         outcome: super::ApplyOutcome::Redelivery,
@@ -1555,7 +1596,9 @@ impl HotEngine {
                                     }
                                     .into());
                                 }
-                                self.validate_redelivery(translog, &operation)?;
+                                if wal_disposition.validates_redelivery() {
+                                    self.validate_redelivery(translog, &operation)?;
+                                }
                                 super::ApplyOutcome::Redelivery
                             }
                             Some(CurrentVersion::LegacyAtOrBelow {
@@ -1858,6 +1901,7 @@ impl HotEngine {
                     vec![operation],
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
+                        validate_redelivery: true,
                     },
                     None,
                     true,
@@ -1929,6 +1973,7 @@ impl HotEngine {
                     operations,
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
+                        validate_redelivery: true,
                     },
                     None,
                     true,
@@ -1975,6 +2020,7 @@ impl HotEngine {
                     }],
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
+                        validate_redelivery: true,
                     },
                     None,
                     true,
@@ -2167,7 +2213,10 @@ impl HotEngine {
             self.apply_sequenced_batch_locked(
                 translog,
                 std::mem::take(batch),
-                WalDisposition::AlreadyInLocalWal { persisted: true },
+                WalDisposition::AlreadyInLocalWal {
+                    persisted: true,
+                    validate_redelivery: false,
+                },
                 Some(writer_state),
                 false,
                 |_| Ok(()),
@@ -3324,6 +3373,14 @@ impl HotEngine {
 
     #[cfg(test)]
     pub(crate) fn writer_is_failed_for_test(&self) -> bool {
+        self.writer
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .writer
+            .is_none()
+    }
+
+    pub(crate) fn writer_requires_rebuild(&self) -> bool {
         self.writer
             .read()
             .unwrap_or_else(|error| error.into_inner())

@@ -3439,10 +3439,11 @@ async fn primary_write_advances_global_checkpoint() {
     );
 
     // And the ISR tracker should know about the replica
-    let isr =
-        primary_sm
-            .isr_tracker
-            .in_sync_replicas("gc-idx", 0, primary_engine.local_checkpoint());
+    let isr = primary_sm.isr_tracker.in_sync_replicas(
+        "gc-idx",
+        0,
+        primary_engine.local_checkpoint().unwrap_or(0),
+    );
     assert!(!isr.is_empty(), "ISR should contain the replica node");
 }
 
@@ -3803,7 +3804,9 @@ async fn bulk_replication_advances_global_checkpoint() {
         engine.global_checkpoint()
     );
     assert!(
-        engine.local_checkpoint() > 0,
+        engine
+            .local_checkpoint()
+            .is_some_and(|checkpoint| checkpoint > 0),
         "local checkpoint should be set after bulk write"
     );
 }
@@ -3907,9 +3910,11 @@ async fn isr_tracker_updated_after_replication() {
 
     // ISR tracker should have the replica checkpoint
     let engine = primary_sm.get_shard("isr-idx", 0).unwrap();
-    let isr = primary_sm
-        .isr_tracker
-        .in_sync_replicas("isr-idx", 0, engine.local_checkpoint());
+    let isr = primary_sm.isr_tracker.in_sync_replicas(
+        "isr-idx",
+        0,
+        engine.local_checkpoint().unwrap_or(0),
+    );
     assert!(
         !isr.is_empty(),
         "ISR should contain the replica after successful replication"

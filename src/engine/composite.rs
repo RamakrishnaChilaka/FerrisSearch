@@ -545,12 +545,28 @@ impl SearchEngine for CompositeEngine {
         primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
         let prepared = self.prepare_vector_mutation(&payload)?;
+        let source_for_rebuild = payload.clone();
+        let rebuild_vectors = self.text.writer_requires_rebuild();
         let receipt = self.text.add_primary_index_with_side_effect(
             doc_id,
             payload,
             primary_term,
             |operation| self.apply_prepared_vector_mutation(operation, &prepared),
         )?;
+        if rebuild_vectors {
+            self.rebuild_vectors()?;
+            self.apply_prepared_vector_mutation(
+                &super::SequencedOperation {
+                    seq_no: receipt.seq_no,
+                    primary_term: receipt.primary_term,
+                    mutation: super::DocumentMutation::Index {
+                        doc_id: receipt.doc_id.clone(),
+                        source: source_for_rebuild,
+                    },
+                },
+                &prepared,
+            )?;
+        }
         self.update_local_checkpoint(receipt.seq_no);
         Ok(receipt)
     }
@@ -564,6 +580,9 @@ impl SearchEngine for CompositeEngine {
             .iter()
             .map(|(_, payload)| self.prepare_vector_mutation(payload))
             .collect::<Result<Vec<_>>>()?;
+        let docs_for_rebuild = docs.clone();
+        let prepared_for_rebuild = prepared.clone();
+        let rebuild_vectors = self.text.writer_requires_rebuild();
 
         let mut prepared = prepared.into_iter();
         let receipt =
@@ -574,6 +593,25 @@ impl SearchEngine for CompositeEngine {
                         .expect("primary bulk vector preparation matches operation order");
                     self.apply_prepared_vector_mutation(operation, &prepared)
                 })?;
+        if rebuild_vectors {
+            self.rebuild_vectors()?;
+            if let Some(start_seq_no) = receipt.start_seq_no {
+                for (offset, ((doc_id, source), prepared)) in docs_for_rebuild
+                    .into_iter()
+                    .zip(prepared_for_rebuild.iter())
+                    .enumerate()
+                {
+                    self.apply_prepared_vector_mutation(
+                        &super::SequencedOperation {
+                            seq_no: start_seq_no + offset as u64,
+                            primary_term: receipt.primary_term,
+                            mutation: super::DocumentMutation::Index { doc_id, source },
+                        },
+                        prepared,
+                    )?;
+                }
+            }
+        }
         if let Some(last_seq_no) = receipt.last_seq_no()? {
             self.update_local_checkpoint(last_seq_no);
         }
@@ -585,11 +623,25 @@ impl SearchEngine for CompositeEngine {
         doc_id: &str,
         primary_term: u64,
     ) -> Result<super::DeleteWriteReceipt> {
+        let rebuild_vectors = self.text.writer_requires_rebuild();
         let receipt =
             self.text
                 .delete_primary_with_side_effect(doc_id, primary_term, |operation| {
                     self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
                 })?;
+        if rebuild_vectors {
+            self.rebuild_vectors()?;
+            self.apply_prepared_vector_mutation(
+                &super::SequencedOperation {
+                    seq_no: receipt.seq_no,
+                    primary_term: receipt.primary_term,
+                    mutation: super::DocumentMutation::Delete {
+                        doc_id: doc_id.to_string(),
+                    },
+                },
+                &PreparedVectorMutation::Delete,
+            )?;
+        }
         self.update_local_checkpoint(receipt.seq_no);
         Ok(receipt)
     }
@@ -605,17 +657,27 @@ impl SearchEngine for CompositeEngine {
             super::DocumentMutation::Delete { .. } => PreparedVectorMutation::Delete,
             super::DocumentMutation::NoOp { .. } => PreparedVectorMutation::None,
         };
-        self.text
+        let rebuild_vectors = self.text.writer_requires_rebuild();
+        let operation_for_rebuild = operation.clone();
+        let receipt = self
+            .text
             .apply_sequenced_operation_with_side_effect(operation, |operation| {
                 self.apply_prepared_vector_mutation(operation, &prepared)
-            })
+            })?;
+        if rebuild_vectors {
+            self.rebuild_vectors()?;
+            if receipt.outcome == super::ApplyOutcome::Applied {
+                self.apply_prepared_vector_mutation(&operation_for_rebuild, &prepared)?;
+            }
+        }
+        Ok(receipt)
     }
 
     fn apply_replica_batch(
         &self,
         operations: Vec<super::SequencedOperation>,
     ) -> Result<super::ReplicaBulkApplyReceipt> {
-        let mut prepared_by_identity = operations
+        let prepared_by_identity = operations
             .iter()
             .map(|operation| {
                 let prepared = match &operation.mutation {
@@ -628,13 +690,29 @@ impl SearchEngine for CompositeEngine {
                 Ok(((operation.primary_term, operation.seq_no), prepared))
             })
             .collect::<Result<std::collections::HashMap<_, _>>>()?;
-        self.text
-            .apply_sequenced_batch_with_side_effect(operations, true, |operation| {
-                let prepared = prepared_by_identity
-                    .remove(&(operation.primary_term, operation.seq_no))
-                    .expect("prepared vector mutation must match the operation");
-                self.apply_prepared_vector_mutation(operation, &prepared)
-            })
+        let mut apply_prepared = prepared_by_identity.clone();
+        let operations_for_rebuild = operations.clone();
+        let rebuild_vectors = self.text.writer_requires_rebuild();
+        let receipt =
+            self.text
+                .apply_sequenced_batch_with_side_effect(operations, true, |operation| {
+                    let prepared = apply_prepared
+                        .remove(&(operation.primary_term, operation.seq_no))
+                        .expect("prepared vector mutation must match the operation");
+                    self.apply_prepared_vector_mutation(operation, &prepared)
+                })?;
+        if rebuild_vectors {
+            self.rebuild_vectors()?;
+            for (operation, outcome) in operations_for_rebuild.iter().zip(&receipt.outcomes) {
+                if *outcome == super::ApplyOutcome::Applied {
+                    let prepared = prepared_by_identity
+                        .get(&(operation.primary_term, operation.seq_no))
+                        .expect("prepared vector mutation must match the operation");
+                    self.apply_prepared_vector_mutation(operation, prepared)?;
+                }
+            }
+        }
+        Ok(receipt)
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -794,8 +872,8 @@ impl SearchEngine for CompositeEngine {
         self.text.doc_count()
     }
 
-    fn local_checkpoint(&self) -> u64 {
-        self.text.sequence_stats().processed_checkpoint.unwrap_or(0)
+    fn local_checkpoint(&self) -> Option<u64> {
+        self.text.sequence_stats().processed_checkpoint
     }
 
     fn update_local_checkpoint(&self, seq_no: u64) {
@@ -1196,6 +1274,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn writer_rebuild_replays_vector_state_before_next_write() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &std::collections::HashMap::from([(
+                "emb".into(),
+                FieldMapping {
+                    field_type: FieldType::KnnVector,
+                    dimension: Some(3),
+                },
+            )]),
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        engine
+            .add_document_with_receipt_at_term("doc", json!({"emb": [1.0, 0.0, 0.0]}), 1)
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.inject_engine_apply_failures_for_test(5, 1);
+        assert!(
+            engine
+                .add_document_with_receipt_at_term("doc", json!({"emb": [0.0, 1.0, 0.0]}), 1)
+                .is_err()
+        );
+        engine
+            .add_document_with_receipt_at_term("trigger", json!({"emb": [0.0, 0.0, 1.0]}), 1)
+            .unwrap();
+
+        let vector_version = engine
+            .vector
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|index| index.version_for_test("doc"));
+        assert_eq!(vector_version.map(|version| version.seq_no), Some(1));
+        assert_eq!(
+            engine.get_document("doc").unwrap().unwrap()["emb"],
+            json!([0.0, 1.0, 0.0])
+        );
+    }
+
     // ── Edge cases ──────────────────────────────────────────────────────
 
     #[test]
@@ -1539,9 +1662,9 @@ mod tests {
     // ── Checkpoint tracking ─────────────────────────────────────────────
 
     #[test]
-    fn local_checkpoint_starts_at_zero() {
+    fn local_checkpoint_starts_empty() {
         let (_dir, engine) = create_engine();
-        assert_eq!(engine.local_checkpoint(), 0);
+        assert_eq!(engine.local_checkpoint(), None);
     }
 
     #[test]
@@ -1550,27 +1673,27 @@ mod tests {
         for seq_no in 0..=5 {
             engine.update_local_checkpoint(seq_no);
         }
-        assert_eq!(engine.local_checkpoint(), 5);
+        assert_eq!(engine.local_checkpoint(), Some(5));
 
         // fetch_max semantics: only advances
         engine.update_local_checkpoint(3);
         assert_eq!(
             engine.local_checkpoint(),
-            5,
+            Some(5),
             "checkpoint should not go backward"
         );
 
         engine.update_local_checkpoint(10);
         assert_eq!(
             engine.local_checkpoint(),
-            5,
+            Some(5),
             "a gap must hold the checkpoint"
         );
         assert_eq!(engine.sequence_stats().max_seq_no, Some(10));
         for seq_no in 6..10 {
             engine.update_local_checkpoint(seq_no);
         }
-        assert_eq!(engine.local_checkpoint(), 10);
+        assert_eq!(engine.local_checkpoint(), Some(10));
     }
 
     #[test]
@@ -1722,16 +1845,20 @@ mod tests {
     #[test]
     fn add_document_advances_local_checkpoint() {
         let (_dir, engine) = create_engine();
-        assert_eq!(engine.local_checkpoint(), 0);
+        assert_eq!(engine.local_checkpoint(), None);
 
         engine.add_document("a", json!({"x": 1})).unwrap();
-        assert_eq!(engine.local_checkpoint(), 0, "first WAL entry is seq_no 0");
+        assert_eq!(
+            engine.local_checkpoint(),
+            Some(0),
+            "first WAL entry is seq_no 0"
+        );
 
         engine.add_document("b", json!({"x": 2})).unwrap();
-        assert_eq!(engine.local_checkpoint(), 1);
+        assert_eq!(engine.local_checkpoint(), Some(1));
 
         engine.add_document("c", json!({"x": 3})).unwrap();
-        assert_eq!(engine.local_checkpoint(), 2);
+        assert_eq!(engine.local_checkpoint(), Some(2));
     }
 
     #[test]
@@ -1745,7 +1872,7 @@ mod tests {
         engine.bulk_add_documents(docs).unwrap();
         assert_eq!(
             engine.local_checkpoint(),
-            2,
+            Some(2),
             "3 docs → seq_nos 0,1,2 → checkpoint=2"
         );
     }
@@ -1855,7 +1982,7 @@ mod tests {
                 .unwrap();
             writer_barrier.wait();
             writer_barrier.wait();
-            assert_eq!(writer_engine.local_checkpoint(), 3);
+            assert_eq!(writer_engine.local_checkpoint(), Some(3));
             receipt
         });
         barrier.wait();
@@ -1871,7 +1998,7 @@ mod tests {
         assert_eq!(deleted.seq_no, 3);
         let empty = engine.bulk_add_documents_with_receipt(vec![]).unwrap();
         assert_eq!(empty.start_seq_no, None);
-        assert_eq!(engine.local_checkpoint(), 3);
+        assert_eq!(engine.local_checkpoint(), Some(3));
         barrier.wait();
         assert_eq!(first.join().unwrap().seq_no, 0);
         assert_eq!(

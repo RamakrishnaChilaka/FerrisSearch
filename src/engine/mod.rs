@@ -525,8 +525,8 @@ pub trait SearchEngine: Send + Sync {
     /// Get the local checkpoint: highest observed seq_no applied to this shard copy.
     /// This is currently a high-water mark, not a contiguous-prefix proof.
     /// Returns 0 if no seq_no tracking is configured (backward compat).
-    fn local_checkpoint(&self) -> u64 {
-        self.sequence_stats().processed_checkpoint.unwrap_or(0)
+    fn local_checkpoint(&self) -> Option<u64> {
+        self.sequence_stats().processed_checkpoint
     }
 
     /// Update the local checkpoint after applying a replicated operation.

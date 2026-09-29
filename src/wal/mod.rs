@@ -462,6 +462,10 @@ pub trait WriteAheadLog: Send + Sync {
     /// Read all pending entries (used for replay on startup).
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
 
+    /// Find the first retained operation for one sequence using generation
+    /// range metadata rather than scanning the full WAL.
+    fn find_entry(&self, seq_no: u64) -> Result<Option<TranslogEntry>>;
+
     /// Read entries with seq_no > the given checkpoint (for replica recovery).
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;
 
@@ -2291,7 +2295,36 @@ impl WriteAheadLog for HotTranslog {
                 Ok(())
             })?;
         }
+
         Ok(entries)
+    }
+
+    fn find_entry(&self, seq_no: u64) -> Result<Option<TranslogEntry>> {
+        let generations = recover_lock(&self.state, "state").generations.clone();
+        for generation in generations.into_iter().filter(|generation| {
+            generation
+                .min_seq_no
+                .is_some_and(|minimum| minimum <= seq_no)
+                && generation
+                    .max_seq_no
+                    .is_some_and(|maximum| seq_no <= maximum)
+        }) {
+            let file = File::open(&generation.path)?;
+            let mut reader = BufReader::new(file);
+            while reader.stream_position()? < generation.size_bytes {
+                let mut len_buf = [0u8; 4];
+                reader.read_exact(&mut len_buf)?;
+                let payload_len = u32::from_le_bytes(len_buf) as usize;
+                checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+                let mut payload = vec![0u8; payload_len];
+                reader.read_exact(&mut payload)?;
+                let entry = decode_wire_entry(&payload)?.into_translog()?;
+                if entry.seq_no == seq_no {
+                    return Ok(Some(entry));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>> {

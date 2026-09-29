@@ -144,3 +144,31 @@ async fn async_unsynced_write_does_not_advance_persisted_checkpoint() {
     assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
     assert_eq!(engine.sequence_stats().persisted_checkpoint, None);
 }
+
+#[test]
+fn reopen_with_gap_and_large_committed_suffix_is_linear_time() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = open_engine(dir.path());
+        apply_index(&engine, "zero", json!({"v": 0}), 0, 1);
+        for seq_no in 2..=2_000 {
+            apply_index(
+                &engine,
+                &format!("doc-{seq_no}"),
+                json!({"v": seq_no}),
+                seq_no,
+                1,
+            );
+        }
+        engine.refresh().unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let reopened = open_engine(dir.path());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "replay of a 2k committed suffix regressed from linear time"
+    );
+    assert_eq!(reopened.sequence_stats().processed_checkpoint, Some(0));
+    assert_eq!(reopened.sequence_stats().max_seq_no, Some(2_000));
+}

@@ -1381,7 +1381,7 @@ impl ShardManager {
                     let identity = ShardCopyIdentity::new(
                         index_uuid,
                         assignment.allocation_id,
-                        assignment.primary_term,
+                        legacy.replica_fence,
                         None,
                     )?;
                     Self::persist_copy_identity(shard_dir, &identity)?;
@@ -2183,7 +2183,7 @@ impl ShardManager {
         index_uuid: &str,
         authority: ShardOpenAuthority,
     ) -> Result<Arc<dyn SearchEngine>> {
-        let (assignment, open_mode, assigned_role) = match authority {
+        let (assignment, mut open_mode, assigned_role) = match authority {
             ShardOpenAuthority::Local { allow_schema_reset } => (
                 None,
                 CompositeOpenMode::CreateOrOpen { allow_schema_reset },
@@ -2321,6 +2321,14 @@ impl ShardManager {
             std::fs::create_dir_all(&shard_dir)?;
             prepared_identity =
                 Some(self.ensure_local_test_identity(&key, &shard_dir, index_uuid)?);
+        }
+        if assignment.is_some_and(|assignment| !assignment.allow_empty_creation)
+            && matches!(assigned_role, Some(AssignedOpenRole::Primary))
+            && let Some(identity) = prepared_identity.as_ref()
+        {
+            open_mode = CompositeOpenMode::ExistingPrimary {
+                primary_term: identity.replica_fence,
+            };
         }
         let stale_snapshot_dir = shard_dir.join("peer-recovery");
         if stale_snapshot_dir.exists() {
@@ -5144,7 +5152,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(identity.version, SHARD_COPY_IDENTITY_VERSION);
-        assert_eq!(identity.replica_fence, 3);
+        assert_eq!(identity.replica_fence, 2);
         assert_eq!(identity.fence_max_seq_no, None);
     }
 

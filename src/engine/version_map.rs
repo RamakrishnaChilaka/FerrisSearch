@@ -111,21 +111,31 @@ impl LiveVersionMap {
     }
 
     pub(crate) fn apply_index(&mut self, doc_id: &str, seq_no: u64, primary_term: u64) {
-        self.current.insert(
-            Box::<str>::from(doc_id),
-            IndexVersionValue {
-                seq_no,
-                primary_term,
-            },
-        );
+        if self
+            .current
+            .insert(
+                Box::<str>::from(doc_id),
+                IndexVersionValue {
+                    seq_no,
+                    primary_term,
+                },
+            )
+            .is_none()
+        {
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_add(estimated_entry_bytes(doc_id));
+        }
         if self
             .tombstones
             .get(doc_id)
             .is_some_and(|tombstone| tombstone.seq_no < seq_no)
+            && let Some((key, _)) = self.tombstones.remove_entry(doc_id)
         {
-            self.tombstones.remove(doc_id);
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(estimated_entry_bytes(&key));
         }
-        self.recalculate_estimated_bytes();
     }
 
     pub(crate) fn apply_delete(&mut self, doc_id: &str, seq_no: u64, primary_term: u64) {
@@ -133,29 +143,45 @@ impl LiveVersionMap {
             .current
             .get(doc_id)
             .is_some_and(|value| value.seq_no < seq_no)
+            && let Some((key, _)) = self.current.remove_entry(doc_id)
         {
-            self.current.remove(doc_id);
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(estimated_entry_bytes(&key));
         }
         if self
             .old
             .get(doc_id)
             .is_some_and(|value| value.seq_no < seq_no)
+            && let Some((key, _)) = self.old.remove_entry(doc_id)
         {
-            self.old.remove(doc_id);
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(estimated_entry_bytes(&key));
         }
-        self.tombstones.insert(
-            Box::<str>::from(doc_id),
-            DeleteVersionValue {
-                seq_no,
-                primary_term,
-                deleted_at: self.clock.now(),
-            },
-        );
-        self.recalculate_estimated_bytes();
+        if self
+            .tombstones
+            .insert(
+                Box::<str>::from(doc_id),
+                DeleteVersionValue {
+                    seq_no,
+                    primary_term,
+                    deleted_at: self.clock.now(),
+                },
+            )
+            .is_none()
+        {
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_add(estimated_entry_bytes(doc_id));
+        }
     }
 
     pub(crate) fn rotate_current_into_old(&mut self) -> Result<()> {
         for (doc_id, value) in self.current.drain() {
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(estimated_entry_bytes(&doc_id));
             match self.old.get(doc_id.as_ref()).copied() {
                 Some(existing) if existing.seq_no > value.seq_no => {}
                 Some(existing)
@@ -173,16 +199,22 @@ impl LiveVersionMap {
                     .into());
                 }
                 _ => {
-                    self.old.insert(doc_id, value);
+                    if self.old.insert(doc_id.clone(), value).is_none() {
+                        self.estimated_bytes = self
+                            .estimated_bytes
+                            .saturating_add(estimated_entry_bytes(&doc_id));
+                    }
                 }
             }
         }
-        self.recalculate_estimated_bytes();
         Ok(())
     }
 
     pub(crate) fn rollback_refresh(&mut self) -> Result<()> {
         for (doc_id, value) in self.old.drain() {
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(estimated_entry_bytes(&doc_id));
             match self.current.get(doc_id.as_ref()).copied() {
                 Some(existing) if existing.seq_no > value.seq_no => {}
                 Some(existing)
@@ -200,11 +232,14 @@ impl LiveVersionMap {
                     .into());
                 }
                 _ => {
-                    self.current.insert(doc_id, value);
+                    if self.current.insert(doc_id.clone(), value).is_none() {
+                        self.estimated_bytes = self
+                            .estimated_bytes
+                            .saturating_add(estimated_entry_bytes(&doc_id));
+                    }
                 }
             }
         }
-        self.recalculate_estimated_bytes();
         Ok(())
     }
 
@@ -213,11 +248,18 @@ impl LiveVersionMap {
         reader_visible_checkpoint: Option<u64>,
         retention: Duration,
     ) -> Vec<PrunedTombstone> {
+        self.estimated_bytes = self.estimated_bytes.saturating_sub(
+            self.old
+                .keys()
+                .map(|doc_id| estimated_entry_bytes(doc_id))
+                .sum::<usize>(),
+        );
         self.old.clear();
         self.reader_visible_checkpoint = reader_visible_checkpoint;
         let now = self.clock.now();
         let processed_checkpoint = reader_visible_checkpoint;
         let mut pruned = Vec::new();
+        let mut removed_bytes = 0usize;
         self.tombstones.retain(|doc_id, tombstone| {
             let old_enough = now.saturating_duration_since(tombstone.deleted_at) >= retention;
             let checkpoint_safe = processed_checkpoint
@@ -233,6 +275,7 @@ impl LiveVersionMap {
                 .all(|value| value.seq_no <= tombstone.seq_no);
             let should_prune = old_enough && checkpoint_safe && no_newer_index;
             if should_prune {
+                removed_bytes = removed_bytes.saturating_add(estimated_entry_bytes(doc_id));
                 pruned.push(PrunedTombstone {
                     key: crate::engine::routing::hash_string(doc_id),
                     seq_no: tombstone.seq_no,
@@ -241,7 +284,7 @@ impl LiveVersionMap {
             }
             !should_prune
         });
-        self.recalculate_estimated_bytes();
+        self.estimated_bytes = self.estimated_bytes.saturating_sub(removed_bytes);
         pruned
     }
 
@@ -285,14 +328,14 @@ impl LiveVersionMap {
         self.max_bytes = max_bytes;
     }
 
-    fn recalculate_estimated_bytes(&mut self) {
-        self.estimated_bytes = self
-            .current
+    #[cfg(test)]
+    fn full_recount_estimated_bytes(&self) -> usize {
+        self.current
             .keys()
             .chain(self.old.keys())
             .chain(self.tombstones.keys())
             .map(|doc_id| estimated_entry_bytes(doc_id))
-            .sum();
+            .sum()
     }
 }
 
@@ -470,5 +513,34 @@ mod tests {
         assert!(versions.old.is_empty());
         assert!(versions.tombstones.is_empty());
         assert_eq!(versions.estimated_bytes(), 0);
+    }
+
+    #[test]
+    fn incremental_byte_accounting_matches_full_recount_and_scales_linearly() {
+        let mut versions = LiveVersionMap::new(usize::MAX);
+        let started = std::time::Instant::now();
+        for seq_no in 0..20_000u64 {
+            versions.apply_index(&format!("doc-{seq_no}"), seq_no, 1);
+        }
+        assert_eq!(
+            versions.estimated_bytes(),
+            versions.full_recount_estimated_bytes()
+        );
+        versions.rotate_current_into_old().unwrap();
+        assert_eq!(
+            versions.estimated_bytes(),
+            versions.full_recount_estimated_bytes()
+        );
+        for seq_no in 0..10_000u64 {
+            versions.apply_delete(&format!("doc-{seq_no}"), 20_000 + seq_no, 1);
+        }
+        assert_eq!(
+            versions.estimated_bytes(),
+            versions.full_recount_estimated_bytes()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "incremental accounting regressed from linear time"
+        );
     }
 }
