@@ -57,7 +57,7 @@ sections still describe the broader target protocol; they are not all shipped.
 | [Automatic recovery](../src/node/mod.rs) | Every node reconciles assigned out-of-sync replicas through bounded file recovery and conditional admission. | Source sessions and pins are still process-local. |
 | [WAL suffix](../src/wal/mod.rs) | Streams retained generations in physical order with generation/byte cursors; sequence filtering never drives pagination. | Recovery compression and resumable file chunks are not implemented. |
 | [Recovery apply](../src/node/peer_recovery.rs) | Decoding or apply failure stops the session; operations use the common term/sequence-aware planner and admission requires the exact processed barrier. | General divergence rollback and repair above the global checkpoint remain D10 work. |
-| [Vector rebuild](../src/engine/composite.rs) | Rebuild reads a capped document set. | Snapshot vectors or rebuild all vectors from the same logical snapshot; failures keep the copy unavailable. |
+| [Vector rebuild](../src/engine/composite.rs) | A post-WAL text failure durably marks vectors stale. Every composite writer-rebuild path reconstructs and fsyncs a replacement vector index before clearing the marker. The rebuild still reads a capped document set. | Snapshot vectors or rebuild all vectors from the same logical snapshot; failures keep the copy unavailable. |
 
 Existing [promotion tests](../tests/consensus_integration.rs) exercise metadata
 changes. The [restart regression](../tests/restart_regression.rs) restarts the
@@ -76,7 +76,10 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > those NoOps in bounded batches. A term/sequence collision durably marks the
 > exact allocation as quarantined before closing it; the copy cannot reopen or
 > accept replication until Raft removes it and fresh peer recovery installs a
-> new allocation identity.
+> new allocation identity. Text-only writer replay durably marks vector state
+> stale; write, maintenance, recovery-snapshot, barrier, activation, startup,
+> and recovery-finalization paths rebuild and fsync vectors before clearing the
+> marker.
 > Earlier build formats are unsupported and require index/cluster recreation
 > and reindexing. This does not implement D10 rollback/resync, client retry
 > tokens, or full OCC.

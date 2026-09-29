@@ -78,6 +78,7 @@ pub struct CompositeEngine {
     vector: RwLock<Option<VectorIndex>>,
     data_dir: PathBuf,
     global_cp: Mutex<Option<u64>>, // persisted global checkpoint, primary only
+    vector_recovery: Mutex<()>,    // serializes text replay with vector rebuild
 }
 ```
 - `HotEngine` owns gap-aware processed/persisted interval tracking.
@@ -117,7 +118,19 @@ tokio::select! {
 ### Vector Auto-detection
 - On `add_document()`: scans payload for arrays of numbers
 - Auto-creates VectorIndex if a `knn_vector` field is encountered
-- `rebuild_vectors()` — recovers USearch index from Tantivy docs on startup (crash recovery)
+- `rebuild_vectors()` constructs a replacement USearch index from the
+  authoritative Tantivy document view, persists and fsyncs it, atomically swaps
+  it into memory, and only then clears `vectors.stale`.
+- A text apply failure after WAL persistence durably creates `vectors.stale`.
+  Its temporary file also means stale on restart. Primary writes, replica
+  apply, refresh, flush, force merge, peer-snapshot preparation, recovery
+  barriers, primary activation, startup open, and peer-recovery finalization
+  must rebuild vectors before clearing that state.
+- `vector_recovery` serializes those rebuild paths with vector mutations so a
+  later failed text operation cannot be hidden by an earlier rebuild clearing
+  the marker.
+- Background refresh must call the composite `refresh()` path, not
+  `HotEngine::refresh()` directly, or it bypasses vector recovery.
 
 ### Reserved Document Metadata
 

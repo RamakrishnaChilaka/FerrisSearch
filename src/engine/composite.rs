@@ -5,7 +5,9 @@
 //! implementations (e.g. shardless/split-based) can implement the SearchEngine
 //! trait directly without using this composite.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -14,6 +16,11 @@ use super::SearchEngine;
 use super::tantivy::HotEngine;
 use super::vector::VectorIndex;
 use crate::wal::TranslogDurability;
+
+const VECTOR_INDEX_FILE: &str = "vectors.usearch";
+const VECTOR_DOC_IDS_FILE: &str = "vectors.docids.bin";
+const VECTORS_STALE_FILE: &str = "vectors.stale";
+const VECTORS_STALE_TEMP_FILE: &str = "vectors.stale.tmp";
 
 /// A composite engine that owns both a text index (Tantivy) and an optional
 /// vector index (USearch). All document operations go through here — vector
@@ -26,6 +33,9 @@ pub struct CompositeEngine {
     global_cp: Mutex<Option<u64>>,
     /// Monotonic local persisted prefix learned through replica apply.
     replica_persisted_cp: Mutex<Option<u64>>,
+    /// Serializes text recovery with vector rebuild and stale-marker updates.
+    vector_recovery: Mutex<()>,
+    has_vector_mappings: bool,
     /// Shared column cache for fast-field Arrow arrays.
     #[allow(dead_code)]
     column_cache: Arc<super::column_cache::ColumnCache>,
@@ -73,9 +83,15 @@ impl CompositeEngine {
             durability,
             column_cache.clone(),
         )?;
+        let has_vector_mappings = mappings.values().any(|mapping| {
+            matches!(
+                mapping.field_type,
+                crate::cluster::state::FieldType::KnnVector
+            )
+        });
 
         // Load existing vector index if present.
-        let vector_path = data_dir.join("vectors.usearch");
+        let vector_path = data_dir.join(VECTOR_INDEX_FILE);
         let vector = if vector_path.exists() {
             // We don't know the dimensions yet — we'll discover on first vector field.
             // For now, skip loading; rebuild_vectors will handle it.
@@ -90,6 +106,8 @@ impl CompositeEngine {
             data_dir,
             global_cp: Mutex::new(None),
             replica_persisted_cp: Mutex::new(None),
+            vector_recovery: Mutex::new(()),
+            has_vector_mappings,
             column_cache,
         })
     }
@@ -109,6 +127,12 @@ impl CompositeEngine {
             durability,
             column_cache.clone(),
         )?;
+        let has_vector_mappings = mappings.values().any(|mapping| {
+            matches!(
+                mapping.field_type,
+                crate::cluster::state::FieldType::KnnVector
+            )
+        });
 
         Ok(Self {
             text,
@@ -116,6 +140,8 @@ impl CompositeEngine {
             data_dir,
             global_cp: Mutex::new(None),
             replica_persisted_cp: Mutex::new(None),
+            vector_recovery: Mutex::new(()),
+            has_vector_mappings,
             column_cache,
         })
     }
@@ -152,7 +178,7 @@ impl CompositeEngine {
         tokio::task::spawn_blocking(move || {
             // Commit/truncate/save work is blocking I/O and must stay off the async
             // scheduler so Raft heartbeats and transport RPCs keep making progress.
-            if let Err(e) = engine.text.refresh() {
+            if let Err(e) = engine.refresh() {
                 tracing::error!("Background refresh failed: {}", e);
             }
             if let Some(flush_threshold) = flush_threshold
@@ -254,6 +280,12 @@ impl CompositeEngine {
             );
             return Ok(false);
         };
+        let _vector_recovery = match self.vector_recovery.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
 
         tracing::info!(
             "Translog size ({} bytes) exceeds threshold ({} bytes), auto-flushing",
@@ -270,7 +302,9 @@ impl CompositeEngine {
             );
             return Ok(false);
         }
-        if !self.try_save_vectors()? {
+        if rebuild_vectors {
+            self.rebuild_vectors_locked()?;
+        } else if !self.try_save_vectors()? {
             tracing::debug!(
                 "Deferred vector index save during auto-flush because the vector index is busy"
             );
@@ -298,6 +332,123 @@ impl CompositeEngine {
         })
     }
 
+    fn vector_index_path(&self) -> std::path::PathBuf {
+        self.data_dir.join(VECTOR_INDEX_FILE)
+    }
+
+    fn vector_doc_ids_path(&self) -> std::path::PathBuf {
+        self.data_dir.join(VECTOR_DOC_IDS_FILE)
+    }
+
+    fn vectors_stale_path(&self) -> std::path::PathBuf {
+        self.data_dir.join(VECTORS_STALE_FILE)
+    }
+
+    fn vectors_stale_temp_path(&self) -> std::path::PathBuf {
+        self.data_dir.join(VECTORS_STALE_TEMP_FILE)
+    }
+
+    fn vectors_are_stale(&self) -> Result<bool> {
+        Ok(self.vectors_stale_path().try_exists()?
+            || self.vectors_stale_temp_path().try_exists()?)
+    }
+
+    fn vector_state_is_relevant(&self) -> Result<bool> {
+        if self.has_vector_mappings
+            || self
+                .vector
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(self.vector_index_path().try_exists()?
+            || self.vector_doc_ids_path().try_exists()?
+            || self.vectors_are_stale()?)
+    }
+
+    fn mark_vectors_stale(&self) -> Result<()> {
+        let marker_path = self.vectors_stale_path();
+        if marker_path.try_exists()? {
+            return Ok(());
+        }
+
+        let temporary_path = self.vectors_stale_temp_path();
+        let mut marker = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)
+            .with_context(|| {
+                format!("failed to create temporary vectors-stale marker {temporary_path:?}")
+            })?;
+        marker.write_all(b"stale\n")?;
+        marker.sync_all()?;
+        drop(marker);
+        std::fs::rename(&temporary_path, &marker_path).with_context(|| {
+            format!(
+                "failed to atomically install vectors-stale marker {marker_path:?} from {temporary_path:?}"
+            )
+        })?;
+        File::open(&self.data_dir)?.sync_all()?;
+        Ok(())
+    }
+
+    fn clear_vectors_stale(&self) -> Result<()> {
+        let mut removed = false;
+        for path in [self.vectors_stale_path(), self.vectors_stale_temp_path()] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to remove vectors-stale marker {path:?}")
+                    });
+                }
+            }
+        }
+        if removed {
+            File::open(&self.data_dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_vector_rebuild(&self, force_text_replay: bool) -> Result<bool> {
+        if !self.vector_state_is_relevant()? {
+            return Ok(false);
+        }
+        let stale = self.vectors_are_stale()?;
+        let writer_requires_rebuild = self.text.writer_requires_rebuild();
+        if force_text_replay || writer_requires_rebuild {
+            self.mark_vectors_stale()?;
+        }
+        Ok(stale || force_text_replay || writer_requires_rebuild)
+    }
+
+    fn record_vector_staleness_after_text_failure(
+        &self,
+        context: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if !self.text.writer_requires_rebuild() {
+            return error;
+        }
+        let marker_result = self.vector_state_is_relevant().and_then(|relevant| {
+            if relevant {
+                self.mark_vectors_stale()
+            } else {
+                Ok(())
+            }
+        });
+        match marker_result {
+            Ok(()) => error,
+            Err(marker_error) => marker_error.context(format!(
+                "failed to persist vectors-stale state after {context} failed: {error:#}"
+            )),
+        }
+    }
+
     /// Ensure a vector index exists with the given dimensions.
     /// Creates one if it doesn't exist, or returns the existing one.
     fn ensure_vector_index(&self, dimensions: usize) -> Result<()> {
@@ -308,7 +459,7 @@ impl CompositeEngine {
             }
         }
 
-        let vector_path = self.data_dir.join("vectors.usearch");
+        let vector_path = self.vector_index_path();
         let vi = VectorIndex::open(&vector_path, dimensions, usearch::ffi::MetricKind::Cos)?;
 
         let mut guard = self.vector.write().unwrap_or_else(|e| e.into_inner());
@@ -318,9 +469,10 @@ impl CompositeEngine {
         Ok(())
     }
 
-    fn prepare_vector_mutation(
+    fn detect_vector_mutation(
         &self,
         payload: &serde_json::Value,
+        expected_dimensions: Option<usize>,
     ) -> Result<PreparedVectorMutation> {
         if let Some(obj) = payload.as_object() {
             for (field, value) in obj {
@@ -332,12 +484,7 @@ impl CompositeEngine {
                     if let Some(vector) = floats
                         && !vector.is_empty()
                     {
-                        if let Some(expected) = self
-                            .vector
-                            .read()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .as_ref()
-                            .map(VectorIndex::dimensions)
+                        if let Some(expected) = expected_dimensions
                             && expected != vector.len()
                         {
                             return Ok(PreparedVectorMutation::SkipShapeMismatch {
@@ -346,7 +493,6 @@ impl CompositeEngine {
                                 actual: vector.len(),
                             });
                         }
-                        self.ensure_vector_index(vector.len())?;
                         return Ok(PreparedVectorMutation::Index { vector });
                     }
                 }
@@ -355,8 +501,25 @@ impl CompositeEngine {
         Ok(PreparedVectorMutation::None)
     }
 
-    fn apply_prepared_vector_mutation(
+    fn prepare_vector_mutation(
         &self,
+        payload: &serde_json::Value,
+    ) -> Result<PreparedVectorMutation> {
+        let expected_dimensions = self
+            .vector
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(VectorIndex::dimensions);
+        let prepared = self.detect_vector_mutation(payload, expected_dimensions)?;
+        if let PreparedVectorMutation::Index { vector } = &prepared {
+            self.ensure_vector_index(vector.len())?;
+        }
+        Ok(prepared)
+    }
+
+    fn apply_prepared_vector_mutation_to_index(
+        index: Option<&VectorIndex>,
         operation: &super::SequencedOperation,
         prepared: &PreparedVectorMutation,
     ) -> Result<()> {
@@ -365,21 +528,12 @@ impl CompositeEngine {
                 PreparedVectorMutation::Index { vector },
                 super::DocumentMutation::Index { doc_id, .. },
             ) => {
-                let guard = self
-                    .vector
-                    .read()
-                    .unwrap_or_else(|error| error.into_inner());
-                let index = guard
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("prepared vector index disappeared"))?;
+                let index =
+                    index.ok_or_else(|| anyhow::anyhow!("prepared vector index disappeared"))?;
                 index.apply_index(doc_id, vector, operation.seq_no, operation.primary_term)?;
             }
             (PreparedVectorMutation::Delete, super::DocumentMutation::Delete { doc_id }) => {
-                let guard = self
-                    .vector
-                    .read()
-                    .unwrap_or_else(|error| error.into_inner());
-                if let Some(index) = guard.as_ref() {
+                if let Some(index) = index {
                     index.apply_delete(doc_id, operation.seq_no, operation.primary_term)?;
                 }
             }
@@ -407,12 +561,69 @@ impl CompositeEngine {
         Ok(())
     }
 
+    fn apply_prepared_vector_mutation(
+        &self,
+        operation: &super::SequencedOperation,
+        prepared: &PreparedVectorMutation,
+    ) -> Result<()> {
+        if let PreparedVectorMutation::Index { vector } = prepared {
+            self.ensure_vector_index(vector.len())?;
+        }
+        let guard = self
+            .vector
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        Self::apply_prepared_vector_mutation_to_index(guard.as_ref(), operation, prepared)
+    }
+
+    fn apply_vector_mutation_after_rebuild(
+        &self,
+        operation: &super::SequencedOperation,
+        prepared: &PreparedVectorMutation,
+    ) -> Result<()> {
+        match self.apply_prepared_vector_mutation(operation, prepared) {
+            Ok(()) => Ok(()),
+            Err(error) => match self.mark_vectors_stale() {
+                Ok(()) => Err(error),
+                Err(marker_error) => Err(marker_error.context(format!(
+                    "failed to persist vectors-stale state after post-rebuild vector apply failed: {error:#}"
+                ))),
+            },
+        }
+    }
+
+    fn persist_vector_index(&self, index: &VectorIndex) -> Result<()> {
+        let vector_path = self.vector_index_path();
+        index.save(&vector_path)?;
+        File::open(&vector_path)?.sync_all()?;
+        File::open(self.vector_doc_ids_path())?.sync_all()?;
+        File::open(&self.data_dir)?.sync_all()?;
+        Ok(())
+    }
+
+    fn remove_persisted_vector_index(&self) -> Result<()> {
+        let mut removed = false;
+        for path in [self.vector_index_path(), self.vector_doc_ids_path()] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to remove vector index file {path:?}"));
+                }
+            }
+        }
+        if removed {
+            File::open(&self.data_dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// Save the vector index to disk (called during flush).
     fn save_vectors(&self) -> Result<()> {
         let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref vi) = *guard {
-            let vector_path = self.data_dir.join("vectors.usearch");
-            vi.save(&vector_path)?;
+        if let Some(ref index) = *guard {
+            self.persist_vector_index(index)?;
         }
         Ok(())
     }
@@ -421,52 +632,61 @@ impl CompositeEngine {
     /// Returns `Ok(false)` when the vector lock is poisoned-and-unrecoverable.
     fn try_save_vectors(&self) -> Result<bool> {
         let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref vi) = *guard {
-            let vector_path = self.data_dir.join("vectors.usearch");
-            vi.save(&vector_path)?;
+        if let Some(ref index) = *guard {
+            self.persist_vector_index(index)?;
         }
         Ok(true)
     }
 
-    /// Rebuild vector index from all documents in Tantivy.
-    /// Called on startup to recover vectors from persisted text documents.
-    /// The primary guard is at the shard-manager level (only called when
-    /// knn_vector fields exist in the index mappings). This method does
-    /// its own early-return if the MatchAll scan finds no documents.
-    pub fn rebuild_vectors(&self) -> Result<()> {
+    fn rebuild_vectors_locked(&self) -> Result<()> {
         let docs = self.text.vector_rebuild_documents()?;
-        if docs.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(index) = self
-            .vector
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-        {
-            index.reset_versions();
-        }
+        let mut rebuilt = None;
         let mut vector_count = 0;
         for (doc_id, source, seq_no, primary_term) in docs {
-            let prepared = self.prepare_vector_mutation(&source)?;
+            let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
+            let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
+            if let PreparedVectorMutation::Index { vector } = &prepared
+                && rebuilt.is_none()
+            {
+                rebuilt = Some(VectorIndex::new(
+                    vector.len(),
+                    usearch::ffi::MetricKind::Cos,
+                )?);
+            }
             let operation = super::SequencedOperation {
                 seq_no,
                 primary_term,
                 mutation: super::DocumentMutation::Index { doc_id, source },
             };
-            self.apply_prepared_vector_mutation(&operation, &prepared)?;
+            Self::apply_prepared_vector_mutation_to_index(rebuilt.as_ref(), &operation, &prepared)?;
         }
 
-        // Check if any vectors were actually indexed
-        if let Some(ref vi) = *self.vector.read().unwrap() {
-            vector_count = vi.len();
+        if let Some(index) = rebuilt.as_ref() {
+            vector_count = index.len();
+            self.persist_vector_index(index)?;
+        } else {
+            self.remove_persisted_vector_index()?;
         }
+        *self
+            .vector
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = rebuilt;
+        self.clear_vectors_stale()?;
 
         if vector_count > 0 {
             tracing::info!("Rebuilt vector index: {} vectors recovered", vector_count);
         }
         Ok(())
+    }
+
+    /// Rebuild the vector index from the authoritative Tantivy document view.
+    /// The rebuild is persisted before durable stale state is cleared.
+    pub fn rebuild_vectors(&self) -> Result<()> {
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.rebuild_vectors_locked()
     }
 }
 
@@ -501,18 +721,30 @@ impl SearchEngine for CompositeEngine {
         primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
         crate::common::validate_document_source(&payload)?;
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let prepared = self.prepare_vector_mutation(&payload)?;
         let source_for_rebuild = payload.clone();
-        let rebuild_vectors = self.text.writer_requires_rebuild();
-        let receipt = self.text.add_primary_index_with_side_effect(
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        let receipt = match self.text.add_primary_index_with_side_effect(
             doc_id,
             payload,
             primary_term,
             |operation| self.apply_prepared_vector_mutation(operation, &prepared),
-        )?;
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(self.record_vector_staleness_after_text_failure(
+                    "primary document indexing",
+                    error,
+                ));
+            }
+        };
         if rebuild_vectors {
-            self.rebuild_vectors()?;
-            self.apply_prepared_vector_mutation(
+            self.rebuild_vectors_locked()?;
+            self.apply_vector_mutation_after_rebuild(
                 &super::SequencedOperation {
                     seq_no: receipt.seq_no,
                     primary_term: receipt.primary_term,
@@ -536,32 +768,45 @@ impl SearchEngine for CompositeEngine {
         for (_, payload) in &docs {
             crate::common::validate_document_source(payload)?;
         }
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let prepared = docs
             .iter()
             .map(|(_, payload)| self.prepare_vector_mutation(payload))
             .collect::<Result<Vec<_>>>()?;
         let docs_for_rebuild = docs.clone();
         let prepared_for_rebuild = prepared.clone();
-        let rebuild_vectors = self.text.writer_requires_rebuild();
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
 
         let mut prepared = prepared.into_iter();
         let receipt =
-            self.text
+            match self
+                .text
                 .add_primary_bulk_with_side_effect(docs, primary_term, |operation| {
                     let prepared = prepared
                         .next()
                         .expect("primary bulk vector preparation matches operation order");
                     self.apply_prepared_vector_mutation(operation, &prepared)
-                })?;
+                }) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Err(self.record_vector_staleness_after_text_failure(
+                        "primary bulk indexing",
+                        error,
+                    ));
+                }
+            };
         if rebuild_vectors {
-            self.rebuild_vectors()?;
+            self.rebuild_vectors_locked()?;
             if let Some(start_seq_no) = receipt.start_seq_no {
                 for (offset, ((doc_id, source), prepared)) in docs_for_rebuild
                     .into_iter()
                     .zip(prepared_for_rebuild.iter())
                     .enumerate()
                 {
-                    self.apply_prepared_vector_mutation(
+                    self.apply_vector_mutation_after_rebuild(
                         &super::SequencedOperation {
                             seq_no: start_seq_no + offset as u64,
                             primary_term: receipt.primary_term,
@@ -583,15 +828,28 @@ impl SearchEngine for CompositeEngine {
         doc_id: &str,
         primary_term: u64,
     ) -> Result<super::DeleteWriteReceipt> {
-        let rebuild_vectors = self.text.writer_requires_rebuild();
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
         let receipt =
-            self.text
+            match self
+                .text
                 .delete_primary_with_side_effect(doc_id, primary_term, |operation| {
                     self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
-                })?;
+                }) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Err(self.record_vector_staleness_after_text_failure(
+                        "primary document deletion",
+                        error,
+                    ));
+                }
+            };
         if rebuild_vectors {
-            self.rebuild_vectors()?;
-            self.apply_prepared_vector_mutation(
+            self.rebuild_vectors_locked()?;
+            self.apply_vector_mutation_after_rebuild(
                 &super::SequencedOperation {
                     seq_no: receipt.seq_no,
                     primary_term: receipt.primary_term,
@@ -613,6 +871,10 @@ impl SearchEngine for CompositeEngine {
         if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
             crate::common::validate_document_source(source)?;
         }
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let prepared = match &operation.mutation {
             super::DocumentMutation::Index { source, .. } => {
                 self.prepare_vector_mutation(source)?
@@ -620,17 +882,23 @@ impl SearchEngine for CompositeEngine {
             super::DocumentMutation::Delete { .. } => PreparedVectorMutation::Delete,
             super::DocumentMutation::NoOp { .. } => PreparedVectorMutation::None,
         };
-        let rebuild_vectors = self.text.writer_requires_rebuild();
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
         let operation_for_rebuild = operation.clone();
-        let receipt = self
+        let receipt = match self
             .text
             .apply_sequenced_operation_with_side_effect(operation, |operation| {
                 self.apply_prepared_vector_mutation(operation, &prepared)
-            })?;
+            }) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(self
+                    .record_vector_staleness_after_text_failure("replica operation apply", error));
+            }
+        };
         if rebuild_vectors {
-            self.rebuild_vectors()?;
+            self.rebuild_vectors_locked()?;
             if receipt.outcome == super::ApplyOutcome::Applied {
-                self.apply_prepared_vector_mutation(&operation_for_rebuild, &prepared)?;
+                self.apply_vector_mutation_after_rebuild(&operation_for_rebuild, &prepared)?;
             }
         }
         self.record_replica_persisted_checkpoint(receipt.sequence.persisted_checkpoint);
@@ -646,6 +914,10 @@ impl SearchEngine for CompositeEngine {
                 crate::common::validate_document_source(source)?;
             }
         }
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let prepared_by_identity = operations
             .iter()
             .map(|operation| {
@@ -661,23 +933,30 @@ impl SearchEngine for CompositeEngine {
             .collect::<Result<std::collections::HashMap<_, _>>>()?;
         let mut apply_prepared = prepared_by_identity.clone();
         let operations_for_rebuild = operations.clone();
-        let rebuild_vectors = self.text.writer_requires_rebuild();
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
         let receipt =
-            self.text
+            match self
+                .text
                 .apply_sequenced_batch_with_side_effect(operations, true, |operation| {
                     let prepared = apply_prepared
                         .remove(&(operation.primary_term, operation.seq_no))
                         .expect("prepared vector mutation must match the operation");
                     self.apply_prepared_vector_mutation(operation, &prepared)
-                })?;
+                }) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Err(self
+                        .record_vector_staleness_after_text_failure("replica batch apply", error));
+                }
+            };
         if rebuild_vectors {
-            self.rebuild_vectors()?;
+            self.rebuild_vectors_locked()?;
             for (operation, outcome) in operations_for_rebuild.iter().zip(&receipt.outcomes) {
                 if *outcome == super::ApplyOutcome::Applied {
                     let prepared = prepared_by_identity
                         .get(&(operation.primary_term, operation.seq_no))
                         .expect("prepared vector mutation must match the operation");
-                    self.apply_prepared_vector_mutation(operation, prepared)?;
+                    self.apply_vector_mutation_after_rebuild(operation, prepared)?;
                 }
             }
         }
@@ -690,7 +969,20 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn refresh(&self) -> Result<()> {
-        let pruned = self.text.refresh_with_pruned_tombstones()?;
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        let pruned = match self.text.refresh_with_pruned_tombstones() {
+            Ok(pruned) => pruned,
+            Err(error) => {
+                return Err(self.record_vector_staleness_after_text_failure("refresh", error));
+            }
+        };
+        if rebuild_vectors {
+            return self.rebuild_vectors_locked();
+        }
         if let Some(index) = self
             .vector
             .read()
@@ -705,24 +997,58 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn flush(&self) -> Result<()> {
-        self.text.flush()?;
-        self.save_vectors()?;
-        Ok(())
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        if let Err(error) = self.text.flush() {
+            return Err(self.record_vector_staleness_after_text_failure("flush", error));
+        }
+        if rebuild_vectors {
+            self.rebuild_vectors_locked()
+        } else {
+            self.save_vectors()
+        }
     }
 
     fn flush_with_global_checkpoint(&self) -> Result<()> {
-        if let Some(truncation_checkpoint) = self.safe_truncation_checkpoint() {
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        let result = if let Some(truncation_checkpoint) = self.safe_truncation_checkpoint() {
             self.text
-                .flush_with_global_checkpoint(truncation_checkpoint)?;
+                .flush_with_global_checkpoint(truncation_checkpoint)
         } else {
-            self.text.flush_without_truncation()?;
+            self.text.flush_without_truncation()
+        };
+        if let Err(error) = result {
+            return Err(
+                self.record_vector_staleness_after_text_failure("checkpoint-aware flush", error)
+            );
         }
-        self.save_vectors()?;
-        Ok(())
+        if rebuild_vectors {
+            self.rebuild_vectors_locked()
+        } else {
+            self.save_vectors()
+        }
     }
 
     fn force_merge(&self, max_num_segments: usize) -> Result<()> {
-        self.text.force_merge(max_num_segments)
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        if let Err(error) = self.text.force_merge(max_num_segments) {
+            return Err(self.record_vector_staleness_after_text_failure("force merge", error));
+        }
+        if rebuild_vectors {
+            self.rebuild_vectors_locked()?;
+        }
+        Ok(())
     }
 
     fn segment_infos(&self) -> Vec<super::SegmentInfo> {
@@ -891,14 +1217,59 @@ impl SearchEngine for CompositeEngine {
         &self,
         snapshot_dir: &std::path::Path,
     ) -> Result<super::PeerRecoverySnapshot> {
-        self.text.create_peer_recovery_snapshot(snapshot_dir)
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        let snapshot = match self.text.create_peer_recovery_snapshot(snapshot_dir) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(self.record_vector_staleness_after_text_failure(
+                    "peer recovery snapshot creation",
+                    error,
+                ));
+            }
+        };
+        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
+            let release_result = self
+                .text
+                .release_peer_recovery_pin(snapshot.retention_pin_id);
+            let _ = std::fs::remove_dir_all(snapshot_dir);
+            if let Err(release_error) = release_result {
+                return Err(release_error.context(format!(
+                    "failed to release peer recovery pin after vector rebuild failed: {error:#}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(snapshot)
     }
 
     fn prepare_peer_recovery_snapshot(
         &self,
         snapshot_dir: &std::path::Path,
     ) -> Result<super::PeerRecoverySnapshotPreparation> {
-        self.text.prepare_peer_recovery_snapshot(snapshot_dir)
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        let preparation = match self.text.prepare_peer_recovery_snapshot(snapshot_dir) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                return Err(self.record_vector_staleness_after_text_failure(
+                    "peer recovery snapshot preparation",
+                    error,
+                ));
+            }
+        };
+        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
+            drop(preparation);
+            let _ = std::fs::remove_dir_all(snapshot_dir);
+            return Err(error);
+        }
+        Ok(preparation)
     }
 
     fn release_peer_recovery_pin(&self, pin_id: u64) -> Result<()> {
@@ -927,18 +1298,50 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn peer_recovery_barrier(&self) -> Result<super::PeerRecoveryBarrier> {
-        self.text.peer_recovery_barrier()
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        let barrier = match self.text.peer_recovery_barrier() {
+            Ok(barrier) => barrier,
+            Err(error) => {
+                return Err(
+                    self.record_vector_staleness_after_text_failure("peer recovery barrier", error)
+                );
+            }
+        };
+        if rebuild_vectors {
+            self.rebuild_vectors_locked()?;
+        }
+        Ok(barrier)
     }
 
     fn prepare_primary_activation(
         &self,
         primary_term: u64,
     ) -> Result<Vec<super::SequencedOperation>> {
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(true)?;
         *self
             .replica_persisted_cp
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
-        self.text.prepare_primary_activation(primary_term)
+        let operations = match self.text.prepare_primary_activation(primary_term) {
+            Ok(operations) => operations,
+            Err(error) => {
+                return Err(
+                    self.record_vector_staleness_after_text_failure("primary activation", error)
+                );
+            }
+        };
+        if rebuild_vectors {
+            self.rebuild_vectors_locked()?;
+        }
+        Ok(operations)
     }
 
     fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
@@ -1247,6 +1650,109 @@ mod tests {
             assert_eq!(hits.len(), 2, "rebuild should restore vector search");
             assert_eq!(hits[0]["_id"], "d1");
         }
+    }
+
+    fn vector_engine(dir: &std::path::Path) -> CompositeEngine {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        CompositeEngine::new_with_mappings(
+            dir,
+            Duration::from_secs(60),
+            &std::collections::HashMap::from([(
+                "emb".into(),
+                FieldMapping {
+                    field_type: FieldType::KnnVector,
+                    dimension: Some(3),
+                },
+            )]),
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap()
+    }
+
+    fn vector_state_after_failed_write(
+        between: impl FnOnce(&CompositeEngine),
+    ) -> (Option<u64>, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = vector_engine(dir.path());
+        engine
+            .add_document_with_receipt_at_term("doc", json!({"emb": [1.0, 0.0, 0.0]}), 1)
+            .unwrap();
+        engine.refresh().unwrap();
+        engine.inject_engine_apply_failures_for_test(5, 1);
+        assert!(
+            engine
+                .add_document_with_receipt_at_term("doc", json!({"emb": [0.0, 1.0, 0.0]}), 1)
+                .is_err()
+        );
+        between(&engine);
+        engine
+            .add_document_with_receipt_at_term("trigger", json!({"emb": [0.0, 0.0, 1.0]}), 1)
+            .unwrap();
+
+        let vector_version = engine
+            .vector
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|index| index.version_for_test("doc"))
+            .map(|version| version.seq_no);
+        let source = engine.get_document("doc").unwrap().unwrap()["emb"].clone();
+        (vector_version, source)
+    }
+
+    #[test]
+    fn refresh_rebuild_recovers_vector_state_before_next_write() {
+        let (vector_version, source) =
+            vector_state_after_failed_write(|engine| engine.refresh().unwrap());
+
+        assert_eq!(vector_version, Some(1));
+        assert_eq!(source, json!([0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn primary_activation_replay_recovers_vector_state_before_next_write() {
+        let (vector_version, source) = vector_state_after_failed_write(|engine| {
+            engine.prepare_primary_activation(1).unwrap();
+        });
+
+        assert_eq!(vector_version, Some(1));
+        assert_eq!(source, json!([0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn vectors_stale_marker_survives_restart_until_rebuild_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("vectors.stale");
+        {
+            let engine = vector_engine(dir.path());
+            engine
+                .add_document_with_receipt_at_term("doc", json!({"emb": [1.0, 0.0, 0.0]}), 1)
+                .unwrap();
+            engine.refresh().unwrap();
+            engine.inject_engine_apply_failures_for_test(5, 1);
+            assert!(
+                engine
+                    .add_document_with_receipt_at_term("doc", json!({"emb": [0.0, 1.0, 0.0]}), 1,)
+                    .is_err()
+            );
+            assert!(marker.exists(), "failed text apply must mark vectors stale");
+        }
+
+        let engine = vector_engine(dir.path());
+        assert!(marker.exists(), "vectors-stale state must survive restart");
+        engine.rebuild_vectors().unwrap();
+        assert!(
+            !marker.exists(),
+            "successful full vector rebuild must clear stale state"
+        );
+        let vector_version = engine
+            .vector
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|index| index.version_for_test("doc"));
+        assert_eq!(vector_version.map(|version| version.seq_no), Some(1));
     }
 
     #[test]

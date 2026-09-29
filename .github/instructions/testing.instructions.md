@@ -328,6 +328,9 @@ cargo test -- test_name                         # Single test by name
   replay, malformed WAL document envelopes, idempotent replay with deletes,
   replica delete survival through promotion, idle refresh/snapshot healing,
   and full transport recovery after a transient source refresh-commit failure.
+- D1 vector recovery regressions must cover a failed post-WAL text apply
+  followed by refresh or primary activation before the next write, plus
+  restart persistence and successful clearing of `vectors.stale`.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary

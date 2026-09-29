@@ -275,13 +275,6 @@ impl VectorIndex {
         }
     }
 
-    pub(crate) fn reset_versions(&self) {
-        self.versions
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-    }
-
     #[cfg(test)]
     pub(crate) fn version_for_test(&self, doc_id: &str) -> Option<VectorVersionValue> {
         self.versions
