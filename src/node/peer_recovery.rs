@@ -459,6 +459,15 @@ struct CompletionSettlementContext<'a> {
     retry_timeout: Duration,
 }
 
+#[cfg_attr(not(feature = "protocol-trace"), allow(dead_code))]
+#[derive(Clone)]
+struct RecoveryApplyContext {
+    node: String,
+    index_uuid: String,
+    shard: u32,
+    allocation: u64,
+}
+
 fn require_recovery_cursor(
     cursor: Option<crate::transport::proto::RecoveryWalCursor>,
     label: &'static str,
@@ -525,6 +534,21 @@ async fn run_peer_recovery(
         anyhow::bail!("peer recovery committed boundary term mismatch");
     }
     validate_file_manifest(&start.files)?;
+    #[cfg(feature = "protocol-trace")]
+    let snapshot_next_seq_no = committed_boundary
+        .max_seq_no
+        .and_then(|seq_no| seq_no.checked_add(1))
+        .unwrap_or(0);
+    #[cfg(feature = "protocol-trace")]
+    let trace_context = crate::protocol_trace::RecoveryTraceContext {
+        source_node: candidate.primary.id.clone(),
+        target_node: local_node_id.to_string(),
+        index_uuid: candidate.metadata.uuid.to_string(),
+        shard: candidate.shard_id,
+        allocation: candidate.allocation_id,
+        session_id: start.session_id.clone(),
+        snapshot_next_seq_no,
+    };
 
     if !shard_manager
         .begin_peer_recovery_target_blocking(
@@ -538,6 +562,18 @@ async fn run_peer_recovery(
         anyhow::bail!("peer recovery target is already active");
     }
     destructive_started.store(true, Ordering::Release);
+    #[cfg(feature = "protocol-trace")]
+    let shard_dir = shard_manager
+        .prepare_peer_recovery_target_blocking_traced(
+            candidate.index_name.clone(),
+            candidate.shard_id,
+            candidate.metadata.uuid.to_string(),
+            candidate.allocation_id,
+            trace_context.clone(),
+        )
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
+    #[cfg(not(feature = "protocol-trace"))]
     let shard_dir = shard_manager
         .prepare_peer_recovery_target_blocking(
             candidate.index_name.clone(),
@@ -569,21 +605,34 @@ async fn run_peer_recovery(
         .map_err(|error| anyhow::anyhow!("index directory sync task failed: {error}"))?
         .map_err(ShardManager::local_storage_failure)?;
 
+    let install = PeerRecoveryTargetInstall {
+        index: candidate.index_name.clone(),
+        shard_id: candidate.shard_id,
+        mappings: candidate.metadata.mappings.clone(),
+        settings: candidate.metadata.settings.clone(),
+        index_uuid: candidate.metadata.uuid.to_string(),
+        allocation_id: candidate.allocation_id,
+        primary_term: start.primary_term,
+        shard_dir,
+        committed_boundary: committed_boundary.clone(),
+        expected_files: start.files.iter().map(|file| file.name.clone()).collect(),
+    };
+    #[cfg(feature = "protocol-trace")]
     let engine = shard_manager
-        .finalize_peer_recovery_target_blocking(PeerRecoveryTargetInstall {
-            index: candidate.index_name.clone(),
-            shard_id: candidate.shard_id,
-            mappings: candidate.metadata.mappings.clone(),
-            settings: candidate.metadata.settings.clone(),
-            index_uuid: candidate.metadata.uuid.to_string(),
-            allocation_id: candidate.allocation_id,
-            primary_term: start.primary_term,
-            shard_dir,
-            committed_boundary: committed_boundary.clone(),
-            expected_files: start.files.iter().map(|file| file.name.clone()).collect(),
-        })
+        .finalize_peer_recovery_target_blocking_traced(install, trace_context.clone())
         .await
         .map_err(ShardManager::local_storage_failure)?;
+    #[cfg(not(feature = "protocol-trace"))]
+    let engine = shard_manager
+        .finalize_peer_recovery_target_blocking(install)
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
+    let recovery_apply = RecoveryApplyContext {
+        node: local_node_id.to_string(),
+        index_uuid: candidate.metadata.uuid.to_string(),
+        shard: candidate.shard_id,
+        allocation: candidate.allocation_id,
+    };
     let mut cursor = snapshot_cursor;
     let mut operations = 0u64;
     loop {
@@ -609,6 +658,7 @@ async fn run_peer_recovery(
         }
         let (new_cursor, applied) = apply_recovery_operations_cursor(
             engine.clone(),
+            Some(recovery_apply.clone()),
             cursor,
             next_cursor,
             committed_boundary.processed_checkpoint,
@@ -652,6 +702,7 @@ async fn run_peer_recovery(
                 require_recovery_cursor(response.next_cursor, "peer recovery next cursor")?;
             let (new_cursor, applied) = apply_recovery_operations_cursor(
                 engine.clone(),
+                Some(recovery_apply.clone()),
                 cursor,
                 next_cursor,
                 committed_boundary.processed_checkpoint,
@@ -672,6 +723,7 @@ async fn run_peer_recovery(
             require_recovery_cursor(prepared.barrier_wal_end, "finalize barrier WAL end")?;
         let (new_cursor, applied) = apply_recovery_operations_cursor(
             engine.clone(),
+            Some(recovery_apply.clone()),
             cursor,
             next_cursor,
             committed_boundary.processed_checkpoint,
@@ -690,6 +742,20 @@ async fn run_peer_recovery(
                 "peer recovery target processed checkpoint does not match the source barrier"
             );
         }
+        #[cfg(feature = "protocol-trace")]
+        crate::protocol_trace::record_recovery_barrier(
+            &candidate.primary.id,
+            local_node_id,
+            candidate.metadata.uuid.as_str(),
+            candidate.shard_id,
+            candidate.allocation_id,
+            &start.session_id,
+            prepared
+                .barrier_max_seq_no
+                .and_then(|seq_no| seq_no.checked_add(1))
+                .unwrap_or(0),
+            engine.protocol_trace_processed_sequences()?,
+        );
         break;
     }
 
@@ -716,7 +782,7 @@ async fn run_peer_recovery(
     let observation = complete_with_observed_settlement(CompletionSettlementContext {
         candidate,
         local_node_id,
-        cluster_manager,
+        cluster_manager: cluster_manager.clone(),
         transport_client: &transport_client,
         session_id: &start.session_id,
         pending: &pending,
@@ -725,6 +791,18 @@ async fn run_peer_recovery(
         retry_timeout: COMPLETE_RETRY_TIMEOUT,
     })
     .await;
+    #[cfg(feature = "protocol-trace")]
+    if observation == TargetMembershipObservation::Unknown {
+        crate::protocol_trace::record_recovery_membership(
+            &candidate.primary.id,
+            local_node_id,
+            candidate.metadata.uuid.as_str(),
+            candidate.shard_id,
+            candidate.allocation_id,
+            &start.session_id,
+            "unknown",
+        );
+    }
 
     let stats = RecoveryStats {
         session_id: start.session_id,
@@ -874,8 +952,10 @@ async fn download_recovery_file(
     Ok(offset)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_recovery_operations_cursor(
     engine: Arc<dyn SearchEngine>,
+    trace: Option<RecoveryApplyContext>,
     cursor: crate::wal::WalCursor,
     next_cursor: crate::wal::WalCursor,
     snapshot_processed_checkpoint: Option<u64>,
@@ -935,10 +1015,41 @@ async fn apply_recovery_operations_cursor(
 
     let applied = decoded.len() as u64;
     let engine_for_apply = engine.clone();
+    #[cfg(feature = "protocol-trace")]
+    let trace_copy = trace
+        .as_ref()
+        .map(|trace| crate::protocol_trace::TraceCopy {
+            node: trace.node.clone(),
+            index_uuid: trace.index_uuid.clone(),
+            shard: trace.shard,
+            allocation: trace.allocation,
+        });
     tokio::task::spawn_blocking(move || {
-        engine_for_apply
-            .apply_replica_batch(decoded)
-            .map_err(ShardManager::local_storage_failure)?;
+        #[cfg(feature = "protocol-trace")]
+        let result = match trace_copy {
+            Some(trace_copy) => crate::protocol_trace::with_open_copy(trace_copy, || {
+                crate::protocol_trace::with_apply_scope(
+                    crate::protocol_trace::ApplyOrigin::Recovery,
+                    decoded.clone(),
+                    || {
+                        engine_for_apply
+                            .apply_replica_batch(decoded)
+                            .map_err(ShardManager::local_storage_failure)
+                    },
+                )
+            }),
+            None => engine_for_apply
+                .apply_replica_batch(decoded)
+                .map_err(ShardManager::local_storage_failure),
+        };
+        #[cfg(not(feature = "protocol-trace"))]
+        let result = {
+            let _ = trace;
+            engine_for_apply
+                .apply_replica_batch(decoded)
+                .map_err(ShardManager::local_storage_failure)
+        };
+        result?;
         Ok::<(), anyhow::Error>(())
     })
     .await
@@ -956,6 +1067,7 @@ async fn apply_recovery_operations(
 ) -> Result<(u64, u64)> {
     let (_, applied) = apply_recovery_operations_cursor(
         engine,
+        None,
         crate::wal::WalCursor {
             generation_id: 0,
             byte_offset: from_seq_no,

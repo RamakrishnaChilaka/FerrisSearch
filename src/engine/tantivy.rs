@@ -3800,6 +3800,20 @@ impl HotEngine {
             .stats()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        let state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let Some(max_seq_no) = state.checkpoints.max_seq_no() else {
+            return Ok(Vec::new());
+        };
+        Ok((0..=max_seq_no)
+            .filter(|seq_no| state.checkpoints.has_processed(*seq_no))
+            .collect())
+    }
+
     pub fn current_primary_term(&self) -> u64 {
         self.apply_state
             .lock()
@@ -7456,6 +7470,11 @@ impl super::SearchEngine for HotEngine {
         self.vector_rebuild_documents()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        HotEngine::protocol_trace_processed_sequences(self)
+    }
+
     fn refresh(&self) -> Result<()> {
         self.refresh_with_pruned_tombstones().map(|_| ())
     }
@@ -7801,6 +7820,10 @@ impl super::SearchEngine for HotEngine {
             snapshot_cursor: prepared.snapshot_cursor,
             #[cfg(test)]
             snapshot_next_seq_no: prepared.snapshot_next_seq_no,
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs: prepared.trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents: prepared.trace_documents,
             committed_boundary: prepared.committed_boundary,
             retention_pin_id: prepared.retention_pin.into_pin_id(),
             files: prepared.files,
@@ -7859,9 +7882,34 @@ impl super::SearchEngine for HotEngine {
                     })?;
                 }
                 std::fs::File::open(snapshot_dir)?.sync_all()?;
+                #[cfg(feature = "protocol-trace")]
+                {
+                    self.reader.reload()?;
+                    let processed_seqs = self.protocol_trace_processed_sequences()?;
+                    let documents = self.vector_rebuild_documents()?;
+                    Ok((file_names, processed_seqs, documents))
+                }
+                #[cfg(not(feature = "protocol-trace"))]
                 Ok(file_names)
             })();
 
+            #[cfg(feature = "protocol-trace")]
+            match result {
+                Ok((file_names, processed_seqs, documents)) => Ok((
+                    snapshot_cursor,
+                    committed_boundary,
+                    retention_pin_id,
+                    file_names,
+                    processed_seqs,
+                    documents,
+                )),
+                Err(error) => {
+                    let _ = translog.release_retention_pin(retention_pin_id);
+                    let _ = std::fs::remove_dir_all(snapshot_dir);
+                    Err(error)
+                }
+            }
+            #[cfg(not(feature = "protocol-trace"))]
             match result {
                 Ok(file_names) => Ok((
                     snapshot_cursor,
@@ -7876,6 +7924,22 @@ impl super::SearchEngine for HotEngine {
                 }
             }
         });
+        #[cfg(feature = "protocol-trace")]
+        let (
+            snapshot_cursor,
+            committed_boundary,
+            retention_pin_id,
+            file_names,
+            trace_processed_seqs,
+            trace_documents,
+        ) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(snapshot_dir);
+                return Err(error);
+            }
+        };
+        #[cfg(not(feature = "protocol-trace"))]
         let (snapshot_cursor, committed_boundary, retention_pin_id, file_names) = match preparation
         {
             Ok(preparation) => preparation,
@@ -7892,6 +7956,10 @@ impl super::SearchEngine for HotEngine {
                 .max_seq_no
                 .and_then(|seq_no| seq_no.checked_add(1))
                 .unwrap_or(0),
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents,
             committed_boundary,
             retention_pin: super::PeerRecoveryRetentionPin::new(
                 self.translog.clone(),

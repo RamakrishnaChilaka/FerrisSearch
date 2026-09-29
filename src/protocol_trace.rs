@@ -86,6 +86,22 @@ pub struct TraceCopySnapshot {
     pub live_documents: Vec<(String, u64, u64, String)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecoveryTraceContext {
+    pub source_node: String,
+    pub target_node: String,
+    pub index_uuid: String,
+    pub shard: u32,
+    pub allocation: u64,
+    pub session_id: String,
+    pub snapshot_next_seq_no: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RecoverySnapshotState {
+    documents: BTreeMap<String, LogicalDocument>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OperationKey {
     pub index_uuid: String,
@@ -237,6 +253,7 @@ struct TraceState {
     replays: HashMap<TraceCopy, ActiveReplay>,
     restart_replays: HashSet<String>,
     pending_commits: HashMap<TraceCopy, String>,
+    recovery_snapshots: HashMap<String, RecoverySnapshotState>,
     known_documents: BTreeSet<String>,
     copy_documents: HashMap<TraceCopy, BTreeMap<String, LogicalDocument>>,
 }
@@ -372,6 +389,7 @@ pub fn start(config: TraceConfig) -> Result<TraceSession> {
         replays: HashMap::new(),
         restart_replays: HashSet::new(),
         pending_commits: HashMap::new(),
+        recovery_snapshots: HashMap::new(),
         known_documents: BTreeSet::new(),
         copy_documents: HashMap::new(),
     });
@@ -1744,6 +1762,192 @@ pub fn record_wal_truncated(copy: &TraceCopy, truncate_through: u64) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn record_recovery_snapshot(
+    source_node: &str,
+    target_node: &str,
+    index_uuid: &str,
+    shard: u32,
+    session_id: &str,
+    snapshot_next_seq_no: u64,
+    mut processed_seqs: Vec<u64>,
+    mut documents: Vec<(String, serde_json::Value, u64, u64)>,
+) {
+    processed_seqs.sort_unstable();
+    processed_seqs.dedup();
+    documents.sort_by(|left, right| left.0.cmp(&right.0));
+    let _ = with_state(|state| {
+        let mut snapshot_documents = BTreeMap::new();
+        let documents = documents
+            .into_iter()
+            .map(|(doc, source, seq_no, term)| {
+                let content_hash = content_hash(&DocumentMutation::Index {
+                    doc_id: doc.clone(),
+                    source,
+                });
+                state.known_documents.insert(doc.clone());
+                snapshot_documents.insert(
+                    doc.clone(),
+                    LogicalDocument {
+                        state: "live",
+                        seq_no,
+                        term,
+                        content_hash: content_hash.clone(),
+                    },
+                );
+                json!({
+                    "doc": doc,
+                    "state": "live",
+                    "seq_no": seq_no,
+                    "term": term,
+                    "content_hash": content_hash,
+                })
+            })
+            .collect::<Vec<_>>();
+        state.recovery_snapshots.insert(
+            session_id.to_string(),
+            RecoverySnapshotState {
+                documents: snapshot_documents,
+            },
+        );
+        push_event(
+            state,
+            "recovery_snapshot",
+            json!({
+                "source_node": source_node,
+                "target_node": target_node,
+                "index_uuid": index_uuid,
+                "shard": shard,
+                "session_id": session_id,
+                "snapshot_next_seq_no": snapshot_next_seq_no,
+                "processed_seqs": processed_seqs,
+                "documents": documents,
+            }),
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_recovery_started(
+    source_node: &str,
+    target_node: &str,
+    index_uuid: &str,
+    shard: u32,
+    allocation: u64,
+    session_id: &str,
+) {
+    let _ = with_state(|state| {
+        push_event(
+            state,
+            "recovery_started",
+            json!({
+                "source_node": source_node,
+                "target_node": target_node,
+                "index_uuid": index_uuid,
+                "shard": shard,
+                "allocation": allocation,
+                "session_id": session_id,
+            }),
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_recovery_installed(
+    source_node: &str,
+    target_node: &str,
+    index_uuid: &str,
+    shard: u32,
+    allocation: u64,
+    session_id: &str,
+    snapshot_next_seq_no: u64,
+) {
+    let _ = with_state(|state| {
+        if let Some(snapshot) = state.recovery_snapshots.get(session_id) {
+            state.copy_documents.insert(
+                TraceCopy {
+                    node: target_node.to_string(),
+                    index_uuid: index_uuid.to_string(),
+                    shard,
+                    allocation,
+                },
+                snapshot.documents.clone(),
+            );
+        }
+        push_event(
+            state,
+            "recovery_installed",
+            json!({
+                "source_node": source_node,
+                "target_node": target_node,
+                "index_uuid": index_uuid,
+                "shard": shard,
+                "allocation": allocation,
+                "session_id": session_id,
+                "snapshot_next_seq_no": snapshot_next_seq_no,
+            }),
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_recovery_barrier(
+    source_node: &str,
+    target_node: &str,
+    index_uuid: &str,
+    shard: u32,
+    allocation: u64,
+    session_id: &str,
+    barrier_next_seq_no: u64,
+    mut processed_seqs: Vec<u64>,
+) {
+    processed_seqs.sort_unstable();
+    processed_seqs.dedup();
+    let _ = with_state(|state| {
+        push_event(
+            state,
+            "recovery_barrier",
+            json!({
+                "source_node": source_node,
+                "target_node": target_node,
+                "index_uuid": index_uuid,
+                "shard": shard,
+                "allocation": allocation,
+                "session_id": session_id,
+                "barrier_next_seq_no": barrier_next_seq_no,
+                "processed_seqs": processed_seqs,
+            }),
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_recovery_membership(
+    source_node: &str,
+    target_node: &str,
+    index_uuid: &str,
+    shard: u32,
+    allocation: u64,
+    session_id: &str,
+    outcome: &str,
+) {
+    let _ = with_state(|state| {
+        push_event(
+            state,
+            "recovery_membership",
+            json!({
+                "source_node": source_node,
+                "target_node": target_node,
+                "index_uuid": index_uuid,
+                "shard": shard,
+                "allocation": allocation,
+                "session_id": session_id,
+                "outcome": outcome,
+            }),
+        );
+    });
+}
+
 pub fn record_copy_state(copy: &TraceCopy, reason: &str, live: Vec<(String, u64, u64, String)>) {
     let _ = with_state(|state| {
         let live = live
@@ -1814,6 +2018,15 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    static TEST_TRACE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_trace_guard() -> MutexGuard<'static, ()> {
+        TEST_TRACE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     fn config(path: &std::path::Path) -> TraceConfig {
         TraceConfig {
             output: path.to_path_buf(),
@@ -1859,6 +2072,7 @@ mod tests {
 
     #[test]
     fn trace_session_writes_consecutive_jsonl() {
+        let _guard = test_trace_guard();
         let dir = tempdir().unwrap();
         let path = dir.path().join("trace.jsonl");
         let session = start(config(&path)).unwrap();
@@ -1893,5 +2107,85 @@ mod tests {
             source: json!({"b": {"d": 3, "c": 2}, "a": 1}),
         };
         assert_eq!(content_hash(&left), content_hash(&right));
+    }
+
+    #[test]
+    fn recovery_events_preserve_sorted_snapshot_evidence() {
+        let _guard = test_trace_guard();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recovery.jsonl");
+        let session = start(config(&path)).unwrap();
+        record_recovery_snapshot(
+            "p",
+            "r",
+            "idx",
+            0,
+            "session",
+            2,
+            vec![1, 0, 1],
+            vec![
+                ("b".into(), json!({"value": 2}), 1, 1),
+                ("a".into(), json!({"value": 1}), 0, 1),
+            ],
+        );
+        record_recovery_started("p", "r", "idx", 0, 2, "session");
+        record_recovery_installed("p", "r", "idx", 0, 2, "session", 2);
+        record_recovery_barrier("p", "r", "idx", 0, 2, "session", 2, vec![1, 0]);
+        record_recovery_membership("p", "r", "idx", 0, 2, "session", "admitted");
+        record_copy_state(
+            &TraceCopy {
+                node: "r".into(),
+                index_uuid: "idx".into(),
+                shard: 0,
+                allocation: 2,
+            },
+            "admission",
+            vec![
+                (
+                    "a".into(),
+                    0,
+                    1,
+                    content_hash(&DocumentMutation::Index {
+                        doc_id: "a".into(),
+                        source: json!({"value": 1}),
+                    }),
+                ),
+                (
+                    "b".into(),
+                    1,
+                    1,
+                    content_hash(&DocumentMutation::Index {
+                        doc_id: "b".into(),
+                        source: json!({"value": 2}),
+                    }),
+                ),
+            ],
+        );
+        session.finish(false).unwrap();
+
+        let records = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "trace_start",
+                "recovery_snapshot",
+                "recovery_started",
+                "recovery_installed",
+                "recovery_barrier",
+                "recovery_membership",
+                "copy_state",
+                "trace_end",
+            ]
+        );
+        assert_eq!(records[1]["processed_seqs"], json!([0, 1]));
+        assert_eq!(records[1]["documents"][0]["doc"], "a");
+        assert_eq!(records[1]["documents"][1]["doc"], "b");
     }
 }

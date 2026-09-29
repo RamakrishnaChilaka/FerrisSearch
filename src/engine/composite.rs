@@ -979,6 +979,11 @@ impl SearchEngine for CompositeEngine {
         self.text.vector_rebuild_documents()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        self.text.protocol_trace_processed_sequences()
+    }
+
     fn refresh(&self) -> Result<()> {
         let _vector_recovery = self
             .vector_recovery

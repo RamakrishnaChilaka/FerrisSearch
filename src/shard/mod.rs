@@ -3122,6 +3122,55 @@ impl ShardManager {
         index_uuid: String,
         allocation_id: AllocationId,
     ) -> Result<PathBuf> {
+        self.prepare_peer_recovery_target_blocking_with_observer(
+            index,
+            shard_id,
+            index_uuid,
+            allocation_id,
+            || {},
+        )
+        .await
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) async fn prepare_peer_recovery_target_blocking_traced(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+        trace: crate::protocol_trace::RecoveryTraceContext,
+    ) -> Result<PathBuf> {
+        self.prepare_peer_recovery_target_blocking_with_observer(
+            index,
+            shard_id,
+            index_uuid,
+            allocation_id,
+            move || {
+                crate::protocol_trace::record_recovery_started(
+                    &trace.source_node,
+                    &trace.target_node,
+                    &trace.index_uuid,
+                    trace.shard,
+                    trace.allocation,
+                    &trace.session_id,
+                );
+            },
+        )
+        .await
+    }
+
+    async fn prepare_peer_recovery_target_blocking_with_observer<F>(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+        observer: F,
+    ) -> Result<PathBuf>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             if allocation_id == 0 {
@@ -3177,16 +3226,50 @@ impl ShardManager {
             file.sync_all()?;
             std::fs::rename(&temporary_path, &marker_path)?;
             std::fs::File::open(&shard_dir)?.sync_all()?;
+            observer();
             Ok(shard_dir)
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking peer recovery target preparation failed: {e}"))?
     }
 
+    #[cfg_attr(feature = "protocol-trace", allow(dead_code))]
     pub(crate) async fn finalize_peer_recovery_target_blocking(
         self: &Arc<Self>,
         install: PeerRecoveryTargetInstall,
     ) -> Result<Arc<dyn SearchEngine>> {
+        self.finalize_peer_recovery_target_blocking_with_observer(install, || {})
+            .await
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) async fn finalize_peer_recovery_target_blocking_traced(
+        self: &Arc<Self>,
+        install: PeerRecoveryTargetInstall,
+        trace: crate::protocol_trace::RecoveryTraceContext,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        self.finalize_peer_recovery_target_blocking_with_observer(install, move || {
+            crate::protocol_trace::record_recovery_installed(
+                &trace.source_node,
+                &trace.target_node,
+                &trace.index_uuid,
+                trace.shard,
+                trace.allocation,
+                &trace.session_id,
+                trace.snapshot_next_seq_no,
+            );
+        })
+        .await
+    }
+
+    async fn finalize_peer_recovery_target_blocking_with_observer<F>(
+        self: &Arc<Self>,
+        install: PeerRecoveryTargetInstall,
+        observer: F,
+    ) -> Result<Arc<dyn SearchEngine>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let PeerRecoveryTargetInstall {
@@ -3304,6 +3387,7 @@ impl ShardManager {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key, dynamic_engine.clone());
+            observer();
             Ok(dynamic_engine)
         })
         .await
