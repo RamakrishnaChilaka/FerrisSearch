@@ -41,6 +41,10 @@ RecoveryAction(action) ==
     /\ action
     /\ UNCHANGED <<ApplySafetyVars, FaultVars, D1Vars>>
 
+FaultAction(action) ==
+    /\ action
+    /\ UNCHANGED <<ApplySafetyVars, D1Vars>>
+
 RecoveryStable(action) ==
     /\ action
     /\ UNCHANGED
@@ -174,11 +178,16 @@ ReplicaApplyEvent(event) ==
     /\ maxSeqNext'[event.node] = event.maxNext
 
 ReplicaResultEvent(event) ==
-    /\ HasAck(event.writeId, event.peer)
-    /\ replicaResponsePersisted[event.writeId][event.peer]
-          <= event.resultPersistedNext
-    /\ event.resultPersistedNext <= persistedNext[event.peer]
-    /\ D1DeliverAck(AckFor(event.writeId, event.peer))
+    /\ CASE event.outcome = "acknowledged" ->
+              /\ HasAck(event.writeId, event.peer)
+              /\ replicaResponsePersisted[event.writeId][event.peer]
+                    <= event.resultPersistedNext
+              /\ event.resultPersistedNext <= persistedNext[event.peer]
+              /\ D1DeliverAck(AckFor(event.writeId, event.peer))
+       [] event.outcome \in {"dropped", "timeout"} ->
+              /\ HasMessage(event.writeId, event.peer)
+              /\ FaultAction(LoseMsg(MessageFor(event.writeId, event.peer)))
+       [] OTHER -> FALSE
 
 ClientResultEvent(event) ==
     /\ event.outcome = "acknowledged"

@@ -23,6 +23,9 @@ VARIABLES
     persistedProcessedNext,
     persistedCommittedNext,
     persistedMaxSeqNext,
+    d1FenceTerm,
+    fenceMaxSeqNext,
+    processedTerm,
     docSeqNext,
     tombstoneSeqNext,
     tombstoneOld,
@@ -44,7 +47,8 @@ VARIABLES
 D1Vars ==
     <<walOrder, processedSeqs, processedNext, persistedSeqs, persistedNext,
       maxSeqNext, persistedProcessedNext, persistedCommittedNext,
-      persistedMaxSeqNext, docSeqNext,
+      persistedMaxSeqNext, d1FenceTerm, fenceMaxSeqNext, processedTerm,
+      docSeqNext,
       tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
       persistedDocSeqNext, persistedTombstoneSeqNext, replaying, replayPos,
       replayBoundary, replayComplete, replaySafe, commitDone, crashDone,
@@ -66,6 +70,109 @@ D1FenceMaxNext(node) ==
     IF maxSeqNext[node] > nextSeq[node]
     THEN maxSeqNext[node]
     ELSE nextSeq[node]
+
+D1TermCollision(node, term, sequenceNumber) ==
+    /\ term = d1FenceTerm[node]
+    /\ sequenceNumber < fenceMaxSeqNext[node]
+    /\ sequenceNumber \in processedSeqs[node]
+    /\ processedTerm[node][sequenceNumber] < term
+
+D1ObserveFence(node, term, capturedMaxNext) ==
+    /\ node \in Nodes
+    /\ term > 0
+    /\ capturedMaxNext = D1FenceMaxNext(node)
+    /\ term >= d1FenceTerm[node]
+    /\ d1FenceTerm' = [d1FenceTerm EXCEPT ![node] = term]
+    /\ fenceMaxSeqNext' =
+          [fenceMaxSeqNext EXCEPT
+              ![node] =
+                  IF term > d1FenceTerm[node] THEN capturedMaxNext ELSE @]
+    /\ replicaFence' =
+          [replicaFence EXCEPT ![node] = IF @ < term THEN term ELSE @]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![node] = IF @ < term THEN term ELSE @]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
+            acked, failed, promotionSafe, admissionSafe, ackMembershipSafe,
+            ApplySafetyVars, termMonotonic, walOrder, processedSeqs,
+            processedNext, persistedSeqs, persistedNext, maxSeqNext,
+            persistedProcessedNext, persistedCommittedNext,
+            persistedMaxSeqNext, processedTerm, docSeqNext,
+            tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
+            persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
+            replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
+            crashDone, duplicateSent, tombstonePruneSafe, pruneDone,
+            PeerRecoveryVars, FaultVars>>
+
+D1PromotionGaps(node) ==
+    {seq \in D1Seqs :
+        /\ seq < maxSeqNext[node]
+        /\ seq \notin processedSeqs[node]}
+
+D1WalSequences(node) ==
+    {writeSeq[walOrder[node][position]] :
+        position \in 1..Len(walOrder[node])}
+
+\* HotEngine::prepare_primary_activation replays the complete local WAL, then
+\* appends and syncs one NoOp for every remaining gap through the local maximum.
+\* NoOps have no client write identity in this model, so their WAL records are
+\* abstracted as durable processed sequence identities rather than walOrder
+\* entries.  The exact-gap and no-local-WAL-entry guards preserve the relevant
+\* sequence uniqueness and replay-before-fill requirements.
+D1FillPromotionNoOps(node, filledSeqs) ==
+    LET nextProcessed == processedSeqs[node] \cup filledSeqs
+        nextPersisted == persistedSeqs[node] \cup filledSeqs
+    IN
+    /\ D1Fixed
+    /\ node = routing.primary
+    /\ alive[node]
+    /\ copyExists[node]
+    /\ CopyAssignmentValid(node)
+    /\ ~BlocksLiveReplication(node)
+    /\ ~replaying[node]
+    /\ views[node].primary = node
+    /\ views[node].term = routing.term
+    /\ views[node].initialized
+    /\ d1FenceTerm[node] = routing.term
+    /\ filledSeqs = D1PromotionGaps(node)
+    /\ filledSeqs \cap D1WalSequences(node) = {}
+    /\ processedSeqs' =
+          [processedSeqs EXCEPT ![node] = nextProcessed]
+    /\ processedNext' =
+          [processedNext EXCEPT ![node] = ContiguousNext(nextProcessed)]
+    /\ persistedSeqs' =
+          [persistedSeqs EXCEPT ![node] = nextPersisted]
+    /\ persistedNext' =
+          [persistedNext EXCEPT ![node] = ContiguousNext(nextPersisted)]
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![node] =
+                  [seq \in D1Seqs |->
+                      IF seq \in filledSeqs
+                      THEN routing.term
+                      ELSE processedTerm[node][seq]]]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
+            messages, sharedHolders, exclusiveHolder, acked, failed,
+            promotionSafe, admissionSafe, ackMembershipSafe, ApplySafetyVars,
+            termMonotonic, walOrder, maxSeqNext, persistedProcessedNext,
+            persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
+            fenceMaxSeqNext, docSeqNext, tombstoneSeqNext, tombstoneOld,
+            persistedOps, persistedDocValue, persistedDocSeqNext,
+            persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
+            replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
+            tombstonePruneSafe, pruneDone, PeerRecoveryVars, FaultVars>>
 
 ReplicaAckFor(message) ==
     Message("ReplicaAck", message.write, message.to, message.from, message.seq,
@@ -102,6 +209,12 @@ D1DataInit ==
     /\ persistedProcessedNext = [node \in Nodes |-> 0]
     /\ persistedCommittedNext = [node \in Nodes |-> 0]
     /\ persistedMaxSeqNext = [node \in Nodes |-> 0]
+    /\ d1FenceTerm =
+          [node \in Nodes |->
+              IF InitialInitialized /\ ReplicaFencing THEN 1 ELSE 0]
+    /\ fenceMaxSeqNext = [node \in Nodes |-> 0]
+    /\ processedTerm =
+          [node \in Nodes |-> [seq \in D1Seqs |-> 0]]
     /\ docSeqNext = [node \in Nodes |-> [doc \in Docs |-> 0]]
     /\ tombstoneSeqNext = [node \in Nodes |-> [doc \in Docs |-> 0]]
     /\ tombstoneOld = [node \in Nodes |-> {}]
@@ -147,6 +260,9 @@ D1TypeOK ==
     /\ persistedProcessedNext \in [Nodes -> 0..MaxWrites]
     /\ persistedCommittedNext \in [Nodes -> 0..MaxWrites]
     /\ persistedMaxSeqNext \in [Nodes -> 0..MaxWrites]
+    /\ d1FenceTerm \in [Nodes -> 0..MaxTerm]
+    /\ fenceMaxSeqNext \in [Nodes -> 0..MaxWrites]
+    /\ processedTerm \in [Nodes -> [D1Seqs -> 0..MaxTerm]]
     /\ docSeqNext \in [Nodes -> [Docs -> 0..MaxWrites]]
     /\ tombstoneSeqNext \in [Nodes -> [Docs -> 0..MaxWrites]]
     /\ tombstoneOld \in [Nodes -> SUBSET Docs]
@@ -200,6 +316,9 @@ D1PrimaryAccept(writeId) ==
               ![primaryNode] = ContiguousNext(nextPersisted)]
     /\ maxSeqNext' =
           [maxSeqNext EXCEPT ![primaryNode] = sequenceNumber + 1]
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![primaryNode][sequenceNumber] = views[primaryNode].term]
     /\ docSeqNext' =
           [docSeqNext EXCEPT ![primaryNode][doc] = sequenceNumber + 1]
     /\ tombstoneSeqNext' =
@@ -217,7 +336,8 @@ D1PrimaryAccept(writeId) ==
             persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
             tombstonePruneSafe, pruneDone, copyAllocation, copyUuid,
-            replicaFence, durableReplicaFence, ApplySafetyVars,
+            replicaFence, durableReplicaFence, d1FenceTerm,
+            fenceMaxSeqNext, ApplySafetyVars,
             PeerRecoveryVars, FaultVars>>
 
 D1ReplicaMessageEnabled(message) ==
@@ -288,6 +408,9 @@ D1HistoricalReplicaApply(message) ==
           [maxSeqNext EXCEPT
               ![replica] =
                   IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![replica][sequenceNumber] = message.term]
     /\ docSeqNext' =
           [docSeqNext EXCEPT ![replica][doc] = sequenceNumber + 1]
     /\ tombstoneSeqNext' =
@@ -311,7 +434,8 @@ D1HistoricalReplicaApply(message) ==
             persistedDocValue, persistedDocSeqNext,
             persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
-            tombstonePruneSafe, pruneDone, PeerRecoveryVars, FaultVars>>
+            tombstonePruneSafe, pruneDone, d1FenceTerm,
+            fenceMaxSeqNext, PeerRecoveryVars, FaultVars>>
 
 \* D1 planner: a previously unprocessed sequence is always retained in the
 \* WAL and checkpoint tracker, but only a per-document newer operation mutates
@@ -332,6 +456,7 @@ D1FixedReplicaProcess(message) ==
     /\ D1Fixed
     /\ D1ReplicaMessageBase(message)
     /\ sequenceNumber \notin processedSeqs[replica]
+    /\ ~D1TermCollision(replica, message.term, sequenceNumber)
     /\ messages' = (messages \ {message}) \cup {response}
     /\ ops' = [ops EXCEPT ![replica] = @ \cup {writeId}]
     /\ durableOps' = [durableOps EXCEPT ![replica] = @ \cup {writeId}]
@@ -371,6 +496,9 @@ D1FixedReplicaProcess(message) ==
           [maxSeqNext EXCEPT
               ![replica] =
                   IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![replica][sequenceNumber] = message.term]
     /\ docSeqNext' =
           IF newer
           THEN [docSeqNext EXCEPT
@@ -401,7 +529,8 @@ D1FixedReplicaProcess(message) ==
             persistedDocValue, persistedDocSeqNext,
             persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
-            tombstonePruneSafe, pruneDone, PeerRecoveryVars, FaultVars>>
+            tombstonePruneSafe, pruneDone, d1FenceTerm,
+            fenceMaxSeqNext, PeerRecoveryVars, FaultVars>>
 
 \* D1 redelivery: acknowledge without a second WAL entry or engine mutation.
 D1FixedReplicaRedelivery(message) ==
@@ -411,6 +540,7 @@ D1FixedReplicaRedelivery(message) ==
     /\ D1Fixed
     /\ D1ReplicaMessageBase(message)
     /\ message.seq \in processedSeqs[replica]
+    /\ ~D1TermCollision(replica, message.term, message.seq)
     /\ messages' = (messages \ {message}) \cup {response}
     /\ replicaFence' =
           [replicaFence EXCEPT
@@ -436,6 +566,30 @@ D1FixedReplicaRedelivery(message) ==
             ApplySafetyVars, termMonotonic, D1Vars, PeerRecoveryVars,
             FaultVars>>
 
+D1FixedReplicaCollision(message) ==
+    LET replica == message.to
+        response ==
+            Message("ReplicaNack", message.write, replica, message.from,
+                    message.seq, epoch[replica], message.fromEpoch,
+                    message.term, message.indexUuid,
+                    message.targetAllocation)
+    IN
+    /\ D1Fixed
+    /\ D1ReplicaMessageEnabled(message)
+    /\ D1TermCollision(replica, message.term, message.seq)
+    /\ messages' = (messages \ {message}) \cup {response}
+    /\ copyMode' = [copyMode EXCEPT ![replica] = "ApplyFailed"]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, sharedHolders,
+            exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
+            ackMembershipSafe, ApplySafetyVars, termMonotonic, D1Vars,
+            PeerRecoveryVars, FaultVars>>
+
 D1DocSeqNextFor(writeSet) ==
     [doc \in Docs |->
         LET writeId == LatestWriteForDoc(writeSet, doc)
@@ -455,6 +609,13 @@ D1InstallRecoverySnapshot(target) ==
         snapshotDocValue == RebuiltDocValue(snapshot)
         snapshotDocSeqNext == D1DocSeqNextFor(snapshot)
         snapshotTombstoneSeqNext == D1TombstoneSeqNextFor(snapshot)
+        snapshotProcessedTerm ==
+            [seq \in D1Seqs |->
+                LET matching ==
+                    {writeId \in snapshot : writeSeq[writeId] = seq}
+                IN IF matching = {}
+                   THEN 0
+                   ELSE writeTerm[CHOOSE writeId \in matching : TRUE]]
     IN
     /\ D1Fixed
     /\ InstallSnapshot(target)
@@ -474,6 +635,12 @@ D1InstallRecoverySnapshot(target) ==
               ![target] = ContiguousNext(sequences)]
     /\ persistedMaxSeqNext' =
           [persistedMaxSeqNext EXCEPT ![target] = boundary]
+    /\ d1FenceTerm' =
+          [d1FenceTerm EXCEPT ![target] = sessionTerm[target]]
+    /\ fenceMaxSeqNext' =
+          [fenceMaxSeqNext EXCEPT ![target] = boundary]
+    /\ processedTerm' =
+          [processedTerm EXCEPT ![target] = snapshotProcessedTerm]
     /\ docSeqNext' =
           [docSeqNext EXCEPT ![target] = snapshotDocSeqNext]
     /\ tombstoneSeqNext' =
@@ -541,6 +708,9 @@ D1FixedRecoveryApply(target) ==
           [maxSeqNext EXCEPT
               ![target] =
                   IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![target][sequenceNumber] = writeTerm[writeId]]
     /\ docSeqNext' =
           IF newer
           THEN [docSeqNext EXCEPT
@@ -575,7 +745,8 @@ D1FixedRecoveryApply(target) ==
             persistedDocValue, persistedDocSeqNext,
             persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
-            tombstonePruneSafe, pruneDone, recoveryAttempts, sessionPhase,
+            tombstonePruneSafe, pruneDone, d1FenceTerm, fenceMaxSeqNext,
+            recoveryAttempts, sessionPhase,
             sessionSource, sessionSourceEpoch, sessionTerm,
             sessionAllocation, sessionBoundary, sessionHead, sessionSnapshot,
             sessionFinalizePreparing, sessionMarkSubmitted,
@@ -619,7 +790,8 @@ D1Redeliver(writeId) ==
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
             walOrder, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
-            persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
+            persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
             replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
@@ -660,7 +832,8 @@ D1PersistBoundary(node, boundary, capturedPersisted, capturedMax, capturedOps,
             termMonotonic, walOrder, processedSeqs, processedNext,
             persistedSeqs, persistedNext, maxSeqNext,
             docSeqNext, tombstoneSeqNext, tombstoneOld, replaying, replayPos,
-            replayBoundary, replayComplete, replaySafe, crashDone,
+            replayBoundary, replayComplete, replaySafe, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, crashDone,
             duplicateSent, tombstonePruneSafe, pruneDone, PeerRecoveryVars,
             FaultVars>>
 
@@ -694,7 +867,8 @@ D1AgeTombstone ==
     /\ UNCHANGED
           <<vars, walOrder, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
-            persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
+            persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, docSeqNext,
             tombstoneSeqNext, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
             replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
@@ -718,7 +892,8 @@ D1PruneTombstone ==
     /\ UNCHANGED
           <<vars, walOrder, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
-            persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
+            persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, docSeqNext,
             persistedOps, persistedDocValue, persistedDocSeqNext,
             persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent>>
@@ -749,8 +924,8 @@ D1CrashReplica ==
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
             replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
-            duplicateSent, tombstonePruneSafe, pruneDone, PeerRecoveryVars,
-            FaultVars>>
+            duplicateSent, tombstonePruneSafe, pruneDone, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, PeerRecoveryVars, FaultVars>>
 
 D1CrashCopy(node) ==
     /\ node \in Nodes
@@ -802,6 +977,11 @@ D1RestartCopy(node) ==
           [persistedNext EXCEPT ![node] = persistedBoundary]
     /\ maxSeqNext' =
           [maxSeqNext EXCEPT ![node] = persistedMaxSeqNext[node]]
+    /\ d1FenceTerm' =
+          [d1FenceTerm EXCEPT ![node] = durableReplicaFence[node]]
+    /\ fenceMaxSeqNext' = fenceMaxSeqNext
+    /\ processedTerm' =
+          [processedTerm EXCEPT ![node] = [seq \in D1Seqs |-> 0]]
     /\ docSeqNext' =
           [docSeqNext EXCEPT ![node] = D1RestoredDocSeqNext(node)]
     /\ tombstoneSeqNext' =
@@ -847,7 +1027,8 @@ D1ReplaySkipAt(node) ==
             persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
-            replayBoundary, replayComplete, replaySafe, commitDone, crashDone,
+            replayBoundary, replayComplete, replaySafe, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, commitDone, crashDone,
             duplicateSent, tombstonePruneSafe, pruneDone>>
 
 D1ReplaySkip ==
@@ -888,6 +1069,9 @@ D1HistoricalReplayApplyAt(node) ==
           [maxSeqNext EXCEPT
               ![node] =
                   IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![node][sequenceNumber] = writeTerm[writeId]]
     /\ docSeqNext' =
           [docSeqNext EXCEPT
               ![node][doc] = sequenceNumber + 1]
@@ -914,7 +1098,8 @@ D1HistoricalReplayApplyAt(node) ==
             persistedDocValue, persistedDocSeqNext,
             persistedTombstoneSeqNext, replaying, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
-            tombstonePruneSafe, pruneDone, PeerRecoveryVars, FaultVars>>
+            tombstonePruneSafe, pruneDone, d1FenceTerm,
+            fenceMaxSeqNext, PeerRecoveryVars, FaultVars>>
 
 D1HistoricalReplayApply ==
     D1HistoricalReplayApplyAt(ReplicaNode)
@@ -967,6 +1152,11 @@ D1FixedReplayApplyAt(node) ==
           [maxSeqNext EXCEPT
               ![node] =
                   IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ processedTerm' =
+          IF redelivery
+          THEN processedTerm
+          ELSE [processedTerm EXCEPT
+                    ![node][sequenceNumber] = writeTerm[writeId]]
     /\ docSeqNext' =
           IF ~redelivery /\ newer
           THEN [docSeqNext EXCEPT
@@ -999,7 +1189,8 @@ D1FixedReplayApplyAt(node) ==
             persistedDocValue, persistedDocSeqNext,
             persistedTombstoneSeqNext, replaying, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
-            tombstonePruneSafe, pruneDone, PeerRecoveryVars, FaultVars>>
+            tombstonePruneSafe, pruneDone, d1FenceTerm,
+            fenceMaxSeqNext, PeerRecoveryVars, FaultVars>>
 
 D1FixedReplayApply ==
     D1FixedReplayApplyAt(ReplicaNode)
@@ -1025,7 +1216,8 @@ D1FinishReplayAt(node) ==
             persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replayPos,
-            replayBoundary, commitDone, crashDone, duplicateSent,
+            replayBoundary, d1FenceTerm, fenceMaxSeqNext, processedTerm,
+            commitDone, crashDone, duplicateSent,
             tombstonePruneSafe, pruneDone>>
 
 D1FinishReplay ==
@@ -1053,7 +1245,8 @@ D1FailReplayAt(node) ==
             persistedMaxSeqNext, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replayPos,
-            replayBoundary, commitDone, crashDone, duplicateSent,
+            replayBoundary, d1FenceTerm, fenceMaxSeqNext, processedTerm,
+            commitDone, crashDone, duplicateSent,
             tombstonePruneSafe, pruneDone, PeerRecoveryVars, FaultVars>>
 
 D1RecordTruncation(node, boundary) ==
@@ -1346,8 +1539,8 @@ D1TruncateToProcessedCheckpoint ==
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
             replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
-            crashDone, duplicateSent, tombstonePruneSafe, PeerRecoveryVars,
-            FaultVars>>
+            crashDone, duplicateSent, tombstonePruneSafe, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, PeerRecoveryVars, FaultVars>>
 
 D1NoTombstoneCrash ==
     /\ commitDone
@@ -1376,8 +1569,8 @@ D1NoTombstoneCrash ==
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
             replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
-            duplicateSent, tombstonePruneSafe, pruneDone, PeerRecoveryVars,
-            FaultVars>>
+            duplicateSent, tombstonePruneSafe, pruneDone, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, PeerRecoveryVars, FaultVars>>
 
 D1RestartWithoutDurableTombstone ==
     LET boundary == persistedProcessedNext[ReplicaNode]
@@ -1423,6 +1616,13 @@ D1RestartWithoutDurableTombstone ==
     /\ maxSeqNext' =
           [maxSeqNext EXCEPT
               ![ReplicaNode] = persistedMaxSeqNext[ReplicaNode]]
+    /\ d1FenceTerm' =
+          [d1FenceTerm EXCEPT
+              ![ReplicaNode] = durableReplicaFence[ReplicaNode]]
+    /\ fenceMaxSeqNext' = fenceMaxSeqNext
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![ReplicaNode] = [seq \in D1Seqs |-> 0]]
     /\ docSeqNext' = [docSeqNext EXCEPT ![ReplicaNode] = restoredSeqs]
     /\ tombstoneSeqNext' =
           [tombstoneSeqNext EXCEPT
@@ -1478,8 +1678,8 @@ D1SendLateOlderIndex ==
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
             replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
-            crashDone, tombstonePruneSafe, pruneDone, PeerRecoveryVars,
-            FaultVars>>
+            crashDone, tombstonePruneSafe, pruneDone, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, PeerRecoveryVars, FaultVars>>
 
 D1NoDurableTombstoneAtRestart ==
     /\ replaying[ReplicaNode]

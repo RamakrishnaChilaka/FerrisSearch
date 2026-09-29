@@ -110,6 +110,12 @@ case "$PROFILE" in
         TYPE_INVARIANT="TraceTypeOK"
         SAFETY_INVARIANT="TraceCoreSafety"
         ;;
+    d1-combined)
+        TRACE_MODULE="TraceD1"
+        ACCEPT_INVARIANT="TraceNotAccepted"
+        TYPE_INVARIANT="TraceTypeOK"
+        SAFETY_INVARIANT="TraceCoreSafety"
+        ;;
     d1-authority)
         TRACE_MODULE="TraceD1Authority"
         ACCEPT_INVARIANT="TraceAuthorityNotAccepted"
@@ -157,7 +163,6 @@ set +e
         -deadlock \
         -difftrace \
         -workers 1 \
-        -dump "$RUN_DIR/states.dump" \
         -metadir "$RUN_DIR/states" \
         -config TraceD1.cfg \
         "$TRACE_MODULE.tla"
@@ -211,6 +216,27 @@ PY
     echo "Trace rejected at schema step $failed_step (event ${failed_event:-trace_end}): $TRACE_PATH" >&2
 }
 
+generate_diagnostic_dump() {
+    mkdir -p "$RUN_DIR/diagnostic-states"
+    set +e
+    (
+        cd "$RUN_DIR"
+        timeout "${TIMEOUT_SECONDS}s" \
+            java \
+            -Djava.io.tmpdir="$RUN_DIR/java-tmp" \
+            -XX:+UseParallelGC \
+            -cp "$JAR" \
+            tlc2.TLC \
+            -deadlock \
+            -workers 1 \
+            -dump "$RUN_DIR/states.dump" \
+            -metadir "$RUN_DIR/diagnostic-states" \
+            -config TraceD1.cfg \
+            "$TRACE_MODULE.tla"
+    ) >"$RUN_DIR/diagnostic.log" 2>&1
+    set -e
+}
+
 if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
     ! grep -Fq "Invariant $TYPE_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
     ! grep -Fq "Invariant $SAFETY_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
@@ -219,6 +245,7 @@ if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
 fi
 
 if grep -Fq "Invariant $SAFETY_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
+    generate_diagnostic_dump
     max_position=$(
         sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
             sort -n |
@@ -231,6 +258,7 @@ fi
 if [[ $status -eq 0 ]] &&
     ! grep -Fq "Error:" "$RUN_DIR/tlc.log" &&
     grep -Fq "Model checking completed. No error has been found." "$RUN_DIR/tlc.log"; then
+    generate_diagnostic_dump
     max_position=$(
         sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
             sort -n |

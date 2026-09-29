@@ -119,11 +119,15 @@ run_valid b2c b2c-bulk-faithful-order-item-local.jsonl
 run_valid b3 b3-bulk-receipts-first-batch-final.jsonl
 run_valid b3c b3c-bulk-receipts-first-item-local.jsonl
 run_invalid a2-overstated-response invalid-replica-response-overstates-persisted.jsonl 15 replica_result
-run_invalid v1 v1-failover-after-replicated-write.jsonl 5 replica_received
+run_valid v1 v1-failover-after-replicated-write.jsonl
 run_invalid v2 v2-recovery-duplicate-catchup-redelivery.jsonl 33 operation_processed
 run_invalid v4 v4-nonquiescent-without-copy-state.jsonl 19 trace_end
-run_invalid v5 v5-collision-then-new-write.jsonl 8 client_write_routed
+run_invalid v5 v5-collision-then-new-write.jsonl 1 wal_appended
 run_invalid v6 v6-pruned-tombstone-absent.jsonl 20 copy_state
 run_invalid v9 v9-trace-sets-hidden-budget.jsonl 0 trace_start
+run_valid combined-16-write valid-combined-two-term-16-writes.jsonl
+run_invalid combined-arrival invalid-combined-arrival-order.jsonl 51 operation_processed
+run_invalid combined-collision invalid-combined-collision-redelivery.jsonl 188 operation_processed
+run_invalid combined-rollback invalid-combined-rollback-after-promotion.jsonl 217 copy_state
 
 echo "D1 schema-v3 trace validator self-tests passed."

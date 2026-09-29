@@ -225,6 +225,15 @@ EVENT_FIELDS = {
         "allocation",
         "term",
     },
+    "promotion_noop_fill": {
+        "node",
+        "index_uuid",
+        "shard",
+        "allocation",
+        "term",
+        "filled_seqs",
+        "checkpoints",
+    },
     "in_sync_removed": {
         "emitter",
         "index_uuid",
@@ -561,7 +570,12 @@ def validate_event(
     elif event == "replica_result":
         if value["replica"] not in nodes:
             fail(line, "replica is not declared")
-        if value["outcome"] not in {"acknowledged", "failed"}:
+        if value["outcome"] not in {
+            "acknowledged",
+            "failed",
+            "dropped",
+            "timeout",
+        }:
             fail(line, "replica_result outcome is invalid")
         integer(
             value["persisted_checkpoint"],
@@ -663,6 +677,16 @@ def validate_event(
             fail(line, "routing promotion in_sync must be an array")
     elif event == "primary_activated":
         integer(value["term"], line, "activation term", positive=True)
+    elif event == "promotion_noop_fill":
+        integer(value["term"], line, "noop-fill term", positive=True)
+        if (
+            not isinstance(value["filled_seqs"], list)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int) or item < 0
+                for item in value["filled_seqs"]
+            )
+        ):
+            fail(line, "filled_seqs must be non-negative integers")
     elif event == "in_sync_removed":
         if value["emitter"] not in nodes or value["removed_node"] not in nodes:
             fail(line, "in-sync removal nodes are not declared")
@@ -740,21 +764,45 @@ def load_trace(path: Path) -> LoadedTrace:
         for line, record in enumerate(records[1:-1], 2)
     ]
     kinds = {event["event"] for event in events}
-    if kinds & {
+    has_recovery = bool(kinds & {
         "recovery_snapshot",
         "recovery_started",
         "recovery_installed",
         "recovery_barrier",
         "recovery_membership",
-    }:
-        profile = "d1-recovery"
-    elif "in_sync_removed" in kinds or any(
+    })
+    has_collision = "in_sync_removed" in kinds or any(
         event["event"] == "operation_processed"
         and event.get("outcome") == "collision"
         for event in events
-    ):
+    )
+    has_authority = bool(
+        kinds & {"routing_promoted", "primary_activated", "promotion_noop_fill"}
+    )
+    has_data = bool(
+        kinds
+        & {
+            "replica_received",
+            "replica_result",
+            "commit_captured",
+            "commit_persisted",
+            "node_restarted",
+            "replay_started",
+            "replay_entry",
+            "replay_finished",
+            "wal_truncated",
+        }
+    )
+    has_client_write = "client_write_routed" in kinds
+    if has_recovery:
+        profile = "d1-recovery"
+    elif has_collision and has_client_write:
+        profile = "d1-combined"
+    elif has_collision:
         profile = "d1-collision"
-    elif kinds & {"routing_promoted", "primary_activated"}:
+    elif has_authority and has_data:
+        profile = "d1-combined"
+    elif has_authority:
         profile = "d1-authority"
     else:
         profile = "d1-core"
@@ -791,6 +839,30 @@ def load_trace(path: Path) -> LoadedTrace:
             "operation_processed",
             "primary_replication_started",
             "client_result",
+            "copy_state",
+        },
+        "d1-combined": {
+            "client_write_routed",
+            "wal_appended",
+            "operation_processed",
+            "primary_replication_started",
+            "replica_received",
+            "replica_result",
+            "client_result",
+            "fence_persisted",
+            "commit_captured",
+            "commit_persisted",
+            "wal_truncated",
+            "node_crashed",
+            "node_restarted",
+            "replay_started",
+            "replay_entry",
+            "replay_finished",
+            "routing_view",
+            "routing_promoted",
+            "in_sync_removed",
+            "promotion_noop_fill",
+            "primary_activated",
             "copy_state",
         },
         "d1-collision": {
@@ -1052,12 +1124,18 @@ def load_trace(path: Path) -> LoadedTrace:
         elif kind == "routing_promoted":
             current_primary = event["new_primary"]
             available = set(event["in_sync"])
+            promoted_view = latest_views[event["emitter"]]
+            promoted_view["primary"] = event["new_primary"]
+            promoted_view["term"] = event["term"]
+            promoted_view["in_sync"] = set(event["in_sync"])
             if profile == "d1-collision":
                 available.add(current_primary)
         elif kind == "primary_activated":
             available.add(event["node"])
+            latest_views[event["node"]]["term"] = event["term"]
         elif kind == "in_sync_removed":
             available.discard(event["removed_node"])
+            latest_views[event["emitter"]]["in_sync"] = set(event["in_sync"])
         elif kind == "recovery_membership":
             if event["outcome"] == "admitted":
                 available.add(event["target_node"])
@@ -1328,7 +1406,13 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "snapshotNext": str(event.get("snapshot_next_seq_no", 0)),
             "barrierNext": str(event.get("barrier_next_seq_no", 0)),
             "observedProcessed": tla_set(
-                [str(item) for item in event.get("processed_seqs", [])]
+                [
+                    str(item)
+                    for item in event.get(
+                        "processed_seqs",
+                        event.get("filled_seqs", []),
+                    )
+                ]
             ),
             "snapshotDocValue": function(
                 "TraceDocs", "doc", snapshot_doc_value, "0"
@@ -1384,11 +1468,13 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
         for event in trace.events
     )
     max_raft_entries = max(raft_events + 1, 1)
+    max_pending_raft = 2 if raft_events else 0
     max_messages = max(6, max_writes * max(1, len(nodes_raw) - 1) * 2)
     max_view_lag = max(max_raft_entries, 2)
     validator_hidden_steps = {
         "d1-core": 6,
         "d1-authority": 10,
+        "d1-combined": 14,
         "d1-collision": 2,
         "d1-recovery": 10,
     }[trace.profile]
@@ -1406,6 +1492,7 @@ TraceDocs == {tla_set([doc[item] for item in docs_raw])}
 TraceInitialPrimary == {node[primary_raw]}
 TraceInitialInSync == {tla_set([node[item] for item in trace.start["shard_state"]["in_sync"]])}
 TraceQuiescent == {"TRUE" if trace.end["quiescent"] else "FALSE"}
+TraceCombined == {"TRUE" if trace.profile == "d1-combined" else "FALSE"}
 Trace == {trace_body}
 
 =============================================================================
@@ -1518,7 +1605,7 @@ INVARIANT TraceAuthorityNotAccepted
     MaxViewLag = {max_view_lag}
     MaxAllocationId = {max_allocations}
     MaxRaftEntries = {max_raft_entries}
-    MaxPendingRaft = 0
+    MaxPendingRaft = {max_pending_raft}
     FaultMode = "{d1_fault_mode}"
     InitialOutOfSync = {"TRUE" if len(trace.start["shard_state"]["in_sync"]) != len(nodes_raw) - 1 else "FALSE"}
     InitialInitialized = TRUE

@@ -130,6 +130,21 @@ CopyStateMatches(node, event) ==
               ELSE /\ writeSeq[writeId] = event.docSeqNext[doc] - 1
                    /\ writeTerm[writeId] = event.docTerm[doc]
 
+StableReplication(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            ApplySafetyVars, PeerRecoveryVars, FaultVars, D1Vars>>
+
+FenceChangingReplication(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars, D1Vars>>
+
+FaultAction(action) ==
+    /\ action
+    /\ UNCHANGED <<ApplySafetyVars, D1Vars>>
+
 ViewMatches(view, event) ==
     /\ view.primary = event.viewPrimary
     /\ view.term = event.viewTerm
@@ -214,6 +229,8 @@ ReplicaProcessEvent(event) ==
           /\ message.seq = event.seq
           /\ CASE event.outcome = "redelivery" ->
                     D1FixedReplicaRedelivery(message)
+             [] event.outcome = "collision" ->
+                    D1FixedReplicaCollision(message)
              [] event.outcome \in {"applied_newer", "stale", "noop"} ->
                     /\ D1FixedReplicaProcess(message)
                     /\ IF event.outcome = "applied_newer"
@@ -222,7 +239,9 @@ ReplicaProcessEvent(event) ==
                                THEN docValue'[event.node][event.doc] = beforeDoc
                                ELSE TRUE
              [] OTHER -> FALSE
-    /\ event.writeId \in durableOps'[event.node]
+    /\ IF event.outcome = "collision"
+          THEN TRUE
+          ELSE event.writeId \in durableOps'[event.node]
     /\ replicaResponsePersisted' =
           [replicaResponsePersisted EXCEPT
               ![event.writeId][event.node] = event.persistedNext]
@@ -236,8 +255,11 @@ ReplicaResultEvent(event) ==
               /\ D1DeliverAck(AckFor(event.writeId, event.peer))
        [] event.outcome = "failed" ->
               /\ HasNack(event.writeId, event.peer)
-              /\ DeliverReplicaNack(NackFor(event.writeId, event.peer))
-              /\ UNCHANGED D1Vars
+              /\ StableReplication(
+                    DeliverReplicaNack(NackFor(event.writeId, event.peer)))
+       [] event.outcome \in {"dropped", "timeout"} ->
+              /\ HasMessage(event.writeId, event.peer)
+              /\ FaultAction(LoseMsg(MessageFor(event.writeId, event.peer)))
        [] OTHER -> FALSE
     /\ IF event.outcome = "acknowledged"
           THEN /\ replicaResponsePersisted[event.writeId][event.peer]
@@ -251,9 +273,10 @@ ClientResultEvent(event) ==
     /\ CASE event.outcome = "acknowledged" ->
               D1PrimaryAck(event.writeId)
        [] event.outcome = "failed" ->
-              /\ \/ PrimaryFail(event.writeId)
-                 \/ PrimaryReject(event.writeId)
-              /\ UNCHANGED D1Vars
+              \/ StableReplication(PrimaryFail(event.writeId))
+              \/ StableReplication(PrimaryReject(event.writeId))
+                 \/ /\ writeStatus[event.writeId] = "Failed"
+                    /\ UNCHANGED d1vars
        [] OTHER -> FALSE
     /\ UNCHANGED AuxVars
 
@@ -366,14 +389,42 @@ CopyStateObservation(event) ==
 
 FenceObservation(event) ==
     /\ event.node \in Nodes
-    /\ event.term > durableReplicaFence[event.node]
-    /\ event.fenceMaxNext = D1FenceMaxNext(event.node)
-    /\ UNCHANGED d1vars
+    /\ D1ObserveFence(event.node, event.term, event.fenceMaxNext)
     /\ UNCHANGED AuxVars
 
 RoutingViewObservation(event) ==
     /\ ViewMatches(views[event.node], event)
     /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+PromotionObservation(event) ==
+    /\ TraceCombined
+    /\ routing.primary = event.newPrimary
+    /\ routing.term = event.term
+    /\ routing.inSync = event.viewInSync
+    /\ raftLeader = event.emitter
+    /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+InSyncRemovalObservation(event) ==
+    /\ TraceCombined
+    /\ event.removedNode \notin routing.inSync
+    /\ routing.inSync = event.viewInSync
+    /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+PromotionNoOpFillObservation(event) ==
+    /\ TraceCombined
+    /\ D1FillPromotionNoOps(event.node, event.observedProcessed)
+    /\ event.term = routing.term
+    /\ LiveCheckpointMatchesPrime(event.node, event)
+    /\ UNCHANGED AuxVars
+
+ActivationEvent(event) ==
+    /\ TraceCombined
+    /\ d1FenceTerm[event.node] = event.term
+    /\ FenceChangingReplication(ObserveActivation(event.node))
+    /\ activated'[event.node] = event.term
     /\ UNCHANGED AuxVars
 
 CoreEvent(event) ==
@@ -413,6 +464,14 @@ CoreEvent(event) ==
             FenceObservation(event)
       [] event.kind = "routing_view" ->
             RoutingViewObservation(event)
+      [] event.kind = "routing_promoted" ->
+            PromotionObservation(event)
+      [] event.kind = "in_sync_removed" ->
+            InSyncRemovalObservation(event)
+      [] event.kind = "promotion_noop_fill" ->
+            PromotionNoOpFillObservation(event)
+      [] event.kind = "primary_activated" ->
+            ActivationEvent(event)
       [] OTHER -> FALSE
 
 ConsumeEvent ==
@@ -426,9 +485,29 @@ ConsumeEvent ==
 
 \* Real unobserved D1 actions only.  These are bounded between observations.
 HiddenD1Action ==
-    \/ D1ScenarioAgeTombstone
-    \/ D1ScenarioPruneTombstone
-    \/ D1ScenarioRedeliver
+    \/ /\ ~TraceCombined
+       /\ D1ScenarioAgeTombstone
+    \/ /\ ~TraceCombined
+       /\ D1ScenarioPruneTombstone
+    \/ /\ ~TraceCombined
+       /\ D1ScenarioRedeliver
+    \/ /\ TraceCombined
+       /\ \E candidate \in Nodes : FaultAction(ElectLeader(candidate))
+    \/ /\ TraceCombined
+       /\ \E leader \in Nodes, node \in Nodes, candidate \in Nodes :
+              FaultAction(SuspectAndRemove(leader, node, candidate))
+    \/ /\ TraceCombined
+       /\ \E node \in Nodes, candidate \in Nodes \cup {NoNode} :
+              FaultAction(ReportShardCopyFailure(node, candidate))
+    \/ /\ TraceCombined
+       /\ \E command \in pendingRaft :
+              FenceChangingReplication(CommitRaft(command))
+    \/ /\ TraceCombined
+       /\ \E node \in Nodes :
+              FenceChangingReplication(DeliverView(node))
+    \/ /\ TraceCombined
+       /\ \E node \in Nodes :
+              StableReplication(ProposeActivate(node))
 
 HiddenStep ==
     /\ tracePos <= Len(Trace)
