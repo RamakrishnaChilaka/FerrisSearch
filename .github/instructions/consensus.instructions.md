@@ -78,6 +78,10 @@ inside the `state.*` helper they call.
 ### Snapshot
 - Format: JSON-serialized `ClusterState`
 - ID: `snap-{last_applied_index}`
+- Unsupported or unreadable snapshot state uses
+  `UnsupportedRaftFormatError` and tells the operator to "wipe the node data
+  directories and recreate the cluster". Never use the index-data remedy for
+  Raft state.
 
 ## Raft Config
 - heartbeat_interval: 1000ms
@@ -88,6 +92,8 @@ inside the `state.*` helper they call.
 - Backed by `redb` (embedded key-value store)
 - Persists to `{data_dir}/raft.db`
 - Survives process restarts
+- Unsupported or unreadable log entries use `UnsupportedRaftFormatError` with
+  the same wipe-and-recreate-cluster remedy as snapshots.
 - redb transactions are blocking; any async openraft storage method that touches the database must offload through a Tokio blocking-pool helper such as `run_blocking_io()` rather than lock/read/write inline on an async worker
 - Keep Raft heartbeats, vote handling, and other control-plane futures on Tokio; do not move them to rayon to compensate for blocking disk I/O
 

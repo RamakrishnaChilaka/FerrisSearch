@@ -65,7 +65,7 @@ impl DiskLogStore {
         serde_json::from_slice(bytes).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                crate::common::UnsupportedIndexFormatError::new(
+                crate::consensus::UnsupportedRaftFormatError::new(
                     "Raft log entry",
                     format!("cannot decode current command format: {error}"),
                 ),
@@ -411,7 +411,12 @@ mod tests {
         let bytes = serde_json::to_vec(&value).unwrap();
 
         let error = DiskLogStore::decode_log_entry(&bytes).unwrap_err();
-        assert!(error.to_string().contains("recreate the index"));
+        assert!(
+            error
+                .to_string()
+                .contains("wipe the node data directories and recreate the cluster")
+        );
+        assert!(!error.to_string().contains("recreate the index"));
     }
 
     #[tokio::test]

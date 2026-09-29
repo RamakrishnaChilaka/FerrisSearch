@@ -760,7 +760,7 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
         let new_state: ClusterState = serde_json::from_slice(&data).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                crate::common::UnsupportedIndexFormatError::new(
+                crate::consensus::UnsupportedRaftFormatError::new(
                     "Raft cluster-state snapshot",
                     format!("cannot decode current snapshot format: {error}"),
                 ),
@@ -769,7 +769,7 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
         if new_state.format_version != crate::cluster::state::CLUSTER_STATE_FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                crate::common::UnsupportedIndexFormatError::new(
+                crate::consensus::UnsupportedRaftFormatError::new(
                     "Raft cluster-state snapshot",
                     format!(
                         "version {} is not supported; expected {}",
@@ -2292,7 +2292,37 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert!(error.to_string().contains("recreate the index"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("wipe the node data directories and recreate the cluster")
+            );
+            assert!(!error.to_string().contains("recreate the index"));
+        });
+    }
+
+    #[test]
+    fn malformed_raft_snapshot_requires_cluster_recreation() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut sm = ClusterStateMachine::new("original".into());
+            let meta = SnapshotMeta {
+                last_log_id: None,
+                last_membership: StoredMembership::default(),
+                snapshot_id: "malformed".into(),
+            };
+
+            let error = sm
+                .install_snapshot(&meta, Cursor::new(b"{not-json".to_vec()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("wipe the node data directories and recreate the cluster")
+            );
+            assert!(!error.to_string().contains("recreate the index"));
         });
     }
 

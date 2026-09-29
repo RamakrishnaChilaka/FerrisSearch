@@ -119,8 +119,9 @@ architecture decision.
   manifest, snapshot, partial-aggregation, or WAL data with defaults.
 - **Pre-1.0 has no backward compatibility.** Do not add migration paths or
   compatibility shims for on-disk, WAL, Raft-log, or wire formats. Incompatible
-  old data fails closed with a clear error directing operators to recreate the
-  index.
+  shard and index data fails closed with clear recreate-the-index guidance.
+  Incompatible Raft logs and snapshots fail closed with the exact operator
+  remedy: "wipe the node data directories and recreate the cluster".
 - **Blocking disk and engine work stays off Tokio workers.** Use Tokio's
   blocking pool for lifecycle I/O and dedicated worker pools for steady-state
   search/write work. Keep Raft and control-plane futures on Tokio.

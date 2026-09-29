@@ -338,10 +338,11 @@ MaxRetryAllocationDecider-style exclusion policy and
 `index.allocation.max_retries` setting are deferred.
 
 FerrisSearch pre-1.0 does not migrate data or metadata from earlier builds.
-Existing indices, shard directories, WALs, manifests, copy identities,
-Raft logs/snapshots, and incompatible peer wire formats fail closed. Delete and
-recreate the index or cluster state, then reindex the source data; there is no
-rolling mixed-version compatibility path.
+Existing indices, shard directories, WALs, manifests, copy identities, Raft
+logs/snapshots, and incompatible peer wire formats fail closed. Recreate
+incompatible indices and reindex their source data. For incompatible Raft logs
+or snapshots, wipe the node data directories and recreate the cluster. There is
+no rolling mixed-version compatibility path.
 
 For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
 the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable
