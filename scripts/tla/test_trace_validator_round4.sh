@@ -5,49 +5,18 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 VALIDATOR="$ROOT_DIR/scripts/tla/validate_trace.sh"
 FIXTURES="$ROOT_DIR/specs/tla/trace/v4"
 TIMEOUT_SECONDS="${TLA_TRACE_ROUND4_TIMEOUT_SECONDS:-120}"
+TRACE_TEST_PREFIX="round4"
+TRACE_TEST_DEFAULT_TIMEOUT="$TIMEOUT_SECONDS"
 
-run_validator() {
-    env TLA_TRACE_TIMEOUT_SECONDS="$TIMEOUT_SECONDS" \
-        "$VALIDATOR" "$1"
-}
+source "$ROOT_DIR/scripts/tla/trace_test_runner.sh"
+trace_test_init
 
 run_valid() {
-    local label=$1
-    local trace=$2
-    local output
-    output=$(mktemp "${TMPDIR:-/tmp}/ferrissearch-trace-round4-valid.XXXXXX")
-    if ! run_validator "$FIXTURES/$trace" >"$output" 2>&1; then
-        cat "$output" >&2
-        rm -f -- "$output"
-        echo "Expected accepted round-4 trace: $label ($trace)" >&2
-        exit 1
-    fi
-    cat "$output"
-    rm -f -- "$output"
-    echo "round4 $label expected=accepted actual=accepted"
+    trace_test_add_valid "$@"
 }
 
 run_invalid() {
-    local label=$1
-    local trace=$2
-    local step=$3
-    local event=$4
-    local output
-    output=$(mktemp "${TMPDIR:-/tmp}/ferrissearch-trace-round4-invalid.XXXXXX")
-    set +e
-    run_validator "$FIXTURES/$trace" >"$output" 2>&1
-    status=$?
-    set -e
-    if [[ $status -ne 1 ]] ||
-        ! grep -Fq "Trace rejected at schema step $step (event $event)" "$output"; then
-        cat "$output" >&2
-        rm -f -- "$output"
-        echo "Expected round-4 rejection: $label ($trace)" >&2
-        exit 1
-    fi
-    cat "$output"
-    rm -f -- "$output"
-    echo "round4 $label expected=rejected actual=rejected step=$step event=$event"
+    trace_test_add_invalid "$@"
 }
 
 run_valid m4c m4c-stale-term-delivery-received-only.jsonl
@@ -62,4 +31,4 @@ run_valid m9 m9-replica-restarts-before-primary-reads-its-acks.jsonl
 run_valid m10 m10-promoted-primary-restart-replays-noop.jsonl
 run_invalid m10c m10c-promoted-primary-restart-without-noop-entry.jsonl 246 replay_entry
 
-echo "D1 trace-validator round-4 scenarios passed."
+trace_test_run_all "D1 trace-validator round-4 scenarios passed."

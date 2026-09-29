@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 VALIDATOR="$ROOT_DIR/scripts/tla/validate_trace.sh"
 FIXTURES="$ROOT_DIR/specs/tla/trace/v4"
+TRACE_TEST_PREFIX="review"
 
 export PYTHONDONTWRITEBYTECODE=1
 
@@ -11,88 +12,19 @@ python3 -m unittest discover \
     -s "$ROOT_DIR/scripts/tla/tests" \
     -p 'test_*.py'
 
+source "$ROOT_DIR/scripts/tla/trace_test_runner.sh"
+trace_test_init
+
 run_valid() {
-    local label=$1
-    local trace=$2
-    local timeout=${3:-}
-    local output
-    local -a command
-    output=$(mktemp "${TMPDIR:-/tmp}/ferrissearch-trace-valid.XXXXXX")
-    if [[ -n "$timeout" ]]; then
-        command=(env TLA_TRACE_TIMEOUT_SECONDS="$timeout" "$VALIDATOR" "$FIXTURES/$trace")
-    else
-        command=("$VALIDATOR" "$FIXTURES/$trace")
-    fi
-    if ! "${command[@]}" >"$output" 2>&1; then
-        cat "$output" >&2
-        rm -f -- "$output"
-        echo "Expected accepted trace: $label ($trace)" >&2
-        exit 1
-    fi
-    cat "$output"
-    rm -f -- "$output"
-    echo "review $label expected=accepted actual=accepted"
+    trace_test_add_valid "$@"
 }
 
 run_invalid() {
-    local label=$1
-    local trace=$2
-    local step=$3
-    local event=$4
-    local timeout=${5:-}
-    local output
-    output=$(mktemp "${TMPDIR:-/tmp}/ferrissearch-trace-invalid.XXXXXX")
-    set +e
-    if [[ -n "$timeout" ]]; then
-        env TLA_TRACE_TIMEOUT_SECONDS="$timeout" \
-            "$VALIDATOR" "$FIXTURES/$trace" >"$output" 2>&1
-    else
-        "$VALIDATOR" "$FIXTURES/$trace" >"$output" 2>&1
-    fi
-    status=$?
-    set -e
-    if [[ $status -eq 0 ]]; then
-        cat "$output" >&2
-        rm -f -- "$output"
-        echo "Expected rejected trace: $label ($trace)" >&2
-        exit 1
-    fi
-    if [[ $status -ne 1 ]]; then
-        cat "$output" >&2
-        rm -f -- "$output"
-        echo "Expected rejection, not inconclusive/error: $label ($trace)" >&2
-        exit 1
-    fi
-    if ! grep -Fq "Trace rejected at schema step $step (event $event)" "$output"; then
-        cat "$output" >&2
-        rm -f -- "$output"
-        echo "Trace $label did not fail at expected step $step ($event)" >&2
-        exit 1
-    fi
-    cat "$output"
-    rm -f -- "$output"
-    echo "review $label expected=rejected actual=rejected step=$step event=$event"
+    trace_test_add_invalid "$@"
 }
 
 run_inconclusive() {
-    local label=$1
-    local expected=$2
-    shift 2
-    local output
-    output=$(mktemp "${TMPDIR:-/tmp}/ferrissearch-trace-inconclusive.XXXXXX")
-    set +e
-    "$@" >"$output" 2>&1
-    status=$?
-    set -e
-    if [[ $status -ne 3 ]] || ! grep -Fq "INCONCLUSIVE: $expected" "$output"; then
-        cat "$output" >&2
-        rm -f -- "$output"
-        echo "Expected inconclusive result: $label" >&2
-        exit 1
-    fi
-    cat "$output"
-    rm -f -- "$output"
-    echo "review $label expected=inconclusive actual=inconclusive"
+    trace_test_add_inconclusive "$@"
 }
 
 # Baseline accepted traces for each exact composition.
@@ -145,8 +77,6 @@ run_invalid n7 n7-core-persist-without-capture.jsonl 16 commit_persisted
 run_valid n8 n8-collision-at-seq-12.jsonl
 run_invalid n9 n9-no-copy-behind-safety.jsonl 16 operation_processed
 run_invalid n10 n10-persisted-checkpoint-mismatch.jsonl 16 operation_processed
-TLA2TOOLS_JAR="${TLA2TOOLS_JAR:-}" "$ROOT_DIR/scripts/tla/check.sh" d1-trace-actions
-echo "review n11 expected=accepted actual=accepted"
 run_valid n12 valid-replay-failed-unavailable.jsonl
 run_valid n13 n13-primary-restart-replay.jsonl
 run_valid n14 valid-concurrent-order.jsonl
@@ -178,11 +108,19 @@ run_valid noop-collision-removed valid-promotion-noop-collision-removed.jsonl
 run_invalid noop-collision-redelivery invalid-promotion-noop-collision-as-redelivery.jsonl 32 operation_processed
 run_valid p7a valid-promotion-noop-replicated-p7a.jsonl
 run_invalid p7b invalid-promotion-noop-untraced-p7b.jsonl 190 operation_processed
-run_inconclusive timeout "trace validation exceeded 1s" \
-    env TLA_TRACE_TIMEOUT_SECONDS=1 \
-    "$VALIDATOR" "$FIXTURES/valid-combined-two-term-16-writes.jsonl"
-run_inconclusive out-of-memory "trace validation exhausted memory" \
-    env TLA_TRACE_HEAP=24m TLA_TRACE_TIMEOUT_SECONDS=60 \
-    "$VALIDATOR" "$FIXTURES/valid-combined-two-term-16-writes.jsonl"
+run_inconclusive \
+    timeout \
+    "trace validation exceeded 1s" \
+    valid-combined-two-term-16-writes.jsonl \
+    1 \
+    "$TRACE_TEST_DEFAULT_HEAP"
+run_inconclusive \
+    out-of-memory \
+    "trace validation exhausted memory" \
+    valid-combined-two-term-16-writes.jsonl \
+    60 \
+    24m
 
-echo "D1 schema-v4 trace validator self-tests passed."
+TLA2TOOLS_JAR="${TLA2TOOLS_JAR:-}" "$ROOT_DIR/scripts/tla/check.sh" d1-trace-actions
+echo "review n11 expected=accepted actual=accepted"
+trace_test_run_all "D1 schema-v4 trace validator self-tests passed."

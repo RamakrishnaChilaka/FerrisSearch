@@ -132,14 +132,19 @@ accurately. Development cluster scripts must give every node a unique data
 directory, HTTP port, transport port, Raft ID, and complete seed-host list.
 
 The separate TLA+ CI job runs `scripts/tla/check.sh` with Java 25 and caches
-the checksum-pinned TLA+ tools 1.7.4 jar. Keep the default matrix below five
-minutes; `fixed-crash`, `fixed-partition`, and `fixed-simulation` are
+the checksum-pinned TLA+ tools 1.7.4 jar. Keep the default matrix below eight
+minutes on a four-CPU runner; `fixed-crash`, `fixed-partition`, and
+`fixed-simulation` are
 local-only unless their bounds are reduced and re-recorded. Each invocation
 needs isolated Java and TLC temporary directories; parallel TLC processes
 otherwise race while extracting standard modules. Expected-violation
 configurations are successful only when they reproduce the documented
-invariant failure. The runner defaults to twelve TLC workers and permits a
-`TLA_WORKERS` override. Keep the bounded G1 empty-store and G2
+invariant failure. Large configurations use `min(12,nproc)` TLC workers and
+remain isolated. Small configurations use at most `min(4,nproc)` concurrent
+single-worker JVMs with isolated output and a 2 GiB heap. Trace fixtures use
+the same bounded job count and print their isolated logs in declaration order.
+`TLA_WORKERS`, `TLA_CONFIG_JOBS`, `TLA_TRACE_JOBS`, and the corresponding heap
+overrides are available for diagnosis. Keep the bounded G1 empty-store and G2
 copy-failure/liveness checks, pending-marker restart regression, term-change
 liveness checks, and minimal two-shard isolation check in the fast matrix.
 Keep corruption,

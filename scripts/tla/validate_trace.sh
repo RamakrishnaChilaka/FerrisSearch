@@ -10,6 +10,7 @@ TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tl
 DEFAULT_JAR="${XDG_CACHE_HOME:-$HOME/.cache}/ferrissearch-tla/v${TLA_VERSION}/tla2tools.jar"
 TIMEOUT_SECONDS="${TLA_TRACE_TIMEOUT_SECONDS:-120}"
 HEAP_SIZE="${TLA_TRACE_HEAP:-4g}"
+EXPECTED_RESULT="${TLA_TRACE_EXPECTED:-auto}"
 INCONCLUSIVE_EXIT=3
 
 usage() {
@@ -25,6 +26,14 @@ if [[ $# -ne 1 ]]; then
     usage
     exit 2
 fi
+
+case "$EXPECTED_RESULT" in
+    auto|accepted|rejected|inconclusive) ;;
+    *)
+        echo "TLA_TRACE_EXPECTED must be auto, accepted, rejected, or inconclusive" >&2
+        exit 2
+        ;;
+esac
 
 TRACE_PATH=$1
 if [[ ! -f "$TRACE_PATH" ]]; then
@@ -158,6 +167,11 @@ cp \
     "$RUN_DIR/"
 mkdir -p "$RUN_DIR/java-tmp" "$RUN_DIR/states"
 
+dump_args=()
+if [[ "$EXPECTED_RESULT" == "auto" || "$EXPECTED_RESULT" == "rejected" ]]; then
+    dump_args=(-dump "$RUN_DIR/states.dump")
+fi
+
 set +e
 (
     cd "$RUN_DIR"
@@ -165,13 +179,14 @@ set +e
         java \
         -Djava.io.tmpdir="$RUN_DIR/java-tmp" \
         -Xmx"$HEAP_SIZE" \
-        -XX:+UseParallelGC \
+        -XX:+UseSerialGC \
+        -XX:ActiveProcessorCount=1 \
         -cp "$JAR" \
         tlc2.TLC \
         -deadlock \
         -difftrace \
         -workers 1 \
-        -dump "$RUN_DIR/states.dump" \
+        "${dump_args[@]}" \
         -metadir "$RUN_DIR/states" \
         -config TraceD1.cfg \
         "$TRACE_MODULE.tla"
@@ -241,6 +256,11 @@ if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
 fi
 
 if grep -Fq "Invariant $SAFETY_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
+    if [[ ! -f "$RUN_DIR/states.dump" ]]; then
+        cat "$RUN_DIR/tlc.log" >&2
+        echo "Trace rejected without a diagnostic state dump: $TRACE_PATH" >&2
+        exit 1
+    fi
     max_position=$(
         sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
             sort -n |
@@ -253,6 +273,10 @@ fi
 if [[ $status -eq 0 ]] &&
     ! grep -Fq "Error:" "$RUN_DIR/tlc.log" &&
     grep -Fq "Model checking completed. No error has been found." "$RUN_DIR/tlc.log"; then
+    if [[ ! -f "$RUN_DIR/states.dump" ]]; then
+        echo "Trace rejected without a diagnostic state dump: $TRACE_PATH" >&2
+        exit 1
+    fi
     max_position=$(
         sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
             sort -n |

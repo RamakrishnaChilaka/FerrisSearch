@@ -7,7 +7,21 @@ TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 DEFAULT_JAR="${XDG_CACHE_HOME:-$HOME/.cache}/ferrissearch-tla/v${TLA_VERSION}/tla2tools.jar"
-WORKERS="${TLA_WORKERS:-12}"
+CPU_COUNT=$(nproc 2>/dev/null || echo 1)
+DEFAULT_WORKERS=$CPU_COUNT
+if ((DEFAULT_WORKERS > 12)); then
+    DEFAULT_WORKERS=12
+fi
+WORKERS="${TLA_WORKERS:-$DEFAULT_WORKERS}"
+CONFIG_JOBS="${TLA_CONFIG_JOBS:-$CPU_COUNT}"
+if [[ ! "$CONFIG_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TLA_CONFIG_JOBS must be a positive integer" >&2
+    exit 2
+fi
+if ((CONFIG_JOBS > 4)); then
+    CONFIG_JOBS=4
+fi
+SMALL_CONFIG_HEAP="${TLA_SMALL_CONFIG_HEAP:-2g}"
 TIMEOUT_SECONDS="${TLA_TIMEOUT_SECONDS:-300}"
 LONG_TIMEOUT_SECONDS="${TLA_LONG_TIMEOUT_SECONDS:-1800}"
 SIMULATION_TRACES="${TLA_SIMULATION_TRACES:-10000}"
@@ -15,7 +29,11 @@ SIMULATION_DEPTH="${TLA_SIMULATION_DEPTH:-80}"
 SIMULATION_SEED="${TLA_SIMULATION_SEED:-20260926}"
 
 RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ferrissearch-tla.XXXXXX")
+RUN_OWNER_PID="${BASHPID:-$$}"
 cleanup() {
+    if [[ "${BASHPID:-$$}" -ne "$RUN_OWNER_PID" ]]; then
+        return
+    fi
     rm -rf -- "${RUN_ROOT:?}"
 }
 trap cleanup EXIT
@@ -205,6 +223,8 @@ fi
 
 run_config() {
     local name=$1
+    local workers=${2:-$WORKERS}
+    local heap_size=${3:-}
     local module
     local cfg
     local expected
@@ -524,6 +544,16 @@ run_config() {
     local java_tmp="$run_dir/java-tmp"
     local states="$run_dir/states"
     local log="$LOG_DIR/tla-${name}.log"
+    local -a java_resource_args
+    if [[ -n "$heap_size" ]]; then
+        java_resource_args=(
+            -Xmx"$heap_size"
+            -XX:+UseSerialGC
+            -XX:ActiveProcessorCount=1
+        )
+    else
+        java_resource_args=(-XX:+UseParallelGC)
+    fi
     mkdir -p "$java_tmp" "$states"
 
     echo "=== TLA+ $name ($expected) ==="
@@ -534,7 +564,7 @@ run_config() {
             timeout "${timeout_seconds}s" \
                 java \
                 -Djava.io.tmpdir="$java_tmp" \
-                -XX:+UseParallelGC \
+                "${java_resource_args[@]}" \
                 -cp "$JAR" \
                 tlc2.TLC \
                 -deadlock \
@@ -548,12 +578,12 @@ run_config() {
             timeout "${timeout_seconds}s" \
                 java \
                 -Djava.io.tmpdir="$java_tmp" \
-                -XX:+UseParallelGC \
+                "${java_resource_args[@]}" \
                 -cp "$JAR" \
                 tlc2.TLC \
                 -deadlock \
                 -difftrace \
-                -workers "$WORKERS" \
+                -workers "$workers" \
                 -metadir "$states" \
                 -config "$cfg" \
                 "$module"
@@ -590,8 +620,84 @@ run_config() {
     fi
 }
 
+config_requires_isolation() {
+    case "$1" in
+        c1-aba|c1-aba-fixed|g2-replica|g2-primary|\
+            s1-combined-replica|s1-combined-primary|s1-combined-liveness|\
+            trace-validator|trace-validator-round4|\
+            fixed-crash|fixed-partition|fixed-simulation)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+run_parallel_batch() {
+    local -a batch=("$@")
+    local batch_root
+    local active=0
+    local failed=0
+    local index
+    local status
+    if ((${#batch[@]} == 0)); then
+        return
+    fi
+    if ((CONFIG_JOBS == 1 || ${#batch[@]} == 1)); then
+        for config in "${batch[@]}"; do
+            run_config "$config"
+        done
+        return
+    fi
+
+    batch_root=$(mktemp -d "$RUN_ROOT/config-batch.XXXXXX")
+    for index in "${!batch[@]}"; do
+        (
+            set +e
+            run_config "${batch[$index]}" 1 "$SMALL_CONFIG_HEAP"
+            status=$?
+            printf '%s\n' "$status" >"$batch_root/$index.status"
+            exit 0
+        ) >"$batch_root/$index.log" 2>&1 &
+        active=$((active + 1))
+        if ((active >= CONFIG_JOBS)); then
+            wait -n
+            active=$((active - 1))
+        fi
+    done
+    while ((active > 0)); do
+        wait -n
+        active=$((active - 1))
+    done
+
+    for index in "${!batch[@]}"; do
+        cat "$batch_root/$index.log"
+        if [[ ! -f "$batch_root/$index.status" ]]; then
+            echo "TLA+ configuration did not record a status: ${batch[$index]}" >&2
+            failed=1
+            continue
+        fi
+        status=$(<"$batch_root/$index.status")
+        if [[ $status -ne 0 ]]; then
+            failed=1
+        fi
+    done
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+}
+
+pending_configs=()
 for config in "${configs[@]}"; do
-    run_config "$config"
+    if config_requires_isolation "$config"; then
+        run_parallel_batch "${pending_configs[@]}"
+        pending_configs=()
+        run_config "$config"
+    else
+        pending_configs+=("$config")
+    fi
 done
+run_parallel_batch "${pending_configs[@]}"
 
 echo "All requested TLA+ configurations matched their expected results."

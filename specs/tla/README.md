@@ -52,6 +52,12 @@ producing a verdict. Override `TLA_TRACE_TIMEOUT_SECONDS` or
 `TLA_TRACE_HEAP` for a documented manual run; do not treat an inconclusive run
 as a rejection.
 
+The self-test scripts run independent fixtures with
+`TLA_TRACE_JOBS=min(4,nproc)` and a 2 GiB heap per ordinary fixture. Each case
+writes an isolated log, and the parent prints logs in declaration order after
+all children finish. The deliberate out-of-memory case keeps its 24 MiB heap.
+Set `TLA_TRACE_JOBS=1` to reproduce the sequential schedule.
+
 Use an existing verified jar or retain raw logs:
 
 ```bash
@@ -64,7 +70,12 @@ TLA_LOG_DIR=/path/to/logs \
 runner gives every invocation isolated TLC and Java temporary directories. It
 fails when an expected-pass configuration reports an error, or when an
 expected counterexample no longer violates its named invariant. Safety checks
-default to twelve TLC workers; set `TLA_WORKERS` to override that count.
+default to `min(12,nproc)` TLC workers; set `TLA_WORKERS` to override that
+count. The fast matrix batches small independent configurations with
+`TLA_CONFIG_JOBS=min(4,nproc)`, one TLC worker and a 2 GiB heap per process.
+Large state spaces and the trace suite remain isolated. Set
+`TLA_CONFIG_JOBS=1` for sequential execution or override the small-process
+heap with `TLA_SMALL_CONFIG_HEAP`.
 
 Deadlock checking is disabled because the finite write/fault/recovery bounds
 create intentional terminal states. Safety configurations use a state
@@ -441,10 +452,10 @@ and unconstrained promotion NoOp ranges.
 With version 4, the same combined witness accepted in 4.99s with 588,448KB
 peak resident memory in the final per-fixture sweep. All 81 checked-in fixtures
 completed under the 120-second/4-GiB limit; the slowest was the exact 500-event
-restart/failover trace at 12.76s and 1,567,388KB. The isolated main self-test
-suite improved from the reviewer's 6m11s version-3 run to 3m24s, and the
-round-4 matrix improved from 9m13s to 53.95s. No verdict, invariant, fixture, or
-semantic observation was removed to obtain these bounds.
+restart/failover trace at 12.76s and 1,567,388KB. The isolated main self-test suite improved from the reviewer's 6m11s
+version-3 run to 2m01s with four 2 GiB jobs on four CPUs. The round-4 matrix
+completed in 28.14s under the same four-CPU limit. No verdict, invariant,
+fixture, or semantic observation was removed to obtain these bounds.
 
 The 500-event representative extends the combined witness with deterministic
 post-failover writes while retaining three-node restart/replay, failover,
@@ -994,15 +1005,17 @@ performance benchmarks.
 | `d1-trace-actions` | 2 nodes / 1 acknowledged write | Earlier captured commit; truncation; both-node restart; successful and failed replay | Trace action coverage | Pass | 16 / 16 | 16 | 2s |
 | `d1-failover-actions` | 3 nodes / 5 writes | Scripted gap/failover path; durable term-3 fences; NoOp fan-out/apply/redelivery; activation; collision | Scripted action coverage, not exhaustive model checking | Pass | 47 / 45 | 45 | 2s |
 | `d1-noop-collision-actions` | 3 nodes / 2 writes | Scripted promotion NoOp collision, NACK, and exact removal | Scripted action coverage, not exhaustive model checking | Pass | 28 / 27 | 27 | 2s |
-| `trace-validator` | Schema-v4 one-shard traces | Exact messages/crash sets/fill ranges; inferred core/authority/collision/recovery composition; semantic copy state | 120s and 4 GiB per trace | Baselines plus m-, n-, p7-, and NoOp mutations match expected verdicts | Per-trace witness search | Per-trace witness search | 3m24s isolated suite |
-| `trace-validator-round4` | Schema-v4 combined traces | Late delivery, truncation/restart, activation gaps, replayable NoOps | 120s and 4 GiB per trace | Round-4 fixture verdicts match | Per-trace witness search | Per-trace witness search | 53.95s isolated suite |
+| `trace-validator` | Schema-v4 one-shard traces | Exact messages/crash sets/fill ranges; inferred core/authority/collision/recovery composition; semantic copy state | Four 2 GiB jobs; 120s per trace | Baselines plus m-, n-, p7-, and NoOp mutations match expected verdicts | Per-trace witness search | Per-trace witness search | 2m01s on four CPUs |
+| `trace-validator-round4` | Schema-v4 combined traces | Late delivery, truncation/restart, activation gaps, replayable NoOps | Four 2 GiB jobs; 120s per trace | Round-4 fixture verdicts match | Per-trace witness search | Per-trace witness search | 28.14s on four CPUs |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
 | `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 112,195,617 / 15,684,270 | 42 | 34m23s |
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
-The complete fast matrix, including trace validation, passed in 8m26s with
-`TLA_WORKERS=8` on September 29, 2026. Every expected pass and expected
-counterexample matched. The two large exhaustive runs also used eight workers.
+The complete fast matrix, including all trace fixtures, passed in 7m16.63s
+under `taskset -c 0-3` on September 29, 2026. Small independent model
+configurations and trace fixtures used four bounded jobs; large configurations
+remained isolated. Every expected pass and expected counterexample matched.
+The two large exhaustive runs remain manual eight-worker commands.
 
 `d1-failover-actions` was introduced as scripted action coverage along one
 31-state path, not as exhaustive model checking. Explicit NoOp

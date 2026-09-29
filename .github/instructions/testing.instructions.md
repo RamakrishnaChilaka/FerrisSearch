@@ -163,8 +163,11 @@ cargo test -- test_name                         # Single test by name
   embedded in the selected bounded model; it is not an implementation proof.
 - `validate_trace.sh` returns `0` for acceptance, `1` for rejection, and `3`
   with `INCONCLUSIVE` for timeout, memory exhaustion, or an incomplete TLC
-  run. CI must never count exit `3` as an expected rejection. Fixture runs
-  default to 120 seconds and a 4 GiB Java heap.
+  run. CI must never count exit `3` as an expected rejection. A standalone
+  fixture defaults to 120 seconds and a 4 GiB Java heap. Self-test fixtures
+  use at most `min(4,nproc)` concurrent 2 GiB JVMs, with isolated logs printed
+  in declaration order; the deliberate OOM fixture retains its explicit small
+  heap.
 - The review mutation matrix must retain rejection for m1, m2, m3, m4, m5,
   m6, m6b, m7, m8, m8b, m9, m9b, m15, m18, and m19, while m13 and m14 remain
   accepted. Also retain the replay-stage invalid trace whose commit boundary is
