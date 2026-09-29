@@ -67,6 +67,8 @@ struct PrimaryActivationState {
     available_primary_reports: Mutex<HashMap<(String, u32, u64, u64), std::time::Instant>>,
     #[cfg(test)]
     available_report_tasks_spawned: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    promotion_noop_bulk_requests_received: std::sync::atomic::AtomicUsize,
 }
 
 fn new_primary_activation_state() -> Arc<PrimaryActivationState> {
@@ -1951,6 +1953,12 @@ impl InternalTransport for TransportService {
         request: Request<ReplicateBulkRequest>,
     ) -> Result<Response<ReplicateBulkResponse>, Status> {
         let req = request.into_inner();
+        #[cfg(test)]
+        if !req.ops.is_empty() && req.ops.iter().all(|operation| operation.op == "noop") {
+            self.primary_activation_state
+                .promotion_noop_bulk_requests_received
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         if req.index_uuid.is_empty() {
             return Err(Status::invalid_argument(
                 "bulk replication requires an index UUID",

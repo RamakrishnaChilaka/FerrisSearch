@@ -338,6 +338,10 @@ cargo test -- test_name                         # Single test by name
   failed gRPC fan-out, a later lifecycle activation, and value-level proof that
   the replica durably received the original term/sequence NoOp and closed its
   checkpoint gap.
+- Keep result-level round-6 coverage that a post-snapshot source apply failure
+  stalls catch-up at the physical cursor and is served during finalize, and
+  that 1,030 non-contiguous promotion NoOps reach a live replica in exactly two
+  bounded bulk RPCs.
 - R6 replay regressions cover more than one 1,000-operation replay batch after
   a fence raise, visibility of every pre-promotion document plus a later write,
   clean assigned-copy reopen, and restart from an intermediate commit whose

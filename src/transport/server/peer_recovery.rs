@@ -1929,6 +1929,203 @@ mod tests {
         }
     }
 
+    fn apply_recovery_operations_for_test(
+        target: &Arc<dyn SearchEngine>,
+        snapshot_processed_checkpoint: Option<u64>,
+        operations: Vec<RecoveryOperation>,
+    ) -> Vec<u64> {
+        let mut applied = Vec::new();
+        let decoded = operations
+            .into_iter()
+            .filter(|operation| {
+                snapshot_processed_checkpoint.is_none_or(|checkpoint| operation.seq_no > checkpoint)
+            })
+            .map(|operation| {
+                applied.push(operation.seq_no);
+                let mutation = match operation.op.as_str() {
+                    "index" => crate::engine::DocumentMutation::Index {
+                        doc_id: operation.doc_id,
+                        source: serde_json::from_slice(&operation.payload_json).unwrap(),
+                    },
+                    "delete" => crate::engine::DocumentMutation::Delete {
+                        doc_id: operation.doc_id,
+                    },
+                    "noop" => crate::engine::DocumentMutation::NoOp {
+                        reason: serde_json::from_slice::<serde_json::Value>(
+                            &operation.payload_json,
+                        )
+                        .unwrap()["_reason"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    },
+                    other => panic!("unknown recovery operation {other}"),
+                };
+                crate::engine::SequencedOperation {
+                    seq_no: operation.seq_no,
+                    primary_term: operation.primary_term,
+                    mutation,
+                }
+            })
+            .collect::<Vec<_>>();
+        if !decoded.is_empty() {
+            target.apply_replica_batch(decoded).unwrap();
+        }
+        applied
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_catch_up_finalizes_and_reaches_source_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, shard_manager, _cluster_manager) = review_service(dir.path());
+        let source = shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        source
+            .add_document("base", serde_json::json!({"value": 0}))
+            .unwrap();
+        let snapshot_dir = dir.path().join("uuid-1/shard_0/peer-recovery/session");
+        let snapshot = prepared_test_snapshot(&source, &snapshot_dir);
+        let snapshot_processed = snapshot.committed_boundary.processed_checkpoint;
+
+        source.inject_engine_apply_failures_for_test(5, 1);
+        assert!(
+            source
+                .add_document("late", serde_json::json!({"value": 1}))
+                .is_err()
+        );
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_manager = Arc::new(ShardManager::new(
+            target_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let shard_dir = target_manager
+            .prepare_peer_recovery_target_blocking("idx".into(), 0, "uuid-1".into(), 1)
+            .await
+            .unwrap();
+        for file in &snapshot.files {
+            let destination = shard_dir.join("index").join(&file.name);
+            std::fs::copy(snapshot_dir.join(&file.name), &destination).unwrap();
+            std::fs::File::open(destination)
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        let target = target_manager
+            .finalize_peer_recovery_target_blocking(crate::shard::PeerRecoveryTargetInstall {
+                index: "idx".into(),
+                shard_id: 0,
+                mappings: HashMap::new(),
+                settings: IndexSettings::default(),
+                index_uuid: "uuid-1".into(),
+                allocation_id: 1,
+                primary_term: snapshot.committed_boundary.term_sequence_state.current_term,
+                shard_dir,
+                committed_boundary: snapshot.committed_boundary.clone(),
+                expected_files: snapshot
+                    .files
+                    .iter()
+                    .map(|file| file.name.clone())
+                    .collect(),
+            })
+            .await
+            .unwrap();
+
+        let session = Arc::new(Mutex::new(SourceSession {
+            index_name: "idx".into(),
+            index_uuid: "uuid-1".into(),
+            shard_id: 0,
+            target_node_id: "replica".into(),
+            target_allocation_id: 1,
+            primary_node_id: "primary".into(),
+            primary_term: 1,
+            snapshot_cursor: snapshot.snapshot_cursor,
+            snapshot_boundary: snapshot.committed_boundary.clone(),
+            snapshot_dir,
+            files: snapshot
+                .files
+                .into_iter()
+                .map(|file| (file.name.clone(), file))
+                .collect(),
+            retention_pin: Some(snapshot.retention_pin),
+            last_activity: Instant::now(),
+            barrier: None,
+            barrier_guard: None,
+            finalize_deadline: None,
+            finalize_preparing: Arc::new(AtomicBool::new(false)),
+            mark_submitted: false,
+            settlement_running: false,
+        }));
+        {
+            let mut registry = service.peer_recovery_state.registry.lock().await;
+            registry
+                .active_shards
+                .insert(("uuid-1".into(), 0), "session".into());
+            registry.sessions.insert("session".into(), session);
+        }
+
+        let mut cursor = snapshot.snapshot_cursor;
+        loop {
+            let response = service
+                .fetch_recovery_ops_inner(FetchRecoveryOpsRequest {
+                    session_id: "session".into(),
+                    cursor: Some(proto_cursor(cursor)),
+                    max_ops: MAX_RECOVERY_OPS as u32,
+                    snapshot_processed_checkpoint: snapshot_processed,
+                })
+                .await
+                .unwrap();
+            let next_cursor = require_cursor(response.next_cursor, "next cursor").unwrap();
+            if !response.complete && next_cursor == cursor && response.operations.is_empty() {
+                break;
+            }
+            apply_recovery_operations_for_test(&target, snapshot_processed, response.operations);
+            cursor = next_cursor;
+            if response.complete {
+                break;
+            }
+        }
+
+        let prepared = service
+            .prepare_finalize_recovery_inner(PrepareFinalizeRecoveryRequest {
+                session_id: "session".into(),
+                cursor: Some(proto_cursor(cursor)),
+                processed_checkpoint: target.sequence_stats().processed_checkpoint,
+            })
+            .await
+            .unwrap();
+        let barrier_wal_end = require_cursor(prepared.barrier_wal_end, "barrier WAL end").unwrap();
+        let finalize_next = require_cursor(prepared.next_cursor, "finalize next cursor").unwrap();
+        let applied =
+            apply_recovery_operations_for_test(&target, snapshot_processed, prepared.operations);
+
+        assert!(prepared.complete);
+        assert!(!prepared.retry_catch_up);
+        assert_eq!(applied, [1]);
+        assert_eq!(finalize_next, barrier_wal_end);
+        assert_eq!(
+            target.sequence_stats().processed_checkpoint,
+            prepared.barrier_processed_checkpoint
+        );
+        source.refresh().unwrap();
+        target.refresh().unwrap();
+        assert_eq!(
+            source.get_document("late").unwrap(),
+            target.get_document("late").unwrap()
+        );
+
+        if let Some(removed) = service.peer_recovery_state.remove_session("session").await {
+            cleanup_session(removed).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled_start_becomes_pollable_and_reopen_cleans_it() {
         let dir = tempfile::tempdir().unwrap();

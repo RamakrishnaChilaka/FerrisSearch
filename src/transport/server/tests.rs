@@ -2728,6 +2728,147 @@ async fn replica_bulk_accepts_non_contiguous_promotion_noops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promotion_noop_batches_reach_live_replica_in_two_requests() {
+    const OLD_TERM_OPS: u64 = 1_031;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replica_port = listener.local_addr().unwrap().port();
+    let mut state = gap_test_state(replica_port);
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let source_allocation = state.shard_allocation_id("idx", 0, "source").unwrap();
+    let replica_allocation = state.shard_allocation_id("idx", 0, "replica").unwrap();
+    let history = (0..OLD_TERM_OPS)
+        .map(|index| crate::engine::SequencedOperation {
+            seq_no: index * 2,
+            primary_term: 1,
+            mutation: crate::engine::DocumentMutation::Index {
+                doc_id: format!("doc-{index}"),
+                source: json!({"value": index}),
+            },
+        })
+        .collect::<Vec<_>>();
+    let max_seq_no = (OLD_TERM_OPS - 1) * 2;
+
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_shards = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_engine = replica_shards
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id: replica_allocation,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    replica_engine.apply_replica_batch(history.clone()).unwrap();
+    replica_engine.refresh().unwrap();
+    let replica_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    replica_manager.update_state(state.clone());
+    let replica_activation_state = new_primary_activation_state();
+    let replica_service = TransportService {
+        cluster_manager: replica_manager,
+        shard_manager: replica_shards,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(replica_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "replica".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: replica_activation_state.clone(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(InternalTransportServer::new(replica_service))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_shards = Arc::new(ShardManager::new(
+        source_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let source_engine = source_shards
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id: source_allocation,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    source_engine.apply_replica_batch(history).unwrap();
+    source_engine.refresh().unwrap();
+    let source_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    source_manager.update_state(state);
+    let source_service = TransportService {
+        cluster_manager: source_manager,
+        shard_manager: source_shards.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(source_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "source".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    source_service
+        .activate_primary_for_lifecycle("idx", 0)
+        .await
+        .unwrap();
+    server.abort();
+
+    assert_eq!(
+        replica_activation_state
+            .promotion_noop_bulk_requests_received
+            .load(std::sync::atomic::Ordering::Acquire),
+        2
+    );
+    assert_eq!(
+        source_engine.sequence_stats().processed_checkpoint,
+        Some(max_seq_no)
+    );
+    assert_eq!(
+        replica_engine.sequence_stats().processed_checkpoint,
+        Some(max_seq_no)
+    );
+    assert_eq!(replica_engine.sequence_stats().max_seq_no, Some(max_seq_no));
+    assert!(
+        source_shards
+            .isr_tracker
+            .gap_observations("idx", 0)
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_promotion_noop_fanout_is_retried_end_to_end() {
     let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replica_port = unavailable_listener.local_addr().unwrap().port();
