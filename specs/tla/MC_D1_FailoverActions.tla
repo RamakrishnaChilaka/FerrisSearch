@@ -3,8 +3,8 @@
 \* validation. A three-copy shard creates an unacknowledged gap on promotion
 \* candidate Q and an unacknowledged term/sequence identity on R. After P
 \* crashes, Q is promoted, durably fences, fills the gap with a replayable
-\* NoOp, activates, and reuses R's old sequence. R must fail closed on the
-\* collision.
+\* NoOp, and activates. The NoOp is applied and redelivered to R before Q
+\* reuses R's old sequence. R must fail closed on the later write collision.
 
 EXTENDS MC_D1_SeqNoApply
 
@@ -24,6 +24,20 @@ AckForWrite(writeId, replica) ==
     CHOOSE message \in messages :
         /\ message.kind = "ReplicaAck"
         /\ message.write = writeId
+        /\ message.from = replica
+
+NoOpFor(sequenceNumber, replica) ==
+    CHOOSE message \in messages :
+        /\ message.kind = "ReplicateNoOp"
+        /\ message.write = NoWrite
+        /\ message.seq = sequenceNumber
+        /\ message.to = replica
+
+NoOpAckMessageFor(sequenceNumber, replica) ==
+    CHOOSE message \in messages :
+        /\ message.kind = "NoOpAck"
+        /\ message.write = NoWrite
+        /\ message.seq = sequenceNumber
         /\ message.from = replica
 
 Stable(action) ==
@@ -88,109 +102,118 @@ Submit2 ==
 Accept2 ==
     /\ Advance(8, 9, D1PrimaryAccept(2))
 
-Apply2R ==
-    /\ Advance(9, 10, D1FixedReplicaProcess(ReplicateFor(2, R)))
-
-Ack2R ==
-    /\ Advance(10, 11, D1DeliverAck(AckForWrite(2, R)))
-
 Drop2Q ==
-    /\ Advance(11, 12, FaultAction(LoseMsg(ReplicateFor(2, Q))))
+    /\ Advance(9, 10, FaultAction(LoseMsg(ReplicateFor(2, Q))))
+
+Drop2R ==
+    /\ Advance(10, 11, FaultAction(LoseMsg(ReplicateFor(2, R))))
 
 Fail2 ==
-    /\ Advance(12, 13, Stable(PrimaryFail(2)))
+    /\ Advance(11, 12, Stable(PrimaryFail(2)))
 
 Submit3 ==
-    /\ Advance(13, 14, D1ClientWriteFrom(P, X, "Put"))
+    /\ Advance(12, 13, D1ClientWriteFrom(P, X, "Put"))
 
 Accept3 ==
-    /\ Advance(14, 15, D1PrimaryAccept(3))
+    /\ Advance(13, 14, D1PrimaryAccept(3))
 
 Apply3Q ==
-    /\ Advance(15, 16, D1FixedReplicaProcess(ReplicateFor(3, Q)))
+    /\ Advance(14, 15, D1FixedReplicaProcess(ReplicateFor(3, Q)))
 
 Apply3R ==
-    /\ Advance(16, 17, D1FixedReplicaProcess(ReplicateFor(3, R)))
+    /\ Advance(15, 16, D1FixedReplicaProcess(ReplicateFor(3, R)))
 
 Ack3Q ==
-    /\ Advance(17, 18, D1DeliverAck(AckForWrite(3, Q)))
+    /\ Advance(16, 17, D1DeliverAck(AckForWrite(3, Q)))
 
 Ack3R ==
-    /\ Advance(18, 19, D1DeliverAck(AckForWrite(3, R)))
+    /\ Advance(17, 18, D1DeliverAck(AckForWrite(3, R)))
 
 Finish3 ==
-    /\ Advance(19, 20, D1PrimaryAck(3))
+    /\ Advance(18, 19, D1PrimaryAck(3))
 
 Submit4 ==
-    /\ Advance(20, 21, D1ClientWriteFrom(P, Y, "Put"))
+    /\ Advance(19, 20, D1ClientWriteFrom(P, Y, "Put"))
 
 Accept4 ==
-    /\ Advance(21, 22, D1PrimaryAccept(4))
+    /\ Advance(20, 21, D1PrimaryAccept(4))
 
 Apply4R ==
-    /\ Advance(22, 23, D1FixedReplicaProcess(ReplicateFor(4, R)))
+    /\ Advance(21, 22, D1FixedReplicaProcess(ReplicateFor(4, R)))
 
 Ack4R ==
-    /\ Advance(23, 24, D1DeliverAck(AckForWrite(4, R)))
+    /\ Advance(22, 23, D1DeliverAck(AckForWrite(4, R)))
 
 Drop4Q ==
-    /\ Advance(24, 25, FaultAction(LoseMsg(ReplicateFor(4, Q))))
+    /\ Advance(23, 24, FaultAction(LoseMsg(ReplicateFor(4, Q))))
 
 Fail4 ==
-    /\ Advance(25, 26, Stable(PrimaryFail(4)))
+    /\ Advance(24, 25, Stable(PrimaryFail(4)))
 
 CrashP ==
-    /\ Advance(26, 27, D1CrashCopy(P))
+    /\ Advance(25, 26, D1CrashCopy(P))
 
 ElectQ ==
-    /\ Advance(27, 28, FaultAction(ElectLeader(Q)))
+    /\ Advance(26, 27, FaultAction(ElectLeader(Q)))
 
 ProposePromotion ==
-    /\ Advance(28, 29, FaultAction(SuspectAndRemove(Q, P, Q)))
+    /\ Advance(27, 28, FaultAction(SuspectAndRemove(Q, P, Q)))
 
 CommitPromotion ==
-    /\ phase = 29
+    /\ phase = 28
     /\ \E command \in pendingRaft :
            /\ command.kind = "UpdateRouting"
            /\ FenceChanging(CommitRaft(command))
-    /\ phase' = 30
-
-DeliverPromotion ==
-    /\ Advance(30, 31, FenceChanging(DeliverView(Q)))
+    /\ phase' = 29
 
 ProposeActivation ==
-    /\ Advance(31, 32, Stable(ProposeActivate(Q)))
+    /\ Advance(29, 30, Stable(ProposeActivate(Q)))
 
 CommitActivation ==
-    /\ phase = 32
+    /\ phase = 30
     /\ \E command \in pendingRaft :
            /\ command.kind = "ActivatePrimary"
            /\ FenceChanging(CommitRaft(command))
-    /\ phase' = 33
-
-DeliverActivatedView ==
-    /\ Advance(33, 34, FenceChanging(DeliverView(Q)))
+    /\ phase' = 31
 
 FenceQ ==
-    /\ Advance(34, 35, D1ObserveFence(Q, 3, 3))
+    /\ Advance(31, 32, D1ObserveFence(Q, 3, 3))
 
 FillQGap ==
-    /\ Advance(35, 36, D1FillPromotionNoOps(Q, {1}))
+    /\ Advance(32, 33, D1FillPromotionNoOps(Q, {1}))
 
 ActivateQ ==
-    /\ Advance(36, 37, FenceChanging(D1ObserveActivation(Q)))
+    /\ Advance(33, 34, FenceChanging(D1ObserveActivation(Q)))
+
+FenceRForNoOp ==
+    /\ Advance(34, 35, D1ObserveFence(R, 3, 4))
+
+ApplyNoOpR ==
+    /\ Advance(35, 36, D1FixedReplicaNoOpProcess(NoOpFor(1, R)))
+
+AckNoOpR ==
+    /\ Advance(36, 37, D1DeliverNoOpAck(NoOpAckMessageFor(1, R)))
+
+RedeliverNoOpR ==
+    /\ Advance(37, 38, D1RedeliverPromotionNoOp(Q, R, 1))
+
+ProcessNoOpRedeliveryR ==
+    /\ Advance(38, 39, D1FixedReplicaNoOpRedelivery(NoOpFor(1, R)))
+
+AckNoOpRedeliveryR ==
+    /\ Advance(39, 40, D1DeliverNoOpAck(NoOpAckMessageFor(1, R)))
 
 Submit5 ==
-    /\ Advance(37, 38, D1ClientWriteFrom(Q, Y, "Put"))
+    /\ Advance(40, 41, D1ClientWriteFrom(Q, Y, "Put"))
 
 Accept5 ==
-    /\ Advance(38, 39, D1PrimaryAccept(5))
+    /\ Advance(41, 42, D1PrimaryAccept(5))
 
 FenceR ==
-    /\ Advance(39, 40, D1ObserveFence(R, 3, 4))
+    /\ Advance(42, 43, D1ObserveFence(R, 3, 4))
 
 CollideR ==
-    /\ Advance(40, 41, D1FixedReplicaCollision(ReplicateFor(5, R)))
+    /\ Advance(43, 44, D1FixedReplicaCollision(ReplicateFor(5, R)))
 
 FailoverNext ==
     \/ Submit1
@@ -202,9 +225,8 @@ FailoverNext ==
     \/ Finish1
     \/ Submit2
     \/ Accept2
-    \/ Apply2R
-    \/ Ack2R
     \/ Drop2Q
+    \/ Drop2R
     \/ Fail2
     \/ Submit3
     \/ Accept3
@@ -223,13 +245,17 @@ FailoverNext ==
     \/ ElectQ
     \/ ProposePromotion
     \/ CommitPromotion
-    \/ DeliverPromotion
     \/ ProposeActivation
     \/ CommitActivation
-    \/ DeliverActivatedView
     \/ FenceQ
     \/ FillQGap
     \/ ActivateQ
+    \/ FenceRForNoOp
+    \/ ApplyNoOpR
+    \/ AckNoOpR
+    \/ RedeliverNoOpR
+    \/ ProcessNoOpRedeliveryR
+    \/ AckNoOpRedeliveryR
     \/ Submit5
     \/ Accept5
     \/ FenceR
@@ -237,15 +263,24 @@ FailoverNext ==
 
 FailoverTypeOK ==
     /\ D1TypeOK
-    /\ phase \in 0..41
+    /\ phase \in 0..44
+
+FailoverProgressEnabled ==
+    \/ phase = 44
+    \/ ENABLED FailoverNext
 
 FailoverActionsCovered ==
-    phase = 41 =>
+    phase = 44 =>
         /\ routing.primary = Q
         /\ routing.term = 3
         /\ activated[Q] = 3
         /\ D1PromotionGaps(Q) = {}
         /\ noopTerm[Q][1] = 3
+        /\ noopTerm[R][1] = 3
+        /\ 1 \in processedSeqs[R]
+        /\ Cardinality(
+              {position \in 1..Len(walOrder[R]) :
+                  WalEntrySeq(walOrder[R][position]) = 1}) = 1
         /\ D1TermCollision(R, 3, 3)
         /\ copyMode[R] = "ApplyFailed"
 

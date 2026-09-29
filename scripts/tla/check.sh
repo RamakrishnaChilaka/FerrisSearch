@@ -114,6 +114,7 @@ default_configs=(
     d1-promotion-replay-noop
     d1-trace-actions
     d1-failover-actions
+    d1-noop-collision-actions
     trace-validator
     two-shard
 )
@@ -178,7 +179,8 @@ d1-primary-gap-max      expected B3NoRecoveryLoop: max-based detector loops
 d1-primary-gap-processed pass: compare replica and primary processed checkpoints
 d1-promotion-replay-noop pass: replay, fill NoOp, activate despite replica gap
 d1-trace-actions        pass: captured commit, truncation, arbitrary restart, failed replay
-d1-failover-actions     pass: durable fence, promotion NoOp, activation, and collision
+d1-failover-actions     pass: NoOp fan-out, apply, redelivery, activation, and collision
+d1-noop-collision-actions pass: promotion NoOp collision, NACK, and exact removal
 trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
 trace-validator-round4  pass: slow restart, truncation, NoOp, and late-message traces
 two-shard               pass: red sibling does not block failover/allocation
@@ -480,6 +482,11 @@ run_config() {
         d1-failover-actions|MC_D1_FailoverActions)
             module="MC_D1_FailoverActions.tla"
             cfg="MC_D1_FailoverActions.cfg"
+            expected="pass"
+            ;;
+        d1-noop-collision-actions|MC_D1_NoOpCollisionActions)
+            module="MC_D1_NoOpCollisionActions.tla"
+            cfg="MC_D1_NoOpCollisionActions.cfg"
             expected="pass"
             ;;
         two-shard|MC_TwoShardIsolation)

@@ -159,14 +159,22 @@ D1WalSequences(node) ==
 
 \* HotEngine::prepare_primary_activation replays the complete local WAL, then
 \* appends and syncs one NoOp for every remaining gap through the local maximum.
-\* NoOps have no client write identity, so synthetic WalEntries carry their
-\* sequence while noopTerm carries their primary term. They are appended to
-\* walOrder, survive restart until truncation, and replay without document
-\* mutation.
+\* The activation path also fans each NoOp out to every in-sync replica. NoOps
+\* have no client write identity, so transport records carry NoWrite while
+\* synthetic WalEntries carry sequence and noopTerm carries primary term.
+\* They survive restart until truncation and replay without document mutation.
 D1FillPromotionNoOps(node, filledSeqs) ==
     LET nextProcessed == processedSeqs[node] \cup filledSeqs
         nextPersisted == persistedSeqs[node] \cup filledSeqs
         noOpEntries == SortedNoOpEntries(filledSeqs)
+        requiredReplicas == views[node].inSync
+        requests ==
+            {Message("ReplicateNoOp", NoWrite, node, replica,
+                     sequenceNumber, epoch[node], epoch[replica],
+                     views[node].term, IndexUuid,
+                     views[node].allocations[replica]) :
+                replica \in requiredReplicas,
+                sequenceNumber \in filledSeqs}
     IN
     /\ D1Fixed
     /\ node = routing.primary
@@ -205,6 +213,7 @@ D1FillPromotionNoOps(node, filledSeqs) ==
                       IF seq \in filledSeqs
                       THEN routing.term
                       ELSE processedTerm[node][seq]]]
+    /\ messages' = messages \cup requests
     /\ UNCHANGED
           <<RaftVars, routing, alive, epoch, raftConnected, activated,
             activationPending, nextWrite, writeStatus, writeDoc, writeKind,
@@ -212,7 +221,7 @@ D1FillPromotionNoOps(node, filledSeqs) ==
             writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
             committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
             replicaFence, durableReplicaFence, copyMode, installMarker,
-            messages, sharedHolders, exclusiveHolder, acked, failed,
+            sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, ApplySafetyVars,
             termMonotonic, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
@@ -224,6 +233,16 @@ D1FillPromotionNoOps(node, filledSeqs) ==
 
 ReplicaAckFor(message) ==
     Message("ReplicaAck", message.write, message.to, message.from, message.seq,
+            epoch[message.to], message.fromEpoch, message.term,
+            message.indexUuid, message.targetAllocation)
+
+NoOpAckFor(message) ==
+    Message("NoOpAck", NoWrite, message.to, message.from, message.seq,
+            epoch[message.to], message.fromEpoch, message.term,
+            message.indexUuid, message.targetAllocation)
+
+NoOpNackFor(message) ==
+    Message("NoOpNack", NoWrite, message.to, message.from, message.seq,
             epoch[message.to], message.fromEpoch, message.term,
             message.indexUuid, message.targetAllocation)
 
@@ -645,6 +664,254 @@ D1FixedReplicaCollision(message) ==
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, ApplySafetyVars, termMonotonic, D1Vars,
             PeerRecoveryVars, FaultVars>>
+
+\* Promotion NoOps use the same fencing, WAL, and checkpoint planner as
+\* ordinary replication, but they do not have a client write ID or mutate a
+\* document. The durable fence is raised separately before this action.
+D1NoOpMessageEnabled(message) ==
+    LET replica == message.to
+    IN
+    /\ message \in messages
+    /\ message.kind = "ReplicateNoOp"
+    /\ message.write = NoWrite
+    /\ message.seq \in D1Seqs
+    /\ alive[replica]
+    /\ ~replaying[replica]
+    /\ copyExists[replica]
+    /\ CopyAssignmentValid(replica)
+    /\ epoch[replica] = message.toEpoch
+    /\ epoch[message.from] = message.fromEpoch
+    /\ ~BlocksLiveReplication(replica)
+    /\ d1FenceTerm[replica] >= message.term
+    /\ durableReplicaFence[replica] >= message.term
+    /\ ReplicaMessageValid(message)
+
+D1FixedReplicaNoOpProcess(message) ==
+    LET replica == message.to
+        sequenceNumber == message.seq
+        response == NoOpAckFor(message)
+        nextProcessed == processedSeqs[replica] \cup {sequenceNumber}
+        nextPersisted ==
+            IF D1RequestDurability
+            THEN persistedSeqs[replica] \cup {sequenceNumber}
+            ELSE persistedSeqs[replica]
+    IN
+    /\ D1Fixed
+    /\ D1NoOpMessageEnabled(message)
+    /\ sequenceNumber \notin processedSeqs[replica]
+    /\ ~D1TermCollision(replica, message.term, sequenceNumber)
+    /\ messages' = (messages \ {message}) \cup {response}
+    /\ nextSeq' =
+          [nextSeq EXCEPT
+              ![replica] =
+                  IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![replica] =
+                  IF ReplicaFencing /\ @ < message.term
+                  THEN message.term
+                  ELSE @]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![replica] =
+                  IF ReplicaFencing /\ DurableReplicaFence
+                     /\ @ < message.term
+                  THEN message.term
+                  ELSE @]
+    /\ staleApplySafe' =
+          staleApplySafe /\ message.term >= durableReplicaFence[replica]
+    /\ activePrimaryApplySafe' =
+          activePrimaryApplySafe
+          /\ (activated[replica] = NoTerm
+              \/ message.term >= activated[replica])
+    /\ walOrder' =
+          [walOrder EXCEPT ![replica] = Append(@, NoOpEntry(sequenceNumber))]
+    /\ noopTerm' =
+          [noopTerm EXCEPT ![replica][sequenceNumber] = message.term]
+    /\ processedSeqs' =
+          [processedSeqs EXCEPT ![replica] = nextProcessed]
+    /\ processedNext' =
+          [processedNext EXCEPT
+              ![replica] = ContiguousNext(nextProcessed)]
+    /\ persistedSeqs' =
+          [persistedSeqs EXCEPT ![replica] = nextPersisted]
+    /\ persistedNext' =
+          [persistedNext EXCEPT
+              ![replica] = ContiguousNext(nextPersisted)]
+    /\ maxSeqNext' =
+          [maxSeqNext EXCEPT
+              ![replica] =
+                  IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![replica][sequenceNumber] = message.term]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, committed,
+            truncBelow, pins, copyExists, copyAllocation, copyUuid, copyMode,
+            installMarker, sharedHolders, exclusiveHolder, acked, failed,
+            promotionSafe, admissionSafe, ackMembershipSafe, termMonotonic,
+            persistedProcessedNext, persistedCommittedNext,
+            persistedMaxSeqNext, d1FenceTerm, fenceMaxSeqNext, docSeqNext,
+            tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
+            persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
+            replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
+            crashDone, duplicateSent, tombstonePruneSafe, pruneDone,
+            PeerRecoveryVars, FaultVars>>
+
+\* A matching duplicate is acknowledged without another WAL append.
+D1FixedReplicaNoOpRedelivery(message) ==
+    LET replica == message.to
+        response == NoOpAckFor(message)
+    IN
+    /\ D1Fixed
+    /\ D1NoOpMessageEnabled(message)
+    /\ message.seq \in processedSeqs[replica]
+    /\ ~D1TermCollision(replica, message.term, message.seq)
+    /\ messages' = (messages \ {message}) \cup {response}
+    /\ replicaFence' =
+          [replicaFence EXCEPT
+              ![replica] =
+                  IF ReplicaFencing /\ @ < message.term
+                  THEN message.term
+                  ELSE @]
+    /\ durableReplicaFence' =
+          [durableReplicaFence EXCEPT
+              ![replica] =
+                  IF ReplicaFencing /\ DurableReplicaFence
+                     /\ @ < message.term
+                  THEN message.term
+                  ELSE @]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            copyMode, installMarker, sharedHolders, exclusiveHolder, acked,
+            failed, promotionSafe, admissionSafe, ackMembershipSafe,
+            ApplySafetyVars, termMonotonic, D1Vars, PeerRecoveryVars,
+            FaultVars>>
+
+\* A newer-term NoOp colliding with an older operation identity fails the copy
+\* closed exactly like an ordinary write collision.
+D1FixedReplicaNoOpCollision(message) ==
+    LET replica == message.to
+        response == NoOpNackFor(message)
+    IN
+    /\ D1Fixed
+    /\ D1NoOpMessageEnabled(message)
+    /\ D1TermCollision(replica, message.term, message.seq)
+    /\ messages' = (messages \ {message}) \cup {response}
+    /\ copyMode' = [copyMode EXCEPT ![replica] = "ApplyFailed"]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, installMarker, sharedHolders,
+            exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
+            ackMembershipSafe, ApplySafetyVars, termMonotonic, D1Vars,
+            PeerRecoveryVars, FaultVars>>
+
+\* A stale allocation, stale term, or unavailable copy rejects a promotion
+\* NoOp without changing the local WAL or document state.
+D1FixedReplicaNoOpReject(message) ==
+    LET replica == message.to
+        response == NoOpNackFor(message)
+    IN
+    /\ D1Fixed
+    /\ message \in messages
+    /\ message.kind = "ReplicateNoOp"
+    /\ message.write = NoWrite
+    /\ alive[replica]
+    /\ copyExists[replica]
+    /\ epoch[replica] = message.toEpoch
+    /\ epoch[message.from] = message.fromEpoch
+    /\ \/ /\ BlocksLiveReplication(replica)
+          /\ ~ApplyMutationFails(replica)
+       \/ ~ReplicaMessageValid(message)
+    /\ messages' = (messages \ {message}) \cup {response}
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            D1Vars, PeerRecoveryVars, FaultVars>>
+
+\* Promotion NoOp responses do not participate in a client write quorum.
+\* Their success or failure is observed by the activation fan-out, then
+\* discarded; collision/removal state is carried separately.
+D1DeliverNoOpAck(message) ==
+    /\ message \in messages
+    /\ message.kind = "NoOpAck"
+    /\ message.write = NoWrite
+    /\ alive[message.to]
+    /\ epoch[message.to] = message.toEpoch
+    /\ messages' = messages \ {message}
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            D1Vars, PeerRecoveryVars, FaultVars>>
+
+D1DeliverNoOpNack(message) ==
+    /\ message \in messages
+    /\ message.kind = "NoOpNack"
+    /\ message.write = NoWrite
+    /\ alive[message.to]
+    /\ epoch[message.to] = message.toEpoch
+    /\ messages' = messages \ {message}
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            D1Vars, PeerRecoveryVars, FaultVars>>
+
+D1RedeliverPromotionNoOp(primaryNode, replica, sequenceNumber) ==
+    LET message ==
+            Message("ReplicateNoOp", NoWrite, primaryNode, replica,
+                    sequenceNumber, epoch[primaryNode], epoch[replica],
+                    noopTerm[primaryNode][sequenceNumber], IndexUuid,
+                    views[primaryNode].allocations[replica])
+    IN
+    /\ D1Fixed
+    /\ primaryNode \in Nodes
+    /\ replica \in views[primaryNode].inSync
+    /\ sequenceNumber \in processedSeqs[primaryNode]
+    /\ noopTerm[primaryNode][sequenceNumber] > 0
+    /\ alive[primaryNode]
+    /\ alive[replica]
+    /\ views[primaryNode].primary = primaryNode
+    /\ message \notin messages
+    /\ messages' = messages \cup {message}
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, nextSeq,
+            committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
+            sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
+            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
+            D1Vars, PeerRecoveryVars, FaultVars>>
 
 D1DocSeqNextFor(writeSet) ==
     [doc \in Docs |->

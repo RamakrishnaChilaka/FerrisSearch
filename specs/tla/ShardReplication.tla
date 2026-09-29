@@ -45,7 +45,9 @@ ReportableStorageFailureModes ==
     ReportableOpenStorageFailureModes \cup {"ApplyFailed"}
 AllStorageFailureModes ==
     StorageRetryModes \cup ReportableStorageFailureModes
-MessageKinds == {"Replicate", "ReplicaAck", "ReplicaNack"}
+WriteMessageKinds == {"Replicate", "ReplicaAck", "ReplicaNack"}
+NoOpMessageKinds == {"ReplicateNoOp", "NoOpAck", "NoOpNack"}
+MessageKinds == WriteMessageKinds \cup NoOpMessageKinds
 IndexUuid == "INDEX_UUID"
 NoIndexUuid == "NO_INDEX_UUID"
 
@@ -1071,7 +1073,7 @@ ReplicationTypeOK ==
     /\ installMarker \in [Nodes -> BOOLEAN]
     /\ messages \subseteq
           [kind      : MessageKinds,
-           write     : WriteIds,
+           write     : WriteIds \cup {NoWrite},
            from      : Nodes,
            to        : Nodes,
            seq       : 0..MaxWrites,
@@ -1080,6 +1082,11 @@ ReplicationTypeOK ==
            term      : 0..MaxTerm,
            indexUuid : {IndexUuid, NoIndexUuid},
            targetAllocation : 0..MaxAllocationId]
+    /\ \A message \in messages :
+           /\ message.kind \in WriteMessageKinds =>
+                  message.write \in WriteIds
+           /\ message.kind \in NoOpMessageKinds =>
+                  message.write = NoWrite
     /\ sharedHolders \in [Nodes -> SUBSET WriteIds]
     /\ exclusiveHolder \in [Nodes -> Nodes \cup {NoNode}]
     /\ acked \subseteq WriteIds
