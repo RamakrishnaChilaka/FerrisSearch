@@ -69,9 +69,11 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > from sequence zero, tracks processed and persisted contiguous prefixes across
 > gaps, returns real `_seq_no`/`_primary_term` receipts, and computes the global
 > checkpoint from persisted authoritative copies. Peer recovery installs the
-> source's exact committed boundary, streams the WAL by physical
-> generation/byte cursor, and admits only after matching the final processed
-> barrier. Promotion persists its fence and fills local gaps with NoOps.
+> source's exact gap-free committed boundary, streams the WAL by physical
+> generation/byte cursor without advancing past a source-unapplied frame, and
+> uses the final replaying barrier to resume from that cursor before admission.
+> Promotion persists its fence, fills local gaps with NoOps, and replicates
+> those NoOps in bounded batches.
 > Earlier build formats are unsupported and require index/cluster recreation
 > and reindexing. This does not implement D10 rollback/resync, client retry
 > tokens, or full OCC.

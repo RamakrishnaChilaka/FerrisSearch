@@ -2016,7 +2016,9 @@ impl InternalTransport for TransportService {
             req.shard_id
         );
 
-        let start_seq_no = req.ops.first().map_or(0, |first| first.seq_no);
+        let batch_op = req.ops.first().map(|operation| operation.op.as_str());
+        let start_seq_no = req.ops.first().map(|operation| operation.seq_no);
+        let mut previous_seq_no = None;
         let mut operations = Vec::with_capacity(req.ops.len());
         for (offset, op) in req.ops.iter().enumerate() {
             if op.index_name != req.index_name
@@ -2029,30 +2031,66 @@ impl InternalTransport for TransportService {
                     "bulk replication operation identity does not match the envelope",
                 ));
             }
-            let expected_seq = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
-                Status::invalid_argument("bulk replication sequence range overflows")
-            })?;
-            if op.seq_no != expected_seq {
+            if Some(op.op.as_str()) != batch_op {
                 return Err(Status::invalid_argument(
-                    "bulk replication sequences must be contiguous and ordered",
+                    "bulk replication operations must use one operation kind",
                 ));
             }
-            if op.op != "index" {
-                return Err(Status::invalid_argument(
-                    "bulk replication only supports index operations",
-                ));
-            }
-            let payload: serde_json::Value =
-                serde_json::from_slice(&op.payload_json).map_err(|e| {
-                    Status::invalid_argument(format!("invalid JSON in bulk replicate: {e}"))
-                })?;
+            let mutation = match batch_op {
+                Some("index") => {
+                    let expected_seq = start_seq_no
+                        .and_then(|start| start.checked_add(offset as u64))
+                        .ok_or_else(|| {
+                            Status::invalid_argument("bulk replication sequence range overflows")
+                        })?;
+                    if op.seq_no != expected_seq {
+                        return Err(Status::invalid_argument(
+                            "bulk index replication sequences must be contiguous and ordered",
+                        ));
+                    }
+                    let payload: serde_json::Value = serde_json::from_slice(&op.payload_json)
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("invalid JSON in bulk replicate: {e}"))
+                        })?;
+                    crate::engine::DocumentMutation::Index {
+                        doc_id: op.doc_id.clone(),
+                        source: payload,
+                    }
+                }
+                Some("noop") => {
+                    if previous_seq_no.is_some_and(|previous| op.seq_no <= previous) {
+                        return Err(Status::invalid_argument(
+                            "bulk NoOp replication sequences must be strictly increasing",
+                        ));
+                    }
+                    let payload: serde_json::Value = serde_json::from_slice(&op.payload_json)
+                        .map_err(|e| {
+                            Status::invalid_argument(format!(
+                                "invalid no-op JSON in bulk replicate: {e}"
+                            ))
+                        })?;
+                    let reason = payload
+                        .get("_reason")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            Status::invalid_argument("bulk replication no-op has no _reason")
+                        })?;
+                    crate::engine::DocumentMutation::NoOp {
+                        reason: reason.to_string(),
+                    }
+                }
+                Some(other) => {
+                    return Err(Status::invalid_argument(format!(
+                        "bulk replication does not support operation '{other}'"
+                    )));
+                }
+                None => unreachable!("the operation loop is empty when no batch kind exists"),
+            };
+            previous_seq_no = Some(op.seq_no);
             operations.push(crate::engine::SequencedOperation {
                 seq_no: op.seq_no,
                 primary_term,
-                mutation: crate::engine::DocumentMutation::Index {
-                    doc_id: op.doc_id.clone(),
-                    source: payload,
-                },
+                mutation,
             });
         }
 
@@ -4478,20 +4516,22 @@ impl TransportService {
         }
         let write_state =
             self.validated_primary_write_state(index_name, shard_id, activated_primary)?;
-        for operation in noops {
-            let crate::engine::DocumentMutation::NoOp { reason } = operation.mutation else {
-                continue;
-            };
-            match crate::replication::replicate_write_with_durability(
+        for batch in noops.chunks(MAX_RECOVERY_OPS) {
+            let first_seq_no = batch
+                .first()
+                .expect("promotion NoOp batch is non-empty")
+                .seq_no;
+            let last_seq_no = batch
+                .last()
+                .expect("promotion NoOp batch is non-empty")
+                .seq_no;
+            match crate::replication::replicate_noop_batch_with_durability(
                 &self.transport_client,
                 &write_state,
                 index_name,
                 shard_id,
-                "",
-                &serde_json::json!({ "_reason": reason }),
-                "noop",
-                operation.seq_no,
-                operation.primary_term,
+                batch,
+                activated_primary.primary_term,
                 self.shard_manager.durability(),
             )
             .await
@@ -4511,7 +4551,7 @@ impl TransportService {
                         &write_state,
                         index_name,
                         shard_id,
-                        operation.primary_term,
+                        activated_primary.primary_term,
                         &errors,
                     )
                     .await;
@@ -4542,9 +4582,11 @@ impl TransportService {
                     tracing::warn!(
                         index = index_name,
                         shard_id,
-                        seq_no = operation.seq_no,
+                        first_seq_no,
+                        last_seq_no,
+                        operation_count = batch.len(),
                         errors = ?errors,
-                        "Promotion NoOp replication failed; retaining replica gap observation"
+                        "Promotion NoOp batch replication failed; retaining replica gap observation"
                     );
                 }
             }

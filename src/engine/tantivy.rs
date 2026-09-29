@@ -7488,6 +7488,13 @@ impl super::SearchEngine for HotEngine {
             let mut writer_state =
                 self.writer_state_with_replay(translog, "peer recovery snapshot")?;
             let boundary = self.current_committed_boundary()?;
+            if boundary.processed_checkpoint != boundary.max_seq_no {
+                anyhow::bail!(
+                    "peer recovery snapshot requires a gap-free source: processed checkpoint {:?} does not equal maximum sequence {:?}",
+                    boundary.processed_checkpoint,
+                    boundary.max_seq_no
+                );
+            }
             let committed_boundary = self.commit_writer_at_boundary(
                 &mut writer_state,
                 "peer recovery snapshot",
@@ -7581,20 +7588,21 @@ impl super::SearchEngine for HotEngine {
         if end_cursor.position() > snapshot.end_cursor().position() {
             anyhow::bail!("peer recovery end cursor exceeds the captured WAL end");
         }
-        let batch = snapshot.read_bounded_cursor(cursor, end_cursor, max_ops, max_bytes)?;
         let checkpoints = self
             .apply_state
             .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
             .checkpoints
             .clone();
-        let operations = batch
-            .entries
-            .into_iter()
-            .filter(|entry| checkpoints.has_processed(entry.seq_no))
-            .collect();
+        let batch = snapshot.read_bounded_cursor_while(
+            cursor,
+            end_cursor,
+            max_ops,
+            max_bytes,
+            |seq_no| checkpoints.has_processed(seq_no),
+        )?;
         Ok(super::PeerRecoveryOpsBatch {
-            operations,
+            operations: batch.entries,
             next_cursor: batch.next_cursor,
             source_max_seq_no: checkpoints.stats().max_seq_no,
             complete: batch.complete,
@@ -12366,6 +12374,84 @@ mod tests {
         engine
             .release_peer_recovery_pin(snapshot.retention_pin_id)
             .unwrap();
+    }
+
+    #[test]
+    fn peer_recovery_snapshot_rejects_a_processed_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        apply_index(&engine, "zero", json!({"value": 0}), 0, 1);
+        apply_index(&engine, "two", json!({"value": 2}), 2, 1);
+
+        let snapshot_dir = dir.path().join("peer-recovery").join("gap");
+        let error = match engine.prepare_peer_recovery_snapshot(&snapshot_dir) {
+            Ok(prepared) => {
+                drop(prepared);
+                panic!("a snapshot cannot discard processed intervals above a gap");
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("processed checkpoint")
+                && error.to_string().contains("maximum sequence"),
+            "{error:#}"
+        );
+        assert!(!snapshot_dir.exists());
+    }
+
+    #[test]
+    fn peer_recovery_cursor_stops_before_an_unprocessed_wal_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        apply_index(&engine, "zero", json!({"value": 0}), 0, 1);
+        let after_processed = engine
+            .with_translog("capture processed cursor", |translog| {
+                Ok(translog.recovery_read_snapshot()?.end_cursor())
+            })
+            .unwrap();
+        engine
+            .with_translog("append unapplied recovery entry", |translog| {
+                translog.append_with_seq(
+                    1,
+                    1,
+                    crate::wal::WalOperation::Index,
+                    json!({
+                        "_doc_id": "one",
+                        "_source": {"value": 1}
+                    }),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let wal_end = engine
+            .with_translog("capture WAL end", |translog| {
+                Ok(translog.recovery_read_snapshot()?.end_cursor())
+            })
+            .unwrap();
+
+        let batch = engine
+            .peer_recovery_ops(
+                crate::wal::WalCursor {
+                    generation_id: after_processed.generation_id,
+                    byte_offset: 0,
+                },
+                Some(wal_end),
+                16,
+                usize::MAX,
+            )
+            .unwrap();
+
+        assert_eq!(
+            batch
+                .operations
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(batch.next_cursor, after_processed);
+        assert!(!batch.complete);
     }
 
     #[test]

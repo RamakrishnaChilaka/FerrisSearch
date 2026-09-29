@@ -601,6 +601,12 @@ async fn run_peer_recovery(
             .context("fetch peer recovery operations")?;
         let next_cursor =
             require_recovery_cursor(response.next_cursor, "peer recovery next cursor")?;
+        if !response.complete && next_cursor == cursor && response.operations.is_empty() {
+            // The source encountered a durable WAL entry that its engine has not
+            // applied yet. Finalization takes the exclusive barrier and rebuilds
+            // the source writer before serving the remaining suffix.
+            break;
+        }
         let (new_cursor, applied) = apply_recovery_operations_cursor(
             engine.clone(),
             cursor,

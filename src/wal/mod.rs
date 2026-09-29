@@ -261,12 +261,27 @@ impl TranslogReadSnapshot {
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<CursorReadBatch> {
+        self.read_bounded_cursor_while(cursor, end_cursor, max_ops, max_bytes, |_| true)
+    }
+
+    pub fn read_bounded_cursor_while<F>(
+        &self,
+        cursor: WalCursor,
+        end_cursor: WalCursor,
+        max_ops: usize,
+        max_bytes: usize,
+        should_read: F,
+    ) -> Result<CursorReadBatch>
+    where
+        F: FnMut(u64) -> bool,
+    {
         HotTranslog::read_bounded_cursor_from_generations(
             &self.generations,
             cursor,
             end_cursor,
             max_ops,
             max_bytes,
+            should_read,
         )
     }
 
@@ -1549,13 +1564,17 @@ impl HotTranslog {
         Ok((entries, read_through_head))
     }
 
-    fn read_bounded_cursor_from_generations(
+    fn read_bounded_cursor_from_generations<F>(
         generations: &[GenerationInfo],
         cursor: WalCursor,
         end_cursor: WalCursor,
         max_ops: usize,
         max_bytes: usize,
-    ) -> Result<CursorReadBatch> {
+        mut should_read: F,
+    ) -> Result<CursorReadBatch>
+    where
+        F: FnMut(u64) -> bool,
+    {
         if max_ops == 0 || max_bytes == 0 {
             anyhow::bail!("bounded cursor read requires non-zero limits");
         }
@@ -1633,6 +1652,20 @@ impl HotTranslog {
                         end_offset
                     );
                 }
+                let prefix_len = payload_len.min(16);
+                let mut prefix = vec![0u8; prefix_len];
+                reader.read_exact(&mut prefix)?;
+                let seq_no = decode_wire_seq_no(&prefix)?;
+                if !should_read(seq_no) {
+                    return Ok(CursorReadBatch {
+                        entries,
+                        next_cursor: WalCursor {
+                            generation_id: generation.id,
+                            byte_offset: frame_start,
+                        },
+                        complete: false,
+                    });
+                }
                 if entries.len() >= max_ops
                     || bytes
                         .checked_add(frame_bytes)
@@ -1651,18 +1684,8 @@ impl HotTranslog {
                         complete: false,
                     });
                 }
-                if frame_bytes > MAX_WAL_FRAME_BYTES {
-                    anyhow::bail!(
-                        "translog operation at {}:{} has frame length {}, exceeding recovery transfer maximum {}",
-                        generation.id,
-                        frame_start,
-                        frame_bytes,
-                        MAX_WAL_FRAME_BYTES
-                    );
-                }
-                let mut payload = vec![0u8; payload_len];
-                reader.read_exact(&mut payload)?;
-                entries.push(decode_wire_entry(&payload)?.into_translog()?);
+                let wire = decode_wire_entry_with_prefix(&mut reader, prefix, payload_len, seq_no)?;
+                entries.push(wire.into_translog()?);
                 bytes += frame_bytes;
                 next_cursor.byte_offset = frame_end;
             }
@@ -1695,6 +1718,7 @@ impl HotTranslog {
                 end_cursor,
                 max_ops,
                 max_bytes,
+                should_read,
             );
         }
 

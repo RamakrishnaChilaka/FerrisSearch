@@ -60,8 +60,8 @@ pub async fn replicate_bulk(
 - `StartPeerRecovery` carries the target-observed allocation ID. The source
   rejects snapshot setup until its own current assignment has the exact same ID.
 - The primary commits under the translog lock, captures the exact committed
-  boundary plus physical WAL end, pins from `processed_checkpoint + 1`, and
-  hard-links the committed Tantivy files.
+  boundary plus physical WAL end, requires a gap-free processed prefix, pins
+  from `processed_checkpoint + 1`, and hard-links the committed Tantivy files.
 - The target wipes only its out-of-sync copy, persists
   `PEER_RECOVERY_IN_PROGRESS`, validates bounded chunks and SHA-256 hashes,
   initializes an empty WAL allocator at source `max_seq_no + 1`, installs the
@@ -72,6 +72,9 @@ pub async fn replicate_bulk(
   clears this state on admission/promotion and only writes the destructive
   in-progress marker after definitive rejection.
 - Catch-up paginates by `(generation_id, byte_offset)` in physical file order.
+  It stops before the first source-unprocessed WAL frame rather than advancing
+  past it; finalization rebuilds the source writer and resumes from that exact
+  cursor.
   A final exclusive shard write barrier captures a physical end and processed
   checkpoint; the target must match both, then the
   primary submits `MarkReplicaInSync(allocation_id, primary, term)` and observes local
@@ -156,6 +159,10 @@ pub async fn replicate_bulk(
   Internal redelivery is term/sequence aware, promotion fills local gaps with
   NoOps, and sustained gaps are probed before exact-allocation removal. This is
   still not general D10 rollback/resync or client retry-token support.
+- Promotion NoOps are replicated in bounded homogeneous bulk batches, preserving
+  each explicit non-contiguous sequence number. A batch transport failure
+  remains best-effort and creates the same replica gap observation as the
+  former single-operation path.
 - A primary engine failure after WAL append but before replication leaves an
   operation that no replica received. After local rebuild/replay advances the
   primary prefix, later replica responses expose the permanent gap; each

@@ -111,6 +111,10 @@ pub struct Node {
 - Source snapshot preparation can rebuild a failed Tantivy writer and replay
   the retained WAL suffix while the shard is idle. A transient source commit
   failure must not leave replica recovery dependent on a later client write.
+- If catch-up reaches a WAL frame the source has not processed, the physical
+  cursor remains at that frame and the target advances to finalization. The
+  exclusive finalize barrier rebuilds/replays the source writer and serves the
+  remaining suffix without discarding the session's transferred snapshot.
 - A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
   An inactive marker whose embedded allocation ID matches the current
   out-of-sync assignment is reported through `FailShardCopy`; an active target,

@@ -1479,6 +1479,9 @@ impl ShardManager {
                     .downcast_ref::<crate::engine::sequence::PrimaryTermSequenceCollisionError>()
                     .is_some()
                 || cause
+                    .downcast_ref::<crate::engine::sequence::SequenceStateCorruptionError>()
+                    .is_some()
+                || cause
                     .downcast_ref::<crate::engine::tantivy::SequenceOperationCollisionError>()
                     .is_some()
                 || cause
@@ -4771,10 +4774,11 @@ mod tests {
         let source = CompositeEngine::new(source_dir.path(), Duration::from_secs(60)).unwrap();
         let source: Arc<dyn SearchEngine> = Arc::new(source);
         apply_index(&source, "doc-1", json!({"value": 1}), 0, 1).unwrap();
+        apply_index(&source, "doc-gap", json!({"value": "filled"}), 1, 1).unwrap();
         apply_index(&source, "doc-2", json!({"value": 2}), 2, 1).unwrap();
         let snapshot_dir = source_dir.path().join("peer-recovery/session");
         let snapshot = source.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
-        assert_eq!(snapshot.committed_boundary.processed_checkpoint, Some(0));
+        assert_eq!(snapshot.committed_boundary.processed_checkpoint, Some(2));
         assert_eq!(snapshot.committed_boundary.max_seq_no, Some(2));
 
         let target_dir = tempfile::tempdir().unwrap();
@@ -4814,8 +4818,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(engine.doc_count(), 2);
-        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.doc_count(), 3);
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(2));
         assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
         assert!(!shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists());
         source
@@ -4877,6 +4881,18 @@ mod tests {
         let identity = restarted.copy_identity("idx", 0).unwrap();
         assert_eq!(identity.replica_fence, 5);
         assert_eq!(identity.fence_max_seq_no, Some(0));
+    }
+
+    #[test]
+    fn sequence_state_identity_mismatch_is_definitive() {
+        let committed = crate::engine::sequence::CommittedBoundaryRecord::empty(2);
+        let error = crate::engine::sequence::initialize_term_sequence_state(2, Some(0), &committed)
+            .unwrap_err();
+
+        assert!(
+            ShardManager::is_definitive_copy_failure(&error),
+            "identity/commit fence disagreement must fail the copy immediately: {error:#}"
+        );
     }
 
     #[test]

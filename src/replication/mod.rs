@@ -52,6 +52,14 @@ impl std::fmt::Display for ReplicaReplicationFailure {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ReplicaWireOperation {
+    seq_no: u64,
+    op: String,
+    doc_id: String,
+    payload_json: Vec<u8>,
+}
+
 /// Replicate a single document write to all in-sync replica nodes for a shard.
 /// Returns Ok(replica_checkpoints) if all in-sync replicas acknowledged, Err otherwise.
 /// Replication is performed concurrently (fan-out) — latency = max(replica RTTs).
@@ -287,6 +295,126 @@ pub async fn replicate_bulk_with_durability(
     primary_term: u64,
     durability: TranslogDurability,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    let operations = docs
+        .iter()
+        .enumerate()
+        .map(|(offset, (doc_id, payload))| {
+            let seq_no = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
+                ReplicaReplicationFailure::message(
+                    "<bulk>",
+                    None,
+                    "bulk replication sequence range overflows".to_string(),
+                )
+            })?;
+            let payload_json = serde_json::to_vec(payload).map_err(|error| {
+                ReplicaReplicationFailure::message(
+                    "<bulk>",
+                    None,
+                    format!("serialize replica payload: {error}"),
+                )
+            })?;
+            Ok(ReplicaWireOperation {
+                seq_no,
+                op: "index".to_string(),
+                doc_id: doc_id.clone(),
+                payload_json,
+            })
+        })
+        .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
+        .map_err(|error| vec![error])?;
+    replicate_explicit_batch_with_durability(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        &operations,
+        primary_term,
+        durability,
+        "bulk",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn replicate_noop_batch_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    operations: &[crate::engine::SequencedOperation],
+    primary_term: u64,
+    durability: TranslogDurability,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    let mut previous_seq_no = None;
+    let operations = operations
+        .iter()
+        .map(|operation| {
+            if operation.primary_term != primary_term {
+                return Err(ReplicaReplicationFailure::message(
+                    "<promotion>",
+                    None,
+                    format!(
+                        "promotion NoOp term {} does not match activated term {primary_term}",
+                        operation.primary_term
+                    ),
+                ));
+            }
+            if previous_seq_no.is_some_and(|previous| operation.seq_no <= previous) {
+                return Err(ReplicaReplicationFailure::message(
+                    "<promotion>",
+                    None,
+                    "promotion NoOp sequences must be strictly increasing".to_string(),
+                ));
+            }
+            previous_seq_no = Some(operation.seq_no);
+            let crate::engine::DocumentMutation::NoOp { reason } = &operation.mutation else {
+                return Err(ReplicaReplicationFailure::message(
+                    "<promotion>",
+                    None,
+                    "promotion replication batch contains a non-NoOp operation".to_string(),
+                ));
+            };
+            let payload_json = serde_json::to_vec(&serde_json::json!({ "_reason": reason }))
+                .map_err(|error| {
+                    ReplicaReplicationFailure::message(
+                        "<promotion>",
+                        None,
+                        format!("serialize promotion NoOp: {error}"),
+                    )
+                })?;
+            Ok(ReplicaWireOperation {
+                seq_no: operation.seq_no,
+                op: "noop".to_string(),
+                doc_id: String::new(),
+                payload_json,
+            })
+        })
+        .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
+        .map_err(|error| vec![error])?;
+    replicate_explicit_batch_with_durability(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        &operations,
+        primary_term,
+        durability,
+        "promotion NoOp",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replicate_explicit_batch_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    operations: &[ReplicaWireOperation],
+    primary_term: u64,
+    durability: TranslogDurability,
+    operation_label: &'static str,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
         None => return Ok(vec![]),
@@ -300,7 +428,7 @@ pub async fn replicate_bulk_with_durability(
             "<routing>",
             None,
             format!(
-                "bulk replication term {primary_term} does not match captured routing term {}",
+                "{operation_label} replication term {primary_term} does not match captured routing term {}",
                 routing.primary_term
             ),
         )]);
@@ -310,8 +438,6 @@ pub async fn replicate_bulk_with_durability(
     if replica_node_ids.is_empty() {
         return Ok(vec![]);
     }
-
-    let docs_owned: Vec<(String, serde_json::Value)> = docs.to_vec();
 
     // Build futures for concurrent replication to all in-sync replicas
     let mut futures = Vec::with_capacity(replica_node_ids.len());
@@ -339,7 +465,7 @@ pub async fn replicate_bulk_with_durability(
         let client = transport_client.clone();
         let idx = index_name.to_string();
         let rid = replica_node_id.to_string();
-        let docs_clone = docs_owned.clone();
+        let operations = operations.to_vec();
         let Some(target_allocation_id) =
             cluster_state.shard_allocation_id(index_name, shard_id, replica_node_id)
         else {
@@ -359,42 +485,20 @@ pub async fn replicate_bulk_with_durability(
         let uuid = index_uuid.clone();
 
         futures.push(tokio::spawn(async move {
-            let ops = match docs_clone
+            let ops = operations
                 .iter()
-                .enumerate()
-                .map(|(offset, (doc_id, payload))| {
-                    let seq_no = start_seq_no
-                        .checked_add(offset as u64)
-                        .ok_or_else(|| "bulk replication sequence range overflows".to_string())?;
-                    let payload_json = serde_json::to_vec(payload)
-                        .map_err(|error| format!("serialize replica payload: {error}"))?;
-                    Ok(ReplicateDocRequest {
-                        index_name: idx.clone(),
-                        shard_id,
-                        doc_id: doc_id.clone(),
-                        payload_json,
-                        op: "index".to_string(),
-                        seq_no,
-                        index_uuid: uuid.clone(),
-                        primary_term: Some(primary_term),
-                        target_allocation_id: Some(target_allocation_id),
-                    })
+                .map(|operation| ReplicateDocRequest {
+                    index_name: idx.clone(),
+                    shard_id,
+                    doc_id: operation.doc_id.clone(),
+                    payload_json: operation.payload_json.clone(),
+                    op: operation.op.clone(),
+                    seq_no: operation.seq_no,
+                    index_uuid: uuid.clone(),
+                    primary_term: Some(primary_term),
+                    target_allocation_id: Some(target_allocation_id),
                 })
-                .collect::<Result<Vec<_>, String>>()
-            {
-                Ok(ops) => ops,
-                Err(error) => {
-                    return (
-                        rid.clone(),
-                        target_allocation_id,
-                        Err(ReplicaReplicationFailure::message(
-                            rid.clone(),
-                            Some(target_allocation_id),
-                            format!("{rid}: {error}"),
-                        )),
-                    );
-                }
-            };
+                .collect();
             match client
                 .replicate_bulk_to_shard(
                     &node_info,
@@ -439,8 +543,8 @@ pub async fn replicate_bulk_with_durability(
             }
             Ok((rid, _, Err(e))) => {
                 error!(
-                    "Bulk replication to {} for {}/shard_{} failed: {}",
-                    rid, index_name, shard_id, e
+                    "{} replication to {} for {}/shard_{} failed: {}",
+                    operation_label, rid, index_name, shard_id, e
                 );
                 errors.push(e);
             }

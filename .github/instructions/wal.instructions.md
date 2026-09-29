@@ -98,6 +98,9 @@ pub trait WriteAheadLog: Send + Sync {
 - `read_bounded_cursor()` paginates by generation and byte offset in physical
   order. Sequence filtering never determines the next cursor, so a physically
   later lower sequence cannot be skipped.
+- Recovery may use `read_bounded_cursor_while()` to stop immediately before the
+  first frame the source has not processed. The returned cursor remains at that
+  frame so source replay can make it eligible without restarting the session.
 - The lock protects only capture and validation of the exclusive head and
   generation-list clone. File scanning runs after releasing it. Recovery scans
   enforce the 32 MiB frame ceiling and use relative seeks for

@@ -151,6 +151,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   before WAL/engine mutation. A higher term is fsynced before mutation. Bulk
   validates the shared envelope and every item before the first mutation and
   advances the fence once.
+- `ReplicateBulk` accepts either contiguous ordered index operations or a
+  strictly increasing, potentially non-contiguous homogeneous NoOp batch.
+  Promotion activation uses bounded NoOp batches rather than one RPC per gap.
 - Successful replica responses carry optional processed and persisted
   checkpoints and must prove the exact single operation or every bulk item was
   processed. A behind contiguous checkpoint is a gap observation, not failure
@@ -171,6 +174,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   `_doc_id`, or missing `_source` on an index
   operation, fails closed; delete operations carry no synthetic source and
   must never be converted back into indexed documents.
+- A catch-up response stops at the first source-unprocessed WAL frame. An empty
+  incomplete response at the unchanged cursor sends the target to
+  `PrepareFinalizeRecovery`, whose exclusive source barrier rebuilds/replays the
+  writer before the remaining suffix is fetched.
 - **peer recovery RPCs**: source sessions are
   UUID/target/allocation/primary-term bound,
   file chunks are at most 1 MiB, operation batches are bounded by count and

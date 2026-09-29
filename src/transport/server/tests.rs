@@ -2578,6 +2578,104 @@ async fn persistent_replica_bulk_wal_io_remains_typed_for_escalation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replica_bulk_accepts_non_contiguous_promotion_noops() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = DomainClusterState::new("promotion-noops".into());
+    state.add_index(DomainIndexMetadata {
+        name: "idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("uuid-1"),
+        number_of_shards: 1,
+        number_of_replicas: 1,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 2,
+                replicas: vec!["node-2".into()],
+                in_sync_replicas: vec!["node-2".into()],
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+    let allocation_id = state.shard_allocation_id("idx", 0, "node-2").unwrap();
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let cluster_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    cluster_manager.update_state(state);
+
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let replica_engine = shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    let service = TransportService {
+        cluster_manager,
+        shard_manager,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-2".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let noop = |seq_no| ReplicateDocRequest {
+        index_name: "idx".into(),
+        shard_id: 0,
+        doc_id: String::new(),
+        payload_json: serde_json::to_vec(&json!({"_reason": "promotion gap"})).unwrap(),
+        op: "noop".into(),
+        seq_no,
+        index_uuid: "uuid-1".into(),
+        primary_term: Some(2),
+        target_allocation_id: Some(allocation_id),
+    };
+
+    let response = service
+        .replicate_bulk(Request::new(ReplicateBulkRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            ops: vec![noop(0), noop(2)],
+            index_uuid: "uuid-1".into(),
+            primary_term: Some(2),
+            target_allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.success, "{}", response.error);
+    assert!(response.all_operations_processed);
+    assert!(response.all_operations_persisted);
+    assert_eq!(
+        replica_engine.sequence_stats().processed_checkpoint,
+        Some(0)
+    );
+    assert_eq!(replica_engine.sequence_stats().max_seq_no, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_clears_on_write() {
     let dir = tempfile::tempdir().unwrap();
     let (raft, shared_state) = crate::consensus::create_raft_instance_mem(1, "primary-io".into())

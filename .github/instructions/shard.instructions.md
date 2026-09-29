@@ -56,6 +56,10 @@ pub struct ShardManager {
 - Assigned opens load and validate the file before publishing an engine.
   Missing, malformed, or mismatched identity fails closed.
 - Identity, marker, WAL, and Tantivy decode/validation failures are definitive.
+  Sequence-state corruption, including disagreement between the durable
+  identity fence maximum and the committed term-start maximum, is also
+  definitive and must fail the exact copy instead of consuming the I/O retry
+  window.
   Other filesystem/engine I/O uses a shared per-copy retry budget: exponential
   1–5 second backoff, at least three failed attempts, and a 60-second minimum
   window before persistent-I/O escalation.
@@ -84,6 +88,9 @@ pub struct ShardManager {
   verified recovery install.
 - Pre-1.0 or unknown copy identity versions are never adopted or upgraded.
   They use the shared unsupported-format error and require index recreation.
+- `fence_max_seq_no` is captured and persisted only when a copy fence advances
+  (or when peer recovery creates a new identity). Ordinary assigned-copy open
+  validates and reconciles that value but never rewrites it.
 - A stale exact `SHARD_COPY_IDENTITY.json.tmp` is removed before the
   initial-primary empty-directory check. Local/test helpers load and preserve
   an existing durable identity rather than overwriting it with allocation `1`.

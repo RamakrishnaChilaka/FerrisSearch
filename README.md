@@ -266,9 +266,10 @@ coordinator-side merge semantics are required.
 - Gap-aware processed and persisted checkpoints, with explicit `None` distinct
   from sequence zero and persisted-prefix global checkpoint calculation
 - Bounded file-based peer recovery for initial, later-added, and rejoining replicas:
-  exact committed-boundary installation, pinned physical-order WAL streaming,
-  processed-checkpoint finalization, a final write barrier, and allocation-bound
-  conditional in-sync admission
+  gap-free committed-boundary installation, pinned physical-order WAL streaming
+  that pauses at source-unapplied frames, processed-checkpoint finalization, a
+  final replaying write barrier, and allocation-bound conditional in-sync
+  admission
 - Raft-owned shard-copy allocation IDs, durable local copy identity, and
   replica primary-term fencing before WAL mutation
 - Fail-closed copy startup with immediate corruption reporting, bounded

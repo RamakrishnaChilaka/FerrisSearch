@@ -188,6 +188,14 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   existing committed segment components plus
   `meta.json`/`.managed.json`. Tantivy's `SegmentMeta::list_files()` can name
   optional absent components; transfer only files that actually exist.
+- Snapshot installation does not transfer the live processed interval set above
+  a gap. Source snapshot creation therefore requires
+  `processed_checkpoint == max_seq_no`; a gapful source retries after local
+  replay/activation closes the gap instead of publishing a lossy boundary.
+- Catch-up scanning stops the physical cursor before the first WAL frame not
+  yet processed by the source. The target then enters finalization, whose
+  exclusive barrier rebuilds/replays a failed source writer before serving the
+  remaining suffix from that same cursor.
 - A persisted committed checkpoint and any WAL truncation must be derived from
   a successful Tantivy commit boundary. Never advance or prune past operations
   that the corresponding commit did not make durable.
