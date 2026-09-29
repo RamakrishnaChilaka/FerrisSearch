@@ -116,9 +116,9 @@ class TraceConverterTests(unittest.TestCase):
         self.assertIn("Trace == <<", module)
         self.assertIn("SPECIFICATION TraceSpec", config)
 
-    def test_v2_is_rejected(self) -> None:
+    def test_v3_is_rejected(self) -> None:
         start = start_record()
-        start["schema"] = "ferrissearch.d1.trace/v2"
+        start["schema"] = "ferrissearch.d1.trace/v3"
         path = self.write_trace([start, end_record(1, 1)])
         with self.assertRaisesRegex(trace_to_tla.TraceSchemaError, "unsupported schema"):
             trace_to_tla.load_trace(path)

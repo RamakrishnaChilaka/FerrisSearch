@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate schema-v3 D1 JSONL and generate TLC trace inputs."""
+"""Validate schema-v4 D1 JSONL and generate TLC trace inputs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "ferrissearch.d1.trace/v3"
+SCHEMA = "ferrissearch.d1.trace/v4"
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 START_FIELDS = {
@@ -81,6 +81,7 @@ EVENT_FIELDS = {
         "index_uuid",
         "shard",
         "allocation",
+        "source_incarnation",
         "request_id",
         "receipt_id",
         "term",
@@ -95,6 +96,7 @@ EVENT_FIELDS = {
         "allocation",
         "source_node",
         "source_incarnation",
+        "message_id",
         "receipt_id",
         "term",
         "seq_no",
@@ -108,8 +110,11 @@ EVENT_FIELDS = {
         "shard",
         "request_id",
         "receipt_id",
+        "message_id",
         "replica",
+        "replica_incarnation",
         "outcome",
+        "message_phase",
         "persisted_checkpoint",
     },
     "client_result": {
@@ -152,7 +157,13 @@ EVENT_FIELDS = {
         "allocation",
         "truncate_through",
     },
-    "node_crashed": {"node", "incarnation", "outcome"},
+    "node_crashed": {
+        "node",
+        "incarnation",
+        "outcome",
+        "failed_request_ids",
+        "dropped_messages",
+    },
     "node_restarted": {
         "node",
         "incarnation",
@@ -176,6 +187,7 @@ EVENT_FIELDS = {
         "allocation",
         "replay_id",
         "ordinal",
+        "receipt_id",
         "term",
         "seq_no",
         "doc",
@@ -230,9 +242,56 @@ EVENT_FIELDS = {
         "index_uuid",
         "shard",
         "allocation",
+        "batch_id",
         "term",
-        "filled_seqs",
+        "noops",
         "checkpoints",
+    },
+    "promotion_noop_replication_started": {
+        "node",
+        "index_uuid",
+        "shard",
+        "allocation",
+        "source_incarnation",
+        "batch_id",
+        "receipt_id",
+        "message_id",
+        "term",
+        "seq_no",
+        "content_hash",
+        "replica",
+        "replica_allocation",
+        "replica_incarnation",
+    },
+    "promotion_noop_received": {
+        "node",
+        "index_uuid",
+        "shard",
+        "allocation",
+        "source_node",
+        "source_incarnation",
+        "batch_id",
+        "receipt_id",
+        "message_id",
+        "term",
+        "seq_no",
+        "content_hash",
+    },
+    "promotion_noop_result": {
+        "node",
+        "index_uuid",
+        "shard",
+        "allocation",
+        "batch_id",
+        "receipt_id",
+        "message_id",
+        "term",
+        "seq_no",
+        "replica",
+        "replica_incarnation",
+        "outcome",
+        "message_phase",
+        "persisted_checkpoint",
     },
     "in_sync_removed": {
         "emitter",
@@ -303,6 +362,8 @@ COPY_DOCUMENT_FIELDS = {
     "term",
     "content_hash",
 }
+NOOP_FIELDS = {"receipt_id", "seq_no", "content_hash"}
+CRASH_MESSAGE_FIELDS = {"message_id", "message_phase"}
 
 
 class TraceSchemaError(ValueError):
@@ -508,10 +569,25 @@ def validate_event(
     for field in ("term",):
         if field in value:
             integer(value[field], line, field, positive=True)
-    for field in ("seq_no", "ordinal", "routing_version", "truncate_through"):
+    for field in (
+        "seq_no",
+        "ordinal",
+        "routing_version",
+        "truncate_through",
+        "source_incarnation",
+        "replica_incarnation",
+        "replica_allocation",
+    ):
         if field in value:
             integer(value[field], line, field)
-    for field in ("request_id", "receipt_id", "commit_id", "replay_id"):
+    for field in (
+        "request_id",
+        "receipt_id",
+        "commit_id",
+        "replay_id",
+        "batch_id",
+        "message_id",
+    ):
         if field in value:
             string(value[field], line, field, nullable=field == "request_id")
     if "content_hash" in value:
@@ -556,13 +632,18 @@ def validate_event(
         for replica in required:
             if not isinstance(replica, dict):
                 fail(line, "required replica must be an object")
-            exact_fields(replica, {"node", "allocation", "incarnation"}, line)
+            exact_fields(
+                replica,
+                {"node", "allocation", "incarnation", "message_id"},
+                line,
+            )
             node = string(replica["node"], line, "required node")
             if node not in nodes or node <= previous:
                 fail(line, "required_replicas must be unique and sorted")
             previous = node
             integer(replica["allocation"], line, "required allocation", positive=True)
             integer(replica["incarnation"], line, "required incarnation")
+            string(replica["message_id"], line, "required message_id")
     elif event == "replica_received":
         if value["source_node"] not in nodes:
             fail(line, "source_node is not declared")
@@ -577,6 +658,15 @@ def validate_event(
             "timeout",
         }:
             fail(line, "replica_result outcome is invalid")
+        if value["message_phase"] not in {"request", "ack", "nack", "none"}:
+            fail(line, "replica_result message_phase is invalid")
+        if (
+            value["outcome"] == "acknowledged"
+            and value["message_phase"] != "ack"
+        ):
+            fail(line, "acknowledged replica result requires ack phase")
+        if value["outcome"] == "failed" and value["message_phase"] != "nack":
+            fail(line, "failed replica result requires nack phase")
         integer(
             value["persisted_checkpoint"],
             line,
@@ -617,6 +707,33 @@ def validate_event(
         integer(value["incarnation"], line, "incarnation")
         if value["outcome"] not in {"clean", "unclean"}:
             fail(line, "crash outcome is invalid")
+        if (
+            not isinstance(value["failed_request_ids"], list)
+            or value["failed_request_ids"]
+            != sorted(set(value["failed_request_ids"]))
+        ):
+            fail(line, "failed_request_ids must be unique and sorted")
+        for request_id in value["failed_request_ids"]:
+            string(request_id, line, "failed_request_ids item")
+        if not isinstance(value["dropped_messages"], list):
+            fail(line, "dropped_messages must be an array")
+        dropped_order: list[tuple[str, str]] = []
+        for dropped in value["dropped_messages"]:
+            if not isinstance(dropped, dict):
+                fail(line, "dropped message must be an object")
+            exact_fields(dropped, CRASH_MESSAGE_FIELDS, line)
+            message_id = string(
+                dropped["message_id"], line, "dropped message_id"
+            )
+            phase = string(
+                dropped["message_phase"], line, "dropped message_phase"
+            )
+            if phase not in {"request", "ack", "nack"}:
+                fail(line, "dropped message phase is invalid")
+            assert message_id is not None and phase is not None
+            dropped_order.append((message_id, phase))
+        if dropped_order != sorted(set(dropped_order)):
+            fail(line, "dropped_messages must be unique and sorted")
     elif event == "node_restarted":
         integer(value["incarnation"], line, "incarnation")
     elif event == "replay_entry":
@@ -679,14 +796,63 @@ def validate_event(
         integer(value["term"], line, "activation term", positive=True)
     elif event == "promotion_noop_fill":
         integer(value["term"], line, "noop-fill term", positive=True)
+        if not isinstance(value["noops"], list):
+            fail(line, "noops must be an array")
+        sequences: list[int] = []
+        receipts: set[str] = set()
+        for noop in value["noops"]:
+            if not isinstance(noop, dict):
+                fail(line, "NoOp entry must be an object")
+            exact_fields(noop, NOOP_FIELDS, line)
+            receipt = string(noop["receipt_id"], line, "NoOp receipt_id")
+            sequence = integer(noop["seq_no"], line, "NoOp seq_no")
+            digest = string(noop["content_hash"], line, "NoOp content_hash")
+            assert receipt is not None and sequence is not None and digest is not None
+            if receipt in receipts:
+                fail(line, "NoOp receipt_id was duplicated")
+            if not HASH_RE.fullmatch(digest):
+                fail(line, "NoOp content_hash must be lowercase SHA-256")
+            receipts.add(receipt)
+            sequences.append(sequence)
+        if sequences != sorted(set(sequences)):
+            fail(line, "NoOps must be unique and sorted by seq_no")
+    elif event == "promotion_noop_replication_started":
+        if value["replica"] not in nodes:
+            fail(line, "promotion NoOp replica is not declared")
+        integer(
+            value["replica_allocation"],
+            line,
+            "replica_allocation",
+            positive=True,
+        )
+    elif event == "promotion_noop_received":
+        if value["source_node"] not in nodes:
+            fail(line, "promotion NoOp source is not declared")
+    elif event == "promotion_noop_result":
+        if value["replica"] not in nodes:
+            fail(line, "promotion NoOp replica is not declared")
+        if value["outcome"] not in {
+            "acknowledged",
+            "failed",
+            "dropped",
+            "timeout",
+        }:
+            fail(line, "promotion NoOp result outcome is invalid")
+        if value["message_phase"] not in {"request", "ack", "nack", "none"}:
+            fail(line, "promotion NoOp result message_phase is invalid")
         if (
-            not isinstance(value["filled_seqs"], list)
-            or any(
-                isinstance(item, bool) or not isinstance(item, int) or item < 0
-                for item in value["filled_seqs"]
-            )
+            value["outcome"] == "acknowledged"
+            and value["message_phase"] != "ack"
         ):
-            fail(line, "filled_seqs must be non-negative integers")
+            fail(line, "acknowledged promotion NoOp requires ack phase")
+        if value["outcome"] == "failed" and value["message_phase"] != "nack":
+            fail(line, "failed promotion NoOp requires nack phase")
+        integer(
+            value["persisted_checkpoint"],
+            line,
+            "persisted_checkpoint",
+            nullable=True,
+        )
     elif event == "in_sync_removed":
         if value["emitter"] not in nodes or value["removed_node"] not in nodes:
             fail(line, "in-sync removal nodes are not declared")
@@ -777,7 +943,15 @@ def load_trace(path: Path) -> LoadedTrace:
         for event in events
     )
     has_authority = bool(
-        kinds & {"routing_promoted", "primary_activated", "promotion_noop_fill"}
+        kinds
+        & {
+            "routing_promoted",
+            "primary_activated",
+            "promotion_noop_fill",
+            "promotion_noop_replication_started",
+            "promotion_noop_received",
+            "promotion_noop_result",
+        }
     )
     has_data = bool(
         kinds
@@ -791,6 +965,8 @@ def load_trace(path: Path) -> LoadedTrace:
             "replay_entry",
             "replay_finished",
             "wal_truncated",
+            "promotion_noop_received",
+            "promotion_noop_result",
         }
     )
     has_client_write = "client_write_routed" in kinds
@@ -862,6 +1038,9 @@ def load_trace(path: Path) -> LoadedTrace:
             "routing_promoted",
             "in_sync_removed",
             "promotion_noop_fill",
+            "promotion_noop_replication_started",
+            "promotion_noop_received",
+            "promotion_noop_result",
             "primary_activated",
             "copy_state",
         },
@@ -900,7 +1079,7 @@ def load_trace(path: Path) -> LoadedTrace:
     end = records[-1]
     exact_fields(end, END_FIELDS, len(records))
     if end["schema"] != SCHEMA:
-        fail(len(records), "trace_end schema does not match v3")
+        fail(len(records), "trace_end schema does not match v4")
     if end["run_id"] != start["run_id"]:
         fail(len(records), "trace_end run_id does not match")
     if integer(end["step"], len(records), "step") != len(records) - 1:
@@ -921,9 +1100,12 @@ def load_trace(path: Path) -> LoadedTrace:
     processed_by_copy: set[tuple[str, str]] = set()
     required_by_request: dict[str, set[str]] = {}
     acked_by_request: dict[str, set[str]] = {}
+    request_state: dict[str, str] = {}
+    request_primary: dict[str, str] = {}
     commits: dict[str, dict[str, Any]] = {}
     replay_active: dict[str, str] = {}
     replay_ordinal: dict[str, int] = {}
+    replay_next_position: dict[str, int] = {}
     last_copy_state = -1
     copy_state_steps: dict[str, int] = {}
     available = {
@@ -945,136 +1127,448 @@ def load_trace(path: Path) -> LoadedTrace:
         }
         for item in start["nodes"]
     }
+    node_incarnations = {
+        item["node"]: item["incarnation"] for item in start["nodes"]
+    }
+    message_attempts: dict[str, dict[str, Any]] = {}
+    attempt_by_receipt_target: dict[tuple[str, str], str] = {}
+    noop_batches: dict[str, dict[str, Any]] = {}
+    wal_entries_by_node: dict[str, list[str]] = {
+        item["node"]: [] for item in start["nodes"]
+    }
+
+    def register_identity(
+        ident: tuple[int, int],
+        content: dict[str, Any],
+        line: int,
+    ) -> None:
+        if ident in identities and identities[ident] != content:
+            fail(line, f"operation identity {ident} changed content")
+        identities.setdefault(ident, content)
+
+    def register_receipt(
+        receipt: str,
+        ident: tuple[int, int] | None,
+        line: int,
+    ) -> None:
+        if ident is None:
+            fail(line, f"receipt {receipt!r} has no operation identity")
+        if receipt in receipts and receipts[receipt] != ident:
+            fail(line, f"receipt {receipt!r} changed operation identity")
+        receipts.setdefault(receipt, ident)
+
+    def register_attempt(
+        attempt: dict[str, Any],
+        line: int,
+    ) -> None:
+        message_id = attempt["message_id"]
+        key = (attempt["receipt_id"], attempt["target"])
+        if message_id in message_attempts:
+            fail(line, f"message_id {message_id!r} was reused")
+        if key in attempt_by_receipt_target:
+            fail(
+                line,
+                "receipt/target already has a transport attempt: "
+                f"{attempt['receipt_id']!r}/{attempt['target']!r}",
+            )
+        message_attempts[message_id] = attempt
+        attempt_by_receipt_target[key] = message_id
+
+    def attempt_destination(attempt: dict[str, Any]) -> str | None:
+        phase = attempt["phase"]
+        if phase == "request":
+            return attempt["target"]
+        if phase in {"ack", "nack"}:
+            return attempt["source"]
+        return None
+
+    def clear_write_attempts(request: str) -> None:
+        for attempt in message_attempts.values():
+            if attempt["type"] == "write" and attempt["request_id"] == request:
+                attempt["phase"] = None
 
     for event in events:
         kind = event["event"]
+        line = event["step"] + 1
         if kind not in {"copy_state", "routing_view"}:
             last_non_observation_step = event["step"]
         request = event.get("request_id")
         ident = identity(event)
         if ident is not None and "content_hash" in event:
-            content = {
-                "doc": event.get("doc"),
-                "op": event.get("op"),
-                "content_hash": event["content_hash"],
-            }
-            if ident in identities and identities[ident] != content:
-                fail(event["step"] + 1, f"operation identity {ident} changed content")
-            identities.setdefault(ident, content)
+            operation_kind = event.get("op")
+            if kind.startswith("promotion_noop_"):
+                operation_kind = "noop"
+            register_identity(
+                ident,
+                {
+                    "doc": event.get("doc"),
+                    "op": operation_kind,
+                    "content_hash": event["content_hash"],
+                },
+                line,
+            )
+
         if kind == "client_write_routed":
             assert request is not None
             if request in request_ids:
-                fail(event["step"] + 1, f"request_id {request!r} was reused")
+                fail(line, f"request_id {request!r} was reused")
             request_ids[request] = len(request_ids) + 1
             routed[request] = event
             acked_by_request[request] = set()
+            request_state[request] = "Routed"
+
         elif kind == "wal_appended":
+            receipt = event["receipt_id"]
             if event["origin"] == "primary" and request not in routed:
-                fail(event["step"] + 1, "primary WAL append has no routed request")
-            receipts[event["receipt_id"]] = ident  # type: ignore[assignment]
-            wal_by_receipt[event["receipt_id"]] = event
-            wal_by_copy.add((event["receipt_id"], event["node"]))
+                fail(line, "primary WAL append has no routed request")
+            register_receipt(receipt, ident, line)
+            copy_key = (receipt, event["node"])
+            if copy_key in wal_by_copy:
+                fail(line, "WAL receipt was appended twice on one copy")
+            wal_by_receipt.setdefault(receipt, event)
+            wal_by_copy.add(copy_key)
+            wal_entries_by_node[event["node"]].append(receipt)
+            if event["origin"] == "live_replication":
+                message_id = attempt_by_receipt_target.get(copy_key)
+                if message_id is None and profile != "d1-collision":
+                    fail(line, "live-replication WAL append has no message attempt")
+                if message_id is not None:
+                    event["_message_id"] = message_id
+
         elif kind == "operation_processed":
             receipt = event["receipt_id"]
-            if (receipt, event["node"]) not in wal_by_copy and event["outcome"] not in {
-                "redelivery",
-                "collision",
-            }:
-                fail(event["step"] + 1, "processed operation has no WAL append")
+            if copy_key := attempt_by_receipt_target.get(
+                (receipt, event["node"])
+            ):
+                event["_message_id"] = copy_key
+            if (
+                (receipt, event["node"]) not in wal_by_copy
+                and event["outcome"] not in {"redelivery", "collision"}
+            ):
+                fail(line, "processed operation has no WAL append")
+            if (
+                event["origin"] == "live_replication"
+                and "_message_id" not in event
+                and profile != "d1-collision"
+            ):
+                fail(line, "processed live operation has no message attempt")
             process_by_receipt[receipt] = event
             processed_by_copy.add((receipt, event["node"]))
+            if event["origin"] == "primary":
+                if request not in routed:
+                    fail(line, "primary process has no routed request")
+                request_state[request] = "Replicating"
+                request_primary[request] = event["node"]
+            if "_message_id" in event:
+                attempt = message_attempts[event["_message_id"]]
+                if attempt["phase"] != "request":
+                    fail(line, "processed operation does not own a request message")
+                attempt["phase"] = (
+                    "nack"
+                    if event["outcome"] in {"collision", "apply_failed"}
+                    else "ack"
+                )
+
         elif kind == "primary_replication_started":
             if request not in routed:
-                fail(event["step"] + 1, "replication start has no routed request")
+                fail(line, "replication start has no routed request")
             receipt = event["receipt_id"]
             if receipt not in wal_by_receipt or receipt not in process_by_receipt:
-                fail(event["step"] + 1, "replication start lacks WAL/apply observations")
+                fail(line, "replication start lacks WAL/apply observations")
             if receipts[receipt] != ident:
-                fail(event["step"] + 1, "replication receipt identity changed")
+                fail(line, "replication receipt identity changed")
+            if event["source_incarnation"] != node_incarnations[event["node"]]:
+                fail(line, "replication source_incarnation is stale")
             required_by_request[request] = {
                 item["node"] for item in event["required_replicas"]
             }
             view = latest_views[event["node"]]
             if required_by_request[request] != view["in_sync"]:
                 fail(
-                    event["step"] + 1,
+                    line,
                     "required_replicas must equal the primary node's in-sync view",
                 )
+            required_message_ids: list[str] = []
             for replica in event["required_replicas"]:
                 if replica["allocation"] != view["allocations"][replica["node"]]:
                     fail(
-                        event["step"] + 1,
+                        line,
                         "required replica allocation does not match the primary view",
                     )
+                if replica["incarnation"] != node_incarnations[replica["node"]]:
+                    fail(line, "required replica incarnation is stale")
+                required_message_ids.append(replica["message_id"])
+                register_attempt(
+                    {
+                        "type": "write",
+                        "message_id": replica["message_id"],
+                        "request_id": request,
+                        "receipt_id": receipt,
+                        "term": event["term"],
+                        "seq_no": event["seq_no"],
+                        "source": event["node"],
+                        "source_incarnation": event["source_incarnation"],
+                        "target": replica["node"],
+                        "target_incarnation": replica["incarnation"],
+                        "target_allocation": replica["allocation"],
+                        "phase": "request",
+                    },
+                    line,
+                )
+            event["_required_message_ids"] = required_message_ids
+
         elif kind == "replica_received":
-            if event["receipt_id"] not in receipts:
-                fail(event["step"] + 1, "replica receipt is unknown")
+            message_id = event["message_id"]
+            attempt = message_attempts.get(message_id)
+            if attempt is None or attempt["type"] != "write":
+                fail(line, "replica receipt names an unknown write message")
+            if (
+                attempt["phase"] != "request"
+                or attempt["receipt_id"] != event["receipt_id"]
+                or attempt["target"] != event["node"]
+                or attempt["source"] != event["source_node"]
+                or attempt["source_incarnation"] != event["source_incarnation"]
+                or attempt["term"] != event["term"]
+                or attempt["seq_no"] != event["seq_no"]
+                or attempt["target_allocation"] != event["allocation"]
+            ):
+                fail(line, "replica receipt does not match its message attempt")
+            event["_message_id"] = message_id
+
         elif kind == "replica_result":
             if request not in required_by_request:
-                fail(event["step"] + 1, "replica result has no replication start")
+                fail(line, "replica result has no replication start")
+            message_id = event["message_id"]
+            attempt = message_attempts.get(message_id)
+            if attempt is None or attempt["type"] != "write":
+                fail(line, "replica result names an unknown write message")
+            if (
+                attempt["request_id"] != request
+                or attempt["receipt_id"] != event["receipt_id"]
+                or attempt["target"] != event["replica"]
+                or attempt["target_incarnation"] != event["replica_incarnation"]
+            ):
+                fail(line, "replica result does not match its message attempt")
+            if event["message_phase"] == "none":
+                if attempt["phase"] is not None:
+                    fail(line, "replica result claims no message while one is in flight")
+            elif attempt["phase"] != event["message_phase"]:
+                fail(line, "replica result message phase does not match")
             if event["outcome"] == "acknowledged":
                 receipt = event["receipt_id"]
                 if (receipt, event["replica"]) not in processed_by_copy:
-                    fail(event["step"] + 1, "replica ack has no processed operation")
+                    fail(line, "replica ack has no processed operation")
                 acked_by_request[request].add(event["replica"])
-        elif kind == "client_result" and event["outcome"] == "acknowledged":
-            if request not in required_by_request:
-                fail(event["step"] + 1, "client ack has no replication start")
-            missing = required_by_request[request] - acked_by_request[request]
-            if missing:
-                fail(
-                    event["step"] + 1,
-                    "client ack is missing required replica(s): "
-                    + ", ".join(sorted(missing)),
-                )
-            if start["durability"] == "request":
-                receipt = next(
-                    item["receipt_id"]
-                    for item in events
-                    if item["event"] == "primary_replication_started"
-                    and item["request_id"] == request
-                )
-                primary_wals = [
-                    item
-                    for item in events
-                    if item["event"] == "wal_appended"
-                    and item["receipt_id"] == receipt
-                    and item["origin"] == "primary"
-                ]
-                if len(primary_wals) != 1 or not primary_wals[0]["durable"]:
-                    fail(event["step"] + 1, "request-durable primary WAL is not durable")
-                for replica in required_by_request[request]:
-                    replica_wals = [
+            if event["outcome"] == "failed":
+                clear_write_attempts(request)
+                request_state[request] = "Failed"
+            else:
+                attempt["phase"] = None
+            event["_message_id"] = message_id
+
+        elif kind == "client_result":
+            assert request is not None
+            if event["outcome"] == "acknowledged":
+                if request not in required_by_request:
+                    fail(line, "client ack has no replication start")
+                missing = required_by_request[request] - acked_by_request[request]
+                if missing:
+                    fail(
+                        line,
+                        "client ack is missing required replica(s): "
+                        + ", ".join(sorted(missing)),
+                    )
+                if start["durability"] == "request":
+                    receipt = next(
+                        item["receipt_id"]
+                        for item in events
+                        if item["event"] == "primary_replication_started"
+                        and item["request_id"] == request
+                    )
+                    primary_wals = [
                         item
                         for item in events
                         if item["event"] == "wal_appended"
                         and item["receipt_id"] == receipt
-                        and item["node"] == replica
+                        and item["origin"] == "primary"
                     ]
-                    if len(replica_wals) != 1 or not replica_wals[0]["durable"]:
-                        fail(
-                            event["step"] + 1,
-                            f"request-durable replica WAL is not durable: {replica}",
-                        )
+                    if len(primary_wals) != 1 or not primary_wals[0]["durable"]:
+                        fail(line, "request-durable primary WAL is not durable")
+                    for replica in required_by_request[request]:
+                        replica_wals = [
+                            item
+                            for item in events
+                            if item["event"] == "wal_appended"
+                            and item["receipt_id"] == receipt
+                            and item["node"] == replica
+                        ]
+                        if len(replica_wals) != 1 or not replica_wals[0]["durable"]:
+                            fail(
+                                line,
+                                "request-durable replica WAL is not durable: "
+                                f"{replica}",
+                            )
+                request_state[request] = "Acked"
+            else:
+                request_state[request] = "Failed"
+                clear_write_attempts(request)
+
         elif kind == "commit_captured":
             commits[event["commit_id"]] = event
+
         elif kind == "commit_persisted":
             if event["commit_id"] not in commits:
-                fail(event["step"] + 1, "commit_persisted has no captured boundary")
+                fail(line, "commit_persisted has no captured boundary")
+
+        elif kind == "promotion_noop_fill":
+            batch_id = event["batch_id"]
+            if batch_id in noop_batches:
+                fail(line, f"promotion NoOp batch {batch_id!r} was reused")
+            noops: dict[str, dict[str, Any]] = {}
+            for noop in event["noops"]:
+                noop_ident = (event["term"], noop["seq_no"])
+                content = {
+                    "doc": None,
+                    "op": "noop",
+                    "content_hash": noop["content_hash"],
+                }
+                register_identity(noop_ident, content, line)
+                register_receipt(noop["receipt_id"], noop_ident, line)
+                if (noop["receipt_id"], event["node"]) in wal_by_copy:
+                    fail(line, "promotion NoOp receipt already exists on primary")
+                wal_by_copy.add((noop["receipt_id"], event["node"]))
+                wal_entries_by_node[event["node"]].append(noop["receipt_id"])
+                noops[noop["receipt_id"]] = noop
+            expected_targets = set(latest_views[event["node"]]["in_sync"])
+            noop_batches[batch_id] = {
+                "event": event,
+                "node": event["node"],
+                "term": event["term"],
+                "noops": noops,
+                "expected_targets": expected_targets,
+                "message_ids": [],
+            }
+
+        elif kind == "promotion_noop_replication_started":
+            batch = noop_batches.get(event["batch_id"])
+            if batch is None:
+                fail(line, "promotion NoOp send has no fill batch")
+            noop = batch["noops"].get(event["receipt_id"])
+            if noop is None:
+                fail(line, "promotion NoOp send has an unknown receipt")
+            view = latest_views[event["node"]]
+            if (
+                batch["node"] != event["node"]
+                or batch["term"] != event["term"]
+                or noop["seq_no"] != event["seq_no"]
+                or noop["content_hash"] != event["content_hash"]
+                or event["source_incarnation"] != node_incarnations[event["node"]]
+                or event["replica"] not in batch["expected_targets"]
+                or event["replica_allocation"]
+                != view["allocations"][event["replica"]]
+                or event["replica_incarnation"]
+                != node_incarnations[event["replica"]]
+            ):
+                fail(line, "promotion NoOp send does not match its fill/view")
+            register_attempt(
+                {
+                    "type": "noop",
+                    "message_id": event["message_id"],
+                    "request_id": None,
+                    "receipt_id": event["receipt_id"],
+                    "term": event["term"],
+                    "seq_no": event["seq_no"],
+                    "source": event["node"],
+                    "source_incarnation": event["source_incarnation"],
+                    "target": event["replica"],
+                    "target_incarnation": event["replica_incarnation"],
+                    "target_allocation": event["replica_allocation"],
+                    "phase": "request",
+                },
+                line,
+            )
+            batch["message_ids"].append(event["message_id"])
+            event["_message_id"] = event["message_id"]
+
+        elif kind == "promotion_noop_received":
+            message_id = event["message_id"]
+            attempt = message_attempts.get(message_id)
+            if attempt is None or attempt["type"] != "noop":
+                fail(line, "promotion NoOp receipt names an unknown message")
+            if (
+                attempt["phase"] != "request"
+                or attempt["receipt_id"] != event["receipt_id"]
+                or attempt["target"] != event["node"]
+                or attempt["source"] != event["source_node"]
+                or attempt["source_incarnation"] != event["source_incarnation"]
+                or attempt["term"] != event["term"]
+                or attempt["seq_no"] != event["seq_no"]
+                or attempt["target_allocation"] != event["allocation"]
+            ):
+                fail(line, "promotion NoOp receipt does not match its message")
+            event["_message_id"] = message_id
+
+        elif kind == "promotion_noop_result":
+            message_id = event["message_id"]
+            attempt = message_attempts.get(message_id)
+            if attempt is None or attempt["type"] != "noop":
+                fail(line, "promotion NoOp result names an unknown message")
+            if (
+                attempt["receipt_id"] != event["receipt_id"]
+                or attempt["source"] != event["node"]
+                or attempt["target"] != event["replica"]
+                or attempt["target_incarnation"] != event["replica_incarnation"]
+                or attempt["term"] != event["term"]
+                or attempt["seq_no"] != event["seq_no"]
+            ):
+                fail(line, "promotion NoOp result does not match its message")
+            if event["message_phase"] == "none":
+                if attempt["phase"] is not None:
+                    fail(line, "promotion NoOp result claims no in-flight message")
+            elif attempt["phase"] != event["message_phase"]:
+                fail(line, "promotion NoOp result message phase does not match")
+            if (
+                event["outcome"] == "acknowledged"
+                and (event["receipt_id"], event["replica"])
+                not in processed_by_copy
+            ):
+                fail(line, "promotion NoOp ack has no processed operation")
+            attempt["phase"] = None
+            event["_message_id"] = message_id
+
         elif kind == "replay_started":
             replay_active[event["node"]] = event["replay_id"]
             replay_ordinal[event["node"]] = 0
+            replay_next_position[event["node"]] = 1
+
         elif kind == "replay_entry":
             if replay_active.get(event["node"]) != event["replay_id"]:
-                fail(event["step"] + 1, "replay_entry has no active replay")
+                fail(line, "replay_entry has no active replay")
             expected = replay_ordinal[event["node"]]
             if event["ordinal"] != expected:
-                fail(event["step"] + 1, f"replay ordinal must be {expected}")
+                fail(line, f"replay ordinal must be {expected}")
+            receipt = event["receipt_id"]
+            if receipt not in receipts:
+                fail(line, "replay_entry names an unknown WAL receipt")
+            if receipts[receipt] != ident:
+                fail(line, "replay_entry receipt identity changed")
+            try:
+                position = wal_entries_by_node[event["node"]].index(receipt) + 1
+            except ValueError:
+                fail(line, "replay_entry receipt is absent from the copy WAL")
+            event["_wal_position"] = position
+            replay_next_position[event["node"]] = position + 1
             replay_ordinal[event["node"]] = expected + 1
+
         elif kind == "replay_finished":
             if replay_active.get(event["node"]) != event["replay_id"]:
-                fail(event["step"] + 1, "replay_finished has no active replay")
+                fail(line, "replay_finished has no active replay")
             replay_active.pop(event["node"])
+            event["_wal_position"] = (
+                len(wal_entries_by_node[event["node"]]) + 1
+                if event["outcome"] == "completed"
+                else replay_next_position[event["node"]]
+            )
             if event["outcome"] == "completed" and event["node"] in {
                 current_primary,
                 *start["shard_state"]["in_sync"],
@@ -1082,17 +1576,19 @@ def load_trace(path: Path) -> LoadedTrace:
                 available.add(event["node"])
             elif event["outcome"] == "failed":
                 available.discard(event["node"])
+
         elif kind == "copy_state":
             for document in event["documents"]:
                 if document["state"] == "absent":
                     continue
-                ident = (document["term"], document["seq_no"])
-                if ident not in identities:
+                document_ident = (document["term"], document["seq_no"])
+                if document_ident not in identities:
                     fail(
-                        event["step"] + 1,
-                        f"copy_state references unknown operation identity {ident}",
+                        line,
+                        "copy_state references unknown operation identity "
+                        f"{document_ident}",
                     )
-                operation = identities[ident]
+                operation = identities[document_ident]
                 expected_kind = (
                     "delete" if document["state"] == "deleted" else "index"
                 )
@@ -1102,11 +1598,12 @@ def load_trace(path: Path) -> LoadedTrace:
                     or operation["content_hash"] != document["content_hash"]
                 ):
                     fail(
-                        event["step"] + 1,
+                        line,
                         "copy_state document does not match the traced operation",
                     )
             last_copy_state = event["step"]
             copy_state_steps[event["node"]] = event["step"]
+
         elif kind == "routing_view":
             latest_views[event["node"]] = {
                 "primary": event["primary"],
@@ -1117,10 +1614,43 @@ def load_trace(path: Path) -> LoadedTrace:
                     for item in event["allocations"]
                 },
             }
+
         elif kind == "node_crashed":
+            if event["incarnation"] != node_incarnations[event["node"]]:
+                fail(line, "node_crashed incarnation is stale")
+            expected_failed = sorted(
+                request_id
+                for request_id, state in request_state.items()
+                if state == "Replicating"
+                and request_primary.get(request_id) == event["node"]
+            )
+            if event["failed_request_ids"] != expected_failed:
+                fail(line, "node_crashed failed_request_ids do not match")
+            expected_dropped = sorted(
+                (
+                    {
+                        "message_id": message_id,
+                        "message_phase": attempt["phase"],
+                    }
+                    for message_id, attempt in message_attempts.items()
+                    if attempt_destination(attempt) == event["node"]
+                ),
+                key=lambda item: (item["message_id"], item["message_phase"]),
+            )
+            if event["dropped_messages"] != expected_dropped:
+                fail(line, "node_crashed dropped_messages do not match")
+            for dropped in expected_dropped:
+                message_attempts[dropped["message_id"]]["phase"] = None
+            for request_id in expected_failed:
+                request_state[request_id] = "Failed"
             available.discard(event["node"])
+
         elif kind == "node_restarted":
+            if event["incarnation"] != node_incarnations[event["node"]] + 1:
+                fail(line, "node_restarted incarnation must advance by one")
+            node_incarnations[event["node"]] = event["incarnation"]
             available.discard(event["node"])
+
         elif kind == "routing_promoted":
             current_primary = event["new_primary"]
             available = set(event["in_sync"])
@@ -1130,18 +1660,41 @@ def load_trace(path: Path) -> LoadedTrace:
             promoted_view["in_sync"] = set(event["in_sync"])
             if profile == "d1-collision":
                 available.add(current_primary)
+
         elif kind == "primary_activated":
             available.add(event["node"])
             latest_views[event["node"]]["term"] = event["term"]
+
         elif kind == "in_sync_removed":
             available.discard(event["removed_node"])
             latest_views[event["emitter"]]["in_sync"] = set(event["in_sync"])
+
         elif kind == "recovery_membership":
             if event["outcome"] == "admitted":
                 available.add(event["target_node"])
             elif event["outcome"] == "promoted":
                 current_primary = event["target_node"]
                 available.add(event["target_node"])
+
+    for batch in noop_batches.values():
+        expected_pairs = {
+            (receipt, target)
+            for receipt in batch["noops"]
+            for target in batch["expected_targets"]
+        }
+        actual_pairs = {
+            (attempt["receipt_id"], attempt["target"])
+            for attempt in message_attempts.values()
+            if attempt["type"] == "noop"
+            and attempt["message_id"] in batch["message_ids"]
+        }
+        if actual_pairs != expected_pairs:
+            fail(
+                batch["event"]["step"] + 1,
+                "promotion NoOp sends must cover every filled sequence and "
+                "in-sync replica",
+            )
+        batch["event"]["_required_message_ids"] = list(batch["message_ids"])
 
     if last_copy_state != (events[-1]["step"] if events else -1):
         fail(len(records), "trace must end with copy_state")
@@ -1227,6 +1780,7 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
     for event in trace.events:
         register_allocation(event.get("node"), event.get("allocation"))
         register_allocation(event.get("removed_node"), event.get("removed_allocation"))
+        register_allocation(event.get("replica"), event.get("replica_allocation"))
         for replica in event.get("required_replicas", []):
             register_allocation(replica["node"], replica["allocation"])
         for assigned in event.get("allocations", []):
@@ -1250,6 +1804,88 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             return requests[request]
         ident = identity(event)
         return 0 if ident is None else identity_to_write.get(ident, 0)
+
+    message_attempts: dict[str, dict[str, Any]] = {}
+    for event in trace.events:
+        if event["event"] == "primary_replication_started":
+            for replica in event["required_replicas"]:
+                message_attempts[replica["message_id"]] = {
+                    "type": "write",
+                    "request_id": event["request_id"],
+                    "receipt_id": event["receipt_id"],
+                    "term": event["term"],
+                    "seq_no": event["seq_no"],
+                    "source": event["node"],
+                    "source_incarnation": event["source_incarnation"],
+                    "target": replica["node"],
+                    "target_incarnation": replica["incarnation"],
+                    "target_allocation": replica["allocation"],
+                }
+        elif event["event"] == "promotion_noop_replication_started":
+            message_attempts[event["message_id"]] = {
+                "type": "noop",
+                "request_id": None,
+                "receipt_id": event["receipt_id"],
+                "term": event["term"],
+                "seq_no": event["seq_no"],
+                "source": event["node"],
+                "source_incarnation": event["source_incarnation"],
+                "target": event["replica"],
+                "target_incarnation": event["replica_incarnation"],
+                "target_allocation": event["replica_allocation"],
+            }
+
+    def message_record(message_id: str, phase: str) -> str:
+        attempt = message_attempts[message_id]
+        is_noop = attempt["type"] == "noop"
+        kind = {
+            ("write", "request"): "Replicate",
+            ("write", "ack"): "ReplicaAck",
+            ("write", "nack"): "ReplicaNack",
+            ("noop", "request"): "ReplicateNoOp",
+            ("noop", "ack"): "NoOpAck",
+            ("noop", "nack"): "NoOpNack",
+        }[(attempt["type"], phase)]
+        if phase == "request":
+            source = attempt["source"]
+            target = attempt["target"]
+            source_incarnation = attempt["source_incarnation"]
+            target_incarnation = attempt["target_incarnation"]
+        else:
+            source = attempt["target"]
+            target = attempt["source"]
+            source_incarnation = attempt["target_incarnation"]
+            target_incarnation = attempt["source_incarnation"]
+        operation = (
+            0
+            if is_noop
+            else requests[attempt["request_id"]]
+        )
+        return (
+            "[kind |-> "
+            + json.dumps(kind)
+            + ", write |-> "
+            + str(operation)
+            + ", from |-> "
+            + node[source]
+            + ", to |-> "
+            + node[target]
+            + ", seq |-> "
+            + str(attempt["seq_no"])
+            + ", fromEpoch |-> "
+            + str(source_incarnation)
+            + ", toEpoch |-> "
+            + str(target_incarnation)
+            + ", term |-> "
+            + str(attempt["term"])
+            + ', indexUuid |-> "INDEX_UUID", targetAllocation |-> '
+            + str(
+                abstract_allocation(
+                    attempt["target"], attempt["target_allocation"]
+                )
+            )
+            + "]"
+        )
 
     fence_by_node: dict[str, int] = {
         raw: 1 for raw in nodes_raw
@@ -1322,12 +1958,47 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             or event.get("source_node")
             or event.get("replica")
         )
-        if (
-            kind in {"wal_appended", "operation_processed"}
-            and event.get("origin") == "live_replication"
-            and event["receipt_id"] in receive_by_receipt
-        ):
-            peer_raw = receive_by_receipt[event["receipt_id"]]["source_node"]
+        message_id = event.get("_message_id")
+        if message_id is not None:
+            attempt = message_attempts[message_id]
+            peer_raw = (
+                attempt["target"]
+                if kind
+                in {
+                    "replica_result",
+                    "promotion_noop_replication_started",
+                    "promotion_noop_result",
+                }
+                else attempt["source"]
+            )
+        message_phase = "none"
+        if kind in {"replica_result", "promotion_noop_result"}:
+            message_phase = event["message_phase"]
+        elif message_id is not None:
+            message_phase = "request"
+        has_transport_message = (
+            message_id is not None and message_phase != "none"
+        )
+        transport_message = (
+            message_record(message_id, message_phase)
+            if has_transport_message
+            else "NoTraceMessage"
+        )
+        required_message_ids = event.get("_required_message_ids", [])
+        required_messages = [
+            message_record(required_id, "request")
+            for required_id in required_message_ids
+        ]
+        crash_dropped_messages = [
+            message_record(
+                dropped["message_id"], dropped["message_phase"]
+            )
+            for dropped in event.get("dropped_messages", [])
+        ]
+        crash_failed_writes = [
+            str(requests[request_id])
+            for request_id in event.get("failed_request_ids", [])
+        ]
         operation_doc = event.get("doc")
         operation_kind = event.get("op")
         write_kind = (
@@ -1363,6 +2034,14 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
                 abstract_allocation(event_node, event.get("allocation"))
             ),
             "required": tla_set(required),
+            "requiredMessages": tla_set(required_messages),
+            "hasTransportMessage": (
+                "TRUE" if has_transport_message else "FALSE"
+            ),
+            "transportMessage": transport_message,
+            "messagePhase": json.dumps(message_phase),
+            "crashFailedWrites": tla_set(crash_failed_writes),
+            "crashDroppedMessages": tla_set(crash_dropped_messages),
             "processedNext": str(cp_next(checkpoints_value["processed"])),
             "persistedNext": str(cp_next(checkpoints_value["persisted"])),
             "maxNext": str(cp_next(checkpoints_value["max_seq_no"])),
@@ -1397,6 +2076,12 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "removedNode": node.get(
                 event.get("removed_node"), '"NO_NODE"'
             ),
+            "removedAllocation": str(
+                abstract_allocation(
+                    event.get("removed_node"),
+                    event.get("removed_allocation"),
+                )
+            ),
             "source": node.get(
                 event.get("source_node"), '"NO_NODE"'
             ),
@@ -1408,9 +2093,12 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "observedProcessed": tla_set(
                 [
                     str(item)
-                    for item in event.get(
-                        "processed_seqs",
-                        event.get("filled_seqs", []),
+                    for item in (
+                        event.get("processed_seqs", [])
+                        or [
+                            noop["seq_no"]
+                            for noop in event.get("noops", [])
+                        ]
                     )
                 ]
             ),
@@ -1420,6 +2108,7 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "resultPersistedNext": str(
                 cp_next(event.get("persisted_checkpoint"))
             ),
+            "walPosition": str(event.get("_wal_position", 0)),
         }
         body = ",\n      ".join(f"{key} |-> {value}" for key, value in fields.items())
         trace_records.append("    [" + body + "]")
@@ -1469,14 +2158,18 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
     )
     max_raft_entries = max(raft_events + 1, 1)
     max_pending_raft = 2 if raft_events else 0
-    max_messages = max(6, max_writes * max(1, len(nodes_raw) - 1) * 2)
+    max_messages = max(
+        6,
+        max_writes * max(1, len(nodes_raw) - 1) * 2,
+        len(message_attempts) * 2,
+    )
     max_view_lag = max(max_raft_entries, 2)
     validator_hidden_steps = {
-        "d1-core": 6,
-        "d1-authority": 10,
-        "d1-combined": 14,
-        "d1-collision": 2,
-        "d1-recovery": 10,
+        "d1-core": 3,
+        "d1-authority": 4,
+        "d1-combined": 4,
+        "d1-collision": 0,
+        "d1-recovery": 8,
     }[trace.profile]
     d1_fault_mode = (
         "D1Fixed" if trace.start["durability"] == "request" else "D1Async"
@@ -1493,6 +2186,17 @@ TraceInitialPrimary == {node[primary_raw]}
 TraceInitialInSync == {tla_set([node[item] for item in trace.start["shard_state"]["in_sync"]])}
 TraceQuiescent == {"TRUE" if trace.end["quiescent"] else "FALSE"}
 TraceCombined == {"TRUE" if trace.profile == "d1-combined" else "FALSE"}
+NoTraceMessage ==
+    [kind |-> "Replicate",
+     write |-> 1,
+     from |-> {node[primary_raw]},
+     to |-> {node[primary_raw]},
+     seq |-> 0,
+     fromEpoch |-> 0,
+     toEpoch |-> 0,
+     term |-> 0,
+     indexUuid |-> "INDEX_UUID",
+     targetAllocation |-> 0]
 Trace == {trace_body}
 
 =============================================================================
@@ -1662,7 +2366,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, TraceSchemaError) as error:
         print(f"trace conversion failed: {error}", file=sys.stderr)
         return 2
-    print(f"converted {len(trace.events)} schema-v3 events")
+    print(f"converted {len(trace.events)} schema-v4 events")
     return 0
 
 

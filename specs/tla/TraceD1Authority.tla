@@ -55,6 +55,8 @@ FaultAction(action) ==
     /\ UNCHANGED ApplySafetyVars
 
 CrashEvent(event) ==
+    /\ WritesOwnedBy(event.node) = event.crashFailedWrites
+    /\ DropNodeMessages(event.node) = event.crashDroppedMessages
     /\ FaultAction(Crash(event.node))
     /\ UNCHANGED observedFenceTerms
 
@@ -67,10 +69,8 @@ PromotionObservation(event) ==
     /\ UNCHANGED observedFenceTerms
 
 RoutingViewEvent(event) ==
-    /\ \/ /\ ViewMatches(views[event.node], event)
-          /\ UNCHANGED vars
-       \/ /\ FenceChangingReplication(DeliverView(event.node))
-          /\ ViewMatches(views'[event.node], event)
+    /\ ViewMatches(views[event.node], event)
+    /\ UNCHANGED vars
     /\ UNCHANGED observedFenceTerms
 
 FenceObservation(event) ==
@@ -120,6 +120,10 @@ PrimaryReplicationObservation(event) ==
     /\ writeTerm[event.writeId] = event.term
     /\ writeRequired[event.writeId] = event.required
     /\ event.required = views[event.node].inSync
+    /\ {message \in messages :
+            /\ message.kind = "Replicate"
+            /\ message.write = event.writeId}
+          = event.requiredMessages
     /\ UNCHANGED vars
     /\ UNCHANGED observedFenceTerms
 
@@ -164,28 +168,72 @@ ConsumeAuthorityEvent ==
     /\ hiddenSteps' = 0
     /\ UNCHANGED finished
 
-HiddenAuthorityAction ==
-    \/ \E candidate \in Nodes : FaultAction(ElectLeader(candidate))
-    \/ \E node \in Nodes : FaultAction(PartitionMetadata(node))
-    \/ \E leader \in Nodes, node \in Nodes, candidate \in Nodes :
-           FaultAction(SuspectAndRemove(leader, node, candidate))
-    \/ \E command \in pendingRaft :
-           FenceChangingReplication(CommitRaft(command))
-    \/ \E node \in Nodes :
-           FenceChangingReplication(DeliverView(node))
-    \/ \E node \in Nodes :
-           StableReplication(ProposeActivate(node))
+PromotionCommandMatches(command, event) ==
+    /\ command.kind = "UpdateRouting"
+    /\ command.actor = event.emitter
+    /\ command.target = routing.primary
+    /\ command.newPrimary = event.newPrimary
+
+DesiredActivationTerm(event) ==
+    IF event.kind = "routing_view" THEN event.viewTerm ELSE event.term
+
+ActivationCommandMatches(command, event) ==
+    /\ command.kind = "ActivatePrimary"
+    /\ command.target = event.node
+    /\ command.expectedTerm + 1 = DesiredActivationTerm(event)
+
+HiddenPromotionAction(event) ==
+    /\ event.kind = "routing_promoted"
+    /\ \/ /\ raftLeader # event.emitter
+          /\ raftLeader \in LiveConnectedVoters
+          /\ FaultAction(PartitionMetadata(raftLeader))
+       \/ /\ raftLeader # event.emitter
+          /\ FaultAction(ElectLeader(event.emitter))
+       \/ /\ raftLeader = event.emitter
+          /\ routing.primary # event.newPrimary
+          /\ ~(\E command \in pendingRaft :
+                    PromotionCommandMatches(command, event))
+          /\ FaultAction(
+                SuspectAndRemove(
+                    event.emitter, routing.primary, event.newPrimary))
+       \/ \E command \in pendingRaft :
+              /\ PromotionCommandMatches(command, event)
+              /\ FenceChangingReplication(CommitRaft(command))
+
+HiddenActivationAction(event) ==
+    /\ event.kind \in {"routing_view", "fence_persisted", "primary_activated"}
+    /\ DesiredActivationTerm(event) > views[event.node].term
+    /\ \/ /\ activationPending[event.node] = NoTerm
+          /\ views[event.node].primary = event.node
+          /\ StableReplication(ProposeActivate(event.node))
+       \/ \E command \in pendingRaft :
+              /\ ActivationCommandMatches(command, event)
+              /\ FenceChangingReplication(CommitRaft(command))
+
+HiddenViewDelivery(event) ==
+    /\ event.kind = "routing_view"
+    /\ applied[event.node] < Len(raftLog)
+    /\ ViewMatches(raftLog[applied[event.node] + 1].state, event)
+    /\ FenceChangingReplication(DeliverView(event.node))
+
+HiddenAuthorityAction(event) ==
+    \/ HiddenPromotionAction(event)
+    \/ HiddenActivationAction(event)
+    \/ HiddenViewDelivery(event)
 
 HiddenAuthorityStep ==
+    LET event == Trace[tracePos]
+    IN
     /\ tracePos <= Len(Trace)
     /\ hiddenSteps < MaxHiddenSteps
-    /\ HiddenAuthorityAction
+    /\ HiddenAuthorityAction(event)
     /\ hiddenSteps' = hiddenSteps + 1
     /\ UNCHANGED <<tracePos, finished, observedFenceTerms>>
 
 FinishAuthorityTrace ==
     /\ tracePos > Len(Trace)
     /\ ~finished
+    /\ (~TraceQuiescent \/ messages = {})
     /\ finished' = TRUE
     /\ UNCHANGED <<vars, tracePos, hiddenSteps, observedFenceTerms>>
 

@@ -138,17 +138,26 @@ PrimaryReplicationObservation(event) ==
     /\ writeTerm[event.writeId] = event.term
     /\ writeRequired[event.writeId] = event.required
     /\ event.required = views[event.node].inSync
+    /\ {message \in messages :
+            /\ message.kind = "Replicate"
+            /\ message.write = event.writeId}
+          = event.requiredMessages
     /\ UNCHANGED d1vars
 
 ReplicaReceiveObservation(event) ==
     /\ event.writeId \in WriteIds
-    /\ HasMessage(event.writeId, event.node)
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ event.transportMessage.kind = "Replicate"
+    /\ event.transportMessage.write = event.writeId
+    /\ event.transportMessage.to = event.node
     /\ UNCHANGED d1vars
 
 ReplicaWalObservation(event) ==
     /\ event.writeId \in WriteIds
-    /\ HasMessage(event.writeId, event.node)
-    /\ LET message == MessageFor(event.writeId, event.node)
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ LET message == event.transportMessage
        IN /\ ReplicaMessageValid(message)
           /\ message.term >= durableReplicaFence[event.node]
     /\ IF RequestDurability THEN event.durable ELSE TRUE
@@ -156,8 +165,9 @@ ReplicaWalObservation(event) ==
 
 ReplicaApplyEvent(event) ==
     /\ event.writeId \in WriteIds
-    /\ HasMessage(event.writeId, event.node)
-    /\ LET message == MessageFor(event.writeId, event.node)
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ LET message == event.transportMessage
            beforeDoc == docValue[event.node][event.doc]
        IN CASE event.outcome = "redelivery" ->
                     D1FixedReplicaRedelivery(message)
@@ -179,14 +189,25 @@ ReplicaApplyEvent(event) ==
 
 ReplicaResultEvent(event) ==
     /\ CASE event.outcome = "acknowledged" ->
-              /\ HasAck(event.writeId, event.peer)
+              /\ event.hasTransportMessage
+              /\ event.transportMessage \in messages
+              /\ event.transportMessage.kind = "ReplicaAck"
               /\ replicaResponsePersisted[event.writeId][event.peer]
                     <= event.resultPersistedNext
               /\ event.resultPersistedNext <= persistedNext[event.peer]
-              /\ D1DeliverAck(AckFor(event.writeId, event.peer))
+              /\ D1DeliverAck(event.transportMessage)
+       [] event.outcome = "failed" ->
+              /\ event.hasTransportMessage
+              /\ event.transportMessage \in messages
+              /\ event.transportMessage.kind = "ReplicaNack"
+              /\ StableReplication(
+                    DeliverReplicaNack(event.transportMessage))
        [] event.outcome \in {"dropped", "timeout"} ->
-              /\ HasMessage(event.writeId, event.peer)
-              /\ FaultAction(LoseMsg(MessageFor(event.writeId, event.peer)))
+              IF event.hasTransportMessage
+              THEN /\ event.transportMessage \in messages
+                   /\ FaultAction(LoseMsg(event.transportMessage))
+              ELSE /\ event.peer \in writeWait[event.writeId]
+                   /\ UNCHANGED d1vars
        [] OTHER -> FALSE
 
 ClientResultEvent(event) ==
@@ -329,6 +350,7 @@ HiddenRecoveryStep ==
 FinishRecoveryTrace ==
     /\ tracePos > Len(Trace)
     /\ ~finished
+    /\ (~TraceQuiescent \/ messages = {})
     /\ finished' = TRUE
     /\ UNCHANGED
           <<d1vars, tracePos, hiddenSteps, replicaResponsePersisted>>

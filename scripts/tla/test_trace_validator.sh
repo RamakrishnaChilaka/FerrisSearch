@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 VALIDATOR="$ROOT_DIR/scripts/tla/validate_trace.sh"
-FIXTURES="$ROOT_DIR/specs/tla/trace/v3"
+FIXTURES="$ROOT_DIR/specs/tla/trace/v4"
 
 export PYTHONDONTWRITEBYTECODE=1
 
@@ -168,14 +168,21 @@ run_invalid v5 v5-collision-then-new-write.jsonl 1 wal_appended
 run_invalid v6 v6-pruned-tombstone-absent.jsonl 20 copy_state
 run_invalid v9 v9-trace-sets-hidden-budget.jsonl 0 trace_start
 run_valid combined-16-write valid-combined-two-term-16-writes.jsonl
+run_valid representative-500 valid-representative-500-restart-failover.jsonl
 run_invalid combined-arrival invalid-combined-arrival-order.jsonl 51 operation_processed
-run_invalid combined-collision invalid-combined-collision-redelivery.jsonl 188 operation_processed
-run_invalid combined-rollback invalid-combined-rollback-after-promotion.jsonl 217 copy_state 180
+run_invalid combined-collision invalid-combined-collision-redelivery.jsonl 190 operation_processed
+run_invalid combined-rollback invalid-combined-rollback-after-promotion.jsonl 219 copy_state
+run_valid noop-applied valid-promotion-noop-applied.jsonl
+run_invalid noop-not-applied invalid-promotion-noop-not-applied.jsonl 33 commit_captured
+run_valid noop-collision-removed valid-promotion-noop-collision-removed.jsonl
+run_invalid noop-collision-redelivery invalid-promotion-noop-collision-as-redelivery.jsonl 32 operation_processed
+run_valid p7a valid-promotion-noop-replicated-p7a.jsonl
+run_invalid p7b invalid-promotion-noop-untraced-p7b.jsonl 190 operation_processed
 run_inconclusive timeout "trace validation exceeded 1s" \
     env TLA_TRACE_TIMEOUT_SECONDS=1 \
     "$VALIDATOR" "$FIXTURES/valid-combined-two-term-16-writes.jsonl"
 run_inconclusive out-of-memory "trace validation exhausted memory" \
-    env JAVA_TOOL_OPTIONS=-Xmx24m TLA_TRACE_TIMEOUT_SECONDS=60 \
+    env TLA_TRACE_HEAP=24m TLA_TRACE_TIMEOUT_SECONDS=60 \
     "$VALIDATOR" "$FIXTURES/valid-combined-two-term-16-writes.jsonl"
 
-echo "D1 schema-v3 trace validator self-tests passed."
+echo "D1 schema-v4 trace validator self-tests passed."

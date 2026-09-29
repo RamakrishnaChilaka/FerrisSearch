@@ -1,379 +1,367 @@
 # D1 implementation trace schema
 
-**Current version:** `ferrissearch.d1.trace/v3`
+**Current and only supported version:** `ferrissearch.d1.trace/v4`
 
-Versions 1 and 2 are retired and rejected by the converter. Rust
-instrumentation has not shipped yet, so version 3 is the implementation
-contract.
+Versions 1 through 3 are retired. The converter rejects them. FerrisSearch is
+pre-1.0, so emitters and fixtures must move to version 4 without compatibility
+shims.
 
 ## What validation means
 
-The converter checks the JSON Lines contract and generates a finite
-`TraceInput.tla` plus TLC constants. Validation is existential:
+`scripts/tla/trace_to_tla.py` validates the JSON Lines contract, derives finite
+constants, and generates `TraceInput.tla`. TLC then searches for a behavior of
+the real D1 `Next` relation that consumes every observation.
 
-- an observed event either constrains a real model action or a model
-  stuttering step;
-- TLC may take a validator-bounded number of real hidden actions
-  between observations; and
-- the trace is accepted only when TLC finds a behavior that consumes every
-  observation.
+The converter infers one composition from the event vocabulary:
 
-The emitter does not choose a profile. The converter infers exactly one
-composition from the event vocabulary and then rejects every event outside
-that composition. Core replication may be combined with failover, restart,
-activation, collision removal, and later-term writes. Peer recovery remains a
-separate composition.
-
-| Inferred composition | TLC module | Exact actions used |
+| Composition | TLC module | Scope |
 | --- | --- | --- |
-| `d1-core` | `TraceD1.tla` | `MC_D1_SeqNoApply`: client routing, D1 primary acceptance, D1 replica processing/redelivery, acknowledgements, captured-boundary persistence, restart, replay, replay failure, and truncation. |
-| `d1-authority` | `TraceD1Authority.tla` | `Invariants`: crash, election, routing promotion, per-node view delivery, activation proposal/commit/observation, and primary write gating. |
-| `d1-combined` | `TraceD1.tla` | Core D1 replication plus crash/restart/replay, routing promotion, fence observation, replay-before-NoOp gap fill, activation, exact in-sync removal, new-term writes, and B1 collision handling. |
-| `d1-collision` | `TraceD1Collision.tla` | `MC_D1_TermCollision`: partial old-term apply, promotion, durable collision fence, definitive collision, and in-sync removal. |
-| `d1-recovery` | `TraceD1Recovery.tla` | `PeerRecovery` control actions plus the same D1 fixed live-replication and recovery-apply state transitions used by `MC_D1_SeqNoApply`. |
+| `d1-core` | `TraceD1.tla` | Primary acceptance, exact-message replica apply, acknowledgements, commit, truncation, crash, restart, and replay. |
+| `d1-authority` | `TraceD1Authority.tla` | Crash, election, promotion, routing-view delivery, fencing, activation, and primary-write gating. |
+| `d1-combined` | `TraceD1.tla` | Core plus failover, promotion NoOp fill and fan-out, exact in-sync removal, and later-term collision handling. |
+| `d1-collision` | `TraceD1Collision.tla` | Durable fence, definitive sequence collision, and exact in-sync removal. |
+| `d1-recovery` | `TraceD1Recovery.tla` | Snapshot installation, pinned WAL suffix, final barrier, conditional membership, and sequence-aware live replication. |
 
-Exact vocabularies:
+Validation is existential. A pass means that this finite observed execution has
+a witness in the bounded model and satisfies that composition's invariants. It
+does not prove unlogged Rust executions correct.
 
-| Composition | Accepted events |
-| --- | --- |
-| Core | `client_write_routed`, `wal_appended`, `operation_processed`, `primary_replication_started`, `replica_received`, `replica_result`, `client_result`, `fence_persisted`, `commit_captured`, `commit_persisted`, `wal_truncated`, `node_crashed`, `node_restarted`, `replay_started`, `replay_entry`, `replay_finished`, `routing_view`, `copy_state` |
-| Authority | `node_crashed`, `routing_promoted`, `routing_view`, `fence_persisted`, `primary_activated`, primary-side client/WAL/process/replication/result events, `copy_state` |
-| Combined | The union of core and authority events, plus `in_sync_removed` and `promotion_noop_fill` |
-| Collision | `wal_appended`, `operation_processed`, `routing_promoted`, `routing_view`, `fence_persisted`, `in_sync_removed`, `copy_state` |
-| Recovery | primary and replica write events, `routing_view`, `recovery_snapshot`, `recovery_started`, `recovery_installed`, `recovery_barrier`, `recovery_membership`, `copy_state` |
+`scripts/tla/validate_trace.sh` defaults to a 120-second timeout and a 4 GiB
+Java heap. Exit codes are:
 
-Recovery actions are used only by `TraceD1Recovery`. They are checked through
-the safety invariants evaluated on each accepted recovery witness; they are not
-part of core, combined, authority, or collision traces.
+- `0`: accepted;
+- `1`: rejected; and
+- `3`: `INCONCLUSIVE` because TLC timed out, exhausted memory, or did not
+  complete normally.
 
-The trace modules still contain trace-side rules rather than only model
-actions:
-
-- outcome labels select which real action/post-state constraint is claimed;
-- authority and collision traces require an observed durable fence before
-  activation or collision processing;
-- the converter enforces request-durability acknowledgements and exact
-  required-replica/view equality;
-- the converter infers the composition and derives finite constants;
-- the trace wrapper stores the persisted checkpoint carried by a replica
-  response until the primary receives it; and
-- the collision wrapper constrains the bounded B1 causal schedule while the
-  sequence number is parameterized.
-
-The core fence maximum uses `D1FenceMaxNext` from the D1 model rather than a
-trace-local formula.
-
-Promotion NoOps have no client write ID. The combined model represents them as
-synthetic WAL entries carrying sequence and primary term, so an uncommitted
-NoOp survives restart and can appear as `replay_entry(op="noop")`. The entries
-still leave logical document state unchanged.
-
-A pass means that the finite observed execution has a witness in these bounded
-models. It does not prove the Rust implementation, the instrumentation, or
-unlogged executions correct.
-
-`scripts/tla/validate_trace.sh` uses a 60-second TLC timeout by default.
-Acceptance exits `0`, rejection exits `1`, and timeout, memory exhaustion, or
-an incomplete TLC run exits `3` with an `INCONCLUSIVE` label. Large restart
-traces can override the timeout with `TLA_TRACE_TIMEOUT_SECONDS`; an
-inconclusive result is never evidence that a trace is invalid.
-
-Every accepting witness also satisfies its composition's safety invariants.
-Core and recovery witnesses check `NoCopyBehindAcked`, logical quiescent
-convergence, no acknowledged-delete resurrection, gap-aware processed and
-persisted checkpoints, WAL sequence uniqueness, and fencing/admission safety.
-Authority witnesses check routing, activation, promotion, and admission
-invariants. Collision witnesses check fail-closed collision handling and
-recovery before promotion.
+An inconclusive result is neither acceptance nor rejection.
 
 ## File framing
 
-The file is UTF-8 JSON Lines. Every line is one JSON object. There are no blank
-lines or logging prefixes.
+The file is UTF-8 JSON Lines. Each line is one JSON object followed by a
+newline. Blank lines, logging prefixes, unknown fields, and unknown events are
+errors.
 
 Every record contains:
 
 | Field | Type | Rule |
 | --- | --- | --- |
-| `schema` | string | Exactly `ferrissearch.d1.trace/v3`. |
-| `run_id` | string | Identical on every line. |
-| `step` | integer | Starts at zero and is consecutive: `step = previous + 1`. |
-| `event` | string | A version-3 event listed below. Unknown events fail conversion. |
-
-The converter rejects unknown fields rather than ignoring them.
+| `schema` | string | Exactly `ferrissearch.d1.trace/v4`. |
+| `run_id` | non-empty string | Identical on every line. |
+| `step` | non-negative integer | Starts at `0` and increases by exactly one. |
+| `event` | string | One version-4 event defined below. |
 
 ### `trace_start`
 
-The first line contains:
+The first record is `trace_start` at step 0. Its additional fields are:
 
-- `test`;
-- `durability`: `request` or `async`;
-- `nodes`: node ID and initial incarnation;
-- one `shard_state`: index UUID, shard, initial primary/term/activation,
-  in-sync set, and each node's allocation, copy-presence, and fence term.
+| Field | Type | Rule |
+| --- | --- | --- |
+| `test` | string | Stable test/scenario name. |
+| `durability` | string | `request` or `async`. |
+| `nodes` | array | Two or three unique `{ "node", "incarnation" }` records. |
+| `shard_state` | object | Initial one-shard authority and copy state. |
 
-The validator derives write, document, node, term, allocation, message, Raft,
-crash, and recovery bounds from the trace. It accepts two or three nodes and
-starts from an initialized term-1 primary. Hidden-step bounds are owned by the
-validator, not the trace.
+`shard_state` contains:
+
+- `index_uuid`, `shard`, `primary`, `term`, and `activated`;
+- sorted `in_sync` replica node IDs; and
+- one `copies` entry per node with `node`, positive `allocation`, `exists`, and
+  `fence_term`.
+
+The current validator starts with term 1, an activated primary, every declared
+copy present, and every fence at term 1.
 
 ### `trace_end`
 
-The final line contains `outcome="completed"`, `quiescent`, and
-`records_before_end`.
+The final record is:
 
-Every completed trace, including `quiescent=false`, ends with `copy_state`.
-For `quiescent=true`:
+```json
+{
+  "schema": "ferrissearch.d1.trace/v4",
+  "run_id": "...",
+  "step": 42,
+  "event": "trace_end",
+  "outcome": "completed",
+  "quiescent": true,
+  "records_before_end": 42
+}
+```
 
-- no replay may remain active;
-- the final protocol record is `copy_state`; and
-- every copy the trace says is available after crash, promotion, replay,
-  removal, activation, or admission has a final `copy_state` after the last
-  state-changing event.
+Every completed trace ends with `copy_state` immediately before `trace_end`.
+When `quiescent` is true, no replay may remain active and every copy still
+available at the end must have a final `copy_state` after the last
+state-changing event.
 
-## Operation identity
+## Shared value contracts
 
-An operation is identified by `(primary_term, seq_no)` for this one-shard
-schema. Every occurrence must retain the same:
+### Operation identity
 
-- document ID;
-- operation kind (`index`, `delete`, or `noop`); and
-- lowercase SHA-256 content hash.
+An operation is identified by `(term, seq_no)`. Every occurrence must retain
+the same document ID, operation kind, and `content_hash`.
 
-For `index`, the hash is over a shared recursively-key-sorted trace encoding of
-the logical source. For `delete`, it covers the document ID and operation kind.
-For `noop`, it covers the reason. Payloads are not logged.
+- `index`: hash the shared recursively key-sorted trace encoding of the logical
+  source.
+- `delete`: hash the operation kind and document ID.
+- `noop`: hash the NoOp reason.
 
-Bulk requests emit one logical request and operation sequence per item.
+`content_hash` is lowercase hexadecimal SHA-256. Payloads are not logged.
+`doc` is JSON `null` only for `noop`.
 
-## Lock-linearized events
+### Checkpoints
 
-Every shared-state field in one event is read while holding the same lock that
-protects the effect, before releasing that lock. The trace stamp is allocated
-inside that critical section. Immutable request/receipt values may be carried
-into a later event, but an event may not reread unrelated mutable state from a
-second lock.
+`checkpoints` is exactly:
 
-Use a process-global synchronous sink:
+```json
+{
+  "processed": 7,
+  "persisted": 7,
+  "max_seq_no": 9
+}
+```
 
-1. acquire the sink mutex;
-2. allocate the next `AtomicU64` step;
-3. append the complete record to the in-memory buffer; and
-4. release the sink mutex.
+Each value is an inclusive sequence number or JSON `null`. `persisted` cannot
+exceed `processed`; `processed` cannot exceed `max_seq_no`.
 
-Normal asynchronous `tracing` output is not valid protocol evidence.
+### Receipts, requests, batches, and messages
 
-### Client and primary
+- `request_id` identifies one client request. It is null only for a promotion
+  NoOp.
+- `receipt_id` identifies one operation identity from primary acceptance
+  through WAL, replica apply, and replay.
+- `batch_id` identifies one promotion gap-fill batch.
+- `message_id` identifies one sequence-target transport attempt. It is never
+  reused.
 
-| Event | Fields beyond framing | Linearization |
-| --- | --- | --- |
-| `client_write_routed` | coordinator `node`, index/shard, `request_id`, `target_node`, document, operation, content hash | Under the coordinator routing-view snapshot used to select the target. |
-| `wal_appended` | node/allocation, request and receipt IDs, term/sequence, operation identity, `origin`, `durable` | Under the translog lock after bytes, configured synchronization, generation metadata, and high-watermark update. |
-| `operation_processed` | node/allocation, IDs, operation identity, origin, planner `outcome`, checkpoints | Under the apply-state lock after the planner effect and checkpoint update. |
-| `primary_replication_started` | primary/allocation, request/receipt, term/sequence, routing version, sorted `required_replicas` with allocation and incarnation | From the immutable validated routing snapshot and successful local receipt, immediately before fan-out. |
-| `client_result` | coordinator, request ID, `acknowledged` or `failed`, failure stage | Immediately before returning the terminal client result. |
+Ordinary `primary_replication_started.required_replicas` is sorted by node and
+contains exactly:
 
-Checkpoints are read only by events emitted under the apply-state lock:
-`operation_processed`, `commit_captured`, `node_restarted`,
-`replay_started`, and `replay_entry`. They are inclusive Rust
-`processed`, `persisted`, and `max_seq_no` values; JSON `null` means no
-checkpoint.
+```json
+{
+  "node": "r",
+  "allocation": 12,
+  "incarnation": 0,
+  "message_id": "write/w7/r"
+}
+```
 
-`primary_replication_started` contains no checkpoint. Its required replica set
-must exactly equal the primary node's latest traced routing view, including
-allocation IDs.
+The set must equal the primary's latest traced in-sync routing view. Promotion
+NoOps emit one `promotion_noop_replication_started` for every NoOp/target pair.
 
-A bulk request may emit every per-item `wal_appended` record before any
-`operation_processed` record. One bulk append and its per-item processing occur
-inside the same translog critical section; the trace order follows the physical
-operations within that section.
+`message_phase` records the exact in-flight phase at result or crash
+linearization:
 
-### Replica transport
+- `request`: the request is addressed to the replica;
+- `ack`: the replica produced an acknowledgement addressed to the primary;
+- `nack`: the replica produced a rejection addressed to the primary; and
+- `none`: no message for this attempt remains in flight.
 
-| Event | Fields beyond framing | Linearization |
-| --- | --- | --- |
-| `replica_received` | target/allocation, source/incarnation, receipt and operation identity | Inside the per-shard write task, after its routing/allocation revalidation and before planner/WAL mutation. This matches the instrumentation boundary introduced by `e01acaf`. |
-| `replica_result` | primary, request/receipt, replica, acknowledged/failed, persisted checkpoint carried by the response | On the primary immediately after the target RPC resolves. The checkpoint is the response-time value, not a later reread. |
-| `fence_persisted` | node/allocation, term, nullable fence maximum, reason | Under the shard-open/identity lock after identity and parent directory durability. |
+An acknowledged result requires `ack`; a failed result requires `nack`.
+`dropped` and `timeout` may name `request`, `ack`, `nack`, or `none` according
+to the trace transport state.
 
-A live-replication or recovery `wal_appended` must have the corresponding
-receipt/fetched operation. A live operation below the durable local fence
-cannot reach the planner. Older-term WAL replay may be redelivery when the
-exact operation is already processed.
+### Incarnations
 
-For an acknowledged result, the item's apply-time persisted checkpoint must be
-less than or equal to the response checkpoint, and the response checkpoint
-must be less than or equal to the replica's persisted checkpoint when the
-primary receives it. This admits concurrent responses and bulk RPCs whose one
-response carries the checkpoint after the complete batch, while rejecting an
-overstated checkpoint.
+Every send captures `source_incarnation` and target `incarnation` from the
+send-time view. A restarted node increments its incarnation by exactly one.
+Late messages keep their captured incarnations; they are not rewritten to the
+current process incarnation.
+
+## Required trace sink and lock order
+
+Implement version 4 behind the test-only trace feature. Use one
+process-global synchronous trace-state mutex that owns:
+
+- the next step;
+- the JSONL record buffer;
+- request state;
+- message IDs and current phases; and
+- node incarnations used by the seeded fault harness.
+
+Do not use asynchronous `tracing` output as protocol evidence.
+
+For a state mutation:
+
+1. acquire the existing lock that protects the effect;
+2. perform the effect;
+3. while still holding that lock, acquire the trace-state mutex;
+4. update trace-only request/message state and append the complete record with
+   the next step; and
+5. release the trace-state mutex before releasing the effect lock.
+
+The trace-state mutex never calls production code and never acquires an effect
+lock. This one-way order prevents deadlock and makes step order match effect
+order. Immutable values may be carried into later records, but an event must
+not reread mutable fields under a second lock.
+
+The fault-test scheduler owns a separate operation gate. Crash and
+`copy_state` observations hold that gate exclusively so no node effect can
+race the observation. They then acquire the trace-state mutex. Ordinary
+operations hold the gate in shared mode.
+
+## Event reference and Rust emission contract
+
+The field lists below are in addition to `schema`, `run_id`, `step`, and
+`event`.
+
+### Client and primary apply
+
+| Event | Required fields | Emit in current Rust code | Required lock and ordering |
+| --- | --- | --- | --- |
+| `client_write_routed` | `node`, `index_uuid`, `shard`, `request_id`, `target_node`, `doc`, `op`, `content_hash` | `TransportService::index_doc`, `TransportService::delete_doc`, and per-item in `TransportService::bulk_index`, after `validated_primary_write_state` selects the target and before the write-pool task is submitted. | Hold the peer-recovery write guard and the test scheduler's shared operation gate. The routing snapshot and request identity are immutable inputs to the event. |
+| `wal_appended` | `node`, `index_uuid`, `shard`, `allocation`, nullable `request_id`, `receipt_id`, `term`, `seq_no`, nullable `doc`, `op`, `content_hash`, `origin`, `durable` | `HotEngine::apply_sequenced_batch_locked`, after `append_batch_with_seq` and required `sync` have succeeded, before engine mutation. Emit batch entries in append order. | Hold the engine translog lock and `apply_state` mutex. `origin` is `primary`, `live_replication`, or `recovery`. |
+| `operation_processed` | All operation identity fields above, `origin`, `outcome`, `checkpoints` | `HotEngine::apply_sequenced_batch_locked`, after the planner effect, `complete_operation`, and any persisted-checkpoint update. Emit a collision before returning its typed error. | Hold `apply_state`. The allowed outcomes are `applied_newer`, `stale`, `redelivery`, `noop`, `collision`, and `apply_failed`. For live transport, atomically change the trace message phase from `request` to `ack` or `nack`. |
+| `primary_replication_started` | `node`, `index_uuid`, `shard`, `allocation`, `source_incarnation`, `request_id`, `receipt_id`, `term`, `seq_no`, sorted `required_replicas`, `routing_version` | `replicate_write_with_durability` or `replicate_explicit_batch_with_durability`, after validating the immutable `ClusterState` snapshot and constructing every target request, immediately before spawning RPC futures. | Acquire the trace-state mutex once for the complete target set. Register every `message_id` in phase `request` before any RPC can run. |
+| `client_result` | `node`, `index_uuid`, `shard`, `request_id`, `outcome`, nullable `failure_stage` | `TransportService::index_doc`, `delete_doc`, or `bulk_index`, immediately before the terminal response is returned. | Hold the trace-state mutex. `acknowledged` requires every replica in the captured required set to have acknowledged; `failed` names a non-null stage. |
+
+Bulk may append all item WAL entries before processing any item. Emit the
+physical order while the one translog critical section remains held.
+
+### Replica transport and fencing
+
+| Event | Required fields | Emit in current Rust code | Required lock and ordering |
+| --- | --- | --- | --- |
+| `replica_received` | `node`, `index_uuid`, `shard`, `allocation`, `source_node`, `source_incarnation`, `message_id`, `receipt_id`, `term`, `seq_no`, `doc`, `op`, `content_hash` | Inside the write-pool closures in `TransportService::replicate_doc` and `TransportService::replicate_bulk`, through `ShardManager::apply_replica_operation`, after UUID/allocation and term validation but before fence persistence, WAL append, or planner mutation. | Hold the per-shard `shard_open_lock`. The attempt must exist in phase `request` and match its send-time source and target incarnations. |
+| `replica_result` | `node`, `index_uuid`, `shard`, `request_id`, `receipt_id`, `message_id`, `replica`, `replica_incarnation`, `outcome`, `message_phase`, nullable `persisted_checkpoint` | On the primary in `replicate_write_with_durability` or `replicate_explicit_batch_with_durability`, immediately after the target RPC resolves and before its result is merged into the request result. | Use the response-carried checkpoint; do not reread replica state. Under the trace-state mutex, verify and clear the named phase. |
+| `fence_persisted` | `node`, `index_uuid`, `shard`, `allocation`, `term`, nullable `fence_max_seq_no`, `reason` | In `ShardManager::apply_replica_operation` or `ShardManager::raise_copy_fence_blocking`, after `persist_copy_identity` has durably replaced the identity record and before later apply/activation work. | Hold `shard_open_lock`. `reason` is `replication`, `activation`, or `recovery`. |
+
+The replica receive event is intentionally inside the per-shard write task.
+Emitting it at gRPC ingress is incorrect because concurrent requests can enter
+the write pool in a different order.
 
 ### Commit and truncation
 
-Commit is deliberately split:
+| Event | Required fields | Emit in current Rust code | Required lock and ordering |
+| --- | --- | --- | --- |
+| `commit_captured` | `node`, `index_uuid`, `shard`, `allocation`, `commit_id`, `checkpoints`, `term_state` | `HotEngine::commit_writer_at_boundary`, after the successful Tantivy commit and after the immutable `CommittedBoundaryRecord` is derived. | Hold the writer lock and `apply_state`. `term_state` contains `current_term`, nullable `max_seq_no_at_term_start`, and sorted `processed_in_current_term_below_start_max`. |
+| `commit_persisted` | `node`, `index_uuid`, `shard`, `allocation`, `commit_id` | `HotEngine::persist_committed_boundary`, after `CommittedBoundaryRecord::persist` has fsynced the temporary file, renamed it, and fsynced the parent directory. | Carry the immutable `commit_id`; do not reread checkpoints. |
+| `wal_truncated` | `node`, `index_uuid`, `shard`, `allocation`, `truncate_through` | `HotTranslog::truncate_below`, after the rolled manifest and sequence high-watermark are persisted and generation deletion attempts finish. | The translog state mutex linearizes manifest mutation. Emit after deletion attempts so the event describes the completed truncation operation. |
 
-| Event | Fields beyond framing | Linearization |
-| --- | --- | --- |
-| `commit_captured` | node/allocation, `commit_id`, checkpoints, term state | Under the commit/apply-state boundary when the immutable committed-boundary record is captured. |
-| `commit_persisted` | node/allocation, `commit_id` only | After atomic record persistence and directory sync. It refers to the earlier immutable capture and does not reread live checkpoints or term state. |
-| `wal_truncated` | node/allocation, inclusive `truncate_through` | After manifest/high-watermark persistence and generation deletion attempts. |
+Capture and persistence are separate events because a fence or write may occur
+between them. Truncation may not exceed the persisted processed checkpoint.
 
-An operation or fence raise may occur between capture and persistence. The
-persisted record remains the captured one. Truncation cannot advance beyond
-the persisted processed checkpoint.
+### Crash, restart, and replay
 
-### Crash and replay
+| Event | Required fields | Emit in current Rust code | Required lock and ordering |
+| --- | --- | --- | --- |
+| `node_crashed` | `node`, `incarnation`, `outcome`, sorted `failed_request_ids`, sorted `dropped_messages` | The seeded fault harness crash function, after it has exclusively stopped ingress and trace-producing tasks for that incarnation. | Hold the scheduler's exclusive operation gate and trace-state mutex. Compute, do not guess, both exact sets from trace state before clearing them. `outcome` is `clean` or `unclean`. |
+| `node_restarted` | `node`, new `incarnation`, `index_uuid`, `shard`, `allocation`, `checkpoints` | Inside `HotEngine::new_with_mappings_mode`, after the startup `ApplyState` is initialized from `translog.committed` and immediately before `engine.replay_translog()`. | No replay entry may run first. Allocate the new incarnation and stamp while startup still has exclusive ownership of the engine. |
+| `replay_started` | `node`, `index_uuid`, `shard`, `allocation`, `replay_id`, `checkpoints` | `HotEngine::replay_translog_suffix_locked`, immediately after `reset_apply_state_to_commit` and before scanning the WAL. | Hold translog, writer, and `apply_state` locks. |
+| `replay_entry` | `node`, `index_uuid`, `shard`, `allocation`, `replay_id`, `ordinal`, `receipt_id`, operation identity fields, `outcome`, `checkpoints` | The replay path through `HotEngine::apply_sequenced_batch_locked`, after one physical WAL entry is classified and its checkpoint effect is complete. | Hold translog and `apply_state`. `ordinal` starts at 0 and follows physical WAL scan order. Outcomes are `skip_committed`, `applied_newer`, `stale`, `redelivery`, or `noop`. |
+| `replay_finished` | `node`, `index_uuid`, `shard`, `allocation`, `replay_id`, `outcome` | `HotEngine::replay_translog_suffix_locked`, after successful reader reload and committed-boundary persistence, or after a terminal replay error marks the writer/copy failed. | Emit exactly once per replay ID. `outcome` is `completed` or `failed`. |
 
-| Event | Fields beyond framing | Linearization |
-| --- | --- | --- |
-| `node_crashed` | node/incarnation and clean/unclean outcome | After old-incarnation ingress and trace-producing tasks are stopped. |
-| `node_restarted` | node/new incarnation, index/shard/allocation, restored checkpoints | Inside `HotEngine::new`, after apply-state reset from the committed boundary and before replay begins. |
-| `replay_started` | node/allocation, replay ID, restored checkpoints | Observation after restart has already installed replay state. It does not perform the reset. |
-| `replay_entry` | replay ID/ordinal, operation identity, planner outcome, checkpoints | After one physical WAL entry passes through the D1 planner. |
-| `replay_finished` | replay ID and completed/failed outcome | After successful reader reload, or after terminal replay failure marks the copy unavailable. |
+`node_restarted` is not a harness observation emitted after open. It must occur
+inside engine construction between apply-state restoration and replay.
 
-Delete tombstones are not durable metadata. A committed delete above a gap is
-absent from the restored version map and replays as `applied_newer`.
+`node_crashed.dropped_messages` contains sorted unique
+`{ "message_id", "message_phase" }` records for every message whose current
+destination is the crashed node. `failed_request_ids` is the sorted exact set
+of requests in `Replicating` state whose primary is the crashed node.
 
-Truncation records an inclusive durable bound, but deleting old generations is
-best-effort. Entries actually removed below the bound produce no replay event.
-If an old generation remains, its entries may still be observed and must use
-`skip_committed`; applying one again is rejected.
+### Routing, activation, and promotion NoOps
 
-Requests and responses already emitted before a process crash remain eligible
-for late delivery. Messages addressed to the crashed process are dropped.
-Consequently, a stale request may be received after its sender crashes and is
-then rejected by the durable term fence, while an already-produced replica
-acknowledgement may reach the primary after the replica restarts.
+| Event | Required fields | Emit in current Rust code | Required lock and ordering |
+| --- | --- | --- | --- |
+| `routing_view` | `node`, `index_uuid`, `shard`, `primary`, `term`, sorted `in_sync`, every `{node, allocation}`, `initialized` | At initial harness capture and whenever a node installs a newer `ClusterState` view. | Hold that node's cluster-state read/write lock for one coherent view. |
+| `routing_promoted` | `emitter`, `index_uuid`, `shard`, `new_primary`, `term`, sorted `in_sync` | `ClusterStateMachine::apply_command_at`, after a successful Raft-applied routing mutation promotes the primary. | Hold `state.write()`. Emit once from the applying Raft state machine, not once per observer. |
+| `in_sync_removed` | `emitter`, `index_uuid`, `shard`, `removed_node`, `removed_allocation`, sorted resulting `in_sync` | `ClusterStateMachine::apply_command_at`, after successful exact-allocation `FailShardCopy` application. | Hold `state.write()`. The allocation must be the one removed by that command. |
+| `promotion_noop_fill` | `node`, `index_uuid`, `shard`, `allocation`, `batch_id`, `term`, sorted `noops`, `checkpoints` | `HotEngine::prepare_primary_activation`, after full local replay, gap computation, NoOp WAL append, translog sync, planner completion, and persisted-checkpoint marking. | Hold the activation maintenance guard, translog lock, and `apply_state`. Each `noops` item is `{receipt_id, seq_no, content_hash}`. |
+| `primary_activated` | `node`, `index_uuid`, `shard`, `allocation`, `term` | `TransportService::prepare_local_primary_activation`, immediately after inserting the term into `primary_activation_state.activated_terms`. | Hold `activated_terms.write()` and the peer-recovery exclusive guard. Emit before dropping the guard and before NoOp fan-out. |
+| `promotion_noop_replication_started` | `node`, `index_uuid`, `shard`, `allocation`, `source_incarnation`, `batch_id`, `receipt_id`, `message_id`, `term`, `seq_no`, `content_hash`, `replica`, `replica_allocation`, `replica_incarnation` | `replicate_noop_batch_with_durability` through `replicate_explicit_batch_with_durability`, after constructing the exact per-target RPC and immediately before it can run. | Under the trace-state mutex, register one request-phase message for each sequence/target pair. Use the immutable validated routing snapshot. |
+| `promotion_noop_received` | `node`, `index_uuid`, `shard`, `allocation`, `source_node`, `source_incarnation`, `batch_id`, `receipt_id`, `message_id`, `term`, `seq_no`, `content_hash` | The NoOp branch of `TransportService::replicate_bulk`, through `ShardManager::apply_replica_operation`, at the same boundary as `replica_received`. | Hold `shard_open_lock`, after identity/term validation and before fence/WAL/planner mutation. |
+| `promotion_noop_result` | `node`, `index_uuid`, `shard`, `allocation`, `batch_id`, `receipt_id`, `message_id`, `term`, `seq_no`, `replica`, `replica_incarnation`, `outcome`, `message_phase`, nullable `persisted_checkpoint` | `replicate_explicit_batch_with_durability`, immediately after the target result resolves. | Use the response-time checkpoint and clear the exact trace message phase under the trace-state mutex. |
 
-The current in-process async-durability test abstraction is lossless across its
-simulated crash: `durable=false` is allowed in async mode, but the in-memory
-WAL is retained. Version 3 does not claim to model power-loss durability for
-that harness.
+The required source order is:
 
-### Routing and activation
+1. `promotion_noop_fill`;
+2. `primary_activated`;
+3. all `promotion_noop_replication_started` events for that batch; and
+4. each replica's receive, optional `fence_persisted`, WAL/process or collision,
+   and result events.
 
-| Event | Fields beyond framing | Linearization |
-| --- | --- | --- |
-| `routing_view` | observing node, primary, term, in-sync nodes, every allocation, initialized flag | Under that node's `ClusterManager` view lock. |
-| `routing_promoted` | single `emitter` (the Raft leader applying the command), new primary, term, in-sync set | Under Raft state-machine apply after routing mutation. |
-| `in_sync_removed` | Raft-leader emitter, removed node/allocation, resulting in-sync set | Under successful exact-allocation `FailShardCopy` apply. |
-| `promotion_noop_fill` | node/allocation/activated term, exact filled sequence set, checkpoints | Inside `HotEngine::prepare_primary_activation`, after full local WAL replay and the synced NoOp batch have updated the apply-state checkpoints, while the activation maintenance/translog boundary still linearizes the result. |
-| `primary_activated` | node/allocation/activated term | Under the activation-state lock after the matching durable fence and routing-term observation. |
-
-Per-node routing views make stale coordinator routing and a stale primary's
-local view expressible. `routing_promoted` is emitted once, by the leader apply,
-not once per observing node. A non-empty `promotion_noop_fill` set must equal
-every remaining missing sequence through the copy's local maximum; sequences
-that still have a local WAL entry cannot be filled because replay precedes gap
-closure. `primary_activated` additionally requires the durable fence for the
-observed term and an empty remaining gap set.
+Activation does not depend on successful NoOp fan-out. A failed NoOp may cause
+exact in-sync removal. Every NoOp from a non-empty fill batch must have exactly
+one send for every replica in the primary's captured in-sync view.
 
 ### Recovery
 
-| Event | Fields beyond framing | Linearization |
-| --- | --- | --- |
-| `recovery_snapshot` | source, target, session, snapshot-next boundary, exact processed sequence set, logical documents | On the source inside `prepare_peer_recovery_snapshot` while the translog lock holds the captured snapshot and retention pin. |
-| `recovery_started` | source, target/allocation, session | After the exact-allocation target install marker is durable. |
-| `recovery_installed` | source, target/allocation, session, snapshot boundary | After verified snapshot installation and strict open. No checkpoints are read here. |
-| `recovery_barrier` | source, target/allocation, session, barrier-next boundary, target processed sequence set | Under the target apply-state boundary after every operation through the source's final barrier has been processed. |
-| `recovery_membership` | source, target/allocation, session, admitted/promoted/rejected/unknown | After target membership observation. |
+| Event | Required fields | Emit in current Rust code | Required lock and ordering |
+| --- | --- | --- | --- |
+| `recovery_snapshot` | `source_node`, `target_node`, `index_uuid`, `shard`, `session_id`, `snapshot_next_seq_no`, sorted `processed_seqs`, sorted semantic `documents` | Source setup launched by `TransportService::launch_source_setup`, after `prepare_peer_recovery_snapshot` captures the files, processed set, WAL cursor, and retention pin. | Hold the source recovery session mutex and the engine's snapshot/translog boundary until the immutable trace values are copied. |
+| `recovery_started` | `source_node`, `target_node`, `index_uuid`, `shard`, `allocation`, `session_id` | `TransportService::start_peer_recovery_inner`, after the exact-allocation target install marker is durable. | Hold the target's per-shard recovery state lock. |
+| `recovery_installed` | Same identities plus `snapshot_next_seq_no` | `TransportService::prepare_finalize_recovery_inner`, after verified snapshot installation and strict target open. | Hold the peer-recovery exclusive guard and target recovery state lock. |
+| `recovery_barrier` | Same identities plus `barrier_next_seq_no` and exact sorted `processed_seqs` | `TransportService::prepare_finalize_recovery_inner`, after suffix replay reaches the pinned source barrier. | Read the target processed set under its apply-state boundary while the admission barrier remains held. |
+| `recovery_membership` | Same identities plus `outcome` | `TransportService::settle_peer_recovery` or `complete_finalize_recovery_inner`, after observing admission, promotion, rejection, or unresolved membership. | Hold the source session/settlement state that decides the outcome. Allowed values are `admitted`, `promoted`, `rejected`, and `unknown`. |
 
-The target is unavailable until admitted or promoted; a promoted target still
-requires activation before primary service. Recovery installation uses the
-captured source snapshot, never the source's later current state.
-
-The ordered-cursor premise is that the recovery source is the activated
-primary. It scans the pinned physical WAL in file order and advances one
-exclusive sequence cursor; therefore catch-up entries arrive in increasing
-physical-WAL order without duplicates. Out-of-order or duplicate catch-up is
-outside this composition.
+Recovery remains a separate composition. The target is unavailable until
+admitted or promoted. A promoted target still requires primary activation.
 
 ### `copy_state`
 
-`copy_state` is an observation, not a claimed planner outcome. It contains:
+`copy_state` fields are `node`, `index_uuid`, `shard`, `allocation`, `reason`,
+and sorted `documents`.
 
-- node/allocation and reason (`quiescent`, `replay`, or `admission`);
-- every traced document in sorted order;
-- `absent`, `live`, or `deleted`;
-- for live/deleted state, exact sequence, primary term, and content hash.
+`reason` is `quiescent`, `replay`, `admission`, or `trace_end`. Each document
+contains:
 
-The instrumentation refreshes first, then takes a trace-only copy snapshot
-while holding the apply/maintenance guard. It uses one reader snapshot for
-live state. Deleted state and its operation identity come from trace-owned
-processed-operation state, not the live-version-map tombstone cache, so the
-event is independent of the 60-second tombstone-retention window. The trace
-stamp is allocated before releasing the guard.
+```json
+{
+  "doc": "d1",
+  "state": "live",
+  "seq_no": 7,
+  "term": 2,
+  "content_hash": "..."
+}
+```
 
-TLC compares this semantic state with the model's document state. Outcome labels
-alone therefore cannot make an incorrect history pass.
+`state` is `absent`, `live`, or `deleted`. Identity fields are null only for
+`absent`.
+
+The fault harness must:
+
+1. hold the scheduler's exclusive operation gate;
+2. call `SearchEngine::refresh` (`HotEngine::refresh_with_pruned_tombstones`);
+3. use one reader snapshot to enumerate live documents;
+4. combine it with trace-owned processed delete identity, not the expiring
+   version-map tombstone cache; and
+5. append `copy_state` before releasing the gate.
+
+Refreshing first is mandatory. A pre-refresh read is not valid evidence.
 
 ## Converter-only checks
 
-Before TLC, `trace_to_tla.py` rejects:
+Before TLC, `trace_to_tla.py` rejects, among other structural failures:
 
-- non-v3 schemas, unknown events/outcomes/fields, or missing fields;
-- non-consecutive steps;
-- reused request IDs or changed operation content;
-- replica processing without the same-copy WAL observation, except definitive
-  collision or redelivery;
-- acknowledgements missing required replica results;
-- in request durability, acknowledgement without a durable primary WAL and a
-  durable WAL on every required replica;
-- `required_replicas` differing from the primary's latest traced in-sync view;
-- malformed replay ordinals or lifecycle pairs; and
-- any trace not ending in `copy_state`; and
-- quiescent traces missing final `copy_state` for an available copy.
+- any schema other than v4;
+- unknown or missing fields, non-consecutive steps, and malformed hashes;
+- changed `(term, seq_no)` content identity;
+- stale or reused message IDs, wrong send-time incarnations, and mismatched
+  message phases;
+- required replica sets that differ from the primary's traced routing view;
+- request-durability acknowledgement without durable WAL on the primary and
+  every required replica;
+- replica apply or acknowledgement without the exact transport attempt;
+- NoOp batches missing any sequence/target send;
+- crash lost sets that differ from exact trace transport/request state;
+- malformed replay ordinals, unknown replay receipt IDs, or lifecycle pairs;
+- commit persistence without a captured immutable boundary;
+- quiescent traces with active replay or pending messages; and
+- traces without final `copy_state` for each available copy.
 
-## Changelog
+The generated trace modules still compose observations with the real D1,
+authority, collision, and recovery actions. Outcome labels and converter
+bookkeeping do not replace model transitions.
 
-### Version 3
+## Version 4 changes
 
-- Moved live replication in recovery traces to D1 fixed
-  process/redelivery actions.
-- Added safety invariants to every accepting witness.
-- Moved primary acceptance to `operation_processed`, allowing concurrent local
-  writes before either fan-out begins.
-- Derived finite constants from the trace and allowed arbitrary-node
-  crash/restart/replay across two or three nodes.
-- Parameterized the B1 collision sequence.
-- Removed emitter-selected profiles and `max_hidden_steps`.
-- Added response-time persisted checkpoints to `replica_result`.
-- Required final `copy_state` for non-quiescent traces.
-- Allowed all bulk WAL records before per-item processing.
-- Keyed response lower bounds by `(write, replica)` and allowed batch-final
-  response checkpoints within the model-observed interval.
-- Made compositions exclusive and documented their complete vocabularies.
-- Added a combined core/failover composition for end-to-end acknowledged-write
-  survival across promotion, replay-before-NoOp gap fill, and later-term
-  collision handling.
-- Made truncation remove old WAL entries nondeterministically, accepted
-  retained entries only as `skip_committed`, and made promotion NoOps
-  replayable across restart.
-- Kept already-sent requests and responses in flight across sender crash.
-- Classified TLC timeout and memory exhaustion as `INCONCLUSIVE`, never as
-  accepted or rejected.
-
-Recovery snapshot and catch-up remain strictly ordered by the implemented
-peer-recovery cursor. Out-of-order or duplicate catch-up batches are not
-expressible in this profile; live replication during recovery is fully
-sequence-aware.
-
-### Version 2
-
-- Replaced deterministic replay of hand-written rules with existential TLC
-  witness search over real D1, Raft/activation, B1, and recovery actions.
-- Added bounded hidden actions and per-node routing views.
-- Added semantic `copy_state`.
-- Split commit capture from persistence.
-- Added `in_sync_removed`, source-side `recovery_snapshot`, and final barrier
-  evidence.
-- Moved checkpoint reads to apply-state-linearized events.
-- Reset D1 volatile state at restart rather than replay start.
-- Defined failed replay as copy-unavailable.
-- Made steps consecutive and request-durability checks structural.
-
-### Version 1
-
-Retired. It used a deterministic trace replay machine with duplicated protocol
-rules and made claims about hidden-step search that it did not implement.
+- Added exact ordinary and promotion-NoOp message IDs and send-time
+  incarnations.
+- Added primary-side NoOp sends, replica NoOp receipt, apply/collision, result,
+  and fence evidence.
+- Added exact crash `failed_request_ids` and phase-qualified
+  `dropped_messages`.
+- Added exact NoOp fill batches and replay `receipt_id`s.
+- Directed hidden promotion, activation, view-delivery, failure-removal, replay,
+  and transport actions from emitted evidence rather than unconstrained
+  choices.
+- Removed version-3 support.

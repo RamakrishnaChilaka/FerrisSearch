@@ -1,7 +1,7 @@
 ----------------------------- MODULE TraceD1 -----------------------------
 \* Existential implementation-trace composition for the real D1 actions.
 \*
-\* TraceInput.tla is generated from one schema-v3 JSONL file.  Low-level
+\* TraceInput.tla is generated from one schema-v4 JSONL file.  Low-level
 \* implementation observations either constrain a real D1 action or advance
 \* by a D1 stuttering step.  TLC searches bounded real hidden D1 actions
 \* between observations.  It accepts a trace only by reaching `finished`.
@@ -64,41 +64,10 @@ TraceInit ==
     /\ replicaResponsePersisted =
           [writeId \in WriteIds |-> [node \in Nodes |-> 0]]
 
-MessageFor(writeId, replica) ==
-    CHOOSE message \in messages :
+WriteRequestMessages(writeId) ==
+    {message \in messages :
         /\ message.kind = "Replicate"
-        /\ message.write = writeId
-        /\ message.to = replica
-
-AckFor(writeId, replica) ==
-    CHOOSE message \in messages :
-        /\ message.kind = "ReplicaAck"
-        /\ message.write = writeId
-        /\ message.from = replica
-
-NackFor(writeId, replica) ==
-    CHOOSE message \in messages :
-        /\ message.kind = "ReplicaNack"
-        /\ message.write = writeId
-        /\ message.from = replica
-
-HasMessage(writeId, replica) ==
-    \E message \in messages :
-        /\ message.kind = "Replicate"
-        /\ message.write = writeId
-        /\ message.to = replica
-
-HasAck(writeId, replica) ==
-    \E message \in messages :
-        /\ message.kind = "ReplicaAck"
-        /\ message.write = writeId
-        /\ message.from = replica
-
-HasNack(writeId, replica) ==
-    \E message \in messages :
-        /\ message.kind = "ReplicaNack"
-        /\ message.write = writeId
-        /\ message.from = replica
+        /\ message.write = writeId}
 
 CheckpointMatches(node, event) ==
     /\ processedNext[node] = event.processedNext
@@ -192,14 +161,19 @@ PrimaryReplicationObservation(event) ==
     /\ writeTerm[event.writeId] = event.term
     /\ writeRequired[event.writeId] = event.required
     /\ event.required = views[event.node].inSync
+    /\ WriteRequestMessages(event.writeId) = event.requiredMessages
     /\ UNCHANGED d1vars
     /\ UNCHANGED AuxVars
 
 ReplicaReceiveObservation(event) ==
     /\ event.writeId \in WriteIds
-    /\ HasMessage(event.writeId, event.node)
-    /\ LET message == MessageFor(event.writeId, event.node)
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ LET message == event.transportMessage
        IN /\ message.from = event.peer
+          /\ message.to = event.node
+          /\ message.kind = "Replicate"
+          /\ message.write = event.writeId
           /\ message.term = event.term
           /\ message.seq = event.seq
           /\ message.targetAllocation = event.allocation
@@ -208,8 +182,9 @@ ReplicaReceiveObservation(event) ==
 
 ReplicaWalObservation(event) ==
     /\ event.writeId \in WriteIds
-    /\ HasMessage(event.writeId, event.node)
-    /\ LET message == MessageFor(event.writeId, event.node)
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ LET message == event.transportMessage
        IN D1ReplicaMessageEnabled(message)
     /\ IF RequestDurability THEN event.durable ELSE TRUE
     /\ UNCHANGED d1vars
@@ -217,10 +192,14 @@ ReplicaWalObservation(event) ==
 
 ReplicaProcessEvent(event) ==
     /\ event.writeId \in WriteIds
-    /\ HasMessage(event.writeId, event.node)
-    /\ LET message == MessageFor(event.writeId, event.node)
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ LET message == event.transportMessage
            beforeDoc == docValue[event.node][event.doc]
        IN /\ message.from = event.peer
+          /\ message.to = event.node
+          /\ message.kind = "Replicate"
+          /\ message.write = event.writeId
           /\ message.term = event.term
           /\ message.seq = event.seq
           /\ CASE event.outcome = "redelivery" ->
@@ -247,30 +226,107 @@ ReplicaProcessEvent(event) ==
 ReplicaResultEvent(event) ==
     /\ event.writeId \in WriteIds
     /\ CASE event.outcome = "acknowledged" ->
-              /\ HasAck(event.writeId, event.peer)
-              /\ D1DeliverAck(AckFor(event.writeId, event.peer))
+              /\ event.hasTransportMessage
+              /\ event.transportMessage \in messages
+              /\ event.transportMessage.kind = "ReplicaAck"
+              /\ event.transportMessage.write = event.writeId
+              /\ event.transportMessage.from = event.peer
+              /\ D1DeliverAck(event.transportMessage)
        [] event.outcome = "failed" ->
-              /\ HasNack(event.writeId, event.peer)
+              /\ event.hasTransportMessage
+              /\ event.transportMessage \in messages
+              /\ event.transportMessage.kind = "ReplicaNack"
+              /\ event.transportMessage.write = event.writeId
+              /\ event.transportMessage.from = event.peer
               /\ StableReplication(
-                    DeliverReplicaNack(NackFor(event.writeId, event.peer)))
+                    DeliverReplicaNack(event.transportMessage))
        [] event.outcome \in {"dropped", "timeout"} ->
-              \/ /\ HasMessage(event.writeId, event.peer)
-                 /\ FaultAction(
-                       LoseMsg(MessageFor(event.writeId, event.peer)))
-              \/ /\ HasAck(event.writeId, event.peer)
-                 /\ FaultAction(LoseMsg(AckFor(event.writeId, event.peer)))
-              \/ /\ HasNack(event.writeId, event.peer)
-                 /\ FaultAction(LoseMsg(NackFor(event.writeId, event.peer)))
-              \/ /\ event.peer \in writeWait[event.writeId]
-                 /\ ~HasMessage(event.writeId, event.peer)
-                 /\ ~HasAck(event.writeId, event.peer)
-                 /\ ~HasNack(event.writeId, event.peer)
-                 /\ UNCHANGED d1vars
+              IF event.hasTransportMessage
+              THEN /\ event.transportMessage \in messages
+                   /\ FaultAction(LoseMsg(event.transportMessage))
+              ELSE /\ event.peer \in writeWait[event.writeId]
+                   /\ UNCHANGED d1vars
        [] OTHER -> FALSE
     /\ IF event.outcome = "acknowledged"
           THEN /\ replicaResponsePersisted[event.writeId][event.peer]
                     <= event.resultPersistedNext
                /\ event.resultPersistedNext <= persistedNext[event.peer]
+          ELSE TRUE
+    /\ UNCHANGED AuxVars
+
+PromotionNoOpSendObservation(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ event.transportMessage.kind = "ReplicateNoOp"
+    /\ event.transportMessage.from = event.node
+    /\ event.transportMessage.to = event.peer
+    /\ event.transportMessage.term = event.term
+    /\ event.transportMessage.seq = event.seq
+    /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+PromotionNoOpReceiveObservation(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ event.transportMessage.kind = "ReplicateNoOp"
+    /\ event.transportMessage.from = event.peer
+    /\ event.transportMessage.to = event.node
+    /\ event.transportMessage.term = event.term
+    /\ event.transportMessage.seq = event.seq
+    /\ event.transportMessage.targetAllocation = event.allocation
+    /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+PromotionNoOpWalObservation(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ D1NoOpMessageEnabled(event.transportMessage)
+    /\ IF RequestDurability THEN event.durable ELSE TRUE
+    /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+PromotionNoOpProcessEvent(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ CASE event.outcome = "noop" ->
+              D1FixedReplicaNoOpProcess(event.transportMessage)
+       [] event.outcome = "redelivery" ->
+              D1FixedReplicaNoOpRedelivery(event.transportMessage)
+       [] event.outcome = "collision" ->
+              D1FixedReplicaNoOpCollision(event.transportMessage)
+       [] OTHER -> FALSE
+    /\ LiveCheckpointMatchesPrime(event.node, event)
+    /\ UNCHANGED AuxVars
+
+PromotionNoOpResultEvent(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ CASE event.outcome = "acknowledged" ->
+              /\ event.hasTransportMessage
+              /\ event.transportMessage \in messages
+              /\ event.transportMessage.kind = "NoOpAck"
+              /\ D1DeliverNoOpAck(event.transportMessage)
+       [] event.outcome = "failed" ->
+              /\ event.hasTransportMessage
+              /\ event.transportMessage \in messages
+              /\ event.transportMessage.kind = "NoOpNack"
+              /\ D1DeliverNoOpNack(event.transportMessage)
+       [] event.outcome \in {"dropped", "timeout"} ->
+              IF event.hasTransportMessage
+              THEN /\ event.transportMessage \in messages
+                   /\ FaultAction(LoseMsg(event.transportMessage))
+              ELSE UNCHANGED d1vars
+       [] OTHER -> FALSE
+    /\ IF event.outcome = "acknowledged"
+          THEN event.resultPersistedNext <= persistedNext[event.peer]
           ELSE TRUE
     /\ UNCHANGED AuxVars
 
@@ -336,6 +392,8 @@ CommitPersistEvent(event) ==
     /\ UNCHANGED replicaResponsePersisted
 
 CrashEvent(event) ==
+    /\ WritesOwnedBy(event.node) = event.crashFailedWrites
+    /\ DropNodeMessages(event.node) = event.crashDroppedMessages
     /\ D1CrashCopy(event.node)
     /\ UNCHANGED AuxVars
 
@@ -355,6 +413,7 @@ ReplayStartObservation(event) ==
 ReplayEntryEvent(event) ==
     /\ event.node \in Nodes
     /\ replaying[event.node]
+    /\ replayPos[event.node] = event.walPosition
     /\ replayPos[event.node] <= Len(walOrder[event.node])
     /\ LET entry == walOrder[event.node][replayPos[event.node]]
        IN /\ event.seq = WalEntrySeq(entry)
@@ -386,6 +445,7 @@ ReplayEntryEvent(event) ==
 
 ReplayFinishEvent(event) ==
     /\ event.node \in Nodes
+    /\ replayPos[event.node] = event.walPosition
     /\ CASE event.outcome = "completed" ->
               /\ D1FinishReplayAt(event.node)
               /\ replaySafe'
@@ -434,6 +494,7 @@ PromotionNoOpFillObservation(event) ==
     /\ TraceCombined
     /\ D1FillPromotionNoOps(event.node, event.observedProcessed)
     /\ event.term = routing.term
+    /\ event.requiredMessages \subseteq messages'
     /\ LiveCheckpointMatchesPrime(event.node, event)
     /\ UNCHANGED AuxVars
 
@@ -449,11 +510,15 @@ CoreEvent(event) ==
       [] event.kind = "wal_appended" ->
             IF event.origin = "primary"
             THEN PrimaryWalObservation(event)
-            ELSE ReplicaWalObservation(event)
+            ELSE IF event.writeId = NoWrite
+                 THEN PromotionNoOpWalObservation(event)
+                 ELSE ReplicaWalObservation(event)
       [] event.kind = "operation_processed" ->
             IF event.origin = "primary"
             THEN PrimaryProcessEvent(event)
-            ELSE ReplicaProcessEvent(event)
+            ELSE IF event.writeId = NoWrite
+                 THEN PromotionNoOpProcessEvent(event)
+                 ELSE ReplicaProcessEvent(event)
       [] event.kind = "primary_replication_started" ->
             PrimaryReplicationObservation(event)
       [] event.kind = "replica_received" ->
@@ -487,6 +552,12 @@ CoreEvent(event) ==
             InSyncRemovalObservation(event)
       [] event.kind = "promotion_noop_fill" ->
             PromotionNoOpFillObservation(event)
+      [] event.kind = "promotion_noop_replication_started" ->
+            PromotionNoOpSendObservation(event)
+      [] event.kind = "promotion_noop_received" ->
+            PromotionNoOpReceiveObservation(event)
+      [] event.kind = "promotion_noop_result" ->
+            PromotionNoOpResultEvent(event)
       [] event.kind = "primary_activated" ->
             ActivationEvent(event)
       [] OTHER -> FALSE
@@ -500,48 +571,117 @@ ConsumeEvent ==
     /\ hiddenSteps' = 0
     /\ UNCHANGED finished
 
-\* Real unobserved D1 actions only.  These are bounded between observations.
-HiddenD1Action ==
-    \/ \E node \in Nodes, nextPosition \in 1..(2 * MaxWrites + 1) :
-           D1SkipTruncatedReplayPrefix(node, nextPosition)
-    \/ /\ ~TraceCombined
-       /\ D1ScenarioAgeTombstone
-    \/ /\ ~TraceCombined
-       /\ D1ScenarioPruneTombstone
-    \/ /\ ~TraceCombined
-       /\ D1ScenarioRedeliver
-    \/ /\ TraceCombined
-       /\ \E candidate \in Nodes : FaultAction(ElectLeader(candidate))
-    \/ /\ TraceCombined
-       /\ \E leader \in Nodes, node \in Nodes, candidate \in Nodes :
-              FaultAction(SuspectAndRemove(leader, node, candidate))
-    \/ /\ TraceCombined
-       /\ \E node \in Nodes, candidate \in Nodes \cup {NoNode} :
-              FaultAction(ReportShardCopyFailure(node, candidate))
-    \/ /\ TraceCombined
-       /\ \E command \in pendingRaft :
-              FenceChangingReplication(CommitRaft(command))
-    \/ /\ TraceCombined
-       /\ \E node \in Nodes :
-              FenceChangingReplication(DeliverView(node))
-    \/ /\ TraceCombined
-       /\ \E node \in Nodes :
-              StableReplication(ProposeActivate(node))
+\* Hidden actions are selected by the next observation. This retains the real
+\* D1/Raft actions while eliminating unrelated node, command, message, and
+\* replay-position choices.
+PromotionCommandMatches(command, event) ==
+    /\ command.kind = "UpdateRouting"
+    /\ command.actor = event.emitter
+    /\ command.target = routing.primary
+    /\ command.newPrimary = event.newPrimary
+
+FailureCommandMatches(command, event) ==
+    /\ command.kind = "FailShardCopy"
+    /\ command.target = event.removedNode
+    /\ command.expectedAllocation = event.removedAllocation
+
+DesiredActivationTerm(event) ==
+    IF event.kind = "routing_view" THEN event.viewTerm ELSE event.term
+
+ActivationCommandMatches(command, event) ==
+    /\ command.kind = "ActivatePrimary"
+    /\ command.target = event.node
+    /\ command.expectedTerm + 1 = DesiredActivationTerm(event)
+
+HiddenReplayAction(event) ==
+    /\ event.kind \in {"replay_entry", "replay_finished"}
+    /\ event.walPosition > replayPos[event.node]
+    /\ D1SkipTruncatedReplayPrefix(event.node, event.walPosition)
+
+HiddenCoreMaintenance(event) ==
+    /\ ~TraceCombined
+    /\ \/ /\ event.kind \in {"node_crashed", "copy_state"}
+          /\ \/ D1ScenarioAgeTombstone
+             \/ D1ScenarioPruneTombstone
+       \/ /\ event.kind = "replica_received"
+          /\ event.writeId = 2
+          /\ event.node = ReplicaNode
+          /\ D1ScenarioRedeliver
+
+HiddenPromotionAction(event) ==
+    /\ TraceCombined
+    /\ event.kind = "routing_promoted"
+    /\ \/ /\ raftLeader # event.emitter
+          /\ FaultAction(ElectLeader(event.emitter))
+       \/ /\ raftLeader = event.emitter
+          /\ routing.primary # event.newPrimary
+          /\ ~(\E command \in pendingRaft :
+                    PromotionCommandMatches(command, event))
+          /\ FaultAction(
+                SuspectAndRemove(
+                    event.emitter, routing.primary, event.newPrimary))
+       \/ \E command \in pendingRaft :
+              /\ PromotionCommandMatches(command, event)
+              /\ FenceChangingReplication(CommitRaft(command))
+
+HiddenActivationAction(event) ==
+    /\ TraceCombined
+    /\ event.kind \in {"routing_view", "fence_persisted", "primary_activated"}
+    /\ event.node \in Nodes
+    /\ DesiredActivationTerm(event) > views[event.node].term
+    /\ \/ /\ raftLeader \notin LiveConnectedVoters
+          /\ FaultAction(ElectLeader(event.node))
+       \/ /\ activationPending[event.node] = NoTerm
+          /\ views[event.node].primary = event.node
+          /\ StableReplication(ProposeActivate(event.node))
+       \/ \E command \in pendingRaft :
+              /\ ActivationCommandMatches(command, event)
+              /\ FenceChangingReplication(CommitRaft(command))
+
+HiddenViewDelivery(event) ==
+    /\ TraceCombined
+    /\ event.kind = "routing_view"
+    /\ applied[event.node] < Len(raftLog)
+    /\ ViewMatches(raftLog[applied[event.node] + 1].state, event)
+    /\ FenceChangingReplication(DeliverView(event.node))
+
+HiddenRemovalAction(event) ==
+    /\ TraceCombined
+    /\ event.kind = "in_sync_removed"
+    /\ \/ /\ ~(\E command \in pendingRaft :
+                    FailureCommandMatches(command, event))
+          /\ FaultAction(
+                ReportShardCopyFailure(event.removedNode, NoNode))
+       \/ \E command \in pendingRaft :
+              /\ FailureCommandMatches(command, event)
+              /\ FenceChangingReplication(CommitRaft(command))
+
+HiddenD1Action(event) ==
+    \/ HiddenReplayAction(event)
+    \/ HiddenCoreMaintenance(event)
+    \/ HiddenPromotionAction(event)
+    \/ HiddenActivationAction(event)
+    \/ HiddenViewDelivery(event)
+    \/ HiddenRemovalAction(event)
 
 HiddenStep ==
+    LET event == Trace[tracePos]
+    IN
     /\ tracePos <= Len(Trace)
     /\ hiddenSteps < MaxHiddenSteps
-    /\ HiddenD1Action
+    /\ HiddenD1Action(event)
     /\ hiddenSteps' = hiddenSteps + 1
     /\ UNCHANGED
           <<tracePos, finished, captureActive, captureBoundary,
-            capturePersisted, captureMax, captureOps, captureDocValue, captureDocSeqNext,
-            captureTombstoneSeqNext, replicaResponsePersisted>>
+            capturePersisted, captureMax, captureOps, captureDocValue,
+            captureDocSeqNext, captureTombstoneSeqNext,
+            replicaResponsePersisted>>
 
 FinishTrace ==
     /\ tracePos > Len(Trace)
     /\ ~finished
     /\ ~(\E node \in Nodes : captureActive[node])
+    /\ (~TraceQuiescent \/ messages = {})
     /\ finished' = TRUE
     /\ UNCHANGED
           <<d1vars, tracePos, hiddenSteps, captureActive, captureBoundary,

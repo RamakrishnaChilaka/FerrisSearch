@@ -8,7 +8,8 @@ TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 DEFAULT_JAR="${XDG_CACHE_HOME:-$HOME/.cache}/ferrissearch-tla/v${TLA_VERSION}/tla2tools.jar"
-TIMEOUT_SECONDS="${TLA_TRACE_TIMEOUT_SECONDS:-60}"
+TIMEOUT_SECONDS="${TLA_TRACE_TIMEOUT_SECONDS:-120}"
+HEAP_SIZE="${TLA_TRACE_HEAP:-4g}"
 INCONCLUSIVE_EXIT=3
 
 usage() {
@@ -163,12 +164,14 @@ set +e
     timeout "${TIMEOUT_SECONDS}s" \
         java \
         -Djava.io.tmpdir="$RUN_DIR/java-tmp" \
+        -Xmx"$HEAP_SIZE" \
         -XX:+UseParallelGC \
         -cp "$JAR" \
         tlc2.TLC \
         -deadlock \
         -difftrace \
         -workers 1 \
+        -dump "$RUN_DIR/states.dump" \
         -metadir "$RUN_DIR/states" \
         -config TraceD1.cfg \
         "$TRACE_MODULE.tla"
@@ -230,46 +233,6 @@ PY
     echo "Trace rejected at schema step $failed_step (event ${failed_event:-trace_end}): $TRACE_PATH" >&2
 }
 
-generate_diagnostic_dump() {
-    local diagnostic_status
-    mkdir -p "$RUN_DIR/diagnostic-states"
-    set +e
-    (
-        cd "$RUN_DIR"
-        timeout "${TIMEOUT_SECONDS}s" \
-            java \
-            -Djava.io.tmpdir="$RUN_DIR/java-tmp" \
-            -XX:+UseParallelGC \
-            -cp "$JAR" \
-            tlc2.TLC \
-            -deadlock \
-            -workers 1 \
-            -dump "$RUN_DIR/states.dump" \
-            -metadir "$RUN_DIR/diagnostic-states" \
-            -config TraceD1.cfg \
-            "$TRACE_MODULE.tla"
-    ) >"$RUN_DIR/diagnostic.log" 2>&1
-    diagnostic_status=$?
-    set -e
-    if [[ $diagnostic_status -eq 124 ]]; then
-            cat "$RUN_DIR/diagnostic.log" >&2
-            inconclusive \
-                "diagnostic trace search exceeded ${TIMEOUT_SECONDS}s: $TRACE_PATH"
-    fi
-    if [[ $diagnostic_status -eq 137 ]] ||
-            grep -Eiq \
-                'OutOfMemoryError|Java ran out of memory|Java heap space|GC overhead limit exceeded|Could not reserve enough space|Cannot allocate memory|insufficient memory|Too small maximum heap' \
-                "$RUN_DIR/diagnostic.log"; then
-            cat "$RUN_DIR/diagnostic.log" >&2
-            inconclusive \
-                "diagnostic trace search exhausted memory: $TRACE_PATH"
-    fi
-    if [[ $diagnostic_status -ne 0 && $diagnostic_status -ne 12 ]]; then
-            cat "$RUN_DIR/diagnostic.log" >&2
-            inconclusive "diagnostic trace search failed: $TRACE_PATH"
-    fi
-}
-
 if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
     ! grep -Fq "Invariant $TYPE_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
     ! grep -Fq "Invariant $SAFETY_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
@@ -278,7 +241,6 @@ if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
 fi
 
 if grep -Fq "Invariant $SAFETY_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
-    generate_diagnostic_dump
     max_position=$(
         sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
             sort -n |
@@ -291,7 +253,6 @@ fi
 if [[ $status -eq 0 ]] &&
     ! grep -Fq "Error:" "$RUN_DIR/tlc.log" &&
     grep -Fq "Model checking completed. No error has been found." "$RUN_DIR/tlc.log"; then
-    generate_diagnostic_dump
     max_position=$(
         sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
             sort -n |
