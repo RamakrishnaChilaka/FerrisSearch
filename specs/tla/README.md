@@ -378,8 +378,9 @@ entire trace through real actions:
 
 The converter infers the composition from the event vocabulary; the emitter
 does not select a profile. Core replication and authority/failover events may
-use the combined composition in one trace. Peer recovery remains a separate
-composition.
+use the combined composition in one trace. A trace that also contains peer
+recovery uses the full composition in `TraceD1.tla`; recovery-only fixtures
+continue to use `TraceD1Recovery.tla`.
 Observed low-level WAL, fence, and commit records may be D1 stuttering steps,
 but they are tied to a later real action and semantic `copy_state`. Observed
 records cannot be reordered or discarded.
@@ -397,11 +398,16 @@ replay records name their physical WAL receipts. Hidden promotion, activation,
 view-delivery, removal, replay-skip, and transport steps are constrained by
 the next observation rather than explored as unrelated choices.
 
-Recovery control actions are used only by `TraceD1Recovery` and compose with
-the D1 fixed planner for live replication and ordered catch-up. The ordering
-premise is an activated-primary source scanning the pinned physical WAL in
-file order with one exclusive sequence cursor. Out-of-order or duplicate
-catch-up batches are therefore not expressible in that composition.
+Recovery control actions are used by `TraceD1Recovery` and the full
+`TraceD1` composition. They compose with the D1 fixed planner for live
+replication, promotion NoOps, fresh-allocation replacement, and ordered
+catch-up. Snapshot and barrier observations compare the exact processed
+sequence set, including promotion NoOps; live-document evidence projects
+delete identities to absence while the model retains tombstone metadata. The
+ordering premise is an activated-primary source scanning the pinned physical
+WAL in file order with one exclusive sequence cursor. Out-of-order or
+duplicate catch-up batches are therefore not expressible in either
+composition.
 
 Bulk traces may record every per-item WAL append before any item is processed;
 the append and processing records remain ordered inside one translog critical

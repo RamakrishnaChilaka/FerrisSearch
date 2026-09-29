@@ -114,6 +114,34 @@ FaultAction(action) ==
     /\ action
     /\ UNCHANGED <<ApplySafetyVars, D1Vars>>
 
+RecoveryAction(action) ==
+    /\ action
+    /\ UNCHANGED <<ApplySafetyVars, FaultVars, D1Vars>>
+
+RecoveryStable(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            sessionAllocation, pendingAllocation, ApplySafetyVars,
+            FaultVars, D1Vars>>
+
+RecoveryInstall(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<sessionAllocation, pendingAllocation, ApplySafetyVars, FaultVars>>
+
+RecoveryTargetComplete(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            sessionAllocation, ApplySafetyVars, FaultVars, D1Vars>>
+
+RecoveryObserveAdmission(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            pendingAllocation, ApplySafetyVars, FaultVars, D1Vars>>
+
 ViewMatches(view, event) ==
     /\ view.primary = event.viewPrimary
     /\ view.term = event.viewTerm
@@ -505,17 +533,84 @@ ActivationEvent(event) ==
     /\ activated'[event.node] = event.term
     /\ UNCHANGED AuxVars
 
+RecoverySnapshotEvent(event) ==
+    /\ EnableRecovery
+    /\ event.source \in Nodes
+    /\ event.target \in Nodes
+    /\ sessionSource[event.target] = event.source
+    /\ RecoveryStable(SourceSnapshot(event.target))
+    /\ sessionBoundary'[event.target] = event.snapshotNext
+    /\ D1SnapshotSequences(
+           event.source,
+           sessionSnapshot'[event.target],
+           sessionBoundary'[event.target])
+          = event.observedProcessed
+    /\ D1VisibleDocValue(sessionSnapshot'[event.target])
+          = event.snapshotDocValue
+    /\ UNCHANGED AuxVars
+
+RecoveryStartEvent(event) ==
+    /\ EnableRecovery
+    /\ RecoveryStable(TargetBeginInstall(event.target))
+    /\ UNCHANGED AuxVars
+
+RecoveryInstallEvent(event) ==
+    /\ EnableRecovery
+    /\ RecoveryInstall(D1InstallRecoverySnapshot(event.target))
+    /\ nextSeq'[event.target] = event.snapshotNext
+    /\ UNCHANGED AuxVars
+
+RecoveryWalObservation(event) ==
+    /\ EnableRecovery
+    /\ sessionFetched[event.node] = event.writeId
+    /\ IF RequestDurability THEN event.durable ELSE TRUE
+    /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+RecoveryApplyEvent(event) ==
+    /\ EnableRecovery
+    /\ sessionFetched[event.node] = event.writeId
+    /\ D1FixedRecoveryApply(event.node)
+    /\ IF event.outcome = "applied_newer"
+          THEN docValue'[event.node][event.doc] = event.writeId
+          ELSE IF event.outcome = "stale"
+               THEN docValue'[event.node][event.doc]
+                    = docValue[event.node][event.doc]
+               ELSE FALSE
+    /\ event.writeId \in durableOps'[event.node]
+    /\ LiveCheckpointMatchesPrime(event.node, event)
+    /\ UNCHANGED AuxVars
+
+RecoveryBarrierEvent(event) ==
+    /\ EnableRecovery
+    /\ sessionHead[event.target] = event.barrierNext
+    /\ sessionCursor[event.target] = event.barrierNext
+    /\ processedSeqs[event.target] = event.observedProcessed
+    /\ RecoveryTargetComplete(TargetComplete(event.target))
+    /\ UNCHANGED AuxVars
+
+RecoveryMembershipEvent(event) ==
+    /\ EnableRecovery
+    /\ event.outcome = "admitted"
+    /\ RecoveryTargetComplete(TargetObserveAdmitted(event.target))
+    /\ event.target \in routing.inSync
+    /\ UNCHANGED AuxVars
+
 CoreEvent(event) ==
     CASE event.kind = "client_write_routed" -> ClientWriteEvent(event)
       [] event.kind = "wal_appended" ->
             IF event.origin = "primary"
             THEN PrimaryWalObservation(event)
+            ELSE IF event.origin = "recovery"
+                 THEN RecoveryWalObservation(event)
             ELSE IF event.writeId = NoWrite
                  THEN PromotionNoOpWalObservation(event)
                  ELSE ReplicaWalObservation(event)
       [] event.kind = "operation_processed" ->
             IF event.origin = "primary"
             THEN PrimaryProcessEvent(event)
+            ELSE IF event.origin = "recovery"
+                 THEN RecoveryApplyEvent(event)
             ELSE IF event.writeId = NoWrite
                  THEN PromotionNoOpProcessEvent(event)
                  ELSE ReplicaProcessEvent(event)
@@ -560,6 +655,16 @@ CoreEvent(event) ==
             PromotionNoOpResultEvent(event)
       [] event.kind = "primary_activated" ->
             ActivationEvent(event)
+      [] event.kind = "recovery_snapshot" ->
+            RecoverySnapshotEvent(event)
+      [] event.kind = "recovery_started" ->
+            RecoveryStartEvent(event)
+      [] event.kind = "recovery_installed" ->
+            RecoveryInstallEvent(event)
+      [] event.kind = "recovery_barrier" ->
+            RecoveryBarrierEvent(event)
+      [] event.kind = "recovery_membership" ->
+            RecoveryMembershipEvent(event)
       [] OTHER -> FALSE
 
 ConsumeEvent ==
@@ -656,6 +761,55 @@ HiddenRemovalAction(event) ==
               /\ FailureCommandMatches(command, event)
               /\ FenceChangingReplication(CommitRaft(command))
 
+HiddenRecoveryAction(event) ==
+    /\ EnableRecovery
+    /\ event.kind \in
+          {"recovery_snapshot", "recovery_started", "recovery_installed",
+           "recovery_barrier", "recovery_membership", "routing_view",
+           "wal_appended", "operation_processed"}
+    /\ \/ \E target \in Nodes, source \in Nodes :
+              /\ event.kind = "recovery_snapshot"
+              /\ target = event.target
+              /\ source = event.source
+              /\ RecoveryAction(StartRecovery(target, source))
+       \/ \E leader \in Nodes, target \in Nodes :
+              /\ event.kind = "routing_view"
+              /\ FaultAction(AllocateAfterLifecycle(leader, target))
+       \/ \E target \in Nodes :
+              /\ event.kind \in {"routing_view", "recovery_snapshot"}
+              /\ FaultAction(ObserveAllocationAccepted(target))
+       \/ \E target \in Nodes :
+              /\ event.kind \in
+                    {"wal_appended", "operation_processed", "recovery_barrier"}
+              /\ RecoveryStable(FetchOps(target))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_barrier"
+              /\ RecoveryStable(FinishCatchUp(target))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_barrier"
+              /\ RecoveryStable(BeginPrepareFinalize(target))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_barrier"
+              /\ RecoveryStable(AcquireFinalizeBarrier(target))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_barrier"
+              /\ RecoveryStable(FinishFinalizeTail(target))
+       \/ \E target \in Nodes :
+              /\ event.kind \in {"routing_view", "recovery_membership"}
+              /\ RecoveryStable(BeginSettlement(target))
+       \/ \E target \in Nodes :
+              /\ event.kind \in {"routing_view", "recovery_membership"}
+              /\ RecoveryStable(ProposeMarkInSync(target))
+       \/ \E command \in pendingRaft :
+              /\ event.kind \in {"routing_view", "recovery_membership"}
+              /\ FenceChangingReplication(CommitRaft(command))
+       \/ \E node \in Nodes :
+              /\ event.kind = "routing_view"
+              /\ FenceChangingReplication(DeliverView(node))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_membership"
+              /\ RecoveryObserveAdmission(ObserveAdmission(target))
+
 HiddenD1Action(event) ==
     \/ HiddenReplayAction(event)
     \/ HiddenCoreMaintenance(event)
@@ -663,6 +817,7 @@ HiddenD1Action(event) ==
     \/ HiddenActivationAction(event)
     \/ HiddenViewDelivery(event)
     \/ HiddenRemovalAction(event)
+    \/ HiddenRecoveryAction(event)
 
 HiddenStep ==
     LET event == Trace[tracePos]

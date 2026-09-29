@@ -970,7 +970,29 @@ def load_trace(path: Path) -> LoadedTrace:
         }
     )
     has_client_write = "client_write_routed" in kinds
-    if has_recovery:
+    if has_recovery and (
+        has_authority
+        or has_collision
+        or bool(
+            kinds
+            & {
+                "commit_captured",
+                "commit_persisted",
+                "wal_truncated",
+                "node_crashed",
+                "node_restarted",
+                "replay_started",
+                "replay_entry",
+                "replay_finished",
+                "promotion_noop_fill",
+                "promotion_noop_replication_started",
+                "promotion_noop_received",
+                "promotion_noop_result",
+            }
+        )
+    ):
+        profile = "d1-full"
+    elif has_recovery:
         profile = "d1-recovery"
     elif has_collision and has_client_write:
         profile = "d1-combined"
@@ -1042,6 +1064,38 @@ def load_trace(path: Path) -> LoadedTrace:
             "promotion_noop_received",
             "promotion_noop_result",
             "primary_activated",
+            "copy_state",
+        },
+        "d1-full": {
+            "client_write_routed",
+            "wal_appended",
+            "operation_processed",
+            "primary_replication_started",
+            "replica_received",
+            "replica_result",
+            "client_result",
+            "fence_persisted",
+            "commit_captured",
+            "commit_persisted",
+            "wal_truncated",
+            "node_crashed",
+            "node_restarted",
+            "replay_started",
+            "replay_entry",
+            "replay_finished",
+            "routing_view",
+            "routing_promoted",
+            "in_sync_removed",
+            "promotion_noop_fill",
+            "promotion_noop_replication_started",
+            "promotion_noop_received",
+            "promotion_noop_result",
+            "primary_activated",
+            "recovery_snapshot",
+            "recovery_started",
+            "recovery_installed",
+            "recovery_barrier",
+            "recovery_membership",
             "copy_state",
         },
         "d1-collision": {
@@ -1766,8 +1820,14 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
         item["node"]: item["allocation"]
         for item in trace.start["shard_state"]["copies"]
     }
+    preserve_allocation_ids = trace.profile == "d1-full"
     allocation_values: dict[str, dict[int, int]] = {
-        raw: {allocation[raw]: 1} for raw in nodes_raw
+        raw: {
+            allocation[raw]: (
+                allocation[raw] if preserve_allocation_ids else 1
+            )
+        }
+        for raw in nodes_raw
     }
 
     def register_allocation(raw_node: str | None, raw_value: int | None) -> None:
@@ -1775,7 +1835,9 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             return
         values = allocation_values[raw_node]
         if raw_value not in values:
-            values[raw_value] = len(values) + 1
+            values[raw_value] = (
+                raw_value if preserve_allocation_ids else len(values) + 1
+            )
 
     for event in trace.events:
         register_allocation(event.get("node"), event.get("allocation"))
@@ -2168,6 +2230,7 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
         "d1-core": 3,
         "d1-authority": 4,
         "d1-combined": 4,
+        "d1-full": 8,
         "d1-collision": 0,
         "d1-recovery": 8,
     }[trace.profile]
@@ -2185,7 +2248,7 @@ TraceDocs == {tla_set([doc[item] for item in docs_raw])}
 TraceInitialPrimary == {node[primary_raw]}
 TraceInitialInSync == {tla_set([node[item] for item in trace.start["shard_state"]["in_sync"]])}
 TraceQuiescent == {"TRUE" if trace.end["quiescent"] else "FALSE"}
-TraceCombined == {"TRUE" if trace.profile == "d1-combined" else "FALSE"}
+TraceCombined == {"TRUE" if trace.profile in {"d1-combined", "d1-full"} else "FALSE"}
 NoTraceMessage ==
     [kind |-> "Replicate",
      write |-> 1,
@@ -2297,13 +2360,14 @@ INVARIANT TraceAuthoritySafety
 INVARIANT TraceAuthorityNotAccepted
 """
     else:
+        recovery_enabled = profile == "d1-full"
         config = f"""CONSTANTS
     Nodes = {tla_set([node[item] for item in nodes_raw])}
     Docs = {tla_set([doc[item] for item in docs_raw])}
     MaxWrites = {max_writes}
     MaxCrashes = {max_crashes}
     MaxPartitions = 0
-    MaxRecoveries = 0
+    MaxRecoveries = {max(1, max_recoveries) if recovery_enabled else 0}
     MaxTerm = {max_term}
     MaxMessages = {max_messages}
     MaxViewLag = {max_view_lag}
@@ -2313,7 +2377,7 @@ INVARIANT TraceAuthorityNotAccepted
     FaultMode = "{d1_fault_mode}"
     InitialOutOfSync = {"TRUE" if len(trace.start["shard_state"]["in_sync"]) != len(nodes_raw) - 1 else "FALSE"}
     InitialInitialized = TRUE
-    EnableRecovery = FALSE
+    EnableRecovery = {"TRUE" if recovery_enabled else "FALSE"}
     AllocationIds = TRUE
     ReplicaFencing = TRUE
     DurableReplicaFence = TRUE

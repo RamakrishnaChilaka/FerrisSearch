@@ -158,8 +158,10 @@ cargo test -- test_name                         # Single test by name
   duplicate planner/routing rules in the trace module.
 - One trace uses exactly one inferred composition. The combined composition
   permits core replication followed by crash/restart, failover, activation,
-  collision removal, and later-term writes. Peer recovery remains separate.
-  Keep the exact event vocabularies synchronized with `SCHEMA.md`.
+  collision removal, and later-term writes. The full composition adds
+  fresh-allocation peer recovery and admission to that same real D1 relation;
+  isolated recovery fixtures retain the recovery-only composition. Keep the
+  exact event vocabularies synchronized with `SCHEMA.md`.
 - TLC trace acceptance is existential witness search with a validator-owned
   hidden-action bound. A pass means only that the finite observation can be
   embedded in the selected bounded model; it is not an implementation proof.

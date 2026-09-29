@@ -220,9 +220,12 @@ SnapshotEvent(event) ==
     /\ sessionSource[event.target] = event.source
     /\ RecoveryStable(SourceSnapshot(event.target))
     /\ sessionBoundary'[event.target] = event.snapshotNext
-    /\ {writeSeq[writeId] : writeId \in sessionSnapshot'[event.target]}
+    /\ D1SnapshotSequences(
+           event.source,
+           sessionSnapshot'[event.target],
+           sessionBoundary'[event.target])
           = event.observedProcessed
-    /\ RebuiltDocValue(sessionSnapshot'[event.target])
+    /\ D1VisibleDocValue(sessionSnapshot'[event.target])
           = event.snapshotDocValue
 
 RecoveryStartEvent(event) ==
@@ -254,8 +257,7 @@ RecoveryApplyEvent(event) ==
 RecoveryBarrierEvent(event) ==
     /\ sessionHead[event.target] = event.barrierNext
     /\ sessionCursor[event.target] = event.barrierNext
-    /\ {writeSeq[writeId] : writeId \in ops[event.target]}
-          = event.observedProcessed
+    /\ processedSeqs[event.target] = event.observedProcessed
     /\ RecoveryTargetComplete(TargetComplete(event.target))
 
 RecoveryMembershipEvent(event) ==

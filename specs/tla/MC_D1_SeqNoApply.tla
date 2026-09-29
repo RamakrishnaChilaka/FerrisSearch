@@ -925,10 +925,26 @@ D1TombstoneSeqNextFor(writeSet) ==
            THEN writeSeq[writeId] + 1
            ELSE 0]
 
+D1SnapshotSequences(source, writeSet, boundary) ==
+    {writeSeq[writeId] : writeId \in writeSet}
+    \cup
+    {seq \in D1Seqs :
+        /\ seq < boundary
+        /\ seq \in processedSeqs[source]
+        /\ noopTerm[source][seq] > 0}
+
+D1VisibleDocValue(writeSet) ==
+    [doc \in Docs |->
+        LET writeId == LatestWriteForDoc(writeSet, doc)
+        IN IF writeId = NoWrite \/ writeKind[writeId] = "Delete"
+           THEN NoWrite
+           ELSE writeId]
+
 D1InstallRecoverySnapshot(target) ==
-    LET snapshot == sessionSnapshot[target]
-        sequences == {writeSeq[writeId] : writeId \in snapshot}
+    LET source == sessionSource[target]
+        snapshot == sessionSnapshot[target]
         boundary == sessionBoundary[target]
+        sequences == D1SnapshotSequences(source, snapshot, boundary)
         snapshotDocValue == RebuiltDocValue(snapshot)
         snapshotDocSeqNext == D1DocSeqNextFor(snapshot)
         snapshotTombstoneSeqNext == D1TombstoneSeqNextFor(snapshot)
@@ -937,7 +953,7 @@ D1InstallRecoverySnapshot(target) ==
                 LET matching ==
                     {writeId \in snapshot : writeSeq[writeId] = seq}
                 IN IF matching = {}
-                   THEN 0
+                   THEN noopTerm[source][seq]
                    ELSE writeTerm[CHOOSE writeId \in matching : TRUE]]
     IN
     /\ D1Fixed
@@ -945,7 +961,11 @@ D1InstallRecoverySnapshot(target) ==
     /\ walOrder' = [walOrder EXCEPT ![target] = <<>>]
     /\ noopTerm' =
           [noopTerm EXCEPT
-              ![target] = [seq \in D1Seqs |-> 0]]
+              ![target] =
+                  [seq \in D1Seqs |->
+                      IF seq \in sequences
+                      THEN noopTerm[source][seq]
+                      ELSE 0]]
     /\ processedSeqs' = [processedSeqs EXCEPT ![target] = sequences]
     /\ processedNext' =
           [processedNext EXCEPT ![target] = ContiguousNext(sequences)]

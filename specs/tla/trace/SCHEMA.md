@@ -19,6 +19,7 @@ The converter infers one composition from the event vocabulary:
 | `d1-core` | `TraceD1.tla` | Primary acceptance, exact-message replica apply, acknowledgements, commit, truncation, crash, restart, and replay. |
 | `d1-authority` | `TraceD1Authority.tla` | Crash, election, promotion, routing-view delivery, fencing, activation, and primary-write gating. |
 | `d1-combined` | `TraceD1.tla` | Core plus failover, promotion NoOp fill and fan-out, exact in-sync removal, and later-term collision handling. |
+| `d1-full` | `TraceD1.tla` | Combined restart/failover behavior plus fresh-allocation peer recovery, exact snapshot and barrier sequence sets, and conditional admission. |
 | `d1-collision` | `TraceD1Collision.tla` | Durable fence, definitive sequence collision, and exact in-sync removal. |
 | `d1-recovery` | `TraceD1Recovery.tla` | Snapshot installation, pinned WAL suffix, final barrier, conditional membership, and sequence-aware live replication. |
 
