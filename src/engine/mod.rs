@@ -522,9 +522,8 @@ pub trait SearchEngine: Send + Sync {
     /// Returns the number of searchable documents.
     fn doc_count(&self) -> u64;
 
-    /// Get the local checkpoint: highest observed seq_no applied to this shard copy.
-    /// This is currently a high-water mark, not a contiguous-prefix proof.
-    /// Returns 0 if no seq_no tracking is configured (backward compat).
+    /// Get the highest contiguous processed sequence on this shard copy.
+    /// `None` means no operation has been processed and differs from `Some(0)`.
     fn local_checkpoint(&self) -> Option<u64> {
         self.sequence_stats().processed_checkpoint
     }
@@ -556,8 +555,8 @@ pub trait SearchEngine: Send + Sync {
         1
     }
 
-    /// Get the global checkpoint: min of all in-sync replica checkpoints.
-    /// Only meaningful on the primary shard.
+    /// Get the monotonic minimum persisted checkpoint across authoritative copies.
+    /// Only meaningful on the primary shard; `None` means it is not yet available.
     fn global_checkpoint(&self) -> Option<u64> {
         None
     }

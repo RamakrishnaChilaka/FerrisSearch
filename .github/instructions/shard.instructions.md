@@ -159,14 +159,16 @@ pub struct IsrTracker {
 }
 
 pub struct ReplicaCheckpoint {
-    pub checkpoint: u64,
+    pub allocation_id: u64,
+    pub processed_checkpoint: Option<u64>,
+    pub persisted_checkpoint: Option<u64>,
     pub last_updated: Instant,
 }
 ```
 
 ### Key Methods
-- `update_replica_checkpoint(index, shard_id, replica_node_id, checkpoint)`
-- `update_replica_checkpoints(index, shard_id, checkpoints: &[(String, u64)])`
+- `update_replica_checkpoint(...)` / `update_replica_checkpoints(...)` take
+  exact-allocation typed checkpoint responses plus the captured primary prefix
 - `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>`
   - Returns a legacy lag-based diagnostic view only; it does not grant
     authoritative in-sync membership
@@ -176,14 +178,16 @@ pub struct ReplicaCheckpoint {
 ### How Checkpoint Observations Are Used
 1. Primary writes to WAL + engine → replicates to the Raft-authoritative
    `ShardRoutingEntry.in_sync_replicas`
-2. Each replica returns its `local_checkpoint` after applying
-3. Primary calls `update_replica_checkpoints()` with returned values
+2. Each replica proves the exact operation processed and returns optional
+   contiguous processed/persisted checkpoints
+3. Primary updates a monotonic maximum per exact allocation; reordered lower
+   responses cannot regress it
 4. A leader that also hosts the primary may use `replica_checkpoints()` to
    prefer the highest observed candidate within the authoritative in-sync set;
    otherwise it chooses a live in-sync cluster member without checkpoint
    ranking
 
-The current checkpoint values are highest-observed sequence watermarks, not
-proof that every lower sequence was applied. Do not describe ISR tracking,
-global checkpoint updates, or recovery as gap-aware until an explicit
-contiguous-prefix protocol exists.
+Checkpoint observations are contiguous-prefix proofs, not maximum sequence
+numbers. `ReplicaGapObservation` fixes its target at first observation and the
+lifecycle performs an exact-allocation sequence-state probe before removal.
+The tracker remains diagnostic/ranking state and never grants membership.

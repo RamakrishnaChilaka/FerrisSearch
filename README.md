@@ -262,11 +262,13 @@ coordinator-side merge semantics are required.
 - Primary/replica shard routing over gRPC
 - Generation-based binary translog with request or asynchronous durability
 - Primary write receipts propagated to REST `_seq_no` responses, including bulk
-  ranges, with replica WAL sequence preservation
-- Monotonic sequence high-watermark tracking
+  ranges and `_primary_term`, with replica WAL operation identity preservation
+- Gap-aware processed and persisted checkpoints, with explicit `None` distinct
+  from sequence zero and persisted-prefix global checkpoint calculation
 - Bounded file-based peer recovery for initial, later-added, and rejoining replicas:
-  committed Tantivy files, pinned WAL suffix, final write barrier, and
-  allocation-bound conditional in-sync admission
+  exact committed-boundary installation, pinned physical-order WAL streaming,
+  processed-checkpoint finalization, a final write barrier, and allocation-bound
+  conditional in-sync admission
 - Raft-owned shard-copy allocation IDs, durable local copy identity, and
   replica primary-term fencing before WAL mutation
 - Fail-closed copy startup with immediate corruption reporting, bounded
@@ -334,9 +336,11 @@ allocation can currently choose the same faulty node again; a
 MaxRetryAllocationDecider-style exclusion policy and
 `index.allocation.max_retries` setting are deferred.
 
-This pre-1.0 protocol does not adopt legacy shard directories or routing
-snapshots that lack allocation identity. Clusters created before this change
-must be recreated or reindexed; there is no rolling compatibility path.
+This pre-1.0 protocol rejects routing snapshots and non-migratable shard copies
+that lack allocation identity. A narrowly verified flushed legacy primary with
+an empty v1 WAL can migrate in place; legacy replicas remain closed until an
+active migrated primary is proven, then receive a fresh allocation and peer
+recovery. There is no rolling mixed-version compatibility path.
 
 For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
 the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable
@@ -440,12 +444,14 @@ production ready**. The most important limits are:
 - At the `8f17172` main baseline, startup replay resurrected acknowledged
   deletes and one transient Tantivy commit failure could lose later
   acknowledged writes. Both defects are fixed on this branch.
-- `_seq_no` now reports the primary WAL assignment, but `_version` and
-  `_primary_term` compatibility fields remain placeholders. Gap-aware
-  checkpoints, primary epochs, idempotent retries, `if_seq_no` /
+- `_seq_no` and `_primary_term` report the primary-assigned operation identity,
+  while `_version` remains a placeholder. Internal replica redelivery is
+  sequence/term aware, but client retry tokens, `if_seq_no` /
   `if_primary_term`, and complete optimistic concurrency control are still
   missing.
-- Replica bootstrap needs snapshot-plus-streamed-WAL recovery.
+- Replica bootstrap uses file snapshot plus physical-order WAL streaming, but
+  source sessions and retention pins remain process-local and general D10
+  rollback/resync is not implemented.
 - Remote manifest publication is serialized only inside one process; there is
   no cross-process compare-and-set or writer fencing.
 - Remote-store ingest is manual, not near-real-time, and there is no unified

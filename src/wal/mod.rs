@@ -143,7 +143,7 @@ impl std::fmt::Display for WalOperation {
 /// A single WAL entry, representing one indexing operation.
 #[derive(Debug, Clone)]
 pub struct TranslogEntry {
-    /// Monotonically increasing sequence number for ordering
+    /// Primary-assigned sequence identity; physical WAL order may differ.
     pub seq_no: u64,
     /// Primary term that assigned this sequence number.
     pub primary_term: u64,

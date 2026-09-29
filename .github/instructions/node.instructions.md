@@ -173,6 +173,17 @@ pub struct Node {
 
 Promotion changes increment the state-machine-owned shard term. A promoted or
 restarted primary still activates once per process before its first write.
+Activation persists the durable fence, replays retained WAL state, fills every
+missing local sequence through the fenced maximum with durable current-term
+NoOps, and only then enables writes. Best-effort NoOp replication may leave a
+bounded replica gap for normal probe/removal handling; it must not weaken local
+activation.
+
+A flushed legacy v1 primary may migrate in place only through the explicit
+primary migration path, using the durable copy-identity fence as the committed
+term. Legacy replicas never self-upgrade; keep them closed/pending until a
+native or migrated active primary is proven, then replace them through a fresh
+allocation and peer recovery.
 Whole-index `UpdateIndex` races beyond the enforced routing rules remain future
 work.
 

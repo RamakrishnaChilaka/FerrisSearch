@@ -1,15 +1,17 @@
 # Shard Replication And Recovery Protocol
 
-> **Status: Proposed design, not implemented.**
+> **Status: Partially implemented.**
 >
-> **Date:** September 24, 2026.
+> **Updated:** September 29, 2026.
 >
-> **Source baseline:** `e805f70ff5dba0be9077b9bc32fcd488e837e6d1` (PR #141).
+> **Historical design baseline:** `e805f70ff5dba0be9077b9bc32fcd488e837e6d1`
+> (PR #141).
 >
-> This document specifies a target for `local_shards`. It does not establish
-> production readiness, completed roadmap tasks, or OpenSearch/Elasticsearch
+> D1 sequencing, fencing, checkpoint, and bounded peer-recovery foundations are
+> implemented. Later RP and D10 sections remain target design. This document
+> does not establish production readiness or OpenSearch/Elasticsearch
 > compatibility. The [acceptance matrix](recovery-acceptance-matrix.md) defines
-> the evidence required before making those claims.
+> the evidence required before making broader claims.
 
 ## 1. Scope And Roadmap Alignment
 
@@ -40,26 +42,39 @@ to implement every package in one PR. See the
 [roadmap](architecture-roadmap.md#9-roadmap-gates) and
 [backlog](next-50-tasks.md).
 
-## 2. Current Behavior And Verified Gaps
+## 2. Implemented Baseline And Remaining Gaps
 
-The table describes the source baseline, not the proposed protocol.
+The table reflects the implemented branch as of September 29, 2026. Later
+sections still describe the broader target protocol; they are not all shipped.
 
 | Surface | Current behavior | Required change |
 |---|---|---|
-| [Node lifecycle](../src/node/mod.rs) | Elects a Raft leader and promotes replicas. Promotion uses the leader's local checkpoint observations or the first replica. | Promotion must use authoritative copy membership and validated history, not a lag heuristic or list order. |
-| [Replica allocation](../src/node/mod.rs) | Lost replica slots are counted only when an index has no orphaned primary in that dead-node pass. | Account for primary and replica loss independently per shard; reconcile desired redundancy. |
-| [Replication](../src/replication/mod.rs) | Sends to configured replicas; a replication failure fails the request after the primary may already have mutated. | Separate desired copies from acknowledged in-sync copies, while preserving explicit ambiguous/failure outcomes. |
-| [Transport](../proto/transport.proto) | Carries primary sequence numbers, but no primary term, history identity, allocation identity, or recovery session. | Validate those identities at every mutation and recovery boundary. |
-| [Checkpoint tracking](../src/engine/composite.rs) | Uses maximum observed sequence numbers; initializes trackers to zero on open. | Reconstruct and persist contiguous processed/durable boundaries without overloading sequence zero. |
-| [Automatic recovery](../src/node/mod.rs) | Runs for replicas whose checkpoint is zero, only on the follower branch. | Reconcile all assigned copies independently of the metadata-leader role and recover nonzero lag. |
-| [WAL suffix](../src/wal/mod.rs) | `read_from(0)` excludes sequence zero; responses materialize the suffix. | An unambiguous start position, retained-history checks, bounded streaming, and snapshot fallback. |
-| [Recovery apply](../src/node/lifecycle.rs) | Logs some apply failures, silently skips malformed index payloads, and returns no terminal result. | The first invalid operation stops that session; no successful completion or in-sync admission. |
+| [Node lifecycle](../src/node/mod.rs) | Promotes only Raft-authoritative in-sync copies, activates restarted/promoted primaries proactively, replays local WAL, and fills local sequence gaps with durable NoOps. | General rollback-to-global-checkpoint and full D10 resync remain unimplemented. |
+| [Replica allocation](../src/node/mod.rs) | Accounts for primary and replica loss independently and conditionally removes exact failed allocations. | Failed-allocation exclusion and configurable allocation retry limits remain deferred. |
+| [Replication](../src/replication/mod.rs) | Synchronously sends exact operation identities only to Raft-authoritative in-sync replicas; any required replica failure fails the request after the primary may already have mutated. | Client retry identity and explicit ambiguous outcomes remain unimplemented. |
+| [Transport](../proto/transport.proto) | Carries term/sequence identity, exact allocation IDs, optional processed/persisted checkpoints, recovery sessions, and physical WAL cursors. | Client-facing idempotency and optimistic concurrency remain separate work. |
+| [Checkpoint tracking](../src/engine/sequence.rs) | Persists contiguous processed/persisted prefixes plus above-gap intervals and maximum sequence identity. | Cross-copy rollback/trimming above the global checkpoint remains out of scope. |
+| [Automatic recovery](../src/node/mod.rs) | Every node reconciles assigned out-of-sync replicas through bounded file recovery and conditional admission. | Source sessions and pins are still process-local. |
+| [WAL suffix](../src/wal/mod.rs) | Streams retained generations in physical order with generation/byte cursors; sequence filtering never drives pagination. | Recovery compression and resumable file chunks are not implemented. |
+| [Recovery apply](../src/node/peer_recovery.rs) | Decoding or apply failure stops the session; operations use the common term/sequence-aware planner and admission requires the exact processed barrier. | General divergence rollback and repair above the global checkpoint remain D10 work. |
 | [Vector rebuild](../src/engine/composite.rs) | Rebuild reads a capped document set. | Snapshot vectors or rebuild all vectors from the same logical snapshot; failures keep the copy unavailable. |
 
 Existing [promotion tests](../tests/consensus_integration.rs) exercise metadata
 changes. The [restart regression](../tests/restart_regression.rs) restarts the
 cluster and checks data preservation. These do not establish a complete
 partition, stale-primary, divergent-history, and interrupted-recovery contract.
+
+> **Implementation note — September 29, 2026:** D1 now stores term-aware WAL v2
+> entries and versioned committed boundaries, distinguishes empty checkpoints
+> from sequence zero, tracks processed and persisted contiguous prefixes across
+> gaps, returns real `_seq_no`/`_primary_term` receipts, and computes the global
+> checkpoint from persisted authoritative copies. Peer recovery installs the
+> source's exact committed boundary, streams the WAL by physical
+> generation/byte cursor, and admits only after matching the final processed
+> barrier. Promotion persists its fence and fills local gaps with NoOps.
+> Flushed legacy primaries have a narrow in-place migration path; legacy
+> replicas require fresh allocation and peer recovery. This does not implement
+> D10 rollback/resync, client retry tokens, or full OCC.
 
 > **Implementation note — September 24, 2026:** the first in-sync tracking
 > package now stores replica eligibility in Raft routing metadata, targets live
@@ -81,10 +96,10 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > snapshot manifest contains the existing committed components plus
 > `meta.json` and `.managed.json`.
 >
-> This is not full RP-3/RP-5: checkpoints remain high-water marks rather than
-> contiguous prefixes; there are no history/allocation IDs, replica-side term
-> fencing, operation-only path selection, resumable chunks, compression, or
-> complete vector transfer (the existing rebuild cap remains). Source sessions
+> This is not full RP-3/RP-5: allocation IDs, durable term fencing, contiguous
+> checkpoints, exact snapshot boundaries, and physical WAL cursors are now
+> implemented, but there is no general operation-only path selection,
+> resumable chunks, compression, or D10 rollback/resync. Source sessions
 > and pins are process-local; only pre-finalize idle setups/sessions expire
 > after ten minutes, while admitting/settling sessions are resolved by
 > settlement rather than idle reaping. The

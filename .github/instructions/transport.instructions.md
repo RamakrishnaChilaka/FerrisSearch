@@ -75,7 +75,8 @@ RaftSnapshot(RaftRequest) → RaftReply
 `ShardDocResponse.seq_no`, `ShardDeleteResponse.seq_no`, and
 `ShardBulkResponse.start_seq_no` are optional on the wire so sequence zero is
 distinct from missing metadata. A successful single/delete response must carry
-`seq_no`; a successful non-empty bulk response must carry `start_seq_no`, while
+`seq_no` and `primary_term`; a successful non-empty bulk response must carry
+`start_seq_no` and `primary_term`, while
 an empty bulk must omit it. New clients fail closed on missing or inconsistent
 receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
@@ -150,8 +151,13 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   before WAL/engine mutation. A higher term is fsynced before mutation. Bulk
   validates the shared envelope and every item before the first mutation and
   advances the fence once.
-- **recover_replica**: Read the live engine's captured generation snapshot and
-  return operations above the requested checkpoint. Never construct a second
+- Successful replica responses carry optional processed and persisted
+  checkpoints and must prove the exact single operation or every bulk item was
+  processed. A behind contiguous checkpoint is a gap observation, not failure
+  of the current operation.
+- **recover_replica**: Compatibility/testing-only RPC that reads processed
+  operations in retained physical file order and reports optional
+  processed/persisted/max stats. Never construct a second
   `HotTranslog` on the live shard directory: open performs startup repair and
   unreferenced-generation cleanup. The RPC remains available for transport
   tests but the node lifecycle does not use this partial suffix as recovery or
@@ -167,9 +173,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **peer recovery RPCs**: source sessions are
   UUID/target/allocation/primary-term bound,
   file chunks are at most 1 MiB, operation batches are bounded by count and
-  bytes, and stale authority aborts the session. Prepare holds the exclusive
-  shard write barrier; Complete keeps it until conditional membership is
-  observed or a term bump settles the outcome.
+  bytes, and stale authority aborts the session. WAL catch-up uses physical
+  generation/byte cursors. Prepare captures the exclusive barrier WAL end and
+  processed checkpoint; Complete requires the target to match both before
+  conditional membership admission.
 - `StartPeerRecovery` is an asynchronous start/status RPC. `preparing=true`
   means the client should poll the same request/session reservation; snapshot
   commit/link/hash work is not performed in the RPC future.
@@ -316,7 +323,8 @@ pub struct TransportClient {
 `forward_index_to_shard()` and `forward_bulk_to_shard()` MUST return `Err(...)` when the shard RPC returns `success: false`. Never wrap a shard failure in `Ok(json!({"error": ...}))` — this hides failures from API handlers, causing them to return HTTP 201 for failed writes.
 
 Successful forwarding returns the primary-assigned write identity:
-`forward_index_to_shard()` / `forward_delete_to_shard()` expose `_seq_no`, and
+`forward_index_to_shard()` / `forward_delete_to_shard()` expose `_seq_no` and
+`_primary_term`, and
 `forward_bulk_to_shard()` returns a typed `BulkWriteReceipt`. Do not reconstruct
 these values from a later checkpoint.
 
