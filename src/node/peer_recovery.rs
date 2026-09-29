@@ -887,7 +887,10 @@ async fn apply_recovery_operations_cursor(
         anyhow::bail!("peer recovery physical cursor regressed");
     }
     if !complete && next_cursor == cursor {
-        anyhow::bail!("bounded peer recovery response made no physical progress");
+        if operations.is_empty() {
+            return Ok((cursor, 0));
+        }
+        anyhow::bail!("bounded peer recovery response returned operations without physical progress");
     }
     let mut decoded = Vec::with_capacity(operations.len());
     for operation in operations {
@@ -1171,6 +1174,33 @@ mod tests {
         .unwrap();
         assert_eq!(next, 12);
         assert_eq!(applied, 2);
+    }
+
+    #[tokio::test]
+    async fn stalled_retry_catch_up_batch_returns_to_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine: Arc<dyn SearchEngine> = Arc::new(
+            crate::engine::CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap(),
+        );
+        let cursor = crate::wal::WalCursor {
+            generation_id: 4,
+            byte_offset: 128,
+        };
+
+        let (next_cursor, applied) = apply_recovery_operations_cursor(
+            engine,
+            cursor,
+            cursor,
+            Some(7),
+            Some(8),
+            false,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(next_cursor, cursor);
+        assert_eq!(applied, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

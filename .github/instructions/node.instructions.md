@@ -117,6 +117,9 @@ pub struct Node {
   cursor remains at that frame and the target advances to finalization. The
   exclusive finalize barrier rebuilds/replays the source writer and serves the
   remaining suffix without discarding the session's transferred snapshot.
+  Apply the same rule when `PrepareFinalizeRecovery` requests another catch-up:
+  an empty incomplete response at the unchanged cursor returns to finalize
+  rather than failing the recovery for lack of physical progress.
 - A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
   An inactive marker whose embedded allocation ID matches the current
   out-of-sync assignment is reported through `FailShardCopy`; an active target,

@@ -74,7 +74,9 @@ pub async fn replicate_bulk(
 - Catch-up paginates by `(generation_id, byte_offset)` in physical file order.
   It stops before the first source-unprocessed WAL frame rather than advancing
   past it; finalization rebuilds the source writer and resumes from that exact
-  cursor.
+  cursor. If finalization requests another catch-up and that fetch stalls empty
+  at the same cursor, the target re-enters finalization instead of destroying
+  the installed snapshot.
   A final exclusive shard write barrier captures a physical end and processed
   checkpoint; the target must match both, then the
   primary submits `MarkReplicaInSync(allocation_id, primary, term)` and observes local

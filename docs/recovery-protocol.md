@@ -83,7 +83,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > and recovery-finalization paths rebuild and fsync vectors before clearing the
 > marker. Intermediate replay commits may persist a committed maximum below the
 > durable term-start fence maximum until later WAL batches are replayed; this is
-> valid sequence state, not corruption.
+> valid sequence state, not corruption. A stalled empty catch-up response at an
+> unchanged physical cursor returns to the exclusive finalize path, including
+> after finalization asks for another catch-up.
 > Earlier build formats are unsupported and require index/cluster recreation
 > and reindexing. This does not implement D10 rollback/resync, client retry
 > tokens, or full OCC.

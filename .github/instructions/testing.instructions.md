@@ -342,6 +342,9 @@ cargo test -- test_name                         # Single test by name
   stalls catch-up at the physical cursor and is served during finalize, and
   that 1,030 non-contiguous promotion NoOps reach a live replica in exactly two
   bounded bulk RPCs.
+- Retry-catch-up coverage must preserve an empty incomplete response at the
+  unchanged physical cursor as a return-to-finalize signal, not a
+  no-progress failure.
 - R6 replay regressions cover more than one 1,000-operation replay batch after
   a fence raise, visibility of every pre-promotion document plus a later write,
   clean assigned-copy reopen, and restart from an intermediate commit whose
