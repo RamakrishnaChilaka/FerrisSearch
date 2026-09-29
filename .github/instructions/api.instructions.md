@@ -231,7 +231,10 @@ with item-level 400 responses so valid neighboring items still run. Action-line
 `_id` and `_index` remain request metadata; only document-source keys are
 rejected. Create-index mapping `properties` uses the same reserved-name check.
 FerrisSearch does not currently expose a public `PUT /{index}/_mapping` route;
-the internal `AddMappings` path enforces the same rule.
+the internal `AddMappings` path enforces the same rule. `body` is the built-in
+catch-all text field: create-index accepts only a plain `{"type":"text"}`
+mapping for it and rejects every other type or parameter as
+`400 mapper_parsing_exception`.
 
 ### Search — src/api/search/mod.rs
 | HTTP | Path | Handler |

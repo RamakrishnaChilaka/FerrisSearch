@@ -51,8 +51,12 @@ ClusterState { cluster_name, version, master_node, nodes, indices, shard_allocat
 Create-index `mappings.properties` rejects document metadata names from
 `common::RESERVED_DOCUMENT_KEYS` with a mapper-parsing error before metadata is
 committed. The internal `AddMappings` transport boundary applies the same
-validation. The non-underscore Tantivy catch-all field `body` is not reserved;
-do not silently add it to the metadata list without an explicit API decision.
+validation. The non-underscore `body` name is the built-in catch-all text
+field, not reserved document metadata. Dynamic mapping never infers or persists
+it. An explicit mapping accepts only the plain definition `{"type":"text"}`;
+other types or parameters are mapper-parsing errors. Authoritative metadata
+with a reserved mapping name or an incompatible `body` mapping is an
+unsupported index format and must fail open with recreate-index guidance.
 
 ### Index UUID
 - Every `IndexMetadata` has a non-empty `uuid: IndexUuid` value; production

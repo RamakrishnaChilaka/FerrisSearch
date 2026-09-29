@@ -143,7 +143,14 @@ tokio::select! {
   second internal sequence or term value.
 - Dynamic mapping ignores reserved names, and engine construction rejects
   reserved explicit mappings before Tantivy schema creation or evolution.
-- `body` remains the non-reserved catch-all field.
+- `body` remains the non-reserved built-in catch-all text field. Dynamic and
+  strict mapping discovery ignore it. A plain explicit text mapping reuses the
+  existing schema field rather than adding a duplicate.
+- Engine creation and reopen validate authoritative mappings before Tantivy
+  schema construction. Reserved names, a non-text or parameterized `body`
+  mapping, and an invalid built-in body schema fail as
+  `UnsupportedIndexFormatError` with recreate-index guidance; they must never
+  reach a schema-builder panic.
 
 ## RemoteStore Engine (src/engine/remote_store.rs)
 - `remote_store` is a shardless read path. Root nodes load the published manifest for an index, query per-leaf cache/load status over gRPC, and batch split assignments to data-node leaves.

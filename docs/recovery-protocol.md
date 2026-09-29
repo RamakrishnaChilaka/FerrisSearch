@@ -88,7 +88,11 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > after finalization asks for another catch-up. Bulk replication resolves
 > authoritative targets before payload serialization; zero-replica bulks avoid
 > that work, and non-empty fan-out shares one serialized operation slice across
-> replica tasks.
+> replica tasks. Dynamic mapping never persists the built-in `body` catch-all;
+> a plain explicit text mapping reuses its existing Tantivy field. Reserved
+> authoritative mapping names or incompatible `body` metadata fail shard open
+> as unsupported index formats with recreate-index guidance rather than
+> reaching schema construction.
 > Earlier build formats are unsupported and require index/cluster recreation
 > and reindexing. This does not implement D10 rollback/resync, client retry
 > tokens, or full OCC.

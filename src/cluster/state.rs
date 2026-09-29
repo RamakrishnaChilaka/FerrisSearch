@@ -681,6 +681,8 @@ impl IndexMetadata {
             crate::common::validate_mapping_field_names(properties.keys().map(String::as_str))
                 .map_err(|error| CreateIndexMetadataError::MapperParsing(error.to_string()))?;
             for (field_name, field_def) in properties {
+                crate::common::validate_builtin_body_mapping_definition(field_name, field_def)
+                    .map_err(|error| CreateIndexMetadataError::MapperParsing(error.to_string()))?;
                 let Some(type_str) = field_def.get("type").and_then(|v| v.as_str()) else {
                     continue;
                 };

@@ -218,6 +218,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - `AddMappings` rejects every shared reserved document metadata name before
   checking leadership or issuing a Raft write. There is no public put-mapping
   HTTP route yet; this RPC is the existing mapping-update trust boundary.
+  `body` is accepted only as a text field without a dimension or other
+  parameters, so a mapping update cannot create a second or incompatible
+  Tantivy catch-all field.
 - **update_settings**: Must be leader; apply via `UpdateIndex` Raft command. Preserve `flush_threshold_bytes` exactly, including `null` resets and `0` as a valid disable value.
 
 ### Critical Invariants

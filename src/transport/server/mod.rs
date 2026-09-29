@@ -2994,6 +2994,14 @@ impl InternalTransport for TransportService {
             req.new_fields.iter().map(|entry| entry.name.as_str()),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        for entry in &req.new_fields {
+            crate::common::validate_builtin_body_mapping_entry(
+                &entry.name,
+                &entry.field_type,
+                entry.dimension.is_some(),
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        }
 
         let raft = self
             .raft
@@ -5312,6 +5320,10 @@ impl TransportService {
     ) -> Result<(), Status> {
         crate::common::validate_mapping_field_names(new_fields.keys().map(String::as_str))
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        for (name, mapping) in new_fields {
+            crate::common::validate_builtin_body_field_mapping(name, mapping)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        }
         if let Some(raft) = self.raft.as_ref()
             && raft.is_leader()
         {

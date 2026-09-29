@@ -42,6 +42,10 @@ pub const RESERVED_DOCUMENT_KEYS: &[&str] = &[
     "_routing",
 ];
 
+pub const BUILTIN_BODY_FIELD: &str = "body";
+pub const BUILTIN_BODY_MAPPING_ERROR: &str =
+    "Field [body] is the built-in catch-all text field and can only be mapped as [text]";
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "Field [{field}] is a metadata field and cannot be added inside a document. Use the index API request parameters."
@@ -62,8 +66,16 @@ impl ReservedDocumentFieldError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Field [body] is the built-in catch-all text field and can only be mapped as [text]")]
+pub struct BuiltinBodyMappingError;
+
 pub fn is_reserved_document_key(field: &str) -> bool {
     RESERVED_DOCUMENT_KEYS.contains(&field)
+}
+
+pub fn is_builtin_body_field(field: &str) -> bool {
+    field == BUILTIN_BODY_FIELD
 }
 
 pub fn validate_document_source(
@@ -86,11 +98,57 @@ pub fn validate_mapping_field_names<'a>(
     Ok(())
 }
 
+pub fn validate_builtin_body_mapping_definition(
+    field: &str,
+    definition: &serde_json::Value,
+) -> std::result::Result<(), BuiltinBodyMappingError> {
+    if !is_builtin_body_field(field) {
+        return Ok(());
+    }
+    let is_plain_text = definition.as_object().is_some_and(|object| {
+        object.len() == 1 && object.get("type").and_then(serde_json::Value::as_str) == Some("text")
+    });
+    if is_plain_text {
+        Ok(())
+    } else {
+        Err(BuiltinBodyMappingError)
+    }
+}
+
+pub fn validate_builtin_body_mapping_entry(
+    field: &str,
+    field_type: &str,
+    has_additional_parameters: bool,
+) -> std::result::Result<(), BuiltinBodyMappingError> {
+    if !is_builtin_body_field(field) || (field_type == "text" && !has_additional_parameters) {
+        Ok(())
+    } else {
+        Err(BuiltinBodyMappingError)
+    }
+}
+
+pub fn validate_builtin_body_field_mapping(
+    field: &str,
+    mapping: &FieldMapping,
+) -> std::result::Result<(), BuiltinBodyMappingError> {
+    if !is_builtin_body_field(field)
+        || (mapping.field_type == FieldType::Text && mapping.dimension.is_none())
+    {
+        Ok(())
+    } else {
+        Err(BuiltinBodyMappingError)
+    }
+}
+
 pub fn is_reserved_document_field_error_message(message: &str) -> bool {
     message.starts_with("Field [")
         && message.contains(
             "] is a metadata field and cannot be added inside a document. Use the index API request parameters.",
         )
+}
+
+pub fn is_mapping_parsing_error_message(message: &str) -> bool {
+    is_reserved_document_field_error_message(message) || message == BUILTIN_BODY_MAPPING_ERROR
 }
 
 /// Validates that an index name is safe and well-formed.
@@ -238,7 +296,7 @@ pub fn infer_field_mappings(payload: &serde_json::Value) -> HashMap<String, Fiel
     let mut mappings = HashMap::new();
     if let Some(obj) = payload.as_object() {
         for (key, value) in obj {
-            if is_reserved_document_key(key) {
+            if is_reserved_document_key(key) || is_builtin_body_field(key) {
                 continue;
             }
             if let Some(mapping) = infer_field_type(value) {
@@ -273,6 +331,7 @@ pub fn detect_new_fields_batch(
         if let Some(obj) = payload.as_object() {
             for (key, value) in obj {
                 if is_reserved_document_key(key)
+                    || is_builtin_body_field(key)
                     || existing_mappings.contains_key(key)
                     || new_fields.contains_key(key)
                 {
@@ -302,7 +361,11 @@ pub fn detect_unknown_fields(
 
     let mut unknown: Vec<String> = obj
         .keys()
-        .filter(|key| !is_reserved_document_key(key) && !existing_mappings.contains_key(*key))
+        .filter(|key| {
+            !is_reserved_document_key(key)
+                && !is_builtin_body_field(key)
+                && !existing_mappings.contains_key(*key)
+        })
         .cloned()
         .collect();
     unknown.sort();
@@ -319,7 +382,10 @@ pub fn detect_unknown_fields_batch(
     for (_, payload) in payloads {
         if let Some(obj) = payload.as_object() {
             for key in obj.keys() {
-                if !is_reserved_document_key(key) && !existing_mappings.contains_key(key) {
+                if !is_reserved_document_key(key)
+                    && !is_builtin_body_field(key)
+                    && !existing_mappings.contains_key(key)
+                {
                     unknown.insert(key.clone());
                 }
             }
@@ -506,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_mapping_excludes_reserved_metadata_but_keeps_body() {
+    fn dynamic_mapping_excludes_reserved_metadata_and_builtin_body() {
         let mut document = serde_json::Map::new();
         for field in [
             "_id",
@@ -527,11 +593,22 @@ mod tests {
         let inferred = infer_field_mappings(&document);
         assert_eq!(
             inferred.keys().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["body".to_string(), "title".to_string()])
+            BTreeSet::from(["title".to_string()])
         );
         assert_eq!(
             detect_unknown_fields(&document, &HashMap::new()),
-            vec!["body".to_string(), "title".to_string()]
+            vec!["title".to_string()]
+        );
+        assert_eq!(
+            detect_new_fields_batch(&[("1".to_string(), document.clone())], &HashMap::new())
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["title".to_string()])
+        );
+        assert_eq!(
+            detect_unknown_fields_batch(&[("1".to_string(), document)], &HashMap::new()),
+            vec!["title".to_string()]
         );
     }
 

@@ -442,12 +442,11 @@ fn forwarded_create_index_error_response(
 
     match status.code() {
         tonic::Code::InvalidArgument => {
-            let error_type =
-                if crate::common::is_reserved_document_field_error_message(status.message()) {
-                    "mapper_parsing_exception"
-                } else {
-                    "illegal_argument_exception"
-                };
+            let error_type = if crate::common::is_mapping_parsing_error_message(status.message()) {
+                "mapper_parsing_exception"
+            } else {
+                "illegal_argument_exception"
+            };
             Some(crate::api::error_response(
                 StatusCode::BAD_REQUEST,
                 error_type,

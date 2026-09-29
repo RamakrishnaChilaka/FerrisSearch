@@ -437,8 +437,12 @@ fn add_mapping_field_to_schema(
     builder: &mut tantivy::schema::SchemaBuilder,
     name: &str,
     mapping: &crate::cluster::state::FieldMapping,
-) -> Option<Field> {
+) -> Result<Option<Field>> {
     use crate::cluster::state::FieldType;
+    validate_authoritative_mapping_entry(name, mapping)?;
+    if crate::common::is_builtin_body_field(name) {
+        return Ok(None);
+    }
     let field = match mapping.field_type {
         FieldType::Text => builder.add_text_field(name, TEXT | STORED),
         FieldType::Keyword => builder.add_text_field(name, (STRING | STORED).set_fast(None)),
@@ -446,9 +450,30 @@ fn add_mapping_field_to_schema(
         FieldType::Float => builder.add_f64_field(name, tantivy::schema::INDEXED | STORED | FAST),
         FieldType::Boolean => builder.add_text_field(name, (STRING | STORED).set_fast(None)),
         FieldType::Date => builder.add_i64_field(name, tantivy::schema::INDEXED | STORED | FAST),
-        FieldType::KnnVector => return None, // vectors in USearch, not Tantivy
+        FieldType::KnnVector => return Ok(None), // vectors in USearch, not Tantivy
     };
-    Some(field)
+    Ok(Some(field))
+}
+
+fn validate_authoritative_mapping_entry(
+    name: &str,
+    mapping: &crate::cluster::state::FieldMapping,
+) -> Result<()> {
+    crate::common::validate_mapping_field_names([name]).map_err(|error| {
+        crate::common::unsupported_index_format("index mapping metadata", error.to_string())
+    })?;
+    crate::common::validate_builtin_body_field_mapping(name, mapping).map_err(|error| {
+        crate::common::unsupported_index_format("index mapping metadata", error.to_string())
+    })
+}
+
+fn validate_authoritative_mappings(
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<()> {
+    for (name, mapping) in mappings {
+        validate_authoritative_mapping_entry(name, mapping)?;
+    }
+    Ok(())
 }
 
 /// Evolve an existing Tantivy meta.json to include new mapped fields.
@@ -461,7 +486,7 @@ fn evolve_meta_json_schema(
     meta_json_path: &Path,
     mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
 ) -> Result<()> {
-    crate::common::validate_mapping_field_names(mappings.keys().map(String::as_str))?;
+    validate_authoritative_mappings(mappings)?;
     let raw = std::fs::read_to_string(meta_json_path)?;
     let mut meta: serde_json::Value = serde_json::from_str(&raw)?;
 
@@ -492,7 +517,7 @@ fn evolve_meta_json_schema(
     for name in &new_names {
         let mapping = &mappings[name];
         let mut tmp_builder = Schema::builder();
-        let Some(_) = add_mapping_field_to_schema(&mut tmp_builder, name, mapping) else {
+        let Some(_) = add_mapping_field_to_schema(&mut tmp_builder, name, mapping)? else {
             continue; // knn_vector → skip
         };
         let tmp_schema = tmp_builder.build();
@@ -517,6 +542,42 @@ fn evolve_meta_json_schema(
         new_names
     );
     Ok(())
+}
+
+fn validate_builtin_schema_fields(
+    schema: &Schema,
+    purpose: HotEnginePurpose,
+) -> Result<(Field, Field)> {
+    let component = match purpose {
+        HotEnginePurpose::LocalShard => "local shard Tantivy schema",
+        HotEnginePurpose::RemoteSplit => "remote split Tantivy schema",
+    };
+    let required_field = |name: &str| {
+        schema.get_field(name).map_err(|_| {
+            crate::common::unsupported_index_format(
+                component,
+                format!("required internal field {name} is missing"),
+            )
+        })
+    };
+    let id_field = required_field("_id")?;
+    let source_field = required_field("_source")?;
+    let body_field = required_field(crate::common::BUILTIN_BODY_FIELD)?;
+    let valid_body = matches!(
+        schema.get_field_entry(body_field).field_type(),
+        tantivy::schema::FieldType::Str(options)
+            if options.is_stored()
+                && options
+                    .get_indexing_options()
+                    .is_some_and(|indexing| indexing.tokenizer() != "raw")
+    );
+    if !valid_body {
+        return Err(crate::common::unsupported_index_format(
+            component,
+            "built-in body field is not a stored analyzed text field",
+        ));
+    }
+    Ok((id_field, source_field))
 }
 
 fn validate_internal_sequence_fields(schema: &Schema, purpose: HotEnginePurpose) -> Result<()> {
@@ -781,7 +842,7 @@ impl HotEngine {
         purpose: HotEnginePurpose,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
-        crate::common::validate_mapping_field_names(mappings.keys().map(String::as_str))?;
+        validate_authoritative_mappings(mappings)?;
         let index_path = data_dir.join("index");
         let meta_json_path = index_path.join("meta.json");
         if existing_only && !meta_json_path.is_file() {
@@ -819,7 +880,7 @@ impl HotEngine {
             mapping_names.sort();
             for name in mapping_names {
                 let mapping = &mappings[&name];
-                add_mapping_field_to_schema(&mut schema_builder, &name, mapping);
+                add_mapping_field_to_schema(&mut schema_builder, &name, mapping)?;
             }
 
             let schema = schema_builder.build();
@@ -828,13 +889,10 @@ impl HotEngine {
         };
 
         let schema = index.schema();
+        let (id_field, source_field) = validate_builtin_schema_fields(&schema, purpose)?;
         validate_internal_sequence_fields(&schema, purpose)?;
 
         // Build the FieldRegistry from the opened schema (authoritative).
-        let id_field = schema.get_field("_id").expect("_id must exist in schema");
-        let source_field = schema
-            .get_field("_source")
-            .expect("_source must exist in schema");
         let seq_no_field = schema.get_field(SEQ_NO_FIELD_NAME).ok();
         let primary_term_field = schema.get_field(PRIMARY_TERM_FIELD_NAME).ok();
 
@@ -8764,6 +8822,86 @@ mod tests {
 
         // File should be unchanged — no rewrite needed.
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn explicit_text_body_mapping_reuses_builtin_schema_field() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mappings = HashMap::from([(
+            "body".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        let engine = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine
+                .index
+                .schema()
+                .fields()
+                .filter(|(_, entry)| entry.name() == "body")
+                .count(),
+            1
+        );
+        apply_index(&engine, "doc", json!({"body": 42}), 0, 1);
+        engine.refresh().unwrap();
+        assert_eq!(engine.get_document("doc").unwrap().unwrap()["body"], 42);
+    }
+
+    #[test]
+    fn invalid_authoritative_builtin_mappings_require_recreate_on_open() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        for (field_name, mapping) in [
+            (
+                "body",
+                FieldMapping {
+                    field_type: FieldType::Integer,
+                    dimension: None,
+                },
+            ),
+            (
+                "_routing",
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap());
+            let mappings = HashMap::from([(field_name.to_string(), mapping)]);
+
+            let error = match HotEngine::open_existing_with_mappings(
+                dir.path(),
+                Duration::from_secs(60),
+                &mappings,
+                TranslogDurability::Request,
+                Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+            ) {
+                Ok(_) => panic!("invalid authoritative mapping unexpectedly opened"),
+                Err(error) => error,
+            };
+            assert!(
+                error.is::<crate::common::UnsupportedIndexFormatError>(),
+                "{field_name}: {error:#}"
+            );
+            assert!(
+                error.to_string().contains("recreate the index"),
+                "{field_name}: {error:#}"
+            );
+        }
     }
 
     #[test]

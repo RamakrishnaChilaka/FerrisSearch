@@ -204,6 +204,95 @@ async fn add_mappings_rejects_reserved_metadata_names_before_raft() {
     }
 }
 
+#[tokio::test]
+async fn add_mappings_accepts_only_plain_text_for_builtin_body() {
+    let (raft, shared_state) = crate::consensus::create_raft_instance_mem(1, "body-mapping".into())
+        .await
+        .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !raft.is_leader() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+
+    let mut state = DomainClusterState::new("body-mapping".into());
+    state.add_node(DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 0,
+        http_port: 0,
+        roles: vec![NodeRole::Master, NodeRole::Data],
+        raft_node_id: 1,
+    });
+    state.master_node = Some("node-1".into());
+    state.add_index(DomainIndexMetadata::build_shard_routing(
+        "idx",
+        1,
+        0,
+        &["node-1".into()],
+    ));
+    *shared_state.write().unwrap() = state;
+
+    let dir = tempfile::tempdir().unwrap();
+    let service = TransportService {
+        cluster_manager: Arc::new(ClusterManager::with_shared_state(shared_state.clone())),
+        shard_manager: Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60))),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: Some(raft),
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    let response = service
+        .add_mappings(Request::new(AddMappingsRequest {
+            index_name: "idx".into(),
+            new_fields: vec![FieldMappingEntry {
+                name: "body".into(),
+                field_type: "text".into(),
+                dimension: None,
+            }],
+            dynamic: "true".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.acknowledged);
+    assert_eq!(
+        shared_state.read().unwrap().indices["idx"].mappings["body"].field_type,
+        FieldType::Text
+    );
+
+    for (field_type, dimension) in [("keyword", None), ("integer", None), ("text", Some(3))] {
+        let error = service
+            .add_mappings(Request::new(AddMappingsRequest {
+                index_name: "idx".into(),
+                new_fields: vec![FieldMappingEntry {
+                    name: "body".into(),
+                    field_type: field_type.into(),
+                    dimension,
+                }],
+                dynamic: "true".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "Field [body] is the built-in catch-all text field and can only be mapped as [text]"
+        );
+    }
+}
+
 #[test]
 fn cluster_state_roundtrip_preserves_metadata() {
     let original = make_full_cluster_state();
