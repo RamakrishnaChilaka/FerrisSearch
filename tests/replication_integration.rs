@@ -854,6 +854,139 @@ async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
     assert_eq!(source["value"], 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deterministic_reordering_survives_promotion_and_new_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new("d1-full-ordering".into()));
+    setup_replica_target_state(&cluster_manager, "d1-full-ordering", 1);
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    install_recovered_replica_fixture(&cluster_manager, &shard_manager, "d1-full-ordering");
+    let (address, server) = start_grpc_server_for_node_with_handle(
+        cluster_manager.clone(),
+        shard_manager.clone(),
+        "replica-node",
+    )
+    .await;
+    let mut client = connect_client(address).await;
+
+    for offset in 0..10u64 {
+        let response = client
+            .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                index_name: "d1-full-ordering".into(),
+                shard_id: 0,
+                doc_id: format!("doc-{offset}"),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": 20 + offset}))
+                    .unwrap(),
+                op: "index".into(),
+                seq_no: 20 + offset,
+                index_uuid: "d1-full-ordering-uuid".into(),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+    }
+    let bulk = (0..20u64)
+        .map(|seq_no| ReplicateDocRequest {
+            index_name: "d1-full-ordering".into(),
+            shard_id: 0,
+            doc_id: format!("doc-{seq_no}"),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": seq_no})).unwrap(),
+            op: "index".into(),
+            seq_no,
+            index_uuid: "d1-full-ordering-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
+        })
+        .collect();
+    let response = client
+        .replicate_bulk(tonic::Request::new(ReplicateBulkRequest {
+            index_name: "d1-full-ordering".into(),
+            shard_id: 0,
+            ops: bulk,
+            index_uuid: "d1-full-ordering-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+    refresh_all(&shard_manager);
+    for offset in 0..10u64 {
+        assert_eq!(
+            shard_manager
+                .get_shard("d1-full-ordering", 0)
+                .unwrap()
+                .get_document(&format!("doc-{offset}"))
+                .unwrap()
+                .unwrap()["value"],
+            20 + offset
+        );
+    }
+
+    let mut promoted = cluster_manager.get_state();
+    let routing = promoted
+        .indices
+        .get_mut("d1-full-ordering")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap();
+    routing.primary = "replica-node".into();
+    routing.primary_term = 2;
+    routing.replicas.clear();
+    routing.in_sync_replicas.clear();
+    routing.unassigned_replicas = 1;
+    promoted
+        .shard_allocations
+        .get_mut("d1-full-ordering")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    cluster_manager.update_state(promoted);
+    let response = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "d1-full-ordering".into(),
+            shard_id: 0,
+            doc_id: "post-promotion".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": "promoted"})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+    shard_manager
+        .get_shard("d1-full-ordering", 0)
+        .unwrap()
+        .refresh()
+        .unwrap();
+    assert_eq!(
+        shard_manager
+            .get_shard("d1-full-ordering", 0)
+            .unwrap()
+            .get_document("post-promotion")
+            .unwrap()
+            .unwrap()["value"],
+        "promoted"
+    );
+    for offset in 0..10u64 {
+        assert_eq!(
+            shard_manager
+                .get_shard("d1-full-ordering", 0)
+                .unwrap()
+                .get_document(&format!("doc-{offset}"))
+                .unwrap()
+                .unwrap()["value"],
+            20 + offset
+        );
+    }
+    server.abort();
+}
+
 #[tokio::test]
 async fn replicate_doc_delete_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
