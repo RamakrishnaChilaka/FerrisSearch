@@ -143,9 +143,10 @@ cargo test -- test_name                         # Single test by name
   local WAL entries before NoOp fill; failed NoOp replication may leave a
   replica gap but cannot block local activation.
 - D1 implementation traces follow `specs/tla/trace/SCHEMA.md`. The converter
-  must accept only schema v3 and reject unknown versions, events, outcomes,
+  must accept only schema v4 and reject unknown versions, events, outcomes,
   fields, non-consecutive steps, invalid durability, required-replica/view
-  mismatch, or invented copy state before invoking TLC.
+  mismatch, stale/reused message IDs, incorrect crash-lost sets, incomplete
+  NoOp fan-out, or invented copy state before invoking TLC.
 - The validator infers the composition from the event vocabulary; the emitter
   does not choose a profile or hidden-step bound. The inferred compositions
   use the owning actions:
@@ -162,7 +163,8 @@ cargo test -- test_name                         # Single test by name
   embedded in the selected bounded model; it is not an implementation proof.
 - `validate_trace.sh` returns `0` for acceptance, `1` for rejection, and `3`
   with `INCONCLUSIVE` for timeout, memory exhaustion, or an incomplete TLC
-  run. CI must never count exit `3` as an expected rejection.
+  run. CI must never count exit `3` as an expected rejection. Fixture runs
+  default to 120 seconds and a 4 GiB Java heap.
 - The review mutation matrix must retain rejection for m1, m2, m3, m4, m5,
   m6, m6b, m7, m8, m8b, m9, m9b, m15, m18, and m19, while m13 and m14 remain
   accepted. Also retain the replay-stage invalid trace whose commit boundary is
@@ -177,20 +179,27 @@ cargo test -- test_name                         # Single test by name
 - Bulk traces may append every item before any item processing event. A bulk
   replica response may carry the batch-final persisted checkpoint; require
   item-local persisted <= response persisted <= current replica persisted.
-- Retain the 217-event combined witness and its invalid arrival-order,
+- Retain the 219-event schema-v4 combined witness and its invalid arrival-order,
   collision-redelivery, and post-promotion rollback variants. The valid
   witness must include a real missing sequence filled by a durable promotion
-  NoOp, not only an empty gap-fill stage. It does not itself contain a
-  promoted-copy restart; retain v6c for replay-before-fill ordering.
+  NoOp plus exact sequence-target fan-out, not only an empty gap-fill stage.
+  It does not itself contain a promoted-copy restart; retain v6c for
+  replay-before-fill ordering. Retain the exact 500-event restart/failover
+  performance fixture and keep every fixture under 120 seconds.
 - Retain the slow round-4 restart matrix:
   m7 empty replay after committed truncation, a retained-entry
   `skip_committed` control and invalid re-apply, m10 replay of an uncommitted
   promotion NoOp and m10c omission, m8 activation without gap fill, m6b fill
   before replay completion, and m4c/m9 late request/ack delivery. Run it with
   `./scripts/tla/check.sh trace-validator-round4`.
-- Keep `d1-failover-actions` green. It exercises model-owned durable fence,
-  NoOp fill, activation, and collision actions against the D1 safety
-  invariants.
+- Keep `d1-failover-actions` and `d1-noop-collision-actions` green. They are
+  scripted action-coverage paths, not exhaustive model checking. Together
+  they exercise model-owned durable fence, NoOp fill/fan-out/apply/redelivery,
+  activation, NoOp collision/NACK, exact removal, and D1 safety invariants.
+- Retain accepted promotion-NoOp apply and collision/removal fixtures plus
+  rejected mutations for an omitted apply, collision mislabeled as
+  redelivery, and reviewer p7b's omitted fan-out. Reviewer p7a must remain
+  accepted.
 - Recovery catch-up ordering assumes an activated-primary source scanning the
   pinned physical WAL with one exclusive cursor. Do not claim support for
   duplicate or out-of-order catch-up traces.

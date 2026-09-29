@@ -45,10 +45,11 @@ Validate one implementation trace or run the trace validator's self-tests:
 ./scripts/tla/check.sh trace-validator-round4
 ```
 
-`validate_trace.sh` defaults to 60 seconds per TLC run. Exit code `0` means
-accepted, `1` means rejected, and `3` with an `INCONCLUSIVE` label means TLC
-timed out, exhausted memory, or failed before producing a verdict. Increase
-`TLA_TRACE_TIMEOUT_SECONDS` for large traces; do not treat an inconclusive run
+`validate_trace.sh` defaults to 120 seconds and a 4 GiB Java heap per TLC run.
+Exit code `0` means accepted, `1` means rejected, and `3` with an
+`INCONCLUSIVE` label means TLC timed out, exhausted memory, or failed before
+producing a verdict. Override `TLA_TRACE_TIMEOUT_SECONDS` or
+`TLA_TRACE_HEAP` for a documented manual run; do not treat an inconclusive run
 as a rejection.
 
 Use an existing verified jar or retain raw logs:
@@ -100,8 +101,9 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_D1_PrimaryGap.tla` | Primary engine-apply gap, max-based recovery loop, and processed-checkpoint comparison. |
 | `MC_D1_PromotionReplayNoOp.tla` | Promotion ordering: replay local WAL, fill gaps with NoOps, tolerate failed NoOp replication, then activate. |
 | `MC_D1_TraceActions.tla` | Checked coverage for earlier captured-boundary persistence, trace truncation, arbitrary-node restart/replay, and failed-replay unavailability. |
-| `MC_D1_FailoverActions.tla` | Three-copy action check for promotion fencing, replayable NoOp gap fill, activation, sequence reuse, and fail-closed collision handling. |
-| `TraceD1.tla` | Existential schema-v3 witness search over real `MC_D1_SeqNoApply` actions, with validator-bounded hidden D1 actions and copy-state observations. |
+| `MC_D1_FailoverActions.tla` | One scripted three-copy action path covering promotion fencing, NoOp fan-out/apply/redelivery, activation, sequence reuse, and fail-closed collision handling. |
+| `MC_D1_NoOpCollisionActions.tla` | One scripted path covering promotion NoOp collision, NACK delivery, and exact in-sync removal. |
+| `TraceD1.tla` | Existential schema-v4 witness search over real `MC_D1_SeqNoApply` actions, with evidence-directed hidden D1 actions and copy-state observations. |
 | `TraceD1Authority.tla` | Exact composition with Raft routing views, failover, durable fencing, activation, and primary write gating. |
 | `TraceD1Collision.tla` | Exact composition with the bounded B1 term/sequence collision and in-sync removal actions. |
 | `TraceD1Recovery.tla` | Exact composition with source snapshot, target install, catch-up, barrier, Raft admission, and target observation actions. |
@@ -289,7 +291,7 @@ retry. The durable variant rejects the same probe.
 
 ## D1 sequence-aware replica apply
 
-`FaultMode = "D1Historical"` models the current pre-D1 behavior:
+`FaultMode = "D1Historical"` models the historical pre-D1 behavior:
 
 - up to three same-shard client writes overlap;
 - primary sequence assignment remains serialized, but replication messages may
@@ -304,7 +306,7 @@ also loses an acknowledged lower-sequence document when a higher sequence is
 committed first and restart skips every WAL entry below that high-water
 boundary.
 
-`FaultMode = "D1Fixed"` models the proposed ADR 0001 D1 planner:
+`FaultMode = "D1Fixed"` models the implemented ADR 0001 D1 planner:
 
 - a per-document applied sequence decides whether an operation mutates logical
   document state;
@@ -338,7 +340,7 @@ closure.
 [`trace/SCHEMA.md`](trace/SCHEMA.md) defines the JSON Lines contract for
 instrumented D1 tests. A process-global ordered event stream records only
 protocol-linearization points. `scripts/tla/trace_to_tla.py` validates the
-version-3 schema exactly, rejects unknown versions, events, outcomes, or
+version-4 schema exactly, rejects unknown versions, events, outcomes, or
 fields, and generates a finite `TraceInput.tla` plus TLC constants.
 
 Validation is existential. TLC accepts only by finding a path that consumes the
@@ -352,9 +354,9 @@ entire trace through real actions:
   and recovery-apply actions.
 
 The converter infers the composition from the event vocabulary; the emitter
-does not select a profile. Hidden-action bounds are validator-owned. Core
-replication and authority/failover events may use the combined composition in
-one trace. Peer recovery remains a separate composition.
+does not select a profile. Core replication and authority/failover events may
+use the combined composition in one trace. Peer recovery remains a separate
+composition.
 Observed low-level WAL, fence, and commit records may be D1 stuttering steps,
 but they are tied to a later real action and semantic `copy_state`. Observed
 records cannot be reordered or discarded.
@@ -364,10 +366,13 @@ a behavior accepted by these bounded compositions. It does not prove the
 implementation correct, verify the instrumentation, replace the bounded model
 configurations, or establish behavior for executions that were not logged.
 
-Version 3 adds source-side recovery snapshots, split commit capture/persistence,
-per-node routing views, exact in-sync removal, restart-time state restoration,
-failed-replay unavailability, and semantic `copy_state`. Checkpoints appear
-only on events emitted under the apply-state boundary.
+Version 4 determines choices that dominated the version-3 search. Ordinary and
+promotion-NoOp sends carry unique message IDs and send-time incarnations.
+Crash records contain exact failed-request and phase-qualified dropped-message
+sets. Promotion gap-fill records contain exact sequence/receipt ranges, and
+replay records name their physical WAL receipts. Hidden promotion, activation,
+view-delivery, removal, replay-skip, and transport steps are constrained by
+the next observation rather than explored as unrelated choices.
 
 Recovery control actions are used only by `TraceD1Recovery` and compose with
 the D1 fixed planner for live replication and ordered catch-up. The ordering
@@ -387,9 +392,10 @@ literals select action/post-state claims; authority/collision wrappers gate on
 observed fences; the converter checks durability and required-replica/view
 equality; response checkpoints are buffered until primary receipt; and the
 bounded B1 causal schedule remains in the collision wrapper. Promotion NoOps
-have no client write ID, so the combined model records synthetic WAL entries
-with sequence and term. They survive restart, replay without document
-mutation, and remain subject to ordinary truncation.
+have no client write ID. They use distinct request/ACK/NACK message kinds that
+carry sequence and term, can raise the replica fence, apply or redeliver, fail
+on an identity collision, survive restart, and remain subject to ordinary
+truncation.
 
 On September 29, 2026, Java 25 and TLA+ tools 1.7.4 produced the expected
 verdict for every checked-in baseline and every Opus review mutation:
@@ -412,38 +418,50 @@ verdict for every checked-in baseline and every Opus review mutation:
 | Round-4 m8 / m10c | Rejected | Missing activation fill / missing replayed NoOp |
 | Round-4 m4c / m9 | Accepted | Already-sent request/ack survives sender crash or restart |
 | Round-4 m6b / v6c | Rejected / accepted | Fill before replay completion rejected; replay-then-fill accepted |
+| Promotion NoOp applied | Accepted | Exact send, receipt, fence/apply, ACK, and semantic state accepted |
+| Promotion NoOp omitted after send | Rejected | Rejected at step 33, `commit_captured` |
+| Promotion NoOp collision then exact removal | Accepted | NACK and exact allocation removal accepted |
+| Collision mislabeled as redelivery | Rejected | Rejected at step 32, `operation_processed` |
+| Reviewer p7a, traced NoOp fan-out | Accepted | Accepted in 5.31s |
+| Reviewer p7b, omitted NoOp fan-out | Rejected | Rejected at step 190, `operation_processed` |
 
-The 217-event combined witness uses 16 writes, three nodes, write terms 1 and
-3, and the intermediate uninitialized promotion term 2. It includes one crash,
-out-of-order replication, dropped required RPCs, promotion, durable fence
-raises, a real sequence-11 NoOp gap fill during activation, a B1
-collision/removal at sequence 13, a later acknowledged write,
-commit/truncation, and old-primary restart/replay. Validation took
-22.41s with 1,361,332KB peak resident memory through `validate_trace.sh`. Raw
-TLC without diagnostic state dumping took 21.40s with 1,415,532KB peak
-resident memory, generated 37,213 states, found 13,752 distinct states, and
-reached depth 226 before finding the accepting witness. The dominant bounds
-are the 16-write D1 state vectors/sets and the three-node authority
-interleavings around promotion, gap fill, and removal.
+The former 217-event version-3 combined witness is 219 events in version 4.
+It uses 16 writes, three nodes, write terms 1 and 3, and the intermediate
+uninitialized promotion term 2. It includes one crash, out-of-order
+replication, exact dropped-message evidence, promotion, durable fence raises,
+a sequence-11 promotion NoOp, a B1 collision/removal at sequence 13, a later
+acknowledged write, commit/truncation, and old-primary restart/replay.
 
-The 217-event witness does not restart or explicitly replay the promoted copy
+Before determinization, a coverage-enabled version-3 run generated 37,213
+states, found 13,752 distinct states, reached depth 226, and took 66.79s with
+1,620,340KB peak resident memory. The dominant branching came from arbitrary
+in-flight message choices, arbitrary crash-lost subsets, replay skip positions,
+and unconstrained promotion NoOp ranges.
+
+With version 4, the same combined witness accepted in 4.99s with 588,448KB
+peak resident memory in the final per-fixture sweep. All 81 checked-in fixtures
+completed under the 120-second/4-GiB limit; the slowest was the exact 500-event
+restart/failover trace at 12.76s and 1,567,388KB. The isolated main self-test
+suite improved from the reviewer's 6m11s version-3 run to 3m24s, and the
+round-4 matrix improved from 9m13s to 53.95s. No verdict, invariant, fixture, or
+semantic observation was removed to obtain these bounds.
+
+The 500-event representative extends the combined witness with deterministic
+post-failover writes while retaining three-node restart/replay, failover,
+promotion NoOp fan-out, and collision removal. It is generated evidence for
+the validator performance target, not yet a captured Rust fault-test trace.
+
+The combined witness does not restart or explicitly replay the promoted copy
 before its first fill. The separate v6c fixture covers promoted-copy restart,
 full observed WAL replay, a new activation term, and only then NoOp fill. The
 m10 fixture additionally proves that an uncommitted promotion NoOp itself is a
 replayable WAL entry after a later crash.
 
-Round-4 traces with one additional late crash were observed at roughly
-69-127 seconds and up to about 2.9GB resident memory. Cost is dominated by the
-trace-derived write bound, three-node D1 state functions, replay length, and
-hidden Raft/view/activation choices around each crash. The slow controls run
-under `trace-validator-round4` with a 600-second default; the ordinary
-validator keeps its 60-second default.
-
 The suite also retains expected-invalid arrival-order, seq-only collision,
-highest-commit, and replay-stage boundary traces. Converter tests reject v1,
-unknown fields/events, non-consecutive steps, and invented copy state. The Rust
-instrumentation is not yet connected, so this is validator evidence from
-checked-in traces, not a captured Rust execution.
+highest-commit, and replay-stage boundary traces. Converter tests reject
+versions 1 through 3, unknown fields/events, non-consecutive steps, and
+invented copy state. Rust instrumentation is not yet connected, so this is
+validator evidence from checked-in traces, not a captured Rust execution.
 
 Two property formulations were retired:
 
@@ -963,8 +981,8 @@ performance benchmarks.
 | `d1-order-historical` | 2 / 2 / 3 | Three concurrent writes; arbitrary replica arrival order | Arrival-order apply | Expected `NoCopyBehindAcked` violation | 384 / 207 | 16 | 2s |
 | `d1-order-fixed` | Same as historical ordering | Same concurrent/message bounds | Seq-aware D1 planner | Pass | 542 / 259 | 16 | 2s |
 | `d1-replay-historical` | 2 / 2 / 3 | Delete committed above gaps; duplicate; crash/restart | Highest-sequence replay boundary | Expected acknowledged replay-loss violation | 457 / 201 | 26 | 2s |
-| `d1-replay-fixed` | Same replay schedule | Processed checkpoint; planner replay; tombstone pruning | Proposed D1 | Pass | 1,583 / 531 | 29 | 2s |
-| `d1-no-durable-tombstone` | 2 / 2 / 3 | Checkpoint 1; truncate seq 0; restart without tombstone; late seq 1 | Proposed D1 | Pass | 132 / 70 | 21 | 2s |
+| `d1-replay-fixed` | Same replay schedule | Processed checkpoint; planner replay; tombstone pruning | Implemented D1 | Pass | 1,583 / 531 | 29 | 2s |
+| `d1-no-durable-tombstone` | 2 / 2 / 3 | Checkpoint 1; truncate seq 0; restart without tombstone; late seq 1 | Implemented D1 | Pass | 132 / 70 | 21 | 2s |
 | `d1-term-collision-seq-only` | 3 copies / seq 11 | Term-1 partial apply; R1 term-2 reuse; later R2 promotion | Seq-only redelivery | Expected `B1NoCopyBehindAcked` violation | 6 / 6 | 6 | 1s |
 | `d1-term-collision-fixed` | Same collision schedule | Durable max on fence raise; fail and recover R2 | Term-aware identity | Pass | 6 / 6 | 6 | <1s |
 | `d1-gaps` | 2 copies / seq 0..2 | Permanent gap 1; pull, recovery, or promotion NoOp | Gap-aware checkpoint | Pass | 5 / 5 | 3 | 1s |
@@ -974,16 +992,28 @@ performance benchmarks.
 | `d1-primary-gap-processed` | Same primary gap | Compare processed checkpoint 1 to 1 | Processed detector | Pass | 3 / 3 | 3 | 1s |
 | `d1-promotion-replay-noop` | Promoted copy WAL `{0,2}` | Replay, NoOp 1, failed NoOp replication, activate | Promotion ordering | Pass | 8 / 7 | 6 | 1s |
 | `d1-trace-actions` | 2 nodes / 1 acknowledged write | Earlier captured commit; truncation; both-node restart; successful and failed replay | Trace action coverage | Pass | 16 / 16 | 16 | 2s |
-| `d1-failover-actions` | 3 nodes / 5 writes | Gap, failover, durable term-3 fences, replayable NoOp, activation, sequence collision | D1 action coverage | Pass | 32 / 31 | 31 | 2s |
-| `trace-validator` | Schema-v3 one-shard traces | Inferred core/authority/collision/recovery composition; validator-owned hidden bounds; semantic copy state | Trace-derived finite constants | Baselines plus m- and n-series mutations match expected verdicts | Per-trace witness search | Per-trace witness search | See current run log |
-| `trace-validator-round4` | Schema-v3 combined traces | Late delivery, truncation/restart, activation gaps, replayable NoOps | 600s per trace | Round-4 fixture verdicts match | Per-trace witness search | Per-trace witness search | See current run log |
+| `d1-failover-actions` | 3 nodes / 5 writes | Scripted gap/failover path; durable term-3 fences; NoOp fan-out/apply/redelivery; activation; collision | Scripted action coverage, not exhaustive model checking | Pass | 47 / 45 | 45 | 2s |
+| `d1-noop-collision-actions` | 3 nodes / 2 writes | Scripted promotion NoOp collision, NACK, and exact removal | Scripted action coverage, not exhaustive model checking | Pass | 28 / 27 | 27 | 2s |
+| `trace-validator` | Schema-v4 one-shard traces | Exact messages/crash sets/fill ranges; inferred core/authority/collision/recovery composition; semantic copy state | 120s and 4 GiB per trace | Baselines plus m-, n-, p7-, and NoOp mutations match expected verdicts | Per-trace witness search | Per-trace witness search | 3m24s isolated suite |
+| `trace-validator-round4` | Schema-v4 combined traces | Late delivery, truncation/restart, activation gaps, replayable NoOps | 120s and 4 GiB per trace | Round-4 fixture verdicts match | Per-trace witness search | Per-trace witness search | 53.95s isolated suite |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
-| `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 87,012,150 / 12,495,758 | 42 | 42m55s |
+| `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 112,195,617 / 15,684,270 | 42 | 34m23s |
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
-The complete default twelve-worker fast matrix, including trace validation,
-ran from 04:19:47 to 04:28:04 UTC (8m17s), and every expected pass or expected
-counterexample matched. The two large exhaustive runs used eight workers.
+The complete fast matrix, including trace validation, passed in 8m26s with
+`TLA_WORKERS=8` on September 29, 2026. Every expected pass and expected
+counterexample matched. The two large exhaustive runs also used eight workers.
+
+`d1-failover-actions` was introduced as scripted action coverage along one
+31-state path, not as exhaustive model checking. Explicit NoOp
+request/ACK/redelivery actions extend the current scripted path to 45 distinct
+states; its purpose remains coverage of named actions and order constraints.
+`d1-noop-collision-actions` is the same kind of scripted coverage for the
+collision/NACK/removal path.
+
+The `fixed-crash` row is the Opus reviewer's eight-worker rerun at source
+commit `17613de`; it replaces the older slower run on a different source
+revision.
 
 The two long fixed-design configurations use the top-level `Next` relation,
 not a scenario wrapper, but `FaultMode` still limits enabled fault classes.
@@ -997,8 +1027,9 @@ the other enabled interleavings within their numeric bounds.
 The larger `fixed-simulation` profile uses 3 nodes, 2 documents, 4 writes,
 2 crashes, 1 partition, 2 recoveries, term 4, 3 in-flight messages, view lag 4,
 and 8 Raft entries. With seed `20260926`, depth 80, and 10,000 requested traces,
-TLC checked 1,588,868 states in 2m59s without finding a violation. Simulation
-is sampling, not exhaustive model checking.
+the September 29, 2026 rerun checked 1,603,294 states in 3m05s with
+1,255,212KB peak resident memory and found no violation. Simulation is
+sampling, not exhaustive model checking.
 
 `MC_TwoShardIsolation.tla` is deliberately smaller than the one-shard
 data-plane model. It models index-level validation, one red shard, sibling
@@ -1039,11 +1070,12 @@ well below the CI budget.
 - This is not a proof for unbounded nodes, writes, terms, crashes, or queues.
 - No Apalache inductive check has been run.
 - No TLAPS proof has been written.
-- The trace validator currently checks schema-v3 fixtures. Rust
-  process/integration tests do not yet emit those events, so no captured Rust
-  execution is claimed as validated evidence yet.
-- Promotion NoOp WAL records use synthetic model identities carrying sequence
-  and term. The validator checks persistence, replay, truncation, exact gap
+- The trace validator checks schema-v4 fixtures. Rust process/integration tests
+  do not yet emit those events, so no captured Rust execution is claimed as
+  validated evidence yet.
+- Promotion NoOp WAL records use model identities carrying sequence and term
+  but no client write ID. The validator checks exact fan-out, replica
+  receipt/apply/fence/collision/result, persistence, replay, truncation, gap
   closure, and document-state neutrality, but not byte-level WAL encoding.
 - Index delete/recreate identity is abstracted as pre-finalize abort rather
   than modeled end to end.
