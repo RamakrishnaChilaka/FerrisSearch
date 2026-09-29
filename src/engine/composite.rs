@@ -974,6 +974,11 @@ impl SearchEngine for CompositeEngine {
         self.text.get_document(doc_id)
     }
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        self.text.vector_rebuild_documents()
+    }
+
     fn refresh(&self) -> Result<()> {
         let _vector_recovery = self
             .vector_recovery

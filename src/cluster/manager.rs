@@ -4,19 +4,69 @@ use std::sync::{Arc, RwLock};
 /// Manages thread-safe access to the Cluster State
 pub struct ClusterManager {
     state: Arc<RwLock<ClusterState>>,
+    #[cfg(feature = "protocol-trace")]
+    protocol_trace_node: RwLock<Option<String>>,
 }
 
 impl ClusterManager {
     pub fn new(cluster_name: String) -> Self {
         Self {
             state: Arc::new(RwLock::new(ClusterState::new(cluster_name))),
+            #[cfg(feature = "protocol-trace")]
+            protocol_trace_node: RwLock::new(None),
         }
     }
 
     /// Create a ClusterManager backed by an externally-owned state (e.g. shared
     /// with the Raft state machine).
     pub fn with_shared_state(state: Arc<RwLock<ClusterState>>) -> Self {
-        Self { state }
+        Self {
+            state,
+            #[cfg(feature = "protocol-trace")]
+            protocol_trace_node: RwLock::new(None),
+        }
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn set_protocol_trace_node(&self, node_id: impl Into<String>) {
+        *self
+            .protocol_trace_node
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(node_id.into());
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn record_protocol_trace_routing_views(&self) -> anyhow::Result<()> {
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        self.record_protocol_trace_routing_views_locked(&state)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn record_protocol_trace_routing_views_locked(
+        &self,
+        state: &ClusterState,
+    ) -> anyhow::Result<()> {
+        let Some(node) = self
+            .protocol_trace_node
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        else {
+            return Ok(());
+        };
+        let mut indices = state.indices.keys().cloned().collect::<Vec<_>>();
+        indices.sort();
+        for index_name in indices {
+            let Some(metadata) = state.indices.get(&index_name) else {
+                continue;
+            };
+            let mut shards = metadata.shard_routing.keys().copied().collect::<Vec<_>>();
+            shards.sort_unstable();
+            for shard in shards {
+                crate::protocol_trace::record_routing_view(&node, state, &index_name, shard)?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns a cloned snapshot of the current state
@@ -39,9 +89,16 @@ impl ClusterManager {
     /// all cluster-state mutations go through `raft.client_write(...)`.
     pub fn update_state(&self, mut new_state: ClusterState) {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "protocol-trace")]
+        let installs_newer_state = new_state.version > state.version;
         // Preserve last_seen since it's transient and not serialized over the network
         new_state.last_seen = std::mem::take(&mut state.last_seen);
         *state = new_state;
+        #[cfg(feature = "protocol-trace")]
+        if installs_newer_state {
+            self.record_protocol_trace_routing_views_locked(&state)
+                .expect("protocol trace routing view must match installed cluster state");
+        }
     }
 
     /// Ping a node to update heartbeat timestamp

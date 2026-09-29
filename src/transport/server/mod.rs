@@ -719,7 +719,7 @@ impl InternalTransport for TransportService {
                     .spawn_write(move || {
                         #[cfg(feature = "protocol-trace")]
                         {
-                            return crate::protocol_trace::with_open_copy(trace_copy, || {
+                            crate::protocol_trace::with_open_copy(trace_copy, || {
                                 crate::protocol_trace::with_request_tokens(
                                     trace_request.into_iter().collect(),
                                     || {
@@ -736,7 +736,7 @@ impl InternalTransport for TransportService {
                                         )
                                     },
                                 )
-                            });
+                            })
                         }
                         #[cfg(not(feature = "protocol-trace"))]
                         engine.add_document_with_receipt_at_term(&doc_id, payload, primary_term)
@@ -1054,7 +1054,7 @@ impl InternalTransport for TransportService {
                     .spawn_write(move || {
                         #[cfg(feature = "protocol-trace")]
                         {
-                            return crate::protocol_trace::with_open_copy(trace_copy, || {
+                            crate::protocol_trace::with_open_copy(trace_copy, || {
                                 crate::protocol_trace::with_request_tokens(trace_requests, || {
                                     crate::protocol_trace::with_apply_scope(
                                         crate::protocol_trace::ApplyOrigin::Primary,
@@ -1067,7 +1067,7 @@ impl InternalTransport for TransportService {
                                         },
                                     )
                                 })
-                            });
+                            })
                         }
                         #[cfg(not(feature = "protocol-trace"))]
                         engine.bulk_add_documents_with_receipt_at_term(docs_for_write, primary_term)
@@ -1348,7 +1348,7 @@ impl InternalTransport for TransportService {
                     .spawn_write(move || {
                         #[cfg(feature = "protocol-trace")]
                         {
-                            return crate::protocol_trace::with_open_copy(trace_copy, || {
+                            crate::protocol_trace::with_open_copy(trace_copy, || {
                                 crate::protocol_trace::with_request_tokens(
                                     trace_request.into_iter().collect(),
                                     || {
@@ -1364,7 +1364,7 @@ impl InternalTransport for TransportService {
                                         )
                                     },
                                 )
-                            });
+                            })
                         }
                         #[cfg(not(feature = "protocol-trace"))]
                         engine.delete_document_with_receipt_at_term(&doc_id, primary_term)
@@ -2240,7 +2240,7 @@ impl InternalTransport for TransportService {
                     .map_err(anyhow::Error::msg)?;
                 #[cfg(feature = "protocol-trace")]
                 {
-                    return crate::protocol_trace::with_apply_scope(
+                    crate::protocol_trace::with_apply_scope(
                         crate::protocol_trace::ApplyOrigin::LiveReplication,
                         vec![sequenced_operation.clone()],
                         || {
@@ -2256,7 +2256,7 @@ impl InternalTransport for TransportService {
                                 |engine| engine.apply_replica_operation(sequenced_operation),
                             )
                         },
-                    );
+                    )
                 }
                 #[cfg(not(feature = "protocol-trace"))]
                 service.shard_manager.apply_replica_operation(
@@ -2534,7 +2534,7 @@ impl InternalTransport for TransportService {
                     .map_err(anyhow::Error::msg)?;
                 #[cfg(feature = "protocol-trace")]
                 {
-                    return crate::protocol_trace::with_apply_scope(
+                    crate::protocol_trace::with_apply_scope(
                         crate::protocol_trace::ApplyOrigin::LiveReplication,
                         trace_operations,
                         || {
@@ -2550,7 +2550,7 @@ impl InternalTransport for TransportService {
                                 |engine| engine.apply_replica_batch(operations),
                             )
                         },
-                    );
+                    )
                 }
                 #[cfg(not(feature = "protocol-trace"))]
                 service.shard_manager.apply_replica_operation(
@@ -4637,6 +4637,16 @@ impl TransportService {
             .map(|_| ())
     }
 
+    #[cfg(feature = "protocol-trace")]
+    pub async fn protocol_trace_activate_primary_for_test(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Result<(), String> {
+        self.activate_primary_for_lifecycle(index_name, shard_id)
+            .await
+    }
+
     async fn ensure_primary_activated(
         &self,
         index_name: &str,
@@ -4986,9 +4996,9 @@ impl TransportService {
             .spawn_write(move || {
                 #[cfg(feature = "protocol-trace")]
                 {
-                    return crate::protocol_trace::with_open_copy(activation_trace_copy, || {
+                    crate::protocol_trace::with_open_copy(activation_trace_copy, || {
                         activation_engine.prepare_primary_activation(primary_term)
-                    });
+                    })
                 }
                 #[cfg(not(feature = "protocol-trace"))]
                 activation_engine.prepare_primary_activation(primary_term)
@@ -5880,15 +5890,18 @@ impl TransportService {
 
 /// Create a gRPC transport server **without Raft** for shard-level integration tests.
 /// Production code must use [`create_transport_service_with_raft`].
-pub fn create_transport_service_for_test(
+fn build_transport_service_for_test(
     cluster_manager: Arc<ClusterManager>,
     shard_manager: Arc<ShardManager>,
     transport_client: crate::transport::TransportClient,
     task_manager: Arc<crate::tasks::TaskManager>,
     local_node_id: String,
-) -> InternalTransportServer<TransportService> {
+) -> TransportService {
     #[cfg(feature = "protocol-trace")]
-    shard_manager.set_protocol_trace_node(local_node_id.clone());
+    {
+        cluster_manager.set_protocol_trace_node(local_node_id.clone());
+        shard_manager.set_protocol_trace_node(local_node_id.clone());
+    }
     let storage_manager = Arc::new(
         crate::storage::StorageManager::new_in_path(shard_manager.data_dir()).unwrap_or_else(
             |error| panic!("create default test remote_store storage manager: {error}"),
@@ -5896,7 +5909,7 @@ pub fn create_transport_service_for_test(
     );
     let peer_recovery_state = peer_recovery::new_peer_recovery_transport_state();
     shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
-    let service = TransportService {
+    TransportService {
         cluster_manager,
         shard_manager,
         transport_client,
@@ -5911,11 +5924,51 @@ pub fn create_transport_service_for_test(
         primary_activation_state: new_primary_activation_state(),
         peer_recovery_state,
         join_lock: new_join_lock(),
-    };
+    }
+}
+
+pub fn create_transport_service_for_test(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    transport_client: crate::transport::TransportClient,
+    task_manager: Arc<crate::tasks::TaskManager>,
+    local_node_id: String,
+) -> InternalTransportServer<TransportService> {
+    let service = build_transport_service_for_test(
+        cluster_manager,
+        shard_manager,
+        transport_client,
+        task_manager,
+        local_node_id,
+    );
     peer_recovery::start_peer_recovery_reaper(service.clone());
     InternalTransportServer::new(service)
         .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+}
+
+#[cfg(feature = "protocol-trace")]
+pub fn create_transport_service_for_test_with_handle(
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+    transport_client: crate::transport::TransportClient,
+    task_manager: Arc<crate::tasks::TaskManager>,
+    local_node_id: String,
+) -> (InternalTransportServer<TransportService>, TransportService) {
+    let service = build_transport_service_for_test(
+        cluster_manager,
+        shard_manager,
+        transport_client,
+        task_manager,
+        local_node_id,
+    );
+    peer_recovery::start_peer_recovery_reaper(service.clone());
+    (
+        InternalTransportServer::new(service.clone())
+            .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE),
+        service,
+    )
 }
 
 /// Create the gRPC transport server with Raft consensus.
@@ -5979,7 +6032,10 @@ pub(crate) fn create_transport_service_with_raft_and_storage_handle(
     local_node_id: String,
 ) -> (InternalTransportServer<TransportService>, TransportService) {
     #[cfg(feature = "protocol-trace")]
-    shard_manager.set_protocol_trace_node(local_node_id.clone());
+    {
+        cluster_manager.set_protocol_trace_node(local_node_id.clone());
+        shard_manager.set_protocol_trace_node(local_node_id.clone());
+    }
     let peer_recovery_state = peer_recovery::new_peer_recovery_transport_state();
     shard_manager.register_source_recovery_cleanup(peer_recovery_state.clone());
     let service = TransportService {

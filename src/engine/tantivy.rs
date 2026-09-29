@@ -1381,6 +1381,8 @@ impl HotEngine {
         #[cfg(not(feature = "protocol-trace"))]
         let seq_only_redelivery = false;
         let planning_snapshot = state.planning_snapshot();
+        #[cfg(feature = "protocol-trace")]
+        let mut trace_checkpoints = planning_snapshot.checkpoints.clone();
         let mut planned = Vec::with_capacity(operations.len());
         let mut shadow_versions = HashMap::<String, CurrentVersion>::new();
         #[cfg(feature = "protocol-trace")]
@@ -1409,14 +1411,15 @@ impl HotEngine {
                     return Err(error);
                 }
                 if already_processed {
-                    if wal_disposition.validates_redelivery() && !seq_only_redelivery {
-                        if let Err(error) = self.validate_redelivery(translog, &operation) {
-                            #[cfg(feature = "protocol-trace")]
-                            {
-                                collision_operation = Some(operation.clone());
-                            }
-                            return Err(error);
+                    if wal_disposition.validates_redelivery()
+                        && !seq_only_redelivery
+                        && let Err(error) = self.validate_redelivery(translog, &operation)
+                    {
+                        #[cfg(feature = "protocol-trace")]
+                        {
+                            collision_operation = Some(operation.clone());
                         }
+                        return Err(error);
                     }
                     planned.push(PlannedOperation {
                         operation,
@@ -1485,16 +1488,14 @@ impl HotEngine {
                                 } else {
                                     if wal_disposition.validates_redelivery()
                                         && !seq_only_redelivery
-                                    {
-                                        if let Err(error) =
+                                        && let Err(error) =
                                             self.validate_redelivery(translog, &operation)
+                                    {
+                                        #[cfg(feature = "protocol-trace")]
                                         {
-                                            #[cfg(feature = "protocol-trace")]
-                                            {
-                                                collision_operation = Some(operation.clone());
-                                            }
-                                            return Err(error);
+                                            collision_operation = Some(operation.clone());
                                         }
+                                        return Err(error);
                                     }
                                     super::ApplyOutcome::Redelivery
                                 }
@@ -1543,7 +1544,7 @@ impl HotEngine {
                 let _ = crate::protocol_trace::record_operation_collision(
                     copy,
                     operation,
-                    state.checkpoints.stats(),
+                    trace_checkpoints.stats(),
                 );
             }
             state.restore_planning_snapshot(planning_snapshot);
@@ -1587,6 +1588,9 @@ impl HotEngine {
         }
         #[cfg(feature = "protocol-trace")]
         if let Some(copy) = trace_copy.as_ref() {
+            let durable = wal_disposition.is_persisted()
+                || (wal_disposition == WalDisposition::Append
+                    && matches!(self.durability, TranslogDurability::Request));
             for planned_operation in planned
                 .iter()
                 .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
@@ -1594,7 +1598,7 @@ impl HotEngine {
                 crate::protocol_trace::record_wal_appended(
                     copy,
                     &planned_operation.operation,
-                    wal_disposition.is_persisted(),
+                    durable,
                 )?;
             }
         }
@@ -1694,11 +1698,27 @@ impl HotEngine {
                 }
                 #[cfg(feature = "protocol-trace")]
                 if let Some(copy) = trace_copy.as_ref() {
+                    if planned_operation.complete {
+                        trace_checkpoints.advance_max_seq_no(planned_operation.operation.seq_no);
+                        trace_checkpoints.mark_processed(planned_operation.operation.seq_no);
+                        if matches!(self.durability, TranslogDurability::Request)
+                            || wal_disposition.is_persisted()
+                        {
+                            trace_checkpoints.mark_persisted(planned_operation.operation.seq_no);
+                        }
+                    }
+                    let trace_outcome = if planned_operation.complete
+                        && planned_operation.outcome == super::ApplyOutcome::Redelivery
+                    {
+                        super::ApplyOutcome::Stale
+                    } else {
+                        planned_operation.outcome
+                    };
                     crate::protocol_trace::record_operation_processed(
                         copy,
                         &planned_operation.operation,
-                        planned_operation.outcome,
-                        state.checkpoints.stats(),
+                        trace_outcome,
+                        trace_checkpoints.stats(),
                     )?;
                 }
             }
@@ -2117,9 +2137,12 @@ impl HotEngine {
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::current_open_copy();
         #[cfg(feature = "protocol-trace")]
-        if let Some(copy) = trace_copy.as_ref() {
-            crate::protocol_trace::record_replay_started(copy, self.sequence_stats());
-        }
+        let trace_replay = trace_copy
+            .as_ref()
+            .and_then(|copy| {
+                crate::protocol_trace::record_replay_started(copy, self.sequence_stats())
+            })
+            .is_some();
         let committed_next_seq = committed
             .processed_checkpoint
             .and_then(|checkpoint| checkpoint.checked_add(1))
@@ -2131,6 +2154,10 @@ impl HotEngine {
             );
         }
         if committed_next_seq == wal_next_seq {
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "completed");
+            }
             return Ok(0);
         }
 
@@ -2143,23 +2170,37 @@ impl HotEngine {
             }
             let operations = std::mem::take(batch);
             #[cfg(feature = "protocol-trace")]
-            let result = crate::protocol_trace::with_apply_scope(
-                crate::protocol_trace::ApplyOrigin::Replay,
-                operations.clone(),
-                || {
-                    self.apply_sequenced_batch_locked(
-                        translog,
-                        operations,
-                        WalDisposition::AlreadyInLocalWal {
-                            persisted: true,
-                            validate_redelivery: false,
-                        },
-                        Some(writer_state),
-                        false,
-                        |_| Ok(()),
-                    )
-                },
-            );
+            let result = if trace_replay {
+                crate::protocol_trace::with_apply_scope(
+                    crate::protocol_trace::ApplyOrigin::Replay,
+                    operations.clone(),
+                    || {
+                        self.apply_sequenced_batch_locked(
+                            translog,
+                            operations,
+                            WalDisposition::AlreadyInLocalWal {
+                                persisted: true,
+                                validate_redelivery: false,
+                            },
+                            Some(writer_state),
+                            false,
+                            |_| Ok(()),
+                        )
+                    },
+                )
+            } else {
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    operations,
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: true,
+                        validate_redelivery: false,
+                    },
+                    Some(writer_state),
+                    false,
+                    |_| Ok(()),
+                )
+            };
             #[cfg(not(feature = "protocol-trace"))]
             let result = self.apply_sequenced_batch_locked(
                 translog,
@@ -2184,6 +2225,15 @@ impl HotEngine {
                 .processed_checkpoint
                 .is_some_and(|checkpoint| entry.seq_no <= checkpoint)
             {
+                #[cfg(feature = "protocol-trace")]
+                if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                    let operation = sequenced_operation_from_entry(&entry)?;
+                    crate::protocol_trace::record_replay_skip(
+                        copy,
+                        &operation,
+                        self.sequence_stats(),
+                    )?;
+                }
                 return Ok(());
             }
             if replayed == 0 {
@@ -2199,14 +2249,26 @@ impl HotEngine {
         if let Err(error) = replay_result {
             let message = format!("translog replay failed during {context}: {error}");
             writer_state.fail(format!("{message}: {error:#}"));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed");
+            }
             return Err(error).context(message);
         }
         if replayed == 0 {
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "completed");
+            }
             return Ok(0);
         }
         flush_batch(&mut batch)?;
         if let Err(error) = self.reader.reload() {
             writer_state.fail(format!("reader reload failed after {context}: {error}"));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed");
+            }
             return Err(error).with_context(|| format!("reader reload failed after {context}"));
         }
         let committed_boundary = last_committed_boundary
@@ -2215,6 +2277,10 @@ impl HotEngine {
             writer_state.fail(format!(
                 "committed checkpoint persistence failed after {context}: {error:#}"
             ));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed");
+            }
             return Err(error).with_context(|| {
                 format!("committed checkpoint persistence failed after {context}")
             });
@@ -2233,7 +2299,7 @@ impl HotEngine {
             replayed
         );
         #[cfg(feature = "protocol-trace")]
-        if let Some(copy) = trace_copy.as_ref() {
+        if trace_replay && let Some(copy) = trace_copy.as_ref() {
             crate::protocol_trace::record_replay_finished(copy, "completed");
         }
         Ok(replayed)
@@ -7383,6 +7449,11 @@ impl super::SearchEngine for HotEngine {
             }
         }
         Ok(None)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        self.vector_rebuild_documents()
     }
 
     fn refresh(&self) -> Result<()> {

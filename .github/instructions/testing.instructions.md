@@ -42,6 +42,8 @@ cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh s1-combined-replica s1-combined-primary s1-combined-liveness
 ./scripts/tla/check.sh trace-validator          # Converter and trace acceptance/rejection
 ./scripts/tla/validate_trace.sh path/to/trace.jsonl
+./scripts/tla/check_d1_trace_invariants.py path/to/trace.jsonl
+./scripts/tla/test_d1_protocol_trace.sh
 ./scripts/tla/test_trace_validator.sh
 ./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
 ./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
@@ -211,6 +213,11 @@ cargo test -- test_name                         # Single test by name
   linearizing lock. Every mutable field in one event comes from that same lock;
   split commit capture/persistence and other cross-lock effects. Do not
   validate normal asynchronous tracing output.
+- The `protocol-trace` feature is test-only. Its seeded three-node real-gRPC
+  suite must accept the unmodified implementation and reject both
+  `arrival-order` and `seq-only-redelivery` at the causal
+  `operation_processed` event in both the independent invariant checker and
+  TLC. Keep the seed in failure output so the run is reproducible.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt

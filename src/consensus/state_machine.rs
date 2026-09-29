@@ -39,6 +39,24 @@ impl ClusterStateMachine {
         self.state.clone()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    pub fn from_state_for_protocol_trace_test(state: ClusterState) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(state)),
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+        }
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn apply_command_for_protocol_trace_test(
+        &self,
+        command: &ClusterCommand,
+        raft_log_index: u64,
+    ) -> ClusterResponse {
+        self.apply_command_at(command, raft_log_index)
+    }
+
     fn apply_command_at(&self, cmd: &ClusterCommand, raft_log_index: u64) -> ClusterResponse {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         match cmd {

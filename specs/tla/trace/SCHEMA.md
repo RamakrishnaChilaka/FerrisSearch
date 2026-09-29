@@ -262,7 +262,7 @@ of requests in `Replicating` state whose primary is the crashed node.
 
 | Event | Required fields | Emit in current Rust code | Required lock and ordering |
 | --- | --- | --- | --- |
-| `routing_view` | `node`, `index_uuid`, `shard`, `primary`, `term`, sorted `in_sync`, every `{node, allocation}`, `initialized` | At initial harness capture and whenever a node installs a newer `ClusterState` view. | Hold that node's cluster-state read/write lock for one coherent view. |
+| `routing_view` | `node`, `index_uuid`, `shard`, `primary`, `term`, sorted `in_sync`, every `{node, allocation}`, `initialized` | `ClusterManager::record_protocol_trace_routing_views` at initial harness capture and `ClusterManager::update_state` whenever a node installs a newer view. | Hold that node's cluster-state read/write lock for one coherent view. |
 | `routing_promoted` | `emitter`, `index_uuid`, `shard`, `new_primary`, `term`, sorted `in_sync` | `ClusterStateMachine::apply_command_at`, after a successful Raft-applied routing mutation promotes the primary. | Hold `state.write()`. Emit once from the applying Raft state machine, not once per observer. |
 | `in_sync_removed` | `emitter`, `index_uuid`, `shard`, `removed_node`, `removed_allocation`, sorted resulting `in_sync` | `ClusterStateMachine::apply_command_at`, after successful exact-allocation `FailShardCopy` application. | Hold `state.write()`. The allocation must be the one removed by that command. |
 | `promotion_noop_fill` | `node`, `index_uuid`, `shard`, `allocation`, `batch_id`, `term`, sorted `noops`, `checkpoints` | `HotEngine::prepare_primary_activation`, after full local replay, gap computation, NoOp WAL append, translog sync, planner completion, and persisted-checkpoint marking. | Hold the activation maintenance guard, translog lock, and `apply_state`. Each `noops` item is `{receipt_id, seq_no, content_hash}`. |
@@ -316,6 +316,11 @@ contains:
 
 `state` is `absent`, `live`, or `deleted`. Identity fields are null only for
 `absent`.
+
+`ShardManager::capture_protocol_trace_copy_state` performs the refresh and
+captures the immutable live-document snapshot. The harness emits all final
+`copy_state` records only after every available copy has been captured, so a
+later copy's commit events cannot make an earlier observation stale.
 
 The fault harness must:
 

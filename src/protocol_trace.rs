@@ -80,6 +80,12 @@ pub struct TraceCopy {
     pub allocation: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TraceCopySnapshot {
+    pub copy: TraceCopy,
+    pub live_documents: Vec<(String, u64, u64, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OperationKey {
     pub index_uuid: String,
@@ -1413,11 +1419,11 @@ pub fn record_node_crashed(node: &str, outcome: &str) -> Result<()> {
         let mut failed_request_ids = state
             .requests
             .iter()
-            .filter_map(|(request_id, request)| {
-                (request.status == RequestStatus::Replicating
-                    && request.primary.as_deref() == Some(node))
-                .then(|| request_id.clone())
+            .filter(|(_, request)| {
+                request.status == RequestStatus::Replicating
+                    && request.primary.as_deref() == Some(node)
             })
+            .map(|(request_id, _)| request_id.clone())
             .collect::<Vec<_>>();
         failed_request_ids.sort();
         let mut dropped_messages = state
@@ -1590,6 +1596,52 @@ fn record_replay_entry(
                 "op": metadata.op,
                 "content_hash": metadata.content_hash,
                 "outcome": outcome_name(outcome),
+                "checkpoints": checkpoints_value(stats),
+            }),
+        );
+        Ok(())
+    }) {
+        Some(result) => result,
+        None => Ok(()),
+    }
+}
+
+pub fn record_replay_skip(
+    copy: &TraceCopy,
+    operation: &SequencedOperation,
+    stats: SequenceStats,
+) -> Result<()> {
+    match with_state(|state| -> Result<()> {
+        let key = operation_key(copy, operation);
+        let metadata = state
+            .operations
+            .get(&key)
+            .cloned()
+            .context("skipped replay operation is unknown")?;
+        let replay = state
+            .replays
+            .get_mut(copy)
+            .context("skipped replay entry has no active replay")?;
+        let replay_id = replay.replay_id.clone();
+        let ordinal = replay.ordinal;
+        replay.ordinal += 1;
+        push_event(
+            state,
+            "replay_entry",
+            json!({
+                "node": copy.node,
+                "index_uuid": copy.index_uuid,
+                "shard": copy.shard,
+                "allocation": copy.allocation,
+                "replay_id": replay_id,
+                "ordinal": ordinal,
+                "receipt_id": metadata.receipt_id,
+                "term": operation.primary_term,
+                "seq_no": operation.seq_no,
+                "doc": metadata.doc,
+                "op": metadata.op,
+                "content_hash": metadata.content_hash,
+                "outcome": "skip_committed",
                 "checkpoints": checkpoints_value(stats),
             }),
         );

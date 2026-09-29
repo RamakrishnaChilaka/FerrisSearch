@@ -40,6 +40,8 @@ Validate one implementation trace or run the trace validator's self-tests:
 
 ```bash
 ./scripts/tla/validate_trace.sh path/to/d1-trace.jsonl
+./scripts/tla/check_d1_trace_invariants.py path/to/d1-trace.jsonl
+./scripts/tla/test_d1_protocol_trace.sh
 ./scripts/tla/test_trace_validator.sh
 ./scripts/tla/check.sh trace-validator
 ./scripts/tla/check.sh trace-validator-round4
@@ -57,6 +59,16 @@ The self-test scripts run independent fixtures with
 writes an isolated log, and the parent prints logs in declaration order after
 all children finish. The deliberate out-of-memory case keeps its 24 MiB heap.
 Set `TLA_TRACE_JOBS=1` to reproduce the sequential schedule.
+
+`test_d1_protocol_trace.sh` runs the seeded three-node in-process gRPC fault
+scenario behind the `protocol-trace` Cargo feature. It captures a correct
+schema-v4 trace plus the `arrival-order` and `seq-only-redelivery` mutations.
+The independent invariant checker and TLC must accept the correct trace and
+reject both mutations at the causal `operation_processed` event. Override
+`D1_TRACE_SEED` to reproduce another schedule. On September 29, 2026, seed
+`13754061` completed the full capture/checker/TLC matrix in 2m31.53s locally
+from an incrementally compiled worktree; a warm rerun completed in 59.17s.
+The correct 141-event trace took 4.27s in TLC.
 
 Use an existing verified jar or retain raw logs:
 
@@ -1084,8 +1096,13 @@ well below the CI budget.
 - No Apalache inductive check has been run.
 - No TLAPS proof has been written.
 - The trace validator checks schema-v4 fixtures. Rust process/integration tests
-  do not yet emit those events, so no captured Rust execution is claimed as
-  validated evidence yet.
+  also emit schema-v4 events behind the test-only `protocol-trace` feature.
+  The seeded three-node real-gRPC scenario covers concurrent single and bulk
+  writes, request delay/drop, failover, promotion NoOp collision and exact
+  removal, primary restart/replay, and final semantic copy snapshots. Its
+  independent checker covers acknowledged-write retention, authoritative-copy
+  convergence, monotonic fences, and gap-aware checkpoints before TLC checks
+  the same trace against the D1 transition system.
 - Promotion NoOp WAL records use model identities carrying sequence and term
   but no client write ID. The validator checks exact fan-out, replica
   receipt/apply/fence/collision/result, persistence, replay, truncation, gap

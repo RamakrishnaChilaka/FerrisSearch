@@ -3782,6 +3782,59 @@ impl ShardManager {
             .collect()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    pub fn capture_protocol_trace_copy_state(
+        &self,
+        index: &str,
+        shard_id: u32,
+    ) -> Result<crate::protocol_trace::TraceCopySnapshot> {
+        let copy = self
+            .protocol_trace_copy(index, shard_id)
+            .ok_or_else(|| anyhow::anyhow!("protocol trace copy is not open"))?;
+        let engine = self
+            .get_shard(index, shard_id)
+            .ok_or_else(|| anyhow::anyhow!("protocol trace shard engine is not open"))?;
+        let live = crate::protocol_trace::with_open_copy(copy.clone(), || {
+            engine.refresh()?;
+            let live = engine
+                .protocol_trace_documents()?
+                .into_iter()
+                .map(|(doc, source, seq_no, term)| {
+                    let content_hash = crate::protocol_trace::content_hash(
+                        &crate::engine::DocumentMutation::Index {
+                            doc_id: doc.clone(),
+                            source,
+                        },
+                    );
+                    (doc, seq_no, term, content_hash)
+                })
+                .collect::<Vec<_>>();
+            Ok::<Vec<(String, u64, u64, String)>, anyhow::Error>(live)
+        })?;
+        Ok(crate::protocol_trace::TraceCopySnapshot {
+            copy,
+            live_documents: live,
+        })
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn close_protocol_trace_shard_for_restart(&self, index: &str, shard_id: u32) {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.shards
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.isr_tracker.remove_shard(index, shard_id);
+    }
+
     /// Close and remove all shard engines for an index, then delete the data directory.
     /// Uses the stored UUID mapping to find the correct on-disk directory.
     pub fn close_index_shards(&self, index: &str) -> Result<()> {

@@ -403,6 +403,11 @@ pub trait SearchEngine: Send + Sync {
     /// Retrieve a document by its `_id`. Returns the `_source` JSON if found.
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>>;
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        anyhow::bail!("protocol trace document enumeration is not supported by this engine")
+    }
+
     /// Commit in-memory buffer and reload the reader so new docs become searchable.
     fn refresh(&self) -> Result<()>;
 

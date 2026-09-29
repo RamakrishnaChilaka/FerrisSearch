@@ -21,6 +21,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: "25"
+
       - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
@@ -30,6 +36,12 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cache TLA+ tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ferrissearch-tla
+          key: ${{ runner.os }}-tla2tools-1.7.4
 
       - name: Check formatting
         run: cargo fmt --check
@@ -42,6 +54,10 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Validate seeded D1 protocol traces
+        timeout-minutes: 5
+        run: ./scripts/tla/test_d1_protocol_trace.sh
 
   tla-model-check:
     runs-on: ubuntu-latest
