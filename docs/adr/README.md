@@ -15,6 +15,10 @@ describe current behavior.
 - **Rejected:** declined. The record stays as evidence for the decision.
 - **Superseded:** replaced by a later ADR, which it names.
 
+A record that contains several decisions can accept one decision before the
+others. That decision carries its own status line, and the record's status
+covers the rest. Implementation status is tracked separately from acceptance.
+
 ## Required sections
 
 The roadmap requires every strategic decision record to contain:
@@ -34,4 +38,4 @@ the backlog tasks that implement each decision.
 
 | ADR | Title | Status | Backlog |
 |---|---|---|---|
-| [0001](0001-write-consistency-and-retry-contract.md) | Write consistency and retry contract | Proposed | FS-001 |
+| [0001](0001-write-consistency-and-retry-contract.md) | Write consistency and retry contract | Proposed; D1 accepted | FS-001 |
