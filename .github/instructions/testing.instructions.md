@@ -75,7 +75,8 @@ cargo test -- test_name                         # Single test by name
   `d1-order-fixed`, `d1-replay-fixed`, `d1-no-durable-tombstone`,
   `d1-term-collision-fixed`, `d1-gaps`,
   `d1-term-collision-restart-identity`, `d1-primary-gap-processed`,
-  `d1-promotion-replay-noop`, `trace-validator`, `two-shard`, `fixed-crash`, and
+  `d1-promotion-replay-noop`, `d1-trace-actions`, `trace-validator`,
+  `two-shard`, `fixed-crash`, and
   `fixed-partition` are expected-pass configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
@@ -142,23 +143,30 @@ cargo test -- test_name                         # Single test by name
   local WAL entries before NoOp fill; failed NoOp replication may leave a
   replica gap but cannot block local activation.
 - D1 implementation traces follow `specs/tla/trace/SCHEMA.md`. The converter
-  must accept only schema v2 and reject unknown versions, events, outcomes,
+  must accept only schema v3 and reject unknown versions, events, outcomes,
   fields, non-consecutive steps, invalid durability, required-replica/view
   mismatch, or invented copy state before invoking TLC.
-- Trace profiles compose observations with the owning actions:
+- The validator infers the composition from the event vocabulary; the emitter
+  does not choose a profile or hidden-step bound. The inferred compositions
+  use the owning actions:
   `TraceD1` with `MC_D1_SeqNoApply`, `TraceD1Authority` with Raft/activation,
   `TraceD1Collision` with the B1 slice, and `TraceD1Recovery` with
   `PeerRecovery`. Do not replace these with a deterministic replay machine or
   duplicate planner/routing rules in the trace module.
-- TLC trace acceptance is existential witness search with a trace-declared
+- TLC trace acceptance is existential witness search with a validator-owned
   hidden-action bound. A pass means only that the finite observation can be
   embedded in the selected bounded model; it is not an implementation proof.
 - The review mutation matrix must retain rejection for m1, m2, m3, m4, m5,
   m6, m6b, m7, m8, m8b, m9, m9b, m15, m18, and m19, while m13 and m14 remain
   accepted. Also retain the replay-stage invalid trace whose commit boundary is
   valid but replay behavior is not.
-- `copy_state` is mandatory for every available copy at quiescence and after
-  replay/admission. Outcome labels alone are not semantic evidence.
+- Round-2 traces must reject n1, n3, n4, n7, n9, and n10; accept n1c, n2, n5,
+  n6, n8, n11, n12, n13, n14, and n15; and keep the dedicated
+  `d1-trace-actions` configuration green.
+- `copy_state` is the final event even for non-quiescent traces, and is
+  mandatory for every available copy at quiescence and after replay/admission.
+  Refresh before taking it. Deleted-state identity is trace-owned and must not
+  depend on the 60-second tombstone-retention cache.
 - Protocol trace events must be synchronously ordered by the process-global
   trace sink and emitted after the named effect but before releasing its
   linearizing lock. Every mutable field in one event comes from that same lock;

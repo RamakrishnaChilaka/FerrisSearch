@@ -92,7 +92,8 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_D1_TermCollisionRestart.tla` | B1 crash/rebuild after fence raise, committed-record-only versus identity-based restoration of collision state. |
 | `MC_D1_PrimaryGap.tla` | Primary engine-apply gap, max-based recovery loop, and processed-checkpoint comparison. |
 | `MC_D1_PromotionReplayNoOp.tla` | Promotion ordering: replay local WAL, fill gaps with NoOps, tolerate failed NoOp replication, then activate. |
-| `TraceD1.tla` | Existential schema-v2 witness search over real `MC_D1_SeqNoApply` actions, with bounded hidden D1 actions and copy-state observations. |
+| `MC_D1_TraceActions.tla` | Checked coverage for earlier captured-boundary persistence, trace truncation, arbitrary-node restart/replay, and failed-replay unavailability. |
+| `TraceD1.tla` | Existential schema-v3 witness search over real `MC_D1_SeqNoApply` actions, with validator-bounded hidden D1 actions and copy-state observations. |
 | `TraceD1Authority.tla` | Exact composition with Raft routing views, failover, durable fencing, activation, and primary write gating. |
 | `TraceD1Collision.tla` | Exact composition with the bounded B1 term/sequence collision and in-sync removal actions. |
 | `TraceD1Recovery.tla` | Exact composition with source snapshot, target install, catch-up, barrier, Raft admission, and target observation actions. |
@@ -341,7 +342,8 @@ entire trace through real actions:
 - `TraceD1Collision.tla` uses `MC_D1_TermCollision`; and
 - `TraceD1Recovery.tla` uses `PeerRecovery` and base replication actions.
 
-Each profile has a trace-declared bound on hidden actions between observations.
+The converter infers the composition from the event vocabulary; the emitter
+does not select a profile. Hidden-action bounds are validator-owned.
 Observed low-level WAL, fence, and commit records may be D1 stuttering steps,
 but they are tied to a later real action and semantic `copy_state`. Observed
 records cannot be reordered or discarded.
@@ -351,18 +353,23 @@ a behavior accepted by these bounded compositions. It does not prove the
 implementation correct, verify the instrumentation, replace the bounded model
 configurations, or establish behavior for executions that were not logged.
 
-Version 2 adds source-side recovery snapshots, split commit capture/persistence,
+Version 3 adds source-side recovery snapshots, split commit capture/persistence,
 per-node routing views, exact in-sync removal, restart-time state restoration,
 failed-replay unavailability, and semantic `copy_state`. Checkpoints appear
 only on events emitted under the apply-state boundary.
 
-The recovery control profile uses ordered `PeerRecovery::ApplyOps`. The
-checked-in
-[`valid-recovery-planner-sample.jsonl`](trace/v2/valid-recovery-planner-sample.jsonl)
-separately samples that ordered newer-operation pattern through the real D1
-planner. This is bounded sampling, not a general refinement proof.
+Recovery control actions compose with the D1 fixed planner for live
+replication and ordered catch-up. Peer recovery's implemented cursor remains
+strictly increasing, so out-of-order or duplicate catch-up batches are not
+expressible in that composition.
 
-On September 28, 2026, Java 25 and TLA+ tools 1.7.4 produced the expected
+Trace-side logic remains and is not presented as protocol-free: outcome
+literals select action/post-state claims; authority/collision wrappers gate on
+observed fences; the converter checks durability and required-replica/view
+equality; response checkpoints are buffered until primary receipt; and the
+bounded B1 causal schedule remains in the collision wrapper.
+
+On September 29, 2026, Java 25 and TLA+ tools 1.7.4 produced the expected
 verdict for every checked-in baseline and every Opus review mutation:
 
 | Reviewer cases | Expected | Actual |
@@ -370,6 +377,8 @@ verdict for every checked-in baseline and every Opus review mutation:
 | m1, m2, m3, m4, m5, m6, m6b, m7, m8, m8b, m9, m9b, m15, m18, m19 | Rejected | Rejected at the documented first schema event |
 | m13: replayed non-durable tombstone delete is `applied_newer` | Accepted | Accepted |
 | m14: operation between commit capture and record persistence | Accepted | Accepted |
+| n1, n3, n4, n7, n9, n10 | Rejected | Rejected at the documented semantic event |
+| n1c, n2, n5, n6, n8, n11, n12, n13, n14, n15 | Accepted | Accepted |
 
 The suite also retains expected-invalid arrival-order, seq-only collision,
 highest-commit, and replay-stage boundary traces. Converter tests reject v1,
@@ -850,7 +859,7 @@ failure. The combined S1 checks do not enable `DiskLoss` or
 
 ## Configurations and results
 
-Results below were produced on September 28, 2026 with Java 25 and the pinned
+Results below were produced on September 29, 2026 with Java 25 and the pinned
 TLA+ tools jar. Times are TLC wall times on one development host, not
 performance benchmarks.
 
@@ -905,13 +914,14 @@ performance benchmarks.
 | `d1-primary-gap-max` | 2 copies / seq 0..2 | Both checkpoints 1; primary max next 3 | Max-based detector | Expected `B3NoRecoveryLoop` violation | 4 / 4 | 4 | <1s |
 | `d1-primary-gap-processed` | Same primary gap | Compare processed checkpoint 1 to 1 | Processed detector | Pass | 3 / 3 | 3 | 1s |
 | `d1-promotion-replay-noop` | Promoted copy WAL `{0,2}` | Replay, NoOp 1, failed NoOp replication, activate | Promotion ordering | Pass | 8 / 7 | 6 | 1s |
-| `trace-validator` | Schema-v2 one-shard traces | Exact core/authority/collision/recovery composition; bounded hidden steps; semantic copy state | Exact allocation/term/sequence observations | Baselines and all 17 reviewer mutations match expected verdicts | Per-trace witness search | Per-trace witness search | See current run log |
+| `d1-trace-actions` | 2 nodes / 1 acknowledged write | Earlier captured commit; truncation; both-node restart; successful and failed replay | Trace action coverage | Pass | 16 / 16 | 16 | 1s |
+| `trace-validator` | Schema-v3 one-shard traces | Inferred core/authority/collision/recovery composition; validator-owned hidden bounds; semantic copy state | Trace-derived finite constants | Baselines plus m- and n-series mutations match expected verdicts | Per-trace witness search | Per-trace witness search | See current run log |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
 | `fixed-crash` | 3 / 1 / 2 | Full `Next`; 1 crash/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 87,012,150 / 12,495,758 | 42 | 42m55s |
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
 The complete default twelve-worker fast matrix, including trace validation,
-ran from 16:06:38 to 16:12:26 UTC (5m48s), and every expected pass or expected
+ran from 02:17:04 to 02:23:28 UTC (6m24s), and every expected pass or expected
 counterexample matched. The two large exhaustive runs used eight workers.
 
 The two long fixed-design configurations use the top-level `Next` relation,
@@ -968,7 +978,7 @@ well below the CI budget.
 - This is not a proof for unbounded nodes, writes, terms, crashes, or queues.
 - No Apalache inductive check has been run.
 - No TLAPS proof has been written.
-- The trace validator currently checks schema-v2 fixtures. Rust
+- The trace validator currently checks schema-v3 fixtures. Rust
   process/integration tests do not yet emit those events, so no captured Rust
   execution is claimed as validated evidence yet.
 - Index delete/recreate identity is abstracted as pre-finalize abort rather
