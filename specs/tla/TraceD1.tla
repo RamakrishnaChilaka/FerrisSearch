@@ -210,11 +210,7 @@ ReplicaWalObservation(event) ==
     /\ event.writeId \in WriteIds
     /\ HasMessage(event.writeId, event.node)
     /\ LET message == MessageFor(event.writeId, event.node)
-       IN /\ D1ReplicaMessageEnabled(message)
-          /\ message.term >= durableReplicaFence[event.node]
-          /\ IF message.term > durableReplicaFence[event.node]
-                THEN event.fenceObservedTerm = message.term
-                ELSE TRUE
+       IN D1ReplicaMessageEnabled(message)
     /\ IF RequestDurability THEN event.durable ELSE TRUE
     /\ UNCHANGED d1vars
     /\ UNCHANGED AuxVars
@@ -258,8 +254,18 @@ ReplicaResultEvent(event) ==
               /\ StableReplication(
                     DeliverReplicaNack(NackFor(event.writeId, event.peer)))
        [] event.outcome \in {"dropped", "timeout"} ->
-              /\ HasMessage(event.writeId, event.peer)
-              /\ FaultAction(LoseMsg(MessageFor(event.writeId, event.peer)))
+              \/ /\ HasMessage(event.writeId, event.peer)
+                 /\ FaultAction(
+                       LoseMsg(MessageFor(event.writeId, event.peer)))
+              \/ /\ HasAck(event.writeId, event.peer)
+                 /\ FaultAction(LoseMsg(AckFor(event.writeId, event.peer)))
+              \/ /\ HasNack(event.writeId, event.peer)
+                 /\ FaultAction(LoseMsg(NackFor(event.writeId, event.peer)))
+              \/ /\ event.peer \in writeWait[event.writeId]
+                 /\ ~HasMessage(event.writeId, event.peer)
+                 /\ ~HasAck(event.writeId, event.peer)
+                 /\ ~HasNack(event.writeId, event.peer)
+                 /\ UNCHANGED d1vars
        [] OTHER -> FALSE
     /\ IF event.outcome = "acknowledged"
           THEN /\ replicaResponsePersisted[event.writeId][event.peer]
@@ -350,20 +356,31 @@ ReplayEntryEvent(event) ==
     /\ event.node \in Nodes
     /\ replaying[event.node]
     /\ replayPos[event.node] <= Len(walOrder[event.node])
-    /\ walOrder[event.node][replayPos[event.node]] = event.writeId
-    /\ CASE event.outcome = "skip_committed" ->
-              D1ReplaySkipAt(event.node)
-       [] event.outcome \in {"applied_newer", "stale", "redelivery", "noop"} ->
-              LET beforeDoc == docValue[event.node][event.doc]
-              IN /\ D1FixedReplayApplyAt(event.node)
-                 /\ IF event.outcome = "applied_newer"
-                       THEN docValue'[event.node][event.doc] = event.writeId
-                       ELSE IF event.outcome = "stale"
-                            THEN docValue'[event.node][event.doc] = beforeDoc
-                            ELSE IF event.outcome = "redelivery"
-                                 THEN docValue'[event.node][event.doc] = beforeDoc
-                                 ELSE TRUE
-       [] OTHER -> FALSE
+    /\ LET entry == walOrder[event.node][replayPos[event.node]]
+       IN /\ event.seq = WalEntrySeq(entry)
+          /\ event.term = WalEntryTerm(event.node, entry)
+          /\ CASE event.outcome = "skip_committed" ->
+                    /\ IF event.writeId = NoWrite
+                          THEN IsNoOpEntry(entry)
+                          ELSE entry = event.writeId
+                    /\ D1ReplaySkipAt(event.node)
+             [] event.outcome = "noop" ->
+                    /\ event.writeId = NoWrite
+                    /\ IsNoOpEntry(entry)
+                    /\ D1ReplayNoOpAt(event.node)
+             [] event.outcome \in {"applied_newer", "stale", "redelivery"} ->
+                    /\ entry = event.writeId
+                    /\ LET beforeDoc == docValue[event.node][event.doc]
+                       IN /\ D1FixedReplayApplyAt(event.node)
+                          /\ IF event.outcome = "applied_newer"
+                                THEN docValue'[event.node][event.doc] =
+                                     event.writeId
+                                ELSE IF event.outcome = "stale"
+                                     THEN docValue'[event.node][event.doc] =
+                                          beforeDoc
+                                     ELSE docValue'[event.node][event.doc] =
+                                          beforeDoc
+             [] OTHER -> FALSE
     /\ LiveCheckpointMatchesPrime(event.node, event)
     /\ UNCHANGED AuxVars
 
@@ -422,8 +439,8 @@ PromotionNoOpFillObservation(event) ==
 
 ActivationEvent(event) ==
     /\ TraceCombined
-    /\ d1FenceTerm[event.node] = event.term
-    /\ FenceChangingReplication(ObserveActivation(event.node))
+    /\ event.term = views[event.node].term
+    /\ FenceChangingReplication(D1ObserveActivation(event.node))
     /\ activated'[event.node] = event.term
     /\ UNCHANGED AuxVars
 
@@ -485,6 +502,8 @@ ConsumeEvent ==
 
 \* Real unobserved D1 actions only.  These are bounded between observations.
 HiddenD1Action ==
+    \/ \E node \in Nodes, nextPosition \in 1..(2 * MaxWrites + 1) :
+           D1SkipTruncatedReplayPrefix(node, nextPosition)
     \/ /\ ~TraceCombined
        /\ D1ScenarioAgeTombstone
     \/ /\ ~TraceCombined

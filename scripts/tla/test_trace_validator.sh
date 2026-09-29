@@ -14,9 +14,16 @@ python3 -m unittest discover \
 run_valid() {
     local label=$1
     local trace=$2
+    local timeout=${3:-}
     local output
+    local -a command
     output=$(mktemp "${TMPDIR:-/tmp}/ferrissearch-trace-valid.XXXXXX")
-    if ! "$VALIDATOR" "$FIXTURES/$trace" >"$output" 2>&1; then
+    if [[ -n "$timeout" ]]; then
+        command=(env TLA_TRACE_TIMEOUT_SECONDS="$timeout" "$VALIDATOR" "$FIXTURES/$trace")
+    else
+        command=("$VALIDATOR" "$FIXTURES/$trace")
+    fi
+    if ! "${command[@]}" >"$output" 2>&1; then
         cat "$output" >&2
         rm -f -- "$output"
         echo "Expected accepted trace: $label ($trace)" >&2
@@ -32,16 +39,28 @@ run_invalid() {
     local trace=$2
     local step=$3
     local event=$4
+    local timeout=${5:-}
     local output
     output=$(mktemp "${TMPDIR:-/tmp}/ferrissearch-trace-invalid.XXXXXX")
     set +e
-    "$VALIDATOR" "$FIXTURES/$trace" >"$output" 2>&1
+    if [[ -n "$timeout" ]]; then
+        env TLA_TRACE_TIMEOUT_SECONDS="$timeout" \
+            "$VALIDATOR" "$FIXTURES/$trace" >"$output" 2>&1
+    else
+        "$VALIDATOR" "$FIXTURES/$trace" >"$output" 2>&1
+    fi
     status=$?
     set -e
     if [[ $status -eq 0 ]]; then
         cat "$output" >&2
         rm -f -- "$output"
         echo "Expected rejected trace: $label ($trace)" >&2
+        exit 1
+    fi
+    if [[ $status -ne 1 ]]; then
+        cat "$output" >&2
+        rm -f -- "$output"
+        echo "Expected rejection, not inconclusive/error: $label ($trace)" >&2
         exit 1
     fi
     if ! grep -Fq "Trace rejected at schema step $step (event $event)" "$output"; then
@@ -53,6 +72,27 @@ run_invalid() {
     cat "$output"
     rm -f -- "$output"
     echo "review $label expected=rejected actual=rejected step=$step event=$event"
+}
+
+run_inconclusive() {
+    local label=$1
+    local expected=$2
+    shift 2
+    local output
+    output=$(mktemp "${TMPDIR:-/tmp}/ferrissearch-trace-inconclusive.XXXXXX")
+    set +e
+    "$@" >"$output" 2>&1
+    status=$?
+    set -e
+    if [[ $status -ne 3 ]] || ! grep -Fq "INCONCLUSIVE: $expected" "$output"; then
+        cat "$output" >&2
+        rm -f -- "$output"
+        echo "Expected inconclusive result: $label" >&2
+        exit 1
+    fi
+    cat "$output"
+    rm -f -- "$output"
+    echo "review $label expected=inconclusive actual=inconclusive"
 }
 
 # Baseline accepted traces for each exact composition.
@@ -71,6 +111,8 @@ run_invalid arrival-order invalid-arrival-order.jsonl 16 operation_processed
 run_invalid seq-only-redelivery invalid-seq-only-redelivery.jsonl 6 operation_processed
 run_invalid highest-commit invalid-highest-commit-replay.jsonl 16 commit_captured
 run_invalid replay-wrong-at-replay invalid-replay-boundary-at-replay.jsonl 33 replay_entry
+run_valid truncated-retained-skip valid-truncated-copy-restart-retained-skip.jsonl
+run_invalid truncated-reapply invalid-truncated-copy-replay-applies-committed-entry.jsonl 16 replay_entry
 
 # Every Opus reviewer mutation.
 run_invalid m1 m1-reorder-replica-applies.jsonl 11 operation_processed
@@ -128,6 +170,12 @@ run_invalid v9 v9-trace-sets-hidden-budget.jsonl 0 trace_start
 run_valid combined-16-write valid-combined-two-term-16-writes.jsonl
 run_invalid combined-arrival invalid-combined-arrival-order.jsonl 51 operation_processed
 run_invalid combined-collision invalid-combined-collision-redelivery.jsonl 188 operation_processed
-run_invalid combined-rollback invalid-combined-rollback-after-promotion.jsonl 217 copy_state
+run_invalid combined-rollback invalid-combined-rollback-after-promotion.jsonl 217 copy_state 180
+run_inconclusive timeout "trace validation exceeded 1s" \
+    env TLA_TRACE_TIMEOUT_SECONDS=1 \
+    "$VALIDATOR" "$FIXTURES/valid-combined-two-term-16-writes.jsonl"
+run_inconclusive out-of-memory "trace validation exhausted memory" \
+    env JAVA_TOOL_OPTIONS=-Xmx24m TLA_TRACE_TIMEOUT_SECONDS=60 \
+    "$VALIDATOR" "$FIXTURES/valid-combined-two-term-16-writes.jsonl"
 
 echo "D1 schema-v3 trace validator self-tests passed."

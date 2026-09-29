@@ -608,7 +608,6 @@ DeliverReplicaAck(message) ==
     /\ writeStatus[writeId] = "Replicating"
     /\ alive[primaryNode]
     /\ epoch[primaryNode] = message.toEpoch
-    /\ epoch[message.from] = message.fromEpoch
     /\ messages' = messages \ {message}
     /\ writeWait' =
           [writeWait EXCEPT ![writeId] = @ \ {message.from}]

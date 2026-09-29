@@ -15,6 +15,7 @@ D1Seqs == 0..(MaxWrites - 1)
 
 VARIABLES
     walOrder,
+    noopTerm,
     processedSeqs,
     processedNext,
     persistedSeqs,
@@ -45,7 +46,7 @@ VARIABLES
     pruneDone
 
 D1Vars ==
-    <<walOrder, processedSeqs, processedNext, persistedSeqs, persistedNext,
+    <<walOrder, noopTerm, processedSeqs, processedNext, persistedSeqs, persistedNext,
       maxSeqNext, persistedProcessedNext, persistedCommittedNext,
       persistedMaxSeqNext, d1FenceTerm, fenceMaxSeqNext, processedTerm,
       docSeqNext,
@@ -55,6 +56,30 @@ D1Vars ==
       duplicateSent, tombstonePruneSafe, pruneDone>>
 
 d1vars == <<vars, D1Vars>>
+
+NoOpEntry(sequenceNumber) == MaxWrites + sequenceNumber + 1
+NoOpEntries == {NoOpEntry(sequenceNumber) : sequenceNumber \in D1Seqs}
+WalEntries == WriteIds \cup NoOpEntries
+
+IsNoOpEntry(entry) == entry \in NoOpEntries
+
+WalEntrySeq(entry) ==
+    IF entry \in WriteIds
+    THEN writeSeq[entry]
+    ELSE entry - MaxWrites - 1
+
+WalEntryTerm(node, entry) ==
+    IF entry \in WriteIds
+    THEN writeTerm[entry]
+    ELSE noopTerm[node][WalEntrySeq(entry)]
+
+SortedNoOpEntries(sequences) ==
+    [ordinal \in 1..Cardinality(sequences) |->
+        NoOpEntry(
+            CHOOSE sequenceNumber \in sequences :
+                Cardinality(
+                    {other \in sequences : other < sequenceNumber})
+                = ordinal - 1)]
 
 SeqNext(writeId) == writeSeq[writeId] + 1
 
@@ -77,6 +102,8 @@ D1TermCollision(node, term, sequenceNumber) ==
     /\ sequenceNumber \in processedSeqs[node]
     /\ processedTerm[node][sequenceNumber] < term
 
+\* ShardManager::raise_copy_fence_blocking persists the term and captured
+\* maximum before a higher-term replica WAL append or primary activation.
 D1ObserveFence(node, term, capturedMaxNext) ==
     /\ node \in Nodes
     /\ term > 0
@@ -100,7 +127,7 @@ D1ObserveFence(node, term, capturedMaxNext) ==
             committed, truncBelow, pins, copyExists, copyAllocation, copyUuid,
             copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
             acked, failed, promotionSafe, admissionSafe, ackMembershipSafe,
-            ApplySafetyVars, termMonotonic, walOrder, processedSeqs,
+            ApplySafetyVars, termMonotonic, walOrder, noopTerm, processedSeqs,
             processedNext, persistedSeqs, persistedNext, maxSeqNext,
             persistedProcessedNext, persistedCommittedNext,
             persistedMaxSeqNext, processedTerm, docSeqNext,
@@ -115,19 +142,31 @@ D1PromotionGaps(node) ==
         /\ seq < maxSeqNext[node]
         /\ seq \notin processedSeqs[node]}
 
+\* TransportService::ensure_primary_activated publishes availability only
+\* after HotEngine::prepare_primary_activation has replayed and closed gaps.
+D1ObserveActivation(node) ==
+    /\ node \in Nodes
+    /\ ~replaying[node]
+    /\ D1PromotionGaps(node) = {}
+    /\ d1FenceTerm[node] >= views[node].term
+    /\ durableReplicaFence[node] >= views[node].term
+    /\ ObserveActivation(node)
+    /\ UNCHANGED D1Vars
+
 D1WalSequences(node) ==
-    {writeSeq[walOrder[node][position]] :
+    {WalEntrySeq(walOrder[node][position]) :
         position \in 1..Len(walOrder[node])}
 
 \* HotEngine::prepare_primary_activation replays the complete local WAL, then
 \* appends and syncs one NoOp for every remaining gap through the local maximum.
-\* NoOps have no client write identity in this model, so their WAL records are
-\* abstracted as durable processed sequence identities rather than walOrder
-\* entries.  The exact-gap and no-local-WAL-entry guards preserve the relevant
-\* sequence uniqueness and replay-before-fill requirements.
+\* NoOps have no client write identity, so synthetic WalEntries carry their
+\* sequence while noopTerm carries their primary term. They are appended to
+\* walOrder, survive restart until truncation, and replay without document
+\* mutation.
 D1FillPromotionNoOps(node, filledSeqs) ==
     LET nextProcessed == processedSeqs[node] \cup filledSeqs
         nextPersisted == persistedSeqs[node] \cup filledSeqs
+        noOpEntries == SortedNoOpEntries(filledSeqs)
     IN
     /\ D1Fixed
     /\ node = routing.primary
@@ -150,6 +189,15 @@ D1FillPromotionNoOps(node, filledSeqs) ==
           [persistedSeqs EXCEPT ![node] = nextPersisted]
     /\ persistedNext' =
           [persistedNext EXCEPT ![node] = ContiguousNext(nextPersisted)]
+    /\ walOrder' =
+          [walOrder EXCEPT ![node] = @ \o noOpEntries]
+    /\ noopTerm' =
+          [noopTerm EXCEPT
+              ![node] =
+                  [seq \in D1Seqs |->
+                      IF seq \in filledSeqs
+                      THEN routing.term
+                      ELSE noopTerm[node][seq]]]
     /\ processedTerm' =
           [processedTerm EXCEPT
               ![node] =
@@ -166,7 +214,7 @@ D1FillPromotionNoOps(node, filledSeqs) ==
             replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, ApplySafetyVars,
-            termMonotonic, walOrder, maxSeqNext, persistedProcessedNext,
+            termMonotonic, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
             fenceMaxSeqNext, docSeqNext, tombstoneSeqNext, tombstoneOld,
             persistedOps, persistedDocValue, persistedDocSeqNext,
@@ -201,6 +249,7 @@ AvailableInSyncCopies ==
 
 D1DataInit ==
     /\ walOrder = [node \in Nodes |-> <<>>]
+    /\ noopTerm = [node \in Nodes |-> [seq \in D1Seqs |-> 0]]
     /\ processedSeqs = [node \in Nodes |-> {}]
     /\ processedNext = [node \in Nodes |-> 0]
     /\ persistedSeqs = [node \in Nodes |-> {}]
@@ -251,7 +300,8 @@ D1Init ==
 
 D1TypeOK ==
     /\ TypeOK
-    /\ walOrder \in [Nodes -> Seq(WriteIds)]
+    /\ walOrder \in [Nodes -> Seq(WalEntries)]
+    /\ noopTerm \in [Nodes -> [D1Seqs -> 0..MaxTerm]]
     /\ processedSeqs \in [Nodes -> SUBSET D1Seqs]
     /\ processedNext \in [Nodes -> 0..MaxWrites]
     /\ persistedSeqs \in [Nodes -> SUBSET D1Seqs]
@@ -301,6 +351,8 @@ D1PrimaryAccept(writeId) ==
             ELSE persistedSeqs[primaryNode]
         doc == writeDoc[writeId]
     IN
+    /\ d1FenceTerm[primaryNode] >= views[primaryNode].term
+    /\ durableReplicaFence[primaryNode] >= views[primaryNode].term
     /\ PrimaryAccept(writeId)
     /\ walOrder' =
           [walOrder EXCEPT ![primaryNode] = Append(@, writeId)]
@@ -337,7 +389,7 @@ D1PrimaryAccept(writeId) ==
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
             tombstonePruneSafe, pruneDone, copyAllocation, copyUuid,
             replicaFence, durableReplicaFence, d1FenceTerm,
-            fenceMaxSeqNext, ApplySafetyVars,
+            fenceMaxSeqNext, noopTerm, ApplySafetyVars,
             PeerRecoveryVars, FaultVars>>
 
 D1ReplicaMessageEnabled(message) ==
@@ -352,6 +404,10 @@ D1ReplicaMessageEnabled(message) ==
     /\ epoch[replica] = message.toEpoch
     /\ epoch[message.from] = message.fromEpoch
     /\ ~BlocksLiveReplication(replica)
+    /\ IF D1Fixed
+          THEN /\ d1FenceTerm[replica] >= message.term
+               /\ durableReplicaFence[replica] >= message.term
+          ELSE TRUE
     /\ ReplicaMessageValid(message)
 
 D1ReplicaMessageBase(message) ==
@@ -435,7 +491,7 @@ D1HistoricalReplicaApply(message) ==
             persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
             tombstonePruneSafe, pruneDone, d1FenceTerm,
-            fenceMaxSeqNext, PeerRecoveryVars, FaultVars>>
+            fenceMaxSeqNext, noopTerm, PeerRecoveryVars, FaultVars>>
 
 \* D1 planner: a previously unprocessed sequence is always retained in the
 \* WAL and checkpoint tracker, but only a per-document newer operation mutates
@@ -530,7 +586,7 @@ D1FixedReplicaProcess(message) ==
             persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
             tombstonePruneSafe, pruneDone, d1FenceTerm,
-            fenceMaxSeqNext, PeerRecoveryVars, FaultVars>>
+            fenceMaxSeqNext, noopTerm, PeerRecoveryVars, FaultVars>>
 
 \* D1 redelivery: acknowledge without a second WAL entry or engine mutation.
 D1FixedReplicaRedelivery(message) ==
@@ -620,6 +676,9 @@ D1InstallRecoverySnapshot(target) ==
     /\ D1Fixed
     /\ InstallSnapshot(target)
     /\ walOrder' = [walOrder EXCEPT ![target] = <<>>]
+    /\ noopTerm' =
+          [noopTerm EXCEPT
+              ![target] = [seq \in D1Seqs |-> 0]]
     /\ processedSeqs' = [processedSeqs EXCEPT ![target] = sequences]
     /\ processedNext' =
           [processedNext EXCEPT ![target] = ContiguousNext(sequences)]
@@ -746,6 +805,7 @@ D1FixedRecoveryApply(target) ==
             persistedTombstoneSeqNext, replaying, replayPos, replayBoundary,
             replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
             tombstonePruneSafe, pruneDone, d1FenceTerm, fenceMaxSeqNext,
+            noopTerm,
             recoveryAttempts, sessionPhase,
             sessionSource, sessionSourceEpoch, sessionTerm,
             sessionAllocation, sessionBoundary, sessionHead, sessionSnapshot,
@@ -788,7 +848,7 @@ D1Redeliver(writeId) ==
             replicaFence, durableReplicaFence, copyMode, installMarker,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
-            walOrder, processedSeqs, processedNext, persistedSeqs,
+            walOrder, noopTerm, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
             fenceMaxSeqNext, processedTerm, docSeqNext,
@@ -829,7 +889,7 @@ D1PersistBoundary(node, boundary, capturedPersisted, capturedMax, capturedOps,
             replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, ApplySafetyVars,
-            termMonotonic, walOrder, processedSeqs, processedNext,
+            termMonotonic, walOrder, noopTerm, processedSeqs, processedNext,
             persistedSeqs, persistedNext, maxSeqNext,
             docSeqNext, tombstoneSeqNext, tombstoneOld, replaying, replayPos,
             replayBoundary, replayComplete, replaySafe, d1FenceTerm,
@@ -865,7 +925,7 @@ D1AgeTombstone ==
     /\ tombstoneOld' =
           [tombstoneOld EXCEPT ![ReplicaNode] = @ \cup {DocX}]
     /\ UNCHANGED
-          <<vars, walOrder, processedSeqs, processedNext, persistedSeqs,
+          <<vars, walOrder, noopTerm, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
             fenceMaxSeqNext, processedTerm, docSeqNext,
@@ -890,7 +950,7 @@ D1PruneTombstone ==
           /\ tombstoneBoundary <= processedNext[ReplicaNode]
     /\ pruneDone' = TRUE
     /\ UNCHANGED
-          <<vars, walOrder, processedSeqs, processedNext, persistedSeqs,
+          <<vars, walOrder, noopTerm, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
             fenceMaxSeqNext, processedTerm, docSeqNext,
@@ -918,7 +978,7 @@ D1CrashReplica ==
             durableReplicaFence, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
-            walOrder, processedSeqs, processedNext, persistedSeqs,
+            walOrder, noopTerm, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
@@ -1001,7 +1061,7 @@ D1RestartCopy(node) ==
             replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, ApplySafetyVars,
-            termMonotonic, walOrder, persistedProcessedNext,
+            termMonotonic, walOrder, noopTerm, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, persistedOps,
             persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaySafe,
@@ -1012,17 +1072,39 @@ D1RestartReplica ==
     /\ crashDone
     /\ D1RestartCopy(ReplicaNode)
 
+\* HotTranslog::open sees no records from deleted generations. The trace does
+\* not emit replay_entry for those records, so one hidden action advances over
+\* a deleted prefix whose entries are all below the durable truncation bound.
+D1SkipTruncatedReplayPrefix(node, nextPosition) ==
+    /\ node \in Nodes
+    /\ replaying[node]
+    /\ replayPos[node] <= Len(walOrder[node])
+    /\ nextPosition \in (replayPos[node] + 1)..(Len(walOrder[node]) + 1)
+    /\ \A position \in replayPos[node]..(nextPosition - 1) :
+           WalEntrySeq(walOrder[node][position]) < truncBelow[node]
+    /\ replayPos' = [replayPos EXCEPT ![node] = nextPosition]
+    /\ UNCHANGED
+          <<vars, walOrder, noopTerm, processedSeqs, processedNext,
+            persistedSeqs, persistedNext, maxSeqNext,
+            persistedProcessedNext, persistedCommittedNext,
+            persistedMaxSeqNext, d1FenceTerm, fenceMaxSeqNext, processedTerm,
+            docSeqNext, tombstoneSeqNext, tombstoneOld, persistedOps,
+            persistedDocValue, persistedDocSeqNext,
+            persistedTombstoneSeqNext, replaying, replayBoundary,
+            replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
+            tombstonePruneSafe, pruneDone>>
+
 D1ReplaySkipAt(node) ==
     LET position == replayPos[node]
-        writeId == walOrder[node][position]
+        entry == walOrder[node][position]
     IN
     /\ node \in Nodes
     /\ replaying[node]
     /\ position <= Len(walOrder[node])
-    /\ writeSeq[writeId] < replayBoundary[node]
+    /\ WalEntrySeq(entry) < replayBoundary[node]
     /\ replayPos' = [replayPos EXCEPT ![node] = @ + 1]
     /\ UNCHANGED
-          <<vars, walOrder, processedSeqs, processedNext, persistedSeqs,
+          <<vars, walOrder, noopTerm, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
@@ -1036,7 +1118,8 @@ D1ReplaySkip ==
 
 D1HistoricalReplayApplyAt(node) ==
     LET position == replayPos[node]
-        writeId == walOrder[node][position]
+        entry == walOrder[node][position]
+        writeId == entry
         sequenceNumber == writeSeq[writeId]
         doc == writeDoc[writeId]
         nextProcessed == processedSeqs[node] \cup {sequenceNumber}
@@ -1046,6 +1129,7 @@ D1HistoricalReplayApplyAt(node) ==
     /\ node \in Nodes
     /\ replaying[node]
     /\ position <= Len(walOrder[node])
+    /\ entry \in WriteIds
     /\ sequenceNumber >= replayBoundary[node]
     /\ ops' = [ops EXCEPT ![node] = @ \cup {writeId}]
     /\ durableOps' =
@@ -1092,7 +1176,7 @@ D1HistoricalReplayApplyAt(node) ==
             copyAllocation, copyUuid, replicaFence, durableReplicaFence,
             copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
             acked, failed, promotionSafe, admissionSafe, ackMembershipSafe,
-            ApplySafetyVars, termMonotonic, walOrder,
+            ApplySafetyVars, termMonotonic, walOrder, noopTerm,
             persistedProcessedNext, persistedCommittedNext,
             persistedMaxSeqNext, persistedOps,
             persistedDocValue, persistedDocSeqNext,
@@ -1106,7 +1190,8 @@ D1HistoricalReplayApply ==
 
 D1FixedReplayApplyAt(node) ==
     LET position == replayPos[node]
-        writeId == walOrder[node][position]
+        entry == walOrder[node][position]
+        writeId == entry
         sequenceNumber == writeSeq[writeId]
         doc == writeDoc[writeId]
         redelivery == sequenceNumber \in processedSeqs[node]
@@ -1118,6 +1203,7 @@ D1FixedReplayApplyAt(node) ==
     /\ node \in Nodes
     /\ replaying[node]
     /\ position <= Len(walOrder[node])
+    /\ entry \in WriteIds
     /\ sequenceNumber >= replayBoundary[node]
     /\ ops' =
           IF redelivery
@@ -1183,7 +1269,7 @@ D1FixedReplayApplyAt(node) ==
             copyAllocation, copyUuid, replicaFence, durableReplicaFence,
             copyMode, installMarker, messages, sharedHolders, exclusiveHolder,
             acked, failed, promotionSafe, admissionSafe, ackMembershipSafe,
-            ApplySafetyVars, termMonotonic, walOrder,
+            ApplySafetyVars, termMonotonic, walOrder, noopTerm,
             persistedProcessedNext, persistedCommittedNext,
             persistedMaxSeqNext, persistedOps,
             persistedDocValue, persistedDocSeqNext,
@@ -1195,13 +1281,67 @@ D1FixedReplayApplyAt(node) ==
 D1FixedReplayApply ==
     D1FixedReplayApplyAt(ReplicaNode)
 
+\* HotEngine::writer_state_with_replay re-applies a retained promotion NoOp
+\* after restart without changing logical document state.
+D1ReplayNoOpAt(node) ==
+    LET position == replayPos[node]
+        entry == walOrder[node][position]
+        sequenceNumber == WalEntrySeq(entry)
+        nextProcessed == processedSeqs[node] \cup {sequenceNumber}
+        nextPersisted == persistedSeqs[node] \cup {sequenceNumber}
+    IN
+    /\ D1Fixed
+    /\ node \in Nodes
+    /\ replaying[node]
+    /\ position <= Len(walOrder[node])
+    /\ IsNoOpEntry(entry)
+    /\ sequenceNumber >= replayBoundary[node]
+    /\ processedSeqs' =
+          [processedSeqs EXCEPT ![node] = nextProcessed]
+    /\ processedNext' =
+          [processedNext EXCEPT
+              ![node] = ContiguousNext(nextProcessed)]
+    /\ persistedSeqs' =
+          [persistedSeqs EXCEPT ![node] = nextPersisted]
+    /\ persistedNext' =
+          [persistedNext EXCEPT
+              ![node] = ContiguousNext(nextPersisted)]
+    /\ nextSeq' =
+          [nextSeq EXCEPT
+              ![node] =
+                  IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ maxSeqNext' =
+          [maxSeqNext EXCEPT
+              ![node] =
+                  IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
+    /\ processedTerm' =
+          [processedTerm EXCEPT
+              ![node][sequenceNumber] = WalEntryTerm(node, entry)]
+    /\ replayPos' = [replayPos EXCEPT ![node] = @ + 1]
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeStatus, writeDoc, writeKind,
+            writeTarget, writePrimary, writeEpoch, writeSeq, writeTerm,
+            writeRequired, writeWait, ops, durableOps, docValue, committed,
+            truncBelow, pins, copyExists, copyAllocation, copyUuid,
+            replicaFence, durableReplicaFence, copyMode, installMarker,
+            messages, sharedHolders, exclusiveHolder, acked, failed,
+            promotionSafe, admissionSafe, ackMembershipSafe, ApplySafetyVars,
+            termMonotonic, walOrder, noopTerm, persistedProcessedNext,
+            persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
+            fenceMaxSeqNext, docSeqNext, tombstoneSeqNext, tombstoneOld,
+            persistedOps, persistedDocValue, persistedDocSeqNext,
+            persistedTombstoneSeqNext, replaying, replayBoundary,
+            replayComplete, replaySafe, commitDone, crashDone, duplicateSent,
+            tombstonePruneSafe, pruneDone, PeerRecoveryVars, FaultVars>>
+
 D1FinishReplayAt(node) ==
     LET boundary == replayBoundary[node]
         covered ==
             \A position \in 1..Len(walOrder[node]) :
-                LET writeId == walOrder[node][position]
-                IN writeSeq[writeId] < boundary
-                   \/ writeSeq[writeId] \in processedSeqs[node]
+                LET entry == walOrder[node][position]
+                IN WalEntrySeq(entry) < boundary
+                   \/ WalEntrySeq(entry) \in processedSeqs[node]
     IN
     /\ node \in Nodes
     /\ replaying[node]
@@ -1211,7 +1351,7 @@ D1FinishReplayAt(node) ==
           [replayComplete EXCEPT ![node] = TRUE]
     /\ replaySafe' = replaySafe /\ covered
     /\ UNCHANGED
-          <<vars, walOrder, processedSeqs, processedNext, persistedSeqs,
+          <<vars, walOrder, noopTerm, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
@@ -1240,6 +1380,7 @@ D1FailReplayAt(node) ==
             replicaFence, durableReplicaFence, messages, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, ApplySafetyVars, termMonotonic, walOrder,
+            noopTerm,
             processedSeqs, processedNext, persistedSeqs, persistedNext,
             maxSeqNext, persistedProcessedNext, persistedCommittedNext,
             persistedMaxSeqNext, docSeqNext,
@@ -1249,6 +1390,8 @@ D1FailReplayAt(node) ==
             commitDone, crashDone, duplicateSent,
             tombstonePruneSafe, pruneDone, PeerRecoveryVars, FaultVars>>
 
+\* HotTranslog truncation advances the durable bound. Generation deletion may
+\* remove every older entry or leave some files for a later cleanup attempt.
 D1RecordTruncation(node, boundary) ==
     /\ node \in Nodes
     /\ boundary <= persistedProcessedNext[node]
@@ -1263,8 +1406,16 @@ D1RecordTruncation(node, boundary) ==
             committed, pins, copyExists, copyAllocation, copyUuid, replicaFence,
             durableReplicaFence, copyMode, installMarker, messages,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
-            admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
-            D1Vars, PeerRecoveryVars, FaultVars>>
+            admissionSafe,             ackMembershipSafe, ApplySafetyVars, termMonotonic, walOrder,
+            noopTerm, processedSeqs, processedNext, persistedSeqs,
+            persistedNext, maxSeqNext, persistedProcessedNext,
+            persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, docSeqNext, tombstoneSeqNext,
+            tombstoneOld, persistedOps, persistedDocValue,
+            persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
+            replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
+            crashDone, duplicateSent, tombstonePruneSafe, pruneDone,
+            PeerRecoveryVars, FaultVars>>
 
 D1ProcessedCheckpointGapAware ==
     \A node \in Nodes :
@@ -1280,8 +1431,8 @@ D1WalHasNoDuplicateSeq ==
     \A node \in Nodes :
       \A first \in 1..Len(walOrder[node]) :
         \A second \in 1..Len(walOrder[node]) :
-            writeSeq[walOrder[node][first]]
-            = writeSeq[walOrder[node][second]]
+            WalEntrySeq(walOrder[node][first])
+            = WalEntrySeq(walOrder[node][second])
             => first = second
 
 \* Retired: a copy may safely contain a newer unacknowledged operation while an
@@ -1463,9 +1614,12 @@ D1ScenarioRestart ==
     D1RestartReplica
 
 D1ReplayNext ==
+    \/ \E nextPosition \in 1..(2 * MaxWrites + 1) :
+           D1SkipTruncatedReplayPrefix(ReplicaNode, nextPosition)
     \/ D1ReplaySkip
     \/ D1HistoricalReplayApply
     \/ D1FixedReplayApply
+    \/ D1ReplayNoOpAt(ReplicaNode)
     \/ D1FinishReplay
 
 D1ScenarioNext ==
@@ -1509,9 +1663,9 @@ D1NoTombstoneCommit ==
 D1TruncateToProcessedCheckpoint ==
     LET boundary == persistedProcessedNext[ReplicaNode]
         retained ==
-            {writeId \in {walOrder[ReplicaNode][position] :
-                            position \in 1..Len(walOrder[ReplicaNode])} :
-                writeSeq[writeId] >= boundary}
+            {entry \in {walOrder[ReplicaNode][position] :
+                          position \in 1..Len(walOrder[ReplicaNode])} :
+                WalEntrySeq(entry) >= boundary}
     IN
     /\ D1Fixed
     /\ commitDone
@@ -1521,7 +1675,7 @@ D1TruncateToProcessedCheckpoint ==
     /\ walOrder' =
           [walOrder EXCEPT
               ![ReplicaNode] =
-                  <<CHOOSE writeId \in retained : TRUE>>]
+                  <<CHOOSE entry \in retained : TRUE>>]
     /\ truncBelow' = [truncBelow EXCEPT ![ReplicaNode] = boundary]
     /\ pruneDone' = TRUE
     /\ UNCHANGED
@@ -1533,7 +1687,7 @@ D1TruncateToProcessedCheckpoint ==
             replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, ApplySafetyVars,
-            termMonotonic, processedSeqs, processedNext, persistedSeqs,
+            termMonotonic, noopTerm, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
@@ -1563,6 +1717,7 @@ D1NoTombstoneCrash ==
             durableReplicaFence, copyMode, installMarker, sharedHolders,
             exclusiveHolder, acked, failed, promotionSafe, admissionSafe,
             ackMembershipSafe, ApplySafetyVars, termMonotonic, walOrder,
+            noopTerm,
             processedSeqs, processedNext, persistedSeqs, persistedNext,
             maxSeqNext, persistedProcessedNext, persistedCommittedNext,
             persistedMaxSeqNext, docSeqNext,
@@ -1642,7 +1797,7 @@ D1RestartWithoutDurableTombstone ==
             replicaFence, durableReplicaFence, copyMode, installMarker,
             messages, sharedHolders, exclusiveHolder, acked, failed,
             promotionSafe, admissionSafe, ackMembershipSafe, ApplySafetyVars,
-            termMonotonic, walOrder, persistedProcessedNext,
+            termMonotonic, walOrder, noopTerm, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, persistedOps,
             persistedDocValue,
             persistedDocSeqNext, persistedTombstoneSeqNext, replaySafe,
@@ -1672,7 +1827,7 @@ D1SendLateOlderIndex ==
             replicaFence, durableReplicaFence, copyMode, installMarker,
             sharedHolders, exclusiveHolder, acked, failed, promotionSafe,
             admissionSafe, ackMembershipSafe, ApplySafetyVars, termMonotonic,
-            walOrder, processedSeqs, processedNext, persistedSeqs,
+            walOrder, noopTerm, processedSeqs, processedNext, persistedSeqs,
             persistedNext, maxSeqNext, persistedProcessedNext,
             persistedCommittedNext, persistedMaxSeqNext, docSeqNext,
             tombstoneSeqNext, tombstoneOld, persistedOps, persistedDocValue,
@@ -1690,7 +1845,7 @@ D1WalTruncatedToBoundary ==
     pruneDone =>
         /\ truncBelow[ReplicaNode] = persistedProcessedNext[ReplicaNode]
         /\ \A position \in 1..Len(walOrder[ReplicaNode]) :
-               writeSeq[walOrder[ReplicaNode][position]]
+               WalEntrySeq(walOrder[ReplicaNode][position])
                >= persistedProcessedNext[ReplicaNode]
 
 D1NoTombstoneNext ==

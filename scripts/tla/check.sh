@@ -113,6 +113,7 @@ default_configs=(
     d1-primary-gap-processed
     d1-promotion-replay-noop
     d1-trace-actions
+    d1-failover-actions
     trace-validator
     two-shard
 )
@@ -177,7 +178,9 @@ d1-primary-gap-max      expected B3NoRecoveryLoop: max-based detector loops
 d1-primary-gap-processed pass: compare replica and primary processed checkpoints
 d1-promotion-replay-noop pass: replay, fill NoOp, activate despite replica gap
 d1-trace-actions        pass: captured commit, truncation, arbitrary restart, failed replay
+d1-failover-actions     pass: durable fence, promotion NoOp, activation, and collision
 trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
+trace-validator-round4  pass: slow restart, truncation, NoOp, and late-message traces
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -209,6 +212,12 @@ run_config() {
     if [[ "$name" == "trace-validator" ]]; then
         echo "=== TLA+ trace-validator (pass) ==="
         TLA2TOOLS_JAR="$JAR" "$ROOT_DIR/scripts/tla/test_trace_validator.sh"
+        return
+    fi
+    if [[ "$name" == "trace-validator-round4" ]]; then
+        echo "=== TLA+ trace-validator-round4 (pass) ==="
+        TLA2TOOLS_JAR="$JAR" \
+            "$ROOT_DIR/scripts/tla/test_trace_validator_round4.sh"
         return
     fi
 
@@ -466,6 +475,11 @@ run_config() {
         d1-trace-actions|MC_D1_TraceActions)
             module="MC_D1_TraceActions.tla"
             cfg="MC_D1_TraceActions.cfg"
+            expected="pass"
+            ;;
+        d1-failover-actions|MC_D1_FailoverActions)
+            module="MC_D1_FailoverActions.tla"
+            cfg="MC_D1_FailoverActions.cfg"
             expected="pass"
             ;;
         two-shard|MC_TwoShardIsolation)

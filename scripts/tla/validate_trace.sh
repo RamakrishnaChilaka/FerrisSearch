@@ -9,9 +9,15 @@ TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 DEFAULT_JAR="${XDG_CACHE_HOME:-$HOME/.cache}/ferrissearch-tla/v${TLA_VERSION}/tla2tools.jar"
 TIMEOUT_SECONDS="${TLA_TRACE_TIMEOUT_SECONDS:-60}"
+INCONCLUSIVE_EXIT=3
 
 usage() {
     echo "Usage: $0 TRACE.jsonl" >&2
+}
+
+inconclusive() {
+    echo "INCONCLUSIVE: $*" >&2
+    exit "$INCONCLUSIVE_EXIT"
 }
 
 if [[ $# -ne 1 ]]; then
@@ -172,8 +178,16 @@ set -e
 
 if [[ $status -eq 124 ]]; then
     cat "$RUN_DIR/tlc.log" >&2
-    echo "Trace validation exceeded ${TIMEOUT_SECONDS}s: $TRACE_PATH" >&2
-    exit 1
+    inconclusive \
+        "trace validation exceeded ${TIMEOUT_SECONDS}s: $TRACE_PATH"
+fi
+
+if [[ $status -eq 137 ]] ||
+    grep -Eiq \
+        'OutOfMemoryError|Java ran out of memory|Java heap space|GC overhead limit exceeded|Could not reserve enough space|Cannot allocate memory|insufficient memory|Too small maximum heap' \
+        "$RUN_DIR/tlc.log"; then
+    cat "$RUN_DIR/tlc.log" >&2
+    inconclusive "trace validation exhausted memory: $TRACE_PATH"
 fi
 
 report_rejection_at_position() {
@@ -217,6 +231,7 @@ PY
 }
 
 generate_diagnostic_dump() {
+    local diagnostic_status
     mkdir -p "$RUN_DIR/diagnostic-states"
     set +e
     (
@@ -234,7 +249,25 @@ generate_diagnostic_dump() {
             -config TraceD1.cfg \
             "$TRACE_MODULE.tla"
     ) >"$RUN_DIR/diagnostic.log" 2>&1
+    diagnostic_status=$?
     set -e
+    if [[ $diagnostic_status -eq 124 ]]; then
+            cat "$RUN_DIR/diagnostic.log" >&2
+            inconclusive \
+                "diagnostic trace search exceeded ${TIMEOUT_SECONDS}s: $TRACE_PATH"
+    fi
+    if [[ $diagnostic_status -eq 137 ]] ||
+            grep -Eiq \
+                'OutOfMemoryError|Java ran out of memory|Java heap space|GC overhead limit exceeded|Could not reserve enough space|Cannot allocate memory|insufficient memory|Too small maximum heap' \
+                "$RUN_DIR/diagnostic.log"; then
+            cat "$RUN_DIR/diagnostic.log" >&2
+            inconclusive \
+                "diagnostic trace search exhausted memory: $TRACE_PATH"
+    fi
+    if [[ $diagnostic_status -ne 0 && $diagnostic_status -ne 12 ]]; then
+            cat "$RUN_DIR/diagnostic.log" >&2
+            inconclusive "diagnostic trace search failed: $TRACE_PATH"
+    fi
 }
 
 if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
@@ -272,5 +305,4 @@ if [[ $status -eq 0 ]] &&
 fi
 
 cat "$RUN_DIR/tlc.log" >&2
-echo "Trace validation failed unexpectedly: $TRACE_PATH" >&2
-exit 1
+inconclusive "TLC failed unexpectedly: $TRACE_PATH"
