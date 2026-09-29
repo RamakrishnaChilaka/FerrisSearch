@@ -25,42 +25,6 @@ if [[ ! -f "$TRACE_PATH" ]]; then
     exit 2
 fi
 
-PROFILE=$(
-    python3 - "$TRACE_PATH" <<'PY'
-import json
-import sys
-with open(sys.argv[1], encoding="utf-8") as handle:
-    print(json.loads(handle.readline()).get("profile", ""))
-PY
-)
-case "$PROFILE" in
-    d1-core)
-        TRACE_MODULE="TraceD1"
-        ACCEPT_INVARIANT="TraceNotAccepted"
-        TYPE_INVARIANT="TraceTypeOK"
-        ;;
-    d1-authority)
-        TRACE_MODULE="TraceD1Authority"
-        ACCEPT_INVARIANT="TraceAuthorityNotAccepted"
-        TYPE_INVARIANT="TraceAuthorityTypeOK"
-        ;;
-    d1-collision)
-        TRACE_MODULE="TraceD1Collision"
-        ACCEPT_INVARIANT="TraceCollisionNotAccepted"
-        TYPE_INVARIANT="TraceCollisionTypeOK"
-        ;;
-    d1-recovery)
-        TRACE_MODULE="TraceD1Recovery"
-        ACCEPT_INVARIANT="TraceRecoveryNotAccepted"
-        TYPE_INVARIANT="TraceRecoveryTypeOK"
-        ;;
-    *)
-        TRACE_MODULE="TraceD1"
-        ACCEPT_INVARIANT="TraceNotAccepted"
-        TYPE_INVARIANT="TraceTypeOK"
-        ;;
-esac
-
 verify_jar() {
     local jar=$1
     local actual
@@ -106,7 +70,8 @@ set +e
 conversion_output=$(
     python3 "$CONVERTER" "$TRACE_PATH" \
         --output "$RUN_DIR/TraceInput.tla" \
-        --config-output "$RUN_DIR/TraceD1.cfg" 2>&1
+        --config-output "$RUN_DIR/TraceD1.cfg" \
+        --profile-output "$RUN_DIR/profile" 2>&1
 )
 conversion_status=$?
 set -e
@@ -133,6 +98,37 @@ PY
     exit 1
 fi
 echo "$conversion_output"
+PROFILE=$(<"$RUN_DIR/profile")
+case "$PROFILE" in
+    d1-core)
+        TRACE_MODULE="TraceD1"
+        ACCEPT_INVARIANT="TraceNotAccepted"
+        TYPE_INVARIANT="TraceTypeOK"
+        SAFETY_INVARIANT="TraceCoreSafety"
+        ;;
+    d1-authority)
+        TRACE_MODULE="TraceD1Authority"
+        ACCEPT_INVARIANT="TraceAuthorityNotAccepted"
+        TYPE_INVARIANT="TraceAuthorityTypeOK"
+        SAFETY_INVARIANT="TraceAuthoritySafety"
+        ;;
+    d1-collision)
+        TRACE_MODULE="TraceD1Collision"
+        ACCEPT_INVARIANT="TraceCollisionNotAccepted"
+        TYPE_INVARIANT="TraceCollisionTypeOK"
+        SAFETY_INVARIANT="TraceCollisionSafety"
+        ;;
+    d1-recovery)
+        TRACE_MODULE="TraceD1Recovery"
+        ACCEPT_INVARIANT="TraceRecoveryNotAccepted"
+        TYPE_INVARIANT="TraceRecoveryTypeOK"
+        SAFETY_INVARIANT="TraceRecoverySafety"
+        ;;
+    *)
+        echo "Converter selected unknown profile: $PROFILE" >&2
+        exit 2
+        ;;
+esac
 cp \
     "$SPEC_DIR/$TRACE_MODULE.tla" \
     "$SPEC_DIR/MC_D1_SeqNoApply.tla" \
@@ -171,25 +167,15 @@ if [[ $status -eq 124 ]]; then
     exit 1
 fi
 
-if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
-    ! grep -Fq "Invariant $TYPE_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
-    echo "Trace accepted by $TRACE_MODULE: $TRACE_PATH"
-    exit 0
-fi
-
-if [[ $status -eq 0 ]] &&
-    ! grep -Fq "Error:" "$RUN_DIR/tlc.log" &&
-    grep -Fq "Model checking completed. No error has been found." "$RUN_DIR/tlc.log"; then
-    max_position=$(
-        sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
-            sort -n |
-            tail -n 1
-    )
-    if [[ -z "$max_position" ]]; then
-        max_position=1
+report_rejection_at_position() {
+    local position=$1
+    local failed_step
+    local failed_event
+    if [[ $position -lt 1 ]]; then
+        position=1
     fi
     failed_step=$(
-        python3 - "$TRACE_PATH" "$max_position" <<'PY'
+        python3 - "$TRACE_PATH" "$position" <<'PY'
 import json
 import sys
 
@@ -219,6 +205,37 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 PY
     )
     echo "Trace rejected at schema step $failed_step (event ${failed_event:-trace_end}): $TRACE_PATH" >&2
+}
+
+if grep -Fq "Invariant $ACCEPT_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
+    ! grep -Fq "Invariant $TYPE_INVARIANT is violated." "$RUN_DIR/tlc.log" &&
+    ! grep -Fq "Invariant $SAFETY_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
+    echo "Trace accepted by $TRACE_MODULE: $TRACE_PATH"
+    exit 0
+fi
+
+if grep -Fq "Invariant $SAFETY_INVARIANT is violated." "$RUN_DIR/tlc.log"; then
+    max_position=$(
+        sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
+            sort -n |
+            tail -n 1
+    )
+    report_rejection_at_position "$(( ${max_position:-2} - 1 ))"
+    exit 1
+fi
+
+if [[ $status -eq 0 ]] &&
+    ! grep -Fq "Error:" "$RUN_DIR/tlc.log" &&
+    grep -Fq "Model checking completed. No error has been found." "$RUN_DIR/tlc.log"; then
+    max_position=$(
+        sed -n 's/.*tracePos = \([0-9][0-9]*\).*/\1/p' "$RUN_DIR/states.dump" |
+            sort -n |
+            tail -n 1
+    )
+    if [[ -z "$max_position" ]]; then
+        max_position=1
+    fi
+    report_rejection_at_position "$max_position"
     exit 1
 fi
 

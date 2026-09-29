@@ -101,23 +101,26 @@ PrimaryWalObservation(event) ==
     /\ UNCHANGED vars
     /\ UNCHANGED observedFenceTerms
 
-PrimaryProcessObservation(event) ==
+PrimaryProcessEvent(event) ==
     /\ event.writeId \in WriteIds
     /\ event.node = writeTarget[event.writeId]
-    /\ CanPrimaryAccept(event.writeId)
     /\ event.outcome = "applied_newer"
-    /\ UNCHANGED vars
-    /\ UNCHANGED observedFenceTerms
-
-PrimaryAcceptEvent(event) ==
-    /\ event.writeId \in WriteIds
     /\ StableReplication(PrimaryAccept(event.writeId))
     /\ writePrimary'[event.writeId] = event.node
     /\ writeSeq'[event.writeId] = event.seq
     /\ writeTerm'[event.writeId] = event.term
-    /\ writeRequired'[event.writeId] = event.required
-    /\ event.required = views[event.node].inSync
     /\ event.writeId \in durableOps'[event.node]
+    /\ UNCHANGED observedFenceTerms
+
+PrimaryReplicationObservation(event) ==
+    /\ event.writeId \in WriteIds
+    /\ writeStatus[event.writeId] = "Replicating"
+    /\ writePrimary[event.writeId] = event.node
+    /\ writeSeq[event.writeId] = event.seq
+    /\ writeTerm[event.writeId] = event.term
+    /\ writeRequired[event.writeId] = event.required
+    /\ event.required = views[event.node].inSync
+    /\ UNCHANGED vars
     /\ UNCHANGED observedFenceTerms
 
 ClientResultEvent(event) ==
@@ -145,9 +148,9 @@ AuthorityEvent(event) ==
       [] event.kind = "client_write_routed" -> ClientWriteEvent(event)
       [] event.kind = "wal_appended" -> PrimaryWalObservation(event)
       [] event.kind = "operation_processed" ->
-            PrimaryProcessObservation(event)
+            PrimaryProcessEvent(event)
       [] event.kind = "primary_replication_started" ->
-            PrimaryAcceptEvent(event)
+            PrimaryReplicationObservation(event)
       [] event.kind = "client_result" -> ClientResultEvent(event)
       [] event.kind = "copy_state" -> CopyStateObservation(event)
       [] OTHER -> FALSE
@@ -201,6 +204,17 @@ TraceAuthorityTypeOK ==
     /\ hiddenSteps \in 0..MaxHiddenSteps
     /\ finished \in BOOLEAN
     /\ observedFenceTerms \in [Nodes -> SUBSET Nat]
+
+TraceAuthoritySafety ==
+    /\ RoutingWellFormed
+    /\ InitializationMonotonic
+    /\ InitializationBeforeAcknowledgement
+    /\ NoAckedLoss
+    /\ PromotionComplete
+    /\ AdmissionComplete
+    /\ NoPartialServe
+    /\ NoApplyBelowObservedFence
+    /\ ActivePrimaryRejectsOldTerm
 
 TraceAuthorityNotAccepted ==
     ~finished

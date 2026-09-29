@@ -24,9 +24,7 @@ def start_record() -> dict[str, object]:
         "step": 0,
         "event": "trace_start",
         "test": "unit",
-        "profile": "d1-core",
         "durability": "request",
-        "max_hidden_steps": 2,
         "nodes": [
             {"node": "p", "incarnation": 0},
             {"node": "r", "incarnation": 0},
@@ -74,6 +72,28 @@ def route_record(step: int = 1) -> dict[str, object]:
         "content_hash": "a" * 64,
     }
 
+def absent_copy_state(step: int = 2) -> dict[str, object]:
+    return {
+        "schema": trace_to_tla.SCHEMA,
+        "run_id": "unit",
+        "step": step,
+        "event": "copy_state",
+        "node": "p",
+        "index_uuid": "idx",
+        "shard": 0,
+        "allocation": 1,
+        "reason": "trace_end",
+        "documents": [
+            {
+                "doc": "d",
+                "state": "absent",
+                "seq_no": None,
+                "term": None,
+                "content_hash": None,
+            }
+        ],
+    }
+
 
 class TraceConverterTests(unittest.TestCase):
     def write_trace(self, records: list[dict[str, object]]) -> Path:
@@ -87,16 +107,18 @@ class TraceConverterTests(unittest.TestCase):
         return path
 
     def test_minimal_prefix_generates_module_and_config(self) -> None:
-        path = self.write_trace([start_record(), route_record(), end_record(2, 2)])
+        path = self.write_trace(
+            [start_record(), route_record(), absent_copy_state(), end_record(3, 3)]
+        )
         trace = trace_to_tla.load_trace(path)
         module, config = trace_to_tla.render(trace)
         self.assertIn("MODULE TraceInput", module)
         self.assertIn("Trace == <<", module)
         self.assertIn("SPECIFICATION TraceSpec", config)
 
-    def test_v1_is_rejected(self) -> None:
+    def test_v2_is_rejected(self) -> None:
         start = start_record()
-        start["schema"] = "ferrissearch.d1.trace/v1"
+        start["schema"] = "ferrissearch.d1.trace/v2"
         path = self.write_trace([start, end_record(1, 1)])
         with self.assertRaisesRegex(trace_to_tla.TraceSchemaError, "unsupported schema"):
             trace_to_tla.load_trace(path)

@@ -1,16 +1,17 @@
 ------------------------ MODULE MC_D1_TermCollision -------------------------
-\* B1 bounded term/sequence collision.  The old primary assigns sequence 11 at
-\* term 1 and only R2 applies it.  R1 is promoted with max_seq_no 10, reuses
-\* sequence 11 at term 2, and acknowledges a different operation.
+\* B1 bounded term/sequence collision at parameterized CollisionSeq.  The old
+\* primary assigns that sequence at term 1 and only R2 applies it.  R1 is
+\* promoted one sequence behind and reuses CollisionSeq at term 2.
 
 EXTENDS Naturals, FiniteSets, TLC
 
-CONSTANTS P, R1, R2, CollisionMode
+CONSTANTS P, R1, R2, CollisionMode, CollisionSeq
 
 Nodes == {P, R1, R2}
 NoOp == "NONE"
-OldOp == "OLD_TERM_1_SEQ_11"
-NewOp == "NEW_TERM_2_SEQ_11"
+OldOp == "OLD_TERM_OPERATION"
+NewOp == "NEW_TERM_OPERATION"
+PriorSeq == CollisionSeq - 1
 
 VARIABLES
     phase,
@@ -36,10 +37,11 @@ B1Init ==
     /\ primary = P
     /\ primaryTerm = 1
     /\ docOp = [node \in Nodes |-> NoOp]
-    /\ docSeq = [node \in Nodes |-> 10]
+    /\ CollisionSeq > 0
+    /\ docSeq = [node \in Nodes |-> PriorSeq]
     /\ docTerm = [node \in Nodes |-> 1]
-    /\ maxSeqNo = [node \in Nodes |-> 10]
-    /\ durableMaxSeqNo = [node \in Nodes |-> 10]
+    /\ maxSeqNo = [node \in Nodes |-> PriorSeq]
+    /\ durableMaxSeqNo = [node \in Nodes |-> PriorSeq]
     /\ fenceTerm = [node \in Nodes |-> 1]
     /\ inSync = {R1, R2}
     /\ newAcknowledged = FALSE
@@ -51,10 +53,10 @@ B1TypeOK ==
     /\ primary \in Nodes
     /\ primaryTerm \in 1..2
     /\ docOp \in [Nodes -> {NoOp, OldOp, NewOp}]
-    /\ docSeq \in [Nodes -> 10..11]
+    /\ docSeq \in [Nodes -> PriorSeq..CollisionSeq]
     /\ docTerm \in [Nodes -> 1..2]
-    /\ maxSeqNo \in [Nodes -> 10..11]
-    /\ durableMaxSeqNo \in [Nodes -> 10..11]
+    /\ maxSeqNo \in [Nodes -> PriorSeq..CollisionSeq]
+    /\ durableMaxSeqNo \in [Nodes -> PriorSeq..CollisionSeq]
     /\ fenceTerm \in [Nodes -> 1..2]
     /\ inSync \subseteq Nodes
     /\ newAcknowledged \in BOOLEAN
@@ -66,18 +68,21 @@ B1TypeOK ==
 B1OldWritePartiallyReplicated ==
     /\ phase = 0
     /\ docOp' = [docOp EXCEPT ![P] = OldOp, ![R2] = OldOp]
-    /\ docSeq' = [docSeq EXCEPT ![P] = 11, ![R2] = 11]
+    /\ docSeq' =
+          [docSeq EXCEPT ![P] = CollisionSeq, ![R2] = CollisionSeq]
     /\ docTerm' = [docTerm EXCEPT ![P] = 1, ![R2] = 1]
-    /\ maxSeqNo' = [maxSeqNo EXCEPT ![P] = 11, ![R2] = 11]
+    /\ maxSeqNo' =
+          [maxSeqNo EXCEPT ![P] = CollisionSeq, ![R2] = CollisionSeq]
     /\ durableMaxSeqNo' =
-          [durableMaxSeqNo EXCEPT ![P] = 11, ![R2] = 11]
+          [durableMaxSeqNo EXCEPT
+              ![P] = CollisionSeq, ![R2] = CollisionSeq]
     /\ phase' = 1
     /\ UNCHANGED
           <<primary, primaryTerm, fenceTerm, inSync, newAcknowledged, failed,
             recovered>>
 
 \* P crashes. R1 is promoted to term 2 and durably records both the fence and
-\* its current max_seq_no (10) before assigning a new sequence.
+\* its current max_seq_no before assigning the collision sequence.
 B1PromoteR1 ==
     /\ phase = 1
     /\ primary' = R1
@@ -91,34 +96,36 @@ B1PromoteR1 ==
           <<docOp, docSeq, docTerm, maxSeqNo, newAcknowledged, failed,
             recovered>>
 
-\* Historical redelivery detection uses sequence only. R2 sees sequence 11 as
+\* Historical redelivery detection uses sequence only. R2 sees CollisionSeq as
 \* processed, acknowledges without applying the term-2 value, and remains
 \* eligible.
 B1SeqOnlyNewWrite ==
     /\ CollisionMode = "SeqOnly"
     /\ phase = 2
     /\ docOp' = [docOp EXCEPT ![R1] = NewOp]
-    /\ docSeq' = [docSeq EXCEPT ![R1] = 11]
+    /\ docSeq' = [docSeq EXCEPT ![R1] = CollisionSeq]
     /\ docTerm' = [docTerm EXCEPT ![R1] = 2]
-    /\ maxSeqNo' = [maxSeqNo EXCEPT ![R1] = 11]
-    /\ durableMaxSeqNo' = [durableMaxSeqNo EXCEPT ![R1] = 11]
+    /\ maxSeqNo' = [maxSeqNo EXCEPT ![R1] = CollisionSeq]
+    /\ durableMaxSeqNo' =
+          [durableMaxSeqNo EXCEPT ![R1] = CollisionSeq]
     /\ fenceTerm' = [fenceTerm EXCEPT ![R2] = 2]
     /\ newAcknowledged' = TRUE
     /\ phase' = 3
     /\ UNCHANGED <<primary, primaryTerm, inSync, failed, recovered>>
 
-\* Fixed D1: raising R2's fence persists max_seq_no 11. A term-2 operation at
+\* Fixed D1: raising R2's fence persists CollisionSeq. A term-2 operation at
 \* that processed sequence is a definitive collision, so R2 fails instead of
 \* returning a false redelivery acknowledgement.
 B1TermAwareNewWrite ==
     /\ CollisionMode = "TermAware"
     /\ phase = 2
     /\ docOp' = [docOp EXCEPT ![R1] = NewOp]
-    /\ docSeq' = [docSeq EXCEPT ![R1] = 11]
+    /\ docSeq' = [docSeq EXCEPT ![R1] = CollisionSeq]
     /\ docTerm' = [docTerm EXCEPT ![R1] = 2]
-    /\ maxSeqNo' = [maxSeqNo EXCEPT ![R1] = 11]
+    /\ maxSeqNo' = [maxSeqNo EXCEPT ![R1] = CollisionSeq]
     /\ durableMaxSeqNo' =
-          [durableMaxSeqNo EXCEPT ![R1] = 11, ![R2] = maxSeqNo[R2]]
+          [durableMaxSeqNo EXCEPT
+              ![R1] = CollisionSeq, ![R2] = maxSeqNo[R2]]
     /\ fenceTerm' = [fenceTerm EXCEPT ![R2] = 2]
     /\ inSync' = {}
     /\ failed' = {R2}
@@ -141,10 +148,11 @@ B1RecoverR2 ==
     /\ phase = 3
     /\ R2 \in failed
     /\ docOp' = [docOp EXCEPT ![R2] = NewOp]
-    /\ docSeq' = [docSeq EXCEPT ![R2] = 11]
+    /\ docSeq' = [docSeq EXCEPT ![R2] = CollisionSeq]
     /\ docTerm' = [docTerm EXCEPT ![R2] = 2]
-    /\ maxSeqNo' = [maxSeqNo EXCEPT ![R2] = 11]
-    /\ durableMaxSeqNo' = [durableMaxSeqNo EXCEPT ![R2] = 11]
+    /\ maxSeqNo' = [maxSeqNo EXCEPT ![R2] = CollisionSeq]
+    /\ durableMaxSeqNo' =
+          [durableMaxSeqNo EXCEPT ![R2] = CollisionSeq]
     /\ fenceTerm' = [fenceTerm EXCEPT ![R2] = 2]
     /\ inSync' = {R2}
     /\ failed' = {}
@@ -179,7 +187,7 @@ B1CollisionFailsClosed ==
     CollisionMode = "TermAware" =>
         (phase >= 3 =>
             /\ fenceTerm[R2] = 2
-            /\ durableMaxSeqNo[R2] = 11
+            /\ durableMaxSeqNo[R2] = CollisionSeq
             /\ \/ R2 \in failed
                \/ docOp[R2] = NewOp)
 

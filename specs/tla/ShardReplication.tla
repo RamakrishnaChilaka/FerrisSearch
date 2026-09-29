@@ -177,7 +177,9 @@ ActiveWrites ==
         writeStatus[w] \in {"Routed", "Replicating"}}
 
 MaxConcurrentClientWrites ==
-    IF FaultMode \in {"D1Historical", "D1Fixed"} THEN 3 ELSE 1
+    IF FaultMode \in {"D1Historical", "D1Fixed", "D1Async"}
+    THEN MaxWrites
+    ELSE 1
 
 WriteMessages(writeId) ==
     {m \in messages : m.write = writeId}

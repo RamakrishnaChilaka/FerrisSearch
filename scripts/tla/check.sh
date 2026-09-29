@@ -112,6 +112,7 @@ default_configs=(
     d1-primary-gap-max
     d1-primary-gap-processed
     d1-promotion-replay-noop
+    d1-trace-actions
     trace-validator
     two-shard
 )
@@ -175,6 +176,7 @@ d1-term-collision-restart-identity pass: identity restores fence collision max
 d1-primary-gap-max      expected B3NoRecoveryLoop: max-based detector loops
 d1-primary-gap-processed pass: compare replica and primary processed checkpoints
 d1-promotion-replay-noop pass: replay, fill NoOp, activate despite replica gap
+d1-trace-actions        pass: captured commit, truncation, arbitrary restart, failed replay
 trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
@@ -459,6 +461,11 @@ run_config() {
         d1-promotion-replay-noop|MC_D1_PromotionReplayNoOp)
             module="MC_D1_PromotionReplayNoOp.tla"
             cfg="MC_D1_PromotionReplayNoOp.cfg"
+            expected="pass"
+            ;;
+        d1-trace-actions|MC_D1_TraceActions)
+            module="MC_D1_TraceActions.tla"
+            cfg="MC_D1_TraceActions.cfg"
             expected="pass"
             ;;
         two-shard|MC_TwoShardIsolation)

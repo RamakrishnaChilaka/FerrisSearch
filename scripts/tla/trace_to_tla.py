@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate schema-v2 D1 JSONL and generate TLC trace inputs."""
+"""Validate schema-v3 D1 JSONL and generate TLC trace inputs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "ferrissearch.d1.trace/v2"
+SCHEMA = "ferrissearch.d1.trace/v3"
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 START_FIELDS = {
@@ -21,9 +21,7 @@ START_FIELDS = {
     "step",
     "event",
     "test",
-    "profile",
     "durability",
-    "max_hidden_steps",
     "nodes",
     "shard_state",
 }
@@ -112,6 +110,7 @@ EVENT_FIELDS = {
         "receipt_id",
         "replica",
         "outcome",
+        "persisted_checkpoint",
     },
     "client_result": {
         "node",
@@ -308,6 +307,7 @@ class LoadedTrace:
     end: dict[str, Any]
     request_ids: dict[str, int]
     identities: dict[tuple[int, int], dict[str, Any]]
+    profile: str
 
 
 def fail(line: int, message: str) -> None:
@@ -380,19 +380,11 @@ def validate_start(value: dict[str, Any], line: int) -> dict[str, Any]:
     if integer(value["step"], line, "step") != 0 or value["event"] != "trace_start":
         fail(line, "first record must be trace_start at step 0")
     string(value["test"], line, "test")
-    if value["profile"] not in {
-        "d1-core",
-        "d1-authority",
-        "d1-collision",
-        "d1-recovery",
-    }:
-        fail(line, "profile is invalid")
     if value["durability"] not in {"request", "async"}:
         fail(line, "durability must be request or async")
-    integer(value["max_hidden_steps"], line, "max_hidden_steps")
     nodes = value["nodes"]
     if not isinstance(nodes, list) or len(nodes) < 2 or len(nodes) > 3:
-        fail(line, "trace profiles support two or three nodes")
+        fail(line, "trace validation supports two or three nodes")
     seen: set[str] = set()
     for item in nodes:
         if not isinstance(item, dict):
@@ -427,9 +419,9 @@ def validate_start(value: dict[str, Any], line: int) -> dict[str, Any]:
     if primary not in seen:
         fail(line, "primary is not declared")
     if integer(shard["term"], line, "term", positive=True) != 1:
-        fail(line, "d1-core starts at term 1")
+        fail(line, "trace validation currently starts at term 1")
     if not boolean(shard["activated"], line, "activated"):
-        fail(line, "d1-core starts with an activated primary")
+        fail(line, "trace validation starts with an activated primary")
     if (
         not isinstance(shard["in_sync"], list)
         or not set(shard["in_sync"]).issubset(seen - {primary})
@@ -449,9 +441,9 @@ def validate_start(value: dict[str, Any], line: int) -> dict[str, Any]:
         copy_nodes.add(node)
         integer(copy["allocation"], line, "allocation", positive=True)
         if not boolean(copy["exists"], line, "exists"):
-            fail(line, "d1-core starts with both copies present")
+            fail(line, "trace validation starts with every declared copy present")
         if integer(copy["fence_term"], line, "fence_term") != 1:
-            fail(line, "d1-core copies start fenced at term 1")
+            fail(line, "trace validation copies start fenced at term 1")
     return value
 
 
@@ -571,6 +563,12 @@ def validate_event(
             fail(line, "replica is not declared")
         if value["outcome"] not in {"acknowledged", "failed"}:
             fail(line, "replica_result outcome is invalid")
+        integer(
+            value["persisted_checkpoint"],
+            line,
+            "persisted_checkpoint",
+            nullable=True,
+        )
     elif event == "client_result":
         if value["outcome"] not in {"acknowledged", "failed"}:
             fail(line, "client_result outcome is invalid")
@@ -620,7 +618,12 @@ def validate_event(
         if value["outcome"] not in {"completed", "failed"}:
             fail(line, "replay_finished outcome is invalid")
     elif event == "copy_state":
-        if value["reason"] not in {"quiescent", "replay", "admission"}:
+        if value["reason"] not in {
+            "quiescent",
+            "replay",
+            "admission",
+            "trace_end",
+        }:
             fail(line, "copy_state reason is invalid")
         if not isinstance(value["documents"], list):
             fail(line, "copy_state.documents must be an array")
@@ -736,10 +739,29 @@ def load_trace(path: Path) -> LoadedTrace:
         validate_event(record, line, start, line - 1)
         for line, record in enumerate(records[1:-1], 2)
     ]
+    kinds = {event["event"] for event in events}
+    if kinds & {
+        "recovery_snapshot",
+        "recovery_started",
+        "recovery_installed",
+        "recovery_barrier",
+        "recovery_membership",
+    }:
+        profile = "d1-recovery"
+    elif "in_sync_removed" in kinds or any(
+        event["event"] == "operation_processed"
+        and event.get("outcome") == "collision"
+        for event in events
+    ):
+        profile = "d1-collision"
+    elif kinds & {"routing_promoted", "primary_activated"}:
+        profile = "d1-authority"
+    else:
+        profile = "d1-core"
     end = records[-1]
     exact_fields(end, END_FIELDS, len(records))
     if end["schema"] != SCHEMA:
-        fail(len(records), "trace_end schema does not match v2")
+        fail(len(records), "trace_end schema does not match v3")
     if end["run_id"] != start["run_id"]:
         fail(len(records), "trace_end run_id does not match")
     if integer(end["step"], len(records), "step") != len(records) - 1:
@@ -805,8 +827,6 @@ def load_trace(path: Path) -> LoadedTrace:
             if request in request_ids:
                 fail(event["step"] + 1, f"request_id {request!r} was reused")
             request_ids[request] = len(request_ids) + 1
-            if len(request_ids) > 3:
-                fail(event["step"] + 1, "d1-core supports at most three writes")
             routed[request] = event
             acked_by_request[request] = set()
         elif kind == "wal_appended":
@@ -965,7 +985,7 @@ def load_trace(path: Path) -> LoadedTrace:
         elif kind == "routing_promoted":
             current_primary = event["new_primary"]
             available = set(event["in_sync"])
-            if start["profile"] == "d1-collision":
+            if profile == "d1-collision":
                 available.add(current_primary)
         elif kind == "primary_activated":
             available.add(event["node"])
@@ -978,9 +998,9 @@ def load_trace(path: Path) -> LoadedTrace:
                 current_primary = event["target_node"]
                 available.add(event["target_node"])
 
+    if last_copy_state != (events[-1]["step"] if events else -1):
+        fail(len(records), "trace must end with copy_state")
     if end["quiescent"]:
-        if last_copy_state != (events[-1]["step"] if events else -1):
-            fail(len(records), "quiescent trace must end with copy_state")
         if replay_active:
             fail(len(records), "quiescent trace has unfinished replay")
         missing_states = sorted(
@@ -994,7 +1014,7 @@ def load_trace(path: Path) -> LoadedTrace:
                 "quiescent trace lacks final copy_state for available node(s): "
                 + ", ".join(missing_states),
             )
-    return LoadedTrace(start, events, end, request_ids, identities)
+    return LoadedTrace(start, events, end, request_ids, identities, profile)
 
 
 def token_map(values: list[str], prefix: str) -> dict[str, str]:
@@ -1048,6 +1068,29 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
         item["node"]: item["allocation"]
         for item in trace.start["shard_state"]["copies"]
     }
+    allocation_values: dict[str, dict[int, int]] = {
+        raw: {allocation[raw]: 1} for raw in nodes_raw
+    }
+
+    def register_allocation(raw_node: str | None, raw_value: int | None) -> None:
+        if raw_node is None or raw_value is None or raw_value == 0:
+            return
+        values = allocation_values[raw_node]
+        if raw_value not in values:
+            values[raw_value] = len(values) + 1
+
+    for event in trace.events:
+        register_allocation(event.get("node"), event.get("allocation"))
+        register_allocation(event.get("removed_node"), event.get("removed_allocation"))
+        for replica in event.get("required_replicas", []):
+            register_allocation(replica["node"], replica["allocation"])
+        for assigned in event.get("allocations", []):
+            register_allocation(assigned["node"], assigned["allocation"])
+
+    def abstract_allocation(raw_node: str | None, raw_value: int | None) -> int:
+        if raw_node is None or raw_value is None or raw_value == 0:
+            return 0
+        return allocation_values[raw_node][raw_value]
 
     identity_to_write: dict[tuple[int, int], int] = {}
     for event in trace.events:
@@ -1172,7 +1215,7 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "seq": str(event.get("seq_no", 0)),
             "term": str(event.get("term", 0)),
             "allocation": str(
-                1 if event_node in allocation else 0
+                abstract_allocation(event_node, event.get("allocation"))
             ),
             "required": tla_set(required),
             "processedNext": str(cp_next(checkpoints_value["processed"])),
@@ -1197,7 +1240,7 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
                 "viewNode",
                 {
                     node[item["node"]]: str(
-                        0 if item["allocation"] == 0 else 1
+                        abstract_allocation(item["node"], item["allocation"])
                     )
                     for item in event.get("allocations", [])
                 },
@@ -1223,6 +1266,9 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "snapshotDocValue": function(
                 "TraceDocs", "doc", snapshot_doc_value, "0"
             ),
+            "resultPersistedNext": str(
+                cp_next(event.get("persisted_checkpoint"))
+            ),
         }
         body = ",\n      ".join(f"{key} |-> {value}" for key, value in fields.items())
         trace_records.append("    [" + body + "]")
@@ -1230,19 +1276,75 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
     trace_body = (
         "<<>>" if not trace_records else "<<\n" + ",\n".join(trace_records) + "\n>>"
     )
+    max_writes = max(1, len(requests))
+    max_term = max(
+        [trace.start["shard_state"]["term"]]
+        + [
+            value
+            for event in trace.events
+            for value in (
+                event.get("term"),
+                event.get("primary_term"),
+            )
+            if isinstance(value, int)
+        ]
+        + [
+            document["term"]
+            for event in trace.events
+            for document in event.get("documents", [])
+            if isinstance(document.get("term"), int)
+        ]
+    )
+    max_crashes = sum(
+        event["event"] == "node_crashed" for event in trace.events
+    )
+    max_recoveries = sum(
+        event["event"] == "recovery_snapshot" for event in trace.events
+    )
+    max_allocations = max(
+        value
+        for values in allocation_values.values()
+        for value in values.values()
+    )
+    raft_events = sum(
+        event["event"]
+        in {
+            "routing_promoted",
+            "in_sync_removed",
+            "primary_activated",
+            "recovery_membership",
+        }
+        for event in trace.events
+    )
+    max_raft_entries = max(raft_events + 1, 1)
+    max_messages = max(6, max_writes * max(1, len(nodes_raw) - 1) * 2)
+    max_view_lag = max(max_raft_entries, 2)
+    validator_hidden_steps = {
+        "d1-core": 6,
+        "d1-authority": 10,
+        "d1-collision": 2,
+        "d1-recovery": 10,
+    }[trace.profile]
+    d1_fault_mode = (
+        "D1Fixed" if trace.start["durability"] == "request" else "D1Async"
+    )
+
     module = f"""---------------------------- MODULE TraceInput ----------------------------
 EXTENDS Naturals, Sequences, FiniteSets
 
-MaxHiddenSteps == {trace.start["max_hidden_steps"]}
+MaxHiddenSteps == {validator_hidden_steps}
 RequestDurability == {"TRUE" if trace.start["durability"] == "request" else "FALSE"}
 TraceNodes == {tla_set([node[item] for item in nodes_raw])}
 TraceDocs == {tla_set([doc[item] for item in docs_raw])}
+TraceInitialPrimary == {node[primary_raw]}
+TraceInitialInSync == {tla_set([node[item] for item in trace.start["shard_state"]["in_sync"]])}
+TraceQuiescent == {"TRUE" if trace.end["quiescent"] else "FALSE"}
 Trace == {trace_body}
 
 =============================================================================
 """
-    max_writes = 3
-    profile = trace.start["profile"]
+
+    profile = trace.profile
     if profile == "d1-recovery":
         initial_out_of_sync = (
             len(nodes_raw) - 1
@@ -1252,14 +1354,14 @@ Trace == {trace_body}
     Nodes = {tla_set([node[item] for item in nodes_raw])}
     Docs = {tla_set([doc[item] for item in docs_raw])}
     MaxWrites = {max_writes}
-    MaxCrashes = 0
+    MaxCrashes = {max_crashes}
     MaxPartitions = 0
-    MaxRecoveries = 1
-    MaxTerm = 2
-    MaxMessages = {max(6, max_writes * 2)}
-    MaxViewLag = 4
-    MaxAllocationId = 2
-    MaxRaftEntries = 2
+    MaxRecoveries = {max(1, max_recoveries)}
+    MaxTerm = {max_term}
+    MaxMessages = {max_messages}
+    MaxViewLag = {max_view_lag}
+    MaxAllocationId = {max_allocations}
+    MaxRaftEntries = {max_raft_entries}
     MaxPendingRaft = 2
     FaultMode = "D1Fixed"
     InitialOutOfSync = {"TRUE" if initial_out_of_sync else "FALSE"}
@@ -1271,10 +1373,15 @@ Trace == {trace_body}
     AllowedWriteKinds = {{"Put", "Delete"}}
     EnableRecoveryFailures = FALSE
     RestorePendingOnRestart = TRUE
+    PrimaryNode = {node[primary_raw]}
+    ReplicaNode = {node[replica_raw]}
+    DocX = {doc[docs_raw[0]]}
+    DocY = {doc[docs_raw[1]]}
 
 SPECIFICATION TraceRecoverySpec
 
 INVARIANT TraceRecoveryTypeOK
+INVARIANT TraceRecoverySafety
 INVARIANT TraceRecoveryNotAccepted
 """
     elif profile == "d1-collision":
@@ -1285,10 +1392,15 @@ INVARIANT TraceRecoveryNotAccepted
     R1 = {node[trace.start["shard_state"]["in_sync"][0]]}
     R2 = {node[trace.start["shard_state"]["in_sync"][1]]}
     CollisionMode = "TermAware"
+    CollisionSeq = {max(
+        event.get("seq_no", 0)
+        for event in trace.events
+    )}
 
 SPECIFICATION TraceCollisionSpec
 
 INVARIANT TraceCollisionTypeOK
+INVARIANT TraceCollisionSafety
 INVARIANT TraceCollisionNotAccepted
 """
     elif profile == "d1-authority":
@@ -1300,14 +1412,14 @@ INVARIANT TraceCollisionNotAccepted
     Nodes = {tla_set([node[item] for item in nodes_raw])}
     Docs = {tla_set([doc[item] for item in docs_raw])}
     MaxWrites = {max_writes}
-    MaxCrashes = 1
+    MaxCrashes = {max(1, max_crashes)}
     MaxPartitions = 1
     MaxRecoveries = 0
-    MaxTerm = 4
-    MaxMessages = {max(6, max_writes * 2)}
-    MaxViewLag = 4
-    MaxAllocationId = 2
-    MaxRaftEntries = 4
+    MaxTerm = {max_term}
+    MaxMessages = {max_messages}
+    MaxViewLag = {max_view_lag}
+    MaxAllocationId = {max_allocations}
+    MaxRaftEntries = {max_raft_entries}
     MaxPendingRaft = 2
     FaultMode = "C2"
     InitialOutOfSync = {"TRUE" if initial_out_of_sync else "FALSE"}
@@ -1323,6 +1435,7 @@ INVARIANT TraceCollisionNotAccepted
 SPECIFICATION TraceAuthoritySpec
 
 INVARIANT TraceAuthorityTypeOK
+INVARIANT TraceAuthoritySafety
 INVARIANT TraceAuthorityNotAccepted
 """
     else:
@@ -1330,17 +1443,17 @@ INVARIANT TraceAuthorityNotAccepted
     Nodes = {tla_set([node[item] for item in nodes_raw])}
     Docs = {tla_set([doc[item] for item in docs_raw])}
     MaxWrites = {max_writes}
-    MaxCrashes = 0
+    MaxCrashes = {max_crashes}
     MaxPartitions = 0
     MaxRecoveries = 0
-    MaxTerm = 2
-    MaxMessages = {max(6, max_writes * 2)}
-    MaxViewLag = 2
-    MaxAllocationId = 2
-    MaxRaftEntries = 0
+    MaxTerm = {max_term}
+    MaxMessages = {max_messages}
+    MaxViewLag = {max_view_lag}
+    MaxAllocationId = {max_allocations}
+    MaxRaftEntries = {max_raft_entries}
     MaxPendingRaft = 0
-    FaultMode = "D1Fixed"
-    InitialOutOfSync = FALSE
+    FaultMode = "{d1_fault_mode}"
+    InitialOutOfSync = {"TRUE" if len(trace.start["shard_state"]["in_sync"]) != len(nodes_raw) - 1 else "FALSE"}
     InitialInitialized = TRUE
     EnableRecovery = FALSE
     AllocationIds = TRUE
@@ -1357,16 +1470,24 @@ INVARIANT TraceAuthorityNotAccepted
 SPECIFICATION TraceSpec
 
 INVARIANT TraceTypeOK
+INVARIANT TraceCoreSafety
 INVARIANT TraceNotAccepted
 """
     return module, config
 
 
-def convert(trace_path: Path, module_path: Path, config_path: Path) -> LoadedTrace:
+def convert(
+    trace_path: Path,
+    module_path: Path,
+    config_path: Path,
+    profile_path: Path | None = None,
+) -> LoadedTrace:
     trace = load_trace(trace_path)
     module, config = render(trace)
     module_path.write_text(module, encoding="utf-8")
     config_path.write_text(config, encoding="utf-8")
+    if profile_path is not None:
+        profile_path.write_text(trace.profile + "\n", encoding="utf-8")
     return trace
 
 
@@ -1375,13 +1496,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("trace", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config-output", type=Path, required=True)
+    parser.add_argument("--profile-output", type=Path)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        trace = convert(args.trace, args.output, args.config_output)
+        trace = convert(
+            args.trace,
+            args.output,
+            args.config_output,
+            args.profile_output,
+        )
     except (OSError, TraceSchemaError) as error:
         print(f"trace conversion failed: {error}", file=sys.stderr)
         return 2
-    print(f"converted {len(trace.events)} schema-v2 events")
+    print(f"converted {len(trace.events)} schema-v3 events")
     return 0
 
 

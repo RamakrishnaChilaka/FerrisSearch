@@ -21,14 +21,14 @@ TraceCollisionInit ==
     /\ observedFenceTerms = [node \in Nodes |-> {1}]
 
 WalObservation(event) ==
-    /\ event.seq = 11
+    /\ event.seq = CollisionSeq
     /\ event.term = 1
     /\ event.node = R2
     /\ UNCHANGED vars
     /\ UNCHANGED observedFenceTerms
 
 OldApplyEvent(event) ==
-    /\ event.seq = 11
+    /\ event.seq = CollisionSeq
     /\ event.term = 1
     /\ event.node = R2
     /\ event.outcome = "applied_newer"
@@ -51,7 +51,7 @@ FenceObservation(event) ==
 CollisionEvent(event) ==
     /\ event.node = R2
     /\ event.term = 2
-    /\ event.seq = 11
+    /\ event.seq = CollisionSeq
     /\ event.term \in observedFenceTerms[R2]
     /\ event.outcome = "collision"
     /\ B1TermAwareNewWrite
@@ -61,6 +61,13 @@ InSyncRemovalObservation(event) ==
     /\ event.removedNode = R2
     /\ R2 \notin inSync
     /\ R2 \in failed
+    /\ UNCHANGED vars
+    /\ UNCHANGED observedFenceTerms
+
+RoutingViewObservation(event) ==
+    /\ event.viewPrimary = primary
+    /\ event.viewTerm = primaryTerm
+    /\ event.viewInSync = inSync
     /\ UNCHANGED vars
     /\ UNCHANGED observedFenceTerms
 
@@ -82,6 +89,8 @@ CollisionTraceEvent(event) ==
       [] event.kind = "in_sync_removed" ->
             InSyncRemovalObservation(event)
       [] event.kind = "copy_state" -> CopyStateObservation(event)
+      [] event.kind = "routing_view" ->
+            RoutingViewObservation(event)
       [] OTHER -> FALSE
 
 ConsumeCollisionEvent ==
@@ -111,6 +120,10 @@ TraceCollisionTypeOK ==
     /\ tracePos \in 1..(Len(Trace) + 1)
     /\ finished \in BOOLEAN
     /\ observedFenceTerms \in [Nodes -> SUBSET Nat]
+
+TraceCollisionSafety ==
+    /\ B1CollisionFailsClosed
+    /\ B1RecoveredBeforePromotion
 
 TraceCollisionNotAccepted ==
     ~finished

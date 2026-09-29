@@ -2,61 +2,67 @@
 \* Exact composition for source snapshot, target install, ordered catch-up,
 \* finalize barrier, admission, and observed target document state.
 
-EXTENDS Invariants, TraceInput
+EXTENDS MC_D1_SeqNoApply, TraceInput
 
 VARIABLES
     tracePos,
     hiddenSteps,
-    finished
+    finished,
+    replicaResponsePersisted
 
-TraceRecoveryVars == <<tracePos, hiddenSteps, finished>>
-traceRecoveryVars == <<vars, TraceRecoveryVars>>
+TraceRecoveryVars ==
+    <<tracePos, hiddenSteps, finished, replicaResponsePersisted>>
+traceRecoveryVars == <<d1vars, TraceRecoveryVars>>
 
 TraceRecoveryInit ==
     /\ Init
+    /\ D1DataInit
+    /\ routing.primary = TraceInitialPrimary
+    /\ routing.inSync = TraceInitialInSync
+    /\ raftLeader = TraceInitialPrimary
     /\ tracePos = 1
     /\ hiddenSteps = 0
     /\ finished = FALSE
+    /\ replicaResponsePersisted = [writeId \in WriteIds |-> 0]
 
 StableReplication(action) ==
     /\ action
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            ApplySafetyVars, PeerRecoveryVars, FaultVars>>
+            ApplySafetyVars, PeerRecoveryVars, FaultVars, D1Vars>>
 
 FenceChangingReplication(action) ==
     /\ action
     /\ UNCHANGED
-          <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars>>
+          <<copyAllocation, copyUuid, PeerRecoveryVars, FaultVars, D1Vars>>
 
 RecoveryAction(action) ==
     /\ action
-    /\ UNCHANGED <<ApplySafetyVars, FaultVars>>
+    /\ UNCHANGED <<ApplySafetyVars, FaultVars, D1Vars>>
 
 RecoveryStable(action) ==
     /\ action
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
             sessionAllocation, pendingAllocation, ApplySafetyVars,
-            FaultVars>>
+            FaultVars, D1Vars>>
 
 RecoveryInstall(action) ==
     /\ action
     /\ UNCHANGED
-          <<sessionAllocation, pendingAllocation, ApplySafetyVars,
-            FaultVars>>
+          <<sessionAllocation, pendingAllocation, ApplySafetyVars, FaultVars>>
 
 RecoveryTargetComplete(action) ==
     /\ action
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            sessionAllocation, ApplySafetyVars, FaultVars>>
+            sessionAllocation, ApplySafetyVars, FaultVars, D1Vars>>
 
 RecoveryObserveAdmission(action) ==
     /\ action
     /\ UNCHANGED
           <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
-            pendingAllocation, ApplySafetyVars, FaultVars>>
+            pendingAllocation, ApplySafetyVars, FaultVars, D1Vars>>
 
 MessageFor(writeId, replica) ==
     CHOOSE message \in messages :
@@ -84,6 +90,7 @@ HasAck(writeId, replica) ==
 
 CopyStateMatches(node, event) ==
     /\ docValue[node] = event.docValue
+    /\ docSeqNext[node] = event.docSeqNext
     /\ \A doc \in Docs :
            LET writeId == event.docValue[doc]
            IN IF writeId = NoWrite
@@ -91,37 +98,47 @@ CopyStateMatches(node, event) ==
               ELSE /\ writeSeq[writeId] = event.docSeqNext[doc] - 1
                    /\ writeTerm[writeId] = event.docTerm[doc]
 
+ViewMatches(view, event) ==
+    /\ view.primary = event.viewPrimary
+    /\ view.term = event.viewTerm
+    /\ view.inSync = event.viewInSync
+    /\ view.allocations = event.viewAllocations
+    /\ view.initialized = event.initialized
+
 ClientWriteEvent(event) ==
     /\ event.writeId = nextWrite
-    /\ StableReplication(
-           ClientWrite(event.node, event.doc, event.writeKind))
+    /\ D1ClientWriteFrom(event.node, event.doc, event.writeKind)
     /\ writeTarget'[event.writeId] = event.peer
 
 PrimaryWalObservation(event) ==
     /\ event.writeId \in WriteIds
     /\ CanPrimaryAccept(event.writeId)
     /\ IF RequestDurability THEN event.durable ELSE TRUE
-    /\ UNCHANGED vars
+    /\ UNCHANGED d1vars
 
-PrimaryProcessObservation(event) ==
+PrimaryProcessEvent(event) ==
     /\ event.writeId \in WriteIds
-    /\ CanPrimaryAccept(event.writeId)
     /\ event.outcome = "applied_newer"
-    /\ UNCHANGED vars
-
-PrimaryAcceptEvent(event) ==
-    /\ event.writeId \in WriteIds
-    /\ StableReplication(PrimaryAccept(event.writeId))
+    /\ D1PrimaryAccept(event.writeId)
     /\ writeSeq'[event.writeId] = event.seq
     /\ writeTerm'[event.writeId] = event.term
-    /\ writeRequired'[event.writeId] = event.required
+    /\ processedNext'[event.node] = event.processedNext
+    /\ persistedNext'[event.node] = event.persistedNext
+    /\ maxSeqNext'[event.node] = event.maxNext
+
+PrimaryReplicationObservation(event) ==
+    /\ event.writeId \in WriteIds
+    /\ writeStatus[event.writeId] = "Replicating"
+    /\ writeSeq[event.writeId] = event.seq
+    /\ writeTerm[event.writeId] = event.term
+    /\ writeRequired[event.writeId] = event.required
     /\ event.required = views[event.node].inSync
-    /\ event.writeId \in durableOps'[event.node]
+    /\ UNCHANGED d1vars
 
 ReplicaReceiveObservation(event) ==
     /\ event.writeId \in WriteIds
     /\ HasMessage(event.writeId, event.node)
-    /\ UNCHANGED vars
+    /\ UNCHANGED d1vars
 
 ReplicaWalObservation(event) ==
     /\ event.writeId \in WriteIds
@@ -130,25 +147,39 @@ ReplicaWalObservation(event) ==
        IN /\ ReplicaMessageValid(message)
           /\ message.term >= durableReplicaFence[event.node]
     /\ IF RequestDurability THEN event.durable ELSE TRUE
-    /\ UNCHANGED vars
+    /\ UNCHANGED d1vars
 
 ReplicaApplyEvent(event) ==
     /\ event.writeId \in WriteIds
     /\ HasMessage(event.writeId, event.node)
-    /\ event.outcome = "applied_newer"
-    /\ FenceChangingReplication(
-           ReplicaApply(MessageFor(event.writeId, event.node)))
-    /\ docValue'[event.node][event.doc] = event.writeId
+    /\ LET message == MessageFor(event.writeId, event.node)
+           beforeDoc == docValue[event.node][event.doc]
+       IN CASE event.outcome = "redelivery" ->
+                    D1FixedReplicaRedelivery(message)
+            [] event.outcome \in {"applied_newer", "stale", "noop"} ->
+                    /\ D1FixedReplicaProcess(message)
+                    /\ IF event.outcome = "applied_newer"
+                          THEN docValue'[event.node][event.doc] = event.writeId
+                          ELSE IF event.outcome = "stale"
+                               THEN docValue'[event.node][event.doc] = beforeDoc
+                               ELSE TRUE
+            [] OTHER -> FALSE
     /\ event.writeId \in durableOps'[event.node]
+    /\ replicaResponsePersisted' =
+          [replicaResponsePersisted EXCEPT
+              ![event.writeId] = event.persistedNext]
+    /\ processedNext'[event.node] = event.processedNext
+    /\ persistedNext'[event.node] = event.persistedNext
+    /\ maxSeqNext'[event.node] = event.maxNext
 
 ReplicaResultEvent(event) ==
     /\ HasAck(event.writeId, event.peer)
-    /\ StableReplication(
-           DeliverReplicaAck(AckFor(event.writeId, event.peer)))
+    /\ replicaResponsePersisted[event.writeId] = event.resultPersistedNext
+    /\ D1DeliverAck(AckFor(event.writeId, event.peer))
 
 ClientResultEvent(event) ==
     /\ event.outcome = "acknowledged"
-    /\ StableReplication(PrimaryAck(event.writeId))
+    /\ D1PrimaryAck(event.writeId)
 
 SnapshotEvent(event) ==
     /\ event.source \in Nodes
@@ -165,20 +196,27 @@ RecoveryStartEvent(event) ==
     /\ RecoveryStable(TargetBeginInstall(event.target))
 
 RecoveryInstallEvent(event) ==
-    /\ RecoveryInstall(InstallSnapshot(event.target))
+    /\ RecoveryInstall(D1InstallRecoverySnapshot(event.target))
     /\ nextSeq'[event.target] = event.snapshotNext
 
 RecoveryWalObservation(event) ==
     /\ sessionFetched[event.node] = event.writeId
     /\ IF RequestDurability THEN event.durable ELSE TRUE
-    /\ UNCHANGED vars
+    /\ UNCHANGED d1vars
 
 RecoveryApplyEvent(event) ==
     /\ sessionFetched[event.node] = event.writeId
-    /\ event.outcome = "applied_newer"
-    /\ RecoveryStable(ApplyOps(event.node))
-    /\ docValue'[event.node][event.doc] = event.writeId
+    /\ D1FixedRecoveryApply(event.node)
+    /\ IF event.outcome = "applied_newer"
+          THEN docValue'[event.node][event.doc] = event.writeId
+          ELSE IF event.outcome = "stale"
+               THEN docValue'[event.node][event.doc]
+                    = docValue[event.node][event.doc]
+               ELSE FALSE
     /\ event.writeId \in durableOps'[event.node]
+    /\ processedNext'[event.node] = event.processedNext
+    /\ persistedNext'[event.node] = event.persistedNext
+    /\ maxSeqNext'[event.node] = event.maxNext
 
 RecoveryBarrierEvent(event) ==
     /\ sessionHead[event.target] = event.barrierNext
@@ -194,9 +232,15 @@ RecoveryMembershipEvent(event) ==
 
 CopyStateObservation(event) ==
     /\ CopyStateMatches(event.node, event)
-    /\ UNCHANGED vars
+    /\ UNCHANGED d1vars
 
-RecoveryTraceEvent(event) ==
+RoutingViewObservation(event) ==
+    /\ \/ /\ ViewMatches(views[event.node], event)
+          /\ UNCHANGED d1vars
+       \/ /\ FenceChangingReplication(DeliverView(event.node))
+          /\ ViewMatches(views'[event.node], event)
+
+RecoveryTraceEventCore(event) ==
     CASE event.kind = "client_write_routed" -> ClientWriteEvent(event)
       [] event.kind = "wal_appended" ->
             IF event.origin = "primary"
@@ -206,12 +250,12 @@ RecoveryTraceEvent(event) ==
                  ELSE RecoveryWalObservation(event)
       [] event.kind = "operation_processed" ->
             IF event.origin = "primary"
-            THEN PrimaryProcessObservation(event)
+            THEN PrimaryProcessEvent(event)
             ELSE IF event.origin = "live_replication"
                  THEN ReplicaApplyEvent(event)
                  ELSE RecoveryApplyEvent(event)
       [] event.kind = "primary_replication_started" ->
-            PrimaryAcceptEvent(event)
+            PrimaryReplicationObservation(event)
       [] event.kind = "replica_received" ->
             ReplicaReceiveObservation(event)
       [] event.kind = "replica_result" -> ReplicaResultEvent(event)
@@ -223,7 +267,16 @@ RecoveryTraceEvent(event) ==
       [] event.kind = "recovery_membership" ->
             RecoveryMembershipEvent(event)
       [] event.kind = "copy_state" -> CopyStateObservation(event)
+      [] event.kind = "routing_view" ->
+            RoutingViewObservation(event)
       [] OTHER -> FALSE
+
+RecoveryTraceEvent(event) ==
+    /\ RecoveryTraceEventCore(event)
+    /\ IF event.kind = "operation_processed"
+          /\ event.origin = "live_replication"
+          THEN TRUE
+          ELSE UNCHANGED replicaResponsePersisted
 
 ConsumeRecoveryEvent ==
     LET event == Trace[tracePos]
@@ -259,13 +312,14 @@ HiddenRecoveryStep ==
     /\ hiddenSteps < MaxHiddenSteps
     /\ HiddenRecoveryAction
     /\ hiddenSteps' = hiddenSteps + 1
-    /\ UNCHANGED <<tracePos, finished>>
+    /\ UNCHANGED <<tracePos, finished, replicaResponsePersisted>>
 
 FinishRecoveryTrace ==
     /\ tracePos > Len(Trace)
     /\ ~finished
     /\ finished' = TRUE
-    /\ UNCHANGED <<vars, tracePos, hiddenSteps>>
+    /\ UNCHANGED
+          <<d1vars, tracePos, hiddenSteps, replicaResponsePersisted>>
 
 TraceRecoveryNext ==
     \/ ConsumeRecoveryEvent
@@ -277,10 +331,25 @@ TraceRecoverySpec ==
     /\ [][TraceRecoveryNext]_traceRecoveryVars
 
 TraceRecoveryTypeOK ==
-    /\ TypeOK
+    /\ D1TypeOK
     /\ tracePos \in 1..(Len(Trace) + 1)
     /\ hiddenSteps \in 0..MaxHiddenSteps
     /\ finished \in BOOLEAN
+    /\ replicaResponsePersisted \in [WriteIds -> 0..MaxWrites]
+
+TraceRecoverySafety ==
+    /\ RoutingWellFormed
+    /\ NoCopyBehindAcked
+    /\ D1NoAcknowledgedDeleteResurrection
+    /\ D1ProcessedCheckpointGapAware
+    /\ D1PersistedCheckpointGapAware
+    /\ D1WalHasNoDuplicateSeq
+    /\ PromotionComplete
+    /\ AdmissionComplete
+    /\ NoPartialServe
+    /\ NoApplyBelowObservedFence
+    /\ ActivePrimaryRejectsOldTerm
+    /\ (finished /\ TraceQuiescent => D1QuiescentConvergence)
 
 TraceRecoveryNotAccepted ==
     ~finished

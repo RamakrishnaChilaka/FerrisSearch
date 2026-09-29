@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 VALIDATOR="$ROOT_DIR/scripts/tla/validate_trace.sh"
-FIXTURES="$ROOT_DIR/specs/tla/trace/v2"
+FIXTURES="$ROOT_DIR/specs/tla/trace/v3"
 
 export PYTHONDONTWRITEBYTECODE=1
 
@@ -57,6 +57,7 @@ run_invalid() {
 
 # Baseline accepted traces for each exact composition.
 run_valid baseline-order valid-concurrent-order.jsonl
+run_valid baseline-core-three-nodes valid-core-three-nodes.jsonl
 run_valid baseline-replay valid-processed-checkpoint-replay.jsonl
 run_valid baseline-authority valid-authority-activation.jsonl
 run_valid baseline-stale-primary valid-stale-primary-local-append.jsonl
@@ -90,4 +91,23 @@ run_invalid m15 m15-drop-replica-wal.jsonl 10 operation_processed
 run_invalid m18 invalid-replay-omits-entry.jsonl 35 replay_finished
 run_invalid m19 invalid-truncate-above-commit.jsonl 30 wal_truncated
 
-echo "D1 schema-v2 trace validator self-tests passed."
+# Round-2 reviewer mutations and scale checks.
+run_invalid n1 n1-recovery-profile-arrival-order-overwrite.jsonl 16 operation_processed
+run_valid n1c n1c-recovery-profile-late-older-stale.jsonl
+run_valid n2 n2-core-concurrent-primary-interleave.jsonl
+run_invalid n3 n3-core-replay-flip-stale.jsonl 35 replay_entry
+run_invalid n4 n4-core-copy-state-wrong.jsonl 20 copy_state
+run_valid n5 n5-core-four-writes.jsonl
+run_valid n6 n6-core-primary-crash.jsonl
+run_invalid n7 n7-core-persist-without-capture.jsonl 16 commit_persisted
+run_valid n8 n8-collision-at-seq-12.jsonl
+run_invalid n9 n9-no-copy-behind-safety.jsonl 16 operation_processed
+run_invalid n10 n10-persisted-checkpoint-mismatch.jsonl 16 operation_processed
+TLA2TOOLS_JAR="${TLA2TOOLS_JAR:-}" "$ROOT_DIR/scripts/tla/check.sh" d1-trace-actions
+echo "review n11 expected=accepted actual=accepted"
+run_valid n12 valid-replay-failed-unavailable.jsonl
+run_valid n13 n13-primary-restart-replay.jsonl
+run_valid n14 valid-concurrent-order.jsonl
+run_valid n15 n15-core-with-routing-view.jsonl
+
+echo "D1 schema-v3 trace validator self-tests passed."
