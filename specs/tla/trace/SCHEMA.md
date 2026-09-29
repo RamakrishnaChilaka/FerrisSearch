@@ -20,15 +20,15 @@ The converter checks the JSON Lines contract and generates a finite
 
 The emitter does not choose a profile. The converter infers exactly one
 composition from the event vocabulary and then rejects every event outside
-that composition. A single trace cannot mix data-plane replication with a
-later failover, recovery with crash/fence/commit observations, or the bounded
-collision script with later ordinary writes. Tests covering more than one
-concern emit separate traces.
+that composition. Core replication may be combined with failover, restart,
+activation, collision removal, and later-term writes. Peer recovery remains a
+separate composition.
 
 | Inferred composition | TLC module | Exact actions used |
 | --- | --- | --- |
 | `d1-core` | `TraceD1.tla` | `MC_D1_SeqNoApply`: client routing, D1 primary acceptance, D1 replica processing/redelivery, acknowledgements, captured-boundary persistence, restart, replay, replay failure, and truncation. |
 | `d1-authority` | `TraceD1Authority.tla` | `Invariants`: crash, election, routing promotion, per-node view delivery, activation proposal/commit/observation, and primary write gating. |
+| `d1-combined` | `TraceD1.tla` | Core D1 replication plus crash/restart/replay, routing promotion, fence observation, replay-before-NoOp gap fill, activation, exact in-sync removal, new-term writes, and B1 collision handling. |
 | `d1-collision` | `TraceD1Collision.tla` | `MC_D1_TermCollision`: partial old-term apply, promotion, durable collision fence, definitive collision, and in-sync removal. |
 | `d1-recovery` | `TraceD1Recovery.tla` | `PeerRecovery` control actions plus the same D1 fixed live-replication and recovery-apply state transitions used by `MC_D1_SeqNoApply`. |
 
@@ -38,12 +38,13 @@ Exact vocabularies:
 | --- | --- |
 | Core | `client_write_routed`, `wal_appended`, `operation_processed`, `primary_replication_started`, `replica_received`, `replica_result`, `client_result`, `fence_persisted`, `commit_captured`, `commit_persisted`, `wal_truncated`, `node_crashed`, `node_restarted`, `replay_started`, `replay_entry`, `replay_finished`, `routing_view`, `copy_state` |
 | Authority | `node_crashed`, `routing_promoted`, `routing_view`, `fence_persisted`, `primary_activated`, primary-side client/WAL/process/replication/result events, `copy_state` |
+| Combined | The union of core and authority events, plus `in_sync_removed` and `promotion_noop_fill` |
 | Collision | `wal_appended`, `operation_processed`, `routing_promoted`, `routing_view`, `fence_persisted`, `in_sync_removed`, `copy_state` |
 | Recovery | primary and replica write events, `routing_view`, `recovery_snapshot`, `recovery_started`, `recovery_installed`, `recovery_barrier`, `recovery_membership`, `copy_state` |
 
 Recovery actions are used only by `TraceD1Recovery`. They are checked through
 the safety invariants evaluated on each accepted recovery witness; they are not
-part of core, authority, or collision traces.
+part of core, combined, authority, or collision traces.
 
 The trace modules still contain trace-side rules rather than only model
 actions:
@@ -61,6 +62,12 @@ actions:
 
 The core fence maximum uses `D1FenceMaxNext` from the D1 model rather than a
 trace-local formula.
+
+Promotion NoOps have no client write ID in the D1 state. The combined model
+therefore represents the synced NoOp batch as the exact durable set of
+previously missing processed sequences, not as entries in `walOrder`. It
+requires every filled sequence to lack a remaining local WAL entry after
+replay and leaves logical document state unchanged.
 
 A pass means that the finite observed execution has a witness in these bounded
 models. It does not prove the Rust implementation, the instrumentation, or
@@ -235,11 +242,15 @@ that harness.
 | `routing_view` | observing node, primary, term, in-sync nodes, every allocation, initialized flag | Under that node's `ClusterManager` view lock. |
 | `routing_promoted` | single `emitter` (the Raft leader applying the command), new primary, term, in-sync set | Under Raft state-machine apply after routing mutation. |
 | `in_sync_removed` | Raft-leader emitter, removed node/allocation, resulting in-sync set | Under successful exact-allocation `FailShardCopy` apply. |
+| `promotion_noop_fill` | node/allocation/activated term, exact filled sequence set, checkpoints | Inside `HotEngine::prepare_primary_activation`, after full local WAL replay and the synced NoOp batch have updated the apply-state checkpoints, while the activation maintenance/translog boundary still linearizes the result. |
 | `primary_activated` | node/allocation/activated term | Under the activation-state lock after the matching durable fence and routing-term observation. |
 
 Per-node routing views make stale coordinator routing and a stale primary's
 local view expressible. `routing_promoted` is emitted once, by the leader apply,
-not once per observing node.
+not once per observing node. A non-empty `promotion_noop_fill` set must equal
+every remaining missing sequence through the copy's local maximum; sequences
+that still have a local WAL entry cannot be filled because replay precedes gap
+closure.
 
 ### Recovery
 
@@ -316,6 +327,9 @@ Before TLC, `trace_to_tla.py` rejects:
 - Keyed response lower bounds by `(write, replica)` and allowed batch-final
   response checkpoints within the model-observed interval.
 - Made compositions exclusive and documented their complete vocabularies.
+- Added a combined core/failover composition for end-to-end acknowledged-write
+  survival across promotion, replay-before-NoOp gap fill, and later-term
+  collision handling.
 
 Recovery snapshot and catch-up remain strictly ordered by the implemented
 peer-recovery cursor. Out-of-order or duplicate catch-up batches are not

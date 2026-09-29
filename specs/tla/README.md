@@ -330,7 +330,7 @@ closure.
 [`trace/SCHEMA.md`](trace/SCHEMA.md) defines the JSON Lines contract for
 instrumented D1 tests. A process-global ordered event stream records only
 protocol-linearization points. `scripts/tla/trace_to_tla.py` validates the
-version-2 schema exactly, rejects unknown versions, events, outcomes, or
+version-3 schema exactly, rejects unknown versions, events, outcomes, or
 fields, and generates a finite `TraceInput.tla` plus TLC constants.
 
 Validation is existential. TLC accepts only by finding a path that consumes the
@@ -340,12 +340,13 @@ entire trace through real actions:
 - `TraceD1Authority.tla` uses Raft, failover, view-delivery, activation, and
   primary-gating actions from `Invariants`;
 - `TraceD1Collision.tla` uses `MC_D1_TermCollision`; and
-- `TraceD1Recovery.tla` uses `PeerRecovery` and base replication actions.
+- `TraceD1Recovery.tla` uses `PeerRecovery` plus the fixed D1 live-replication
+  and recovery-apply actions.
 
 The converter infers the composition from the event vocabulary; the emitter
-does not select a profile. Hidden-action bounds are validator-owned. Exactly
-one composition is allowed per trace. A test that covers replicated writes and
-then failover, for example, emits separate core and authority traces.
+does not select a profile. Hidden-action bounds are validator-owned. Core
+replication and authority/failover events may use the combined composition in
+one trace. Peer recovery remains a separate composition.
 Observed low-level WAL, fence, and commit records may be D1 stuttering steps,
 but they are tied to a later real action and semantic `copy_state`. Observed
 records cannot be reordered or discarded.
@@ -377,7 +378,11 @@ Trace-side logic remains and is not presented as protocol-free: outcome
 literals select action/post-state claims; authority/collision wrappers gate on
 observed fences; the converter checks durability and required-replica/view
 equality; response checkpoints are buffered until primary receipt; and the
-bounded B1 causal schedule remains in the collision wrapper.
+bounded B1 causal schedule remains in the collision wrapper. Promotion NoOps
+have no client write ID in the D1 state, so the combined model records them as
+the exact durable set of missing processed sequences rather than as
+`walOrder` entries; it still requires replay to have removed every gap backed
+by a local WAL entry before fill.
 
 On September 29, 2026, Java 25 and TLA+ tools 1.7.4 produced the expected
 verdict for every checked-in baseline and every Opus review mutation:
@@ -391,7 +396,23 @@ verdict for every checked-in baseline and every Opus review mutation:
 | n1c, n2, n5, n6, n8, n11, n12, n13, n14, n15 | Accepted | Accepted |
 | a1, b1, b2, b3 and adjacent/item-local controls | Accepted | Accepted |
 | Overstated response checkpoint | Rejected | Rejected at `replica_result` |
-| Mixed-composition v1/v5 and recovery-duplicate v2 | Rejected | Rejected by composition/action vocabulary |
+| v1 replicated writes followed by failover | Accepted | Accepted by combined composition |
+| Recovery-duplicate v2 | Rejected | Rejected by the ordered recovery action |
+| Incomplete collision/later-write v5 | Rejected | Rejected at its first ungrounded WAL observation |
+| 16-write, two-write-term combined witness | Accepted | Accepted; invalid arrival/collision/rollback variants rejected |
+
+The 217-event combined witness uses 16 writes, three nodes, write terms 1 and
+3, and the intermediate uninitialized promotion term 2. It includes one crash,
+out-of-order replication, dropped required RPCs, promotion, durable fence
+raises, a real sequence-11 NoOp gap fill after WAL replay, activation, a B1
+collision/removal at sequence 13, a later acknowledged write,
+commit/truncation, and old-primary restart/replay. Validation took
+22.41s with 1,361,332KB peak resident memory through `validate_trace.sh`. Raw
+TLC without diagnostic state dumping took 21.40s with 1,415,532KB peak
+resident memory, generated 37,213 states, found 13,752 distinct states, and
+reached depth 226 before finding the accepting witness. The dominant bounds
+are the 16-write D1 state vectors/sets and the three-node authority
+interleavings around promotion, gap fill, and removal.
 
 The suite also retains expected-invalid arrival-order, seq-only collision,
 highest-commit, and replay-stage boundary traces. Converter tests reject v1,
@@ -994,6 +1015,10 @@ well below the CI budget.
 - The trace validator currently checks schema-v3 fixtures. Rust
   process/integration tests do not yet emit those events, so no captured Rust
   execution is claimed as validated evidence yet.
+- Promotion NoOp WAL-record identity is abstracted to durable processed
+  sequence identity. The validator checks the exact remaining gap set,
+  checkpoint advancement, replay-before-fill, and document-state neutrality,
+  but not byte-level NoOp WAL encoding.
 - Index delete/recreate identity is abstracted as pre-finalize abort rather
   than modeled end to end.
 - File/chunk/frame-size limits, SHA-256 implementation details, torn-frame

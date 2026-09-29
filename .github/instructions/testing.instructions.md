@@ -153,10 +153,10 @@ cargo test -- test_name                         # Single test by name
   `TraceD1Collision` with the B1 slice, and `TraceD1Recovery` with
   `PeerRecovery`. Do not replace these with a deterministic replay machine or
   duplicate planner/routing rules in the trace module.
-- One trace uses exactly one composition. Mixed replication/failover,
-  recovery/crash-fence-commit, or collision/later-write scenarios must be split
-  into concern-specific traces. Keep the exact event vocabularies synchronized
-  with `SCHEMA.md`.
+- One trace uses exactly one inferred composition. The combined composition
+  permits core replication followed by crash/restart, failover, activation,
+  collision removal, and later-term writes. Peer recovery remains separate.
+  Keep the exact event vocabularies synchronized with `SCHEMA.md`.
 - TLC trace acceptance is existential witness search with a validator-owned
   hidden-action bound. A pass means only that the finite observation can be
   embedded in the selected bounded model; it is not an implementation proof.
@@ -174,6 +174,10 @@ cargo test -- test_name                         # Single test by name
 - Bulk traces may append every item before any item processing event. A bulk
   replica response may carry the batch-final persisted checkpoint; require
   item-local persisted <= response persisted <= current replica persisted.
+- Retain the 217-event combined witness and its invalid arrival-order,
+  collision-redelivery, and post-promotion rollback variants. The valid
+  witness must include a real missing sequence filled by a durable promotion
+  NoOp after local WAL replay, not only an empty gap-fill stage.
 - Recovery catch-up ordering assumes an activated-primary source scanning the
   pinned physical WAL with one exclusive cursor. Do not claim support for
   duplicate or out-of-order catch-up traces.
