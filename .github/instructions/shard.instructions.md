@@ -71,9 +71,14 @@ pub struct ShardManager {
   outcome. In production it means the Tantivy writer was killed, so the next
   commit fails and rebuild or restart replay applies the entry on this copy.
   On a primary, replicas never receive it, so copies can diverge; peer
-  recovery from this copy can ship the retained entry to a new copy.
-  Definitive and open-level failures may quarantine, but only after the report
-  throttle admits the attempt.
+  recovery from this copy can ship the retained entry to a new copy. When a
+  later write exposes that missing sequence, every affected replica normally
+  reaches the fixed gap deadline (about 60 seconds), is removed, and is
+  peer-recovered. This is intentionally conservative until D10 adds targeted
+  repair.
+  Definitive and open-level failures may quarantine only after the report
+  throttle admits the attempt, except sequence/version collisions, which
+  quarantine immediately and are also reported by the primary.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.

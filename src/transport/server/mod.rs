@@ -658,7 +658,7 @@ impl InternalTransport for TransportService {
                 );
 
                 // Replicate to replica shards with seq_no
-                match crate::replication::replicate_write(
+                match crate::replication::replicate_write_with_durability(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -668,6 +668,7 @@ impl InternalTransport for TransportService {
                     "index",
                     seq_no,
                     primary_term,
+                    self.shard_manager.durability(),
                 )
                 .await
                 {
@@ -682,6 +683,14 @@ impl InternalTransport for TransportService {
                         );
                     }
                     Err(errors) => {
+                        self.report_definitive_replica_failures(
+                            &write_state,
+                            &req.index_name,
+                            req.shard_id,
+                            primary_term,
+                            &errors,
+                        )
+                        .await;
                         tracing::warn!(
                             "Replication errors for {}/shard_{}: {:?}",
                             req.index_name,
@@ -691,7 +700,10 @@ impl InternalTransport for TransportService {
                         return Ok(Response::new(ShardDocResponse {
                             success: false,
                             doc_id: id,
-                            error: format!("Replication failed: {}", errors.join("; ")),
+                            error: format!(
+                                "Replication failed: {}",
+                                Self::replication_failure_message(&errors)
+                            ),
                             seq_no: Some(seq_no),
                             primary_term: Some(primary_term),
                         }));
@@ -710,7 +722,10 @@ impl InternalTransport for TransportService {
                 Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
-                Err(Status::resource_exhausted(e.to_string()))
+                Err(Status::resource_exhausted(format!(
+                    "{}{e}",
+                    crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX
+                )))
             }
             Err(e) => {
                 self.report_local_copy_failure(
@@ -883,7 +898,7 @@ impl InternalTransport for TransportService {
                     &activated_primary,
                 );
                 // Replicate to replica shards
-                match crate::replication::replicate_bulk(
+                match crate::replication::replicate_bulk_with_durability(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -891,6 +906,7 @@ impl InternalTransport for TransportService {
                     &docs,
                     start_seq_no,
                     primary_term,
+                    self.shard_manager.durability(),
                 )
                 .await
                 {
@@ -905,6 +921,14 @@ impl InternalTransport for TransportService {
                         );
                     }
                     Err(errors) => {
+                        self.report_definitive_replica_failures(
+                            &write_state,
+                            &req.index_name,
+                            req.shard_id,
+                            primary_term,
+                            &errors,
+                        )
+                        .await;
                         tracing::warn!(
                             "Bulk replication errors for {}/shard_{}: {:?}",
                             req.index_name,
@@ -914,7 +938,10 @@ impl InternalTransport for TransportService {
                         return Ok(Response::new(ShardBulkResponse {
                             success: false,
                             doc_ids: ids,
-                            error: format!("Replication failed: {}", errors.join("; ")),
+                            error: format!(
+                                "Replication failed: {}",
+                                Self::replication_failure_message(&errors)
+                            ),
                             start_seq_no: Some(start_seq_no),
                             primary_term: Some(primary_term),
                         }));
@@ -934,7 +961,10 @@ impl InternalTransport for TransportService {
                 Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
-                Err(Status::resource_exhausted(e.to_string()))
+                Err(Status::resource_exhausted(format!(
+                    "{}{e}",
+                    crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX
+                )))
             }
             Err(e) => {
                 self.report_local_copy_failure(
@@ -1053,7 +1083,7 @@ impl InternalTransport for TransportService {
                     &activated_primary,
                 );
                 // Replicate delete to replica shards
-                match crate::replication::replicate_write(
+                match crate::replication::replicate_write_with_durability(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -1063,6 +1093,7 @@ impl InternalTransport for TransportService {
                     "delete",
                     seq_no,
                     primary_term,
+                    self.shard_manager.durability(),
                 )
                 .await
                 {
@@ -1077,6 +1108,14 @@ impl InternalTransport for TransportService {
                         );
                     }
                     Err(errors) => {
+                        self.report_definitive_replica_failures(
+                            &write_state,
+                            &req.index_name,
+                            req.shard_id,
+                            primary_term,
+                            &errors,
+                        )
+                        .await;
                         tracing::warn!(
                             "Delete replication errors for {}/shard_{}: {:?}",
                             req.index_name,
@@ -1086,7 +1125,10 @@ impl InternalTransport for TransportService {
                         return Ok(Response::new(ShardDeleteResponse {
                             success: false,
                             deleted,
-                            error: format!("Replication failed: {}", errors.join("; ")),
+                            error: format!(
+                                "Replication failed: {}",
+                                Self::replication_failure_message(&errors)
+                            ),
                             seq_no: Some(seq_no),
                             primary_term: Some(primary_term),
                         }));
@@ -1104,7 +1146,10 @@ impl InternalTransport for TransportService {
                 Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
-                Err(Status::resource_exhausted(e.to_string()))
+                Err(Status::resource_exhausted(format!(
+                    "{}{e}",
+                    crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX
+                )))
             }
             Err(e) => {
                 self.report_local_copy_failure(
@@ -1842,6 +1887,7 @@ impl InternalTransport for TransportService {
                 Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) => {
+                let definitive = ShardManager::is_definitive_copy_failure(&e);
                 if assigned_authoritative {
                     self.report_local_copy_failure(
                         &req.index_name,
@@ -1852,6 +1898,9 @@ impl InternalTransport for TransportService {
                         &e,
                     )
                     .await;
+                }
+                if definitive {
+                    return Err(Status::data_loss(e.to_string()));
                 }
                 let sequence = self
                     .shard_manager
@@ -2048,6 +2097,7 @@ impl InternalTransport for TransportService {
                 Err(Status::invalid_argument(e.to_string()))
             }
             Err(e) => {
+                let definitive = ShardManager::is_definitive_copy_failure(&e);
                 if assigned_authoritative {
                     self.report_local_copy_failure(
                         &req.index_name,
@@ -2058,6 +2108,9 @@ impl InternalTransport for TransportService {
                         &e,
                     )
                     .await;
+                }
+                if definitive {
+                    return Err(Status::data_loss(e.to_string()));
                 }
                 let sequence = self
                     .shard_manager
@@ -2125,7 +2178,7 @@ impl InternalTransport for TransportService {
         let identity = self
             .shard_manager
             .copy_identity(&req.index_name, req.shard_id)
-            .ok_or_else(|| Status::not_found("sequence-state probe copy is not open"))?;
+            .ok_or_else(|| Status::unavailable("sequence-state probe copy is not open"))?;
         if identity.index_uuid != req.index_uuid || identity.allocation_id != allocation_id {
             return Err(Status::failed_precondition(
                 "sequence-state probe durable identity mismatch",
@@ -2140,7 +2193,7 @@ impl InternalTransport for TransportService {
         let engine = self
             .shard_manager
             .get_shard(&req.index_name, req.shard_id)
-            .ok_or_else(|| Status::not_found("sequence-state probe copy is not open"))?;
+            .ok_or_else(|| Status::unavailable("sequence-state probe copy is not open"))?;
         let sequence = engine.sequence_stats();
         let active_primary = routing.primary == self.local_node_id
             && routing.primary_term == req.expected_primary_term
@@ -3505,199 +3558,250 @@ impl TransportService {
     }
 
     pub(crate) async fn reconcile_replica_gaps(&self) {
+        self.reconcile_replica_gaps_with_probe_timeout(std::time::Duration::from_secs(2))
+            .await;
+    }
+
+    async fn reconcile_replica_gaps_with_probe_timeout(&self, probe_timeout: std::time::Duration) {
         const GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
         let observations = self
             .shard_manager
             .isr_tracker
             .expired_gap_observations(GAP_TIMEOUT);
-        for (key, observation) in observations {
-            let state = self.cluster_manager.get_state();
-            let current = state
-                .indices
-                .get(&key.index)
-                .and_then(|metadata| {
-                    metadata
-                        .shard_routing
-                        .get(&key.shard_id)
-                        .map(|routing| (metadata, routing))
-                })
-                .filter(|(metadata, routing)| {
-                    metadata.uuid.as_str() == observation.index_uuid
-                        && routing.primary == self.local_node_id
-                        && routing.primary_term == observation.primary_term
-                        && state.shard_allocation_id(
-                            &key.index,
-                            key.shard_id,
-                            &observation.replica_node_id,
-                        ) == Some(observation.allocation_id)
-                });
-            let Some((_, _)) = current else {
-                self.shard_manager.isr_tracker.remove_gap_observation(
-                    &key.index,
-                    key.shard_id,
-                    &observation.replica_node_id,
-                    observation.allocation_id,
-                    observation.primary_term,
-                );
-                continue;
-            };
-
-            let should_fail = match state.nodes.get(&observation.replica_node_id) {
-                Some(replica) => match self
-                    .transport_client
-                    .get_shard_sequence_state(
-                        replica,
-                        GetShardSequenceStateRequest {
-                            index_name: key.index.clone(),
-                            index_uuid: observation.index_uuid.clone(),
-                            shard_id: key.shard_id,
-                            allocation_id: Some(observation.allocation_id),
-                            expected_primary_term: observation.primary_term,
-                        },
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        if response.sequence_format_version
-                            != crate::engine::SEQUENCE_FORMAT_VERSION
-                        {
-                            self.shard_manager.isr_tracker.has_gap_observation(
-                                &key.index,
-                                key.shard_id,
-                                &observation.replica_node_id,
-                                observation.allocation_id,
-                                observation.primary_term,
-                            )
-                        } else if self.shard_manager.isr_tracker.record_gap_probe_checkpoint(
-                            &key.index,
-                            key.shard_id,
-                            &observation.replica_node_id,
-                            observation.allocation_id,
-                            response.processed_checkpoint,
-                        ) {
-                            false
-                        } else {
-                            self.shard_manager.isr_tracker.has_gap_observation(
-                                &key.index,
-                                key.shard_id,
-                                &observation.replica_node_id,
-                                observation.allocation_id,
-                                observation.primary_term,
-                            )
-                        }
-                    }
-                    Err(error) => {
-                        let definitive =
-                            error.downcast_ref::<tonic::Status>().is_some_and(|status| {
-                                matches!(
-                                    status.code(),
-                                    tonic::Code::InvalidArgument
-                                        | tonic::Code::NotFound
-                                        | tonic::Code::FailedPrecondition
-                                        | tonic::Code::DataLoss
-                                )
-                            });
-                        if !definitive {
-                            tracing::warn!(
-                                index = key.index,
-                                shard_id = key.shard_id,
-                                replica = observation.replica_node_id,
-                                allocation_id = observation.allocation_id,
-                                error = %error,
-                                "Replica gap probe failed transiently; retaining the fixed target"
-                            );
-                        }
-                        definitive
-                            && self.shard_manager.isr_tracker.has_gap_observation(
-                                &key.index,
-                                key.shard_id,
-                                &observation.replica_node_id,
-                                observation.allocation_id,
-                                observation.primary_term,
-                            )
-                    }
-                },
-                None => self.shard_manager.isr_tracker.has_gap_observation(
-                    &key.index,
-                    key.shard_id,
-                    &observation.replica_node_id,
-                    observation.allocation_id,
-                    observation.primary_term,
-                ),
-            };
-            if !should_fail {
-                continue;
+        futures::future::join_all(observations.into_iter().map(|(key, observation)| {
+            let service = self.clone();
+            async move {
+                service
+                    .reconcile_replica_gap(key, observation, probe_timeout)
+                    .await;
             }
+        }))
+        .await;
+    }
 
-            let command = crate::consensus::types::ClusterCommand::FailShardCopy {
+    async fn reconcile_replica_gap(
+        &self,
+        key: crate::shard::ShardKey,
+        observation: crate::shard::ReplicaGapObservation,
+        probe_timeout: std::time::Duration,
+    ) {
+        let state = self.cluster_manager.get_state();
+        let current = state
+            .indices
+            .get(&key.index)
+            .and_then(|metadata| {
+                metadata
+                    .shard_routing
+                    .get(&key.shard_id)
+                    .map(|routing| (metadata, routing))
+            })
+            .filter(|(metadata, routing)| {
+                metadata.uuid.as_str() == observation.index_uuid
+                    && routing.primary == self.local_node_id
+                    && routing.primary_term == observation.primary_term
+                    && state.shard_allocation_id(
+                        &key.index,
+                        key.shard_id,
+                        &observation.replica_node_id,
+                    ) == Some(observation.allocation_id)
+            });
+        if current.is_none() {
+            self.shard_manager.isr_tracker.remove_gap_observation(
+                &key.index,
+                key.shard_id,
+                &observation,
+            );
+            return;
+        }
+
+        let Some(replica) = state.nodes.get(&observation.replica_node_id) else {
+            tracing::warn!(
+                index = key.index,
+                shard_id = key.shard_id,
+                replica = observation.replica_node_id,
+                allocation_id = observation.allocation_id,
+                "Replica gap probe could not start because the assigned node is absent"
+            );
+            return;
+        };
+        let probe = self.transport_client.get_shard_sequence_state(
+            replica,
+            GetShardSequenceStateRequest {
                 index_name: key.index.clone(),
                 index_uuid: observation.index_uuid.clone(),
                 shard_id: key.shard_id,
-                node: observation.replica_node_id.clone(),
-                allocation_id: observation.allocation_id,
+                allocation_id: Some(observation.allocation_id),
                 expected_primary_term: observation.primary_term,
-                promote_only: false,
-                promotion_candidate: None,
-            };
-            let result = if self.raft.as_ref().is_some_and(|raft| raft.is_leader()) {
-                crate::consensus::client_write_checked(
-                    self.raft
-                        .as_ref()
-                        .expect("Raft presence checked for leader gap report"),
-                    command,
-                )
-                .await
-                .map_err(anyhow::Error::msg)
-            } else {
-                let Some(master_id) = state.master_node.as_ref() else {
+            },
+        );
+        let should_fail = match tokio::time::timeout(probe_timeout, probe).await {
+            Ok(Ok(response)) => {
+                if response.sequence_format_version != crate::engine::SEQUENCE_FORMAT_VERSION {
                     tracing::warn!(
                         index = key.index,
                         shard_id = key.shard_id,
-                        "Cannot report replica gap because no Raft leader is known"
+                        replica = observation.replica_node_id,
+                        allocation_id = observation.allocation_id,
+                        format_version = response.sequence_format_version,
+                        "Replica gap probe returned an unsupported sequence format"
                     );
-                    continue;
-                };
-                let Some(master) = state.nodes.get(master_id) else {
-                    tracing::warn!(
-                        index = key.index,
-                        shard_id = key.shard_id,
-                        master = master_id,
-                        "Cannot report replica gap because the Raft leader is absent"
-                    );
-                    continue;
-                };
-                self.transport_client
-                    .forward_fail_shard_copy(
-                        master,
-                        FailShardCopyRequest {
-                            index_name: key.index.clone(),
-                            index_uuid: observation.index_uuid.clone(),
-                            shard_id: key.shard_id,
-                            node_id: observation.replica_node_id.clone(),
-                            allocation_id: Some(observation.allocation_id),
-                            promote_only: false,
-                            expected_primary_term: observation.primary_term,
-                        },
-                    )
-                    .await
-            };
-            match result {
-                Ok(()) => self.shard_manager.isr_tracker.remove_gap_observation(
+                    false
+                } else if self.shard_manager.isr_tracker.record_gap_probe_checkpoint(
                     &key.index,
                     key.shard_id,
-                    &observation.replica_node_id,
-                    observation.allocation_id,
-                    observation.primary_term,
-                ),
-                Err(error) => tracing::warn!(
+                    &observation,
+                    response.processed_checkpoint,
+                ) {
+                    false
+                } else {
+                    self.shard_manager.isr_tracker.has_gap_observation(
+                        &key.index,
+                        key.shard_id,
+                        &observation,
+                    )
+                }
+            }
+            Ok(Err(error)) => {
+                let definitive = error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+                    matches!(
+                        status.code(),
+                        tonic::Code::FailedPrecondition | tonic::Code::DataLoss
+                    )
+                });
+                if !definitive {
+                    tracing::warn!(
+                        index = key.index,
+                        shard_id = key.shard_id,
+                        replica = observation.replica_node_id,
+                        allocation_id = observation.allocation_id,
+                        error = %error,
+                        "Replica gap probe failed transiently; retaining the fixed target"
+                    );
+                }
+                definitive
+                    && self.shard_manager.isr_tracker.has_gap_observation(
+                        &key.index,
+                        key.shard_id,
+                        &observation,
+                    )
+            }
+            Err(_) => {
+                tracing::warn!(
                     index = key.index,
                     shard_id = key.shard_id,
                     replica = observation.replica_node_id,
                     allocation_id = observation.allocation_id,
-                    error = %error,
-                    "Failed to remove replica after the fixed gap target remained unmet"
-                ),
+                    timeout_ms = probe_timeout.as_millis(),
+                    "Replica gap probe timed out; retaining the fixed target"
+                );
+                false
             }
+        };
+        if !should_fail
+            || !self.shard_manager.isr_tracker.has_gap_observation(
+                &key.index,
+                key.shard_id,
+                &observation,
+            )
+        {
+            return;
+        }
+
+        let state = self.cluster_manager.get_state();
+        let still_current = state
+            .indices
+            .get(&key.index)
+            .and_then(|metadata| {
+                metadata
+                    .shard_routing
+                    .get(&key.shard_id)
+                    .map(|routing| (metadata, routing))
+            })
+            .is_some_and(|(metadata, routing)| {
+                metadata.uuid.as_str() == observation.index_uuid
+                    && routing.primary == self.local_node_id
+                    && routing.primary_term == observation.primary_term
+                    && state.shard_allocation_id(
+                        &key.index,
+                        key.shard_id,
+                        &observation.replica_node_id,
+                    ) == Some(observation.allocation_id)
+            });
+        if !still_current {
+            self.shard_manager.isr_tracker.remove_gap_observation(
+                &key.index,
+                key.shard_id,
+                &observation,
+            );
+            return;
+        }
+
+        let command = crate::consensus::types::ClusterCommand::FailShardCopy {
+            index_name: key.index.clone(),
+            index_uuid: observation.index_uuid.clone(),
+            shard_id: key.shard_id,
+            node: observation.replica_node_id.clone(),
+            allocation_id: observation.allocation_id,
+            expected_primary_term: observation.primary_term,
+            promote_only: false,
+            promotion_candidate: None,
+        };
+        let result = if self.raft.as_ref().is_some_and(|raft| raft.is_leader()) {
+            crate::consensus::client_write_checked(
+                self.raft
+                    .as_ref()
+                    .expect("Raft presence checked for leader gap report"),
+                command,
+            )
+            .await
+            .map_err(anyhow::Error::msg)
+        } else {
+            let Some(master_id) = state.master_node.as_ref() else {
+                tracing::warn!(
+                    index = key.index,
+                    shard_id = key.shard_id,
+                    "Cannot report replica gap because no Raft leader is known"
+                );
+                return;
+            };
+            let Some(master) = state.nodes.get(master_id) else {
+                tracing::warn!(
+                    index = key.index,
+                    shard_id = key.shard_id,
+                    master = master_id,
+                    "Cannot report replica gap because the Raft leader is absent"
+                );
+                return;
+            };
+            self.transport_client
+                .forward_fail_shard_copy(
+                    master,
+                    FailShardCopyRequest {
+                        index_name: key.index.clone(),
+                        index_uuid: observation.index_uuid.clone(),
+                        shard_id: key.shard_id,
+                        node_id: observation.replica_node_id.clone(),
+                        allocation_id: Some(observation.allocation_id),
+                        promote_only: false,
+                        expected_primary_term: observation.primary_term,
+                    },
+                )
+                .await
+        };
+        match result {
+            Ok(()) => self.shard_manager.isr_tracker.remove_gap_observation(
+                &key.index,
+                key.shard_id,
+                &observation,
+            ),
+            Err(error) => tracing::warn!(
+                index = key.index,
+                shard_id = key.shard_id,
+                replica = observation.replica_node_id,
+                allocation_id = observation.allocation_id,
+                error = %error,
+                "Failed to remove replica after the fixed gap target remained unmet"
+            ),
         }
     }
 
@@ -3719,6 +3823,26 @@ impl TransportService {
                 "Local shard-copy error is retryable and was not reported to routing"
             );
             return;
+        }
+        let collision_failure = ShardManager::is_sequence_collision_failure(error);
+        if collision_failure
+            && self
+                .shard_manager
+                .copy_identity(index_name, shard_id)
+                .is_some_and(|identity| {
+                    identity.index_uuid == index_uuid && identity.allocation_id == allocation_id
+                })
+            && let Err(quarantine_error) = self
+                .shard_manager
+                .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
+                .await
+        {
+            tracing::warn!(
+                index = index_name,
+                shard_id,
+                error = %quarantine_error,
+                "Failed to quarantine sequence-colliding local shard copy"
+            );
         }
         let current = self.cluster_manager.get_state();
         let Some(metadata) = current.indices.get(index_name) else {
@@ -3785,7 +3909,7 @@ impl TransportService {
                     routing.primary_term,
                 ));
         }
-        if ShardManager::should_quarantine_copy_failure(error) {
+        if !collision_failure && ShardManager::should_quarantine_copy_failure(error) {
             if promote_only {
                 self.primary_activation_state
                     .activated_terms
@@ -4448,7 +4572,7 @@ impl TransportService {
             let crate::engine::DocumentMutation::NoOp { reason } = operation.mutation else {
                 continue;
             };
-            match crate::replication::replicate_write(
+            match crate::replication::replicate_write_with_durability(
                 &self.transport_client,
                 &write_state,
                 index_name,
@@ -4458,6 +4582,7 @@ impl TransportService {
                 "noop",
                 operation.seq_no,
                 operation.primary_term,
+                self.shard_manager.durability(),
             )
             .await
             {
@@ -4472,6 +4597,14 @@ impl TransportService {
                     );
                 }
                 Err(errors) => {
+                    self.report_definitive_replica_failures(
+                        &write_state,
+                        index_name,
+                        shard_id,
+                        operation.primary_term,
+                        &errors,
+                    )
+                    .await;
                     let primary_sequence = engine.sequence_stats();
                     if let Some(metadata) = write_state.indices.get(index_name) {
                         for replica_node_id in metadata.in_sync_replica_nodes(shard_id) {
@@ -4781,6 +4914,112 @@ impl TransportService {
             primary_sequence.processed_checkpoint,
             replica_checkpoints,
         );
+    }
+
+    fn replication_failure_message(
+        failures: &[crate::replication::ReplicaReplicationFailure],
+    ) -> String {
+        failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    async fn report_definitive_replica_failures(
+        &self,
+        write_state: &crate::cluster::state::ClusterState,
+        index_name: &str,
+        shard_id: u32,
+        primary_term: u64,
+        failures: &[crate::replication::ReplicaReplicationFailure],
+    ) {
+        let Some(metadata) = write_state.indices.get(index_name) else {
+            return;
+        };
+        let Some(routing) = metadata.shard_routing.get(&shard_id) else {
+            return;
+        };
+        if routing.primary != self.local_node_id || routing.primary_term != primary_term {
+            return;
+        }
+        let index_uuid = metadata.uuid.to_string();
+
+        for failure in failures.iter().filter(|failure| failure.definitive) {
+            let Some(allocation_id) = failure.allocation_id else {
+                continue;
+            };
+            if !routing.is_replica_in_sync(&failure.node_id)
+                || write_state.shard_allocation_id(index_name, shard_id, &failure.node_id)
+                    != Some(allocation_id)
+            {
+                continue;
+            }
+
+            let command = crate::consensus::types::ClusterCommand::FailShardCopy {
+                index_name: index_name.to_string(),
+                index_uuid: index_uuid.clone(),
+                shard_id,
+                node: failure.node_id.clone(),
+                allocation_id,
+                expected_primary_term: primary_term,
+                promote_only: false,
+                promotion_candidate: None,
+            };
+            let result = if let Some(raft) = self.raft.as_ref().filter(|raft| raft.is_leader()) {
+                crate::consensus::client_write_checked(raft, command)
+                    .await
+                    .map_err(anyhow::Error::msg)
+            } else {
+                let Some(master_id) = write_state.master_node.as_ref() else {
+                    tracing::warn!(
+                        index = index_name,
+                        shard_id,
+                        replica = failure.node_id,
+                        allocation_id,
+                        "Cannot report definitive replica failure because no Raft leader is known"
+                    );
+                    continue;
+                };
+                let Some(master) = write_state.nodes.get(master_id) else {
+                    tracing::warn!(
+                        index = index_name,
+                        shard_id,
+                        replica = failure.node_id,
+                        allocation_id,
+                        master = master_id,
+                        "Cannot report definitive replica failure because the Raft leader is absent"
+                    );
+                    continue;
+                };
+                self.transport_client
+                    .forward_fail_shard_copy(
+                        master,
+                        FailShardCopyRequest {
+                            index_name: index_name.to_string(),
+                            index_uuid: index_uuid.clone(),
+                            shard_id,
+                            node_id: failure.node_id.clone(),
+                            allocation_id: Some(allocation_id),
+                            promote_only: false,
+                            expected_primary_term: primary_term,
+                        },
+                    )
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    index = index_name,
+                    shard_id,
+                    replica = failure.node_id,
+                    allocation_id,
+                    primary_term,
+                    reason = failure.message,
+                    error = %error,
+                    "Primary could not remove a definitively failed replica"
+                );
+            }
+        }
     }
 
     /// Run a maintenance operation (refresh or flush) only on shards assigned

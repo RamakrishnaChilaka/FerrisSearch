@@ -203,11 +203,14 @@ Oversized single/delete writes return a validation error before mutation;
 oversized bulk documents remain attributable item failures.
 Retryable gRPC `ABORTED` write failures map to HTTP 503
 `shard_not_available_exception` with the underlying cause preserved.
+Only `RESOURCE_EXHAUSTED` statuses carrying the stable version-map-capacity
+marker map to HTTP 429 `version_map_capacity_exceeded`; unrelated resource
+exhaustion remains a 500 forwarding failure.
 
 This does not implement full OpenSearch write concurrency semantics.
-`_version` / `_primary_term` values that appear in compatibility response shapes
-remain placeholders, and `if_seq_no` / `if_primary_term`, primary epochs,
-idempotent retries, and complete optimistic concurrency control are not yet
+`_seq_no` and `_primary_term` are real primary-assigned operation receipts.
+`_version` remains a placeholder, and `if_seq_no` / `if_primary_term`, client
+retry identity, and complete optimistic concurrency control are not yet
 implemented.
 
 Declared keyword fields accept nested arrays of string/number/boolean scalars,

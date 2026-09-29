@@ -17,7 +17,7 @@ pub async fn replicate_write(
     op: &str,          // "index" or "delete"
     seq_no: u64,       // from primary's WAL
     primary_term: u64,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<String>>
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>>
 // Err: list of error messages
 
 pub async fn replicate_bulk(
@@ -28,7 +28,7 @@ pub async fn replicate_bulk(
     docs: &[(String, Value)],
     start_seq_no: u64,
     primary_term: u64,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<String>>
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>>
 ```
 
 ## Replication Flow (Primary → Replicas)
@@ -134,7 +134,16 @@ pub async fn replicate_bulk(
   changing authority; the first later successful local write conditionally
   clears that status at the same term. Definitive and open-level failures may
   quarantine and require fresh activation after repair.
-- Failed replication returns `Err(Vec<String>)` with per-replica error messages
+- Failed replication returns typed per-replica failures retaining node,
+  allocation, message, and definitive status. A primary receiving a definitive
+  `DATA_LOSS` failure conditionally removes that exact allocation at the
+  captured term before returning the write failure.
+- Request durability requires every replica response to prove the exact
+  operation persisted; async durability requires processed proof and advances
+  persisted checkpoints only after fsync or commit.
+- Replica background auto-flush uses its own contiguous persisted prefix when
+  no primary global checkpoint exists. It may prune through that committed
+  prefix but never through a gap; promotion clears the replica-only bound.
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates only when the reporting leader hosts the primary;
   otherwise candidate selection falls back to a live in-sync cluster member.
@@ -148,6 +157,12 @@ pub async fn replicate_bulk(
   Internal redelivery is term/sequence aware, promotion fills local gaps with
   NoOps, and sustained gaps are probed before exact-allocation removal. This is
   still not general D10 rollback/resync or client retry-token support.
+- A primary engine failure after WAL append but before replication leaves an
+  operation that no replica received. After local rebuild/replay advances the
+  primary prefix, later replica responses expose the permanent gap; each
+  affected replica is normally removed after the approximately 60-second gap
+  deadline and peer-recovered. Promotion NoOps do not repair this live-primary
+  divergence; targeted gap repair is deferred to D10.
 
 ## Recovery Protocol Work
 

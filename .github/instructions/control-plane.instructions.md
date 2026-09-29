@@ -29,7 +29,9 @@ cluster-state version.
 `FailShardCopy.promote_only` is required for primary-copy reports. The state
 machine accepts such a report only when an in-sync replica can be promoted; it
 must reject rather than clear the last primary allocation. Replica reports set
-`promote_only = false`.
+`promote_only = false`. `expected_primary_term` is serde-defaulted for old Raft
+log entries; `0` means the legacy unconditioned command, while every new caller
+must send the captured nonzero term.
 
 `primary_unavailable` is status only. `MarkPrimaryUnavailable` sets it for the
 exact initialized allocation without changing authority. `MarkPrimaryAvailable`

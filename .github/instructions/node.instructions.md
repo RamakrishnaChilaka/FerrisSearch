@@ -67,7 +67,8 @@ pub struct Node {
    reports remove the exact allocation; primary reports are promote-only and
    are submitted only with an in-sync candidate. Duplicate reports are
    throttled per allocation. Definitive/open-level quarantine occurs only
-   after that throttle; Apply escalation leaves the copy open for reads.
+   after that throttle except for sequence/version collisions, which
+   quarantine immediately; Apply escalation leaves the copy open for reads.
 5. Proactively invoke the shared primary-activation path for each local primary
    after startup or promotion. The activation cache is keyed by
    UUID/shard/allocation/term so lifecycle ticks and request handlers do not
@@ -177,7 +178,9 @@ Activation persists the durable fence, replays retained WAL state, fills every
 missing local sequence through the fenced maximum with durable current-term
 NoOps, and only then enables writes. Best-effort NoOp replication may leave a
 bounded replica gap for normal probe/removal handling; it must not weaken local
-activation.
+activation. These promotion NoOps fill gaps on the promoted copy only; they do
+not repair replicas that missed a real post-WAL primary operation. Such copies
+follow the gap deadline and peer-recovery path until D10 exists.
 
 A flushed legacy v1 primary may migrate in place only through the explicit
 primary migration path, using the durable copy-identity fence as the committed

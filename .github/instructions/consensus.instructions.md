@@ -29,7 +29,7 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `ActivatePrimary { index_name, index_uuid, shard_id, primary, allocation_id, expected_term }` — conditionally bump the term and monotonically mark the shard initialized
 - `MarkPrimaryUnavailable { index_name, index_uuid, shard_id, primary, allocation_id }` — set status-only unavailability for the exact initialized primary allocation
 - `MarkPrimaryAvailable { index_name, index_uuid, shard_id, primary, allocation_id, primary_term }` — clear status-only unavailability only for the exact current primary allocation and term, without changing the term
-- `FailShardCopy { index_name, index_uuid, shard_id, node, allocation_id, promote_only, promotion_candidate }` — conditionally remove an unopenable replica or promote the leader-selected in-sync survivor; primary reports must be promote-only
+- `FailShardCopy { index_name, index_uuid, shard_id, node, allocation_id, expected_primary_term, promote_only, promotion_candidate }` — conditionally remove an unopenable replica or promote the leader-selected in-sync survivor; primary reports must be promote-only. The term field has a serde default, and `0` is the pre-field legacy unconditioned form.
 - `AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
 - `PutApiKey { record: SecurityApiKeyRecord }` — upsert a dynamic API key (stores only the hash) into `ClusterState.api_keys`
 - `DeleteApiKey { key_id: String }` — remove a dynamic API key
@@ -64,7 +64,7 @@ pub struct ClusterStateMachine {
 | `ActivatePrimary` | increment the term and set `primary_initialized` only when UUID, allocation ID, primary, and expected term match |
 | `MarkPrimaryUnavailable` | set the status-only unavailable flag for the exact initialized primary allocation; reject an already-set flag |
 | `MarkPrimaryAvailable` | clear an already-set unavailable flag only when UUID, primary, allocation, and primary term match; never change the term |
-| `FailShardCopy` | after initialization, remove only an exact failed replica allocation; a primary command must be promote-only and promotes an in-sync candidate with a term bump, otherwise it is rejected without clearing the primary allocation |
+| `FailShardCopy` | after initialization, remove only an exact failed replica allocation; nonzero `expected_primary_term` must match, while legacy zero is unconditioned. A primary command must be promote-only and promotes an in-sync candidate with a term bump, otherwise it is rejected without clearing the primary allocation |
 | `AddMappings` | merge `new_fields` into `state.indices[name].mappings` via `.entry().or_insert()` |
 | `PutApiKey` / `DeleteApiKey` | `insert` / `remove` on `state.api_keys` |
 | `PutRole` / `DeleteRole` | `insert` / `remove` on `state.roles` |

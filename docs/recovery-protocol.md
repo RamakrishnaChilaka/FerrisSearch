@@ -241,6 +241,15 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > verify the currently registered index UUID before touching disk, so a delayed
 > abort cannot recreate a deleted index incarnation.
 >
+> **D1 collision/gap correction — September 29, 2026:** definitive
+> sequence/version collisions are returned as `DATA_LOSS`, quarantined without
+> waiting for a lagging replica routing view, and reported by the primary with
+> the exact allocation and captured term. Gap probes are concurrent and
+> timeout-bounded; an assigned copy that is still opening is transient
+> `UNAVAILABLE`, while only proven identity/allocation mismatch or corruption
+> is definitive. Replicas may auto-flush only through their own committed
+> persisted prefix and never across a gap.
+>
 > **Availability-status and Apply corrections — September 27, 2026:** a
 > write-only failure no longer bypasses the local activation cache or causes
 > periodic primary-term bumps. `primary_unavailable` remains set for the exact
@@ -462,6 +471,11 @@ cancelled/drained under the shard permit before that position is resolved.
 A delayed attempt cannot subsequently replace the no-op. Once a real WAL record is durable,
 an engine failure cannot be hidden by replacing that record with a no-op: stop
 the copy, reconstruct its state, and preserve the ambiguous client outcome.
+In the implemented D1 subset, if this happens on the primary before fan-out,
+no replica receives that real record. After local replay and a later write
+expose the gap, the fixed-target timer normally removes every affected replica
+after about 60 seconds and peer recovery rebuilds it from the primary. Promotion
+NoOps do not repair this case; targeted live gap repair remains D10 work.
 
 ### Storage errors and recoverable crash tails
 

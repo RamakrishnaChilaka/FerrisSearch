@@ -8,9 +8,16 @@ use std::time::Duration;
 
 #[test]
 fn d1_commit3_version_map_capacity_is_retryable_429() {
-    let error = anyhow::Error::new(tonic::Status::resource_exhausted(
-        "version map capacity exceeded",
-    ));
+    let unrelated = anyhow::Error::new(tonic::Status::resource_exhausted("worker queue full"));
+    assert_eq!(
+        forwarded_write_error_classification(&unrelated),
+        (StatusCode::INTERNAL_SERVER_ERROR, "forward_exception")
+    );
+
+    let error = anyhow::Error::new(tonic::Status::resource_exhausted(format!(
+        "{}version map capacity exceeded",
+        crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX
+    )));
 
     assert_eq!(
         forwarded_write_error_classification(&error),

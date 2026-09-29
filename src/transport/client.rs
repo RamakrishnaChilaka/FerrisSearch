@@ -603,6 +603,7 @@ impl TransportClient {
         &self,
         node: &NodeInfo,
         request: ReplicateDocRequest,
+        require_persisted: bool,
     ) -> Result<ReplicaApplyResponse, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let response = client
@@ -610,12 +611,15 @@ impl TransportClient {
             .await?
             .into_inner();
         decode_replica_apply_response(
-            response.success,
-            &response.error,
-            response.processed_checkpoint,
-            response.persisted_checkpoint,
-            response.operation_processed,
-            response.operation_persisted,
+            ReplicaApplyResponseFields {
+                success: response.success,
+                error: &response.error,
+                processed_checkpoint: response.processed_checkpoint,
+                persisted_checkpoint: response.persisted_checkpoint,
+                operation_processed: response.operation_processed,
+                operation_persisted: response.operation_persisted,
+            },
+            require_persisted,
             "replication",
         )
     }
@@ -625,6 +629,7 @@ impl TransportClient {
         &self,
         node: &NodeInfo,
         request: ReplicateBulkRequest,
+        require_persisted: bool,
     ) -> Result<ReplicaApplyResponse, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let response = client
@@ -632,12 +637,15 @@ impl TransportClient {
             .await?
             .into_inner();
         decode_replica_apply_response(
-            response.success,
-            &response.error,
-            response.processed_checkpoint,
-            response.persisted_checkpoint,
-            response.all_operations_processed,
-            response.all_operations_persisted,
+            ReplicaApplyResponseFields {
+                success: response.success,
+                error: &response.error,
+                processed_checkpoint: response.processed_checkpoint,
+                persisted_checkpoint: response.persisted_checkpoint,
+                operation_processed: response.all_operations_processed,
+                operation_persisted: response.all_operations_persisted,
+            },
+            require_persisted,
             "bulk replication",
         )
     }
@@ -1396,39 +1404,50 @@ fn decode_shard_delete_response(
     }))
 }
 
-fn decode_replica_apply_response(
+struct ReplicaApplyResponseFields<'a> {
     success: bool,
-    error: &str,
+    error: &'a str,
     processed_checkpoint: Option<u64>,
     persisted_checkpoint: Option<u64>,
     operation_processed: bool,
     operation_persisted: bool,
+}
+
+fn decode_replica_apply_response(
+    response: ReplicaApplyResponseFields<'_>,
+    require_persisted: bool,
     label: &str,
 ) -> Result<ReplicaApplyResponse, anyhow::Error> {
-    if !success {
-        anyhow::bail!("{label} failed: {error}");
+    if !response.success {
+        anyhow::bail!("{label} failed: {}", response.error);
     }
-    if !operation_processed {
+    if !response.operation_processed {
         anyhow::bail!("successful {label} response did not prove the operation was processed");
     }
-    if persisted_checkpoint.is_some() && processed_checkpoint.is_none() {
+    if response.persisted_checkpoint.is_some() && response.processed_checkpoint.is_none() {
         anyhow::bail!("{label} response has a persisted checkpoint without a processed checkpoint");
     }
-    if let (Some(persisted), Some(processed)) = (persisted_checkpoint, processed_checkpoint)
+    if let (Some(persisted), Some(processed)) =
+        (response.persisted_checkpoint, response.processed_checkpoint)
         && persisted > processed
     {
         anyhow::bail!(
             "{label} response persisted checkpoint {persisted} exceeds processed checkpoint {processed}"
         );
     }
-    if operation_persisted && !operation_processed {
+    if response.operation_persisted && !response.operation_processed {
         anyhow::bail!("{label} response persisted an unprocessed operation");
     }
+    if require_persisted && !response.operation_persisted {
+        anyhow::bail!(
+            "successful {label} response under request durability did not prove the operation was persisted"
+        );
+    }
     Ok(ReplicaApplyResponse {
-        processed_checkpoint,
-        persisted_checkpoint,
-        operation_processed,
-        operation_persisted,
+        processed_checkpoint: response.processed_checkpoint,
+        persisted_checkpoint: response.persisted_checkpoint,
+        operation_processed: response.operation_processed,
+        operation_persisted: response.operation_persisted,
     })
 }
 
@@ -1767,28 +1786,67 @@ mod tests {
 
     #[test]
     fn replica_response_decoder_requires_exact_operation_proof() {
-        let response =
-            decode_replica_apply_response(true, "", None, None, true, false, "replication")
-                .unwrap();
+        let response = decode_replica_apply_response(
+            ReplicaApplyResponseFields {
+                success: true,
+                error: "",
+                processed_checkpoint: None,
+                persisted_checkpoint: None,
+                operation_processed: true,
+                operation_persisted: false,
+            },
+            false,
+            "replication",
+        )
+        .unwrap();
         assert!(response.operation_processed);
         assert!(!response.operation_persisted);
         assert_eq!(response.processed_checkpoint, None);
 
         assert!(
             decode_replica_apply_response(
-                true,
-                "",
-                Some(10),
-                Some(10),
-                false,
+                ReplicaApplyResponseFields {
+                    success: true,
+                    error: "",
+                    processed_checkpoint: Some(10),
+                    persisted_checkpoint: Some(10),
+                    operation_processed: false,
+                    operation_persisted: false,
+                },
                 false,
                 "replication",
             )
             .is_err()
         );
         assert!(
-            decode_replica_apply_response(true, "", Some(5), Some(6), true, true, "replication",)
-                .is_err()
+            decode_replica_apply_response(
+                ReplicaApplyResponseFields {
+                    success: true,
+                    error: "",
+                    processed_checkpoint: Some(5),
+                    persisted_checkpoint: Some(6),
+                    operation_processed: true,
+                    operation_persisted: true,
+                },
+                false,
+                "replication",
+            )
+            .is_err()
+        );
+        assert!(
+            decode_replica_apply_response(
+                ReplicaApplyResponseFields {
+                    success: true,
+                    error: "",
+                    processed_checkpoint: Some(5),
+                    persisted_checkpoint: Some(5),
+                    operation_processed: true,
+                    operation_persisted: false,
+                },
+                true,
+                "replication",
+            )
+            .is_err()
         );
     }
 

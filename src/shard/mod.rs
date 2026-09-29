@@ -434,6 +434,17 @@ pub struct ReplicaGapObservation {
     pub max_reported_checkpoint: Option<u64>,
 }
 
+impl ReplicaGapObservation {
+    fn same_probe_identity(&self, other: &Self) -> bool {
+        self.index_uuid == other.index_uuid
+            && self.replica_node_id == other.replica_node_id
+            && self.allocation_id == other.allocation_id
+            && self.primary_term == other.primary_term
+            && self.first_seen == other.first_seen
+            && self.target_checkpoint == other.target_checkpoint
+    }
+}
+
 /// Tracks replica checkpoint observations for primary shards on this node.
 ///
 /// Raft routing metadata owns authoritative in-sync membership. The lag-based
@@ -659,8 +670,7 @@ impl IsrTracker {
         &self,
         index: &str,
         shard_id: u32,
-        replica_node_id: &str,
-        allocation_id: AllocationId,
+        expected: &ReplicaGapObservation,
         processed_checkpoint: Option<u64>,
     ) -> bool {
         let key = ShardKey::new(index, shard_id);
@@ -671,11 +681,11 @@ impl IsrTracker {
             .unwrap_or_else(|e| e.into_inner());
         let Some(observation) = gaps
             .get_mut(&key)
-            .and_then(|observations| observations.get_mut(replica_node_id))
+            .and_then(|observations| observations.get_mut(&expected.replica_node_id))
         else {
             return false;
         };
-        if observation.allocation_id != allocation_id {
+        if !observation.same_probe_identity(expected) {
             return false;
         }
         let max_reported =
@@ -683,8 +693,8 @@ impl IsrTracker {
         observation.max_reported_checkpoint = max_reported;
         if let Some(stored) = replicas
             .get_mut(&key)
-            .and_then(|replicas| replicas.get_mut(replica_node_id))
-            .filter(|stored| stored.allocation_id == allocation_id)
+            .and_then(|replicas| replicas.get_mut(&expected.replica_node_id))
+            .filter(|stored| stored.allocation_id == expected.allocation_id)
         {
             stored.processed_checkpoint =
                 Self::max_checkpoint(stored.processed_checkpoint, processed_checkpoint);
@@ -692,7 +702,7 @@ impl IsrTracker {
         }
         if max_reported.is_some_and(|reported| reported >= observation.target_checkpoint) {
             if let Some(observations) = gaps.get_mut(&key) {
-                observations.remove(replica_node_id);
+                observations.remove(&expected.replica_node_id);
             }
             return true;
         }
@@ -703,9 +713,7 @@ impl IsrTracker {
         &self,
         index: &str,
         shard_id: u32,
-        replica_node_id: &str,
-        allocation_id: AllocationId,
-        primary_term: u64,
+        expected: &ReplicaGapObservation,
     ) {
         let key = ShardKey::new(index, shard_id);
         let mut gaps = self
@@ -716,13 +724,10 @@ impl IsrTracker {
             return;
         };
         if observations
-            .get(replica_node_id)
-            .is_some_and(|observation| {
-                observation.allocation_id == allocation_id
-                    && observation.primary_term == primary_term
-            })
+            .get(&expected.replica_node_id)
+            .is_some_and(|observation| observation.same_probe_identity(expected))
         {
-            observations.remove(replica_node_id);
+            observations.remove(&expected.replica_node_id);
         }
     }
 
@@ -730,19 +735,14 @@ impl IsrTracker {
         &self,
         index: &str,
         shard_id: u32,
-        replica_node_id: &str,
-        allocation_id: AllocationId,
-        primary_term: u64,
+        expected: &ReplicaGapObservation,
     ) -> bool {
         self.gap_observations
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&ShardKey::new(index, shard_id))
-            .and_then(|observations| observations.get(replica_node_id))
-            .is_some_and(|observation| {
-                observation.allocation_id == allocation_id
-                    && observation.primary_term == primary_term
-            })
+            .and_then(|observations| observations.get(&expected.replica_node_id))
+            .is_some_and(|observation| observation.same_probe_identity(expected))
     }
 
     #[cfg(test)]
@@ -1509,6 +1509,10 @@ impl ShardManager {
             .cloned()
     }
 
+    pub fn durability(&self) -> TranslogDurability {
+        self.durability
+    }
+
     pub fn validate_open_copy_identity(
         &self,
         index: &str,
@@ -1542,8 +1546,25 @@ impl ShardManager {
                     .downcast_ref::<crate::engine::tantivy::SequenceOperationCollisionError>()
                     .is_some()
                 || cause
+                    .downcast_ref::<crate::engine::version_map::VersionMapCollisionError>()
+                    .is_some()
+                || cause
                     .downcast_ref::<tantivy::TantivyError>()
                     .is_some_and(Self::tantivy_failure_is_definitive)
+        })
+    }
+
+    pub(crate) fn is_sequence_collision_failure(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::engine::sequence::PrimaryTermSequenceCollisionError>()
+                .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::tantivy::SequenceOperationCollisionError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::version_map::VersionMapCollisionError>()
+                    .is_some()
         })
     }
 
@@ -4434,18 +4455,53 @@ mod tests {
             &[replica_checkpoint("r1", 7, Some(0), Some(0))],
             first_seen,
         );
-        assert_eq!(
-            tracker
-                .expired_gap_observations_at(
-                    Duration::from_secs(60),
-                    first_seen + Duration::from_secs(61)
-                )
-                .len(),
-            1
+        let mut expired = tracker.expired_gap_observations_at(
+            Duration::from_secs(60),
+            first_seen + Duration::from_secs(61),
+        );
+        assert_eq!(expired.len(), 1);
+        let (_, observation) = expired.pop().unwrap();
+
+        assert!(tracker.record_gap_probe_checkpoint("idx", 0, &observation, Some(5)));
+        assert!(tracker.gap_observations("idx", 0).is_empty());
+    }
+
+    #[test]
+    fn review_c3_stale_probe_cannot_mutate_reopened_gap_observation() {
+        let tracker = IsrTracker::new(100);
+        let first_seen = Instant::now();
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(5),
+            },
+            &[replica_checkpoint("r1", 7, Some(0), Some(0))],
+            first_seen,
+        );
+        let old = tracker.gap_observations("idx", 0).pop().unwrap();
+        tracker.remove_gap_observation("idx", 0, &old);
+
+        let reopened_at = first_seen + Duration::from_secs(30);
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(10),
+            },
+            &[replica_checkpoint("r1", 7, Some(0), Some(0))],
+            reopened_at,
         );
 
-        assert!(tracker.record_gap_probe_checkpoint("idx", 0, "r1", 7, Some(5)));
-        assert!(tracker.gap_observations("idx", 0).is_empty());
+        assert!(!tracker.record_gap_probe_checkpoint("idx", 0, &old, Some(10)));
+        let observations = tracker.gap_observations("idx", 0);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].first_seen, reopened_at);
+        assert_eq!(observations[0].target_checkpoint, 10);
     }
 
     #[test]

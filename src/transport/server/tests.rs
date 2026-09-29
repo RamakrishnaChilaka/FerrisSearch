@@ -3939,3 +3939,476 @@ async fn search_remote_store_splits_requires_local_index_metadata() {
     assert_eq!(err.code(), tonic::Code::NotFound);
     assert!(err.message().contains("index [remotehits] not found"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_c3_collision_with_lagging_view_quarantines_copy() {
+    let mut state = gap_test_state(0);
+    state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap()
+        .primary_term = 1;
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let allocation_id = state.shard_allocation_id("idx", 0, "replica").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let engine = shards
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    engine
+        .apply_replica_batch(
+            (0..=5)
+                .map(|seq_no| crate::engine::SequencedOperation {
+                    seq_no,
+                    primary_term: 1,
+                    mutation: crate::engine::DocumentMutation::Index {
+                        doc_id: format!("doc-{seq_no}"),
+                        source: json!({"term": 1, "seq": seq_no}),
+                    },
+                })
+                .collect(),
+        )
+        .unwrap();
+    let manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    manager.update_state(state);
+    let service = TransportService {
+        cluster_manager: manager,
+        shard_manager: shards.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "replica".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    match service
+        .replicate_doc(Request::new(ReplicateDocRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            doc_id: "doc-5".into(),
+            payload_json: serde_json::to_vec(&json!({"term": 2})).unwrap(),
+            op: "index".into(),
+            seq_no: 5,
+            index_uuid: "uuid-1".into(),
+            primary_term: Some(2),
+            target_allocation_id: Some(allocation_id),
+        }))
+        .await
+    {
+        Ok(response) => assert!(!response.into_inner().success),
+        Err(status) => assert_eq!(status.code(), tonic::Code::DataLoss),
+    }
+    assert!(
+        shards.get_shard("idx", 0).is_none(),
+        "a definitive collision must quarantine the copy even when its routing view lags"
+    );
+}
+
+#[derive(Clone, Default)]
+struct ReviewC3LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for ReviewC3LogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn review_c3_unopened_copy_gap_probe_is_transient() {
+    let logs = ReviewC3LogBuffer::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replica_port = listener.local_addr().unwrap().port();
+    let mut state = gap_test_state(replica_port);
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_shards = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    replica_manager.update_state(state.clone());
+    let replica_service = TransportService {
+        cluster_manager: replica_manager,
+        shard_manager: replica_shards,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(replica_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "replica".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(InternalTransportServer::new(replica_service))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let allocation_id = state.shard_allocation_id("idx", 0, "replica").unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_shards = Arc::new(ShardManager::new(
+        source_dir.path(),
+        Duration::from_secs(60),
+    ));
+    source_shards.isr_tracker.update_replica_checkpoints_at(
+        "idx",
+        0,
+        crate::shard::ReplicaCheckpointContext {
+            index_uuid: "uuid-1",
+            primary_term: 2,
+            primary_processed_checkpoint: Some(5),
+        },
+        &[crate::shard::ReplicaCheckpointUpdate {
+            node_id: "replica".into(),
+            allocation_id,
+            processed_checkpoint: Some(4),
+            persisted_checkpoint: Some(4),
+        }],
+        std::time::Instant::now() - Duration::from_secs(61),
+    );
+    let source_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    source_manager.update_state(state);
+    let source_service = TransportService {
+        cluster_manager: source_manager,
+        shard_manager: source_shards.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(source_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "source".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    source_service.reconcile_replica_gaps().await;
+    server.abort();
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        captured.contains("Replica gap probe failed transiently"),
+        "{captured}"
+    );
+    assert!(
+        !captured.contains("Failed to remove replica after the fixed gap target remained unmet"),
+        "{captured}"
+    );
+    assert_eq!(
+        source_shards.isr_tracker.gap_observations("idx", 0).len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_c3_primary_reports_collision_from_lagging_view_replica() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replica_port = listener.local_addr().unwrap().port();
+    let mut authoritative = gap_test_state(replica_port);
+    authoritative
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let allocation_id = authoritative
+        .shard_allocation_id("idx", 0, "replica")
+        .unwrap();
+
+    let mut lagged = authoritative.clone();
+    lagged
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap()
+        .primary_term = 1;
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_shards = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_engine = replica_shards
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    replica_engine
+        .apply_replica_batch(
+            (0..=5)
+                .map(|seq_no| crate::engine::SequencedOperation {
+                    seq_no,
+                    primary_term: 1,
+                    mutation: crate::engine::DocumentMutation::Index {
+                        doc_id: format!("doc-{seq_no}"),
+                        source: json!({"term": 1, "seq": seq_no}),
+                    },
+                })
+                .collect(),
+        )
+        .unwrap();
+    let replica_manager = Arc::new(ClusterManager::new(lagged.cluster_name.clone()));
+    replica_manager.update_state(lagged);
+    let replica_service = TransportService {
+        cluster_manager: replica_manager,
+        shard_manager: replica_shards,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(replica_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "replica".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let replica_server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(InternalTransportServer::new(replica_service))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let (raft, shared_state) =
+        crate::consensus::create_raft_instance_mem(1, authoritative.cluster_name.clone())
+            .await
+            .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !raft.is_leader() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    *shared_state.write().unwrap() = authoritative.clone();
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_service = TransportService {
+        cluster_manager: Arc::new(ClusterManager::with_shared_state(shared_state.clone())),
+        shard_manager: Arc::new(ShardManager::new(
+            primary_dir.path(),
+            Duration::from_secs(60),
+        )),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(primary_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: Some(raft),
+        local_node_id: "source".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    let failures = crate::replication::replicate_write_with_durability(
+        &primary_service.transport_client,
+        &authoritative,
+        "idx",
+        0,
+        "doc-5",
+        &json!({"term": 2}),
+        "index",
+        5,
+        2,
+        crate::wal::TranslogDurability::Request,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].definitive);
+    assert_eq!(failures[0].allocation_id, Some(allocation_id));
+
+    primary_service
+        .report_definitive_replica_failures(&authoritative, "idx", 0, 2, &failures)
+        .await;
+    replica_server.abort();
+
+    let state = shared_state.read().unwrap();
+    let routing = &state.indices["idx"].shard_routing[&0];
+    assert!(routing.replicas.is_empty());
+    assert!(routing.in_sync_replicas.is_empty());
+    assert_eq!(routing.unassigned_replicas, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_c3_gap_probes_run_concurrently_with_short_timeout() {
+    let listener_one = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_two = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_one = listener_one.local_addr().unwrap().port();
+    let port_two = listener_two.local_addr().unwrap().port();
+    let blackhole = |listener: tokio::net::TcpListener| {
+        tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+            }
+        })
+    };
+    let blackhole_one = blackhole(listener_one);
+    let blackhole_two = blackhole(listener_two);
+
+    let mut state = gap_test_state(port_one);
+    state.add_node(DomainNodeInfo {
+        id: "replica-2".into(),
+        name: "replica-2".into(),
+        host: "127.0.0.1".into(),
+        transport_port: port_two,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    let allocation_two = 2;
+    {
+        let routing = state
+            .indices
+            .get_mut("idx")
+            .unwrap()
+            .shard_routing
+            .get_mut(&0)
+            .unwrap();
+        routing.replicas.push("replica-2".into());
+        routing.in_sync_replicas.push("replica-2".into());
+    }
+    {
+        let allocations = state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap();
+        allocations
+            .replicas
+            .insert("replica-2".into(), allocation_two);
+        allocations.primary_initialized = true;
+    }
+    let allocation_one = state.shard_allocation_id("idx", 0, "replica").unwrap();
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_shards = Arc::new(ShardManager::new(
+        source_dir.path(),
+        Duration::from_secs(60),
+    ));
+    source_shards.isr_tracker.update_replica_checkpoints_at(
+        "idx",
+        0,
+        crate::shard::ReplicaCheckpointContext {
+            index_uuid: "uuid-1",
+            primary_term: 2,
+            primary_processed_checkpoint: Some(5),
+        },
+        &[
+            crate::shard::ReplicaCheckpointUpdate {
+                node_id: "replica".into(),
+                allocation_id: allocation_one,
+                processed_checkpoint: Some(4),
+                persisted_checkpoint: Some(4),
+            },
+            crate::shard::ReplicaCheckpointUpdate {
+                node_id: "replica-2".into(),
+                allocation_id: allocation_two,
+                processed_checkpoint: Some(4),
+                persisted_checkpoint: Some(4),
+            },
+        ],
+        std::time::Instant::now() - Duration::from_secs(61),
+    );
+    let manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    manager.update_state(state);
+    let service = TransportService {
+        cluster_manager: manager,
+        shard_manager: source_shards.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(source_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "source".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    let started = std::time::Instant::now();
+    service
+        .reconcile_replica_gaps_with_probe_timeout(Duration::from_millis(300))
+        .await;
+    let elapsed = started.elapsed();
+    blackhole_one.abort();
+    blackhole_two.abort();
+
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "two concurrent 300ms probes took {elapsed:?}"
+    );
+    assert_eq!(
+        source_shards.isr_tracker.gap_observations("idx", 0).len(),
+        2
+    );
+}

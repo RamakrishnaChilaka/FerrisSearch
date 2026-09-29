@@ -106,8 +106,11 @@ tokio::select! {
 - Subscribes to `SettingsManager::watch_flush_threshold()` for WAL auto-flush
 - Reacts to dynamic `refresh_interval_ms` and `flush_threshold_bytes` settings changes without restart
 - Each refresh/auto-flush tick must run on Tokio's blocking pool (`spawn_blocking`) because `refresh()`, checkpoint-aware truncation, and vector persistence all perform blocking I/O; never run shard maintenance inline on async runtime workers or Raft heartbeats can stall during multi-shard compaction bursts
-- Auto-flush must use `flush_with_global_checkpoint()` and skip only when the
-  global checkpoint is `None`; sequence zero is a valid safe checkpoint.
+- Primary auto-flush must use the global checkpoint and skip when it is
+  `None`; sequence zero is a valid safe checkpoint.
+- Replica apply tracks a separate monotonic local persisted prefix. When no
+  primary global checkpoint exists, replica auto-flush may truncate only
+  through that prefix. Clear this replica-only bound before primary activation.
 - Background auto-flush should use best-effort helpers so maintenance ticks defer instead of blocking active ingestion or vector persistence
 
 ### Vector Auto-detection

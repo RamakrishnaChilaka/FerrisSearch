@@ -398,6 +398,8 @@ pub struct VersionMapCapacityError {
     pub max_bytes: usize,
 }
 
+pub(crate) const VERSION_MAP_CAPACITY_STATUS_PREFIX: &str = "version_map_capacity_exceeded: ";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +451,18 @@ mod tests {
         versions.apply_delete("doc", 2, 1);
         let error = versions.lookup("doc").unwrap_err();
         assert!(error.is::<VersionMapCollisionError>());
+    }
+
+    #[test]
+    fn review_c3_version_map_collision_is_definitive() {
+        let mut versions = LiveVersionMap::new(usize::MAX);
+        versions.apply_index("doc", 2, 1);
+        versions.apply_delete("doc", 2, 1);
+
+        let error = versions.lookup("doc").unwrap_err();
+        assert!(crate::shard::ShardManager::is_definitive_copy_failure(
+            &error
+        ));
     }
 
     #[test]

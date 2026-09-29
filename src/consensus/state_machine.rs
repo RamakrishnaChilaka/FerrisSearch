@@ -513,12 +513,9 @@ impl ClusterStateMachine {
                         "index '{index_name}' has no shard {shard_id}"
                     ));
                 };
-                if *expected_primary_term == 0 {
-                    return ClusterResponse::Error(format!(
-                        "failed-copy primary term must be greater than zero for index '{index_name}' shard {shard_id}"
-                    ));
-                }
-                if current_routing.primary_term != *expected_primary_term {
+                if *expected_primary_term != 0
+                    && current_routing.primary_term != *expected_primary_term
+                {
                     return ClusterResponse::Error(format!(
                         "primary term mismatch for failed copy of index '{index_name}' shard {shard_id}: expected {}, got {}",
                         current_routing.primary_term, expected_primary_term
@@ -1522,6 +1519,29 @@ mod tests {
                 .unwrap()
                 .shard_allocation_id("idx", 0, "node-2"),
             Some(14)
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::FailShardCopy {
+                    index_name: "idx".into(),
+                    index_uuid: "test-uuid".into(),
+                    shard_id: 0,
+                    node: "node-2".into(),
+                    allocation_id: 14,
+                    expected_primary_term: 0,
+                    promote_only: false,
+                    promotion_candidate: None,
+                },
+                16,
+            ),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.state_handle()
+                .read()
+                .unwrap()
+                .shard_allocation_id("idx", 0, "node-2"),
+            None
         );
     }
 

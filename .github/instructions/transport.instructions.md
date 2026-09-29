@@ -154,7 +154,19 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - Successful replica responses carry optional processed and persisted
   checkpoints and must prove the exact single operation or every bulk item was
   processed. A behind contiguous checkpoint is a gap observation, not failure
-  of the current operation.
+  of the current operation. Under request durability the client also requires
+  exact-operation persisted proof; async durability may acknowledge processing
+  before the timer fsync.
+- A sequence/version collision is `DATA_LOSS`, is quarantined immediately even
+  when the replica's routing view lags the message term, and retains exact node
+  and allocation identity through fan-out. The primary conditionally reports
+  that exact copy at the write's captured term; do not depend only on the
+  replica's local routing view to start recovery.
+- Gap probes run concurrently under a two-second per-probe timeout. A copy that
+  is assigned but still opening/replaying returns `UNAVAILABLE`. Only proven
+  UUID/allocation/durable-identity mismatch (`FAILED_PRECONDITION`) or
+  corruption (`DATA_LOSS`) is definitive. Probe completion must still match
+  the exact observation start/target identity before removal.
 - **recover_replica**: Compatibility/testing-only RPC that reads processed
   operations in retained physical file order and reports optional
   processed/persisted/max stats. Never construct a second
@@ -219,7 +231,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   the shared count/time policy is exhausted. Quarantine happens only after the
   report throttle and only for definitive or open-level failures; Apply
   escalation leaves the engine open for reads and never triggers runtime WAL
-  replay. Replica escalation removes the copy; primary escalation is
+  replay. Sequence/version collisions bypass the ordinary quarantine throttle.
+  Replica escalation removes the copy; primary escalation is
   promote-only and requires an in-sync candidate.
 - Production transport and node lifecycle share one primary-activation state.
   Proactive lifecycle activation and request-triggered activation are

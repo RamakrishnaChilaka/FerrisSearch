@@ -8,7 +8,49 @@ use crate::cluster::state::ClusterState;
 use crate::shard::ReplicaCheckpointUpdate;
 use crate::transport::TransportClient;
 use crate::transport::proto::{ReplicateBulkRequest, ReplicateDocRequest};
+use crate::wal::TranslogDurability;
 use tracing::error;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaReplicationFailure {
+    pub node_id: String,
+    pub allocation_id: Option<u64>,
+    pub message: String,
+    pub definitive: bool,
+}
+
+impl ReplicaReplicationFailure {
+    fn message(node_id: impl Into<String>, allocation_id: Option<u64>, message: String) -> Self {
+        Self {
+            node_id: node_id.into(),
+            allocation_id,
+            message,
+            definitive: false,
+        }
+    }
+
+    fn from_error(node_id: String, allocation_id: u64, error: anyhow::Error) -> Self {
+        let definitive = error
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == tonic::Code::DataLoss);
+        Self {
+            message: format!("{node_id}: {error}"),
+            node_id,
+            allocation_id: Some(allocation_id),
+            definitive,
+        }
+    }
+
+    pub fn contains(&self, value: &str) -> bool {
+        self.message.contains(value)
+    }
+}
+
+impl std::fmt::Display for ReplicaReplicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
 
 /// Replicate a single document write to all in-sync replica nodes for a shard.
 /// Returns Ok(replica_checkpoints) if all in-sync replicas acknowledged, Err otherwise.
@@ -24,7 +66,35 @@ pub async fn replicate_write(
     op: &str,
     seq_no: u64,
     primary_term: u64,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<String>> {
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    replicate_write_with_durability(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        doc_id,
+        payload,
+        op,
+        seq_no,
+        primary_term,
+        TranslogDurability::Request,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn replicate_write_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    doc_id: &str,
+    payload: &serde_json::Value,
+    op: &str,
+    seq_no: u64,
+    primary_term: u64,
+    durability: TranslogDurability,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
         None => return Ok(vec![]), // no index metadata, nothing to replicate
@@ -34,9 +104,13 @@ pub async fn replicate_write(
     };
     let index_uuid = metadata.uuid.to_string();
     if routing.primary_term != primary_term {
-        return Err(vec![format!(
-            "replication term {primary_term} does not match captured routing term {}",
-            routing.primary_term
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<routing>",
+            None,
+            format!(
+                "replication term {primary_term} does not match captured routing term {}",
+                routing.primary_term
+            ),
         )]);
     }
 
@@ -58,7 +132,11 @@ pub async fn replicate_write(
                     (
                         rid.clone(),
                         0,
-                        Err(format!("Replica node {rid} not in cluster state")),
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            None,
+                            format!("Replica node {rid} not in cluster state"),
+                        )),
                     )
                 }));
                 continue;
@@ -78,8 +156,10 @@ pub async fn replicate_write(
                 (
                     rid.clone(),
                     0,
-                    Err(format!(
-                        "Replica node {rid} has no allocation ID in cluster state"
+                    Err(ReplicaReplicationFailure::message(
+                        rid.clone(),
+                        None,
+                        format!("Replica node {rid} has no allocation ID in cluster state"),
                     )),
                 )
             }));
@@ -94,7 +174,11 @@ pub async fn replicate_write(
                     return (
                         rid.clone(),
                         target_allocation_id,
-                        Err(format!("{rid}: serialize replica payload: {error}")),
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            Some(target_allocation_id),
+                            format!("{rid}: serialize replica payload: {error}"),
+                        )),
                     );
                 }
             };
@@ -112,15 +196,19 @@ pub async fn replicate_write(
                         primary_term: Some(primary_term),
                         target_allocation_id: Some(target_allocation_id),
                     },
+                    matches!(durability, TranslogDurability::Request),
                 )
                 .await
             {
                 Ok(checkpoint) => (rid, target_allocation_id, Ok(checkpoint)),
-                Err(e) => (
-                    rid.clone(),
-                    target_allocation_id,
-                    Err(format!("{rid}: {e}")),
-                ),
+                Err(error) => {
+                    let failure = ReplicaReplicationFailure::from_error(
+                        rid.clone(),
+                        target_allocation_id,
+                        error,
+                    );
+                    (rid, target_allocation_id, Err(failure))
+                }
             }
         }));
     }
@@ -148,7 +236,11 @@ pub async fn replicate_write(
             }
             Err(e) => {
                 error!("Replication task panicked: {}", e);
-                errors.push(format!("task panicked: {e}"));
+                errors.push(ReplicaReplicationFailure::message(
+                    "<task>",
+                    None,
+                    format!("task panicked: {e}"),
+                ));
             }
         }
     }
@@ -170,7 +262,31 @@ pub async fn replicate_bulk(
     docs: &[(String, serde_json::Value)],
     start_seq_no: u64,
     primary_term: u64,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<String>> {
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    replicate_bulk_with_durability(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        docs,
+        start_seq_no,
+        primary_term,
+        TranslogDurability::Request,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn replicate_bulk_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    docs: &[(String, serde_json::Value)],
+    start_seq_no: u64,
+    primary_term: u64,
+    durability: TranslogDurability,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
         None => return Ok(vec![]),
@@ -180,9 +296,13 @@ pub async fn replicate_bulk(
     };
     let index_uuid = metadata.uuid.to_string();
     if routing.primary_term != primary_term {
-        return Err(vec![format!(
-            "bulk replication term {primary_term} does not match captured routing term {}",
-            routing.primary_term
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<routing>",
+            None,
+            format!(
+                "bulk replication term {primary_term} does not match captured routing term {}",
+                routing.primary_term
+            ),
         )]);
     }
 
@@ -205,7 +325,11 @@ pub async fn replicate_bulk(
                     (
                         rid.clone(),
                         0,
-                        Err(format!("Replica node {rid} not in cluster state")),
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            None,
+                            format!("Replica node {rid} not in cluster state"),
+                        )),
                     )
                 }));
                 continue;
@@ -223,8 +347,10 @@ pub async fn replicate_bulk(
                 (
                     rid.clone(),
                     0,
-                    Err(format!(
-                        "Replica node {rid} has no allocation ID in cluster state"
+                    Err(ReplicaReplicationFailure::message(
+                        rid.clone(),
+                        None,
+                        format!("Replica node {rid} has no allocation ID in cluster state"),
                     )),
                 )
             }));
@@ -261,7 +387,11 @@ pub async fn replicate_bulk(
                     return (
                         rid.clone(),
                         target_allocation_id,
-                        Err(format!("{rid}: {error}")),
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            Some(target_allocation_id),
+                            format!("{rid}: {error}"),
+                        )),
                     );
                 }
             };
@@ -276,15 +406,19 @@ pub async fn replicate_bulk(
                         primary_term: Some(primary_term),
                         target_allocation_id: Some(target_allocation_id),
                     },
+                    matches!(durability, TranslogDurability::Request),
                 )
                 .await
             {
                 Ok(checkpoint) => (rid, target_allocation_id, Ok(checkpoint)),
-                Err(e) => (
-                    rid.clone(),
-                    target_allocation_id,
-                    Err(format!("{rid}: {e}")),
-                ),
+                Err(error) => {
+                    let failure = ReplicaReplicationFailure::from_error(
+                        rid.clone(),
+                        target_allocation_id,
+                        error,
+                    );
+                    (rid, target_allocation_id, Err(failure))
+                }
             }
         }));
     }
@@ -312,7 +446,11 @@ pub async fn replicate_bulk(
             }
             Err(e) => {
                 error!("Bulk replication task panicked: {}", e);
-                errors.push(format!("task panicked: {e}"));
+                errors.push(ReplicaReplicationFailure::message(
+                    "<task>",
+                    None,
+                    format!("task panicked: {e}"),
+                ));
             }
         }
     }

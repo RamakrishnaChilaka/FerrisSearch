@@ -24,6 +24,8 @@ pub struct CompositeEngine {
     data_dir: std::path::PathBuf,
     /// Monotonic replicated persisted checkpoint (primary only).
     global_cp: Mutex<Option<u64>>,
+    /// Monotonic local persisted prefix learned through replica apply.
+    replica_persisted_cp: Mutex<Option<u64>>,
     /// Shared column cache for fast-field Arrow arrays.
     #[allow(dead_code)]
     column_cache: Arc<super::column_cache::ColumnCache>,
@@ -87,6 +89,7 @@ impl CompositeEngine {
             vector: RwLock::new(vector),
             data_dir,
             global_cp: Mutex::new(None),
+            replica_persisted_cp: Mutex::new(None),
             column_cache,
         })
     }
@@ -112,6 +115,7 @@ impl CompositeEngine {
             vector: RwLock::new(None),
             data_dir,
             global_cp: Mutex::new(None),
+            replica_persisted_cp: Mutex::new(None),
             column_cache,
         })
     }
@@ -138,6 +142,7 @@ impl CompositeEngine {
             vector: RwLock::new(None),
             data_dir,
             global_cp: Mutex::new(None),
+            replica_persisted_cp: Mutex::new(None),
             column_cache,
         })
     }
@@ -162,6 +167,7 @@ impl CompositeEngine {
             vector: RwLock::new(None),
             data_dir,
             global_cp: Mutex::new(None),
+            replica_persisted_cp: Mutex::new(None),
             column_cache,
         })
     }
@@ -311,9 +317,9 @@ impl CompositeEngine {
             return Ok(false);
         }
 
-        let Some(global_checkpoint) = self.global_checkpoint() else {
+        let Some(truncation_checkpoint) = self.safe_truncation_checkpoint() else {
             tracing::debug!(
-                "Skipping auto-flush with translog size {} bytes because no global checkpoint is available",
+                "Skipping auto-flush with translog size {} bytes because no safe truncation checkpoint is available",
                 tl_size
             );
             return Ok(false);
@@ -326,7 +332,7 @@ impl CompositeEngine {
         );
         if !self
             .text
-            .try_flush_with_global_checkpoint(global_checkpoint)?
+            .try_flush_with_global_checkpoint(truncation_checkpoint)?
         {
             tracing::debug!(
                 "Skipping auto-flush with translog size {} bytes because the shard is busy ingesting or committing",
@@ -340,6 +346,26 @@ impl CompositeEngine {
             );
         }
         Ok(true)
+    }
+
+    fn record_replica_persisted_checkpoint(&self, checkpoint: Option<u64>) {
+        let Some(checkpoint) = checkpoint else {
+            return;
+        };
+        let mut current = self
+            .replica_persisted_cp
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *current = Some(current.map_or(checkpoint, |value| value.max(checkpoint)));
+    }
+
+    fn safe_truncation_checkpoint(&self) -> Option<u64> {
+        self.global_checkpoint().or_else(|| {
+            *self
+                .replica_persisted_cp
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        })
     }
 
     /// Ensure a vector index exists with the given dimensions.
@@ -670,6 +696,7 @@ impl SearchEngine for CompositeEngine {
                 self.apply_prepared_vector_mutation(&operation_for_rebuild, &prepared)?;
             }
         }
+        self.record_replica_persisted_checkpoint(receipt.sequence.persisted_checkpoint);
         Ok(receipt)
     }
 
@@ -712,6 +739,7 @@ impl SearchEngine for CompositeEngine {
                 }
             }
         }
+        self.record_replica_persisted_checkpoint(receipt.sequence.persisted_checkpoint);
         Ok(receipt)
     }
 
@@ -741,8 +769,9 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn flush_with_global_checkpoint(&self) -> Result<()> {
-        if let Some(global_checkpoint) = self.global_checkpoint() {
-            self.text.flush_with_global_checkpoint(global_checkpoint)?;
+        if let Some(truncation_checkpoint) = self.safe_truncation_checkpoint() {
+            self.text
+                .flush_with_global_checkpoint(truncation_checkpoint)?;
         } else {
             self.text.flush_without_truncation()?;
         }
@@ -963,6 +992,10 @@ impl SearchEngine for CompositeEngine {
         &self,
         primary_term: u64,
     ) -> Result<Vec<super::SequencedOperation>> {
+        *self
+            .replica_persisted_cp
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         self.text.prepare_primary_activation(primary_term)
     }
 
@@ -1788,6 +1821,63 @@ mod tests {
         assert!(flushed_second);
         assert!(after_second > 0);
         assert!(after_second < before_second);
+    }
+
+    #[test]
+    fn review_c3_replica_auto_flush_prunes_only_persisted_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let apply = |seq_no: u64| {
+            engine
+                .apply_replica_operation(crate::engine::SequencedOperation {
+                    seq_no,
+                    primary_term: 1,
+                    mutation: crate::engine::DocumentMutation::Index {
+                        doc_id: format!("doc-{seq_no}"),
+                        source: json!({"value": seq_no}),
+                    },
+                })
+                .unwrap()
+        };
+
+        let first = apply(0);
+        assert_eq!(first.sequence.persisted_checkpoint, Some(0));
+        assert!(engine.maybe_auto_flush(1).unwrap());
+        assert!(
+            engine
+                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .is_empty(),
+            "the committed persisted prefix should be pruned"
+        );
+
+        let above_gap = apply(2);
+        assert_eq!(above_gap.sequence.persisted_checkpoint, Some(0));
+        assert!(engine.maybe_auto_flush(1).unwrap());
+        assert_eq!(
+            engine
+                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .iter()
+                .map(|operation| operation.seq_no)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "auto-flush must retain operations above a permanent gap"
+        );
+
+        let filled = apply(1);
+        assert_eq!(filled.sequence.persisted_checkpoint, Some(2));
+        assert!(engine.maybe_auto_flush(1).unwrap());
+        assert!(
+            engine
+                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .is_empty(),
+            "once the gap closes, the newly committed persisted prefix may be pruned"
+        );
     }
 
     #[test]

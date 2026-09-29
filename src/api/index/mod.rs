@@ -25,14 +25,20 @@ fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &
     if is_document_validation_error(error) {
         return (StatusCode::BAD_REQUEST, "mapper_parsing_exception");
     }
-    match error
-        .downcast_ref::<tonic::Status>()
-        .map(tonic::Status::code)
-    {
-        Some(tonic::Code::ResourceExhausted) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "version_map_capacity_exceeded",
-        ),
+    let status = error.downcast_ref::<tonic::Status>();
+    match status.map(tonic::Status::code) {
+        Some(tonic::Code::ResourceExhausted)
+            if status.is_some_and(|status| {
+                status
+                    .message()
+                    .starts_with(crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX)
+            }) =>
+        {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "version_map_capacity_exceeded",
+            )
+        }
         Some(tonic::Code::Aborted) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "shard_not_available_exception",
