@@ -153,6 +153,10 @@ cargo test -- test_name                         # Single test by name
   `TraceD1Collision` with the B1 slice, and `TraceD1Recovery` with
   `PeerRecovery`. Do not replace these with a deterministic replay machine or
   duplicate planner/routing rules in the trace module.
+- One trace uses exactly one composition. Mixed replication/failover,
+  recovery/crash-fence-commit, or collision/later-write scenarios must be split
+  into concern-specific traces. Keep the exact event vocabularies synchronized
+  with `SCHEMA.md`.
 - TLC trace acceptance is existential witness search with a validator-owned
   hidden-action bound. A pass means only that the finite observation can be
   embedded in the selected bounded model; it is not an implementation proof.
@@ -167,6 +171,12 @@ cargo test -- test_name                         # Single test by name
   mandatory for every available copy at quiescence and after replay/admission.
   Refresh before taking it. Deleted-state identity is trace-owned and must not
   depend on the 60-second tombstone-retention cache.
+- Bulk traces may append every item before any item processing event. A bulk
+  replica response may carry the batch-final persisted checkpoint; require
+  item-local persisted <= response persisted <= current replica persisted.
+- Recovery catch-up ordering assumes an activated-primary source scanning the
+  pinned physical WAL with one exclusive cursor. Do not claim support for
+  duplicate or out-of-order catch-up traces.
 - Protocol trace events must be synchronously ordered by the process-global
   trace sink and emitted after the named effect but before releasing its
   linearizing lock. Every mutable field in one event comes from that same lock;

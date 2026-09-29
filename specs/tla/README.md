@@ -343,7 +343,9 @@ entire trace through real actions:
 - `TraceD1Recovery.tla` uses `PeerRecovery` and base replication actions.
 
 The converter infers the composition from the event vocabulary; the emitter
-does not select a profile. Hidden-action bounds are validator-owned.
+does not select a profile. Hidden-action bounds are validator-owned. Exactly
+one composition is allowed per trace. A test that covers replicated writes and
+then failover, for example, emits separate core and authority traces.
 Observed low-level WAL, fence, and commit records may be D1 stuttering steps,
 but they are tied to a later real action and semantic `copy_state`. Observed
 records cannot be reordered or discarded.
@@ -358,10 +360,18 @@ per-node routing views, exact in-sync removal, restart-time state restoration,
 failed-replay unavailability, and semantic `copy_state`. Checkpoints appear
 only on events emitted under the apply-state boundary.
 
-Recovery control actions compose with the D1 fixed planner for live
-replication and ordered catch-up. Peer recovery's implemented cursor remains
-strictly increasing, so out-of-order or duplicate catch-up batches are not
-expressible in that composition.
+Recovery control actions are used only by `TraceD1Recovery` and compose with
+the D1 fixed planner for live replication and ordered catch-up. The ordering
+premise is an activated-primary source scanning the pinned physical WAL in
+file order with one exclusive sequence cursor. Out-of-order or duplicate
+catch-up batches are therefore not expressible in that composition.
+
+Bulk traces may record every per-item WAL append before any item is processed;
+the append and processing records remain ordered inside one translog critical
+section. Replica response checkpoints may be batch-final: the model requires
+the item-local persisted checkpoint to be no greater than the response, and
+the response to be no greater than the replica's persisted checkpoint at
+primary receipt.
 
 Trace-side logic remains and is not presented as protocol-free: outcome
 literals select action/post-state claims; authority/collision wrappers gate on
@@ -379,6 +389,9 @@ verdict for every checked-in baseline and every Opus review mutation:
 | m14: operation between commit capture and record persistence | Accepted | Accepted |
 | n1, n3, n4, n7, n9, n10 | Rejected | Rejected at the documented semantic event |
 | n1c, n2, n5, n6, n8, n11, n12, n13, n14, n15 | Accepted | Accepted |
+| a1, b1, b2, b3 and adjacent/item-local controls | Accepted | Accepted |
+| Overstated response checkpoint | Rejected | Rejected at `replica_result` |
+| Mixed-composition v1/v5 and recovery-duplicate v2 | Rejected | Rejected by composition/action vocabulary |
 
 The suite also retains expected-invalid arrival-order, seq-only collision,
 highest-commit, and replay-stage boundary traces. Converter tests reject v1,
@@ -921,7 +934,7 @@ performance benchmarks.
 | `fixed-partition` | 3 / 1 / 2 | Full `Next`; 1 live-node partition/recovery; message loss/delay; term 3; log 2; view lag 1 | Full fixed design | Pass | 99,132,329 / 13,133,936 | 42 | 44m53s |
 
 The complete default twelve-worker fast matrix, including trace validation,
-ran from 02:17:04 to 02:23:28 UTC (6m24s), and every expected pass or expected
+ran from 04:19:47 to 04:28:04 UTC (8m17s), and every expected pass or expected
 counterexample matched. The two large exhaustive runs used eight workers.
 
 The two long fixed-design configurations use the top-level `Next` relation,
