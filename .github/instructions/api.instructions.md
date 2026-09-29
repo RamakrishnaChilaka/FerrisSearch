@@ -166,7 +166,10 @@ callers to the supported top-level `engine` field; never silently create a
 `publish_remote_store_documents()` applies the same mapped-keyword validation as
 normal CRUD before publishing any bundle or manifest. Keyword object values
 return a field-specific `400 mapper_parsing_exception`; they are not build
-failures and must not publish partial data.
+failures and must not publish partial data. Document `_id` remains publish
+request metadata and is stripped from `_source`; every other shared reserved
+document key returns `400 mapper_parsing_exception` before staging or manifest
+publication.
 `AppState.raft` is `Arc<RaftInstance>`, not `Option` — Raft is always present. Index-management handlers use `state.raft` directly without unwrapping.
 `POST /{index}/_forcemerge` keeps its asynchronous `202 Accepted` task
 lifecycle. `max_num_segments` defaults to `1` and must parse as an integer in

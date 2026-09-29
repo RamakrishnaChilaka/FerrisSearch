@@ -76,6 +76,10 @@ best-effort fallbacks.
   flattening, string/number/boolean coercion, null skipping, and per-field
   deduplication as `HotEngine` indexing. If every distinct value cannot fit
   within the summary cap, omit that field's summary entirely.
+- Publish validates every source before staging. Top-level `_id` is request
+  metadata and is stripped before indexing; every other shared reserved
+  document key is a `400 mapper_parsing_exception` and must not create a bundle
+  or manifest.
 - Any future multi-writer protocol needs conditional pointer publication,
   monotonic writer fencing, idempotent operation identity, and crash evidence.
   A process mutex or "last generation + 1" is not sufficient.

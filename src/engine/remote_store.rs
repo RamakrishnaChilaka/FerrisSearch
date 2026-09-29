@@ -1341,6 +1341,24 @@ pub(crate) async fn publish_docs(
         ));
     }
 
+    for doc in &docs {
+        let Some(object) = doc.as_object() else {
+            continue;
+        };
+        if let Err(error) = crate::common::validate_mapping_field_names(
+            object
+                .keys()
+                .map(String::as_str)
+                .filter(|field| *field != "_id"),
+        ) {
+            return Err(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "mapper_parsing_exception",
+                error,
+            ));
+        }
+    }
+
     let (field_ranges, field_terms) = match build_split_field_summaries(&docs, &metadata.mappings) {
         Ok(summaries) => summaries,
         Err(error) => {
@@ -1405,7 +1423,8 @@ pub(crate) async fn publish_docs(
         Err(join_err) => Err(anyhow::anyhow!(join_err)),
     } {
         let _ = std::fs::remove_dir_all(&staging_dir);
-        if e.is::<DocumentValidationError>() {
+        if e.is::<DocumentValidationError>() || e.is::<crate::common::ReservedDocumentFieldError>()
+        {
             return Err(crate::api::error_response(
                 StatusCode::BAD_REQUEST,
                 "mapper_parsing_exception",

@@ -4912,6 +4912,59 @@ async fn remote_store_publish_rejects_keyword_objects_without_publishing() -> Re
 }
 
 #[tokio::test]
+async fn remote_store_publish_rejects_reserved_source_without_publishing() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json("/pubreserved", json!({ "engine": "remote_store" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let metadata = harness
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("pubreserved")
+        .cloned()
+        .expect("index metadata should exist");
+    for field in RESERVED_METADATA_KEYS_FOR_TEST
+        .iter()
+        .copied()
+        .filter(|field| *field != "_id")
+    {
+        let (status, body) = harness
+            .post_json(
+                "/pubreserved/_remote_store/publish",
+                json!({
+                    "docs": [
+                        { "_id": "valid", "title": "allowed request metadata" },
+                        { "_id": "invalid", (field): 7, "title": "reserved source metadata" }
+                    ]
+                }),
+            )
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+    }
+
+    let manifest = harness
+        .app_state
+        .storage_manager
+        .load_current_manifest(
+            metadata.uuid.as_str(),
+            Some(&ferrissearch::storage::compute_schema_hash(
+                &metadata.mappings,
+            )),
+        )
+        .await?;
+    assert!(
+        manifest.is_none(),
+        "reserved source metadata must not publish a manifest"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_store_publish_rejects_on_local_shards_engine() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     let (status, _) = harness
