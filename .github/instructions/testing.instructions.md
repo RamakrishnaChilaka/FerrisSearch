@@ -160,6 +160,9 @@ cargo test -- test_name                         # Single test by name
 - TLC trace acceptance is existential witness search with a validator-owned
   hidden-action bound. A pass means only that the finite observation can be
   embedded in the selected bounded model; it is not an implementation proof.
+- `validate_trace.sh` returns `0` for acceptance, `1` for rejection, and `3`
+  with `INCONCLUSIVE` for timeout, memory exhaustion, or an incomplete TLC
+  run. CI must never count exit `3` as an expected rejection.
 - The review mutation matrix must retain rejection for m1, m2, m3, m4, m5,
   m6, m6b, m7, m8, m8b, m9, m9b, m15, m18, and m19, while m13 and m14 remain
   accepted. Also retain the replay-stage invalid trace whose commit boundary is
@@ -177,7 +180,17 @@ cargo test -- test_name                         # Single test by name
 - Retain the 217-event combined witness and its invalid arrival-order,
   collision-redelivery, and post-promotion rollback variants. The valid
   witness must include a real missing sequence filled by a durable promotion
-  NoOp after local WAL replay, not only an empty gap-fill stage.
+  NoOp, not only an empty gap-fill stage. It does not itself contain a
+  promoted-copy restart; retain v6c for replay-before-fill ordering.
+- Retain the slow round-4 restart matrix:
+  m7 empty replay after committed truncation, a retained-entry
+  `skip_committed` control and invalid re-apply, m10 replay of an uncommitted
+  promotion NoOp and m10c omission, m8 activation without gap fill, m6b fill
+  before replay completion, and m4c/m9 late request/ack delivery. Run it with
+  `./scripts/tla/check.sh trace-validator-round4`.
+- Keep `d1-failover-actions` green. It exercises model-owned durable fence,
+  NoOp fill, activation, and collision actions against the D1 safety
+  invariants.
 - Recovery catch-up ordering assumes an activated-primary source scanning the
   pinned physical WAL with one exclusive cursor. Do not claim support for
   duplicate or out-of-order catch-up traces.

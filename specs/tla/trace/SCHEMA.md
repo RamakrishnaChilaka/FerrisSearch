@@ -63,15 +63,20 @@ actions:
 The core fence maximum uses `D1FenceMaxNext` from the D1 model rather than a
 trace-local formula.
 
-Promotion NoOps have no client write ID in the D1 state. The combined model
-therefore represents the synced NoOp batch as the exact durable set of
-previously missing processed sequences, not as entries in `walOrder`. It
-requires every filled sequence to lack a remaining local WAL entry after
-replay and leaves logical document state unchanged.
+Promotion NoOps have no client write ID. The combined model represents them as
+synthetic WAL entries carrying sequence and primary term, so an uncommitted
+NoOp survives restart and can appear as `replay_entry(op="noop")`. The entries
+still leave logical document state unchanged.
 
 A pass means that the finite observed execution has a witness in these bounded
 models. It does not prove the Rust implementation, the instrumentation, or
 unlogged executions correct.
+
+`scripts/tla/validate_trace.sh` uses a 60-second TLC timeout by default.
+Acceptance exits `0`, rejection exits `1`, and timeout, memory exhaustion, or
+an incomplete TLC run exits `3` with an `INCONCLUSIVE` label. Large restart
+traces can override the timeout with `TLA_TRACE_TIMEOUT_SECONDS`; an
+inconclusive result is never evidence that a trace is invalid.
 
 Every accepting witness also satisfies its composition's safety invariants.
 Core and recovery witnesses check `NoCopyBehindAcked`, logical quiescent
@@ -230,6 +235,17 @@ the persisted processed checkpoint.
 Delete tombstones are not durable metadata. A committed delete above a gap is
 absent from the restored version map and replays as `applied_newer`.
 
+Truncation records an inclusive durable bound, but deleting old generations is
+best-effort. Entries actually removed below the bound produce no replay event.
+If an old generation remains, its entries may still be observed and must use
+`skip_committed`; applying one again is rejected.
+
+Requests and responses already emitted before a process crash remain eligible
+for late delivery. Messages addressed to the crashed process are dropped.
+Consequently, a stale request may be received after its sender crashes and is
+then rejected by the durable term fence, while an already-produced replica
+acknowledgement may reach the primary after the replica restarts.
+
 The current in-process async-durability test abstraction is lossless across its
 simulated crash: `durable=false` is allowed in async mode, but the in-memory
 WAL is retained. Version 3 does not claim to model power-loss durability for
@@ -250,7 +266,8 @@ local view expressible. `routing_promoted` is emitted once, by the leader apply,
 not once per observing node. A non-empty `promotion_noop_fill` set must equal
 every remaining missing sequence through the copy's local maximum; sequences
 that still have a local WAL entry cannot be filled because replay precedes gap
-closure.
+closure. `primary_activated` additionally requires the durable fence for the
+observed term and an empty remaining gap set.
 
 ### Recovery
 
@@ -330,6 +347,12 @@ Before TLC, `trace_to_tla.py` rejects:
 - Added a combined core/failover composition for end-to-end acknowledged-write
   survival across promotion, replay-before-NoOp gap fill, and later-term
   collision handling.
+- Made truncation remove old WAL entries nondeterministically, accepted
+  retained entries only as `skip_committed`, and made promotion NoOps
+  replayable across restart.
+- Kept already-sent requests and responses in flight across sender crash.
+- Classified TLC timeout and memory exhaustion as `INCONCLUSIVE`, never as
+  accepted or rejected.
 
 Recovery snapshot and catch-up remain strictly ordered by the implemented
 peer-recovery cursor. Out-of-order or duplicate catch-up batches are not
