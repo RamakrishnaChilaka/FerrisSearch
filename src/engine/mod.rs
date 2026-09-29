@@ -77,7 +77,9 @@ pub struct ReplicaBulkApplyReceipt {
 pub(crate) struct DocumentValidationError(pub String);
 
 pub(crate) fn is_write_validation_error(error: &anyhow::Error) -> bool {
-    error.is::<DocumentValidationError>() || error.is::<crate::wal::WalFrameTooLargeError>()
+    error.is::<DocumentValidationError>()
+        || error.is::<crate::common::ReservedDocumentFieldError>()
+        || error.is::<crate::wal::WalFrameTooLargeError>()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

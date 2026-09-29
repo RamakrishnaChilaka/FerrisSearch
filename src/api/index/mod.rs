@@ -55,6 +55,14 @@ fn document_write_error_response(
     crate::api::error_response(status, error_type, format!("{operation} failed: {error}"))
 }
 
+fn mapper_parsing_error_response(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    crate::api::error_response(StatusCode::BAD_REQUEST, "mapper_parsing_exception", error)
+}
+
+fn validate_document_source_for_api(source: &Value) -> Result<(), (StatusCode, Json<Value>)> {
+    crate::common::validate_document_source(source).map_err(mapper_parsing_error_response)
+}
+
 mod bulk;
 mod maintenance;
 
@@ -416,6 +424,7 @@ fn create_index_error_response(error: CreateIndexMetadataError) -> (StatusCode, 
             "illegal_argument_exception",
             message,
         ),
+        CreateIndexMetadataError::MapperParsing(message) => mapper_parsing_error_response(message),
         CreateIndexMetadataError::UnimplementedEngine(engine) => crate::api::error_response(
             StatusCode::NOT_IMPLEMENTED,
             "illegal_argument_exception",
@@ -432,11 +441,19 @@ fn forwarded_create_index_error_response(
         .find_map(|cause| cause.downcast_ref::<tonic::Status>())?;
 
     match status.code() {
-        tonic::Code::InvalidArgument => Some(crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "illegal_argument_exception",
-            status.message(),
-        )),
+        tonic::Code::InvalidArgument => {
+            let error_type =
+                if crate::common::is_reserved_document_field_error_message(status.message()) {
+                    "mapper_parsing_exception"
+                } else {
+                    "illegal_argument_exception"
+                };
+            Some(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                error_type,
+                status.message(),
+            ))
+        }
         tonic::Code::Unimplemented => Some(crate::api::error_response(
             StatusCode::NOT_IMPLEMENTED,
             "illegal_argument_exception",
@@ -591,22 +608,16 @@ pub async fn index_document(
     State(state): State<AppState>,
     Path(index_name): Path<crate::common::IndexName>,
     Query(refresh_param): Query<RefreshParam>,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
 
     // IndexName is validated at extraction time
 
-    // Extract or generate _id, then strip it from the document body
-    let doc_id = if let Some(id) = payload.get("_id").and_then(|v| v.as_str()) {
-        id.to_string()
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    };
-    // Remove _id from the stored payload — it's metadata, not part of the document source
-    if let Some(obj) = payload.as_object_mut() {
-        obj.remove("_id");
+    if let Err(response) = validate_document_source_for_api(&payload) {
+        return response;
     }
+    let doc_id = uuid::Uuid::new_v4().to_string();
 
     let cluster_state = state.cluster_manager.get_state();
 
@@ -677,15 +688,14 @@ pub async fn index_document_with_id(
     State(state): State<AppState>,
     Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
     Query(refresh_param): Query<RefreshParam>,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
 
     // IndexName is validated at extraction time
 
-    // Remove _id from stored payload if present — it's metadata, not document source
-    if let Some(obj) = payload.as_object_mut() {
-        obj.remove("_id");
+    if let Err(response) = validate_document_source_for_api(&payload) {
+        return response;
     }
 
     let cluster_state = state.cluster_manager.get_state();
@@ -1183,6 +1193,17 @@ pub async fn update_document(
 ) -> (StatusCode, Json<Value>) {
     // IndexName is validated at extraction time
 
+    if let Some(doc) = body.get("doc")
+        && let Err(response) = validate_document_source_for_api(doc)
+    {
+        return response;
+    }
+    if let Some(upsert) = body.get("upsert")
+        && let Err(response) = validate_document_source_for_api(upsert)
+    {
+        return response;
+    }
+
     let partial = match body.get("doc") {
         Some(d) if d.is_object() => d.clone(),
         _ => {
@@ -1267,6 +1288,9 @@ pub async fn update_document(
     } else {
         partial
     };
+    if let Err(response) = validate_document_source_for_api(&merged) {
+        return response;
+    }
 
     // 3. Re-index the merged document
     match state

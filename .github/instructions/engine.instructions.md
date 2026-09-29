@@ -119,6 +119,19 @@ tokio::select! {
 - Auto-creates VectorIndex if a `knn_vector` field is encountered
 - `rebuild_vectors()` — recovers USearch index from Tantivy docs on startup (crash recovery)
 
+### Reserved Document Metadata
+
+- Every primary, replica, recovery, and direct engine index source uses
+  `common::validate_document_source()` before WAL or engine mutation.
+- The shared reserved list contains `_id`, `_doc_id`, `_source`, `_seq_no`,
+  `_primary_term`, `_version`, `_index`, and `_routing`.
+- `FieldRegistry.fields` excludes every reserved name even when it exists in
+  the authoritative Tantivy schema, so a validation bypass cannot append a
+  second internal sequence or term value.
+- Dynamic mapping ignores reserved names, and engine construction rejects
+  reserved explicit mappings before Tantivy schema creation or evolution.
+- `body` remains the non-reserved catch-all field.
+
 ## RemoteStore Engine (src/engine/remote_store.rs)
 - `remote_store` is a shardless read path. Root nodes load the published manifest for an index, query per-leaf cache/load status over gRPC, and batch split assignments to data-node leaves.
 - Newly published splits persist exact manifest summaries under `field_ranges` (mapped integer/float/date min/max) and `field_terms` (small exact mapped keyword/boolean distinct sets). Keyword summaries must reuse `HotEngine`'s index-time recursive flatten/coerce/null-skip semantics; exceeding the distinct-value cap omits the entire field summary instead of publishing a partial set. Root-side search prunes published splits against those summaries for supported `term` and `range` filters before rendezvous scheduling; missing or unsupported metadata must keep the split. GET/POST search responses and SQL/EXPLAIN ANALYZE paths that execute through remote_store expose `remote_store.pruning` counters for published, candidate, pruned, and assigned split counts.

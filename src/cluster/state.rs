@@ -269,6 +269,7 @@ impl std::fmt::Display for DynamicMapping {
 pub enum CreateIndexMetadataError {
     NoDataNodes,
     InvalidArgument(String),
+    MapperParsing(String),
     UnimplementedEngine(IndexEngine),
 }
 
@@ -277,6 +278,7 @@ impl std::fmt::Display for CreateIndexMetadataError {
         match self {
             Self::NoDataNodes => write!(f, "No data nodes available to assign shards"),
             Self::InvalidArgument(message) => f.write_str(message),
+            Self::MapperParsing(message) => f.write_str(message),
             Self::UnimplementedEngine(engine) => {
                 write!(
                     f,
@@ -670,6 +672,8 @@ impl IndexMetadata {
             .pointer("/mappings/properties")
             .and_then(|v| v.as_object())
         {
+            crate::common::validate_mapping_field_names(properties.keys().map(String::as_str))
+                .map_err(|error| CreateIndexMetadataError::MapperParsing(error.to_string()))?;
             for (field_name, field_def) in properties {
                 let Some(type_str) = field_def.get("type").and_then(|v| v.as_str()) else {
                     continue;
@@ -2381,6 +2385,45 @@ mod tests {
         assert_eq!(metadata.dynamic, DynamicMapping::True);
         assert_eq!(metadata.mappings["created_at"].field_type, FieldType::Date);
         assert_eq!(metadata.mappings["title"].field_type, FieldType::Text);
+    }
+
+    #[test]
+    fn create_index_rejects_reserved_mapping_properties() {
+        for field in [
+            "_id",
+            "_doc_id",
+            "_source",
+            "_seq_no",
+            "_primary_term",
+            "_version",
+            "_index",
+            "_routing",
+        ] {
+            let error = IndexMetadata::from_create_request_body(
+                "events",
+                &serde_json::json!({
+                    "settings": {
+                        "number_of_shards": 1,
+                        "number_of_replicas": 0
+                    },
+                    "mappings": {
+                        "properties": {
+                            (field): { "type": "keyword" }
+                        }
+                    }
+                }),
+                &["node-1".into()],
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                CreateIndexMetadataError::MapperParsing(reason)
+                    if reason == format!(
+                        "Field [{field}] is a metadata field and cannot be added inside a document. Use the index API request parameters."
+                    )
+            ));
+        }
     }
 
     #[test]

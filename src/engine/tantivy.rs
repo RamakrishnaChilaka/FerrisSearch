@@ -461,6 +461,7 @@ fn evolve_meta_json_schema(
     meta_json_path: &Path,
     mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
 ) -> Result<()> {
+    crate::common::validate_mapping_field_names(mappings.keys().map(String::as_str))?;
     let raw = std::fs::read_to_string(meta_json_path)?;
     let mut meta: serde_json::Value = serde_json::from_str(&raw)?;
 
@@ -780,6 +781,7 @@ impl HotEngine {
         purpose: HotEnginePurpose,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
+        crate::common::validate_mapping_field_names(mappings.keys().map(String::as_str))?;
         let index_path = data_dir.join("index");
         let meta_json_path = index_path.join("meta.json");
         if existing_only && !meta_json_path.is_file() {
@@ -841,7 +843,7 @@ impl HotEngine {
         let mut date_fields = Vec::new();
         for (field, entry) in schema.fields() {
             let name: String = entry.name().to_string();
-            if name == "_source" || name == "_id" {
+            if crate::common::is_reserved_document_key(&name) {
                 continue;
             }
             fields.insert(name.clone(), field);
@@ -2789,6 +2791,7 @@ impl HotEngine {
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for document in documents {
+            crate::common::validate_document_source(document)?;
             if let Some(object) = document.as_object() {
                 for (field_name, value) in object {
                     if matches!(
@@ -2837,6 +2840,7 @@ impl HotEngine {
         seq_no: u64,
         primary_term: u64,
     ) -> Result<TantivyDocument> {
+        crate::common::validate_document_source(payload)?;
         let mut doc = TantivyDocument::new();
 
         // Store the document ID
@@ -8415,6 +8419,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
         (dir, engine)
+    }
+
+    #[test]
+    fn field_registry_excludes_reserved_internal_metadata_fields() {
+        let (_dir, engine) = create_engine();
+        let registry = engine.field_registry.read().unwrap();
+
+        for field in [
+            "_id",
+            "_doc_id",
+            "_source",
+            "_seq_no",
+            "_primary_term",
+            "_version",
+            "_index",
+            "_routing",
+        ] {
+            assert!(
+                !registry.fields.contains_key(field),
+                "reserved field {field} must not be source-addressable"
+            );
+        }
+        assert!(registry.fields.contains_key("body"));
     }
 
     fn apply_index(

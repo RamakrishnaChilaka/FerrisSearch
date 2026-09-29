@@ -152,6 +152,58 @@ fn make_full_cluster_state() -> DomainClusterState {
     cs
 }
 
+#[tokio::test]
+async fn add_mappings_rejects_reserved_metadata_names_before_raft() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new("mapping-validation".into()));
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let service = TransportService {
+        cluster_manager,
+        shard_manager,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-1".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+
+    for field in [
+        "_id",
+        "_doc_id",
+        "_source",
+        "_seq_no",
+        "_primary_term",
+        "_version",
+        "_index",
+        "_routing",
+    ] {
+        let error = service
+            .add_mappings(Request::new(AddMappingsRequest {
+                index_name: "idx".into(),
+                new_fields: vec![FieldMappingEntry {
+                    name: field.to_string(),
+                    field_type: "keyword".into(),
+                    dimension: None,
+                }],
+                dynamic: "true".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            format!(
+                "Field [{field}] is a metadata field and cannot be added inside a document. Use the index API request parameters."
+            )
+        );
+    }
+}
+
 #[test]
 fn cluster_state_roundtrip_preserves_metadata() {
     let original = make_full_cluster_state();

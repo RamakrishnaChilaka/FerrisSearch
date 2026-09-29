@@ -3,6 +3,7 @@
 use super::*;
 
 pub(super) struct BulkDoc {
+    pub action: String,
     pub doc_id: String,
     pub index: Option<String>,
     pub payload: Value,
@@ -87,6 +88,21 @@ fn bulk_error_item(
     }
 
     item
+}
+
+fn validate_bulk_document(
+    document: &BulkDoc,
+) -> Result<(), crate::common::ReservedDocumentFieldError> {
+    if document.action == "update" {
+        if let Some(doc) = document.payload.get("doc") {
+            crate::common::validate_document_source(doc)?;
+        }
+        if let Some(upsert) = document.payload.get("upsert") {
+            crate::common::validate_document_source(upsert)?;
+        }
+        return Ok(());
+    }
+    crate::common::validate_document_source(&document.payload)
 }
 
 pub(super) fn route_bulk_doc(
@@ -282,13 +298,18 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
             && let Ok(doc) = serde_json::from_str::<Value>(doc_line)
         {
             // Parse action metadata
-            let action_meta = serde_json::from_str::<Value>(action_line)
-                .ok()
-                .and_then(|action| {
-                    action
-                        .as_object()
-                        .and_then(|obj| obj.values().next().cloned())
-                });
+            let parsed_action = serde_json::from_str::<Value>(action_line).ok();
+            let action_name = parsed_action
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|object| object.keys().next())
+                .cloned()
+                .unwrap_or_else(|| "index".to_string());
+            let action_meta = parsed_action.and_then(|action| {
+                action
+                    .as_object()
+                    .and_then(|obj| obj.values().next().cloned())
+            });
 
             let action_id = action_meta
                 .as_ref()
@@ -300,6 +321,7 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
 
             let doc_id = action_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             docs.push(BulkDoc {
+                action: action_name,
                 doc_id,
                 index: action_index,
                 payload: doc,
@@ -345,6 +367,17 @@ pub async fn bulk_index_global(
     let mut by_index: HashMap<String, Vec<(usize, String, Value)>> = HashMap::new();
 
     for (position, doc) in docs.into_iter().enumerate() {
+        if let Err(error) = validate_bulk_document(&doc) {
+            has_errors = true;
+            item_results[position] = Some(bulk_error_item(
+                doc.index.as_deref(),
+                &doc.doc_id,
+                StatusCode::BAD_REQUEST,
+                "mapper_parsing_exception",
+                error,
+            ));
+            continue;
+        }
         if let Some(index_name) = doc.index {
             by_index
                 .entry(index_name)
@@ -535,15 +568,40 @@ pub async fn bulk_index(
     };
 
     // Parse NDJSON body
-    let docs: Vec<(String, Value)> = parse_bulk_ndjson(text)
-        .into_iter()
-        .map(|d| (d.doc_id, d.payload))
-        .collect();
+    let docs = parse_bulk_ndjson(text);
 
     if docs.is_empty() {
         return (
             StatusCode::OK,
             Json(serde_json::json!({ "took": 0, "errors": false, "items": [] })),
+        );
+    }
+
+    let mut item_results: Vec<Option<Value>> = vec![None; docs.len()];
+    let mut has_errors = false;
+    let mut valid_documents = Vec::new();
+    for (position, document) in docs.into_iter().enumerate() {
+        if let Err(error) = validate_bulk_document(&document) {
+            has_errors = true;
+            item_results[position] = Some(bulk_error_item(
+                Some(&index_name),
+                &document.doc_id,
+                StatusCode::BAD_REQUEST,
+                "mapper_parsing_exception",
+                error,
+            ));
+        } else {
+            valid_documents.push((position, document));
+        }
+    }
+    if valid_documents.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "took": 0,
+                "errors": has_errors,
+                "items": item_results.into_iter().flatten().collect::<Vec<_>>()
+            })),
         );
     }
 
@@ -563,16 +621,14 @@ pub async fn bulk_index(
         return resp;
     }
 
-    let mut item_results: Vec<Option<Value>> = vec![None; docs.len()];
-    let mut has_errors = false;
     let mut routed_docs = Vec::new();
 
-    for (position, (doc_id, payload)) in docs.into_iter().enumerate() {
+    for (position, document) in valid_documents {
         match route_bulk_doc(
             position,
             index_name.to_string(),
-            doc_id,
-            payload,
+            document.doc_id,
+            document.payload,
             &metadata,
             &cluster_state,
         ) {

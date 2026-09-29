@@ -1719,6 +1719,113 @@ async fn primary_write_replicates_to_replica_node() {
 }
 
 #[tokio::test]
+async fn reserved_source_never_mutates_primary_or_replica() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("reserved-source".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("reserved-source".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &replica_cm,
+        "reserved-source-idx",
+        replica_addr.port(),
+    );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "reserved-source-idx");
+
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
+    let mut primary_client = connect_client(primary_addr).await;
+
+    let error = primary_client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "reserved-source-idx".into(),
+            shard_id: 0,
+            doc_id: "poison".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"_seq_no": 999})).unwrap(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("Field [_seq_no] is a metadata field")
+    );
+
+    let error = primary_client
+        .bulk_index(tonic::Request::new(ShardBulkRequest {
+            index_name: "reserved-source-idx".into(),
+            shard_id: 0,
+            documents_json: vec![
+                serde_json::to_vec(&serde_json::json!({
+                    "_source": {"value": 999}
+                }))
+                .unwrap(),
+            ],
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("Field [_source] is a metadata field")
+    );
+
+    for manager in [&primary_sm, &replica_sm] {
+        let engine = manager.get_shard("reserved-source-idx", 0).unwrap();
+        assert_eq!(engine.sequence_stats().max_seq_no, None);
+        assert!(
+            engine
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+    }
+
+    let response = primary_client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "reserved-source-idx".into(),
+            shard_id: 0,
+            doc_id: "healthy".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+
+    refresh_all(&primary_sm);
+    refresh_all(&replica_sm);
+    for address in [primary_addr, replica_addr] {
+        let mut client = connect_client(address).await;
+        let response = client
+            .get_doc(tonic::Request::new(ShardGetRequest {
+                index_name: "reserved-source-idx".into(),
+                shard_id: 0,
+                doc_id: "healthy".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.found);
+        let source: serde_json::Value = serde_json::from_slice(&response.source_json).unwrap();
+        assert_eq!(source["value"], 1);
+    }
+}
+
+#[tokio::test]
 async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
     let replica_dir = tempfile::tempdir().unwrap();
     let replica_cm = Arc::new(ClusterManager::new("out-of-sync".into()));
@@ -3868,8 +3975,10 @@ async fn bulk_replication_advances_global_checkpoint() {
     // Bulk index 5 docs
     let documents_json: Vec<Vec<u8>> = (0..5)
         .map(|i| {
-            let payload =
-                serde_json::json!({"_id": format!("b-{}", i), "msg": format!("bulk-{}", i)});
+            let payload = serde_json::json!({
+                "_doc_id": format!("b-{i}"),
+                "_source": {"msg": format!("bulk-{i}")}
+            });
             serde_json::to_vec(&payload).unwrap()
         })
         .collect();

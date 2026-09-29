@@ -23,6 +23,17 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 
+const RESERVED_METADATA_KEYS_FOR_TEST: &[&str] = &[
+    "_id",
+    "_doc_id",
+    "_source",
+    "_seq_no",
+    "_primary_term",
+    "_version",
+    "_index",
+    "_routing",
+];
+
 struct RestTestHarness {
     _temp_dir: TempDir,
     app_state: AppState,
@@ -124,6 +135,22 @@ async fn get_json_from_base_url(
     let status = response.status();
     let value = response.json().await?;
     Ok((status, value))
+}
+
+fn assert_mapper_parsing_error(status: StatusCode, body: &Value, field: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+    assert_eq!(
+        body["error"]["type"],
+        json!("mapper_parsing_exception"),
+        "{field}: {body}"
+    );
+    assert_eq!(
+        body["error"]["reason"],
+        json!(format!(
+            "Field [{field}] is a metadata field and cannot be added inside a document. Use the index API request parameters."
+        )),
+        "{field}: {body}"
+    );
 }
 
 impl RestTestHarness {
@@ -2967,6 +2994,178 @@ async fn rest_sql_distributed_semijoin_merges_inner_groups_across_shards() -> Re
 }
 
 // ── Dynamic Mapping Integration Tests ──────────────────────────────────
+
+#[tokio::test]
+async fn reserved_metadata_fields_are_rejected_across_rest_write_entries() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    for (offset, field) in RESERVED_METADATA_KEYS_FOR_TEST.iter().enumerate() {
+        let (status, body) = harness
+            .put_json(
+                &format!("/reserved-mapping-{offset}"),
+                json!({
+                    "settings": {
+                        "number_of_shards": 1,
+                        "number_of_replicas": 0
+                    },
+                    "mappings": {
+                        "properties": {
+                            (*field): { "type": "keyword" }
+                        }
+                    }
+                }),
+            )
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+    }
+
+    let (status, body) = harness
+        .put_json(
+            "/reserved-docs",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (offset, field) in RESERVED_METADATA_KEYS_FOR_TEST.iter().enumerate() {
+        let source = json!({ (*field): 999 });
+        let (status, body) = harness
+            .post_json("/reserved-docs/_doc", source.clone())
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+
+        let (status, body) = harness
+            .put_json(&format!("/reserved-docs/_doc/put-{offset}"), source)
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+    }
+
+    let (status, body) = harness
+        .put_json("/reserved-docs/_doc/base?refresh=true", json!({"value": 1}))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for field in RESERVED_METADATA_KEYS_FOR_TEST {
+        let (status, body) = harness
+            .post_json(
+                "/reserved-docs/_update/base",
+                json!({"doc": { (*field): 999 }}),
+            )
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+
+        let (status, body) = harness
+            .post_json(
+                "/reserved-docs/_update/base",
+                json!({
+                    "doc": {"value": 2},
+                    "upsert": { (*field): 999 }
+                }),
+            )
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+    }
+
+    let (status, body) = harness
+        .put_json(
+            "/reserved-docs/_doc/healthy?refresh=true",
+            json!({"body": "allowed", "value": 2}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = harness.get_json("/reserved-docs/_doc/healthy").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"]["body"], json!("allowed"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_reserved_metadata_fields_are_per_item_errors() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/reserved-bulk",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut ndjson = String::new();
+    let mut invalid_items = 0usize;
+    for action in ["index", "create", "update"] {
+        for field in RESERVED_METADATA_KEYS_FOR_TEST {
+            let doc_id = format!("{action}-{invalid_items}");
+            ndjson.push_str(&serde_json::to_string(&json!({
+                (action): { "_id": doc_id }
+            }))?);
+            ndjson.push('\n');
+            let source = if action == "update" {
+                json!({"doc": { (*field): 999 }, "upsert": {"value": 0}})
+            } else {
+                json!({ (*field): 999 })
+            };
+            ndjson.push_str(&serde_json::to_string(&source)?);
+            ndjson.push('\n');
+            invalid_items += 1;
+        }
+    }
+    ndjson.push_str("{\"index\":{\"_id\":\"healthy\"}}\n");
+    ndjson.push_str("{\"body\":\"allowed\",\"value\":1}\n");
+
+    let response = harness
+        .client
+        .post(format!(
+            "{}/reserved-bulk/_bulk?refresh=true",
+            harness.base_url
+        ))
+        .header(CONTENT_TYPE, "application/x-ndjson")
+        .body(ndjson)
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], json!(true));
+    let items = body["items"]
+        .as_array()
+        .expect("bulk items should be an array");
+    assert_eq!(items.len(), invalid_items + 1);
+    for item in &items[..invalid_items] {
+        let result = item
+            .as_object()
+            .and_then(|object| object.values().next())
+            .expect("bulk item should have one operation result");
+        assert_eq!(result["status"], json!(400), "{result}");
+        assert_eq!(
+            result["error"]["type"],
+            json!("mapper_parsing_exception"),
+            "{result}"
+        );
+    }
+    let healthy = items
+        .last()
+        .and_then(Value::as_object)
+        .and_then(|object| object.values().next())
+        .expect("healthy bulk item should have a result");
+    assert_eq!(healthy["status"], json!(201), "{healthy}");
+
+    let (status, body) = harness.get_json("/reserved-bulk/_doc/healthy").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"]["body"], json!("allowed"));
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn dynamic_true_auto_creates_mappings_on_index() -> Result<()> {

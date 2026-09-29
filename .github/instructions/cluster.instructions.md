@@ -43,6 +43,14 @@ ClusterState { cluster_name, version, master_node, nodes, indices, shard_allocat
 - `remote_store` data is added through the dedicated publish endpoint, which is currently a manually invoked, single-writer-oriented path rather than near-real-time ingest
 - The shared `AppConfig.storage_uri` selects the process object-store backend; do not treat per-index `object_store_uri` metadata as an independently wired backend without verifying source
 
+### Reserved Mapping Names
+
+Create-index `mappings.properties` rejects document metadata names from
+`common::RESERVED_DOCUMENT_KEYS` with a mapper-parsing error before metadata is
+committed. The internal `AddMappings` transport boundary applies the same
+validation. The non-underscore Tantivy catch-all field `body` is not reserved;
+do not silently add it to the metadata list without an explicit API decision.
+
 ### Index UUID
 - Every `IndexMetadata` has a non-empty `uuid: IndexUuid` value; production
   creation generates UUID v4 values, while transport and test fixtures may

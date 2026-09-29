@@ -151,6 +151,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   before WAL/engine mutation. A higher term is fsynced before mutation. Bulk
   validates the shared envelope and every item before the first mutation and
   advances the fence once.
+- Primary and replica index RPCs reject reserved document-source metadata
+  through the shared validator before dynamic mapping, WAL append, or replica
+  apply. These failures are `INVALID_ARGUMENT`, allowing REST coordinators to
+  return `400 mapper_parsing_exception`.
 - `ReplicateBulk` accepts either contiguous ordered index operations or a
   strictly increasing, potentially non-contiguous homogeneous NoOp batch.
   Promotion activation uses bounded NoOp batches rather than one RPC per gap.
@@ -203,6 +207,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **sql_record_batch / sql_record_batch_stream**: Execute local shard SQL fast-field reads and return Arrow IPC batches. `SqlRecordBatchStream` may emit multiple batches for the same shard; `batch_size = 0` means use the engine default. Stream responses must carry `total_hits`, `collected_rows`, and actual `streaming_used` metadata on every batch so the coordinator can build accurate `meta` / truncation decisions before draining the rest of the stream. The coordinator-facing live path should prefer `open_sql_batch_stream_to_shard()` so only the first response is read eagerly.
 - **raft_vote / raft_append_entries / raft_snapshot**: Deserialize JSON, forward to Raft instance
 - **create_index / delete_index**: Must be leader; execute via `raft.client_write()`. `create_index` must preserve index settings from the forwarded JSON body, including `refresh_interval_ms` and `flush_threshold_bytes`.
+- `AddMappings` rejects every shared reserved document metadata name before
+  checking leadership or issuing a Raft write. There is no public put-mapping
+  HTTP route yet; this RPC is the existing mapping-update trust boundary.
 - **update_settings**: Must be leader; apply via `UpdateIndex` Raft command. Preserve `flush_threshold_bytes` exactly, including `null` resets and `0` as a valid disable value.
 
 ### Critical Invariants

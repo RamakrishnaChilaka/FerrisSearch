@@ -372,6 +372,9 @@ fn create_index_error_status(error: crate::cluster::state::CreateIndexMetadataEr
         crate::cluster::state::CreateIndexMetadataError::InvalidArgument(message) => {
             Status::invalid_argument(message)
         }
+        crate::cluster::state::CreateIndexMetadataError::MapperParsing(message) => {
+            Status::invalid_argument(message)
+        }
         crate::cluster::state::CreateIndexMetadataError::UnimplementedEngine(engine) => {
             Status::unimplemented(format!(
                 "index engine [{engine}] is recognized but not implemented yet"
@@ -579,6 +582,8 @@ impl InternalTransport for TransportService {
 
         let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
             .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
+        crate::common::validate_document_source(&payload)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         let doc_id = if req.doc_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
@@ -803,12 +808,15 @@ impl InternalTransport for TransportService {
         for b in &req.documents_json {
             let val: serde_json::Value = serde_json::from_slice(b)
                 .map_err(|e| Status::invalid_argument(format!("invalid JSON in bulk: {e}")))?;
-            let doc_id = val
-                .get("_doc_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let payload = val.get("_source").cloned().unwrap_or(val.clone());
+            let (doc_id, payload) = match (
+                val.get("_doc_id").and_then(serde_json::Value::as_str),
+                val.get("_source"),
+            ) {
+                (Some(doc_id), Some(source)) => (doc_id.to_string(), source.clone()),
+                _ => (uuid::Uuid::new_v4().to_string(), val),
+            };
+            crate::common::validate_document_source(&payload)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
             docs.push((doc_id, payload));
         }
 
@@ -1738,6 +1746,12 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| {
                 Status::invalid_argument("replication requires a target allocation ID")
             })?;
+        if req.op == "index" {
+            let source: serde_json::Value = serde_json::from_slice(&req.payload_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
+            crate::common::validate_document_source(&source)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        }
         let assigned = match self.replica_apply_routing(
             &req.index_name,
             req.shard_id,
@@ -1939,6 +1953,16 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| {
                 Status::invalid_argument("bulk replication requires a target allocation ID")
             })?;
+        for operation in &req.ops {
+            if operation.op == "index" {
+                let source: serde_json::Value = serde_json::from_slice(&operation.payload_json)
+                    .map_err(|e| {
+                        Status::invalid_argument(format!("invalid JSON in bulk replicate: {e}"))
+                    })?;
+                crate::common::validate_document_source(&source)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            }
+        }
         let assigned = match self.replica_apply_routing(
             &req.index_name,
             req.shard_id,
@@ -2941,6 +2965,11 @@ impl InternalTransport for TransportService {
         request: Request<AddMappingsRequest>,
     ) -> Result<Response<AddMappingsResponse>, Status> {
         let req = request.into_inner();
+
+        crate::common::validate_mapping_field_names(
+            req.new_fields.iter().map(|entry| entry.name.as_str()),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         let raft = self
             .raft
@@ -5157,6 +5186,8 @@ impl TransportService {
         metadata: &crate::cluster::state::IndexMetadata,
         merged_mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
     ) -> Result<(), Status> {
+        crate::common::validate_mapping_field_names(new_fields.keys().map(String::as_str))
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         if let Some(raft) = self.raft.as_ref()
             && raft.is_leader()
         {

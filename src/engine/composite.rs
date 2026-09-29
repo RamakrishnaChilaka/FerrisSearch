@@ -500,6 +500,7 @@ impl SearchEngine for CompositeEngine {
         payload: serde_json::Value,
         primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
+        crate::common::validate_document_source(&payload)?;
         let prepared = self.prepare_vector_mutation(&payload)?;
         let source_for_rebuild = payload.clone();
         let rebuild_vectors = self.text.writer_requires_rebuild();
@@ -532,6 +533,9 @@ impl SearchEngine for CompositeEngine {
         docs: Vec<(String, serde_json::Value)>,
         primary_term: u64,
     ) -> Result<super::BulkWriteReceipt> {
+        for (_, payload) in &docs {
+            crate::common::validate_document_source(payload)?;
+        }
         let prepared = docs
             .iter()
             .map(|(_, payload)| self.prepare_vector_mutation(payload))
@@ -606,6 +610,9 @@ impl SearchEngine for CompositeEngine {
         &self,
         operation: super::SequencedOperation,
     ) -> Result<super::ReplicaApplyReceipt> {
+        if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
+            crate::common::validate_document_source(source)?;
+        }
         let prepared = match &operation.mutation {
             super::DocumentMutation::Index { source, .. } => {
                 self.prepare_vector_mutation(source)?
@@ -634,6 +641,11 @@ impl SearchEngine for CompositeEngine {
         &self,
         operations: Vec<super::SequencedOperation>,
     ) -> Result<super::ReplicaBulkApplyReceipt> {
+        for operation in &operations {
+            if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
+                crate::common::validate_document_source(source)?;
+            }
+        }
         let prepared_by_identity = operations
             .iter()
             .map(|operation| {
@@ -2092,5 +2104,54 @@ mod tests {
             }])
             .unwrap();
         assert!(engine.vector.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn reserved_document_keys_fail_before_wal_and_reopen_remains_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+
+        for field in [
+            "_id",
+            "_doc_id",
+            "_source",
+            "_seq_no",
+            "_primary_term",
+            "_version",
+            "_index",
+            "_routing",
+        ] {
+            let source = json!({ (field): 999 });
+            let error = engine
+                .add_document_with_receipt("single", source.clone())
+                .unwrap_err();
+            assert!(
+                error.is::<crate::common::ReservedDocumentFieldError>(),
+                "{field}: {error:#}"
+            );
+
+            let error = engine
+                .bulk_add_documents_with_receipt(vec![("bulk".into(), source)])
+                .unwrap_err();
+            assert!(
+                error.is::<crate::common::ReservedDocumentFieldError>(),
+                "{field}: {error:#}"
+            );
+            assert_eq!(engine.sequence_stats().max_seq_no, None);
+        }
+
+        engine
+            .add_document_with_receipt(
+                "healthy",
+                json!({"body": "body remains a supported source field", "value": 1}),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+        drop(engine);
+
+        let reopened = CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let source = reopened.get_document("healthy").unwrap().unwrap();
+        assert_eq!(source["body"], "body remains a supported source field");
+        assert_eq!(source["value"], 1);
     }
 }

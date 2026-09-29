@@ -219,6 +219,17 @@ value within one document while preserving `_source`. Object values fail as
 `400 mapper_parsing_exception`; validate the whole shard batch before any WAL
 or writer mutation.
 
+Document sources must reject the shared reserved metadata keys `_id`,
+`_doc_id`, `_source`, `_seq_no`, `_primary_term`, `_version`, `_index`, and
+`_routing`. Single index and update requests return
+`400 mapper_parsing_exception`; update validation covers `doc`, `upsert`, and
+the merged source. Bulk `index`, `create`, and `update` items fail independently
+with item-level 400 responses so valid neighboring items still run. Action-line
+`_id` and `_index` remain request metadata; only document-source keys are
+rejected. Create-index mapping `properties` uses the same reserved-name check.
+FerrisSearch does not currently expose a public `PUT /{index}/_mapping` route;
+the internal `AddMappings` path enforces the same rule.
+
 ### Search — src/api/search/mod.rs
 | HTTP | Path | Handler |
 |------|------|---------|
