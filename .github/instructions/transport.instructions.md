@@ -157,7 +157,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   return `400 mapper_parsing_exception`.
 - `ReplicateBulk` accepts either contiguous ordered index operations or a
   strictly increasing, potentially non-contiguous homogeneous NoOp batch.
-  Promotion activation uses bounded NoOp batches rather than one RPC per gap.
+  Promotion activation uses bounded NoOp batches rather than one RPC per
+  missing sequence number.
 - A failed promotion NoOp batch remains pending in the shared activation state.
   The next lifecycle or request activation retries it even when the local
   UUID/shard/allocation/term cache already says the primary is active. Remove
