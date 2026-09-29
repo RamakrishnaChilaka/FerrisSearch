@@ -78,14 +78,13 @@ pub async fn replicate_bulk(
   membership before releasing writes.
 - Admission uncertainty remains write-blocking until membership is observed or
   `ActivatePrimary` commits a term bump that makes the stale admission
-  impossible. `RecoverReplica` remains a legacy isolated transport API.
+  impossible.
 
 ## gRPC RPCs Used
 | RPC | Purpose |
 |-----|---------|
 | `ReplicateDoc` | Single document replication to replica |
 | `ReplicateBulk` | Batch document replication to replica |
-| `RecoverReplica` | Fetch missed operations from primary's WAL |
 | `StartPeerRecovery` / `FetchRecoveryFileChunk` | Create and transfer the pinned file snapshot |
 | `FetchRecoveryOps` | Fetch bounded ordered WAL suffix batches |
 | `PrepareFinalizeRecovery` / `CompleteFinalizeRecovery` | Establish the final barrier and conditionally admit the target |

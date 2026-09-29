@@ -182,11 +182,9 @@ activation. These promotion NoOps fill gaps on the promoted copy only; they do
 not repair replicas that missed a real post-WAL primary operation. Such copies
 follow the gap deadline and peer-recovery path until D10 exists.
 
-A flushed legacy v1 primary may migrate in place only through the explicit
-primary migration path, using the durable copy-identity fence as the committed
-term. Legacy replicas never self-upgrade; keep them closed/pending until a
-native or migrated active primary is proven, then replace them through a fresh
-allocation and peer recovery.
+Earlier shard schemas, committed boundaries, manifests, WAL entries, and copy
+identities never migrate in place. Every role fails closed through the same
+typed unsupported-format error and directs the operator to recreate the index.
 Whole-index `UpdateIndex` races beyond the enforced routing rules remain future
 work.
 

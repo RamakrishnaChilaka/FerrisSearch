@@ -61,6 +61,18 @@ impl DiskLogStore {
         io::Error::other(msg.to_string())
     }
 
+    fn decode_log_entry(bytes: &[u8]) -> io::Result<types::Entry> {
+        serde_json::from_slice(bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::common::UnsupportedIndexFormatError::new(
+                    "Raft log entry",
+                    format!("cannot decode current command format: {error}"),
+                ),
+            )
+        })
+    }
+
     fn read_meta<T: serde::de::DeserializeOwned>(&self, key: &str) -> io::Result<Option<T>> {
         let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
         let tx = db.begin_read().map_err(Self::io_err)?;
@@ -139,8 +151,7 @@ impl RaftLogReader<TypeConfig> for DiskLogStore {
                 .map_err(DiskLogStore::io_err)?
             {
                 let (_, val) = item.map_err(DiskLogStore::io_err)?;
-                let entry: types::Entry = serde_json::from_slice(val.value())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let entry = DiskLogStore::decode_log_entry(val.value())?;
                 entries.push(entry);
             }
             Ok(entries)
@@ -170,8 +181,7 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
                 let table = tx.open_table(LOG_TABLE).map_err(DiskLogStore::io_err)?;
                 match table.last().map_err(DiskLogStore::io_err)? {
                     Some((_, val)) => {
-                        let entry: types::Entry = serde_json::from_slice(val.value())
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        let entry = DiskLogStore::decode_log_entry(val.value())?;
                         Some(entry.log_id)
                     }
                     None => None,
@@ -365,6 +375,43 @@ mod tests {
         assert!(!path.exists());
         let _store = DiskLogStore::open(&path).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn no_compat_old_raft_log_entry_requires_recreate() {
+        fn remove_field(value: &mut serde_json::Value, field: &str) -> bool {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove(field).is_some()
+                        || map.values_mut().any(|value| remove_field(value, field))
+                }
+                serde_json::Value::Array(values) => {
+                    values.iter_mut().any(|value| remove_field(value, field))
+                }
+                _ => false,
+            }
+        }
+
+        let entry = make_normal_entry(
+            7,
+            2,
+            ClusterCommand::FailShardCopy {
+                index_name: "idx".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 0,
+                node: "node-2".into(),
+                allocation_id: 9,
+                expected_primary_term: 2,
+                promote_only: false,
+                promotion_candidate: None,
+            },
+        );
+        let mut value = serde_json::to_value(entry).unwrap();
+        assert!(remove_field(&mut value, "expected_primary_term"));
+        let bytes = serde_json::to_vec(&value).unwrap();
+
+        let error = DiskLogStore::decode_log_entry(&bytes).unwrap_err();
+        assert!(error.to_string().contains("recreate the index"));
     }
 
     #[tokio::test]

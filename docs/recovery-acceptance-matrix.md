@@ -220,8 +220,6 @@ Round-4 evidence adds
 `bulk_aborted_failure_remains_attributable_and_retryable`.
 
 Round-5 evidence adds
-`legacy_large_frame_opens_replays_and_skips_in_recovery`,
-`bounded_range_rejects_legacy_large_frame_in_transfer_range`,
 `bounded_range_rejects_partial_post_head_frame_in_non_final_generation`,
 `bounded_range_rejects_partial_post_head_frame_inside_captured_size`,
 `open_truncates_partial_active_tail_before_append`, and
@@ -230,12 +228,10 @@ Round-5 evidence adds
 `bounded_range_rejects_torn_terminal_frame_followed_by_append`, and the
 `wal_frame_limit_*` write-boundary tests.
 
-Round-6 evidence adds
-`transport::server::tests::recover_replica_does_not_open_or_mutate_live_wal`.
-It deterministically pauses a live append after a partial frame is visible,
-starts legacy `RecoverReplica`, verifies the RPC enters the live engine read
-path without shrinking the file, then proves the completed append and all
-acknowledged documents survive engine reopen.
+The former pre-1.0 large-frame and `RecoverReplica` compatibility exercises
+were removed with the compatibility paths they covered. Earlier WAL, identity,
+manifest, Raft-log, and wire formats now fail closed with recreate-the-index
+guidance instead of entering recovery.
 
 The September 27 allocation/fencing review adds
 `red_sibling_shard_does_not_block_update_index`,

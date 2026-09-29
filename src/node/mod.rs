@@ -192,107 +192,6 @@ fn should_attempt_failed_copy_report(
     true
 }
 
-async fn reconcile_legacy_replica_migrations(
-    local_node_id: &str,
-    cluster_manager: &ClusterManager,
-    shard_manager: &ShardManager,
-    transport_client: &TransportClient,
-    raft: &RaftInstance,
-) {
-    for (key, pending) in shard_manager.legacy_replica_migrations() {
-        let state = cluster_manager.get_state();
-        let Some(metadata) = state.indices.get(&key.index) else {
-            shard_manager.remove_legacy_replica_migration(&key.index, key.shard_id);
-            continue;
-        };
-        let Some(routing) = metadata.shard_routing.get(&key.shard_id) else {
-            shard_manager.remove_legacy_replica_migration(&key.index, key.shard_id);
-            continue;
-        };
-        if metadata.uuid.as_str() != pending.index_uuid
-            || state.shard_allocation_id(&key.index, key.shard_id, local_node_id)
-                != Some(pending.allocation_id)
-        {
-            shard_manager.remove_legacy_replica_migration(&key.index, key.shard_id);
-            continue;
-        }
-        if routing.primary == local_node_id {
-            shard_manager.remove_legacy_replica_migration(&key.index, key.shard_id);
-            continue;
-        }
-        if !routing.is_replica_in_sync(local_node_id) {
-            continue;
-        }
-        let Some(primary) = state.nodes.get(&routing.primary) else {
-            continue;
-        };
-        let Some(primary_allocation_id) =
-            state.shard_allocation_id(&key.index, key.shard_id, &routing.primary)
-        else {
-            continue;
-        };
-        let Ok(probe) = transport_client
-            .get_shard_sequence_state(
-                primary,
-                crate::transport::proto::GetShardSequenceStateRequest {
-                    index_name: key.index.clone(),
-                    index_uuid: pending.index_uuid.clone(),
-                    shard_id: key.shard_id,
-                    allocation_id: Some(primary_allocation_id),
-                    expected_primary_term: routing.primary_term,
-                },
-            )
-            .await
-        else {
-            continue;
-        };
-        if !probe.active_primary
-            || probe.sequence_format_version != crate::engine::SEQUENCE_FORMAT_VERSION
-        {
-            continue;
-        }
-        let command = ClusterCommand::FailShardCopy {
-            index_name: key.index.clone(),
-            index_uuid: pending.index_uuid.clone(),
-            shard_id: key.shard_id,
-            node: local_node_id.to_string(),
-            allocation_id: pending.allocation_id,
-            expected_primary_term: routing.primary_term,
-            promote_only: false,
-            promotion_candidate: None,
-        };
-        let result = if raft.is_leader() {
-            crate::consensus::client_write_checked(raft, command)
-                .await
-                .map_err(anyhow::Error::msg)
-        } else {
-            let Some(master_id) = state.master_node.as_ref() else {
-                continue;
-            };
-            let Some(master) = state.nodes.get(master_id) else {
-                continue;
-            };
-            transport_client
-                .forward_fail_shard_copy(
-                    master,
-                    crate::transport::proto::FailShardCopyRequest {
-                        index_name: key.index.clone(),
-                        index_uuid: pending.index_uuid.clone(),
-                        shard_id: key.shard_id,
-                        node_id: local_node_id.to_string(),
-                        allocation_id: Some(pending.allocation_id),
-                        promote_only: false,
-                        expected_primary_term: routing.primary_term,
-                    },
-                )
-                .await
-        };
-        if result.is_ok() {
-            shard_manager.remove_legacy_replica_migration(&key.index, key.shard_id);
-        }
-    }
-}
-
 async fn report_failed_shard_copies(
     failures: Vec<ShardCopyFailure>,
     cluster_manager: &ClusterManager,
@@ -831,16 +730,6 @@ impl Node {
             .await;
             state = manager.get_state();
             activate_local_primaries(&state, &local_id, &primary_activation_service).await;
-            reconcile_legacy_replica_migrations(
-                &local_id,
-                manager.as_ref(),
-                manager_clone.as_ref(),
-                &client,
-                raft.as_ref(),
-            )
-            .await;
-            state = manager.get_state();
-
             let mut orphan_cleanup_done = cleanup_orphaned_data_if_authoritative_blocking(
                 Some(state.clone()),
                 local_id.clone(),

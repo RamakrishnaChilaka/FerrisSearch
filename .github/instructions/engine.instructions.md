@@ -57,8 +57,9 @@ pub trait SearchEngine: Send + Sync {
 - `apply_replica_operation` / `apply_replica_batch` are the only production
   replica/recovery entry points and require explicit sequence and primary term
 - Replica/recovery code MUST preserve the primary-assigned seq_no when writing to WAL; do not route replicated operations through the local-allocation methods
-- Primary transport handlers must use the receipt-returning methods. The legacy
-  ID/count methods delegate to them and intentionally discard only the receipt.
+- Primary transport handlers must use the receipt-returning methods. The
+  convenience ID/count methods delegate to them and intentionally discard only
+  the receipt.
 - A receipt belongs to its operation, even if another write advances a checkpoint
   before replication. Never reconstruct its sequence from `last_seq_no()` or
   `local_checkpoint()`.
@@ -176,7 +177,7 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   searchable segment count is at most the requested positive bound while
   preserving document values, deletes, and the committed WAL boundary.
 - `rebuild_vectors()` is only called when the index has `KnnVector` fields in its mappings. The shard manager gates this check; the composite engine's `rebuild_vectors()` itself is still a 100K-doc MatchAll scan, so never call it unconditionally.
-- Even the legacy `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used directly; never run Tantivy commit/reload inline on an async interval task
+- Even the direct `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used; never run Tantivy commit/reload inline on an async interval task
 - Replica/recovery writes use explicit-sequence append APIs, including
   arbitrary ordered batches, so persisted WAL operation identities match the
   primary even when delivery order differs from sequence order.
@@ -231,8 +232,8 @@ With FAST, Tantivy reads a columnar structure - orders of magnitude faster for r
 - Validate keyword objects before any WAL append or writer mutation, including
   the entire shard batch and explicit-sequence paths. Replay must surface invalid
   values rather than silently omit indexed data.
-- Numeric keyword arrays are not vector fields. Keep them out of the legacy
-  automatic vector-detection path.
+- Numeric keyword arrays are not vector fields. Keep them out of automatic
+  vector detection.
 - Query DSL terms buckets count matching documents once per keyword value.
   SQL's direct columnar readers remain scalar-first; this does not introduce
   SQL array expressions or `UNNEST` semantics.

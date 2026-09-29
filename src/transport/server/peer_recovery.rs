@@ -9,7 +9,7 @@ use crate::transport::proto::{
     CompleteFinalizeRecoveryRequest, CompleteFinalizeRecoveryResponse,
     FetchRecoveryFileChunkRequest, FetchRecoveryFileChunkResponse, FetchRecoveryOpsRequest,
     FetchRecoveryOpsResponse, MarkReplicaInSyncRequest, PrepareFinalizeRecoveryRequest,
-    PrepareFinalizeRecoveryResponse, RecoverReplicaOp, RecoveryFileMetadata, RecoveryWalCursor,
+    PrepareFinalizeRecoveryResponse, RecoveryFileMetadata, RecoveryOperation, RecoveryWalCursor,
     StartPeerRecoveryRequest, StartPeerRecoveryResponse,
 };
 use std::collections::HashMap;
@@ -544,7 +544,7 @@ async fn record_setup_failure(
     }
 }
 
-pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverReplicaOp, Status> {
+pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoveryOperation, Status> {
     let operation = crate::wal::document_operation(&entry)
         .map_err(|error| Status::internal(error.to_string()))?;
     let (doc_id, payload) = match operation {
@@ -558,7 +558,7 @@ pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverRep
             (String::new(), serde_json::json!({ "_reason": reason }))
         }
     };
-    Ok(RecoverReplicaOp {
+    Ok(RecoveryOperation {
         seq_no: entry.seq_no,
         op: entry.op.as_str().to_string(),
         doc_id,
@@ -570,7 +570,7 @@ pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoverRep
 
 fn recovery_ops(
     operations: Vec<crate::wal::TranslogEntry>,
-) -> Result<Vec<RecoverReplicaOp>, Status> {
+) -> Result<Vec<RecoveryOperation>, Status> {
     operations.into_iter().map(recovery_op).collect()
 }
 
@@ -1993,7 +1993,7 @@ mod tests {
         reopened.flush().unwrap();
         assert!(
             reopened
-                .legacy_recovery_ops(1, 16, 1024 * 1024)
+                .retained_recovery_ops(1, 16, 1024 * 1024)
                 .unwrap()
                 .operations
                 .is_empty(),
@@ -3451,7 +3451,7 @@ mod tests {
         engine.flush().unwrap();
         assert!(
             engine
-                .legacy_recovery_ops(snapshot.snapshot_next_seq_no, 16, 1024 * 1024)
+                .retained_recovery_ops(snapshot.snapshot_next_seq_no, 16, 1024 * 1024)
                 .unwrap()
                 .operations
                 .is_empty(),

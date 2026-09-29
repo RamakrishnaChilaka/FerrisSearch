@@ -6,6 +6,31 @@ pub mod sql_parse;
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "unsupported {component} format: {detail}; FerrisSearch pre-1.0 does not support migrations; recreate the index"
+)]
+pub(crate) struct UnsupportedIndexFormatError {
+    component: String,
+    detail: String,
+}
+
+impl UnsupportedIndexFormatError {
+    pub(crate) fn new(component: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            component: component.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+pub(crate) fn unsupported_index_format(
+    component: impl Into<String>,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(UnsupportedIndexFormatError::new(component, detail))
+}
+
 /// Validates that an index name is safe and well-formed.
 /// Prevents path traversal attacks and rejects names that would cause filesystem issues.
 fn validate_index_name(name: &str) -> std::result::Result<(), &'static str> {

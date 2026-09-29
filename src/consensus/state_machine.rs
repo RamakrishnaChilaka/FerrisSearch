@@ -513,9 +513,12 @@ impl ClusterStateMachine {
                         "index '{index_name}' has no shard {shard_id}"
                     ));
                 };
-                if *expected_primary_term != 0
-                    && current_routing.primary_term != *expected_primary_term
-                {
+                if *expected_primary_term == 0 {
+                    return ClusterResponse::Error(format!(
+                        "failed-copy primary term must be greater than zero for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if current_routing.primary_term != *expected_primary_term {
                     return ClusterResponse::Error(format!(
                         "primary term mismatch for failed copy of index '{index_name}' shard {shard_id}: expected {}, got {}",
                         current_routing.primary_term, expected_primary_term
@@ -754,8 +757,28 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
         snapshot: Cursor<Vec<u8>>,
     ) -> Result<(), io::Error> {
         let data = snapshot.into_inner();
-        let new_state: ClusterState = serde_json::from_slice(&data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let new_state: ClusterState = serde_json::from_slice(&data).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::common::UnsupportedIndexFormatError::new(
+                    "Raft cluster-state snapshot",
+                    format!("cannot decode current snapshot format: {error}"),
+                ),
+            )
+        })?;
+        if new_state.format_version != crate::cluster::state::CLUSTER_STATE_FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::common::UnsupportedIndexFormatError::new(
+                    "Raft cluster-state snapshot",
+                    format!(
+                        "version {} is not supported; expected {}",
+                        new_state.format_version,
+                        crate::cluster::state::CLUSTER_STATE_FORMAT_VERSION
+                    ),
+                ),
+            ));
+        }
 
         {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
@@ -1520,29 +1543,6 @@ mod tests {
                 .shard_allocation_id("idx", 0, "node-2"),
             Some(14)
         );
-        assert_eq!(
-            sm.apply_command_at(
-                &ClusterCommand::FailShardCopy {
-                    index_name: "idx".into(),
-                    index_uuid: "test-uuid".into(),
-                    shard_id: 0,
-                    node: "node-2".into(),
-                    allocation_id: 14,
-                    expected_primary_term: 0,
-                    promote_only: false,
-                    promotion_candidate: None,
-                },
-                16,
-            ),
-            ClusterResponse::Ok
-        );
-        assert_eq!(
-            sm.state_handle()
-                .read()
-                .unwrap()
-                .shard_allocation_id("idx", 0, "node-2"),
-            None
-        );
     }
 
     #[test]
@@ -2270,6 +2270,29 @@ mod tests {
             assert_eq!(state.cluster_name, "replaced");
             assert!(state.nodes.contains_key("new-node"));
             assert!(!state.nodes.contains_key("old"));
+        });
+    }
+
+    #[test]
+    fn no_compat_old_raft_snapshot_requires_recreate() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut sm = ClusterStateMachine::new("original".into());
+            let mut old_state = ClusterState::new("old".into());
+            old_state.format_version = 0;
+            let snap_data = serde_json::to_vec(&old_state).unwrap();
+            let meta = SnapshotMeta {
+                last_log_id: None,
+                last_membership: StoredMembership::default(),
+                snapshot_id: "old-format".into(),
+            };
+
+            let error = sm
+                .install_snapshot(&meta, Cursor::new(snap_data))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("recreate the index"));
         });
     }
 

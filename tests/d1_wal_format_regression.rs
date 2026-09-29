@@ -59,6 +59,10 @@ fn direct_open_rejects_even_an_empty_v1_manifest_without_migration_authority() {
         error.contains("unsupported translog manifest") && error.contains("version 1"),
         "unexpected legacy WAL error: {error}"
     );
+    assert!(
+        error.contains("recreate the index"),
+        "legacy WAL error did not explain remediation: {error}"
+    );
 }
 
 #[tokio::test]

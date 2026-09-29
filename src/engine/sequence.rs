@@ -6,7 +6,7 @@ use std::io::Write;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-pub(crate) const COMMITTED_BOUNDARY_FORMAT_VERSION: u32 = 1;
+pub(crate) const COMMITTED_BOUNDARY_FORMAT_VERSION: u32 = 2;
 pub const SEQUENCE_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,7 +323,6 @@ pub(crate) struct CommittedBoundaryRecord {
     pub persisted_checkpoint: Option<u64>,
     pub max_seq_no: Option<u64>,
     pub max_seq_no_of_updates_or_deletes: Option<u64>,
-    pub legacy_migration_checkpoint: Option<u64>,
     pub term_sequence_state: PrimaryTermSequenceRecord,
 }
 
@@ -335,7 +334,6 @@ impl CommittedBoundaryRecord {
             persisted_checkpoint: None,
             max_seq_no: None,
             max_seq_no_of_updates_or_deletes: None,
-            legacy_migration_checkpoint: None,
             term_sequence_state: PrimaryTermSequenceRecord {
                 current_term,
                 max_seq_no_at_term_start: None,
@@ -346,11 +344,13 @@ impl CommittedBoundaryRecord {
 
     pub(crate) fn validate(&self) -> Result<()> {
         if self.version != COMMITTED_BOUNDARY_FORMAT_VERSION {
-            return Err(UnsupportedCommittedBoundaryVersionError {
-                found: self.version,
-                expected: COMMITTED_BOUNDARY_FORMAT_VERSION,
-            }
-            .into());
+            return Err(crate::common::unsupported_index_format(
+                "committed sequence boundary",
+                format!(
+                    "version {} is not supported; expected {}",
+                    self.version, COMMITTED_BOUNDARY_FORMAT_VERSION
+                ),
+            ));
         }
         if let (Some(persisted), Some(processed)) =
             (self.persisted_checkpoint, self.processed_checkpoint)
@@ -377,10 +377,6 @@ impl CommittedBoundaryRecord {
                 "maximum sequence number of updates or deletes",
                 self.max_seq_no_of_updates_or_deletes,
             ),
-            (
-                "legacy migration checkpoint",
-                self.legacy_migration_checkpoint,
-            ),
         ] {
             if let (Some(value), Some(max_seq_no)) = (value, self.max_seq_no)
                 && value > max_seq_no
@@ -392,7 +388,6 @@ impl CommittedBoundaryRecord {
         }
         if self.max_seq_no.is_none()
             && (self.max_seq_no_of_updates_or_deletes.is_some()
-                || self.legacy_migration_checkpoint.is_some()
                 || self.term_sequence_state.max_seq_no_at_term_start.is_some()
                 || !self
                     .term_sequence_state
@@ -447,27 +442,37 @@ impl CommittedBoundaryRecord {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if let Some(next_seq_no) = std::str::from_utf8(&bytes)
+        if std::str::from_utf8(&bytes)
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
+            .is_some()
         {
-            return Err(LegacyCommittedBoundaryFormatError { next_seq_no }.into());
+            return Err(crate::common::unsupported_index_format(
+                "committed sequence boundary",
+                "legacy integer encoding",
+            ));
         }
         let header =
             serde_json::from_slice::<CommittedBoundaryVersionHeader>(&bytes).map_err(|error| {
-                committed_boundary_corruption(format!(
-                    "decode committed boundary version {path:?}: {error}"
-                ))
+                crate::common::unsupported_index_format(
+                    "committed sequence boundary",
+                    format!("cannot decode version header at {path:?}: {error}"),
+                )
             })?;
         if header.version != COMMITTED_BOUNDARY_FORMAT_VERSION {
-            return Err(UnsupportedCommittedBoundaryVersionError {
-                found: header.version,
-                expected: COMMITTED_BOUNDARY_FORMAT_VERSION,
-            }
-            .into());
+            return Err(crate::common::unsupported_index_format(
+                "committed sequence boundary",
+                format!(
+                    "version {} is not supported; expected {}",
+                    header.version, COMMITTED_BOUNDARY_FORMAT_VERSION
+                ),
+            ));
         }
         let record = serde_json::from_slice::<Self>(&bytes).map_err(|error| {
-            committed_boundary_corruption(format!("decode committed boundary {path:?}: {error}"))
+            crate::common::unsupported_index_format(
+                "committed sequence boundary",
+                format!("cannot decode current format at {path:?}: {error}"),
+            )
         })?;
         record.validate()?;
         Ok(Some(record))
@@ -696,19 +701,6 @@ pub(crate) struct PrimaryTermSequenceCollisionError {
 pub(crate) struct PrimaryTermSequenceStateTermError {
     expected: u64,
     found: u64,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("unsupported committed boundary version {found} (expected {expected})")]
-pub(crate) struct UnsupportedCommittedBoundaryVersionError {
-    found: u32,
-    expected: u32,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("legacy integer committed boundary {next_seq_no} requires migration")]
-pub(crate) struct LegacyCommittedBoundaryFormatError {
-    next_seq_no: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -941,7 +933,6 @@ mod tests {
             persisted_checkpoint: Some(7),
             max_seq_no: Some(10),
             max_seq_no_of_updates_or_deletes: Some(9),
-            legacy_migration_checkpoint: None,
             term_sequence_state: PrimaryTermSequenceRecord {
                 current_term: 3,
                 max_seq_no_at_term_start: Some(6),
@@ -974,18 +965,18 @@ mod tests {
         let mut record = empty_record();
         record.version += 1;
         let error = record.validate().unwrap_err();
-        assert!(error.is::<UnsupportedCommittedBoundaryVersionError>());
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
     }
 
     #[test]
-    fn legacy_integer_committed_boundary_has_typed_error() {
+    fn no_compat_integer_committed_boundary_requires_recreate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("translog.committed");
         std::fs::write(&path, "17\n").unwrap();
 
         let error = CommittedBoundaryRecord::load(&path).unwrap_err();
 
-        assert!(error.is::<LegacyCommittedBoundaryFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
     }
 
     #[test]

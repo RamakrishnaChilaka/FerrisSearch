@@ -117,6 +117,10 @@ architecture decision.
   or add unfenced read-modify-write manifest updates.
 - **Wire and storage decoding fails loudly.** Never replace malformed protocol,
   manifest, snapshot, partial-aggregation, or WAL data with defaults.
+- **Pre-1.0 has no backward compatibility.** Do not add migration paths or
+  compatibility shims for on-disk, WAL, Raft-log, or wire formats. Incompatible
+  old data fails closed with a clear error directing operators to recreate the
+  index.
 - **Blocking disk and engine work stays off Tokio workers.** Use Tokio's
   blocking pool for lifecycle I/O and dedicated worker pools for steady-state
   search/write work. Keep Raft and control-plane futures on Tokio.

@@ -50,8 +50,6 @@ const TRANSLOG_GENERATION_WIDTH: usize = 20;
 const MAX_NOOP_REASON_BYTES: usize = 1024;
 /// Maximum total frame size accepted for new writes and peer-recovery transfer.
 pub const MAX_WAL_FRAME_BYTES: usize = 32 * 1024 * 1024;
-/// Bounded compatibility ceiling for complete frames written before the write cap existed.
-pub const MAX_WAL_DECODE_FRAME_BYTES: usize = 65 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 #[error("WAL frame is {frame_bytes} bytes, exceeding maximum {max_bytes} bytes")]
@@ -66,26 +64,6 @@ pub(crate) struct WalCorruptionError {
     message: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("unsupported {component} format version {found} (expected {expected})")]
-pub(crate) struct UnsupportedWalFormatError {
-    component: &'static str,
-    found: u32,
-    expected: u32,
-}
-
-impl UnsupportedWalFormatError {
-    pub(crate) fn is_legacy_manifest(&self) -> bool {
-        self.component == "translog manifest" && self.found == 1
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("legacy WAL migration failed: {message}")]
-pub(crate) struct LegacyWalMigrationError {
-    message: String,
-}
-
 fn wal_corruption(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(WalCorruptionError {
         message: message.into(),
@@ -93,11 +71,10 @@ fn wal_corruption(message: impl Into<String>) -> anyhow::Error {
 }
 
 fn unsupported_wal_format(component: &'static str, found: u32, expected: u32) -> anyhow::Error {
-    anyhow::Error::new(UnsupportedWalFormatError {
+    crate::common::unsupported_index_format(
         component,
-        found,
-        expected,
-    })
+        format!("version {found} is not supported; expected {expected}"),
+    )
 }
 
 /// The type of WAL operation.
@@ -371,13 +348,6 @@ impl WireEntryV2 {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct LegacyWireEntryV1 {
-    seq_no: u64,
-    op: String,
-    payload_json: String,
-}
-
 fn validate_entry_identity(
     primary_term: u64,
     op: WalOperation,
@@ -600,29 +570,17 @@ fn decode_wire_entry(payload: &[u8]) -> Result<WireEntryV2> {
             }
             Ok(wire)
         }
-        Err(v2_error) => {
-            let legacy_v1 = bincode_next::serde::decode_from_slice::<LegacyWireEntryV1, _>(
-                payload,
-                BINCODE_CONFIG,
-            );
-            if legacy_v1.is_ok_and(|(legacy, consumed)| {
-                consumed == payload.len()
-                    && WalOperation::parse(&legacy.op).is_ok()
-                    && serde_json::from_str::<serde_json::Value>(&legacy.payload_json).is_ok()
-            }) {
-                return Err(unsupported_wal_format(
-                    "translog entry",
-                    1,
-                    TRANSLOG_ENTRY_FORMAT_VERSION,
-                ));
-            }
-            if declared_version == Some(TRANSLOG_ENTRY_FORMAT_VERSION) {
-                return Err(wal_corruption(format!(
-                    "decode translog v2 frame: {v2_error}"
-                )));
-            }
-            Err(wal_corruption(format!("decode translog frame: {v2_error}")))
-        }
+        Err(v2_error) => Err(crate::common::unsupported_index_format(
+            "translog entry",
+            match declared_version {
+                Some(version) => format!(
+                    "version {version} cannot be decoded as current version {TRANSLOG_ENTRY_FORMAT_VERSION}: {v2_error}"
+                ),
+                None => format!(
+                    "cannot decode current version {TRANSLOG_ENTRY_FORMAT_VERSION}: {v2_error}"
+                ),
+            },
+        )),
     }
 }
 
@@ -659,7 +617,7 @@ fn read_next_entry<R: Read>(
         }
     })?;
     let payload_len = u32::from_le_bytes(len_buf) as usize;
-    let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)
+    let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)
         .map_err(|error| wal_corruption(error.to_string()))?;
     if let Some(remaining) = remaining_file_bytes
         && frame_bytes as u64 > remaining
@@ -832,24 +790,6 @@ struct TranslogManifest {
 #[derive(Deserialize)]
 struct ManifestVersionHeader {
     version: u32,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyTranslogManifestV1 {
-    version: u32,
-    active_generation_id: u64,
-    next_generation_id: u64,
-    generations: Vec<LegacyManifestGenerationV1>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyManifestGenerationV1 {
-    id: u64,
-    first_seq_no: Option<u64>,
-    last_seq_no: Option<u64>,
-    size_bytes: u64,
 }
 
 impl TranslogManifest {
@@ -1071,7 +1011,7 @@ fn scan_active_generation_from_path(path: &Path) -> Result<ActiveGenerationScan>
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf)?;
         let payload_len = u32::from_le_bytes(len_buf) as usize;
-        let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)
+        let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)
             .map_err(|error| wal_corruption(error.to_string()))?;
         let frame_end = frame_start
             .checked_add(frame_bytes as u64)
@@ -1117,8 +1057,12 @@ fn load_translog_manifest(data_dir: &Path) -> Result<Option<TranslogManifest>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let header = serde_json::from_slice::<ManifestVersionHeader>(&bytes)
-        .map_err(|error| wal_corruption(format!("decode translog manifest {path:?}: {error}")))?;
+    let header = serde_json::from_slice::<ManifestVersionHeader>(&bytes).map_err(|error| {
+        crate::common::unsupported_index_format(
+            "translog manifest",
+            format!("cannot decode version header at {path:?}: {error}"),
+        )
+    })?;
     if header.version != TRANSLOG_MANIFEST_VERSION {
         return Err(unsupported_wal_format(
             "translog manifest",
@@ -1126,8 +1070,12 @@ fn load_translog_manifest(data_dir: &Path) -> Result<Option<TranslogManifest>> {
             TRANSLOG_MANIFEST_VERSION,
         ));
     }
-    let manifest = serde_json::from_slice::<TranslogManifest>(&bytes)
-        .map_err(|error| wal_corruption(format!("decode translog manifest {path:?}: {error}")))?;
+    let manifest = serde_json::from_slice::<TranslogManifest>(&bytes).map_err(|error| {
+        crate::common::unsupported_index_format(
+            "translog manifest",
+            format!("cannot decode current format at {path:?}: {error}"),
+        )
+    })?;
     manifest
         .validate()
         .with_context(|| format!("validate translog manifest {path:?}"))?;
@@ -1421,107 +1369,6 @@ impl HotTranslog {
         })
     }
 
-    pub(crate) fn migrate_empty_v1<P: AsRef<Path>>(data_dir: P) -> Result<Option<u64>> {
-        let data_dir = data_dir.as_ref();
-        let path = manifest_path(data_dir);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let header: ManifestVersionHeader = serde_json::from_slice(&bytes).map_err(|error| {
-            wal_corruption(format!("decode translog manifest {path:?}: {error}"))
-        })?;
-        if header.version == TRANSLOG_MANIFEST_VERSION {
-            return Ok(None);
-        }
-        if header.version != 1 {
-            return Err(unsupported_wal_format(
-                "translog manifest",
-                header.version,
-                TRANSLOG_MANIFEST_VERSION,
-            ));
-        }
-        let legacy: LegacyTranslogManifestV1 = serde_json::from_slice(&bytes).map_err(|error| {
-            wal_corruption(format!("decode legacy translog manifest {path:?}: {error}"))
-        })?;
-        if legacy.version != 1 || legacy.generations.is_empty() {
-            return Err(LegacyWalMigrationError {
-                message: "legacy translog manifest is malformed".to_string(),
-            }
-            .into());
-        }
-        let mut generations = Vec::with_capacity(legacy.generations.len());
-        for generation in legacy.generations {
-            let path = generation_path(data_dir, generation.id);
-            let actual_size = fs::metadata(&path)?.len();
-            if generation.size_bytes != 0
-                || actual_size != 0
-                || generation.first_seq_no.is_some()
-                || generation.last_seq_no.is_some()
-            {
-                return Err(LegacyWalMigrationError {
-                    message: format!("legacy translog generation {} is not empty", generation.id),
-                }
-                .into());
-            }
-            generations.push(ManifestGenerationInfo {
-                id: generation.id,
-                min_seq_no: None,
-                max_seq_no: None,
-                size_bytes: 0,
-            });
-        }
-        if !generations
-            .iter()
-            .any(|generation| generation.id == legacy.active_generation_id)
-        {
-            return Err(LegacyWalMigrationError {
-                message: "legacy translog active generation is missing".to_string(),
-            }
-            .into());
-        }
-        let persisted_next_seq_no = match fs::read_to_string(data_dir.join(TRANSLOG_SEQNO_FILE)) {
-            Ok(value) => value.trim().parse::<u64>().map_err(|error| {
-                wal_corruption(format!(
-                    "invalid legacy translog sequence watermark: {error}"
-                ))
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error.into()),
-        };
-        let committed_next_seq_no = fs::read_to_string(data_dir.join("translog.committed"))
-            .map_err(|error| LegacyWalMigrationError {
-                message: format!("read legacy committed boundary: {error}"),
-            })?
-            .trim()
-            .parse::<u64>()
-            .map_err(|error| LegacyWalMigrationError {
-                message: format!("parse legacy committed boundary: {error}"),
-            })?;
-        if committed_next_seq_no != persisted_next_seq_no {
-            return Err(LegacyWalMigrationError {
-                message: format!(
-                    "legacy committed boundary {committed_next_seq_no} does not match sequence watermark {persisted_next_seq_no}"
-                ),
-            }
-            .into());
-        }
-
-        persist_translog_manifest(
-            &path,
-            &TranslogManifest {
-                version: TRANSLOG_MANIFEST_VERSION,
-                entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
-                active_generation_id: legacy.active_generation_id,
-                next_generation_id: legacy.next_generation_id,
-                generations,
-            },
-        )?;
-        File::open(data_dir)?.sync_all()?;
-        Ok(Some(committed_next_seq_no))
-    }
-
     #[cfg(test)]
     fn maybe_fail_write_for_test(&self) -> Result<()> {
         let mut failure = recover_lock(self.write_io_failure.as_ref(), "write I/O failure");
@@ -1634,7 +1481,7 @@ impl HotTranslog {
                     );
                 }
                 let payload_len = u32::from_le_bytes(len_buf) as usize;
-                let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+                let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)?;
                 let payload_start = reader.stream_position()?;
                 let frame_end = payload_start
                     .checked_add(payload_len as u64)
@@ -1774,7 +1621,7 @@ impl HotTranslog {
                     )
                 })?;
                 let payload_len = u32::from_le_bytes(len_buf) as usize;
-                let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+                let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)?;
                 let frame_end = frame_start
                     .checked_add(frame_bytes as u64)
                     .ok_or_else(|| anyhow::anyhow!("translog frame cursor overflow"))?;
@@ -2315,7 +2162,7 @@ impl WriteAheadLog for HotTranslog {
                 let mut len_buf = [0u8; 4];
                 reader.read_exact(&mut len_buf)?;
                 let payload_len = u32::from_le_bytes(len_buf) as usize;
-                checked_frame_bytes(payload_len, MAX_WAL_DECODE_FRAME_BYTES)?;
+                checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)?;
                 let mut payload = vec![0u8; payload_len];
                 reader.read_exact(&mut payload)?;
                 let entry = decode_wire_entry(&payload)?.into_translog()?;
@@ -2789,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_v2_frame_written_before_limit_opens_replays_and_skips_in_recovery() {
+    fn oversized_current_frame_is_rejected_on_open() {
         let _guard = WAL_FRAME_LIMIT_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -2802,7 +2649,6 @@ mod tests {
         };
         let frame = encode_entry_without_write_limit(&pre_limit);
         assert!(frame.len() > MAX_WAL_FRAME_BYTES);
-        assert!(frame.len() < 65 * 1024 * 1024);
         fs::write(generation_path(dir.path(), 0), &frame).unwrap();
         let manifest = TranslogManifest {
             version: TRANSLOG_MANIFEST_VERSION,
@@ -2820,50 +2666,11 @@ mod tests {
         drop(frame);
         drop(pre_limit);
 
-        let wal = HotTranslog::open(dir.path()).unwrap();
-        assert_eq!(wal.next_seq_no(), 1);
-        let entries = wal.read_all().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].seq_no, 0);
-        assert_eq!(
-            entries[0].payload["blob"].as_str().unwrap().len(),
-            40 * 1024 * 1024
-        );
-        drop(entries);
-
-        let mut replayed = Vec::new();
-        assert_eq!(
-            wal.for_each_from(0, &mut |entry| {
-                replayed.push(entry.seq_no);
-                Ok(())
-            })
-            .unwrap(),
-            1
-        );
-        assert_eq!(replayed, [0]);
-
-        let appended = wal
-            .append(WalOperation::Index, json!({"value": "new"}))
-            .unwrap();
-        assert_eq!(appended.seq_no, 1);
-        let snapshot = wal.recovery_read_snapshot().unwrap();
-        let (operations, complete) = snapshot
-            .read_bounded_range(1, 16, MAX_WAL_FRAME_BYTES)
-            .unwrap();
-        assert!(complete);
-        assert_eq!(
-            operations
-                .iter()
-                .map(|entry| entry.seq_no)
-                .collect::<Vec<_>>(),
-            [1]
-        );
-
-        let oversized = payload_for_frame_len(2, WalOperation::Index, MAX_WAL_FRAME_BYTES + 1);
-        let before_size = wal.size_bytes().unwrap();
-        assert!(wal.append(WalOperation::Index, oversized).is_err());
-        assert_eq!(wal.next_seq_no(), 2);
-        assert_eq!(wal.size_bytes().unwrap(), before_size);
+        let error = match HotTranslog::open(dir.path()) {
+            Ok(_) => panic!("oversized persisted frame unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeding maximum"));
     }
 
     #[test]
@@ -3251,13 +3058,20 @@ mod tests {
         frame.extend_from_slice(&encoded);
 
         let error = decode_entries(&mut std::io::Cursor::new(frame)).unwrap_err();
-        assert!(error.is::<UnsupportedWalFormatError>());
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
     }
 
     #[test]
-    fn legacy_v1_entry_fails_with_typed_error() {
+    fn no_compat_v1_entry_requires_recreate() {
+        #[derive(Serialize)]
+        struct V1Entry {
+            seq_no: u64,
+            op: String,
+            payload_json: String,
+        }
+
         for seq_no in [0u64, 1, 2, 3, 7, 300, 1 << 33] {
-            let wire = LegacyWireEntryV1 {
+            let wire = V1Entry {
                 seq_no,
                 op: "index".to_string(),
                 payload_json: serde_json::to_string(&json!({
@@ -3273,8 +3087,12 @@ mod tests {
 
             let error = decode_entries(&mut std::io::Cursor::new(frame)).unwrap_err();
             assert!(
-                error.is::<UnsupportedWalFormatError>(),
+                error.is::<crate::common::UnsupportedIndexFormatError>(),
                 "legacy seq_no {seq_no} was misclassified: {error:#}"
+            );
+            assert!(
+                error.to_string().contains("recreate the index"),
+                "legacy seq_no {seq_no} did not explain remediation: {error:#}"
             );
         }
     }
@@ -3631,10 +3449,10 @@ mod tests {
     }
 
     #[test]
-    fn bounded_range_rejects_frame_above_legacy_decode_limit() {
+    fn bounded_range_rejects_frame_above_frame_limit() {
         let dir = tempfile::tempdir().unwrap();
         let path = generation_path(dir.path(), 0);
-        fs::write(&path, (MAX_WAL_DECODE_FRAME_BYTES as u32).to_le_bytes()).unwrap();
+        fs::write(&path, (MAX_WAL_FRAME_BYTES as u32).to_le_bytes()).unwrap();
         let generation = GenerationInfo {
             id: 0,
             path,
@@ -3656,7 +3474,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_range_rejects_legacy_large_frame_in_transfer_range() {
+    fn bounded_range_rejects_oversized_frame_in_transfer_range() {
         let _guard = WAL_FRAME_LIMIT_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -3688,11 +3506,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("exceeding recovery transfer maximum")
-        );
+        assert!(error.to_string().contains("exceeding maximum"));
     }
 
     #[test]

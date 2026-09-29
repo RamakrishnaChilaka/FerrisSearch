@@ -336,20 +336,18 @@ allocation can currently choose the same faulty node again; a
 MaxRetryAllocationDecider-style exclusion policy and
 `index.allocation.max_retries` setting are deferred.
 
-This pre-1.0 protocol rejects routing snapshots and non-migratable shard copies
-that lack allocation identity. A narrowly verified flushed legacy primary with
-an empty v1 WAL can migrate in place; legacy replicas remain closed until an
-active migrated primary is proven, then receive a fresh allocation and peer
-recovery. There is no rolling mixed-version compatibility path.
+FerrisSearch pre-1.0 does not migrate data or metadata from earlier builds.
+Existing indices, shard directories, WALs, manifests, copy identities,
+Raft logs/snapshots, and incompatible peer wire formats fail closed. Delete and
+recreate the index or cluster state, then reindex the source data; there is no
+rolling mixed-version compatibility path.
 
 For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
 the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable
 JSON document body is therefore slightly smaller and varies with the document
 ID and serialized shape. Oversized single or bulk items are rejected before
-WAL mutation. Restart and replay retain bounded upgrade compatibility for
-complete legacy frames up to 65 MiB; peer recovery may skip those frames when
-they are already represented by the file snapshot, but transferred operations
-remain limited to 32 MiB.
+WAL mutation. Restart, replay, and peer recovery enforce the same 32 MiB frame
+limit.
 
 Force merge keeps its asynchronous `202 Accepted` task lifecycle. A valid
 `max_num_segments` is at least 1; each shard drains already-scheduled automatic

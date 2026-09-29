@@ -82,8 +82,8 @@ pub struct ShardManager {
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.
-- Pre-1.0 copies without this file are not adopted; clusters must be recreated
-  or reindexed.
+- Pre-1.0 or unknown copy identity versions are never adopted or upgraded.
+  They use the shared unsupported-format error and require index recreation.
 - A stale exact `SHARD_COPY_IDENTITY.json.tmp` is removed before the
   initial-primary empty-directory check. Local/test helpers load and preserve
   an existing durable identity rather than overwriting it with allocation `1`.
@@ -175,7 +175,7 @@ pub struct ReplicaCheckpoint {
 - `update_replica_checkpoint(...)` / `update_replica_checkpoints(...)` take
   exact-allocation typed checkpoint responses plus the captured primary prefix
 - `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>`
-  - Returns a legacy lag-based diagnostic view only; it does not grant
+  - Returns a lag-based diagnostic view only; it does not grant
     authoritative in-sync membership
 - `replica_checkpoints(index, shard_id) -> Vec<(String, u64)>`
 - `remove_shard(index, shard_id)`, `remove_index(index)`

@@ -18,7 +18,8 @@
 
 use ferrissearch::cluster::state::IndexEngine;
 use ferrissearch::storage::{
-    RemoteSplitManifest, RemoteSplitState, RemoteStoreManifest, StorageManager,
+    REMOTE_MANIFEST_FORMAT_VERSION, RemoteSplitManifest, RemoteSplitState, RemoteStoreManifest,
+    StorageManager,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -60,7 +61,7 @@ fn random_prefix() -> String {
 
 fn sample_manifest(index_uuid: &str, generation: u64) -> RemoteStoreManifest {
     RemoteStoreManifest {
-        version: 1,
+        version: REMOTE_MANIFEST_FORMAT_VERSION,
         engine: IndexEngine::RemoteStore,
         index_uuid: index_uuid.into(),
         index_name: "events".into(),

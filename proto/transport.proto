@@ -64,7 +64,7 @@ message IndexMetadata {
     string uuid = 5;
     repeated FieldMappingEntry mappings = 6;
     IndexSettings settings = 7;
-    // Dynamic mapping mode: \"true\", \"false\", \"strict\" (empty = \"false\" for backward compat)
+    // Dynamic mapping mode: \"true\", \"false\", or \"strict\".
     string dynamic = 8;
 }
 
@@ -80,6 +80,7 @@ message ClusterState {
     // never a plaintext secret).
     repeated string api_keys_json = 6;
     repeated string roles_json = 7;
+    uint32 format_version = 8;
 }
 
 message JoinRequest {
@@ -289,24 +290,8 @@ message GetShardSequenceStateResponse {
 
 // ─── Replica Recovery ───────────────────────────────────────────────────────
 
-message RecoverReplicaRequest {
-    string index_name = 1;
-    uint32 shard_id = 2;
-    optional uint64 processed_checkpoint = 3;
-}
-
-message RecoverReplicaResponse {
-    bool success = 1;
-    string error = 2;
-    uint64 ops_replayed = 3;      // number of operations sent to the replica
-    optional uint64 processed_checkpoint = 4;
-    repeated RecoverReplicaOp operations = 5; // the actual translog entries for replay
-    optional uint64 persisted_checkpoint = 6;
-    optional uint64 max_seq_no = 7;
-}
-
 // A single operation in a recovery response (matches translog entry).
-message RecoverReplicaOp {
+message RecoveryOperation {
     uint64 seq_no = 1;
     string op = 2;           // "index", "delete", or "noop"
     string doc_id = 3;
@@ -368,7 +353,7 @@ message FetchRecoveryOpsRequest {
 }
 
 message FetchRecoveryOpsResponse {
-    repeated RecoverReplicaOp operations = 1;
+    repeated RecoveryOperation operations = 1;
     RecoveryWalCursor next_cursor = 2;
     optional uint64 source_max_seq_no = 3;
     bool complete = 4;
@@ -382,7 +367,7 @@ message PrepareFinalizeRecoveryRequest {
 }
 
 message PrepareFinalizeRecoveryResponse {
-    repeated RecoverReplicaOp operations = 1;
+    repeated RecoveryOperation operations = 1;
     RecoveryWalCursor next_cursor = 2;
     RecoveryWalCursor barrier_wal_end = 3;
     optional uint64 barrier_processed_checkpoint = 4;
@@ -677,7 +662,7 @@ message GetTaskStatusResponse {
 // ─── Service Definition ─────────────────────────────────────────────────────
 
 service InternalTransport {
-    // Cluster coordination (legacy — kept for backward compat during migration)
+    // Cluster coordination
     rpc JoinCluster(JoinRequest) returns (JoinResponse);
     rpc PublishState(PublishStateRequest) returns (Empty);
     rpc Ping(PingRequest) returns (Empty);
@@ -703,8 +688,6 @@ service InternalTransport {
     rpc ReplicateBulk(ReplicateBulkRequest) returns (ReplicateBulkResponse);
     rpc GetShardSequenceState(GetShardSequenceStateRequest) returns (GetShardSequenceStateResponse);
 
-    // Replica recovery: replica sends its checkpoint, primary replays translog
-    rpc RecoverReplica(RecoverReplicaRequest) returns (RecoverReplicaResponse);
     rpc StartPeerRecovery(StartPeerRecoveryRequest) returns (StartPeerRecoveryResponse);
     rpc FetchRecoveryFileChunk(FetchRecoveryFileChunkRequest) returns (FetchRecoveryFileChunkResponse);
     rpc FetchRecoveryOps(FetchRecoveryOpsRequest) returns (FetchRecoveryOpsResponse);

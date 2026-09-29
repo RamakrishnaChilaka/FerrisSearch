@@ -55,7 +55,7 @@ fn stale_primary_term_is_rejected_before_wal_append() {
         .unwrap();
     engine.reconcile_term_sequence_state(2, Some(0)).unwrap();
     let before = engine
-        .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+        .retained_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
 
@@ -65,7 +65,7 @@ fn stale_primary_term_is_rejected_before_wal_append() {
             .is_err()
     );
     let after = engine
-        .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+        .retained_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(after.len(), before.len());
@@ -85,7 +85,7 @@ fn full_flush_retains_history_above_a_processed_gap() {
         apply_index(&engine, "b", json!({"v": 2}), 2, 1);
         engine.flush().unwrap();
         let retained = engine
-            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations;
         assert!(retained.iter().any(|entry| entry.seq_no == 2));
@@ -112,7 +112,7 @@ fn checkpoint_flush_caps_pruning_at_the_processed_checkpoint() {
             .flush_with_global_checkpoint(receipt.seq_no)
             .unwrap();
         let retained = engine
-            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations;
         assert!(retained.iter().any(|entry| entry.seq_no == 2));

@@ -71,7 +71,7 @@ pub trait WriteAheadLog: Send + Sync {
 - `write_bulk_with_receipt()` returns the first sequence reserved under the WAL
   lock; the input length determines its contiguous range. Empty input returns
   `None` without allocating a sequence. `write_bulk()` is the discard-receipt
-  compatibility wrapper.
+  convenience wrapper.
 - Primary sequence exhaustion and overflowing explicit bulk ranges must fail
   before any bytes are written; never wrap or reuse a saturated allocator value.
 - `MAX_WAL_FRAME_BYTES` is 32 MiB including the four-byte length prefix. Every
@@ -79,18 +79,15 @@ pub trait WriteAheadLog: Send + Sync {
   is fully encoded and checked before any WAL bytes or sequence state change.
   The effective `_source` limit is slightly smaller because the encoded frame
   also contains `_doc_id`, `_source`, operation, sequence, and bincode metadata.
-- `MAX_WAL_DECODE_FRAME_BYTES` is 65 MiB (`GRPC_MAX_MESSAGE_SIZE + 1 MiB`) for
-  bounded compatibility with complete frames written before the 32 MiB write
-  cap existed. Restart scan, replay, and recovery frames skipped below the
-  requested cursor use this decode ceiling and also validate against the actual
-  file length. Frames transferred by recovery remain limited to 32 MiB.
+- Restart scan, replay, and recovery enforce the same 32 MiB frame ceiling as
+  new writes.
 - `append_with_seq()` persists a caller-supplied `(primary_term, seq_no)` and
   advances the local allocator past it.
 - `append_batch_with_seq()` preserves arbitrary physical input order for live
   replica apply and peer recovery; do not sort it by sequence.
-- `write_bulk_with_start_seq()` is only the contiguous compatibility helper.
-- `read_from(seq_no)` is a legacy compatibility/testing API, not a peer
-  recovery pagination cursor.
+- `write_bulk_with_start_seq()` is only the contiguous explicit-sequence helper.
+- `read_from(seq_no)` is a test-only sequence filter, not a peer-recovery
+  pagination cursor.
 - `for_each_from(seq_no, callback)` streams entries with seq_no >= the given value without loading the whole WAL into memory (used by startup replay)
 - `size_bytes()` returns the summed size of all retained generations so the engine can trigger checkpoint-aware auto-flush
 - `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only generations whose max seq_no is ≤ the checkpoint; it does NOT rewrite mixed generations in place
@@ -103,8 +100,7 @@ pub trait WriteAheadLog: Send + Sync {
   later lower sequence cannot be skipped.
 - The lock protects only capture and validation of the exclusive head and
   generation-list clone. File scanning runs after releasing it. Recovery scans
-  use the 65 MiB decode ceiling for skipped/terminal compatibility frames, the
-  32 MiB transfer ceiling for returned operations, and relative seeks for
+  enforce the 32 MiB frame ceiling and use relative seeks for
   bounded pre-cursor frames after decoding only their sequence prefix. An
   incomplete frame is a concurrent append only in the final captured generation
   when it starts at or beyond that generation's captured `size_bytes`; it ends
@@ -125,8 +121,8 @@ pub trait WriteAheadLog: Send + Sync {
   instead. Persistent rebuild/replay I/O reaches the Apply retry budget only
   when a write triggers the rebuild; maintenance-triggered failures log and
   retry on the next tick without escalating.
-- WAL document interpretation is shared by startup/runtime replay, peer
-  recovery, and legacy `RecoverReplica`. Every operation requires `_doc_id`;
+- WAL document interpretation is shared by startup/runtime replay and peer
+  recovery. Every operation requires `_doc_id`;
   index operations additionally require `_source`. Missing fields are typed
   corruption. Replay deletes the ID for every operation and adds a document
   back only for `Index`.

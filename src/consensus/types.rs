@@ -91,7 +91,6 @@ pub enum ClusterCommand {
         shard_id: u32,
         node: String,
         allocation_id: u64,
-        #[serde(default)]
         expected_primary_term: u64,
         promote_only: bool,
         promotion_candidate: Option<String>,
@@ -504,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn review_c3_old_fail_shard_copy_command_defaults_primary_term() {
+    fn no_compat_old_fail_shard_copy_command_is_rejected() {
         let command = ClusterCommand::FailShardCopy {
             index_name: "logs".into(),
             index_uuid: "uuid-1".into(),
@@ -521,13 +520,6 @@ mod tests {
             .unwrap()
             .remove("expected_primary_term");
 
-        let restored: ClusterCommand = serde_json::from_value(value).unwrap();
-        assert!(matches!(
-            restored,
-            ClusterCommand::FailShardCopy {
-                expected_primary_term: 0,
-                ..
-            }
-        ));
+        assert!(serde_json::from_value::<ClusterCommand>(value).is_err());
     }
 }

@@ -592,13 +592,13 @@ pub trait SearchEngine: Send + Sync {
         anyhow::bail!("peer recovery operation streaming is not supported by this engine")
     }
 
-    fn legacy_recovery_ops(
+    fn retained_recovery_ops(
         &self,
         _min_seq_no: u64,
         _max_ops: usize,
         _max_bytes: usize,
     ) -> Result<PeerRecoveryOpsBatch> {
-        anyhow::bail!("legacy recovery operation streaming is not supported by this engine")
+        anyhow::bail!("retained recovery operation streaming is not supported by this engine")
     }
 
     fn peer_recovery_barrier(&self) -> Result<PeerRecoveryBarrier> {

@@ -1,11 +1,6 @@
-use ferrissearch::engine::column_cache::ColumnCache;
-use ferrissearch::engine::tantivy::HotEngine;
 use ferrissearch::engine::{CompositeEngine, SearchEngine};
 use serde_json::json;
-use std::sync::Arc;
 use std::time::Duration;
-use tantivy::schema::{STORED, STRING, Schema, TEXT};
-use tantivy::{Index, TantivyDocument};
 
 fn open_engine(path: &std::path::Path) -> CompositeEngine {
     CompositeEngine::new(path, Duration::from_secs(3600)).unwrap()
@@ -102,7 +97,7 @@ fn duplicate_delivery_does_not_append_twice_and_reopens() {
         apply_index(&engine, "x", json!({"value": 1}), 0, 1);
         assert_eq!(
             engine
-                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .len(),
@@ -135,7 +130,7 @@ fn incompatible_same_term_redelivery_fails_without_another_wal_entry() {
     );
     assert_eq!(
         engine
-            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .len(),
@@ -150,74 +145,6 @@ fn new_local_index_schema_contains_sequence_identity_fields() {
     let meta: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("index/meta.json")).unwrap())
             .unwrap();
-    let names = meta["schema"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|entry| entry["name"].as_str())
-        .collect::<Vec<_>>();
-    assert!(names.contains(&"_seq_no"));
-    assert!(names.contains(&"_primary_term"));
-}
-
-#[test]
-fn flushed_legacy_primary_adds_sequence_fields_in_place() {
-    let dir = tempfile::tempdir().unwrap();
-    let index_path = dir.path().join("index");
-    std::fs::create_dir_all(&index_path).unwrap();
-    let mut schema = Schema::builder();
-    let id = schema.add_text_field("_id", (STRING | STORED).set_fast(None));
-    let source = schema.add_text_field("_source", STORED);
-    let body = schema.add_text_field("body", TEXT | STORED);
-    let index = Index::open_or_create(
-        tantivy::directory::MmapDirectory::open(&index_path).unwrap(),
-        schema.build(),
-    )
-    .unwrap();
-    let mut writer = index.writer(64 * 1024 * 1024).unwrap();
-    let mut document = TantivyDocument::new();
-    document.add_text(id, "legacy");
-    document.add_text(source, r#"{"value":"legacy"}"#);
-    document.add_text(body, "legacy");
-    writer.add_document(document).unwrap();
-    writer.commit().unwrap();
-    drop(writer);
-    drop(index);
-
-    std::fs::write(dir.path().join("translog-00000000000000000000.bin"), []).unwrap();
-    std::fs::write(
-        dir.path().join("translog.manifest"),
-        serde_json::to_vec(&json!({
-            "version": 1,
-            "active_generation_id": 0,
-            "next_generation_id": 1,
-            "generations": [{
-                "id": 0,
-                "first_seq_no": null,
-                "last_seq_no": null,
-                "size_bytes": 0
-            }]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("translog.seqno"), "1").unwrap();
-    std::fs::write(dir.path().join("translog.committed"), "1").unwrap();
-
-    let engine = HotEngine::new_with_mappings(
-        dir.path(),
-        Duration::from_secs(3600),
-        &std::collections::HashMap::new(),
-        ferrissearch::wal::TranslogDurability::Request,
-        Arc::new(ColumnCache::new(0, 0)),
-    )
-    .unwrap();
-    assert_eq!(
-        engine.get_document("legacy").unwrap().unwrap()["value"],
-        "legacy"
-    );
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(index_path.join("meta.json")).unwrap()).unwrap();
     let names = meta["schema"]
         .as_array()
         .unwrap()

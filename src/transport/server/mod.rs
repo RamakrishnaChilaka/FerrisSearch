@@ -499,12 +499,9 @@ impl InternalTransport for TransportService {
             }
         }
 
-        // Fallback: legacy join (no Raft configured at all)
-        self.cluster_manager.add_node(ni);
-        let state = self.cluster_manager.get_state();
-        Ok(Response::new(JoinResponse {
-            state: Some(cluster_state_to_proto(&state)),
-        }))
+        Err(Status::unavailable(
+            "Raft is required for JoinCluster on every production node",
+        ))
     }
 
     async fn publish_state(
@@ -2215,93 +2212,6 @@ impl InternalTransport for TransportService {
         }))
     }
 
-    async fn recover_replica(
-        &self,
-        request: Request<RecoverReplicaRequest>,
-    ) -> Result<Response<RecoverReplicaResponse>, Status> {
-        let req = request.into_inner();
-        let engine = self
-            .get_or_open_shard(&req.index_name, req.shard_id)
-            .await?;
-
-        info!(
-            "gRPC: recover_replica for {}/shard_{} from checkpoint {:?}",
-            req.index_name, req.shard_id, req.processed_checkpoint
-        );
-
-        let from_seq_no = req
-            .processed_checkpoint
-            .and_then(|checkpoint| checkpoint.checked_add(1))
-            .unwrap_or(0);
-        let entries = {
-            let recovery_engine = engine.clone();
-            match self
-                .worker_pools
-                .spawn_search(move || {
-                    recovery_engine.legacy_recovery_ops(from_seq_no, usize::MAX, usize::MAX)
-                })
-                .await
-            {
-                Ok(Ok(batch)) if batch.complete => batch.operations,
-                Ok(Ok(_)) => {
-                    let sequence = engine.sequence_stats();
-                    return Ok(Response::new(RecoverReplicaResponse {
-                        success: false,
-                        error: "Live recovery read did not reach the captured WAL head".to_string(),
-                        ops_replayed: 0,
-                        processed_checkpoint: sequence.processed_checkpoint,
-                        operations: vec![],
-                        persisted_checkpoint: sequence.persisted_checkpoint,
-                        max_seq_no: sequence.max_seq_no,
-                    }));
-                }
-                Ok(Err(e)) => {
-                    let sequence = engine.sequence_stats();
-                    return Ok(Response::new(RecoverReplicaResponse {
-                        success: false,
-                        error: format!("Failed to read live recovery operations: {e}"),
-                        ops_replayed: 0,
-                        processed_checkpoint: sequence.processed_checkpoint,
-                        operations: vec![],
-                        persisted_checkpoint: sequence.persisted_checkpoint,
-                        max_seq_no: sequence.max_seq_no,
-                    }));
-                }
-                Err(e) => {
-                    let sequence = engine.sequence_stats();
-                    return Ok(Response::new(RecoverReplicaResponse {
-                        success: false,
-                        error: format!("Live recovery read task failed: {e}"),
-                        ops_replayed: 0,
-                        processed_checkpoint: sequence.processed_checkpoint,
-                        operations: vec![],
-                        persisted_checkpoint: sequence.persisted_checkpoint,
-                        max_seq_no: sequence.max_seq_no,
-                    }));
-                }
-            }
-        };
-
-        let ops_count = entries.len() as u64;
-
-        // Convert translog entries to proto operations for the replica to replay
-        let operations = entries
-            .into_iter()
-            .map(peer_recovery::recovery_op)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let sequence = engine.sequence_stats();
-        Ok(Response::new(RecoverReplicaResponse {
-            success: true,
-            error: String::new(),
-            ops_replayed: ops_count,
-            processed_checkpoint: sequence.processed_checkpoint,
-            operations,
-            persisted_checkpoint: sequence.persisted_checkpoint,
-            max_seq_no: sequence.max_seq_no,
-        }))
-    }
-
     async fn start_peer_recovery(
         &self,
         request: Request<StartPeerRecoveryRequest>,
@@ -3022,7 +2932,7 @@ impl InternalTransport for TransportService {
             );
         }
 
-        let dynamic = conversions::proto_to_dynamic_mapping(&req.dynamic);
+        let dynamic = conversions::proto_to_dynamic_mapping(&req.dynamic)?;
 
         let cmd = crate::consensus::types::ClusterCommand::AddMappings {
             index_name: req.index_name.clone(),

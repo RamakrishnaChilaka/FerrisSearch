@@ -65,16 +65,11 @@ pub(crate) struct InternalSequenceFieldError {
     message: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("legacy replica is awaiting primary D1 migration")]
-pub(crate) struct LegacyReplicaAwaitingPrimaryMigration;
-
 struct ApplyState {
     checkpoints: LocalCheckpointTracker,
     term_sequences: PrimaryTermSequenceState,
     versions: LiveVersionMap,
     max_seq_no_of_updates_or_deletes: Option<u64>,
-    legacy_migration_checkpoint: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -96,7 +91,6 @@ impl ApplyState {
             term_sequences,
             versions: LiveVersionMap::new(DEFAULT_VERSION_MAP_MAX_BYTES),
             max_seq_no_of_updates_or_deletes: committed.max_seq_no_of_updates_or_deletes,
-            legacy_migration_checkpoint: committed.legacy_migration_checkpoint,
         })
     }
 
@@ -109,7 +103,6 @@ impl ApplyState {
         )?;
         self.versions.reset();
         self.max_seq_no_of_updates_or_deletes = committed.max_seq_no_of_updates_or_deletes;
-        self.legacy_migration_checkpoint = committed.legacy_migration_checkpoint;
         Ok(())
     }
 
@@ -134,7 +127,6 @@ impl ApplyState {
             persisted_checkpoint: self.checkpoints.persisted_checkpoint(),
             max_seq_no: self.checkpoints.max_seq_no(),
             max_seq_no_of_updates_or_deletes: self.max_seq_no_of_updates_or_deletes,
-            legacy_migration_checkpoint: self.legacy_migration_checkpoint,
             term_sequence_state: self.term_sequences.to_record(),
         }
     }
@@ -193,7 +185,6 @@ impl WalDisposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentVersion {
     Native(super::version_map::VersionValue),
-    LegacyAtOrBelow { migration_checkpoint: u64 },
 }
 
 struct PlannedOperation {
@@ -222,21 +213,14 @@ struct FieldRegistry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HotEnginePurpose {
-    LocalShard(LegacyOpenRole),
+    LocalShard,
     RemoteSplit,
 }
 
 impl HotEnginePurpose {
     fn requires_sequence_fields(self) -> bool {
-        matches!(self, Self::LocalShard(_))
+        matches!(self, Self::LocalShard)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LegacyOpenRole {
-    Primary { primary_term: u64 },
-    Replica,
-    RecoveryTarget,
 }
 
 const SEQ_NO_FIELD_NAME: &str = "_seq_no";
@@ -338,8 +322,6 @@ pub struct HotEngine {
     peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
     #[cfg(test)]
     peer_recovery_snapshot_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-    #[cfg(test)]
-    peer_recovery_read_started_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     field_registry: RwLock<FieldRegistry>,
     /// The per-index refresh interval (e.g. 5s default, matches OpenSearch's index.refresh_interval)
     pub refresh_interval: Duration,
@@ -536,214 +518,16 @@ fn evolve_meta_json_schema(
     Ok(())
 }
 
-fn evolve_meta_json_internal_sequence_fields(meta_json_path: &Path) -> Result<()> {
-    let raw = std::fs::read_to_string(meta_json_path)?;
-    let mut meta: serde_json::Value = serde_json::from_str(&raw)?;
-    let schema_arr = meta
-        .get_mut("schema")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| authoritative_schema_error("meta.json missing 'schema' array"))?;
-    let existing_names: std::collections::HashSet<&str> = schema_arr
-        .iter()
-        .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
-        .collect();
-    let has_seq_no = existing_names.contains(SEQ_NO_FIELD_NAME);
-    let has_primary_term = existing_names.contains(PRIMARY_TERM_FIELD_NAME);
-    match (has_seq_no, has_primary_term) {
-        (true, true) => return Ok(()),
-        (true, false) | (false, true) => {
-            return Err(authoritative_schema_error(
-                "local shard schema contains only one D1 sequence field",
-            ));
-        }
-        (false, false) => {}
-    }
-
-    for name in [SEQ_NO_FIELD_NAME, PRIMARY_TERM_FIELD_NAME] {
-        let mut builder = Schema::builder();
-        builder.add_u64_field(name, FAST | STORED);
-        let serialized = serde_json::to_value(builder.build())?;
-        let entry = serialized
-            .as_array()
-            .and_then(|entries| entries.first())
-            .cloned()
-            .ok_or_else(|| authoritative_schema_error("serialize internal u64 schema field"))?;
-        schema_arr.push(entry);
-    }
-
-    let tmp_path = meta_json_path.with_extension("json.tmp");
-    let mut bytes = serde_json::to_vec_pretty(&meta)?;
-    bytes.push(b'\n');
-    std::fs::write(&tmp_path, bytes)?;
-    std::fs::rename(&tmp_path, meta_json_path)?;
-    Ok(())
-}
-
-fn internal_sequence_field_presence(meta_json_path: &Path) -> Result<(bool, bool)> {
-    let raw = std::fs::read_to_string(meta_json_path)?;
-    let meta: serde_json::Value = serde_json::from_str(&raw)?;
-    let schema = meta
-        .get("schema")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| authoritative_schema_error("meta.json missing 'schema' array"))?;
-    let names = schema
-        .iter()
-        .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
-        .collect::<std::collections::HashSet<_>>();
-    Ok((
-        names.contains(SEQ_NO_FIELD_NAME),
-        names.contains(PRIMARY_TERM_FIELD_NAME),
-    ))
-}
-
-fn prepare_internal_sequence_schema(
-    data_dir: &Path,
-    meta_json_path: &Path,
-    purpose: HotEnginePurpose,
-) -> Result<()> {
-    let HotEnginePurpose::LocalShard(role) = purpose else {
-        return Ok(());
-    };
-    match internal_sequence_field_presence(meta_json_path)? {
-        (true, true) => return Ok(()),
-        (true, false) | (false, true) => {
-            return Err(authoritative_schema_error(
-                "local shard schema contains only one D1 sequence field",
-            ));
-        }
-        (false, false) => {}
-    }
-
-    match role {
-        LegacyOpenRole::Replica => Err(LegacyReplicaAwaitingPrimaryMigration.into()),
-        LegacyOpenRole::RecoveryTarget => {
-            let boundary = CommittedBoundaryRecord::load(&data_dir.join("translog.committed"))?
-                .ok_or_else(|| {
-                    authoritative_schema_error(
-                        "legacy recovery target is missing its committed boundary",
-                    )
-                })?;
-            if boundary.legacy_migration_checkpoint.is_none() {
-                return Err(authoritative_schema_error(
-                    "native recovery target is missing D1 sequence fields",
-                ));
-            }
-            evolve_meta_json_internal_sequence_fields(meta_json_path)
-        }
-        LegacyOpenRole::Primary { primary_term } => {
-            migrate_flushed_legacy_primary(data_dir, meta_json_path, primary_term)
-        }
-    }
-}
-
-fn migrate_flushed_legacy_primary(
-    data_dir: &Path,
-    meta_json_path: &Path,
-    primary_term: u64,
-) -> Result<()> {
-    let committed_path = data_dir.join("translog.committed");
-    let committed_bytes = std::fs::read(&committed_path)?;
-    if committed_bytes.first() == Some(&b'{') {
-        let committed = CommittedBoundaryRecord::load(&committed_path)?.ok_or_else(|| {
-            authoritative_schema_error("legacy primary committed boundary disappeared")
-        })?;
-        if committed.legacy_migration_checkpoint.is_none() && committed.max_seq_no.is_some() {
-            return Err(authoritative_schema_error(
-                "native local shard is missing D1 sequence fields",
-            ));
-        }
-        return evolve_meta_json_internal_sequence_fields(meta_json_path);
-    }
-
-    let migrated_next_seq_no = HotTranslog::migrate_empty_v1(data_dir)?;
-    let legacy_next_seq_no = std::str::from_utf8(&committed_bytes)?
-        .trim()
-        .parse::<u64>()
-        .map_err(|error| {
-            authoritative_schema_error(format!("parse legacy committed boundary: {error}"))
-        })?;
-    if migrated_next_seq_no.is_some_and(|migrated| migrated != legacy_next_seq_no) {
-        return Err(authoritative_schema_error(
-            "legacy WAL migration returned an inconsistent boundary",
-        ));
-    }
-    let persisted_next_seq_no = std::fs::read_to_string(data_dir.join("translog.seqno"))
-        .unwrap_or_else(|_| "0".to_string())
-        .trim()
-        .parse::<u64>()
-        .map_err(|error| {
-            authoritative_schema_error(format!("parse legacy sequence watermark: {error}"))
-        })?;
-    if persisted_next_seq_no != legacy_next_seq_no {
-        return Err(authoritative_schema_error(
-            "legacy committed boundary does not match sequence watermark",
-        ));
-    }
-
-    let committed = legacy_committed_boundary(legacy_next_seq_no, primary_term);
-    committed.persist(&committed_path)?;
-    evolve_meta_json_internal_sequence_fields(meta_json_path)
-}
-
-fn legacy_committed_boundary(
-    legacy_next_seq_no: u64,
-    primary_term: u64,
-) -> CommittedBoundaryRecord {
-    let checkpoint = legacy_next_seq_no.checked_sub(1);
-    CommittedBoundaryRecord {
-        version: super::sequence::COMMITTED_BOUNDARY_FORMAT_VERSION,
-        processed_checkpoint: checkpoint,
-        persisted_checkpoint: checkpoint,
-        max_seq_no: checkpoint,
-        max_seq_no_of_updates_or_deletes: checkpoint,
-        legacy_migration_checkpoint: checkpoint,
-        term_sequence_state: super::sequence::PrimaryTermSequenceRecord {
-            current_term: primary_term,
-            max_seq_no_at_term_start: checkpoint,
-            processed_in_current_term_below_start_max: checkpoint
-                .map(|end| vec![super::sequence::SeqNoRange { start: 0, end }])
-                .unwrap_or_default(),
-        },
-    }
-}
-
-fn prepare_remote_split_sequence_state(data_dir: &Path) -> Result<()> {
-    let committed_path = data_dir.join("translog.committed");
-    let bytes = match std::fs::read(&committed_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if bytes.first() == Some(&b'{') {
-        return Ok(());
-    }
-    let migrated_next_seq_no = HotTranslog::migrate_empty_v1(data_dir)?;
-    let legacy_next_seq_no =
-        std::str::from_utf8(&bytes)?
-            .trim()
-            .parse::<u64>()
-            .map_err(|error| {
-                authoritative_schema_error(format!(
-                    "parse remote split committed boundary: {error}"
-                ))
-            })?;
-    if migrated_next_seq_no.is_some_and(|migrated| migrated != legacy_next_seq_no) {
-        return Err(authoritative_schema_error(
-            "remote split WAL migration returned an inconsistent boundary",
-        ));
-    }
-    legacy_committed_boundary(legacy_next_seq_no, 1).persist(&committed_path)
-}
-
 fn validate_internal_sequence_fields(schema: &Schema, purpose: HotEnginePurpose) -> Result<()> {
     if !purpose.requires_sequence_fields() {
         return Ok(());
     }
     for name in [SEQ_NO_FIELD_NAME, PRIMARY_TERM_FIELD_NAME] {
         let field = schema.get_field(name).map_err(|_| {
-            authoritative_schema_error(format!(
-                "local shard schema is missing internal field {name}"
-            ))
+            crate::common::unsupported_index_format(
+                "local shard Tantivy schema",
+                format!("required internal field {name} is missing"),
+            )
         })?;
         let entry = schema.get_field_entry(field);
         let valid = matches!(
@@ -752,9 +536,10 @@ fn validate_internal_sequence_fields(schema: &Schema, purpose: HotEnginePurpose)
                 if options.is_fast() && options.is_stored()
         );
         if !valid {
-            return Err(authoritative_schema_error(format!(
-                "local shard internal field {name} must be a stored u64 fast field"
-            )));
+            return Err(crate::common::unsupported_index_format(
+                "local shard Tantivy schema",
+                format!("internal field {name} is not a stored u64 fast field"),
+            ));
         }
     }
     Ok(())
@@ -926,7 +711,7 @@ impl HotEngine {
 
     /// Create a new HotEngine with explicit field mappings.
     /// When mappings are provided, named Tantivy fields are created for each mapped field.
-    /// The "body" catch-all is always created for backward compatibility with `?q=` queries.
+    /// The "body" catch-all is always created for `?q=` queries.
     ///
     /// **Schema evolution**: If the on-disk index already exists but the provided
     /// mappings contain fields not yet in the stored schema, the meta.json is
@@ -946,7 +731,7 @@ impl HotEngine {
             durability,
             column_cache,
             false,
-            HotEnginePurpose::LocalShard(LegacyOpenRole::Primary { primary_term: 1 }),
+            HotEnginePurpose::LocalShard,
         )
     }
 
@@ -981,44 +766,7 @@ impl HotEngine {
             durability,
             column_cache,
             true,
-            HotEnginePurpose::LocalShard(LegacyOpenRole::Replica),
-        )
-    }
-
-    pub(crate) fn open_existing_primary_with_mappings<P: AsRef<Path>>(
-        data_dir: P,
-        refresh_interval: Duration,
-        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
-        durability: TranslogDurability,
-        column_cache: Arc<super::column_cache::ColumnCache>,
-        primary_term: u64,
-    ) -> Result<Self> {
-        Self::new_with_mappings_mode(
-            data_dir,
-            refresh_interval,
-            mappings,
-            durability,
-            column_cache,
-            true,
-            HotEnginePurpose::LocalShard(LegacyOpenRole::Primary { primary_term }),
-        )
-    }
-
-    pub(crate) fn open_recovery_target_with_mappings<P: AsRef<Path>>(
-        data_dir: P,
-        refresh_interval: Duration,
-        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
-        durability: TranslogDurability,
-        column_cache: Arc<super::column_cache::ColumnCache>,
-    ) -> Result<Self> {
-        Self::new_with_mappings_mode(
-            data_dir,
-            refresh_interval,
-            mappings,
-            durability,
-            column_cache,
-            true,
-            HotEnginePurpose::LocalShard(LegacyOpenRole::RecoveryTarget),
+            HotEnginePurpose::LocalShard,
         )
     }
 
@@ -1047,10 +795,6 @@ impl HotEngine {
         // order (and thus Field handle IDs) and only appends.
         if index_exists {
             validate_existing_schema_mappings(&meta_json_path, mappings)?;
-            if purpose == HotEnginePurpose::RemoteSplit {
-                prepare_remote_split_sequence_state(data_dir)?;
-            }
-            prepare_internal_sequence_schema(data_dir, &meta_json_path, purpose)?;
             evolve_meta_json_schema(&meta_json_path, mappings)?;
         }
 
@@ -1175,8 +919,6 @@ impl HotEngine {
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
-            #[cfg(test)]
-            peer_recovery_read_started_sender: Mutex::new(None),
             field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
@@ -1394,36 +1136,18 @@ impl HotEngine {
         let (seq_column, term_column) = match (seq_column, term_column) {
             (Ok(seq_column), Ok(term_column)) => (seq_column, term_column),
             _ => {
-                return state
-                    .legacy_migration_checkpoint
-                    .map(|migration_checkpoint| {
-                        Some(CurrentVersion::LegacyAtOrBelow {
-                            migration_checkpoint,
-                        })
-                    })
-                    .ok_or_else(|| {
-                        anyhow::Error::new(InternalSequenceFieldError {
-                            message: format!(
-                                "native document [{doc_id}] is missing _seq_no or _primary_term"
-                            ),
-                        })
-                    });
+                return Err(crate::common::unsupported_index_format(
+                    "local shard Tantivy segment",
+                    format!("document [{doc_id}] is missing _seq_no or _primary_term"),
+                ));
             }
         };
         let mut seq_values = seq_column.values_for_doc(address.doc_id);
         let Some(seq_no) = seq_values.next() else {
-            return state
-                .legacy_migration_checkpoint
-                .map(|migration_checkpoint| {
-                    Some(CurrentVersion::LegacyAtOrBelow {
-                        migration_checkpoint,
-                    })
-                })
-                .ok_or_else(|| {
-                    anyhow::Error::new(InternalSequenceFieldError {
-                        message: format!("document [{doc_id}] has no {SEQ_NO_FIELD_NAME} value"),
-                    })
-                });
+            return Err(crate::common::unsupported_index_format(
+                "local shard Tantivy segment",
+                format!("document [{doc_id}] has no {SEQ_NO_FIELD_NAME} value"),
+            ));
         };
         if seq_values.next().is_some() {
             return Err(InternalSequenceFieldError {
@@ -1433,20 +1157,10 @@ impl HotEngine {
         }
         let mut term_values = term_column.values_for_doc(address.doc_id);
         let Some(primary_term) = term_values.next() else {
-            return state
-                .legacy_migration_checkpoint
-                .map(|migration_checkpoint| {
-                    Some(CurrentVersion::LegacyAtOrBelow {
-                        migration_checkpoint,
-                    })
-                })
-                .ok_or_else(|| {
-                    anyhow::Error::new(InternalSequenceFieldError {
-                        message: format!(
-                            "document [{doc_id}] has no {PRIMARY_TERM_FIELD_NAME} value"
-                        ),
-                    })
-                });
+            return Err(crate::common::unsupported_index_format(
+                "local shard Tantivy segment",
+                format!("document [{doc_id}] has no {PRIMARY_TERM_FIELD_NAME} value"),
+            ));
         };
         if term_values.next().is_some() {
             return Err(InternalSequenceFieldError {
@@ -1600,11 +1314,6 @@ impl HotEngine {
                                     self.validate_redelivery(translog, &operation)?;
                                 }
                                 super::ApplyOutcome::Redelivery
-                            }
-                            Some(CurrentVersion::LegacyAtOrBelow {
-                                migration_checkpoint,
-                            }) if operation.seq_no <= migration_checkpoint => {
-                                super::ApplyOutcome::Stale
                             }
                             _ => super::ApplyOutcome::Applied,
                         };
@@ -2474,8 +2183,7 @@ impl HotEngine {
         text: &str,
     ) -> Option<serde_json::Value> {
         let mut json_val = serde_json::from_str::<serde_json::Value>(text).ok()?;
-        // Mixed-version compatibility: older segments may still store mapped
-        // Date values as offsets or raw epoch millis in _source.
+        // Keep stored date fields in the public JSON representation.
         Self::normalize_result_source_with_registry(registry, &mut json_val);
         Some(json_val)
     }
@@ -3425,15 +3133,6 @@ impl HotEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_wal_append_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
-        self.with_translog("set append frame barrier", |translog| {
-            translog.set_append_frame_barrier(Some(barrier));
-            Ok(())
-        })
-        .expect("set append frame barrier");
-    }
-
-    #[cfg(test)]
     pub(crate) fn inject_wal_write_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
         self.with_translog("inject WAL write failure", |translog| {
             translog.inject_write_io_failures_for_test(raw_os_error, attempts);
@@ -3523,17 +3222,6 @@ impl HotEngine {
         }
         *remaining -= 1;
         Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_peer_recovery_read_started_sender_for_test(
-        &self,
-        sender: tokio::sync::oneshot::Sender<()>,
-    ) {
-        *self
-            .peer_recovery_read_started_sender
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
     }
 
     /// Shared search execution helper — returns _id + _source from each hit.
@@ -3801,13 +3489,6 @@ impl HotEngine {
             .max(1)
     }
 
-    pub(crate) fn legacy_migration_checkpoint(&self) -> Option<u64> {
-        self.apply_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .legacy_migration_checkpoint
-    }
-
     pub(crate) fn vector_rebuild_documents(
         &self,
     ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
@@ -3817,10 +3498,6 @@ impl HotEngine {
             .field_registry
             .read()
             .unwrap_or_else(|error| error.into_inner());
-        let state = self
-            .apply_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
         let mut documents = Vec::with_capacity(top_docs.len());
         for (_, address) in top_docs {
             let stored = searcher.doc::<TantivyDocument>(address)?;
@@ -3857,14 +3534,10 @@ impl HotEngine {
                     (seq_no, primary_term)
                 }
                 _ => {
-                    let checkpoint = state.legacy_migration_checkpoint.ok_or_else(|| {
-                        anyhow::Error::new(InternalSequenceFieldError {
-                            message: format!(
-                                "native document [{doc_id}] is missing vector version fields"
-                            ),
-                        })
-                    })?;
-                    (checkpoint, state.term_sequences.current_term().max(1))
+                    return Err(crate::common::unsupported_index_format(
+                        "local shard Tantivy segment",
+                        format!("document [{doc_id}] is missing vector version fields"),
+                    ));
                 }
             };
             documents.push((doc_id, source, sequence.0, sequence.1));
@@ -7901,15 +7574,6 @@ impl super::SearchEngine for HotEngine {
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
-        #[cfg(test)]
-        if let Some(sender) = self
-            .peer_recovery_read_started_sender
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            let _ = sender.send(());
-        }
         let snapshot = self.with_translog("peer recovery operation snapshot", |translog| {
             translog.recovery_read_snapshot()
         })?;
@@ -7937,22 +7601,13 @@ impl super::SearchEngine for HotEngine {
         })
     }
 
-    fn legacy_recovery_ops(
+    fn retained_recovery_ops(
         &self,
         min_seq_no: u64,
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
-        #[cfg(test)]
-        if let Some(sender) = self
-            .peer_recovery_read_started_sender
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            let _ = sender.send(());
-        }
-        let snapshot = self.with_translog("legacy recovery operation snapshot", |translog| {
+        let snapshot = self.with_translog("retained recovery operation snapshot", |translog| {
             translog.recovery_read_snapshot()
         })?;
         let (operations, complete) = snapshot.read_bounded_range(min_seq_no, max_ops, max_bytes)?;
@@ -8779,7 +8434,7 @@ mod tests {
             .unwrap();
     }
 
-    fn create_flushed_legacy_fixture(path: &Path, nonempty_wal: bool) {
+    fn create_pre_d1_schema_fixture(path: &Path) {
         let index_path = path.join("index");
         std::fs::create_dir_all(&index_path).unwrap();
         let mut schema = Schema::builder();
@@ -8800,31 +8455,6 @@ mod tests {
         writer.commit().unwrap();
         drop(writer);
         drop(index);
-
-        let generation_bytes = if nonempty_wal { vec![1u8] } else { Vec::new() };
-        std::fs::write(
-            path.join("translog-00000000000000000000.bin"),
-            &generation_bytes,
-        )
-        .unwrap();
-        std::fs::write(
-            path.join("translog.manifest"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "active_generation_id": 0,
-                "next_generation_id": 1,
-                "generations": [{
-                    "id": 0,
-                    "first_seq_no": if nonempty_wal { Some(0) } else { None },
-                    "last_seq_no": if nonempty_wal { Some(0) } else { None },
-                    "size_bytes": generation_bytes.len(),
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(path.join("translog.seqno"), "1").unwrap();
-        std::fs::write(path.join("translog.committed"), "1").unwrap();
     }
 
     struct MergeWriteGate {
@@ -8983,7 +8613,6 @@ mod tests {
             refresh_after_commit_release_receiver: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
-            peer_recovery_read_started_sender: Mutex::new(None),
             field_registry: RwLock::new(FieldRegistry {
                 id_field,
                 source_field,
@@ -9103,88 +8732,22 @@ mod tests {
     }
 
     #[test]
-    fn flushed_legacy_primary_migrates_in_place_and_bounds_old_documents() {
+    fn no_compat_missing_sequence_schema_requires_recreate() {
         let dir = tempfile::tempdir().unwrap();
-        create_flushed_legacy_fixture(dir.path(), false);
-        let engine = HotEngine::open_existing_primary_with_mappings(
-            dir.path(),
-            Duration::from_secs(60),
-            &HashMap::new(),
-            TranslogDurability::Request,
-            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
-            2,
-        )
-        .unwrap();
-        assert_eq!(
-            engine.get_document("legacy").unwrap().unwrap()["value"],
-            "legacy"
-        );
-        assert_eq!(engine.legacy_migration_checkpoint(), Some(0));
+        create_pre_d1_schema_fixture(dir.path());
 
-        apply_index(&engine, "legacy", json!({"value": "stale"}), 0, 2);
-        engine.refresh().unwrap();
-        assert_eq!(
-            engine.get_document("legacy").unwrap().unwrap()["value"],
-            "legacy"
-        );
-
-        apply_index(&engine, "legacy", json!({"value": "native"}), 1, 2);
-        engine.refresh().unwrap();
-        assert_eq!(
-            engine.get_document("legacy").unwrap().unwrap()["value"],
-            "native"
-        );
-        let boundary = CommittedBoundaryRecord::load(&dir.path().join("translog.committed"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(boundary.legacy_migration_checkpoint, Some(0));
-    }
-
-    #[test]
-    fn flushed_legacy_replica_waits_for_primary_migration() {
-        use crate::cluster::state::{FieldMapping, FieldType};
-
-        let dir = tempfile::tempdir().unwrap();
-        create_flushed_legacy_fixture(dir.path(), false);
-        let meta_path = dir.path().join("index/meta.json");
-        let before = std::fs::read(&meta_path).unwrap();
-        let mappings = HashMap::from([(
-            "new_field".to_string(),
-            FieldMapping {
-                field_type: FieldType::Keyword,
-                dimension: None,
-            },
-        )]);
         let error = match HotEngine::open_existing_with_mappings(
             dir.path(),
             Duration::from_secs(60),
-            &mappings,
-            TranslogDurability::Request,
-            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
-        ) {
-            Ok(_) => panic!("legacy replica unexpectedly migrated in place"),
-            Err(error) => error,
-        };
-        assert!(error.is::<LegacyReplicaAwaitingPrimaryMigration>());
-        assert_eq!(std::fs::read(meta_path).unwrap(), before);
-    }
-
-    #[test]
-    fn nonempty_legacy_wal_fails_closed_during_primary_migration() {
-        let dir = tempfile::tempdir().unwrap();
-        create_flushed_legacy_fixture(dir.path(), true);
-        let error = match HotEngine::open_existing_primary_with_mappings(
-            dir.path(),
-            Duration::from_secs(60),
             &HashMap::new(),
             TranslogDurability::Request,
             Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
-            2,
         ) {
-            Ok(_) => panic!("non-empty legacy WAL unexpectedly migrated"),
+            Ok(_) => panic!("pre-D1 schema unexpectedly opened"),
             Err(error) => error,
         };
-        assert!(error.is::<crate::wal::LegacyWalMigrationError>());
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
     }
 
     #[test]
@@ -9247,7 +8810,8 @@ mod tests {
             Ok(_) => panic!("malformed internal field unexpectedly opened"),
             Err(error) => error,
         };
-        assert!(error.is::<AuthoritativeSchemaError>());
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
     }
 
     #[test]
@@ -9266,24 +8830,6 @@ mod tests {
         let schema = engine.index.schema();
         assert!(schema.get_field(SEQ_NO_FIELD_NAME).is_err());
         assert!(schema.get_field(PRIMARY_TERM_FIELD_NAME).is_err());
-    }
-
-    #[test]
-    fn legacy_remote_split_with_empty_v1_wal_remains_readable() {
-        let dir = tempfile::tempdir().unwrap();
-        create_flushed_legacy_fixture(dir.path(), false);
-        let engine = HotEngine::new_remote_split_with_mappings(
-            dir.path(),
-            Duration::from_secs(60),
-            &HashMap::new(),
-            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
-        )
-        .unwrap();
-        assert_eq!(
-            engine.get_document("legacy").unwrap().unwrap()["value"],
-            "legacy"
-        );
-        assert!(engine.index.schema().get_field(SEQ_NO_FIELD_NAME).is_err());
     }
 
     #[test]
@@ -10198,7 +9744,7 @@ mod tests {
         assert_eq!(receipt.start_seq_no, Some(0));
         assert_eq!(
             engine
-                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .len(),
@@ -11784,86 +11330,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_stored_date_source_is_normalized_on_all_read_paths() {
-        use crate::cluster::state::{FieldMapping, FieldType};
-        use crate::search::{SortClause, SortDirection, SortOrder};
-
-        let mut mappings = HashMap::new();
-        mappings.insert(
-            "created_at".to_string(),
-            FieldMapping {
-                field_type: FieldType::Date,
-                dimension: None,
-            },
-        );
-
-        let (_dir, engine) = create_engine_with_mappings(mappings);
-        let registry = engine
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let created_at = *registry.fields.get("created_at").unwrap();
-
-        let mut doc = TantivyDocument::new();
-        doc.add_text(registry.id_field, "legacy");
-        doc.add_text(
-            registry.source_field,
-            json!({
-                "title": "legacy",
-                "created_at": "2025-01-05T08:15:00+05:30"
-            })
-            .to_string(),
-        );
-        doc.add_i64(
-            created_at,
-            crate::common::date::parse_iso8601_to_epoch_millis("2025-01-05T08:15:00+05:30")
-                .unwrap(),
-        );
-        drop(registry);
-
-        {
-            let mut writer_state = engine.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("legacy date test").unwrap();
-            writer.add_document(doc).unwrap();
-            writer.commit().unwrap();
-        }
-        engine.reader.reload().unwrap();
-
-        let doc = engine.get_document("legacy").unwrap().unwrap();
-        assert_eq!(doc["created_at"], json!("2025-01-05T02:45:00Z"));
-
-        let base_req = SearchRequest {
-            query: QueryClause::MatchAll(json!({})),
-            size: 10,
-            from: 0,
-            knn: None,
-            sort: vec![],
-            search_after: None,
-            aggs: HashMap::new(),
-        };
-        let (hits, _, _) = engine.search_query(&base_req).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(
-            hits[0]["_source"]["created_at"],
-            json!("2025-01-05T02:45:00Z")
-        );
-
-        let sorted_req = SearchRequest {
-            sort: vec![SortClause::Field(HashMap::from([(
-                "created_at".to_string(),
-                SortOrder::Direction(SortDirection::Asc),
-            )]))],
-            ..base_req
-        };
-        let (sorted_hits, _, _) = engine.search_query(&sorted_req).unwrap();
-        assert_eq!(sorted_hits.len(), 1);
-        assert_eq!(
-            sorted_hits[0]["_source"]["created_at"],
-            json!("2025-01-05T02:45:00Z")
-        );
-    }
-
-    #[test]
     fn mapped_integer_field_does_not_parse_iso_string_query_as_date() {
         use crate::cluster::state::{FieldMapping, FieldType};
 
@@ -12886,7 +12352,7 @@ mod tests {
         let snapshot_reader = snapshot_index.reader().unwrap();
         assert_eq!(snapshot_reader.searcher().num_docs(), 2);
 
-        let suffix = engine.legacy_recovery_ops(2, 16, 1024 * 1024).unwrap();
+        let suffix = engine.retained_recovery_ops(2, 16, 1024 * 1024).unwrap();
         assert!(suffix.complete);
         assert_eq!(suffix.source_max_seq_no, Some(2));
         assert_eq!(
@@ -12913,7 +12379,7 @@ mod tests {
 
         let assert_retained = |expected: &[u64]| {
             let batch = engine
-                .legacy_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
+                .retained_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
                 .unwrap();
             assert_eq!(
                 batch
@@ -12949,7 +12415,7 @@ mod tests {
         engine.flush().unwrap();
         assert!(
             engine
-                .legacy_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
+                .retained_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
                 .unwrap()
                 .operations
                 .is_empty()
@@ -12977,7 +12443,7 @@ mod tests {
 
         let scan_engine = engine.clone();
         let scan = std::thread::spawn(move || {
-            scan_engine.legacy_recovery_ops(suffix.seq_no, 16, 4 * 1024 * 1024)
+            scan_engine.retained_recovery_ops(suffix.seq_no, 16, 4 * 1024 * 1024)
         });
         barrier.wait();
 

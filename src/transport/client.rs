@@ -662,39 +662,6 @@ impl TransportClient {
             .into_inner())
     }
 
-    /// Request a retained WAL suffix from the primary.
-    ///
-    /// The node lifecycle does not use this partial response for replica
-    /// recovery or in-sync admission; complete file recovery is still pending.
-    pub async fn request_recovery(
-        &self,
-        primary_node: &NodeInfo,
-        index_name: &str,
-        shard_id: u32,
-        processed_checkpoint: Option<u64>,
-    ) -> Result<RecoveryResult, anyhow::Error> {
-        let mut client = self
-            .connect(&primary_node.host, primary_node.transport_port)
-            .await?;
-        let request = tonic::Request::new(RecoverReplicaRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            processed_checkpoint,
-        });
-        let response = client.recover_replica(request).await?.into_inner();
-        if response.success {
-            Ok(RecoveryResult {
-                ops_replayed: response.ops_replayed,
-                processed_checkpoint: response.processed_checkpoint,
-                persisted_checkpoint: response.persisted_checkpoint,
-                max_seq_no: response.max_seq_no,
-                operations: response.operations,
-            })
-        } else {
-            Err(anyhow::anyhow!("Recovery failed: {}", response.error))
-        }
-    }
-
     pub async fn start_peer_recovery(
         &self,
         primary_node: &NodeInfo,
@@ -1493,15 +1460,6 @@ fn remote_store_split_to_proto(
         checksum: split.checksum.clone(),
         size_bytes: split.size_bytes,
     }
-}
-
-/// Result of a recovery request from the primary.
-pub struct RecoveryResult {
-    pub ops_replayed: u64,
-    pub processed_checkpoint: Option<u64>,
-    pub persisted_checkpoint: Option<u64>,
-    pub max_seq_no: Option<u64>,
-    pub operations: Vec<RecoverReplicaOp>,
 }
 
 // ─── Helper to convert domain NodeInfo → proto NodeInfo ─────────────────────

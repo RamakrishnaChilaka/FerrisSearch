@@ -8,7 +8,7 @@ use crate::shard::{
 use crate::transport::TransportClient;
 use crate::transport::proto::{
     CompleteFinalizeRecoveryRequest, FetchRecoveryFileChunkRequest, FetchRecoveryOpsRequest,
-    PrepareFinalizeRecoveryRequest, RecoverReplicaOp, RecoveryFileMetadata,
+    PrepareFinalizeRecoveryRequest, RecoveryFileMetadata, RecoveryOperation,
     StartPeerRecoveryRequest,
 };
 use anyhow::{Context, Result};
@@ -875,7 +875,7 @@ async fn apply_recovery_operations_cursor(
     snapshot_processed_checkpoint: Option<u64>,
     source_max_seq_no: Option<u64>,
     complete: bool,
-    operations: Vec<RecoverReplicaOp>,
+    operations: Vec<RecoveryOperation>,
 ) -> Result<(crate::wal::WalCursor, u64)> {
     if next_cursor.position() < cursor.position() {
         anyhow::bail!("peer recovery physical cursor regressed");
@@ -941,7 +941,7 @@ async fn apply_recovery_operations(
     from_seq_no: u64,
     primary_next_seq_no: u64,
     complete: bool,
-    operations: Vec<RecoverReplicaOp>,
+    operations: Vec<RecoveryOperation>,
 ) -> Result<(u64, u64)> {
     let (_, applied) = apply_recovery_operations_cursor(
         engine,
@@ -1118,14 +1118,14 @@ mod tests {
             9,
             true,
             vec![
-                RecoverReplicaOp {
+                RecoveryOperation {
                     seq_no: 5,
                     primary_term: 2,
                     op: "index".into(),
                     doc_id: "a".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
                 },
-                RecoverReplicaOp {
+                RecoveryOperation {
                     seq_no: 8,
                     primary_term: 2,
                     op: "delete".into(),
@@ -1145,14 +1145,14 @@ mod tests {
             12,
             true,
             vec![
-                RecoverReplicaOp {
+                RecoveryOperation {
                     seq_no: 11,
                     primary_term: 2,
                     op: "delete".into(),
                     doc_id: "a".into(),
                     payload_json: Vec::new(),
                 },
-                RecoverReplicaOp {
+                RecoveryOperation {
                     seq_no: 10,
                     primary_term: 2,
                     op: "delete".into(),

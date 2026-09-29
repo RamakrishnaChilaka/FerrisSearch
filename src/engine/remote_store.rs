@@ -1614,26 +1614,11 @@ pub(crate) async fn verify_splits(
     let mut ok_count = 0u32;
     let mut mismatch_count = 0u32;
     let mut missing_count = 0u32;
-    let mut unsupported_count = 0u32;
     let mut split_reports: Vec<Value> = Vec::with_capacity(splits.len());
 
     for split in splits {
         let split_id = split.split_id.clone();
         let expected = split.checksum.clone();
-
-        // Legacy placeholder from an earlier build of this feature. Surface
-        // it so operators know which splits cannot be verified until they
-        // are republished, without failing the whole request.
-        if expected.starts_with("sha256:pending:") {
-            unsupported_count += 1;
-            split_reports.push(serde_json::json!({
-                "split_id": split_id,
-                "status": "unsupported",
-                "reason": "legacy placeholder checksum; republish to get a real hash",
-                "expected": expected,
-            }));
-            continue;
-        }
 
         // Stream-download the bundle and hash it without materializing to disk.
         // This works uniformly against both the local and S3 backends.
@@ -1685,7 +1670,7 @@ pub(crate) async fn verify_splits(
         "ok_count": ok_count,
         "mismatch_count": mismatch_count,
         "missing_count": missing_count,
-        "unsupported_count": unsupported_count,
+        "unsupported_count": 0,
     }))
 }
 

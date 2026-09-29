@@ -57,6 +57,10 @@ best-effort fallbacks.
 
 - Index UUID, manifest generation, split ID, checksum, schema hash, and bundle
   path are identities. Validate them and fail closed on disagreement.
+- Pointer and manifest format versions must match the current constants.
+  Unknown versions and placeholder checksums are unsupported pre-1.0 formats;
+  return the shared recreate-the-index error instead of adapting or reporting
+  an "unsupported" success entry.
 - Publish immutable data before the mutable pointer. A failed pointer update
   may leave unreachable immutable objects; it must not expose a partial split.
 - Never use `unwrap_or_default()` when decoding a pointer, manifest, summary, or

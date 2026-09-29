@@ -120,79 +120,9 @@ impl CompositeEngine {
         })
     }
 
-    pub(crate) fn open_existing_primary_with_mappings(
-        data_dir: impl AsRef<Path>,
-        refresh_interval: Duration,
-        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
-        durability: TranslogDurability,
-        column_cache: Arc<super::column_cache::ColumnCache>,
-        primary_term: u64,
-    ) -> Result<Self> {
-        let data_dir = data_dir.as_ref().to_path_buf();
-        let text = HotEngine::open_existing_primary_with_mappings(
-            &data_dir,
-            refresh_interval,
-            mappings,
-            durability,
-            column_cache.clone(),
-            primary_term,
-        )?;
-        Ok(Self {
-            text,
-            vector: RwLock::new(None),
-            data_dir,
-            global_cp: Mutex::new(None),
-            replica_persisted_cp: Mutex::new(None),
-            column_cache,
-        })
-    }
-
-    pub(crate) fn open_recovery_target_with_mappings(
-        data_dir: impl AsRef<Path>,
-        refresh_interval: Duration,
-        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
-        durability: TranslogDurability,
-        column_cache: Arc<super::column_cache::ColumnCache>,
-    ) -> Result<Self> {
-        let data_dir = data_dir.as_ref().to_path_buf();
-        let text = HotEngine::open_recovery_target_with_mappings(
-            &data_dir,
-            refresh_interval,
-            mappings,
-            durability,
-            column_cache.clone(),
-        )?;
-        Ok(Self {
-            text,
-            vector: RwLock::new(None),
-            data_dir,
-            global_cp: Mutex::new(None),
-            replica_persisted_cp: Mutex::new(None),
-            column_cache,
-        })
-    }
-
     /// Get a reference to the underlying HotEngine (for refresh loop).
     pub fn text_engine(&self) -> &HotEngine {
         &self.text
-    }
-
-    pub(crate) fn legacy_migration_checkpoint(&self) -> Option<u64> {
-        self.text.legacy_migration_checkpoint()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_wal_append_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
-        self.text.set_wal_append_barrier_for_test(barrier);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_peer_recovery_read_started_sender_for_test(
-        &self,
-        sender: tokio::sync::oneshot::Sender<()>,
-    ) {
-        self.text
-            .set_peer_recovery_read_started_sender_for_test(sender);
     }
 
     /// Start the background refresh loop for the text engine.
@@ -974,14 +904,14 @@ impl SearchEngine for CompositeEngine {
             .peer_recovery_ops(cursor, end_cursor, max_ops, max_bytes)
     }
 
-    fn legacy_recovery_ops(
+    fn retained_recovery_ops(
         &self,
         min_seq_no: u64,
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
         self.text
-            .legacy_recovery_ops(min_seq_no, max_ops, max_bytes)
+            .retained_recovery_ops(min_seq_no, max_ops, max_bytes)
     }
 
     fn peer_recovery_barrier(&self) -> Result<super::PeerRecoveryBarrier> {
@@ -1845,7 +1775,7 @@ mod tests {
         assert!(engine.maybe_auto_flush(1).unwrap());
         assert!(
             engine
-                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .is_empty(),
@@ -1857,7 +1787,7 @@ mod tests {
         assert!(engine.maybe_auto_flush(1).unwrap());
         assert_eq!(
             engine
-                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .iter()
@@ -1872,7 +1802,7 @@ mod tests {
         assert!(engine.maybe_auto_flush(1).unwrap());
         assert!(
             engine
-                .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .is_empty(),
@@ -2117,7 +2047,7 @@ mod tests {
         assert_eq!(delete.primary_term, 7);
 
         let operations = engine
-            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations;
         assert_eq!(

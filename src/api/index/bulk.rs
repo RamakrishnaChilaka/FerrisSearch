@@ -274,13 +274,12 @@ pub(super) fn finalize_bulk_items(
 /// Supports standard OpenSearch format:
 ///   {"index": {"_index": "idx", "_id": "1"}}
 ///   {"field": "value"}
-/// Also supports legacy FerrisSearch format where _id is in the doc itself.
 pub(super) fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
     let mut docs = Vec::new();
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     while let Some(action_line) = lines.next() {
         if let Some(doc_line) = lines.next()
-            && let Ok(mut doc) = serde_json::from_str::<Value>(doc_line)
+            && let Ok(doc) = serde_json::from_str::<Value>(doc_line)
         {
             // Parse action metadata
             let action_meta = serde_json::from_str::<Value>(action_line)
@@ -299,30 +298,11 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
                 .as_ref()
                 .and_then(|m| m.get("_index").and_then(|v| v.as_str().map(String::from)));
 
-            let doc_id = if let Some(id) = action_id {
-                id
-            } else if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
-                id.to_string()
-            } else if let Some(id) = doc.get("_doc_id").and_then(|v| v.as_str()) {
-                id.to_string()
-            } else {
-                uuid::Uuid::new_v4().to_string()
-            };
-            // Strip id metadata from stored payload
-            if let Some(obj) = doc.as_object_mut() {
-                obj.remove("_id");
-                obj.remove("_doc_id");
-            }
-            // If doc has _source wrapper, unwrap it
-            let payload = if let Some(source) = doc.get("_source").cloned() {
-                source
-            } else {
-                doc
-            };
+            let doc_id = action_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             docs.push(BulkDoc {
                 doc_id,
                 index: action_index,
-                payload,
+                payload: doc,
             });
         }
     }

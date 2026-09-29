@@ -316,9 +316,9 @@ write itself remains on the dedicated write pool.
 ## Bulk Index Parsing
 `parse_bulk_ndjson(text)` supports:
 - **OpenSearch format**: action line `{"index": {"_index": "idx", "_id": "1"}}` + document line
-- **Legacy format**: `_id` or `_doc_id` in document body
-- **`_source` wrapper**: unwrapped before storage
 - **Missing IDs**: UUID auto-generated
+- Document bodies are stored as supplied. Do not infer IDs from `_id` /
+  `_doc_id` source fields or unwrap a source-level `_source` object.
 
 ## Auto-Create Index (Coordinator Pattern)
 Document and bulk handlers auto-create missing indices via `auto_create_index()`. This helper:

@@ -29,9 +29,9 @@ cluster-state version.
 `FailShardCopy.promote_only` is required for primary-copy reports. The state
 machine accepts such a report only when an in-sync replica can be promoted; it
 must reject rather than clear the last primary allocation. Replica reports set
-`promote_only = false`. `expected_primary_term` is serde-defaulted for old Raft
-log entries; `0` means the legacy unconditioned command, while every new caller
-must send the captured nonzero term.
+`promote_only = false`. `expected_primary_term` is required and nonzero; old
+Raft log entries missing it are unsupported and prevent startup with recreate
+guidance.
 
 `primary_unavailable` is status only. `MarkPrimaryUnavailable` sets it for the
 exact initialized allocation without changing authority. `MarkPrimaryAvailable`
@@ -61,28 +61,28 @@ The state machine snapshots the entire `ClusterState` with serde:
 `serde_json::to_vec(&state)` in `src/consensus/state_machine.rs` (the
 `ClusterSnapshotBuilder` path). Restore is the symmetric `serde_json::from_slice`.
 Therefore **any new field you add to `ClusterState` is persisted and restored
-automatically** — provided you make it backward-compatible with old snapshots:
+automatically**. FerrisSearch pre-1.0 intentionally does not deserialize an
+older snapshot shape after a persisted field is added:
 
 ```rust
 // src/cluster/state.rs — on the ClusterState struct
-#[serde(default)] pub api_keys: HashMap<String, SecurityApiKeyRecord>,
-#[serde(default)] pub roles:    HashMap<String, SecurityRoleDefinition>,
+pub api_keys: HashMap<String, SecurityApiKeyRecord>,
+pub roles:    HashMap<String, SecurityRoleDefinition>,
 ```
 
-`#[serde(default)]` is **mandatory** on every new `ClusterState` field: a node may load
-a snapshot written before the field existed. Also initialize the field in
-`ClusterState::new()` (and anywhere a `ClusterState` is constructed literally, e.g.
-`Default`). Embedded structs derive `Serialize, Deserialize, Clone, Debug, PartialEq`
-(add `Eq` when all fields are `Eq`), and use `#[serde(default)]` on their own optional
-fields for the same forward-compat reason.
+Do not add `#[serde(default)]` as a compatibility shim. Initialize the field in
+`ClusterState::new()` and every literal constructor. Embedded structs derive
+`Serialize, Deserialize, Clone, Debug, PartialEq` (add `Eq` when applicable).
+Defaults remain acceptable only when they define current request semantics, not
+when they make an older persisted format readable.
 
 ### ⚠️ The transport proto `ClusterState` is a SEPARATE representation — keep it in sync
 
 The Raft *snapshot* serde is automatic, but `proto/transport.proto`'s `message ClusterState`
 is a **second, hand-written** representation used by the `JoinCluster` response snapshot
 (`cluster_state_to_proto` / `proto_to_cluster_state` in `src/transport/server/conversions.rs`).
-Adding a `#[serde(default)]` field to the domain `ClusterState` does **not** update the proto —
-the field is silently dropped on every join/startup snapshot roundtrip. The codebase invariant
+Adding a domain `ClusterState` field does **not** update the proto — the field is
+silently dropped on every join/startup snapshot roundtrip. The codebase invariant
 is that **ClusterState transport snapshots must be lossless**, so when you add a control-plane
 field you must also:
 
@@ -96,6 +96,8 @@ field you must also:
 4. Add a roundtrip test in `src/transport/server/tests.rs` with the field populated, asserting
    equality after `cluster_state_to_proto` → `proto_to_cluster_state`, plus a malformed-entry
    rejection test.
+5. Bump `ClusterState.format_version`; old/missing wire versions must reject
+   with recreate guidance.
 
 ## The 7 steps (every step has a copy-paste anchor)
 
@@ -109,10 +111,10 @@ dependency (`consensus` already depends on `cluster::state`). Reference structs:
 
 - Store **derived/safe** data only. For secrets, store the SHA-256 hash (64-char hex),
   never plaintext. Normalize on the way in.
-- Add the field(s) to `ClusterState` with `#[serde(default)]`; init in `new()`.
+- Add the field(s) to `ClusterState`; init in `new()`.
 - **Tests:** serde roundtrip of the struct; a `ClusterState` roundtrip with the field
-  populated (snapshot safety); and an *old-snapshot* JSON literal missing the field that
-  still deserializes via `#[serde(default)]`.
+  populated (snapshot safety); and an old-shape JSON literal missing the field
+  that is rejected.
 
 ### 2. `ClusterCommand` variant + `Display` + apply arm
 Three edits, all mirroring `AddMappings`:
@@ -239,7 +241,7 @@ match resolve_leader_or_master(&state, "api key creation") {
 ### 7. Tests (BLOCKING — see `testing.instructions.md`)
 Cover every new branch at three layers:
 1. **Unit** — types serde roundtrip; state_machine apply (mutation + version bump);
-   `ClusterState` snapshot roundtrip + old-snapshot default.
+   current `ClusterState` snapshot roundtrip + old-shape rejection.
 2. **Transport** — a direct gRPC test of each new RPC against a real
    `TransportService` (leader applies; non-leader returns `failed_precondition`).
 3. **Coordinator / multi-node** — at least one test where a **follower** node's API
@@ -273,7 +275,8 @@ let cluster_manager = ClusterManager::with_shared_state(state_handle); // moves 
 - ❌ Returning "not the leader" / "send to master" from an API handler instead of
   forwarding.
 - ❌ Forgetting `state.version += 1` in an apply arm.
-- ❌ A new `ClusterState` field without `#[serde(default)]` (breaks old-snapshot restore).
+- ❌ A new persisted field with `#[serde(default)]` solely to keep an old
+  snapshot readable.
 - ❌ Adding a `ClusterState` field but not the transport proto `ClusterState` message +
   `cluster_state_to_proto` / `proto_to_cluster_state` (silently dropped on join snapshots).
 - ❌ `unwrap_or_default()` on a transport JSON payload (silently drops data).

@@ -69,7 +69,7 @@ fn promotion_replays_then_fills_gaps_with_durable_noops() {
         assert_eq!(engine.sequence_stats().processed_checkpoint, Some(2));
         assert_eq!(engine.sequence_stats().persisted_checkpoint, Some(2));
         let wal = engine
-            .legacy_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations;
         assert!(

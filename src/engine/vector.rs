@@ -69,7 +69,7 @@ impl VectorIndex {
                     .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {e}"))?;
             }
             // Load doc_id mapping sidecar if present
-            vi.load_doc_id_map(path);
+            vi.load_doc_id_map(path)?;
         }
         Ok(vi)
     }
@@ -322,34 +322,41 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// Load the doc_id mapping sidecar if present.
-    pub fn load_doc_id_map(&self, usearch_path: impl AsRef<Path>) {
+    /// Load the current binary doc_id mapping sidecar if present.
+    pub fn load_doc_id_map(&self, usearch_path: impl AsRef<Path>) -> Result<()> {
         let bin_path = usearch_path.as_ref().with_extension("docids.bin");
-        // Try binary format first, fall back to legacy JSON
-        if let Ok(data) = std::fs::read(&bin_path)
-            && let Ok((loaded, _)) = bincode_next::serde::decode_from_slice::<HashMap<u64, String>, _>(
-                &data,
-                BINCODE_CONFIG,
-            )
-        {
+        if let Ok(data) = std::fs::read(&bin_path) {
+            let (loaded, consumed) = bincode_next::serde::decode_from_slice::<
+                HashMap<u64, String>,
+                _,
+            >(&data, BINCODE_CONFIG)
+            .map_err(|error| {
+                crate::common::unsupported_index_format(
+                    "vector doc-id map",
+                    format!("cannot decode current binary sidecar {bin_path:?}: {error}"),
+                )
+            })?;
+            if consumed != data.len() {
+                return Err(crate::common::unsupported_index_format(
+                    "vector doc-id map",
+                    format!("binary sidecar {bin_path:?} has trailing bytes"),
+                ));
+            }
             let mut map = self
                 .key_to_doc_id
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
             *map = loaded;
-            return;
+            return Ok(());
         }
-        // Legacy JSON fallback
         let json_path = usearch_path.as_ref().with_extension("docids.json");
-        if let Ok(data) = std::fs::read_to_string(&json_path)
-            && let Ok(loaded) = serde_json::from_str::<HashMap<u64, String>>(&data)
-        {
-            let mut map = self
-                .key_to_doc_id
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            *map = loaded;
+        if json_path.try_exists()? {
+            return Err(crate::common::unsupported_index_format(
+                "vector doc-id map",
+                format!("JSON sidecar {json_path:?} is not supported"),
+            ));
         }
+        Ok(())
     }
 }
 
@@ -363,6 +370,18 @@ mod tests {
         assert_eq!(vi.dimensions(), 3);
         assert_eq!(vi.len(), 0);
         assert!(vi.is_empty());
+    }
+
+    #[test]
+    fn no_compat_json_doc_id_map_requires_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        std::fs::write(path.with_extension("docids.json"), "{}").unwrap();
+        let vi = VectorIndex::new(3, MetricKind::Cos).unwrap();
+
+        let error = vi.load_doc_id_map(&path).unwrap_err();
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
     }
 
     #[test]

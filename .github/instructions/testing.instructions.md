@@ -253,8 +253,8 @@ cargo test -- test_name                         # Single test by name
 - For restart/rejoin data-loss fixes that depend on real process startup order, add or extend a process-backed `restart_regression` test that runs real `ferrissearch` binaries through create -> ingest -> flush -> restart -> verify count/UUID-dir invariants.
 - For authoritative in-sync membership changes, cover creation-time admission,
   later allocation staying out of sync, removal, in-sync-only targeted and
-  fallback promotion, out-of-sync-first replica reduction, legacy serde
-  fail-closed behavior, strict proto roundtrip/rejection, and live replication
+  fallback promotion, out-of-sync-first replica reduction, strict persisted
+  format rejection, strict proto roundtrip/rejection, and live replication
   targeting. Add a real three-process flush -> allocate replica -> primary loss
   -> red shard -> original-primary rejoin regression that verifies exact
   acknowledged values.
@@ -318,8 +318,7 @@ cargo test -- test_name                         # Single test by name
 - Round-7 storage regressions cover delete-preserving startup and failed-writer
   replay, malformed WAL document envelopes, idempotent replay with deletes,
   replica delete survival through promotion, idle refresh/snapshot healing,
-  full transport recovery after a transient source refresh-commit failure, and
-  operation-correct legacy `RecoverReplica` encoding.
+  and full transport recovery after a transient source refresh-commit failure.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary
@@ -332,18 +331,14 @@ cargo test -- test_name                         # Single test by name
   missing existing Tantivy metadata, same-term index UUID replacement,
   partially visible post-head WAL appends, the 32 MiB frame boundary on every
   WAL write API, and HTTP 503 mapping with attributable bulk failures.
-- Round-5 WAL regressions cover legacy 40 MiB frame open/replay/skip
-  compatibility, the retained 32 MiB recovery-transfer ceiling, exact
+- Round-5 WAL regressions cover the uniform 32 MiB persisted/recovery frame
+  ceiling, exact
   final-generation/captured-size handling for in-progress appends, durable
   active-tail truncation before append, and fail-closed middle corruption.
-- Round-6 recovery coverage pauses a real live WAL append mid-frame and calls
-  legacy `RecoverReplica`; the RPC must wait for and read through the live
-  engine, never truncate/delete files through a second `HotTranslog::open`, and
-  a subsequent engine reopen must replay every acknowledged frame.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.
-- For any new Raft control-plane mutation (new `ClusterCommand`, new `ClusterState` config field, new forwarded write RPC — see `control-plane.instructions.md`), add all three layers: (1) unit — `types.rs` serde JSON roundtrip per variant, `state_machine.rs` apply test asserting the map changed AND `version` bumped, `cluster/state.rs` `ClusterState` snapshot roundtrip plus an old-snapshot literal missing the field deserializing via `#[serde(default)]`; (2) transport — a direct gRPC test of each RPC (leader applies, non-leader returns `failed_precondition`); (3) coordinator/multi-node — a follower's API handler forwards the write to the leader and the change is observable on the leader (preserve real `raft_node_id`s, route through a non-master node).
+- For any new Raft control-plane mutation (new `ClusterCommand`, new `ClusterState` config field, new forwarded write RPC — see `control-plane.instructions.md`), add all three layers: (1) unit — `types.rs` serde JSON roundtrip per variant, `state_machine.rs` apply test asserting the map changed AND `version` bumped, `cluster/state.rs` current-shape snapshot roundtrip plus a missing-field fixture that is rejected; (2) transport — a direct gRPC test of each RPC (leader applies, non-leader returns `failed_precondition`); (3) coordinator/multi-node — a follower's API handler forwards the write to the leader and the change is observable on the leader (preserve real `raft_node_id`s, route through a non-master node).
 - For the dynamic security control plane specifically, also assert: create→authenticate→revoke→denied, custom-role authz grants only mapped actions, static + dynamic keys coexist, `GET /_security/*` never leaks `hash_sha256`, and a non-admin principal gets 403 on `/_security/*`. Security-enabled REST harnesses must treat HTTP 401 on `GET /` as "server up" during readiness polling (auth rejects the probe).
 - For SQL identifier case-sensitivity fixes, add helper-level canonicalization coverage plus REST regressions for both buffered and streamed SQL endpoints using real mixed-case mapping fields, and cover both unquoted source references and quoted exact-identifier preservation on the residual/DataFusion path.
 - For `ferris-cli` interactive features, test command parsing and completion token boundaries in pure helpers; keep watch-mode behavior factored so the logic is covered without relying on terminal I/O in tests.

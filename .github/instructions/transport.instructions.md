@@ -33,7 +33,6 @@ SqlRecordBatchStream(SqlRecordBatchRequest) → stream SqlRecordBatchResponse
 // Replication (primary → replica)
 ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse
 ReplicateBulk(ReplicateBulkRequest) → ReplicateBulkResponse
-RecoverReplica(RecoverReplicaRequest) → RecoverReplicaResponse
 StartPeerRecovery(StartPeerRecoveryRequest) → StartPeerRecoveryResponse
 FetchRecoveryFileChunk(FetchRecoveryFileChunkRequest) → FetchRecoveryFileChunkResponse
 FetchRecoveryOps(FetchRecoveryOpsRequest) → FetchRecoveryOpsResponse
@@ -82,11 +81,12 @@ receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
 
+`ClusterState.format_version` is required and must equal the one current wire
+version. Missing/unknown versions are rejected with recreate guidance.
 `ShardAssignment.in_sync_replica_node_ids` carries the authoritative replica
 acknowledgement/promotion set in JoinCluster snapshots. Conversion must preserve
 it losslessly and reject duplicate IDs, the primary ID, or any ID absent from
-`replica_node_ids` with `INVALID_ARGUMENT`. An absent field from pre-1.0 peers
-decodes as empty and therefore non-promotable.
+`replica_node_ids` with `INVALID_ARGUMENT`.
 `ShardAssignment` also carries primary/replica allocation IDs, the initial
 CreateIndex allocation ID, `primary_initialized`, and the status-only
 `primary_unavailable` flag. Missing allocation metadata is rejected on join
@@ -167,19 +167,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   UUID/allocation/durable-identity mismatch (`FAILED_PRECONDITION`) or
   corruption (`DATA_LOSS`) is definitive. Probe completion must still match
   the exact observation start/target identity before removal.
-- **recover_replica**: Compatibility/testing-only RPC that reads processed
-  operations in retained physical file order and reports optional
-  processed/persisted/max stats. Never construct a second
-  `HotTranslog` on the live shard directory: open performs startup repair and
-  unreferenced-generation cleanup. The RPC remains available for transport
-  tests but the node lifecycle does not use this partial suffix as recovery or
-  admission. It returns `success=false` rather than an empty success when the
-  retained WAL cannot reach the captured head (for example after a flush, or
-  on a copy installed from files), when a concurrent flush removes a needed
-  generation, or when a legacy frame above the 32 MiB transfer limit falls in
-  the requested range.
-- Modern peer-recovery catch-up and legacy `RecoverReplica` share the strict WAL
-  document decoder. Missing `_doc_id`, or missing `_source` on an index
+- Peer-recovery catch-up uses the strict WAL document decoder. Missing
+  `_doc_id`, or missing `_source` on an index
   operation, fails closed; delete operations carry no synthetic source and
   must never be converted back into indexed documents.
 - **peer recovery RPCs**: source sessions are

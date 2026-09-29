@@ -45,7 +45,7 @@ ClusterState { cluster_name, version, master_node, nodes, indices, shard_allocat
 
 ### Index UUID
 - Every `IndexMetadata` has a non-empty `uuid: IndexUuid` value; production
-  creation generates UUID v4 values, while transport and legacy fixtures may
+  creation generates UUID v4 values, while transport and test fixtures may
   preserve any non-empty identifier
 - Missing or empty UUIDs fail deserialization; startup must not synthesize
   identity for an existing index
@@ -99,12 +99,12 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
   the in-sync set. The node recovery driver installs and admits them; until
   then they remain `INITIALIZING`, receive no live writes, and are not
   promotable.
-- Missing `in_sync_replicas` in pre-1.0 serde metadata defaults to empty. This
-  deliberately fails closed; legacy replicas do not inherit eligibility.
-- `primary_term` is per shard, starts at 1 for new indices, and defaults to 0
-  only when reading legacy pre-term metadata. `UpdateIndex` cannot set it:
-  unchanged primaries preserve the current term and accepted primary changes
-  increment it in the Raft state machine.
+- Persisted routing and allocation metadata must contain the complete current
+  shape. Missing `in_sync_replicas`, primary term, allocation identity, or
+  activation fields is an unsupported format; do not serde-default it.
+- `primary_term` is per shard and starts at 1 for new indices. `UpdateIndex`
+  cannot set it: unchanged primaries preserve the current term and accepted
+  primary changes increment it in the Raft state machine.
 - `UpdateIndex` can only remove in-sync members by intersecting the current set
   with the submitted replica assignments. It cannot add members. A primary
   change is accepted only when the candidate is in the current in-sync set.

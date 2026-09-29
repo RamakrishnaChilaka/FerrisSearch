@@ -72,9 +72,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > source's exact committed boundary, streams the WAL by physical
 > generation/byte cursor, and admits only after matching the final processed
 > barrier. Promotion persists its fence and fills local gaps with NoOps.
-> Flushed legacy primaries have a narrow in-place migration path; legacy
-> replicas require fresh allocation and peer recovery. This does not implement
-> D10 rollback/resync, client retry tokens, or full OCC.
+> Earlier build formats are unsupported and require index/cluster recreation
+> and reindexing. This does not implement D10 rollback/resync, client retry
+> tokens, or full OCC.
 
 > **Implementation note — September 24, 2026:** the first in-sync tracking
 > package now stores replica eligibility in Raft routing metadata, targets live
@@ -151,26 +151,19 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > closed. Retryable forwarded `ABORTED` writes map to HTTP 503.
 >
 > **Round-5 corrections — September 26, 2026:** the 32 MiB total-frame ceiling
-> remains the limit for new WAL writes and transferred recovery operations,
-> while restart scan, replay, and recovery skips accept complete legacy frames
-> up to a separate 65 MiB decode ceiling. The concurrent-append exception
-> applies only to the final captured generation at or beyond its captured file
-> size. On restart, an incomplete active-generation tail is truncated to the
-> last fully decoded frame and both file and directory are fsynced before
-> append; complete or middle corruption still fails closed.
->
-> **Round-6 correction — September 26, 2026:** legacy `RecoverReplica` now
-> reads through the live engine's captured generation state. It never creates
-> a second `HotTranslog` on a live shard, so it cannot run startup tail repair
-> or unreferenced-generation deletion against an active writer. Test-only live
-> WAL inspections use the same non-mutating engine path.
+> applies uniformly to writes, restart scan, replay, and recovery. The
+> concurrent-append exception applies only to the final captured generation at
+> or beyond its captured file size. On restart, an incomplete
+> active-generation tail is truncated to the last fully decoded frame and both
+> file and directory are fsynced before append; complete or middle corruption
+> still fails closed.
 >
 > **Round-7 corrections — September 27, 2026:** WAL replay now validates the
 > internal `_doc_id` and operation payload, deletes that ID for every
 > operation, and adds a document back only for an index operation. Startup,
-> failed-writer reconstruction, peer-recovery catch-up, and legacy
-> `RecoverReplica` therefore preserve deletes and fail closed on malformed
-> operation envelopes. Blocking maintenance and snapshot preparation acquire
+> failed-writer reconstruction, and peer-recovery catch-up therefore preserve
+> deletes and fail closed on malformed operation envelopes. Blocking
+> maintenance and snapshot preparation acquire
 > the writer through the same rebuild-and-replay path as document writes, so
 > an idle repaired primary can recover and serve peer recovery without an
 > unrelated client mutation. Replay holds the shard translog lock for the
@@ -303,9 +296,8 @@ The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including
 the four-byte frame header, sequence and operation fields, JSON serialization,
 and the internal `_doc_id` / `_source` wrapper. The maximum usable `_source`
-therefore varies slightly with document ID and content. The 65 MiB decode-only
-ceiling exists solely so upgraded nodes can open and replay complete legacy
-frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
+therefore varies slightly with document ID and content. The same limit applies
+to restart, replay, and peer-recovery transfer.
 
 **Known write-failure limit:** synchronous WAL/fsync/engine failures now fail
 the request and enter bounded escalation, but a WAL entry whose later engine
@@ -900,7 +892,7 @@ Admission decisions require evidence; metrics and log messages are not that
 evidence. Report excluded/stale copies and unmet minimum durability explicitly
 even when other copies continue serving.
 
-## 10. Persistence And Pre-1.0 Compatibility
+## 10. Persistence And Pre-1.0 Format Policy
 
 This protocol changes WAL records, snapshot metadata, and transport messages.
 Version them together. Unknown formats and corruption fail closed; only a proven
@@ -908,13 +900,13 @@ unsealed trailing attempt beyond the durability frontier can be discarded under
 the restart rule in Section 5.
 New fields are not silently defaulted into a valid epoch, allocation, or history.
 
-Existing old-format data can be opened only by a future deliberate
-conversion/export path and must not be labelled protocol-safe by assuming a
-term of zero or a complete prefix from a maximum sequence. The current pre-1.0
-implementation requires reindexing or a fresh cluster when routing snapshots or
-local copies lack allocation identity; no rolling mixed-protocol support or
-legacy adoption path is provided. Broader format/conversion details remain part
-of FS-005.
+There is no conversion/export path in the current pre-1.0 implementation.
+Earlier on-disk schemas, WAL entries/manifests, committed boundaries, copy
+identities, vector sidecars, Raft logs/snapshots, and cluster-state wire
+snapshots are unsupported. Startup or join fails with recreate-the-index
+guidance. Operators must recreate the index or cluster state and reindex source
+data; no role-specific migration, term-zero default, rolling mixed-protocol
+support, or compatibility shim is provided.
 
 Ordinary process restart and same-version recovery remain required. File
 deletion and old-generation cleanup must wait until atomic-install and retention
