@@ -395,6 +395,55 @@ fn create_index_error_status(error: crate::cluster::state::CreateIndexMetadataEr
     }
 }
 
+#[cfg(test)]
+static TRACKED_REPLICA_INDEX_PAYLOAD: std::sync::Mutex<Option<Vec<u8>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TRACKED_REPLICA_INDEX_PARSE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TRACK_REPLICA_INDEX_PAYLOAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn start_tracking_replica_index_payload(payload: &[u8]) {
+    *TRACKED_REPLICA_INDEX_PAYLOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(payload.to_vec());
+    TRACKED_REPLICA_INDEX_PARSE_COUNT.store(0, std::sync::atomic::Ordering::Release);
+    TRACK_REPLICA_INDEX_PAYLOAD.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+fn stop_tracking_replica_index_payload() -> usize {
+    TRACK_REPLICA_INDEX_PAYLOAD.store(false, std::sync::atomic::Ordering::Release);
+    *TRACKED_REPLICA_INDEX_PAYLOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+    TRACKED_REPLICA_INDEX_PARSE_COUNT.swap(0, std::sync::atomic::Ordering::AcqRel)
+}
+
+fn parse_replica_index_source(
+    payload_json: &[u8],
+    invalid_json_context: &str,
+) -> Result<serde_json::Value, Status> {
+    #[cfg(test)]
+    if TRACK_REPLICA_INDEX_PAYLOAD.load(std::sync::atomic::Ordering::Acquire)
+        && TRACKED_REPLICA_INDEX_PAYLOAD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(payload_json)
+    {
+        TRACKED_REPLICA_INDEX_PARSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    let source = serde_json::from_slice(payload_json)
+        .map_err(|error| Status::invalid_argument(format!("{invalid_json_context}: {error}")))?;
+    crate::common::validate_document_source(&source)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(source)
+}
+
 #[tonic::async_trait]
 impl InternalTransport for TransportService {
     type SqlRecordBatchStreamStream =
@@ -1758,12 +1807,14 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| {
                 Status::invalid_argument("replication requires a target allocation ID")
             })?;
-        if req.op == "index" {
-            let source: serde_json::Value = serde_json::from_slice(&req.payload_json)
-                .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
-            crate::common::validate_document_source(&source)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        }
+        let index_source = if req.op == "index" {
+            Some(parse_replica_index_source(
+                &req.payload_json,
+                "invalid JSON",
+            )?)
+        } else {
+            None
+        };
         let assigned = match self.replica_apply_routing(
             &req.index_name,
             req.shard_id,
@@ -1843,11 +1894,15 @@ impl InternalTransport for TransportService {
         );
 
         let operation = match req.op.as_str() {
-            "index" => crate::engine::DocumentMutation::Index {
-                doc_id: req.doc_id.clone(),
-                source: serde_json::from_slice(&req.payload_json)
-                    .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?,
-            },
+            "index" => {
+                let source = index_source.ok_or_else(|| {
+                    Status::internal("validated replica index source is unavailable")
+                })?;
+                crate::engine::DocumentMutation::Index {
+                    doc_id: req.doc_id.clone(),
+                    source,
+                }
+            }
             "delete" => crate::engine::DocumentMutation::Delete {
                 doc_id: req.doc_id.clone(),
             },
@@ -1974,16 +2029,21 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| {
                 Status::invalid_argument("bulk replication requires a target allocation ID")
             })?;
-        for operation in &req.ops {
-            if operation.op == "index" {
-                let source: serde_json::Value = serde_json::from_slice(&operation.payload_json)
-                    .map_err(|e| {
-                        Status::invalid_argument(format!("invalid JSON in bulk replicate: {e}"))
-                    })?;
-                crate::common::validate_document_source(&source)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            }
-        }
+        let index_sources = req
+            .ops
+            .iter()
+            .map(|operation| {
+                if operation.op == "index" {
+                    parse_replica_index_source(
+                        &operation.payload_json,
+                        "invalid JSON in bulk replicate",
+                    )
+                    .map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
         let assigned = match self.replica_apply_routing(
             &req.index_name,
             req.shard_id,
@@ -2068,7 +2128,7 @@ impl InternalTransport for TransportService {
         let start_seq_no = req.ops.first().map(|operation| operation.seq_no);
         let mut previous_seq_no = None;
         let mut operations = Vec::with_capacity(req.ops.len());
-        for (offset, op) in req.ops.iter().enumerate() {
+        for (offset, (op, index_source)) in req.ops.iter().zip(index_sources).enumerate() {
             if op.index_name != req.index_name
                 || op.shard_id != req.shard_id
                 || op.index_uuid != req.index_uuid
@@ -2096,10 +2156,9 @@ impl InternalTransport for TransportService {
                             "bulk index replication sequences must be contiguous and ordered",
                         ));
                     }
-                    let payload: serde_json::Value = serde_json::from_slice(&op.payload_json)
-                        .map_err(|e| {
-                            Status::invalid_argument(format!("invalid JSON in bulk replicate: {e}"))
-                        })?;
+                    let payload = index_source.ok_or_else(|| {
+                        Status::internal("validated bulk replica index source is unavailable")
+                    })?;
                     crate::engine::DocumentMutation::Index {
                         doc_id: op.doc_id.clone(),
                         source: payload,

@@ -120,6 +120,11 @@ pub async fn replicate_bulk(
 - Each replicated operation must fit the same 32 MiB encoded WAL-frame limit as
   a primary operation. Oversized explicit-sequence single or bulk writes fail
   validation before replica WAL mutation.
+- Replica transport decodes each index payload exactly once and reuses the
+  validated JSON value when constructing the sequenced operation. Bulk decodes
+  and source-validates every index payload before shard open, then completes
+  envelope and operation validation before fence advancement or engine
+  mutation.
 - Pending-target reconciliation admits only the same allocation when in sync or
   after promotion. Admission is checked first; otherwise missing/different
   allocation identity, a different primary, or a strictly newer observed term

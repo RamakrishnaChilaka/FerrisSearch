@@ -348,6 +348,10 @@ cargo test -- test_name                         # Single test by name
 - Zero-replica bulk replication coverage must prove target resolution happens
   before sequence-range construction or JSON serialization. Performance
   changes require equivalent release-mode before/after measurements.
+- Replica JSON decode coverage must exercise the real single and bulk
+  transport handlers and prove one decode per index operation. Keep the
+  engine's independent source validation as defense in depth, and use an
+  equivalent release-mode workload for performance claims.
 - R6 replay regressions cover more than one 1,000-operation replay batch after
   a fence raise, visibility of every pre-promotion document plus a later write,
   clean assigned-copy reopen, and restart from an intermediate commit whose

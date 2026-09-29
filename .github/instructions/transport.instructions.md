@@ -155,6 +155,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   through the shared validator before dynamic mapping, WAL append, or replica
   apply. These failures are `INVALID_ARGUMENT`, allowing REST coordinators to
   return `400 mapper_parsing_exception`.
+- Replica index payloads are decoded and source-validated once on the async
+  transport path, before shard open or worker dispatch. Reuse that parsed value
+  when constructing the sequenced operation; bulk still validates every
+  payload before the first worker-side fence or engine mutation.
 - `ReplicateBulk` accepts either contiguous ordered index operations or a
   strictly increasing, potentially non-contiguous homogeneous NoOp batch.
   Promotion activation uses bounded NoOp batches rather than one RPC per

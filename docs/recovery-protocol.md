@@ -88,7 +88,10 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > after finalization asks for another catch-up. Bulk replication resolves
 > authoritative targets before payload serialization; zero-replica bulks avoid
 > that work, and non-empty fan-out shares one serialized operation slice across
-> replica tasks. Dynamic mapping never persists the built-in `body` catch-all;
+> replica tasks. Replica receivers decode and source-validate each index
+> payload once, then reuse the parsed value while retaining whole-batch
+> validation before fence or engine mutation. Dynamic mapping never persists
+> the built-in `body` catch-all;
 > a plain explicit text mapping reuses its existing Tantivy field. Reserved
 > authoritative mapping names or incompatible `body` metadata fail shard open
 > as unsupported index formats with recreate-index guidance rather than

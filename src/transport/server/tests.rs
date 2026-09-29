@@ -2718,6 +2718,134 @@ async fn persistent_replica_bulk_wal_io_remains_typed_for_escalation() {
     );
 }
 
+fn replica_json_test_service() -> (tempfile::TempDir, TransportService, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = DomainClusterState::new("replica-json".into());
+    state.add_index(DomainIndexMetadata {
+        name: "idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("uuid-1"),
+        number_of_shards: 1,
+        number_of_replicas: 1,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "node-1".into(),
+                primary_term: 2,
+                replicas: vec!["node-2".into()],
+                in_sync_replicas: vec!["node-2".into()],
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+    let allocation_id = state.shard_allocation_id("idx", 0, "node-2").unwrap();
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let cluster_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    cluster_manager.update_state(state);
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    let service = TransportService {
+        cluster_manager,
+        shard_manager,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "node-2".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    (dir, service, allocation_id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replica_index_payload_json_is_decoded_once_per_operation() {
+    let (_dir, service, allocation_id) = replica_json_test_service();
+    let marker = uuid::Uuid::new_v4().to_string();
+    let single_payload = serde_json::to_vec(&json!({
+        "marker": marker,
+        "kind": "single"
+    }))
+    .unwrap();
+    start_tracking_replica_index_payload(&single_payload);
+    let response = service
+        .replicate_doc(Request::new(ReplicateDocRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            doc_id: "single".into(),
+            payload_json: single_payload,
+            op: "index".into(),
+            seq_no: 0,
+            index_uuid: "uuid-1".into(),
+            primary_term: Some(2),
+            target_allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+    let single_parse_count = stop_tracking_replica_index_payload();
+
+    let bulk_payload = serde_json::to_vec(&json!({
+        "marker": marker,
+        "kind": "bulk"
+    }))
+    .unwrap();
+    let ops = (1..=3)
+        .map(|seq_no| ReplicateDocRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            doc_id: format!("bulk-{seq_no}"),
+            payload_json: bulk_payload.clone(),
+            op: "index".into(),
+            seq_no,
+            index_uuid: "uuid-1".into(),
+            primary_term: Some(2),
+            target_allocation_id: Some(allocation_id),
+        })
+        .collect();
+    start_tracking_replica_index_payload(&bulk_payload);
+    let response = service
+        .replicate_bulk(Request::new(ReplicateBulkRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            ops,
+            index_uuid: "uuid-1".into(),
+            primary_term: Some(2),
+            target_allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+    let bulk_parse_count = stop_tracking_replica_index_payload();
+    assert_eq!((single_parse_count, bulk_parse_count), (1, 3));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replica_bulk_accepts_non_contiguous_promotion_noops() {
     let dir = tempfile::tempdir().unwrap();
