@@ -81,7 +81,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > new allocation identity. Text-only writer replay durably marks vector state
 > stale; write, maintenance, recovery-snapshot, barrier, activation, startup,
 > and recovery-finalization paths rebuild and fsync vectors before clearing the
-> marker.
+> marker. Intermediate replay commits may persist a committed maximum below the
+> durable term-start fence maximum until later WAL batches are replayed; this is
+> valid sequence state, not corruption.
 > Earlier build formats are unsupported and require index/cluster recreation
 > and reindexing. This does not implement D10 rollback/resync, client retry
 > tokens, or full OCC.

@@ -173,6 +173,11 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - Replay holds the translog lock for the entire retained suffix so no new WAL
   entry can be appended before reconstruction is complete. This blocks writes
   to that shard and can be a long critical section when refresh is disabled.
+- The durable term-start maximum comes from the copy fence and may be ahead of
+  `CommittedBoundaryRecord.max_seq_no` at an intermediate replay commit. This is
+  valid because WAL-only operations have not reached that batch yet. Validation
+  still requires every recorded current-term processed interval to stay at or
+  below both the committed maximum and the term-start maximum.
 - `translog_size_bytes()` exposes the current WAL size for the auto-flush loop
 - The Tantivy `IndexWriter` heap budget is intentionally capped at 64 MiB per shard. Multi-shard restart/open paths must not reserve the old 512 MiB-per-shard budget or nodes with many local shards can OOM before recovery completes.
 - Force merge is serialized only within one `HotEngine`. It temporarily installs

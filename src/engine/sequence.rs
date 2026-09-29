@@ -388,7 +388,6 @@ impl CommittedBoundaryRecord {
         }
         if self.max_seq_no.is_none()
             && (self.max_seq_no_of_updates_or_deletes.is_some()
-                || self.term_sequence_state.max_seq_no_at_term_start.is_some()
                 || !self
                     .term_sequence_state
                     .processed_in_current_term_below_start_max
@@ -398,19 +397,13 @@ impl CommittedBoundaryRecord {
                 "empty committed boundary contains sequence metadata",
             ));
         }
-        if self.max_seq_no.is_some() && self.term_sequence_state.current_term == 0 {
+        if (self.max_seq_no.is_some()
+            || self.term_sequence_state.max_seq_no_at_term_start.is_some())
+            && self.term_sequence_state.current_term == 0
+        {
             return Err(committed_boundary_corruption(
                 "non-empty committed boundary has a zero primary term",
             ));
-        }
-        if let (Some(term_start_max), Some(max_seq_no)) = (
-            self.term_sequence_state.max_seq_no_at_term_start,
-            self.max_seq_no,
-        ) && term_start_max > max_seq_no
-        {
-            return Err(committed_boundary_corruption(format!(
-                "term-start maximum {term_start_max} exceeds maximum sequence number {max_seq_no}"
-            )));
         }
 
         let intervals = SeqNoIntervals::from_ranges(
@@ -418,6 +411,16 @@ impl CommittedBoundaryRecord {
                 .term_sequence_state
                 .processed_in_current_term_below_start_max,
         )?;
+        if let Some(max_seq_no) = self.max_seq_no
+            && intervals
+                .ranges
+                .values()
+                .any(|range_end| *range_end > max_seq_no)
+        {
+            return Err(committed_boundary_corruption(format!(
+                "current-term processed interval exceeds maximum sequence number {max_seq_no}"
+            )));
+        }
         if let Some(term_start_max) = self.term_sequence_state.max_seq_no_at_term_start {
             if intervals
                 .ranges
@@ -966,6 +969,33 @@ mod tests {
         record.version += 1;
         let error = record.validate().unwrap_err();
         assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+    }
+
+    #[test]
+    fn committed_boundary_allows_fence_maximum_ahead_of_replay_progress() {
+        let mut record = CommittedBoundaryRecord::empty(2);
+        record.term_sequence_state.max_seq_no_at_term_start = Some(1_000);
+        record.validate().unwrap();
+
+        record.processed_checkpoint = Some(999);
+        record.persisted_checkpoint = Some(999);
+        record.max_seq_no = Some(999);
+        record.max_seq_no_of_updates_or_deletes = Some(999);
+        record.validate().unwrap();
+
+        record
+            .term_sequence_state
+            .processed_in_current_term_below_start_max = vec![SeqNoRange {
+            start: 1_000,
+            end: 1_000,
+        }];
+        let error = record.validate().unwrap_err();
+        assert!(error.is::<CommittedBoundaryCorruptionError>());
+        assert!(
+            error
+                .to_string()
+                .contains("processed interval exceeds maximum sequence number")
+        );
     }
 
     #[test]

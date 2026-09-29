@@ -9948,6 +9948,72 @@ mod tests {
     }
 
     #[test]
+    fn reopen_resumes_from_intermediate_replay_commit_below_fence_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+            let docs = (0..TRANSLOG_REPLAY_BATCH_SIZE)
+                .map(|seq_no| (format!("d-{seq_no}"), json!({"n": seq_no})))
+                .collect();
+            engine
+                .bulk_add_documents_with_receipt_at_term(docs, 1)
+                .unwrap();
+            engine.refresh().unwrap();
+            engine
+                .with_translog("append final pre-promotion operation", |translog| {
+                    translog.append_with_seq(
+                        TRANSLOG_REPLAY_BATCH_SIZE,
+                        1,
+                        crate::wal::WalOperation::Index,
+                        json!({
+                            "_doc_id": format!("d-{}", TRANSLOG_REPLAY_BATCH_SIZE),
+                            "_source": {"n": TRANSLOG_REPLAY_BATCH_SIZE}
+                        }),
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            engine
+                .reconcile_term_sequence_state(2, Some(TRANSLOG_REPLAY_BATCH_SIZE))
+                .unwrap();
+
+            engine.refresh().unwrap();
+            let committed = CommittedBoundaryRecord::load(&dir.path().join("translog.committed"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                committed.processed_checkpoint,
+                Some(TRANSLOG_REPLAY_BATCH_SIZE - 1)
+            );
+            assert_eq!(committed.max_seq_no, Some(TRANSLOG_REPLAY_BATCH_SIZE - 1));
+            assert_eq!(
+                committed.term_sequence_state.max_seq_no_at_term_start,
+                Some(TRANSLOG_REPLAY_BATCH_SIZE)
+            );
+        }
+
+        let reopened = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+        reopened
+            .reconcile_term_sequence_state(2, Some(TRANSLOG_REPLAY_BATCH_SIZE))
+            .unwrap();
+        assert_eq!(
+            reopened.sequence_stats().processed_checkpoint,
+            Some(TRANSLOG_REPLAY_BATCH_SIZE)
+        );
+        assert_eq!(
+            reopened.sequence_stats().max_seq_no,
+            Some(TRANSLOG_REPLAY_BATCH_SIZE)
+        );
+        assert_eq!(
+            reopened
+                .get_document(&format!("d-{TRANSLOG_REPLAY_BATCH_SIZE}"))
+                .unwrap()
+                .unwrap()["n"],
+            json!(TRANSLOG_REPLAY_BATCH_SIZE)
+        );
+    }
+
+    #[test]
     fn replay_is_idempotent_when_a_batched_suffix_is_replayed_again() {
         // Simulate a crash after replay committed a batch to Tantivy segments but
         // before the final checkpoint was fully advanced. The next startup should

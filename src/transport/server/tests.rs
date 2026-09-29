@@ -2892,6 +2892,160 @@ async fn failed_promotion_noop_fanout_is_retried_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promoted_primary_replays_multiple_batches_and_reopens_cleanly() {
+    const DOCUMENT_COUNT: u64 = 1_001;
+
+    let mut state = gap_test_state(1);
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap()
+        .in_sync_replicas
+        .clear();
+    state.indices.get_mut("idx").unwrap().mappings.insert(
+        "value".into(),
+        FieldMapping {
+            field_type: FieldType::Integer,
+            dimension: None,
+        },
+    );
+    state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .settings
+        .refresh_interval_ms = Some(3_600_000);
+    let allocation_id = state.shard_allocation_id("idx", 0, "source").unwrap();
+    let mappings = state.indices["idx"].mappings.clone();
+    let settings = state.indices["idx"].settings.clone();
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(3600)));
+        let engine = shards
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &mappings,
+                &settings,
+                "uuid-1",
+                crate::shard::AssignedShardOpen {
+                    allocation_id,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .apply_replica_batch(
+                (0..DOCUMENT_COUNT)
+                    .map(|seq_no| crate::engine::SequencedOperation {
+                        seq_no,
+                        primary_term: 1,
+                        mutation: crate::engine::DocumentMutation::Index {
+                            doc_id: format!("doc-{seq_no}"),
+                            source: json!({"value": seq_no}),
+                        },
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        let manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+        manager.update_state(state.clone());
+        let service = TransportService {
+            cluster_manager: manager,
+            shard_manager: shards,
+            transport_client: crate::transport::TransportClient::new(),
+            storage_manager: test_storage_manager(dir.path()),
+            remote_store_reader_cache: test_remote_store_reader_cache(),
+            raft: None,
+            local_node_id: "source".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+            task_manager: Arc::new(crate::tasks::TaskManager::new()),
+            primary_activation_state: new_primary_activation_state(),
+            peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+            join_lock: new_join_lock(),
+        };
+
+        service
+            .activate_primary_for_lifecycle("idx", 0)
+            .await
+            .unwrap();
+        let response = service
+            .index_doc(Request::new(ShardDocRequest {
+                index_name: "idx".into(),
+                shard_id: 0,
+                doc_id: "after-promotion".into(),
+                payload_json: serde_json::to_vec(&json!({"value": DOCUMENT_COUNT})).unwrap(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), DOCUMENT_COUNT + 1);
+        for seq_no in 0..DOCUMENT_COUNT {
+            assert_eq!(
+                engine
+                    .get_document(&format!("doc-{seq_no}"))
+                    .unwrap()
+                    .unwrap()["value"],
+                json!(seq_no)
+            );
+        }
+        assert_eq!(
+            engine.get_document("after-promotion").unwrap().unwrap()["value"],
+            json!(DOCUMENT_COUNT)
+        );
+    }
+
+    let reopened_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(3600)));
+    let reopened = reopened_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &mappings,
+            &settings,
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(reopened.doc_count(), DOCUMENT_COUNT + 1);
+    assert_eq!(
+        reopened.sequence_stats().processed_checkpoint,
+        Some(DOCUMENT_COUNT)
+    );
+    for seq_no in 0..DOCUMENT_COUNT {
+        assert_eq!(
+            reopened
+                .get_document(&format!("doc-{seq_no}"))
+                .unwrap()
+                .unwrap()["value"],
+            json!(seq_no)
+        );
+    }
+    assert_eq!(
+        reopened.get_document("after-promotion").unwrap().unwrap()["value"],
+        json!(DOCUMENT_COUNT)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_clears_on_write() {
     let dir = tempfile::tempdir().unwrap();
     let (raft, shared_state) = crate::consensus::create_raft_instance_mem(1, "primary-io".into())
