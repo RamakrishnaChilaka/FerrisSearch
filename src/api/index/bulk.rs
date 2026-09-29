@@ -93,6 +93,8 @@ fn bulk_error_item(
 fn validate_bulk_document(
     document: &BulkDoc,
 ) -> Result<(), crate::common::ReservedDocumentFieldError> {
+    crate::common::validate_document_source(&document.payload)?;
+
     if document.action == "update" {
         if let Some(doc) = document.payload.get("doc") {
             crate::common::validate_document_source(doc)?;
@@ -100,9 +102,8 @@ fn validate_bulk_document(
         if let Some(upsert) = document.payload.get("upsert") {
             crate::common::validate_document_source(upsert)?;
         }
-        return Ok(());
     }
-    crate::common::validate_document_source(&document.payload)
+    Ok(())
 }
 
 pub(super) fn route_bulk_doc(

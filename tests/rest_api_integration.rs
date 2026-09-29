@@ -3168,6 +3168,62 @@ async fn bulk_reserved_metadata_fields_are_per_item_errors() -> Result<()> {
 }
 
 #[tokio::test]
+async fn bulk_update_wrapper_reserved_fields_are_isolated_per_item() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/reserved-bulk-update",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let bulk = concat!(
+        "{\"index\":{\"_id\":\"good\"}}\n",
+        "{\"value\":1}\n",
+        "{\"update\":{\"_id\":\"source-option\"}}\n",
+        "{\"doc\":{\"value\":2},\"_source\":true}\n",
+        "{\"update\":{\"_id\":\"sequence-option\"}}\n",
+        "{\"doc\":{\"value\":3},\"_seq_no\":999}\n"
+    );
+    let (status, body) = harness
+        .post_ndjson("/reserved-bulk-update/_bulk?refresh=true", bulk)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], json!(true), "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(3), "{body}");
+    assert_eq!(body["items"][0]["index"]["status"], json!(201), "{body}");
+    for position in [1, 2] {
+        assert_eq!(
+            body["items"][position]["index"]["status"],
+            json!(400),
+            "{body}"
+        );
+        assert_eq!(
+            body["items"][position]["index"]["error"]["type"],
+            json!("mapper_parsing_exception"),
+            "{body}"
+        );
+    }
+
+    let (status, body) = harness.get_json("/reserved-bulk-update/_doc/good").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"], json!({"value": 1}));
+
+    let (status, body) = harness
+        .put_json("/reserved-bulk-update/_doc/after", json!({"value": 4}))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn dynamic_true_auto_creates_mappings_on_index() -> Result<()> {
     let harness = RestTestHarness::start().await?;
 
