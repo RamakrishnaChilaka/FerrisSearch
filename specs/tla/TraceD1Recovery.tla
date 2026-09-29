@@ -169,16 +169,19 @@ ReplicaApplyEvent(event) ==
     /\ event.transportMessage \in messages
     /\ LET message == event.transportMessage
            beforeDoc == docValue[event.node][event.doc]
-       IN CASE event.outcome = "redelivery" ->
+       IN /\ message.write = event.writeId
+          /\ message.term = event.term
+          /\ message.seq = event.seq
+          /\ CASE event.outcome = "redelivery" ->
                     D1FixedReplicaRedelivery(message)
-            [] event.outcome \in {"applied_newer", "stale", "noop"} ->
+             [] event.outcome \in {"applied_newer", "stale", "noop"} ->
                     /\ D1FixedReplicaProcess(message)
                     /\ IF event.outcome = "applied_newer"
                           THEN docValue'[event.node][event.doc] = event.writeId
                           ELSE IF event.outcome = "stale"
                                THEN docValue'[event.node][event.doc] = beforeDoc
                                ELSE TRUE
-            [] OTHER -> FALSE
+             [] OTHER -> FALSE
     /\ event.writeId \in durableOps'[event.node]
     /\ replicaResponsePersisted' =
           [replicaResponsePersisted EXCEPT

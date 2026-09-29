@@ -129,7 +129,8 @@ exceed `processed`; `processed` cannot exceed `max_seq_no`.
 - `request_id` identifies one client request. It is null only for a promotion
   NoOp.
 - `receipt_id` identifies one operation identity from primary acceptance
-  through WAL, replica apply, and replay.
+  through WAL, replica apply, and replay. Every event using one receipt must
+  repeat the same term, sequence, operation, document, and content hash.
 - `batch_id` identifies one promotion gap-fill batch.
 - `message_id` identifies one sequence-target transport attempt. It is never
   reused.

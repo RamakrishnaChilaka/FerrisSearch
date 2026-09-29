@@ -108,6 +108,21 @@ run_valid noop-collision-removed valid-promotion-noop-collision-removed.jsonl
 run_invalid noop-collision-redelivery invalid-promotion-noop-collision-as-redelivery.jsonl 32 operation_processed
 run_valid p7a valid-promotion-noop-replicated-p7a.jsonl
 run_invalid p7b invalid-promotion-noop-untraced-p7b.jsonl 190 operation_processed
+run_invalid \
+    r6-b1-noop-seq \
+    invalid-r6-noop-processed-wrong-seq-label.jsonl \
+    186 \
+    operation_processed
+run_invalid \
+    r6-b1-noop-term \
+    invalid-r6-noop-processed-wrong-term-label.jsonl \
+    186 \
+    operation_processed
+run_invalid \
+    r6-b1-recovery-identity \
+    invalid-r6-recovery-apply-wrong-identity.jsonl \
+    16 \
+    operation_processed
 run_inconclusive \
     timeout \
     "trace validation exceeded 1s" \

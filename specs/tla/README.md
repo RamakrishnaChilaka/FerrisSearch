@@ -453,6 +453,7 @@ verdict for every checked-in baseline and every Opus review mutation:
 | Collision mislabeled as redelivery | Rejected | Rejected at step 32, `operation_processed` |
 | Reviewer p7a, traced NoOp fan-out | Accepted | Accepted in 5.31s |
 | Reviewer p7b, omitted NoOp fan-out | Rejected | Rejected at step 190, `operation_processed` |
+| Round-6 processed-event identity mislabels | Rejected | NoOp term/sequence labels reject at step 186; recovery write identity rejects at step 16 |
 
 The former 217-event version-3 combined witness is 219 events in version 4.
 It uses 16 writes, three nodes, write terms 1 and 3, and the intermediate

@@ -1291,6 +1291,7 @@ def load_trace(path: Path) -> LoadedTrace:
 
         elif kind == "operation_processed":
             receipt = event["receipt_id"]
+            register_receipt(receipt, ident, line)
             if copy_key := attempt_by_receipt_target.get(
                 (receipt, event["node"])
             ):

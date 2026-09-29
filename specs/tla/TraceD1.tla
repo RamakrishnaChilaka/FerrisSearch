@@ -324,6 +324,9 @@ PromotionNoOpProcessEvent(event) ==
     /\ event.writeId = NoWrite
     /\ event.hasTransportMessage
     /\ event.transportMessage \in messages
+    /\ event.transportMessage.to = event.node
+    /\ event.transportMessage.term = event.term
+    /\ event.transportMessage.seq = event.seq
     /\ CASE event.outcome = "noop" ->
               D1FixedReplicaNoOpProcess(event.transportMessage)
        [] event.outcome = "redelivery" ->
