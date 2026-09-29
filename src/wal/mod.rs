@@ -2270,6 +2270,10 @@ impl WriteAheadLog for HotTranslog {
             retained,
             preserved_seq
         );
+        #[cfg(feature = "protocol-trace")]
+        if let Some(copy) = crate::protocol_trace::current_open_copy() {
+            crate::protocol_trace::record_wal_truncated(&copy, global_checkpoint);
+        }
         Ok(())
     }
 

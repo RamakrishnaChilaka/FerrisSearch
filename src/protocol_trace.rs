@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -128,12 +128,13 @@ pub enum ApplyOrigin {
 #[derive(Debug, Clone)]
 struct ApplyScope {
     origin: ApplyOrigin,
-    operations: Vec<OperationKey>,
+    operations: Vec<SequencedOperation>,
 }
 
 thread_local! {
     static OPEN_COPY: RefCell<Option<TraceCopy>> = const { RefCell::new(None) };
     static APPLY_SCOPE: RefCell<Option<ApplyScope>> = const { RefCell::new(None) };
+    static REQUEST_SCOPE: RefCell<VecDeque<RequestToken>> = const { RefCell::new(VecDeque::new()) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +229,8 @@ struct TraceState {
     message_by_copy_operation: HashMap<(OperationKey, String), String>,
     faults: Vec<FaultState>,
     replays: HashMap<TraceCopy, ActiveReplay>,
+    restart_replays: HashSet<String>,
+    pending_commits: HashMap<TraceCopy, String>,
     known_documents: BTreeSet<String>,
     copy_documents: HashMap<TraceCopy, BTreeMap<String, LogicalDocument>>,
 }
@@ -361,6 +364,8 @@ pub fn start(config: TraceConfig) -> Result<TraceSession> {
             .map(|rule| FaultState { rule, used: false })
             .collect(),
         replays: HashMap::new(),
+        restart_replays: HashSet::new(),
+        pending_commits: HashMap::new(),
         known_documents: BTreeSet::new(),
         copy_documents: HashMap::new(),
     });
@@ -413,7 +418,7 @@ pub fn current_open_copy() -> Option<TraceCopy> {
 
 pub fn with_apply_scope<T>(
     origin: ApplyOrigin,
-    operations: Vec<OperationKey>,
+    operations: Vec<SequencedOperation>,
     operation: impl FnOnce() -> T,
 ) -> T {
     APPLY_SCOPE.with(|slot| {
@@ -432,9 +437,40 @@ pub fn current_apply_operations() -> Vec<OperationKey> {
     APPLY_SCOPE.with(|slot| {
         slot.borrow()
             .as_ref()
+            .map(|scope| {
+                let copy = current_open_copy();
+                scope
+                    .operations
+                    .iter()
+                    .filter_map(|operation| {
+                        copy.as_ref().map(|copy| operation_key(copy, operation))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+pub fn current_apply_operation_values() -> Vec<SequencedOperation> {
+    APPLY_SCOPE.with(|slot| {
+        slot.borrow()
+            .as_ref()
             .map(|scope| scope.operations.clone())
             .unwrap_or_default()
     })
+}
+
+pub fn with_request_tokens<T>(tokens: Vec<RequestToken>, operation: impl FnOnce() -> T) -> T {
+    REQUEST_SCOPE.with(|slot| {
+        let previous = slot.replace(tokens.into());
+        let result = operation();
+        slot.replace(previous);
+        result
+    })
+}
+
+fn take_request_token() -> Option<RequestToken> {
+    REQUEST_SCOPE.with(|slot| slot.borrow_mut().pop_front())
 }
 
 pub fn content_hash(mutation: &DocumentMutation) -> String {
@@ -580,12 +616,14 @@ fn operation_for_apply(
     }
     let (doc, op, content_hash) = operation_parts(operation);
     let request_id = if origin == ApplyOrigin::Primary {
-        let doc = doc
-            .as_deref()
-            .context("primary NoOps must use promotion_noop_fill")?;
-        find_pending_request(state, copy, doc, op, &content_hash)
-            .context("primary operation has no routed trace request")?
-            .into()
+        let request_id = take_request_token()
+            .map(|token| token.request_id)
+            .or_else(|| {
+                doc.as_deref()
+                    .and_then(|doc| find_pending_request(state, copy, doc, op, &content_hash))
+            })
+            .context("primary operation has no routed trace request")?;
+        Some(request_id)
     } else {
         None
     };
@@ -969,13 +1007,14 @@ pub fn message_for(key: &OperationKey, target: &str) -> Option<TraceMessage> {
     .flatten()
 }
 
-pub fn take_fault(message_id: &str) -> Option<FaultAction> {
+fn take_fault(message_id: &str, accepts: impl Fn(FaultAction) -> bool) -> Option<FaultAction> {
     with_state(|state| {
         let message = state.messages.get(message_id)?;
         let rule = state.faults.iter_mut().find(|fault| {
             !fault.used
                 && fault.rule.target == message.message.target
                 && fault.rule.seq_no == message.message.key.seq_no
+                && accepts(fault.rule.action)
         })?;
         rule.used = true;
         Some(rule.rule.action)
@@ -984,7 +1023,12 @@ pub fn take_fault(message_id: &str) -> Option<FaultAction> {
 }
 
 pub async fn apply_request_fault(message_id: &str) -> bool {
-    match take_fault(message_id) {
+    match take_fault(message_id, |action| {
+        matches!(
+            action,
+            FaultAction::DelayRequest { .. } | FaultAction::DropRequest
+        )
+    }) {
         Some(FaultAction::DelayRequest { millis }) => {
             tokio::time::sleep(Duration::from_millis(millis)).await;
             false
@@ -995,7 +1039,10 @@ pub async fn apply_request_fault(message_id: &str) -> bool {
 }
 
 pub fn should_drop_response(message_id: &str) -> bool {
-    matches!(take_fault(message_id), Some(FaultAction::DropResponse))
+    matches!(
+        take_fault(message_id, |action| action == FaultAction::DropResponse),
+        Some(FaultAction::DropResponse)
+    )
 }
 
 pub fn record_replica_received(copy: &TraceCopy, operation: &SequencedOperation) -> Result<()> {
@@ -1457,6 +1504,7 @@ pub fn record_node_restarted(copy: &TraceCopy, stats: SequenceStats) {
         if !state.restart_pending.remove(&copy.node) {
             return;
         }
+        state.restart_replays.insert(copy.node.clone());
         let incarnation = state.nodes[&copy.node];
         push_event(
             state,
@@ -1475,6 +1523,9 @@ pub fn record_node_restarted(copy: &TraceCopy, stats: SequenceStats) {
 
 pub fn record_replay_started(copy: &TraceCopy, stats: SequenceStats) -> Option<String> {
     with_state(|state| {
+        if !state.restart_replays.remove(&copy.node) {
+            return None;
+        }
         let replay_id = format!("replay-{}", state.next_replay);
         state.next_replay += 1;
         state.replays.insert(
@@ -1496,8 +1547,9 @@ pub fn record_replay_started(copy: &TraceCopy, stats: SequenceStats) -> Option<S
                 "checkpoints": checkpoints_value(stats),
             }),
         );
-        replay_id
+        Some(replay_id)
     })
+    .flatten()
 }
 
 fn record_replay_entry(
@@ -1578,6 +1630,9 @@ pub fn record_commit_captured(
     with_state(|state| {
         let commit_id = format!("commit-{}", state.next_commit);
         state.next_commit += 1;
+        state
+            .pending_commits
+            .insert(copy.clone(), commit_id.clone());
         push_event(
             state,
             "commit_captured",
@@ -1602,8 +1657,11 @@ pub fn record_commit_captured(
     })
 }
 
-pub fn record_commit_persisted(copy: &TraceCopy, commit_id: &str) {
+pub fn record_commit_persisted(copy: &TraceCopy) {
     let _ = with_state(|state| {
+        let Some(commit_id) = state.pending_commits.remove(copy) else {
+            return;
+        };
         push_event(
             state,
             "commit_persisted",

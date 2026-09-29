@@ -815,6 +815,8 @@ pub struct ShardManager {
     /// Shared column cache for SQL fast-field Arrow arrays and grouped-partials
     /// full-segment decoded columns.
     column_cache: Arc<crate::engine::column_cache::ColumnCache>,
+    #[cfg(feature = "protocol-trace")]
+    protocol_trace_node: RwLock<Option<String>>,
 }
 
 impl ShardManager {
@@ -877,7 +879,37 @@ impl ShardManager {
             isr_tracker: IsrTracker::new(1000),
             durability,
             column_cache,
+            #[cfg(feature = "protocol-trace")]
+            protocol_trace_node: RwLock::new(None),
         }
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn set_protocol_trace_node(&self, node_id: impl Into<String>) {
+        *self
+            .protocol_trace_node
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(node_id.into());
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy(
+        &self,
+        index: &str,
+        shard_id: u32,
+    ) -> Option<crate::protocol_trace::TraceCopy> {
+        let node = self
+            .protocol_trace_node
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()?;
+        let identity = self.copy_identity(index, shard_id)?;
+        Some(crate::protocol_trace::TraceCopy {
+            node,
+            index_uuid: identity.index_uuid,
+            shard: shard_id,
+            allocation: identity.allocation_id,
+        })
     }
 
     /// Get the base data directory.
@@ -2069,7 +2101,7 @@ impl ShardManager {
 
         let mut cleaned_stale_schema = false;
         for attempt in 0..=LOCK_BUSY_RETRIES {
-            let open_result = match mode {
+            let open = || match mode {
                 CompositeOpenMode::ExistingOnly => CompositeEngine::open_existing_with_mappings(
                     shard_dir,
                     refresh_interval,
@@ -2085,6 +2117,13 @@ impl ShardManager {
                     self.column_cache.clone(),
                 ),
             };
+            #[cfg(feature = "protocol-trace")]
+            let open_result = match self.protocol_trace_copy(index, shard_id) {
+                Some(copy) => crate::protocol_trace::with_open_copy(copy, open),
+                None => open(),
+            };
+            #[cfg(not(feature = "protocol-trace"))]
+            let open_result = open();
             match open_result {
                 Ok(engine) => return Ok(Arc::new(engine)),
                 Err(err) => {
@@ -2575,6 +2614,14 @@ impl ShardManager {
             .get(&key)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("replica shard engine is not open"))?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_copy = self.protocol_trace_copy(index, shard_id);
+        #[cfg(feature = "protocol-trace")]
+        if let Some(copy) = trace_copy.as_ref() {
+            for operation in crate::protocol_trace::current_apply_operation_values() {
+                crate::protocol_trace::record_replica_received(copy, &operation)?;
+            }
+        }
         if context.message_term > identity.replica_fence {
             let fence_max_seq_no = engine
                 .sequence_stats()
@@ -2600,10 +2647,25 @@ impl ShardManager {
             }
             self.clear_copy_io_failure(&retry_key);
             self.cache_copy_identity(&key, identity.clone());
+            #[cfg(feature = "protocol-trace")]
+            if let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_fence(
+                    copy,
+                    identity.replica_fence,
+                    identity.fence_max_seq_no,
+                    "replication",
+                );
+            }
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
         }
         self.ensure_local_apply_allowed(context.index_uuid, shard_id, context.allocation_id)?;
+        #[cfg(feature = "protocol-trace")]
+        let result = match trace_copy {
+            Some(copy) => crate::protocol_trace::with_open_copy(copy, || operation(engine)),
+            None => operation(engine),
+        };
+        #[cfg(not(feature = "protocol-trace"))]
         let result = operation(engine);
         self.record_local_apply_result(context.index_uuid, shard_id, context.allocation_id, result)
     }
@@ -2662,6 +2724,15 @@ impl ShardManager {
                 }
                 shard_manager.clear_copy_io_failure(&retry_key);
                 shard_manager.cache_copy_identity(&key, identity.clone());
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = shard_manager.protocol_trace_copy(&index, shard_id) {
+                    crate::protocol_trace::record_fence(
+                        &copy,
+                        identity.replica_fence,
+                        identity.fence_max_seq_no,
+                        "activation",
+                    );
+                }
                 engine.reconcile_term_sequence_state(
                     identity.replica_fence,
                     identity.fence_max_seq_no,

@@ -633,6 +633,17 @@ impl ClusterStateMachine {
                         "invalid allocation metadata after failing copy for index '{index_name}' shard {shard_id}: {reason}"
                     ));
                 }
+                #[cfg(feature = "protocol-trace")]
+                let promoted_trace = is_primary.then(|| {
+                    (
+                        routing.primary.clone(),
+                        routing.primary_term,
+                        routing.in_sync_replicas.clone(),
+                    )
+                });
+                #[cfg(feature = "protocol-trace")]
+                let removed_trace = (!is_primary)
+                    .then(|| (routing.primary.clone(), routing.in_sync_replicas.clone()));
                 state.indices.insert(index_name.clone(), metadata);
                 state
                     .shard_allocations
@@ -640,6 +651,28 @@ impl ClusterStateMachine {
                     .expect("validated allocation map exists")
                     .insert(*shard_id, allocations);
                 state.version += 1;
+                #[cfg(feature = "protocol-trace")]
+                if let Some((new_primary, term, in_sync)) = promoted_trace {
+                    crate::protocol_trace::record_routing_promoted(
+                        &new_primary,
+                        index_uuid,
+                        *shard_id,
+                        &new_primary,
+                        term,
+                        &in_sync,
+                    );
+                }
+                #[cfg(feature = "protocol-trace")]
+                if let Some((emitter, in_sync)) = removed_trace {
+                    crate::protocol_trace::record_in_sync_removed(
+                        &emitter,
+                        index_uuid,
+                        *shard_id,
+                        node,
+                        *allocation_id,
+                        &in_sync,
+                    );
+                }
                 ClusterResponse::Ok
             }
             ClusterCommand::AddMappings {
