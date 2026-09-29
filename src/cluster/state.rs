@@ -338,6 +338,12 @@ impl IndexEngine {
     pub fn from_create_request_body(
         body: &serde_json::Value,
     ) -> Result<Self, CreateIndexMetadataError> {
+        if body.pointer("/settings/engine").is_some() {
+            return Err(CreateIndexMetadataError::InvalidArgument(
+                "index engine must be specified in the top-level [engine] field, not [settings.engine]"
+                    .to_string(),
+            ));
+        }
         Self::from_create_value(body.get("engine"))
     }
 
@@ -2518,6 +2524,26 @@ mod tests {
 
         assert_eq!(metadata.settings.engine, IndexEngine::RemoteStore);
         assert!(!metadata.settings.engine.supports_writes());
+    }
+
+    #[test]
+    fn index_metadata_rejects_settings_engine_and_names_top_level_field() {
+        let error = IndexMetadata::from_create_request_body(
+            "idx",
+            &serde_json::json!({
+                "settings": {
+                    "engine": "remote_store"
+                }
+            }),
+            &["node-1".into()],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CreateIndexMetadataError::InvalidArgument(reason)
+                if reason == "index engine must be specified in the top-level [engine] field, not [settings.engine]"
+        ));
     }
 
     #[test]

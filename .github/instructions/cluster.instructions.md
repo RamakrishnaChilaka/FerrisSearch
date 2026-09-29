@@ -37,6 +37,9 @@ ClusterState { cluster_name, version, master_node, nodes, indices, shard_allocat
 
 ### Engine Selection
 - `IndexSettings.engine` is a create-time selector persisted in cluster state, surfaced by `GET /{index}/_settings`, `SHOW TABLES`, and `SHOW CREATE TABLE`
+- Create-index parsing accepts only the top-level `engine` selector.
+  `settings.engine` is rejected and the error names the supported top-level
+  field instead of silently defaulting to `local_shards`.
 - `engine` is immutable after creation — `PUT /{index}/_settings` must reject attempts to change it
 - `local_shards` supports ordinary document CRUD through shard routing, WAL, and replication
 - `remote_store` can be created and queried through manifest-backed split execution; it is shardless and ordinary document CRUD returns `501`

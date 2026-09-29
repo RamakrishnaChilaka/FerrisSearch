@@ -3477,6 +3477,42 @@ async fn create_index_with_remote_store_engine_allows_create_but_rejects_writes(
 }
 
 #[tokio::test]
+async fn create_index_rejects_settings_engine_and_names_top_level_field() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/nested-engine",
+            json!({
+                "settings": {
+                    "engine": "remote_store",
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
+    assert_eq!(
+        body["error"]["reason"],
+        json!(
+            "index engine must be specified in the top-level [engine] field, not [settings.engine]"
+        )
+    );
+    assert!(
+        !harness
+            .app_state
+            .cluster_manager
+            .get_state()
+            .indices
+            .contains_key("nested-engine")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_index_with_remote_store_engine_when_forwarded_to_leader() -> Result<()> {
     let harness = MultiNodeRestHarness::start_three_nodes().await?;
 
