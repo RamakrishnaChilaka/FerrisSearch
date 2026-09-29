@@ -345,6 +345,9 @@ cargo test -- test_name                         # Single test by name
 - Retry-catch-up coverage must preserve an empty incomplete response at the
   unchanged physical cursor as a return-to-finalize signal, not a
   no-progress failure.
+- Zero-replica bulk replication coverage must prove target resolution happens
+  before sequence-range construction or JSON serialization. Performance
+  changes require equivalent release-mode before/after measurements.
 - R6 replay regressions cover more than one 1,000-operation replay batch after
   a fence raise, visibility of every pre-promotion document plus a later write,
   clean assigned-copy reopen, and restart from an intermediate commit whose

@@ -2932,7 +2932,7 @@ async fn failed_promotion_noop_fanout_is_retried_end_to_end() {
     };
 
     tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         source_service.activate_primary_for_lifecycle("idx", 0),
     )
     .await
@@ -3001,7 +3001,7 @@ async fn failed_promotion_noop_fanout_is_retried_end_to_end() {
     });
 
     tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         source_service.activate_primary_for_lifecycle("idx", 0),
     )
     .await

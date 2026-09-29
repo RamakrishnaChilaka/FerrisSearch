@@ -85,7 +85,10 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > durable term-start fence maximum until later WAL batches are replayed; this is
 > valid sequence state, not corruption. A stalled empty catch-up response at an
 > unchanged physical cursor returns to the exclusive finalize path, including
-> after finalization asks for another catch-up.
+> after finalization asks for another catch-up. Bulk replication resolves
+> authoritative targets before payload serialization; zero-replica bulks avoid
+> that work, and non-empty fan-out shares one serialized operation slice across
+> replica tasks.
 > Earlier build formats are unsupported and require index/cluster recreation
 > and reindexing. This does not implement D10 rollback/resync, client retry
 > tokens, or full OCC.

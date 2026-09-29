@@ -9,6 +9,7 @@ use crate::shard::ReplicaCheckpointUpdate;
 use crate::transport::TransportClient;
 use crate::transport::proto::{ReplicateBulkRequest, ReplicateDocRequest};
 use crate::wal::TranslogDurability;
+use std::sync::Arc;
 use tracing::error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,49 @@ struct ReplicaWireOperation {
     op: String,
     doc_id: String,
     payload_json: Vec<u8>,
+}
+
+struct ReplicaBatchRoute {
+    index_uuid: String,
+    replica_node_ids: Vec<String>,
+}
+
+fn resolve_replica_batch_route(
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    primary_term: u64,
+    operation_label: &'static str,
+) -> Result<Option<ReplicaBatchRoute>, Vec<ReplicaReplicationFailure>> {
+    let metadata = match cluster_state.indices.get(index_name) {
+        Some(metadata) => metadata,
+        None => return Ok(None),
+    };
+    let Some(routing) = metadata.shard_routing.get(&shard_id) else {
+        return Ok(None);
+    };
+    if routing.primary_term != primary_term {
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<routing>",
+            None,
+            format!(
+                "{operation_label} replication term {primary_term} does not match captured routing term {}",
+                routing.primary_term
+            ),
+        )]);
+    }
+    let replica_node_ids = metadata
+        .in_sync_replica_nodes(shard_id)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if replica_node_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ReplicaBatchRoute {
+        index_uuid: metadata.uuid.to_string(),
+        replica_node_ids,
+    }))
 }
 
 /// Replicate a single document write to all in-sync replica nodes for a shard.
@@ -295,6 +339,11 @@ pub async fn replicate_bulk_with_durability(
     primary_term: u64,
     durability: TranslogDurability,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    let Some(route) =
+        resolve_replica_batch_route(cluster_state, index_name, shard_id, primary_term, "bulk")?
+    else {
+        return Ok(Vec::new());
+    };
     let operations = docs
         .iter()
         .enumerate()
@@ -325,9 +374,10 @@ pub async fn replicate_bulk_with_durability(
     replicate_explicit_batch_with_durability(
         transport_client,
         cluster_state,
+        route,
         index_name,
         shard_id,
-        &operations,
+        Arc::from(operations),
         primary_term,
         durability,
         "bulk",
@@ -391,12 +441,23 @@ pub async fn replicate_noop_batch_with_durability(
         })
         .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
         .map_err(|error| vec![error])?;
-    replicate_explicit_batch_with_durability(
-        transport_client,
+    let Some(route) = resolve_replica_batch_route(
         cluster_state,
         index_name,
         shard_id,
-        &operations,
+        primary_term,
+        "promotion NoOp",
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    replicate_explicit_batch_with_durability(
+        transport_client,
+        cluster_state,
+        route,
+        index_name,
+        shard_id,
+        Arc::from(operations),
         primary_term,
         durability,
         "promotion NoOp",
@@ -408,42 +469,19 @@ pub async fn replicate_noop_batch_with_durability(
 async fn replicate_explicit_batch_with_durability(
     transport_client: &TransportClient,
     cluster_state: &ClusterState,
+    route: ReplicaBatchRoute,
     index_name: &str,
     shard_id: u32,
-    operations: &[ReplicaWireOperation],
+    operations: Arc<[ReplicaWireOperation]>,
     primary_term: u64,
     durability: TranslogDurability,
     operation_label: &'static str,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
-    let metadata = match cluster_state.indices.get(index_name) {
-        Some(m) => m,
-        None => return Ok(vec![]),
-    };
-    let Some(routing) = metadata.shard_routing.get(&shard_id) else {
-        return Ok(vec![]);
-    };
-    let index_uuid = metadata.uuid.to_string();
-    if routing.primary_term != primary_term {
-        return Err(vec![ReplicaReplicationFailure::message(
-            "<routing>",
-            None,
-            format!(
-                "{operation_label} replication term {primary_term} does not match captured routing term {}",
-                routing.primary_term
-            ),
-        )]);
-    }
-
-    let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
-    if replica_node_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
     // Build futures for concurrent replication to all in-sync replicas
-    let mut futures = Vec::with_capacity(replica_node_ids.len());
+    let mut futures = Vec::with_capacity(route.replica_node_ids.len());
 
-    for replica_node_id in &replica_node_ids {
-        let node_info = match cluster_state.nodes.get(*replica_node_id) {
+    for replica_node_id in &route.replica_node_ids {
+        let node_info = match cluster_state.nodes.get(replica_node_id) {
             Some(n) => n.clone(),
             None => {
                 let rid = replica_node_id.to_string();
@@ -465,7 +503,7 @@ async fn replicate_explicit_batch_with_durability(
         let client = transport_client.clone();
         let idx = index_name.to_string();
         let rid = replica_node_id.to_string();
-        let operations = operations.to_vec();
+        let operations = Arc::clone(&operations);
         let Some(target_allocation_id) =
             cluster_state.shard_allocation_id(index_name, shard_id, replica_node_id)
         else {
@@ -482,7 +520,7 @@ async fn replicate_explicit_batch_with_durability(
             }));
             continue;
         };
-        let uuid = index_uuid.clone();
+        let uuid = route.index_uuid.clone();
 
         futures.push(tokio::spawn(async move {
             let ops = operations
@@ -798,8 +836,17 @@ mod tests {
         let client = TransportClient::new();
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec![]);
-        let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, 1).await;
+        let docs = vec![
+            (
+                "d1".into(),
+                serde_json::json!({"payload": "x".repeat(4096)}),
+            ),
+            (
+                "d2".into(),
+                serde_json::json!({"payload": "y".repeat(4096)}),
+            ),
+        ];
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, u64::MAX, 1).await;
         assert!(result.is_ok());
     }
 

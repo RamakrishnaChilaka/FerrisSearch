@@ -97,6 +97,11 @@ pub async fn replicate_bulk(
 ## Key Design Decisions
 - **Synchronous replication**: primary waits for every authoritative in-sync replica before ACK
 - **Concurrent fan-out**: replicas are contacted in parallel via `tokio::spawn` + `join_all` — write latency = max(replica RTTs), not sum
+- Bulk replication resolves the captured routing term and authoritative targets
+  before cloning document IDs or serializing payloads. A zero-target bulk
+  returns immediately. Non-empty fan-out serializes each payload once and
+  shares the immutable operation slice across replica tasks; each gRPC request
+  performs only its required owned protobuf copy.
 - Assigned replicas are in `ShardRoutingEntry.replicas`; required
   acknowledgement targets are in `ShardRoutingEntry.in_sync_replicas`
 - Primary write handlers hold the shard's shared write-barrier guard from
